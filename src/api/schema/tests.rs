@@ -90,6 +90,32 @@ fn workspace_close_group_intent_defaults_false_and_round_trips() {
 }
 
 #[test]
+fn plugin_workspace_right_request_round_trips() {
+    let request = Request {
+        id: "plugin-right".into(),
+        method: Method::PluginPaneOpen(PluginPaneOpenParams {
+            plugin_id: "example.explorer".into(),
+            entrypoint: "explorer".into(),
+            placement: Some(PluginPanePlacement::WorkspaceRight),
+            width: Some(crate::popup_size::PopupSize::Cells(24)),
+            height: None,
+            workspace_id: Some("w1".into()),
+            target_pane_id: None,
+            direction: None,
+            cwd: None,
+            focus: true,
+            env: HashMap::new(),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "plugin.pane.open");
+    assert_eq!(json["params"]["placement"], "workspace_right");
+    assert_eq!(json["params"]["width"], 24);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+}
+
+#[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {
         id: "start".into(),

@@ -96,6 +96,10 @@ enum PaneLaunchIdentity {
         tab_id: String,
         pane_id: String,
     },
+    WorkspaceManaged {
+        workspace_id: String,
+        pane_id: String,
+    },
     OmitPane,
 }
 
@@ -116,6 +120,14 @@ impl PaneLaunchEnv {
         self.identity = PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
+            pane_id,
+        };
+        self
+    }
+
+    pub(crate) fn with_workspace_identity(mut self, workspace_id: String, pane_id: String) -> Self {
+        self.identity = PaneLaunchIdentity::WorkspaceManaged {
+            workspace_id,
             pane_id,
         };
         self
@@ -144,6 +156,14 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         } => {
             cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
             cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
+            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+        }
+        PaneLaunchIdentity::WorkspaceManaged {
+            workspace_id,
+            pane_id,
+        } => {
+            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+            cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
             cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
         }
         PaneLaunchIdentity::OmitPane => {
@@ -684,6 +704,8 @@ fn spawn_basic_detection_task(
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     state_events: mpsc::Sender<AppEvent>,
+    initial_agent: Option<Agent>,
+    initial_state: AgentState,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
@@ -695,11 +717,11 @@ fn spawn_basic_detection_task(
     let pending_release_for_task = pending_release.clone();
 
     let handle = tokio::spawn(async move {
-        let mut agent_presence = AgentDetectionPresence::from_agent(None);
-        let mut state = AgentState::Unknown;
-        let mut last_visible_idle = false;
-        let mut last_visible_blocker = false;
-        let mut last_visible_working = false;
+        let mut agent_presence = AgentDetectionPresence::from_agent(initial_agent);
+        let mut state = initial_state;
+        let mut last_visible_idle = initial_agent.is_some() && state == AgentState::Idle;
+        let mut last_visible_blocker = initial_agent.is_some() && state == AgentState::Blocked;
+        let mut last_visible_working = initial_agent.is_some() && state == AgentState::Working;
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
@@ -707,6 +729,7 @@ fn spawn_basic_detection_task(
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
         let mut pending_foreground_shell_clear = false;
+        let mut pending_restore_probe = initial_agent.is_some();
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
@@ -735,6 +758,7 @@ fn spawn_basic_detection_task(
                     acquisition_started_at = None;
                     last_content_change_at = None;
                     pending_foreground_shell_clear = false;
+                    pending_restore_probe = false;
                     foreground_shell_exit_reported = false;
                     release_was_active = false;
                     last_detection_text.clear();
@@ -772,7 +796,7 @@ fn spawn_basic_detection_task(
                     acquisition_age: acquisition_started_at
                         .map(|started| now.duration_since(started)),
                     pending_foreground_shell_clear,
-                    pending_restore_probe: false,
+                    pending_restore_probe,
                     elapsed_since_process_check: now.duration_since(last_process_check),
                 };
                 !should_skip_process_probe_for_lifecycle_authority(
@@ -814,6 +838,7 @@ fn spawn_basic_detection_task(
                     &mut foreground_shell_exit_reported,
                 );
                 last_foreground_pgid = tracked_process_group_id;
+                pending_restore_probe = false;
                 if new_agent.is_some() {
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -1669,6 +1694,7 @@ impl PaneRuntime {
             input_state: self.input_state(),
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
+            agent_state: None,
         }
     }
 
@@ -1879,7 +1905,12 @@ impl PaneRuntime {
             input_state,
             terminal_title,
             initial_history_ansi,
+            agent_state,
         } = state;
+        let (initial_agent, initial_agent_state, initial_lifecycle_authority_active) = agent_state
+            .as_ref()
+            .map(crate::handoff_runtime::HandoffAgentState::detection_seed)
+            .unwrap_or((None, AgentState::Unknown, false));
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
 
@@ -1984,7 +2015,8 @@ impl PaneRuntime {
             })?)
         };
 
-        let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let full_lifecycle_authority_active =
+            Arc::new(AtomicBool::new(initial_lifecycle_authority_active));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
@@ -1992,6 +2024,8 @@ impl PaneRuntime {
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
             events,
+            initial_agent,
+            initial_agent_state,
         );
 
         Ok(Self {
@@ -2692,6 +2726,9 @@ impl PaneRuntime {
         #[cfg(test)]
         AGGREGATE_INPUT_STATE_READS.set(AGGREGATE_INPUT_STATE_READS.get() + 1);
         self.terminal.input_state()
+    }
+    pub fn alternate_screen(&self) -> Option<bool> {
+        self.terminal.alternate_screen()
     }
 
     pub fn keyboard_report_all_requested(&self) -> bool {

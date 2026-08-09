@@ -8,8 +8,6 @@ use crate::{
 };
 
 struct PreparedPaneInput {
-    ws_idx: usize,
-    pane_id: crate::layout::PaneId,
     target: TerminalInputTarget,
     bytes: Bytes,
 }
@@ -55,7 +53,7 @@ impl App {
 
         let input = self.prepare_terminal_key_forward(source_id, key)?;
         let sent = self
-            .lookup_runtime_sender(input.ws_idx, input.pane_id)
+            .terminal_input_runtime(&input.target)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
         sent.then_some(input.target)
     }
@@ -120,8 +118,23 @@ impl App {
             return None;
         }
 
+        if matches!(key_event.code, KeyCode::Esc) {
+            if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
+                let workspace_id = workspace_id.to_string();
+                self.state.unfocus_workspace_plugin_pane(&workspace_id);
+                self.state.mode = Mode::Terminal;
+                return None;
+            }
+        }
+
         if self.state.is_prefix_key(&key) {
-            self.state.mode = Mode::Prefix;
+            if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
+                let workspace_id = workspace_id.to_string();
+                self.state.unfocus_workspace_plugin_pane(&workspace_id);
+                self.state.mode = Mode::Terminal;
+            } else {
+                self.state.mode = Mode::Prefix;
+            }
             return None;
         }
 
@@ -135,54 +148,62 @@ impl App {
             return None;
         }
 
-        let ws_idx = self.state.active?;
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_id = ws.focused_pane_id()?;
-        let terminal_id = ws.terminal_id(pane_id)?.clone();
-        let rt =
-            self.state
-                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
-
-        // Intercept plain PageUp/PageDown presses for pane scrollback only
-        // when the focused pane looks like a shell transcript. Normal-screen
-        // pagers such as `less -X` keep the primary screen but enter
-        // application cursor mode while they own special keys.
-        // Modified page keys are pane shortcuts, and release events should not
-        // produce a second host-scroll action.
-        // Only intercept when we know the pane state; if input_state is unknown,
-        // fail-open and forward the key to the pane.
-        if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
-            && key_event.modifiers.is_empty()
-        {
-            if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
-                if host_scroll {
-                    if key_event.kind == crossterm::event::KeyEventKind::Release {
-                        return None;
-                    }
-                    if matches!(
-                        key_event.kind,
-                        crossterm::event::KeyEventKind::Press
-                            | crossterm::event::KeyEventKind::Repeat
-                    ) {
-                        let lines = self
-                            .state
-                            .pane_info_by_id(pane_id)
-                            .map(|info| info.inner_rect.height as usize)
-                            .unwrap_or(10)
-                            .max(1);
-                        if key_event.code == KeyCode::PageUp {
-                            self.state
-                                .scroll_pane_up(&self.terminal_runtimes, pane_id, lines);
-                        } else {
-                            self.state
-                                .scroll_pane_down(&self.terminal_runtimes, pane_id, lines);
+        let (terminal_id, pane_id) =
+            if let Some((_, pane)) = self.state.focused_workspace_plugin_pane() {
+                (pane.terminal_id.clone(), None)
+            } else {
+                let ws_idx = self.state.active?;
+                let ws = self.state.workspaces.get(ws_idx)?;
+                let pane_id = ws.focused_pane_id()?;
+                (ws.terminal_id(pane_id)?.clone(), Some(pane_id))
+            };
+        let target = TerminalInputTarget { terminal_id };
+        let rt = self.terminal_input_runtime(&target)?;
+        if let Some(pane_id) = pane_id {
+            // Intercept plain PageUp/PageDown presses for pane scrollback only
+            // when the focused pane looks like a shell transcript. Normal-screen
+            // pagers such as `less -X` keep the primary screen but enter
+            // application cursor mode while they own special keys.
+            // Modified page keys are pane shortcuts, and release events should not
+            // produce a second host-scroll action.
+            // Only intercept when we know the pane state; if input_state is unknown,
+            // fail-open and forward the key to the pane.
+            if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                && key_event.modifiers.is_empty()
+            {
+                if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
+                    if host_scroll {
+                        if key_event.kind == crossterm::event::KeyEventKind::Release {
+                            return None;
                         }
-                        debug!(
-                            code = ?key_event.code,
-                            lines,
-                            "intercepted page key for pane scrollback"
-                        );
-                        return None;
+                        if matches!(
+                            key_event.kind,
+                            crossterm::event::KeyEventKind::Press
+                                | crossterm::event::KeyEventKind::Repeat
+                        ) {
+                            let lines = self
+                                .state
+                                .pane_info_by_id(pane_id)
+                                .map(|info| info.inner_rect.height as usize)
+                                .unwrap_or(10)
+                                .max(1);
+                            if key_event.code == KeyCode::PageUp {
+                                self.state
+                                    .scroll_pane_up(&self.terminal_runtimes, pane_id, lines);
+                            } else {
+                                self.state.scroll_pane_down(
+                                    &self.terminal_runtimes,
+                                    pane_id,
+                                    lines,
+                                );
+                            }
+                            debug!(
+                                code = ?key_event.code,
+                                lines,
+                                "intercepted page key for pane scrollback"
+                            );
+                            return None;
+                        }
                     }
                 }
             }
@@ -228,9 +249,7 @@ impl App {
         }
 
         Some(PreparedPaneInput {
-            ws_idx,
-            pane_id,
-            target: TerminalInputTarget { terminal_id },
+            target,
             bytes: Bytes::from(bytes),
         })
     }
@@ -390,7 +409,7 @@ impl App {
         }
 
         let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
-        let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
+        let sent = if let Some(runtime) = self.terminal_input_runtime(&input.target) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
             false
@@ -1747,6 +1766,64 @@ mod tests {
         let bytes = rx.try_recv().unwrap();
         assert_eq!(bytes.as_ref(), b"\x1b\x7f");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_input_routes_to_focused_workspace_plugin_pane() {
+        let mut app = app_for_mouse_test();
+        let workspace = Workspace::test_new("plugin-input");
+        let workspace_id = workspace.id.clone();
+        let tiled_pane_id = workspace.tabs[0].root_pane;
+        let tiled_terminal_id = workspace
+            .terminal_id(tiled_pane_id)
+            .expect("tiled terminal")
+            .clone();
+        let (tiled_runtime, mut tiled_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(tiled_terminal_id, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let (plugin_runtime, mut plugin_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(40, 24);
+        app.terminal_runtimes
+            .insert(plugin_terminal_id.clone(), plugin_runtime);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.input".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 38, 22);
+
+        let target = app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+
+        assert!(target.is_some());
+        assert_eq!(plugin_rx.try_recv().unwrap().as_ref(), b"x");
+        assert!(plugin_rx.try_recv().is_err());
+        assert!(tiled_rx.try_recv().is_err());
+
+        let target =
+            app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert!(target.is_none());
+        assert!(!app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert!(plugin_rx.try_recv().is_err());
     }
 
     fn app_with_plain_scrollback(

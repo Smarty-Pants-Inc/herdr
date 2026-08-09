@@ -319,6 +319,9 @@ impl TerminalRuntime {
     pub fn input_state(&self) -> Option<crate::pane::InputState> {
         self.0.input_state()
     }
+    pub fn alternate_screen(&self) -> Option<bool> {
+        self.0.alternate_screen()
+    }
 
     pub fn keyboard_report_all_requested(&self) -> bool {
         self.0.keyboard_report_all_requested()

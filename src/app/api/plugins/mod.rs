@@ -383,13 +383,16 @@ impl App {
             return encode_error(id, code, message);
         }
         let placement = params.placement.unwrap_or(pane.placement);
-        if placement != PluginPanePlacement::Popup
-            && (params.width.is_some() || params.height.is_some())
-        {
+        let invalid_size = match placement {
+            PluginPanePlacement::Popup => false,
+            PluginPanePlacement::WorkspaceRight => params.height.is_some(),
+            _ => params.width.is_some() || params.height.is_some(),
+        };
+        if invalid_size {
             return encode_error(
                 id,
                 "invalid_params",
-                "width and height are only supported when placement is popup",
+                "width is supported for popup and workspace_right placements; height is popup-only",
             );
         }
         if placement == PluginPanePlacement::Popup && self.state.mode != crate::app::Mode::Terminal
@@ -410,6 +413,15 @@ impl App {
                         id,
                         "invalid_params",
                         "overlay and popup plugin panes target the active pane",
+                    );
+                }
+            }
+            PluginPanePlacement::WorkspaceRight => {
+                if params.target_pane_id.is_some() || params.direction.is_some() {
+                    return encode_error(
+                        id,
+                        "invalid_params",
+                        "workspace_right plugin panes support workspace_id but not target_pane_id or direction",
                     );
                 }
             }
@@ -438,6 +450,9 @@ impl App {
                 self.open_plugin_overlay_pane(id, params, &plugin, pane)
             }
             PluginPanePlacement::Popup => self.open_plugin_popup_pane(id, params, &plugin, pane),
+            PluginPanePlacement::WorkspaceRight => {
+                self.open_plugin_workspace_right_pane(id, params, &plugin, pane)
+            }
             PluginPanePlacement::Split | PluginPanePlacement::Zoomed => {
                 self.open_plugin_split_pane(id, params, &plugin, pane, placement)
             }
@@ -450,6 +465,12 @@ impl App {
         id: String,
         params: PluginPaneFocusParams,
     ) -> String {
+        if let Some(plugin_pane) = self.focus_workspace_plugin_pane(&params.pane_id) {
+            return encode_success(
+                id,
+                ResponseResult::PluginWorkspacePaneFocused { plugin_pane },
+            );
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "plugin_pane_not_found", "plugin pane not found");
         };
@@ -481,6 +502,14 @@ impl App {
         id: String,
         params: PluginPaneCloseParams,
     ) -> String {
+        if self
+            .workspace_plugin_pane_info_for_public_id(&params.pane_id)
+            .is_some()
+        {
+            let pane_id = params.pane_id;
+            self.close_workspace_plugin_pane(&pane_id);
+            return encode_success(id, ResponseResult::PluginPaneClosed { pane_id });
+        }
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "plugin_pane_not_found", "plugin pane not found");
         };
@@ -1476,6 +1505,9 @@ platforms = ["linux", "macos"]
             width_px: 11,
             height_px: 22,
         };
+        app.state.palette.accent = ratatui::style::Color::Blue;
+        app.state.palette.sidebar_bg = ratatui::style::Color::Rgb(1, 2, 3);
+        app.state.palette.text = ratatui::style::Color::Reset;
         app.state.terminals.get_mut(&root_terminal).unwrap().cwd = "/tmp".into();
         let target_public_pane_id = app.public_pane_id(0, root_pane).unwrap();
 
@@ -1494,7 +1526,7 @@ platforms = ["linux", "macos"]
 [[panes]]
 id = "board"
 title = "Plugin Board"
-command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_ENTRYPOINT_ID\" \"$HERDR_WORKSPACE_ID\" \"$HERDR_PANE_ID\" \"$HERDR_BIN_PATH\" \"$HERDR_PLUGIN_CONTEXT_JSON\" \"${{HERDR_CELL_WIDTH_PX-unset}}\" \"${{HERDR_CELL_HEIGHT_PX-unset}}\" > {}"]
+command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_ENTRYPOINT_ID\" \"$HERDR_WORKSPACE_ID\" \"$HERDR_PANE_ID\" \"$HERDR_BIN_PATH\" \"$HERDR_PLUGIN_CONTEXT_JSON\" \"$HERDR_THEME_ACCENT\" \"$HERDR_THEME_SIDEBAR_BG\" \"$HERDR_THEME_TEXT\" \"${{HERDR_CELL_WIDTH_PX-unset}}\" \"${{HERDR_CELL_HEIGHT_PX-unset}}\" > {}"]
 "#,
                 capture.display()
             ),
@@ -1528,6 +1560,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
                         "HERDR_BIN_PATH".to_string(),
                         "/tmp/spoofed-herdr".to_string(),
                     ),
+                    ("HERDR_THEME_SIDEBAR_BG".to_string(), "#ffffff".to_string()),
                 ]),
             }),
         });
@@ -1568,6 +1601,9 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
             context.focused_pane_id.as_deref(),
             Some(target_public_pane_id.as_str())
         );
+        assert_eq!(lines.next(), Some("blue"));
+        assert_eq!(lines.next(), Some("#010203"));
+        assert_eq!(lines.next(), Some("reset"));
         assert_eq!(lines.next(), Some("unset"));
         assert_eq!(lines.next(), Some("unset"));
 
@@ -2016,6 +2052,152 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         });
         assert!(app.state.popup_pane.is_none());
         assert!(event_hub.events_after(0).is_empty());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_pane_open_workspace_right_tracks_workspace_not_tab() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut first_workspace = crate::workspace::Workspace::test_new("plugin-right");
+        let second_tab = first_workspace.test_add_tab(Some("second"));
+        app.state.workspaces = vec![
+            first_workspace,
+            crate::workspace::Workspace::test_new("other"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+        let workspace_id = app.public_workspace_id(0);
+
+        let root = unique_temp_path("plugin-pane-workspace-right");
+        let env_capture = root.join("workspace-env.txt");
+        let manifest = format!(
+            r#"
+id = "example.workspace-right"
+name = "Workspace Right Plugin"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "explorer"
+title = "Explorer"
+placement = "workspace_right"
+width = 24
+command = ["sh", "-c", "printf %s \"$HERDR_WORKSPACE_ID|${{HERDR_TAB_ID-unset}}|$HERDR_PANE_ID\" > '{}'; sleep 30"]
+"#,
+            env_capture.display()
+        );
+        write_manifest_content(&root, &manifest);
+        link_manifest(&mut app, &root);
+
+        let open = app.handle_api_request(Request {
+            id: "pane-open-workspace-right".into(),
+            method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                plugin_id: "example.workspace-right".into(),
+                entrypoint: "explorer".into(),
+                placement: None,
+                width: None,
+                height: None,
+                workspace_id: Some(workspace_id.clone()),
+                target_pane_id: None,
+                direction: None,
+                cwd: None,
+                focus: false,
+                env: std::collections::HashMap::new(),
+            }),
+        });
+        let ResponseResult::PluginWorkspacePaneOpened { plugin_pane } = response_result(&open)
+        else {
+            panic!("expected workspace plugin pane opened response: {open}");
+        };
+        assert_eq!(plugin_pane.workspace_id, workspace_id);
+        assert_eq!(
+            plugin_pane.pane_id,
+            format!("{}:plugin", plugin_pane.workspace_id)
+        );
+        assert!(!plugin_pane.focused);
+        assert_eq!(
+            read_capture_when_ready(&env_capture, || {
+                app.drain_internal_events();
+            }),
+            format!("{}|unset|{}", plugin_pane.workspace_id, plugin_pane.pane_id)
+        );
+        assert_eq!(app.state.workspace_plugin_panes.len(), 1);
+        assert!(app.state.workspaces[0]
+            .tabs
+            .iter()
+            .all(|tab| tab.layout.pane_count() == 1));
+
+        assert!(app.state.workspace_plugin_panes[&workspace_id].collapsed);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 1);
+        assert!(app.state.view.workspace_plugin_pane_inner.is_empty());
+
+        let initially_focused = app
+            .focus_workspace_plugin_pane(&plugin_pane.pane_id)
+            .expect("workspace plugin pane");
+        assert!(initially_focused.focused);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        let terminal_width_with_plugin = app.state.view.terminal_area.width;
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 24);
+
+        assert!(app.state.switch_workspace_tab(0, second_tab));
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 24);
+        assert!(app
+            .state
+            .workspace_plugin_panes
+            .get(&plugin_pane.workspace_id)
+            .is_some_and(|pane| pane.focused));
+
+        app.state.switch_workspace(1);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert!(app.state.view.workspace_plugin_pane_outer.is_empty());
+        assert!(app.state.view.terminal_area.width > terminal_width_with_plugin);
+
+        let focus = app.handle_api_request(Request {
+            id: "pane-focus-workspace-right".into(),
+            method: Method::PluginPaneFocus(PluginPaneFocusParams {
+                pane_id: plugin_pane.pane_id.clone(),
+            }),
+        });
+        let ResponseResult::PluginWorkspacePaneFocused {
+            plugin_pane: focused,
+        } = response_result(&focus)
+        else {
+            panic!("expected workspace plugin pane focused response: {focus}");
+        };
+        assert!(focused.focused);
+        assert_eq!(focused.pane_id, plugin_pane.pane_id);
+        assert_eq!(app.state.active, Some(0));
+
+        let close = app.handle_api_request(Request {
+            id: "pane-close-workspace-right".into(),
+            method: Method::PluginPaneClose(PluginPaneCloseParams {
+                pane_id: plugin_pane.pane_id.clone(),
+            }),
+        });
+        assert_eq!(
+            response_result(&close),
+            ResponseResult::PluginPaneClosed {
+                pane_id: plugin_pane.pane_id
+            }
+        );
+        assert!(app.state.workspace_plugin_panes.is_empty());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();

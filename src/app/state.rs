@@ -25,6 +25,17 @@ pub(crate) struct PopupPaneState {
     pub height: Option<crate::popup_size::PopupSize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspacePluginPaneState {
+    pub pane_id: PaneId,
+    pub terminal_id: crate::terminal::TerminalId,
+    pub plugin_id: String,
+    pub entrypoint: String,
+    pub width: Option<crate::popup_size::PopupSize>,
+    pub focused: bool,
+    pub collapsed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -877,6 +888,8 @@ pub struct ViewState {
     pub tab_scroll_right_hit_area: Rect,
     pub new_tab_hit_area: Rect,
     pub terminal_area: Rect,
+    pub workspace_plugin_pane_outer: Rect,
+    pub workspace_plugin_pane_inner: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
@@ -1233,6 +1246,11 @@ pub(crate) enum DragTarget {
         grab_row_offset: u16,
     },
     SidebarDivider,
+    WorkspacePluginDivider {
+        workspace_id: String,
+        right_edge: u16,
+        available_width: u16,
+    },
     SidebarSectionDivider,
 }
 
@@ -1605,6 +1623,8 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// Optional right-edge plugin terminal attached to each workspace.
+    pub(crate) workspace_plugin_panes: std::collections::HashMap<String, WorkspacePluginPaneState>,
     /// Session-modal terminal popup. This is intentionally outside workspace layouts.
     pub(crate) popup_pane: Option<PopupPaneState>,
     /// Recent plugin action/event command executions.
@@ -1886,6 +1906,8 @@ impl AppState {
                 tab_scroll_right_hit_area: Rect::default(),
                 new_tab_hit_area: Rect::default(),
                 terminal_area: Rect::default(),
+                workspace_plugin_pane_outer: Rect::default(),
+                workspace_plugin_pane_inner: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
@@ -1991,6 +2013,7 @@ impl AppState {
             integration_install_messages: Vec::new(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
+            workspace_plugin_panes: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,

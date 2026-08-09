@@ -12,6 +12,7 @@ use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
+use super::widgets::render_panel_separator;
 use crate::app::state::{AgentPanelSort, Palette};
 use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
@@ -768,17 +769,13 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
     frame
         .buffer_mut()
         .set_style(area, Style::default().bg(p.sidebar_bg));
-    let sep_style = if is_navigating {
-        Style::default().fg(p.accent)
-    } else {
-        Style::default().fg(p.surface_dim)
-    };
-    let sep_x = area.x + area.width.saturating_sub(1);
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        buf[(sep_x, y)].set_symbol("│");
-        buf[(sep_x, y)].set_style(sep_style);
-    }
+    render_panel_separator(
+        frame,
+        area,
+        area.x + area.width.saturating_sub(1),
+        is_navigating,
+        p,
+    );
 
     let (ws_area, divider_y, detail_area) = collapsed_sidebar_sections(area);
     if ws_area == Rect::default() {
@@ -989,18 +986,13 @@ pub(super) fn render_sidebar(
         .buffer_mut()
         .set_style(area, Style::default().bg(p.sidebar_bg));
     let is_navigating = matches!(app.mode, Mode::Navigate);
-    let sep_style = if is_navigating {
-        Style::default().fg(p.accent)
-    } else {
-        Style::default().fg(p.surface_dim)
-    };
-
-    let sep_x = area.x + area.width.saturating_sub(1);
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        buf[(sep_x, y)].set_symbol("│");
-        buf[(sep_x, y)].set_style(sep_style);
-    }
+    render_panel_separator(
+        frame,
+        area,
+        area.x + area.width.saturating_sub(1),
+        is_navigating,
+        p,
+    );
 
     let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
 
