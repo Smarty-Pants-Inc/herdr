@@ -13,7 +13,7 @@ use super::panes::{
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
-    PluginPaneInfo,
+    PluginPaneInfo, PluginWorkspacePaneInfo,
 };
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
@@ -260,6 +260,12 @@ pub enum ResponseResult {
     },
     PluginPaneFocused {
         plugin_pane: PluginPaneInfo,
+    },
+    PluginWorkspacePaneOpened {
+        plugin_pane: PluginWorkspacePaneInfo,
+    },
+    PluginWorkspacePaneFocused {
+        plugin_pane: PluginWorkspacePaneInfo,
     },
     PluginPaneClosed {
         pane_id: String,

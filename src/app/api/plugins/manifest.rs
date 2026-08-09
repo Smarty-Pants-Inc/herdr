@@ -422,12 +422,16 @@ fn normalize_manifest_pane(
         .filter(|description| !description.is_empty());
     let platforms = normalize_platforms(pane.platforms)?;
     let command = normalize_command(pane.command)?;
-    if pane.placement != PluginPanePlacement::Popup
-        && (pane.width.is_some() || pane.height.is_some())
-    {
+    let invalid_size = match pane.placement {
+        PluginPanePlacement::Popup => false,
+        PluginPanePlacement::WorkspaceRight => pane.height.is_some(),
+        _ => pane.width.is_some() || pane.height.is_some(),
+    };
+    if invalid_size {
         return Err((
             "invalid_plugin_pane_size",
-            "pane width and height are only supported when placement is popup".to_string(),
+            "pane width is supported for popup and workspace_right placements; height is popup-only"
+                .to_string(),
         ));
     }
     Ok(PluginManifestPane {
