@@ -392,6 +392,9 @@ impl PaneTerminal {
     pub fn input_state(&self) -> Option<InputState> {
         self.ghostty.input_state()
     }
+    pub fn alternate_screen(&self) -> Option<bool> {
+        self.ghostty.alternate_screen()
+    }
 
     pub fn keyboard_report_all_requested(&self) -> bool {
         self.ghostty.keyboard_report_all_requested()
@@ -1803,6 +1806,10 @@ impl GhosttyPaneTerminal {
                 .mode_get(crate::ghostty::MODE_COLOR_SCHEME_REPORT)
                 .ok()?,
         })
+    }
+    pub fn alternate_screen(&self) -> Option<bool> {
+        let core = self.core.lock().ok()?;
+        Some(core.terminal.active_screen().ok()? == crate::ghostty::ActiveScreen::Alternate)
     }
 
     pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
