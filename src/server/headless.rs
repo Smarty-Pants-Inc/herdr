@@ -589,6 +589,7 @@ impl HeadlessServer {
                 needs_render = true;
                 crate::render_prof::event("render.request.signal");
             }
+
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
             if self.drain_internal_events_with_forwarding() {
