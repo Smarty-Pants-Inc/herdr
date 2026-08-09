@@ -409,7 +409,27 @@ pub(crate) fn focused_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> Option<CursorState> {
-    crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
+    workspace_plugin_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
+        crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
+    })
+}
+
+fn workspace_plugin_terminal_cursor(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> Option<CursorState> {
+    let (_, pane) = app_state.focused_workspace_plugin_pane()?;
+    let runtime = terminal_runtimes.get(&pane.terminal_id)?;
+    if runtime.synchronized_output_active() {
+        return None;
+    }
+    let cursor = runtime.cursor_state(app_state.view.workspace_plugin_pane_inner, true)?;
+    Some(CursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+        shape: cursor.shape,
+    })
 }
 
 fn focused_terminal_owns_host_cursor(
@@ -418,6 +438,9 @@ fn focused_terminal_owns_host_cursor(
 ) -> bool {
     if app_state.mode != Mode::Terminal {
         return false;
+    }
+    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
+        return terminal_runtimes.get(&pane.terminal_id).is_some();
     }
 
     let Some(ws_idx) = app_state.active else {
@@ -446,6 +469,11 @@ fn focused_terminal_suppresses_host_cursor(
 ) -> bool {
     if app_state.mode != Mode::Terminal {
         return false;
+    }
+    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
+        return terminal_runtimes
+            .get(&pane.terminal_id)
+            .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active);
     }
 
     let Some(ws_idx) = app_state.active else {

@@ -3528,6 +3528,7 @@
           "enum": [
             "overlay",
             "popup",
+            "workspace_right",
             "split",
             "tab",
             "zoomed"
@@ -8542,6 +8543,7 @@
           "enum": [
             "overlay",
             "popup",
+            "workspace_right",
             "split",
             "tab",
             "zoomed"
@@ -8615,6 +8617,37 @@
             "github"
           ],
           "type": "string"
+        },
+        "PluginWorkspacePaneInfo": {
+          "properties": {
+            "entrypoint": {
+              "type": "string"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "plugin_id",
+            "entrypoint",
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "focused"
+          ],
+          "type": "object"
         },
         "PopupSize": {
           "oneOf": [
@@ -9760,6 +9793,38 @@
                 },
                 "type": {
                   "const": "plugin_pane_focused",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "plugin_pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "plugin_pane": {
+                  "$ref": "#/schemas/success_response/$defs/PluginWorkspacePaneInfo"
+                },
+                "type": {
+                  "const": "plugin_workspace_pane_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "plugin_pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "plugin_pane": {
+                  "$ref": "#/schemas/success_response/$defs/PluginWorkspacePaneInfo"
+                },
+                "type": {
+                  "const": "plugin_workspace_pane_focused",
                   "type": "string"
                 }
               },
