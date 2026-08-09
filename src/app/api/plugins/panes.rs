@@ -41,6 +41,86 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn open_plugin_workspace_right_pane(
+        &mut self,
+        id: String,
+        params: PluginPaneOpenParams,
+        plugin: &InstalledPluginInfo,
+        pane: PluginManifestPane,
+    ) -> String {
+        let ws_idx = match params.workspace_id.as_deref() {
+            Some(workspace_id) => match self.parse_workspace_id(workspace_id) {
+                Some(ws_idx) => ws_idx,
+                None => return encode_error(id, "workspace_not_found", "workspace not found"),
+            },
+            None => match self.state.active {
+                Some(ws_idx) => ws_idx,
+                None => return encode_error(id, "no_active_workspace", "no active workspace"),
+            },
+        };
+        let workspace_id = self.public_workspace_id(ws_idx);
+        if let Some(existing) = self.workspace_plugin_pane_info(&workspace_id) {
+            if existing.plugin_id != plugin.plugin_id || existing.entrypoint != pane.id {
+                return encode_error(
+                    id,
+                    "workspace_plugin_pane_exists",
+                    "workspace already has a right plugin pane",
+                );
+            }
+            let plugin_pane = if params.focus {
+                self.focus_workspace_plugin_pane(&existing.pane_id)
+                    .unwrap_or(existing)
+            } else {
+                existing
+            };
+            return encode_success(
+                id,
+                ResponseResult::PluginWorkspacePaneOpened { plugin_pane },
+            );
+        }
+        let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
+        let extra_env =
+            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+                Ok(env) => env,
+                Err((code, message)) => return encode_error(id, &code, message),
+            };
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
+        let width = params.width.or(pane.width);
+        if let Err(err) = self.spawn_workspace_plugin_argv_command(
+            workspace_id.clone(),
+            plugin.plugin_id.clone(),
+            pane.id.clone(),
+            &pane.command,
+            cwd,
+            extra_env,
+            width,
+            params.focus,
+        ) {
+            return encode_error(id, "plugin_pane_open_failed", err.to_string());
+        }
+        if let Some(terminal_id) = self
+            .state
+            .workspace_plugin_panes
+            .get(&workspace_id)
+            .map(|state| state.terminal_id.clone())
+        {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.set_manual_label(pane.title);
+            }
+        }
+        let Some(plugin_pane) = self.workspace_plugin_pane_info(&workspace_id) else {
+            return encode_error(
+                id,
+                "plugin_pane_open_failed",
+                "workspace plugin pane disappeared",
+            );
+        };
+        encode_success(
+            id,
+            ResponseResult::PluginWorkspacePaneOpened { plugin_pane },
+        )
+    }
+
     pub(super) fn open_plugin_overlay_pane(
         &mut self,
         id: String,
@@ -243,6 +323,7 @@ impl App {
             .map_err(|err| ("plugin_user_dir_create_failed".to_string(), err.to_string()))?;
         env.retain(|(key, _)| !plugin_pane_protected_env_key(key));
         env.extend(super::env::plugin_path_env(plugin));
+        env.extend(plugin_theme_env(&self.state.palette));
         env.push((
             crate::api::SOCKET_PATH_ENV_VAR.to_string(),
             crate::api::socket_path().display().to_string(),
@@ -338,16 +419,68 @@ impl App {
 }
 
 fn plugin_pane_protected_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        crate::api::SOCKET_PATH_ENV_VAR
-            | "HERDR_ENV"
-            | "HERDR_PLUGIN_ID"
-            | "HERDR_PLUGIN_ROOT"
-            | "HERDR_PLUGIN_CONFIG_DIR"
-            | "HERDR_PLUGIN_STATE_DIR"
-            | "HERDR_PLUGIN_ENTRYPOINT_ID"
-            | "HERDR_PLUGIN_CONTEXT_JSON"
-            | "HERDR_BIN_PATH"
-    )
+    key.starts_with("HERDR_THEME_")
+        || matches!(
+            key,
+            crate::api::SOCKET_PATH_ENV_VAR
+                | "HERDR_ENV"
+                | "HERDR_PLUGIN_ID"
+                | "HERDR_PLUGIN_ROOT"
+                | "HERDR_PLUGIN_CONFIG_DIR"
+                | "HERDR_PLUGIN_STATE_DIR"
+                | "HERDR_PLUGIN_ENTRYPOINT_ID"
+                | "HERDR_PLUGIN_CONTEXT_JSON"
+                | "HERDR_BIN_PATH"
+        )
+}
+
+fn plugin_theme_env(palette: &crate::app::state::Palette) -> Vec<(String, String)> {
+    [
+        ("HERDR_THEME_ACCENT", palette.accent),
+        ("HERDR_THEME_PANEL_BG", palette.panel_bg),
+        ("HERDR_THEME_SIDEBAR_BG", palette.sidebar_bg),
+        ("HERDR_THEME_SURFACE0", palette.surface0),
+        ("HERDR_THEME_SURFACE1", palette.surface1),
+        ("HERDR_THEME_SURFACE_DIM", palette.surface_dim),
+        ("HERDR_THEME_OVERLAY0", palette.overlay0),
+        ("HERDR_THEME_OVERLAY1", palette.overlay1),
+        ("HERDR_THEME_TEXT", palette.text),
+        ("HERDR_THEME_SUBTEXT0", palette.subtext0),
+        ("HERDR_THEME_MAUVE", palette.mauve),
+        ("HERDR_THEME_GREEN", palette.green),
+        ("HERDR_THEME_YELLOW", palette.yellow),
+        ("HERDR_THEME_RED", palette.red),
+        ("HERDR_THEME_BLUE", palette.blue),
+        ("HERDR_THEME_TEAL", palette.teal),
+        ("HERDR_THEME_PEACH", palette.peach),
+    ]
+    .into_iter()
+    .map(|(key, color)| (key.to_string(), plugin_theme_color(color)))
+    .collect()
+}
+
+fn plugin_theme_color(color: ratatui::style::Color) -> String {
+    use ratatui::style::Color;
+
+    match color {
+        Color::Reset => "reset".to_string(),
+        Color::Black => "black".to_string(),
+        Color::Red => "red".to_string(),
+        Color::Green => "green".to_string(),
+        Color::Yellow => "yellow".to_string(),
+        Color::Blue => "blue".to_string(),
+        Color::Magenta => "magenta".to_string(),
+        Color::Cyan => "cyan".to_string(),
+        Color::Gray => "gray".to_string(),
+        Color::DarkGray => "darkgray".to_string(),
+        Color::LightRed => "lightred".to_string(),
+        Color::LightGreen => "lightgreen".to_string(),
+        Color::LightYellow => "lightyellow".to_string(),
+        Color::LightBlue => "lightblue".to_string(),
+        Color::LightMagenta => "lightmagenta".to_string(),
+        Color::LightCyan => "lightcyan".to_string(),
+        Color::White => "white".to_string(),
+        Color::Indexed(index) => format!("indexed:{index}"),
+        Color::Rgb(red, green, blue) => format!("#{red:02x}{green:02x}{blue:02x}"),
+    }
 }
