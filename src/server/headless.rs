@@ -2967,7 +2967,7 @@ impl HeadlessServer {
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
-        self.app.route_client_events_from(client_id, events, false);
+        let terminal_forward_only = self.app.route_client_events_from(client_id, events, false);
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
@@ -2992,7 +2992,9 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || (interaction && !render_neutral_mouse_motion)
+            foreground_changed
+                || theme_changed
+                || (interaction && !render_neutral_mouse_motion && !terminal_forward_only)
         }
     }
 
@@ -8483,7 +8485,7 @@ next_tab = ""
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
 
-        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
             client_id: 1,
             events: vec![crate::protocol::ClientInputEvent::Key {
                 code: crate::protocol::ClientKeyCode::Char('j'),
@@ -8665,6 +8667,69 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn forwarded_terminal_keys_skip_full_render_unless_local_view_changes() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded terminal key"),
+            Bytes::from_static(b"x")
+        );
+
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        server.app.state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('y'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(server.app.state.selection.is_none());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded key after selection clear"),
+            Bytes::from_static(b"y")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        assert!(matches!(
+            input_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn passive_mouse_motion_forwards_without_requesting_render() {
         let mut server = test_headless_server();
         let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1003h\x1b[?1006h");
@@ -8756,8 +8821,9 @@ next_tab = ""
         server: &mut HeadlessServer,
         terminal_bytes: &[u8],
     ) -> tokio::sync::mpsc::Receiver<Bytes> {
-        let mut workspace = crate::workspace::Workspace::test_new("focus-reporting");
+        let workspace = crate::workspace::Workspace::test_new("focus-reporting");
         let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
         let (runtime, input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -8766,11 +8832,11 @@ next_tab = ""
                 terminal_bytes,
                 4,
             );
-        workspace.insert_test_runtime(pane_id, runtime);
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
         input_rx
     }
 
