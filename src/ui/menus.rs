@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
@@ -19,24 +19,37 @@ fn keybind_label(bindings: &crate::config::ActionKeybinds) -> String {
     bindings.label().unwrap_or_else(|| "unset".to_string())
 }
 
-fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: ratatui::style::Color) {
-    frame.render_widget(Clear, area);
+fn bottom_bar_styles(app: &AppState, mode_bg: Color) -> (Style, Style, Style) {
+    (
+        Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+        Style::default().fg(app.palette.overlay0),
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(mode_bg)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: Color) -> Rect {
+    let bar = Rect::new(
+        area.x,
+        area.y.saturating_add(area.height.saturating_sub(1)),
+        area.width,
+        1,
+    );
+    frame.render_widget(Clear, bar);
     let buf = frame.buffer_mut();
-    for x in area.x..area.x + area.width {
-        buf[(x, area.y)].set_style(Style::default().bg(bg));
+    for x in bar.x..bar.x.saturating_add(bar.width) {
+        buf[(x, bar.y)].set_style(Style::default().bg(bg));
     }
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(line), bar);
+    bar
 }
 
 pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let key = Style::default()
-        .fg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(app.palette.overlay0);
-    let mode_style = Style::default()
-        .fg(panel_contrast_fg(&app.palette))
-        .bg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
+    let (key, dim, mode_style) = bottom_bar_styles(app, app.palette.accent);
 
     let workspace_picker = prefix_rhs_label(&app.keybinds.workspace_picker);
     let help = prefix_rhs_label(&app.keybinds.help);
@@ -55,20 +68,11 @@ pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rec
         Span::styled(" keybinds", dim),
     ]);
 
-    let overlay_y = area.y + area.height.saturating_sub(1);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
-    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
+    render_bottom_bar(frame, area, line, app.palette.panel_bg);
 }
 
 pub(super) fn render_copy_mode_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let key = Style::default()
-        .fg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(app.palette.overlay0);
-    let mode_style = Style::default()
-        .fg(panel_contrast_fg(&app.palette))
-        .bg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
+    let (key, dim, mode_style) = bottom_bar_styles(app, app.palette.accent);
 
     let Some(copy_mode) = app.copy_mode.as_ref() else {
         return;
@@ -122,21 +126,11 @@ pub(super) fn render_copy_mode_overlay(app: &AppState, frame: &mut Frame, area: 
         ])
     };
 
-    let overlay_y = area.y + area.height.saturating_sub(1);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
-    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
+    render_bottom_bar(frame, area, line, app.palette.panel_bg);
 }
 
 pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let key = Style::default()
-        .fg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(app.palette.overlay0);
-
-    let mode_style = Style::default()
-        .fg(panel_contrast_fg(&app.palette))
-        .bg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
+    let (key, dim, mode_style) = bottom_bar_styles(app, app.palette.accent);
 
     let kb = &app.keybinds;
     let new_tab = prefix_rhs_label(&kb.new_tab);
@@ -185,9 +179,7 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
         Span::styled(" detach", dim),
     ]);
 
-    let overlay_y = area.y + area.height.saturating_sub(1);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
-    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
+    let overlay_area = render_bottom_bar(frame, area, line, app.palette.panel_bg);
 
     if app.update_available.is_some() {
         let status = Line::from(vec![Span::styled(
@@ -209,6 +201,27 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
             status_area,
         );
     }
+}
+
+pub(super) fn render_workspace_plugin_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let (key, dim, mode_style) = bottom_bar_styles(app, app.palette.accent);
+    let prefix = crate::config::format_key_combo((app.prefix_code, app.prefix_mods));
+    let line = Line::from(vec![
+        Span::styled(" EXPLORER ", mode_style),
+        Span::raw(" "),
+        Span::styled("esc", key),
+        Span::styled(" back  ", dim),
+        Span::styled(prefix, key),
+        Span::styled(" back  ", dim),
+        Span::styled("↑↓/jk", key),
+        Span::styled(" move  ", dim),
+        Span::styled("←→/hl", key),
+        Span::styled(" tree  ", dim),
+        Span::styled("enter", key),
+        Span::styled(" open", dim),
+    ]);
+
+    render_bottom_bar(frame, area, line, app.palette.panel_bg);
 }
 
 pub(super) fn render_global_launcher_menu(app: &AppState, frame: &mut Frame) {
@@ -257,15 +270,7 @@ pub(super) fn render_global_launcher_menu(app: &AppState, frame: &mut Frame) {
 }
 
 pub(super) fn render_resize_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
-    let key = Style::default()
-        .fg(app.palette.accent)
-        .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(app.palette.overlay0);
-
-    let mode_style = Style::default()
-        .fg(panel_contrast_fg(&app.palette))
-        .bg(app.palette.mauve)
-        .add_modifier(Modifier::BOLD);
+    let (key, dim, mode_style) = bottom_bar_styles(app, app.palette.mauve);
 
     let line = Line::from(vec![
         Span::styled(" RESIZE ", mode_style),
@@ -278,9 +283,7 @@ pub(super) fn render_resize_overlay(app: &AppState, frame: &mut Frame, area: Rec
         Span::styled(" done", dim),
     ]);
 
-    let overlay_y = area.y + area.height.saturating_sub(1);
-    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
-    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
+    render_bottom_bar(frame, area, line, app.palette.panel_bg);
 }
 
 pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
@@ -312,4 +315,27 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
         .highlight_symbol(" ");
     let mut state = ListState::default().with_selected(Some(menu.list.highlighted));
     frame.render_stateful_widget(list, inner, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn workspace_plugin_footer_lists_escape_back() {
+        let app = AppState::test_new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+
+        terminal
+            .draw(|frame| render_workspace_plugin_overlay(&app, frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(text.contains("esc back"), "{text}");
+    }
 }

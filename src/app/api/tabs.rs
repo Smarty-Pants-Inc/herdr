@@ -114,7 +114,8 @@ impl App {
                     }
                 }
                 if focus {
-                    self.state.switch_workspace_tab(ws_idx, tab_idx);
+                    let root_pane = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+                    self.state.focus_pane_in_workspace(ws_idx, root_pane);
                     self.state.mode = Mode::Terminal;
                 }
                 self.schedule_session_save();
@@ -133,7 +134,9 @@ impl App {
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
             return tab_not_found(id, &target.tab_id);
         };
-        self.state.switch_workspace_tab(ws_idx, tab_idx);
+        let root_pane = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+        self.state.focus_pane_in_workspace(ws_idx, root_pane);
+        self.state.mode = Mode::Terminal;
         let tab = self.tab_info(ws_idx, tab_idx).unwrap();
 
         encode_success(id, ResponseResult::TabInfo { tab })
@@ -496,5 +499,43 @@ mod tests {
             crate::worktree::canonical_or_original(&cached_cwd)
         );
         shutdown_test_runtimes(&mut app);
+    }
+    #[test]
+    fn tab_focus_transfers_focus_from_workspace_plugin_pane() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
+        let mut workspace = Workspace::test_new("tabs");
+        let second_tab = workspace.test_add_tab(None);
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        let tab_id = app.public_tab_id(0, second_tab).unwrap();
+
+        let response = app.handle_tab_focus("req".into(), TabTarget { tab_id });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::TabInfo { .. }));
+        assert_eq!(app.state.workspaces[0].active_tab_index(), second_tab);
+        assert!(
+            !app.state
+                .workspace_plugin_panes
+                .get(&workspace_id)
+                .unwrap()
+                .focused
+        );
     }
 }
