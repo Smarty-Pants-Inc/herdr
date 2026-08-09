@@ -946,6 +946,7 @@ impl App {
             if self.render_dirty.is_pending() {
                 needs_render = true;
             }
+
             // Drain a bounded internal-event batch for responsiveness. API handlers
             // perform an exhaustive drain before reading pane/runtime state.
             if self.drain_internal_events() {
