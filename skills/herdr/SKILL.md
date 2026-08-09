@@ -25,23 +25,25 @@ The installed binary is the authority for command syntax. Start with:
 herdr --help
 ```
 
-Then print the relevant command group by running the group without a subcommand:
+Then inspect the relevant command group with `--help`:
 
 ```bash
-herdr agent
-herdr pane
-herdr workspace
-herdr tab
-herdr worktree
-herdr terminal
-herdr notification
-herdr integration
-herdr session
+herdr agent --help
+herdr pane --help
+herdr workspace --help
+herdr tab --help
+herdr worktree --help
+herdr terminal --help
+herdr notification --help
+herdr integration --help
+herdr session --help
 ```
 
-Do not run bare `herdr` for discovery; it launches or attaches the TUI. Do not probe a mutating nested command by omitting arguments. Commands such as `herdr workspace create` are valid with defaults and will execute.
+Do not run bare `herdr` for discovery; it launches or attaches the TUI. Do not run a command group without `--help`: current Herdr prints usage but exits with status 2, which automation surfaces as an error. Do not probe a mutating nested command by omitting arguments. Commands such as `herdr workspace create` are valid with defaults and will execute.
 
 Most control commands return JSON. Read identifiers and state from those responses instead of predicting them.
+
+Before starting or resuming a supported agent, run `herdr integration status`. If the target integration is missing or outdated, report that state and update it with `herdr integration install <kind>` only when authorized; then recheck status before relying on lifecycle or session metadata.
 
 ## Understand layout, panes, and agents
 
@@ -87,6 +89,12 @@ herdr agent list
 
 Creation responses expose the IDs to use next. `workspace create` returns `.result.workspace`, `.result.tab`, and `.result.root_pane`. `tab create` returns `.result.tab` and `.result.root_pane`. `pane split` returns the new pane as `.result.pane`.
 
+`worktree open` resolves the owning repository from caller context. When the caller is itself in a linked worktree, pass the main checkout explicitly with `--cwd /absolute/main-checkout` or an already-open parent workspace with `--workspace <id>`; changing the shell's directory or relaunching Herdr is not required:
+
+```bash
+herdr worktree open --cwd /absolute/main-checkout --path /absolute/existing-worktree --label <label> --no-focus
+```
+
 ## Start and coordinate an agent
 
 Default to a sibling pane in the current tab and the current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.
@@ -111,13 +119,37 @@ An available shell pane must be at its interactive prompt, with the shell itself
 herdr agent start reviewer --kind codex --pane <returned-pane-id>
 ```
 
-Use the kind requested by the user. Run `herdr agent` to inspect the installed kind list and options. Pass native agent arguments only after `--`:
+Use the kind requested by the user. Run `herdr agent --help` to inspect the installed kind list and options. Pass native agent arguments only after `--`:
 
 ```bash
 herdr agent start reviewer --kind codex --pane <returned-pane-id> -- <agent-args...>
 ```
 
 `agent start` returns only after Herdr detects the expected agent in the same pane and considers it ready for interactive input. It defaults to a 30-second startup timeout.
+
+### Resume an existing OMP session
+
+For a terminal-manager migration, use the exact absolute OMP session JSONL path instead of `--continue`, an ID prefix, or the interactive picker. CWD aliases and historical sessions can otherwise select the wrong conversation.
+
+1. Verify the session header's `cwd` and a recent transcript marker against the source terminal. If the checkout moved or was renamed, verify that equivalence explicitly and pass the destination with `--cwd`.
+2. Gracefully exit the source OMP process and confirm it stopped. Never run two OMP processes against the same session file.
+3. Start the resumed session in the destination pane:
+
+```bash
+herdr agent start <name> --kind omp --pane <pane-id> -- --resume /absolute/path/to/session.jsonl --cwd /absolute/destination/worktree
+```
+
+If multiple source processes share one JSONL but hold distinct in-memory branches, do not resume the shared path twice. Quiesce them one at a time, append a unique handoff marker, then run `/fork` inside that source OMP process before `/exit`. Source-side `/fork` atomically writes the exact in-memory branch to a new session file, even if a sibling process replaced the original path and left this process writing an unlinked inode. Record the `Session forked to ...` path and resume that new file in Herdr with `--resume`.
+
+If a source process is already gone and the remaining on-disk shared file is verified to represent that branch, ensure no process has it open, then use Herdr `--fork` once for that branch:
+
+```bash
+herdr agent start <name> --kind omp --pane <pane-id> -- --fork /absolute/path/to/shared-session.jsonl --cwd /absolute/destination/worktree
+```
+
+Verify every destination session path differs from the shared source and from the other branches before migrating the next one.
+
+4. Verify `herdr agent get <name>` reports the expected session path, then read the agent and confirm its transcript marker before treating the migration as complete.
 
 Submit work through the agent surface:
 

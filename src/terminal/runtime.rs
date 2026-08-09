@@ -319,6 +319,9 @@ impl TerminalRuntime {
     pub fn input_state(&self) -> Option<crate::pane::InputState> {
         self.0.input_state()
     }
+    pub fn alternate_screen(&self) -> Option<bool> {
+        self.0.alternate_screen()
+    }
 
     /// Reads only whether the alternate screen is active.
     pub fn alternate_screen_active(&self) -> bool {

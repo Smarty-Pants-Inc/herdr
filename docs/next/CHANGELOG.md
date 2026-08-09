@@ -14,6 +14,7 @@
 - `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.
 - Settings and `ui.status_indicators = "symbols"` can now use distinct static shapes for blocked, working, done, idle, and unknown agent states. (#2260)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+- Workspace-right plugin panes can collapse to a one-cell sidebar control, use borderless sidebar chrome, and receive the active palette through protected `HERDR_THEME_*` environment variables.
 
 ### Changed
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding.

@@ -858,10 +858,16 @@ fn plugin_command() -> Command {
                         .about("Open a plugin pane")
                         .arg(option("plugin", "ID"))
                         .arg(option("entrypoint", "ID"))
-                        .arg(
-                            option("placement", "PLACEMENT")
-                                .value_parser(["overlay", "split", "tab", "zoomed"]),
-                        )
+                        .arg(option("placement", "PLACEMENT").value_parser([
+                            "overlay",
+                            "popup",
+                            "workspace-right",
+                            "split",
+                            "tab",
+                            "zoomed",
+                        ]))
+                        .arg(option("width", "SIZE"))
+                        .arg(option("height", "SIZE"))
                         .arg(option("workspace", "ID"))
                         .arg(option("target-pane", "PANE"))
                         .arg(split_direction_option())
@@ -1223,7 +1229,9 @@ mod tests {
         assert!(open
             .get_arguments()
             .any(|arg| arg.get_long() == Some("entrypoint")));
-        assert!(option_values(open, "placement").contains(&"zoomed".to_string()));
+        assert!(option_values(open, "placement").contains(&"workspace-right".to_string()));
+        assert!(has_option(open, "width"));
+        assert!(has_option(open, "height"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
 mod window_title;
+pub(crate) mod workspace_plugin_pane;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -596,6 +597,8 @@ impl App {
                 tab_scroll_right_hit_area: Rect::default(),
                 new_tab_hit_area: Rect::default(),
                 terminal_area: Rect::default(),
+                workspace_plugin_pane_outer: Rect::default(),
+                workspace_plugin_pane_inner: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
@@ -688,6 +691,7 @@ impl App {
             integration_install_messages: Vec::new(),
             installed_plugins: load_plugin_registry(no_session),
             plugin_panes: std::collections::HashMap::new(),
+            workspace_plugin_panes: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
@@ -3821,6 +3825,63 @@ mod tests {
             input_rx.recv().await.expect("forwarded focus lost report"),
             bytes::Bytes::from_static(b"\x1b[O")
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_plugin_prefix_cancels_explorer_selection() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("plugin-focus-reporting");
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 38, 22);
+
+        let pane_id = crate::layout::PaneId::alloc();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                38,
+                22,
+                0,
+                b"\x1b[?1004h",
+                4,
+            );
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id,
+                terminal_id,
+                plugin_id: "example.focus".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        app.sync_focus_events();
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[I")
+        );
+
+        app.handle_key(crate::input::TerminalKey::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
+        app.sync_focus_events();
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(!app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert_eq!(
+            input_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[O")
+        );
+        assert!(input_rx.try_recv().is_err());
     }
 
     #[tokio::test]

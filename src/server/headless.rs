@@ -1230,7 +1230,10 @@ impl HeadlessServer {
         for ws in &self.app.state.workspaces {
             for tab in &ws.tabs {
                 for (pane_id, pane) in &tab.panes {
-                    pane_by_terminal.insert(pane.attached_terminal_id.clone(), pane_id.raw());
+                    pane_by_terminal.insert(
+                        pane.attached_terminal_id.clone(),
+                        (pane_id.raw(), pane.seen),
+                    );
                 }
             }
         }
@@ -1273,16 +1276,15 @@ impl HeadlessServer {
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
-            let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
+            let Some((pane_id, seen)) = pane_by_terminal.get(terminal_id).copied() else {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            handoff_runtime.agent_state = terminal
+                .map(|terminal| crate::handoff_runtime::HandoffAgentState::capture(terminal, seen));
+            let has_agent_session =
+                terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
             if !has_agent_session {
                 handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             }
@@ -4266,6 +4268,7 @@ impl HeadlessServer {
 
     fn retained_pty_update_allowed_by_app_state(&self) -> bool {
         self.app.state.mode == app::Mode::Terminal
+            && self.app.state.focused_workspace_plugin_pane().is_none()
             && self.app.state.popup_pane.is_none()
             && self.app.state.selection.is_none()
             && self.app.state.copy_mode.is_none()
@@ -5269,6 +5272,37 @@ mod tests {
             }),
             RetainedRenderPlan::HiddenPty
         );
+    }
+
+    #[test]
+    fn retained_pty_update_disables_workspace_plugin_footer_overlay() {
+        let mut server = test_headless_server();
+        server.app.state.mode = app::Mode::Navigate;
+        assert!(!server.retained_pty_update_allowed_by_app_state());
+
+        server.app.state.mode = app::Mode::Terminal;
+        assert!(server.retained_pty_update_allowed_by_app_state());
+
+        let workspace = crate::workspace::Workspace::test_new("retained-plugin-footer");
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        server.app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 20, 20);
+        server.app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        assert!(!server.retained_pty_update_allowed_by_app_state());
     }
 
     fn test_headless_server() -> HeadlessServer {
