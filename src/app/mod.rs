@@ -1681,18 +1681,48 @@ impl App {
         }
     }
 
+    fn terminal_forwarding_preserves_view(&self) -> bool {
+        if self.state.popup_pane.is_some()
+            || self.state.selection.is_some()
+            || self.state.selection_autoscroll.is_some()
+            || self.selection_autoscroll_deadline.is_some()
+        {
+            return false;
+        }
+
+        let runtime = if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            runtime
+        } else {
+            let Some(ws_idx) = self.state.active else {
+                return false;
+            };
+            let Some(runtime) = self
+                .state
+                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            else {
+                return false;
+            };
+            runtime
+        };
+        runtime
+            .scroll_metrics()
+            .is_none_or(|metrics| metrics.offset_from_bottom == 0)
+    }
+
     fn execute_repeat_plan_headless(
         &mut self,
         source_id: InputSourceId,
         lease_key: input::InputLeaseKey,
         key: crate::input::TerminalKey,
         plan: input::RepeatPlan,
-    ) {
+    ) -> bool {
         match plan {
             input::RepeatPlan::Forwarded(target) => {
-                if !self.forward_terminal_key_to_target_headless(&target, key) {
+                let forwarded = self.forward_terminal_key_to_target_headless(&target, key);
+                if !forwarded {
                     self.input_leases.remove(&lease_key);
                 }
+                forwarded
             }
             input::RepeatPlan::Reprocess {
                 context,
@@ -1733,8 +1763,9 @@ impl App {
                         }
                     }
                 }
+                false
             }
-            input::RepeatPlan::Ignore => {}
+            input::RepeatPlan::Ignore => false,
         }
     }
 
@@ -1789,9 +1820,15 @@ impl App {
         source_id: InputSourceId,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
-    ) {
+    ) -> bool {
+        let mut terminal_forward_only = !events.is_empty()
+            && events
+                .iter()
+                .all(|event| matches!(event, crate::raw_input::RawInputEvent::Key(_)))
+            && self.terminal_forwarding_preserves_view();
         for event in events {
             let previous_mode = self.state.mode;
+            let mut event_forwarded = false;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
                     let lease_key = input::InputLeaseKey::new(source_id, &key);
@@ -1805,6 +1842,7 @@ impl App {
                                 self.handle_non_terminal_key_headless(key.clone());
                                 None
                             };
+                            event_forwarded = target.is_some();
                             let resulting_context = self.terminal_input_context();
                             let plan = self.input_leases.complete_press(
                                 lease_key,
@@ -1822,11 +1860,12 @@ impl App {
                                 &key,
                                 current_context.as_ref(),
                             );
-                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            event_forwarded =
+                                self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
                         }
                         crossterm::event::KeyEventKind::Release => {
                             if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                                let _ = self
+                                event_forwarded = self
                                     .forward_terminal_key_to_target_headless(&lease.target, key);
                             }
                         }
@@ -1888,8 +1927,10 @@ impl App {
                 crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => {}
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
+            terminal_forward_only &= event_forwarded;
             self.sync_prefix_input_source(previous_mode);
         }
+        terminal_forward_only
     }
 
     pub(crate) fn clear_input_source(&mut self, source_id: InputSourceId) {
