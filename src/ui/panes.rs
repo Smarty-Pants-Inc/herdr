@@ -10,7 +10,7 @@ use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
 #[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
-use super::widgets::panel_contrast_fg;
+use super::widgets::{panel_contrast_fg, render_panel_separator};
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
 use crate::layout::PaneInfo;
@@ -439,6 +439,110 @@ pub(super) fn resize_popup_pane(
             inner.width,
             cell_size.width_px,
             cell_size.height_px,
+        );
+    }
+}
+
+pub(super) fn resize_workspace_plugin_pane(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    inner: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    if inner.is_empty() {
+        return;
+    }
+    let Some((_, pane)) = app.active_workspace_plugin_pane() else {
+        return;
+    };
+    if app.direct_attach_resize_locks.contains(&pane.terminal_id) {
+        return;
+    }
+    if let Some(runtime) = terminal_runtimes.get(&pane.terminal_id) {
+        runtime.resize(
+            inner.height,
+            inner.width,
+            cell_size.width_px,
+            cell_size.height_px,
+        );
+    }
+}
+
+pub(crate) fn workspace_plugin_pane_toggle_rect(outer: Rect) -> Rect {
+    if outer.is_empty() {
+        return Rect::default();
+    }
+    Rect::new(
+        outer.x,
+        outer.y.saturating_add(outer.height.saturating_sub(1)),
+        1,
+        1,
+    )
+}
+
+pub(super) fn render_workspace_plugin_pane(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
+    let outer = app.view.workspace_plugin_pane_outer;
+    let inner = app.view.workspace_plugin_pane_inner;
+    if outer.is_empty() {
+        return;
+    }
+    let Some((_, pane)) = app.active_workspace_plugin_pane() else {
+        return;
+    };
+
+    frame.render_widget(Clear, outer);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(app.palette.sidebar_bg)),
+        outer,
+    );
+    let input_active = pane.focused && app.mode == crate::app::Mode::Terminal;
+    render_panel_separator(frame, outer, outer.x, input_active, &app.palette);
+    let toggle = workspace_plugin_pane_toggle_rect(outer);
+    if !toggle.is_empty() {
+        frame.buffer_mut()[(toggle.x, toggle.y)]
+            .set_symbol(if pane.collapsed { "«" } else { "»" })
+            .set_style(
+                Style::default()
+                    .fg(app.palette.overlay0)
+                    .bg(app.palette.sidebar_bg),
+            );
+    }
+    if inner.y > outer.y {
+        if let Some(title) = app
+            .terminals
+            .get(&pane.terminal_id)
+            .and_then(|terminal| terminal.manual_label.as_deref())
+        {
+            let title_area = Rect::new(
+                inner.x.saturating_add(1),
+                outer.y,
+                inner.width.saturating_sub(1),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(title).style(
+                    Style::default()
+                        .fg(app.palette.overlay0)
+                        .bg(app.palette.sidebar_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                title_area,
+            );
+        }
+    }
+
+    if let Some(runtime) = (!inner.is_empty())
+        .then(|| terminal_runtimes.get(&pane.terminal_id))
+        .flatten()
+    {
+        runtime.render(
+            frame,
+            inner,
+            input_active && !pane_is_scrolled_back(runtime),
         );
     }
 }
@@ -1603,5 +1707,79 @@ mod tests {
             panic!("selection background should resolve to rgb");
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
+    }
+    #[tokio::test]
+    async fn workspace_plugin_pane_matches_sidebar_chrome() {
+        let mut app = AppState::test_new();
+        let workspace = Workspace::test_new("plugin-render");
+        let workspace_id = workspace.id.clone();
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.palette.sidebar_bg = Color::Rgb(1, 2, 3);
+        app.palette.overlay0 = Color::Rgb(4, 5, 6);
+        app.view.workspace_plugin_pane_outer = Rect::new(4, 0, 8, 4);
+        app.view.workspace_plugin_pane_inner = Rect::new(5, 1, 7, 3);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        app.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: PaneId::alloc(),
+                terminal_id: terminal_id.clone(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(8)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.set_manual_label("explorer".into());
+        app.terminals.insert(terminal_id.clone(), terminal_state);
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        runtimes.insert(
+            terminal_id,
+            TerminalRuntime::test_with_screen_bytes(7, 3, b"tree"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 4)).unwrap();
+
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(4, 0)].symbol(), "│");
+        assert_eq!(buffer[(4, 0)].style().fg, Some(app.palette.surface_dim));
+        assert_eq!(buffer[(4, 0)].style().bg, Some(app.palette.sidebar_bg));
+        assert_eq!(buffer[(4, 3)].symbol(), "»");
+        assert_eq!(buffer[(6, 0)].symbol(), "e");
+        assert_eq!(buffer[(6, 0)].style().fg, Some(app.palette.overlay0));
+        assert!(buffer[(6, 0)].style().add_modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(5, 1)].symbol(), "t");
+        app.workspace_plugin_panes
+            .values_mut()
+            .next()
+            .expect("workspace plugin pane")
+            .focused = true;
+        app.mode = crate::app::Mode::Terminal;
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(4, 0)].style().fg,
+            Some(app.palette.accent)
+        );
+
+        app.mode = crate::app::Mode::Prefix;
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(4, 0)].style().fg,
+            Some(app.palette.surface_dim)
+        );
+        for (_, runtime) in runtimes.drain() {
+            runtime.shutdown();
+        }
     }
 }

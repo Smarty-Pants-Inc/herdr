@@ -143,6 +143,10 @@ impl App {
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(runtime) = self
                 .state
@@ -173,6 +177,10 @@ impl App {
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.send_bytes(Bytes::from(text)).await;
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(runtime) = self
                 .state
@@ -197,6 +205,10 @@ impl App {
             return;
         }
 
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.send_paste(text).await;
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(rt) = self
                 .state
@@ -354,6 +366,9 @@ impl App {
 
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
+            return;
+        }
+        if self.handle_workspace_plugin_mouse(mouse) {
             return;
         }
         if self.handle_overlay_mouse(mouse) {
@@ -1047,5 +1062,85 @@ mod tests {
 
         state.mode = Mode::ConfirmClose;
         assert!(!modal_paste_target_active(&state));
+    }
+    #[test]
+    fn workspace_plugin_toggle_collapses_and_expands_without_focusing() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-toggle");
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 0, 25, 20);
+
+        assert!(app.handle_workspace_plugin_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            80,
+            19,
+        )));
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert!(pane.collapsed);
+        assert!(!pane.focused);
+
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(105, 0, 1, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::default();
+        assert!(app.handle_workspace_plugin_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            105,
+            19,
+        )));
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert!(!pane.collapsed);
+        assert!(!pane.focused);
+    }
+    #[test]
+    fn workspace_plugin_separator_drag_resizes_without_closing() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-resize");
+        let workspace_id = workspace.id.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id,
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 1, 25, 19);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 80, 5));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(crate::app::state::DragTarget::WorkspacePluginDivider { .. })
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 5));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 70, 5));
+
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert_eq!(pane.pane_id, pane_id);
+        assert_eq!(pane.width, Some(crate::popup_size::PopupSize::Cells(36)));
+        assert!(app.state.drag.is_none());
     }
 }

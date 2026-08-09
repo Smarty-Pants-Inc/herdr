@@ -45,6 +45,7 @@
 - Navigate-mode selection rows now use a dedicated per-theme cursor color, customizable via `theme.custom.selection_bg`, so the cursor stays distinguishable from the active Space and Agent highlight.
 - Copy mode now supports `B`, `E`, and `W` motions over whitespace-delimited big words. (#2270, thanks @jplew)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+- Workspace-right plugin panes can collapse to a one-cell sidebar control, use borderless sidebar chrome, and receive the active palette through protected `HERDR_THEME_*` environment variables.
 
 ### Changed
 - Windows support is now generally available through stable releases and uses the stable update channel by default. Existing preview installs stay on preview until explicitly switched.

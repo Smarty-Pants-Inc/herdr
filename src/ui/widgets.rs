@@ -36,6 +36,21 @@ pub(super) fn panel_contrast_fg(p: &Palette) -> Color {
     }
 }
 
+pub(super) fn render_panel_separator(
+    frame: &mut Frame,
+    area: Rect,
+    x: u16,
+    active: bool,
+    p: &Palette,
+) {
+    let style = Style::default()
+        .fg(if active { p.accent } else { p.surface_dim })
+        .bg(p.sidebar_bg);
+    for y in area.y..area.y.saturating_add(area.height) {
+        frame.buffer_mut()[(x, y)].set_symbol("│").set_style(style);
+    }
+}
+
 pub(crate) fn centered_popup_rect(area: Rect, popup_w: u16, popup_h: u16) -> Option<Rect> {
     let popup_w = popup_w.min(area.width.saturating_sub(4));
     let popup_h = popup_h.min(area.height.saturating_sub(2));
