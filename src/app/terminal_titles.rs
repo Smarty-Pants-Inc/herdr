@@ -100,7 +100,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Claude);
         terminal.state = AgentState::Working;
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
-        runtime.test_process_pty_bytes("\x1b]0;⠋ 修复🙂标题\x07".as_bytes());
+        runtime.test_process_pty_bytes("\x1b]0;π ⠋ 修复🙂标题\x07".as_bytes());
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         let sources = HashSet::from([pane_id]);
 
@@ -112,19 +112,25 @@ mod tests {
             }
         );
         let pane = app.pane_info(0, pane_id).unwrap();
-        assert_eq!(pane.terminal_title.as_deref(), Some("⠋ 修复🙂标题"));
-        assert_eq!(pane.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠋ 修复🙂标题"));
+        assert_eq!(
+            pane.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
         assert_eq!(pane.title, None);
         assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Working);
         assert_eq!(pane.revision, 1);
         let agent = app.collect_agent_infos().pop().unwrap();
-        assert_eq!(agent.terminal_title.as_deref(), Some("⠋ 修复🙂标题"));
-        assert_eq!(agent.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(agent.terminal_title.as_deref(), Some("π ⠋ 修复🙂标题"));
+        assert_eq!(
+            agent.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
 
         app.terminal_runtimes
             .get(&terminal_id)
             .unwrap()
-            .test_process_pty_bytes("\x1b]2;⠙ 修复🙂标题\x1b\\".as_bytes());
+            .test_process_pty_bytes("\x1b]2;π ⠙ 修复🙂标题\x1b\\".as_bytes());
         assert_eq!(
             app.sync_terminal_titles(&sources),
             TerminalTitleChanges {
@@ -133,8 +139,11 @@ mod tests {
             }
         );
         let pane = app.pane_info(0, pane_id).unwrap();
-        assert_eq!(pane.terminal_title.as_deref(), Some("⠙ 修复🙂标题"));
-        assert_eq!(pane.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠙ 修复🙂标题"));
+        assert_eq!(
+            pane.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
         assert_eq!(pane.revision, 1);
         assert_eq!(pane_updated_events(&event_hub), 1);
 
