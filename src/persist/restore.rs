@@ -527,6 +527,10 @@ fn restore_tab(
             })
             .unwrap_or_default();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
+        #[cfg(unix)]
+        let imported_agent_state = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.agent_state.clone());
         let was_imported = imported_runtime.is_some();
         let pending_native_agent_restore = if was_imported {
             None
@@ -649,18 +653,30 @@ fn restore_tab(
                     (Some(_), None) => {}
                     (None, _) => {}
                 }
-                if let Some(agent) = initial_restore_agent {
-                    let _ = terminal.set_detected_state_with_screen_signals_at(
-                        Some(agent),
-                        AgentState::Idle,
-                        false,
-                        false,
-                        false,
-                        false,
-                        std::time::Instant::now(),
-                    );
+                #[cfg(unix)]
+                let restored_seen = imported_agent_state
+                    .as_ref()
+                    .map(|agent_state| agent_state.restore(&mut terminal));
+                #[cfg(not(unix))]
+                let restored_seen: Option<bool> = None;
+                if restored_seen.is_none() {
+                    if let Some(agent) = initial_restore_agent {
+                        let _ = terminal.set_detected_state_with_screen_signals_at(
+                            Some(agent),
+                            AgentState::Idle,
+                            false,
+                            false,
+                            false,
+                            false,
+                            std::time::Instant::now(),
+                        );
+                    }
                 }
-                panes.insert(*id, PaneState::new(terminal_id.clone()));
+                let mut pane = PaneState::new(terminal_id.clone());
+                if let Some(seen) = restored_seen {
+                    pane.seen = seen;
+                }
+                panes.insert(*id, pane);
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }

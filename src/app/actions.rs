@@ -322,12 +322,14 @@ impl AppState {
         let Some(tab_idx) = ws.find_tab_index_for_pane(pane_id) else {
             return false;
         };
+        let workspace_id = ws.id.clone();
         let previous = self.current_pane_focus_target();
         let target = PaneFocusTarget {
-            workspace_id: ws.id.clone(),
+            workspace_id: workspace_id.clone(),
             pane_id,
         };
-        if previous.as_ref() == Some(&target) {
+        let workspace_plugin_focus_changed = self.unfocus_workspace_plugin_pane(&workspace_id);
+        if previous.as_ref() == Some(&target) && !workspace_plugin_focus_changed {
             return false;
         }
 
@@ -1685,6 +1687,11 @@ impl AppState {
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
             pane_ids.extend(self.pane_ids_for_workspace(*idx));
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
+                if let Some(plugin_pane) = self.workspace_plugin_panes.remove(&workspace_id) {
+                    self.direct_attach_resize_locks
+                        .remove(&plugin_pane.terminal_id);
+                    terminal_ids.push(plugin_pane.terminal_id);
+                }
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
