@@ -201,6 +201,9 @@ impl App {
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.close_workspace_plugin_pane_by_internal_id(*pane_id) {
+                return;
+            }
             if self
                 .state
                 .popup_pane
@@ -845,9 +848,8 @@ impl App {
     ) {
         let current_focus = self.state.active.and_then(|idx| {
             self.state
-                .workspaces
-                .get(idx)
-                .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
+                .focused_terminal_pane_id(idx)
+                .map(|pane_id| (idx, pane_id))
         });
         if current_focus == self.last_focus {
             if let (Some((ws_idx, pane_id)), Some(event)) = (current_focus, outer_event) {
@@ -885,7 +887,19 @@ impl App {
                     },
                 });
             }
-            if let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) {
+            let public_pane_id = self.public_pane_id(ws_idx, pane_id).or_else(|| {
+                let workspace_id = self.public_workspace_id(ws_idx);
+                self.state
+                    .workspace_plugin_panes
+                    .get(&workspace_id)
+                    .filter(|pane| pane.pane_id == pane_id)
+                    .map(|_| {
+                        crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(
+                            &workspace_id,
+                        )
+                    })
+            });
+            if let Some(public_pane_id) = public_pane_id {
                 self.emit_event(crate::api::schema::EventEnvelope {
                     event: crate::api::schema::EventKind::PaneFocused,
                     data: crate::api::schema::EventData::PaneFocused {
@@ -905,10 +919,13 @@ impl App {
         pane_id: crate::layout::PaneId,
         event: crate::ghostty::FocusEvent,
     ) {
-        let Some(runtime) = self.state.workspaces.get(ws_idx).and_then(|_| {
-            self.state
-                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
-        }) else {
+        let runtime = self.workspace_plugin_runtime_for_pane(pane_id).or_else(|| {
+            self.state.workspaces.get(ws_idx).and_then(|_| {
+                self.state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            })
+        });
+        let Some(runtime) = runtime else {
             return;
         };
         runtime.try_send_focus_event(event);

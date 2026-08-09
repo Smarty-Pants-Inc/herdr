@@ -446,6 +446,7 @@ pub enum PluginPanePlacement {
     #[default]
     Overlay,
     Popup,
+    WorkspaceRight,
     Split,
     Tab,
     Zoomed,
@@ -466,4 +467,14 @@ pub struct PluginPaneInfo {
     pub plugin_id: String,
     pub entrypoint: String,
     pub pane: PaneInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginWorkspacePaneInfo {
+    pub plugin_id: String,
+    pub entrypoint: String,
+    pub pane_id: String,
+    pub terminal_id: String,
+    pub workspace_id: String,
+    pub focused: bool,
 }
