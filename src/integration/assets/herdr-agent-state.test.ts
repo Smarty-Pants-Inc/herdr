@@ -498,6 +498,34 @@ test("Oh My Pi retries working before a queued idle state", async () => {
   expect(requestState(attemptedRequests[2])).toBe("idle");
 });
 
+test("Oh My Pi reasserts working when a continuation starts a tool without agent_start", async () => {
+  const requests = await startRecordingServer("omp-tool-continuation");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("agent_end")?.({ messages: [] }, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  handlers.get("tool_execution_start")?.({ toolName: "hub", args: {} }, context);
+  await waitFor(() => requestStates(requests).length === 3);
+
+  expect(requestStates(requests)).toEqual(["working", "idle", "working"]);
+});
+
 test("Pi retries working state after an unanswered socket attempt", async () => {
   const { attemptedRequests, deliveredRequests, connectionCount } =
     await startDroppedFirstResponseServer("pi-retry");
