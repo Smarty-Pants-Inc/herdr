@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+const SCROLL_RENDER_INTERVAL: Duration = Duration::from_millis(8);
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -154,6 +155,7 @@ pub struct App {
     pub(crate) last_render_at: Option<Instant>,
     /// Last attempt that could update a connected presentation surface.
     pub(crate) last_presentation_at: Option<Instant>,
+    pub(crate) scroll_render_pending: bool,
     pub(crate) input_leases: input::InputLeaseTable,
     pub render_notify: Arc<Notify>,
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
@@ -791,6 +793,7 @@ impl App {
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
             last_presentation_at: None,
+            scroll_render_pending: false,
             input_leases: input::InputLeaseTable::default(),
             api_rx,
             event_hub,
@@ -1858,6 +1861,13 @@ impl App {
                     self.handle_text_commit_headless(text.as_str());
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    if matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::ScrollUp
+                            | crossterm::event::MouseEventKind::ScrollDown
+                    ) {
+                        self.request_scroll_render();
+                    }
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
                         self.handle_mouse_event_headless(source_id, mouse);
                     } else {
