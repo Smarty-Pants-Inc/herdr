@@ -413,13 +413,17 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
-    if (event?.toolName !== "ask") {
-      return;
-    }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
-    activateBlocked(askBlockedMessage(event.args));
+    clearPendingTimers();
+    clearFailureState();
+    agentActive = true;
+    if (event?.toolName === "ask") {
+      activateBlocked(askBlockedMessage(event.args));
+      return;
+    }
+    publishState();
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
