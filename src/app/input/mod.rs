@@ -619,6 +619,9 @@ impl App {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
+        if crate::app::actions::safe_web_url(&url).is_none() {
+            return true;
+        }
         match open_url(&url) {
             Ok(Some(child)) => self.detached_process_children.push(child),
             Ok(None) => {}
