@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn install_test_link_handler(app: &mut App) {
+    fn install_test_link_handler(app: &mut App, handler_id: &str, pattern: &str) {
         let plugin_root = std::env::temp_dir();
         app.state.installed_plugins = std::collections::HashMap::from([(
             "example.links".to_string(),
@@ -557,9 +557,9 @@ mod tests {
                 events: Vec::new(),
                 panes: Vec::new(),
                 link_handlers: vec![crate::api::schema::PluginManifestLinkHandler {
-                    id: "github-issue".into(),
-                    title: "Open GitHub issue".into(),
-                    pattern: "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$".into(),
+                    id: handler_id.into(),
+                    title: "Open link".into(),
+                    pattern: pattern.into(),
                     action: "open".into(),
                     platforms: None,
                 }],
@@ -975,7 +975,11 @@ mod tests {
                 4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
-        install_test_link_handler(&mut app);
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         let mut send_mouse = |source_id, kind, column, modifiers| {
             app.handle_mouse_from_input_source(
                 source_id,
@@ -1023,7 +1027,11 @@ mod tests {
                 4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
-        install_test_link_handler(&mut app);
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         let url_x = info.inner_rect.x + col;
 
         app.handle_mouse_from_input_source(
@@ -1119,7 +1127,11 @@ mod tests {
         let col = line.find("github").expect("url host") as u16;
 
         let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());
-        install_test_link_handler(&mut ctrl_app);
+        install_test_link_handler(
+            &mut ctrl_app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         ctrl_app.handle_mouse(modified_mouse(
             MouseEventKind::Down(MouseButton::Left),
             ctrl_info.inner_rect.x + col,
@@ -1136,7 +1148,11 @@ mod tests {
         assert_eq!(ctrl_log.action_id.as_deref(), Some("open"));
 
         let (mut super_app, super_info) = app_with_screen_bytes(line.as_bytes());
-        install_test_link_handler(&mut super_app);
+        install_test_link_handler(
+            &mut super_app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         super_app.handle_mouse(modified_mouse(
             MouseEventKind::Down(MouseButton::Left),
             super_info.inner_rect.x + col,
@@ -1305,6 +1321,64 @@ mod tests {
                 .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, 1)
                 .as_deref(),
             Some("https://example.com/hidden-target")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_click_osc8_file_url_invokes_plugin_handler_and_suppresses_release() {
+        let uri = "file:///tmp/odd%20file.rs?line=12&col=4";
+        let screen =
+            format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\");
+        let (mut app, info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                0,
+                screen.as_bytes(),
+                4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        install_test_link_handler(&mut app, "local-file", "^file://");
+
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, 1)
+                .as_deref(),
+            Some(uri)
+        );
+
+        let x = info.inner_rect.x + 1;
+        app.handle_mouse_from_input_source(
+            41,
+            modified_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                info.inner_rect.y,
+                KeyModifiers::CONTROL,
+            ),
+        );
+        app.handle_mouse_from_input_source(
+            41,
+            modified_mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                x,
+                info.inner_rect.y,
+                KeyModifiers::empty(),
+            ),
+        );
+
+        let log = app
+            .state
+            .plugin_command_logs
+            .last()
+            .expect("file link should start plugin handler");
+        assert_eq!(log.action_id.as_deref(), Some("open"));
+        assert!(
+            input_rx.try_recv().is_err(),
+            "handled file link must not reach pane"
         );
     }
 
