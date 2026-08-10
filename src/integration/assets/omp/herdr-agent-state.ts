@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=8
+// HERDR_INTEGRATION_VERSION=9
 // @ts-nocheck
 
 import net from "node:net";
@@ -413,13 +413,17 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
-    if (event?.toolName !== "ask") {
-      return;
-    }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
-    activateBlocked(askBlockedMessage(event.args));
+    clearPendingTimers();
+    clearFailureState();
+    agentActive = true;
+    if (event?.toolName === "ask") {
+      activateBlocked(askBlockedMessage(event.args));
+      return;
+    }
+    publishState();
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
