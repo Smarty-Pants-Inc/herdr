@@ -626,6 +626,9 @@ impl App {
         if plugin_handled {
             return true;
         }
+        if crate::app::actions::safe_web_url(&url).is_none() {
+            return true;
+        }
         match open_url(&url) {
             Ok(Some(child)) => self.detached_process_children.push(child),
             Ok(None) => {}
