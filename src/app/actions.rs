@@ -2962,7 +2962,11 @@ impl AppState {
         }
     }
 
-    fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
+    pub(crate) fn update_terminal_state<F>(
+        &mut self,
+        pane_id: PaneId,
+        update: F,
+    ) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {

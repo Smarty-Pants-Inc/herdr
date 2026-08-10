@@ -26,6 +26,20 @@ pub(crate) fn stripped_terminal_title(title: &str) -> Option<String> {
 
     Some(title.to_string())
 }
+pub(crate) fn terminal_title_has_activity_glyph(title: &str) -> bool {
+    let title = title.trim();
+    if strip_leading_activity_glyph(title).is_some() {
+        return true;
+    }
+
+    let mut chars = title.chars();
+    let Some(_) = chars.next() else {
+        return false;
+    };
+    let after_first = chars.as_str();
+    after_first.chars().next().is_some_and(char::is_whitespace)
+        && strip_leading_activity_glyph(after_first.trim_start()).is_some()
+}
 
 fn strip_leading_activity_glyph(title: &str) -> Option<&str> {
     let mut chars = title.chars();
@@ -40,7 +54,7 @@ fn strip_leading_activity_glyph(title: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::stripped_terminal_title;
+    use super::{stripped_terminal_title, terminal_title_has_activity_glyph};
 
     #[test]
     fn strips_one_recognized_leading_activity_glyph() {
@@ -80,6 +94,15 @@ mod tests {
         assert_eq!(stripped_terminal_title("π ⠋").as_deref(), Some("π"));
         for title in ["π⠋ task", "OMP ⠋ task"] {
             assert_eq!(stripped_terminal_title(title).as_deref(), Some(title));
+        }
+    }
+    #[test]
+    fn recognizes_activity_glyphs_in_supported_title_positions() {
+        for title in ["⠋ task", "π ⠙ task", "  π   ✳ task  "] {
+            assert!(terminal_title_has_activity_glyph(title));
+        }
+        for title in ["π > task", "OMP ⠋ task", "task ⠋ detail"] {
+            assert!(!terminal_title_has_activity_glyph(title));
         }
     }
 
