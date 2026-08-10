@@ -663,7 +663,7 @@ impl App {
         }
     }
 
-    fn emit_terminal_or_system_agent_notifications(
+    pub(crate) fn emit_terminal_or_system_agent_notifications(
         &self,
         pane_updates: &[crate::app::actions::PaneStateUpdate],
     ) {
