@@ -3030,11 +3030,14 @@ fn omp_ask_and_approval_events_report_blocked_state() {
         .find("deactivateBlocked();")
         .expect("approval resolution should unblock the pane");
 
-    let ask_handler = omp_handler("tool_execution_start");
-    ask_handler
-        .find("event?.toolName !== \"ask\"")
-        .expect("tool execution handler should only treat Ask as blocked");
-    ask_handler
+    let tool_start_handler = omp_handler("tool_execution_start");
+    tool_start_handler
+        .find("agentActive = true;")
+        .expect("tool execution should reassert working after continuation resumes");
+    tool_start_handler
+        .find("event?.toolName === \"ask\"")
+        .expect("tool execution should identify Ask for blocked state");
+    tool_start_handler
         .find("activateBlocked(askBlockedMessage(event.args));")
         .expect("Ask start should block the pane");
 
