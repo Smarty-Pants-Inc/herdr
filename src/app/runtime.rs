@@ -232,6 +232,13 @@ impl App {
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 let changes_view = !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved)
                     || self.state.mode.mouse_motion_changes_view();
+                if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                ) {
+                    self.request_scroll_render();
+                }
                 if self.state.popup_pane.is_some() || self.state.mouse_capture {
                     self.handle_mouse(mouse);
                 } else {
@@ -527,9 +534,25 @@ impl App {
         self.selection_autoscroll_deadline = None;
     }
 
+    pub(super) fn request_scroll_render(&mut self) {
+        self.scroll_render_pending = true;
+    }
+
+    fn render_interval(&self) -> std::time::Duration {
+        if self.scroll_render_pending {
+            super::SCROLL_RENDER_INTERVAL
+        } else {
+            MIN_RENDER_INTERVAL
+        }
+    }
+
+    pub(crate) fn mark_rendered(&mut self, now: Instant) {
+        self.record_render_attempt(now, true);
+    }
+
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
-            Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,
+            Some(last_render_at) => now.duration_since(last_render_at) >= self.render_interval(),
             None => true,
         }
     }
@@ -545,6 +568,7 @@ impl App {
 
     pub(crate) fn record_render_attempt(&mut self, now: Instant, presentation: bool) {
         self.last_render_at = Some(now);
+        self.scroll_render_pending = false;
         if presentation {
             self.last_presentation_at = Some(now);
         }
@@ -604,7 +628,7 @@ impl App {
     ) -> Option<Instant> {
         let render_deadline = if needs_render {
             self.last_render_at
-                .map(|last_render_at| last_render_at + MIN_RENDER_INTERVAL)
+                .map(|last_render_at| last_render_at + self.render_interval())
                 .filter(|deadline| *deadline > now)
         } else {
             None
@@ -975,5 +999,38 @@ mod tests {
             .pending_agent_resume_plan
             .is_some());
         assert!(app.pending_agent_resume_deadline.is_none());
+    }
+    #[test]
+    fn wheel_input_uses_fast_render_cadence_once() {
+        let (mut app, _) = test_app_with_pane();
+        let rendered_at = Instant::now();
+        app.last_render_at = Some(rendered_at);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::ScrollUp,
+                    column: 10,
+                    row: 5,
+                    modifiers: crossterm::event::KeyModifiers::empty(),
+                },
+            )],
+            true,
+        );
+
+        assert!(!app.can_render_now(rendered_at + Duration::from_millis(7)));
+        assert!(app.can_render_now(rendered_at + Duration::from_millis(8)));
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(
+                rendered_at + Duration::from_millis(1),
+                true,
+                false,
+            ),
+            Some(rendered_at + Duration::from_millis(8))
+        );
+
+        app.mark_rendered(rendered_at + Duration::from_millis(8));
+        assert!(!app.can_render_now(rendered_at + MIN_RENDER_INTERVAL));
+        assert!(app.can_render_now(rendered_at + Duration::from_millis(8) + MIN_RENDER_INTERVAL));
     }
 }
