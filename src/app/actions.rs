@@ -2255,7 +2255,7 @@ impl AppState {
             .into_iter()
             .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
         {
-            return safe_web_url(&uri).map(str::to_owned);
+            return safe_osc8_url(&uri).map(str::to_owned);
         }
 
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
@@ -2308,6 +2308,10 @@ impl AppState {
 
 pub(crate) fn safe_web_url(url: &str) -> Option<&str> {
     (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
+}
+
+fn safe_osc8_url(url: &str) -> Option<&str> {
+    safe_web_url(url).or_else(|| url.starts_with("file://").then_some(url))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
