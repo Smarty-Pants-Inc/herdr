@@ -775,7 +775,7 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
-                self.app.last_render_at = Some(now);
+                self.app.mark_rendered(now);
                 needs_render = false;
                 needs_full_render = false;
                 needs_graphics_render = false;
@@ -1715,7 +1715,7 @@ impl HeadlessServer {
     /// Uses the original full-render semantics when pane graphics are dormant.
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        while !self.should_quit.load(Ordering::Acquire) && !self.app.scroll_render_pending {
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -1727,7 +1727,7 @@ impl HeadlessServer {
     /// Returns the strongest render impact from the drained event batch.
     fn drain_server_events_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
+        while !self.should_quit.load(Ordering::Acquire) && !self.app.scroll_render_pending {
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -8730,6 +8730,40 @@ next_tab = ""
             RenderEncoding::SemanticFrame,
             None,
         )
+    }
+
+    #[test]
+    fn scroll_input_yields_server_event_drain_until_rendered() {
+        let mut server = test_headless_server();
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientInputEvents {
+                client_id: 1,
+                events: vec![crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::ScrollUp,
+                    column: 10,
+                    row: 5,
+                    modifiers: 0,
+                }],
+            })
+            .unwrap();
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientInput {
+                client_id: 99,
+                data: b"queued after scroll".to_vec(),
+            })
+            .unwrap();
+
+        let _ = server.drain_server_events();
+
+        assert!(server.app.scroll_render_pending);
+        assert!(matches!(
+            server.server_event_rx.try_recv(),
+            Ok(ServerEvent::ClientInput { client_id: 99, .. })
+        ));
     }
 
     #[test]
