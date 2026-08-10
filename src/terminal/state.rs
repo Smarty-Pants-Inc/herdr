@@ -222,20 +222,44 @@ impl TerminalState {
             .and_then(super::stripped_terminal_title)
     }
 
-    pub(crate) fn set_terminal_title(&mut self, title: Option<String>) -> TerminalTitleChange {
+    pub(crate) fn set_terminal_title(
+        &mut self,
+        title: Option<String>,
+    ) -> (TerminalTitleChange, TerminalStateMutation) {
         if self.terminal_title == title {
-            return TerminalTitleChange::default();
+            return (
+                TerminalTitleChange::default(),
+                TerminalStateMutation::default(),
+            );
         }
+
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_stripped = self.terminal_title_stripped();
         self.terminal_title = title;
         let stripped_changed = previous_stripped != self.terminal_title_stripped();
         if stripped_changed {
             self.revision = self.revision.wrapping_add(1);
         }
-        TerminalTitleChange {
+
+        let change = TerminalTitleChange {
             raw_changed: true,
             stripped_changed,
-        }
+        };
+        let mutation = TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            ..TerminalStateMutation::default()
+        };
+        (change, mutation)
     }
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {
@@ -2133,6 +2157,18 @@ impl TerminalState {
                 .filter(|authority| self.hook_authority_is_effective(authority))
                 .map(|authority| authority.state)
                 .unwrap_or(self.fallback_state)
+        };
+        let state = if state == AgentState::Idle
+            && self.live_full_lifecycle_hook_authority()
+            && self.effective_known_agent() == Some(Agent::Omp)
+            && self
+                .terminal_title
+                .as_deref()
+                .is_some_and(super::terminal_title_has_activity_glyph)
+        {
+            AgentState::Working
+        } else {
+            state
         };
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
