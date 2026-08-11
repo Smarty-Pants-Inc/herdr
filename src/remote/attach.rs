@@ -26,12 +26,15 @@ const BRIDGE_IO_POLL: Duration = Duration::from_millis(1);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+pub(crate) const REMOTE_CLIENT_RECONNECT_EXIT_CODE: i32 = 75;
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -178,42 +181,44 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
-    if let Some((remote_herdr, status)) = probe_running_remote_server(&remote_ssh, &session_name)? {
-        reconcile_local_client_to_running_server(&status)?;
-        if !remote_binary_matches(&remote_ssh, &remote_herdr)? {
-            return Err(io::Error::other(format!(
-                "the running remote server is intact, but {} cannot bridge protocol {CURRENT_PROTOCOL}",
-                remote_herdr.shell_path
-            )));
-        }
-        let _bridge = SshStdioBridge::start(
-            remote.target,
+    let mut remote_herdr =
+        if let Some(remote_herdr) = running_remote_client_target(&remote_ssh, &session_name)? {
+            remote_herdr
+        } else {
+            let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+            ensure_remote_server_ready(
+                &remote_ssh,
+                &prepared_remote.remote_herdr,
+                prepared_remote.installed_or_replaced,
+                prepared_remote.stop_after_install_approved,
+                remote.live_handoff,
+            )?;
+            prepared_remote.remote_herdr
+        };
+
+    loop {
+        let bridge = SshStdioBridge::start(
+            remote.target.clone(),
             remote_herdr,
             local_socket.clone(),
-            session_name,
+            session_name.clone(),
             remote_ssh.options(),
         )?;
-        return run_client_process(&local_socket, &reattach_command, remote.keybindings);
+        let client_exit = run_client_process(&local_socket, &reattach_command, remote.keybindings);
+        drop(bridge);
+
+        match client_exit? {
+            RemoteClientProcessExit::Done => return Ok(()),
+            RemoteClientProcessExit::Reconnect => {
+                eprintln!("herdr: remote server is updating; reconnecting...");
+                remote_herdr = wait_for_running_remote_client_target(
+                    &remote_ssh,
+                    &session_name,
+                    Instant::now() + REMOTE_RECONNECT_TIMEOUT,
+                )?;
+            }
+        }
     }
-
-    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
-    ensure_remote_server_ready(
-        &remote_ssh,
-        &prepared_remote.remote_herdr,
-        prepared_remote.installed_or_replaced,
-        prepared_remote.stop_after_install_approved,
-        remote.live_handoff,
-    )?;
-
-    let _bridge = SshStdioBridge::start(
-        remote.target,
-        prepared_remote.remote_herdr,
-        local_socket.clone(),
-        session_name,
-        remote_ssh.options(),
-    )?;
-
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,6 +857,45 @@ fn probe_running_remote_server(
         return Err(io::Error::other(error));
     }
     Ok(None)
+}
+fn running_remote_client_target(
+    ssh: &RemoteSsh,
+    session_name: &str,
+) -> io::Result<Option<RemoteHerdr>> {
+    let Some((remote_herdr, status)) = probe_running_remote_server(ssh, session_name)? else {
+        return Ok(None);
+    };
+    reconcile_local_client_to_running_server(&status)?;
+    if !remote_binary_matches(ssh, &remote_herdr)? {
+        return Err(io::Error::other(format!(
+            "the running remote server is intact, but {} cannot bridge protocol {CURRENT_PROTOCOL}",
+            remote_herdr.shell_path
+        )));
+    }
+    Ok(Some(remote_herdr))
+}
+
+fn wait_for_running_remote_client_target(
+    ssh: &RemoteSsh,
+    session_name: &str,
+    deadline: Instant,
+) -> io::Result<RemoteHerdr> {
+    let mut last_error = None;
+    loop {
+        thread::sleep(REMOTE_RECONNECT_POLL_INTERVAL);
+        match running_remote_client_target(ssh, session_name) {
+            Ok(Some(remote_herdr)) => return Ok(remote_herdr),
+            Ok(None) => {}
+            Err(err) => last_error = Some(err),
+        }
+        if Instant::now() >= deadline {
+            let detail = last_error.map(|err| format!(": {err}")).unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for the updated remote Herdr server{detail}"),
+            ));
+        }
+    }
 }
 
 fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
@@ -2348,11 +2392,30 @@ fn copy_local_stream_to_writer<W: io::Write>(
     Ok(total)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteClientProcessExit {
+    Done,
+    Reconnect,
+}
+
+fn classify_remote_client_process_exit(
+    success: bool,
+    code: Option<i32>,
+) -> Option<RemoteClientProcessExit> {
+    if success {
+        Some(RemoteClientProcessExit::Done)
+    } else if code == Some(REMOTE_CLIENT_RECONNECT_EXIT_CODE) {
+        Some(RemoteClientProcessExit::Reconnect)
+    } else {
+        None
+    }
+}
+
 fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
-) -> io::Result<()> {
+) -> io::Result<RemoteClientProcessExit> {
     let exe = std::env::current_exe()?;
     let status = Command::new(exe)
         .arg("client")
@@ -2369,14 +2432,12 @@ fn run_client_process(
         .stderr(Stdio::inherit())
         .status()?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    classify_remote_client_process_exit(status.success(), status.code()).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::Interrupted,
             format!("remote client exited with {status}"),
-        ))
-    }
+        )
+    })
 }
 
 fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
@@ -3145,6 +3206,20 @@ mod tests {
             Some(8)
         );
         assert!(parse_client_status_json(r#"{"protocol":"unknown"}"#).is_none());
+    }
+
+    #[test]
+    fn remote_client_exit_code_requests_reconnect() {
+        assert_eq!(
+            classify_remote_client_process_exit(false, Some(REMOTE_CLIENT_RECONNECT_EXIT_CODE)),
+            Some(RemoteClientProcessExit::Reconnect)
+        );
+        assert_eq!(
+            classify_remote_client_process_exit(true, Some(0)),
+            Some(RemoteClientProcessExit::Done)
+        );
+        assert_eq!(classify_remote_client_process_exit(false, Some(1)), None);
+        assert_eq!(classify_remote_client_process_exit(false, None), None);
     }
 
     #[test]
