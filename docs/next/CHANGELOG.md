@@ -49,7 +49,7 @@
 - Windows support is now generally available through stable releases and uses the stable update channel by default. Existing preview installs stay on preview until explicitly switched.
 - Headless servers now use a configurable 120×40 virtual terminal instead of 80×24 when no client is attached, giving newly created panes a practical default size. (#2828)
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding. (#2570, thanks @dhh)
-- Bumped the client/server protocol version to 21 for typed live-handoff reconnect signaling.
+- Bumped the client/server protocol version to 21 for typed live-handoff reconnect signaling and client-local HTTP(S) link opening.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 - Full-app clients attached to the same session now navigate workspaces, tabs, pane focus, focus history, and zoom independently while continuing to share panes, processes, and output.
 
@@ -118,6 +118,7 @@
 - Host terminal appearance is re-queried when focus returns, keeping automatic light and dark themes current. (#2416, #2417)
 - The bundled and installable Herdr agent skill now matches this stable release's CLI and lifecycle behavior. (#2847)
 - `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+- Remote attaches now open unhandled HTTP(S) pane links on the clicking client's desktop while plugin-handled `file://` links stay in the remote workspace.
 
 ## [0.8.0] - 2026-08-03
 
