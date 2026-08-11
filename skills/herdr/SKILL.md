@@ -1,6 +1,6 @@
 ---
 name: herdr
-description: "Control Herdr, a terminal multiplexer for coding agents. Use only when the user explicitly mentions Herdr or asks to use Herdr to inspect or control panes, tabs, workspaces, commands, or another agent. Do not use merely because a task could benefit from a background terminal, delegation, or parallel work. Requires HERDR_ENV=1."
+description: "Control Herdr, a terminal multiplexer for coding agents. Use when the user mentions Herdr, or when `HERDR_ENV=1` and the task requires inspecting, contacting, prompting, waiting for, starting, or controlling another top-level agent, session, pane, tab, or workspace. Do not use for ordinary same-session subagent delegation or parallelism. Requires HERDR_ENV=1."
 ---
 
 # Herdr
@@ -36,6 +36,7 @@ herdr worktree --help
 herdr terminal --help
 herdr notification --help
 herdr integration --help
+herdr plugin --help
 herdr session --help
 ```
 
@@ -44,6 +45,27 @@ Do not run bare `herdr` for discovery; it launches or attaches the TUI. Do not r
 Most control commands return JSON. Read identifiers and state from those responses instead of predicting them.
 
 Before starting or resuming a supported agent, run `herdr integration status`. If the target integration is missing or outdated, report that state and update it with `herdr integration install <kind>` only when authorized; then recheck status before relying on lifecycle or session metadata.
+
+## Use installed plugin surfaces
+
+HerdR plugins are the shared extension surface for executable workflow tools. Discover installed capabilities before calling a product binary directly or inventing an agent-specific wrapper:
+
+```bash
+herdr plugin list --json
+herdr plugin list --plugin <plugin-id> --json
+herdr plugin action list --plugin <plugin-id>
+herdr plugin pane --help
+```
+
+The filtered plugin JSON is the manifest-backed source for action IDs and pane entrypoint IDs. Invoke the declared surface with:
+
+```bash
+herdr plugin action invoke <action-id> --plugin <plugin-id>
+herdr plugin pane open --plugin <plugin-id> --entrypoint <entrypoint-id> \
+  --workspace "$HERDR_WORKSPACE_ID" --cwd "$PWD" --no-focus
+```
+
+Use a qualified action ID when more than one plugin declares the same local ID. Keep background panes unfocused unless the user asks to switch context. A successful invoke or open proves launch only; inspect the returned log or pane and verify the tool's result. Do not install, uninstall, enable, disable, or relink a plugin unless the user authorized that host mutation.
 
 ## Understand layout, panes, and agents
 
@@ -94,6 +116,17 @@ Creation responses expose the IDs to use next. `workspace create` returns `.resu
 ```bash
 herdr worktree open --cwd /absolute/main-checkout --path /absolute/existing-worktree --label <label> --no-focus
 ```
+
+## Coordinate existing top-level agents
+
+When `HERDR_ENV=1`, use Herdr for requests such as "ask the main agent", "tell the other agent", or "work with that agent", even when the user did not name Herdr. These are cross-session coordination, not ordinary delegation. OMP `hub` sees only peers in the current OMP session; an empty hub roster does not prove no sibling Herdr agents exist. Never start another terminal manager as a fallback.
+
+1. Run `herdr agent list`; select candidates by verified cwd, workspace, and terminal title.
+2. Run `herdr agent get <target>` and `herdr agent read <target> --source recent-unwrapped --lines 120` to verify the exact repository, worktree, process, and task.
+3. If the recipient must finish its current turn first, run `herdr agent wait <target> --timeout <ms>` and inspect any `blocked` state. Then use `herdr agent prompt <target> "<message>" --wait --timeout <ms>`.
+4. Confirm delivery or response from fresh `agent get` and `agent read` state. A successful send proves transport only.
+
+If no matching target exists, start one through Herdr only when the user asked to spawn it or the task explicitly requires an owner in that checkout. Do not substitute an OMP subagent, raw terminal injection, or Orca session.
 
 ## Start and coordinate an agent
 
