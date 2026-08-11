@@ -8,8 +8,8 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    read_limited_reader, ClipboardCommand, ClipboardImage, DesktopNotificationAction,
+    ForegroundJob, ForegroundProcess, LimitedRead, Signal,
 };
 
 pub(crate) use super::unix_common::{
@@ -582,15 +582,24 @@ fn unique_timestamp_nanos() -> u128 {
 /// hosting terminal on click. Fall back to built-in AppleScript notifications
 /// when it is not available.
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
-    show_desktop_notification_with_command(title, body, |program| Command::new(program))
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    title: &str,
+    body: Option<&str>,
+    action: Option<&DesktopNotificationAction>,
+) -> std::io::Result<bool> {
+    show_desktop_notification_with_command(title, body, action, |program| Command::new(program))
 }
 
 fn show_desktop_notification_with_command(
     title: &str,
     body: Option<&str>,
+    action: Option<&DesktopNotificationAction>,
     mut command: impl FnMut(&str) -> Command,
 ) -> std::io::Result<bool> {
-    if show_terminal_notifier_notification(title, body, &mut command).unwrap_or(false) {
+    if show_terminal_notifier_notification(title, body, action, &mut command).unwrap_or(false) {
         return Ok(true);
     }
 
@@ -600,6 +609,7 @@ fn show_desktop_notification_with_command(
 fn show_terminal_notifier_notification(
     title: &str,
     body: Option<&str>,
+    action: Option<&DesktopNotificationAction>,
     command: &mut impl FnMut(&str) -> Command,
 ) -> std::io::Result<bool> {
     let activate_bundle_id = verified_terminal_bundle_identifier(command);
@@ -607,6 +617,7 @@ fn show_terminal_notifier_notification(
         title,
         body,
         activate_bundle_id.as_deref(),
+        action,
         command,
     )
 }
@@ -615,10 +626,11 @@ fn show_terminal_notifier_notification_with_options(
     title: &str,
     body: Option<&str>,
     activate_bundle_id: Option<&str>,
+    action: Option<&DesktopNotificationAction>,
     command: &mut impl FnMut(&str) -> Command,
 ) -> std::io::Result<bool> {
     let mut cmd = command("terminal-notifier");
-    build_terminal_notifier_command(&mut cmd, title, body, activate_bundle_id);
+    build_terminal_notifier_command(&mut cmd, title, body, activate_bundle_id, action);
     run_notification_command(cmd)
 }
 
@@ -627,12 +639,24 @@ fn build_terminal_notifier_command(
     title: &str,
     body: Option<&str>,
     activate_bundle_id: Option<&str>,
+    action: Option<&DesktopNotificationAction>,
 ) {
     cmd.arg("-title").arg(title);
     cmd.arg("-message").arg(body.unwrap_or_default());
     if let Some(bundle_id) = activate_bundle_id {
         cmd.arg("-activate").arg(bundle_id);
     }
+    if let Some(action) = action {
+        cmd.arg("-execute").arg(notification_action_command(action));
+    }
+}
+
+fn notification_action_command(action: &DesktopNotificationAction) -> String {
+    std::iter::once(action.executable.to_string_lossy().into_owned())
+        .chain(action.args.iter().cloned())
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn show_osascript_notification(
@@ -1120,6 +1144,7 @@ mod tests {
             "pi finished",
             Some("workspace 1"),
             Some("com.mitchellh.ghostty"),
+            None,
         );
         let args = cmd
             .get_args()
@@ -1134,6 +1159,47 @@ mod tests {
                 "workspace 1",
                 "-activate",
                 "com.mitchellh.ghostty"
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_notifier_command_quotes_activation_callback() {
+        let action = DesktopNotificationAction {
+            executable: PathBuf::from("/Applications/Herdr & app/herdr"),
+            args: vec![
+                "notification".into(),
+                "activate".into(),
+                "/tmp/client socket;$(bad)".into(),
+                "42".into(),
+                "work space '$(bad)'".into(),
+                "7".into(),
+            ],
+        };
+        let mut cmd = Command::new("terminal-notifier");
+        build_terminal_notifier_command(
+            &mut cmd,
+            "pi finished",
+            Some("workspace 1"),
+            Some("com.mitchellh.ghostty"),
+            Some(&action),
+        );
+        let args = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "-title".to_owned(),
+                "pi finished".to_owned(),
+                "-message".to_owned(),
+                "workspace 1".to_owned(),
+                "-activate".to_owned(),
+                "com.mitchellh.ghostty".to_owned(),
+                "-execute".to_owned(),
+                "'/Applications/Herdr & app/herdr' 'notification' 'activate' '/tmp/client socket;$(bad)' '42' 'work space '\"'\"'$(bad)'\"'\"'' '7'".to_owned(),
             ]
         );
     }
@@ -1158,6 +1224,7 @@ mod tests {
             "title",
             Some("body"),
             Some("com.mitchellh.ghostty"),
+            None,
             &mut command,
         )
         .expect("terminal-notifier command should run");
@@ -1188,8 +1255,9 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
                 .env("HERDR_NOTIFY_ARGS", &path);
             cmd
         };
-        let shown = show_desktop_notification_with_command("title", Some("body"), &mut command)
-            .expect("osascript fallback should run");
+        let shown =
+            show_desktop_notification_with_command("title", Some("body"), None, &mut command)
+                .expect("osascript fallback should run");
 
         assert!(shown);
         let args = std::fs::read_to_string(&path).expect("args file");
