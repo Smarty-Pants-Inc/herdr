@@ -182,7 +182,7 @@ class SmartyInstallerTests(unittest.TestCase):
         self.payload.write_bytes(b"fake-smarty-herdr-binary\n")
         self.expected_sha256 = hashlib.sha256(self.payload.read_bytes()).hexdigest()
 
-        for command in ("awk", "cat", "chmod", "cp", "mkdir", "mktemp", "mv", "rm", "sed", "shasum"):
+        for command in ("awk", "cat", "chmod", "cp", "mkdir", "mktemp", "mv", "rm", "shasum"):
             path = shutil.which(command)
             if path is None:
                 self.fail(f"test host is missing required command: {command}")
@@ -196,13 +196,6 @@ case "$1" in
   -m) echo arm64 ;;
   *) exit 1 ;;
 esac
-""",
-        )
-        self._write_executable(
-            "id",
-            """#!/bin/sh
-[ "$1" = "-u" ] || exit 1
-echo 501
 """,
         )
         self._write_executable(
@@ -222,12 +215,6 @@ if [ -n "$out" ]; then
 else
   cat "$FAKE_MANIFEST"
 fi
-""",
-        )
-        self._write_executable(
-            "launchctl",
-            """#!/bin/sh
-printf '%s\n' "$*" >> "$FAKE_LAUNCHCTL_LOG"
 """,
         )
         self._write_executable(
@@ -296,10 +283,7 @@ print(value)
             "PATH": str(self.bin_dir),
             "FAKE_MANIFEST": str(manifest),
             "FAKE_PAYLOAD": str(self.payload),
-            "FAKE_LAUNCHCTL_LOG": str(self.launchctl_log),
             "HERDR_INSTALL_DIR": str(self.install_dir if install_dir is None else install_dir),
-            "HERDR_LAUNCH_AGENTS_DIR": str(self.launch_agents_dir),
-            "HERDR_LAUNCHCTL": str(self.bin_dir / "launchctl"),
             "HERDR_PLUTIL": str(self.bin_dir / "plutil"),
         }
         return subprocess.run(
@@ -310,7 +294,7 @@ print(value)
             check=False,
         )
 
-    def test_installs_direct_binary_and_launch_agent(self) -> None:
+    def test_installs_direct_self_updating_binary(self) -> None:
         result = self._run_installer(self.expected_sha256)
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -318,22 +302,10 @@ print(value)
         self.assertEqual(installed.read_bytes(), self.payload.read_bytes())
         self.assertFalse(installed.is_symlink())
         self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+        self.assertIn("installed self-updating client", result.stdout)
+        self.assertFalse(self.launch_agents_dir.exists())
+        self.assertFalse(self.launchctl_log.exists())
 
-        plist = self.launch_agents_dir / "ai.smartypants.herdr-auto-update.plist"
-        content = plist.read_text(encoding="utf-8")
-        self.assertEqual(plist.stat().st_mode & 0o777, 0o600)
-        self.assertIn(f"<string>{installed}</string>", content)
-        self.assertIn("<string>update</string>", content)
-        self.assertIn("<string>--handoff</string>", content)
-        self.assertIn("<integer>300</integer>", content)
-        self.assertEqual(
-            self.launchctl_log.read_text(encoding="utf-8").splitlines(),
-            [
-                "bootout gui/501/ai.smartypants.herdr-auto-update",
-                f"bootstrap gui/501 {plist}",
-                "kickstart -k gui/501/ai.smartypants.herdr-auto-update",
-            ],
-        )
     def test_rejects_relative_install_path(self) -> None:
         result = self._run_installer(self.expected_sha256, install_dir="relative")
 
