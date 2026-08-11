@@ -2128,6 +2128,12 @@ impl HeadlessServer {
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
     ) {
+        let delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
         if self.app.state.toast_config.delay_seconds != 0 {
             return;
         }
@@ -2157,7 +2163,7 @@ impl HeadlessServer {
             }
         }
 
-        if !should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+        if !should_forward_toast_to_clients(delivery) {
             return;
         }
         let Some(kind) = crate::app::actions::notification_toast_for_pane_state_update(
@@ -2186,7 +2192,7 @@ impl HeadlessServer {
             update.pane_id,
         );
         self.send_notify_to_foreground_client(
-            toast_notify_kind(self.app.state.toast_config.delivery)
+            toast_notify_kind(delivery)
                 .expect("toast forwarding requires a client notification kind"),
             format!("{agent_label} {event_text}"),
             non_empty_body(&context),
@@ -2197,6 +2203,12 @@ impl HeadlessServer {
         &mut self,
         delivery: &crate::app::state::AgentNotificationDelivery,
     ) {
+        let toast_delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
         if let Some(sound) = delivery.sound {
             self.send_notify_to_foreground_client(
                 protocol::NotifyKind::Sound,
@@ -2205,10 +2217,10 @@ impl HeadlessServer {
             );
         }
 
-        if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+        if should_forward_toast_to_clients(toast_delivery) {
             if let Some(toast) = &delivery.client_notification {
                 self.send_notify_to_foreground_client(
-                    toast_notify_kind(self.app.state.toast_config.delivery)
+                    toast_notify_kind(toast_delivery)
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
@@ -2257,7 +2269,14 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
         };
 
-        match self.app.state.toast_config.delivery {
+        self.sync_foreground_client_state();
+        let delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
+        match delivery {
             config::ToastDelivery::Off => {
                 return serde_json::to_string(&api::schema::SuccessResponse {
                     id,
@@ -2282,6 +2301,9 @@ impl HeadlessServer {
                 return response;
             }
             config::ToastDelivery::Terminal | config::ToastDelivery::System => {}
+            config::ToastDelivery::Hybrid => {
+                unreachable!("hybrid delivery must be resolved before notification routing")
+            }
         }
 
         let body = params
@@ -2298,8 +2320,7 @@ impl HeadlessServer {
             })
             .unwrap_or_else(|_| "{}".to_string());
         }
-        let kind = toast_notify_kind(self.app.state.toast_config.delivery)
-            .expect("terminal/system delivery has notify kind");
+        let kind = toast_notify_kind(delivery).expect("terminal/system delivery has notify kind");
         let shown = self.send_notify_to_foreground_client(kind, title, body);
         if shown {
             self.app.mark_api_notification_shown(Instant::now());
@@ -2492,28 +2513,18 @@ impl HeadlessServer {
                 false
             }
             AppEvent::StateChanged { pane_id, agent, .. } => {
-                // Capture toast before handling.
                 let toast_before = self.app.state.toast.clone();
                 let pane_id_val = *pane_id;
                 let agent_val = *agent;
-
-                // Find the previous effective state of this pane before the event
-                // is processed. Notifications must follow effective state changes,
-                // not raw fallback reports that may be masked by hook authority.
                 let prev_state = self.pane_effective_state(pane_id_val);
                 let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
 
-                // Handle the state change (updates pane state, sets toast on AppState).
-                // Headless mode disables local sound playback separately from the
-                // sound policy so reloads can keep server-side notification policy live.
                 self.sync_foreground_client_state();
                 let suppress_completion = self
                     .app
                     .handle_internal_event_with_pane_updates(ev)
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
-
-                // Forward sound notification to clients when server-side sound policy allows it.
                 let is_active_tab = self
                     .app
                     .state
@@ -2523,12 +2534,16 @@ impl HeadlessServer {
                         ws.find_tab_index_for_pane(pane_id_val)
                             .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
                     });
-
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);
-
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
 
                 if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
@@ -2553,7 +2568,7 @@ impl HeadlessServer {
 
                 let toast_msg = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
-                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                    && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
                         self.app
@@ -2578,7 +2593,7 @@ impl HeadlessServer {
 
                 if let Some(msg) = toast_msg {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
                     );
@@ -2591,15 +2606,9 @@ impl HeadlessServer {
                 agent_label,
                 ..
             } => {
-                // Hook reports can be stale or no-op after sequence rejection.
-                // Forward only effective state changes observed after handling.
                 let toast_before = self.app.state.toast.clone();
                 let pane_id_val = *pane_id;
                 let agent_val = crate::detect::parse_agent_label(agent_label);
-
-                // Capture the previous effective state for this pane. Hook reports
-                // are already folded into pane.state; raw hook transitions must not
-                // produce a second notification path.
                 let prev_state = self.pane_effective_state(pane_id_val);
                 let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
 
@@ -2609,9 +2618,6 @@ impl HeadlessServer {
                     .handle_internal_event_with_pane_updates(ev)
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
-
-                // Forward sound notification based on the effective transition when
-                // server-side sound policy allows it.
                 let is_active_tab = self
                     .app
                     .state
@@ -2621,12 +2627,16 @@ impl HeadlessServer {
                         ws.find_tab_index_for_pane(pane_id_val)
                             .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
                     });
-
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);
-
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
 
                 if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
@@ -2651,7 +2661,7 @@ impl HeadlessServer {
 
                 let toast_msg = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
-                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                    && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
                         self.app
@@ -2676,7 +2686,7 @@ impl HeadlessServer {
 
                 if let Some(msg) = toast_msg {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
                     );
@@ -2693,28 +2703,32 @@ impl HeadlessServer {
                 let install_command = install_command.clone();
 
                 self.app.handle_internal_event(ev);
-
-                let toast_msg =
-                    if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
-                        if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                            self.app
-                                .state
-                                .toast
-                                .as_ref()
-                                .map(|toast| format!("{}: {}", toast.title, toast.context))
-                        } else {
-                            Some(format!(
-                                "v{version} available: {}",
-                                crate::update::update_install_instruction(&install_command)
-                            ))
-                        }
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
+                let toast_msg = if should_forward_toast_to_clients(toast_delivery) {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
                     } else {
-                        None
-                    };
+                        Some(format!(
+                            "v{version} available: {}",
+                            crate::update::update_install_instruction(&install_command)
+                        ))
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(msg) = toast_msg {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
                     );
@@ -4003,20 +4017,24 @@ impl HeadlessServer {
         if let Some(revision_before) = pane_graphics_revision_before {
             changed |= revision_before != self.app.pane_graphics.revision();
         }
-
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
         // show a terminal or system notification.
         let toast_after = self.app.state.toast.clone();
-        let forwarded_toast_from_state = if should_forward_toast_to_clients(
-            self.app.state.toast_config.delivery,
-        ) && toast_after.is_some()
+        let toast_delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
+        let forwarded_toast_from_state = if should_forward_toast_to_clients(toast_delivery)
+            && toast_after.is_some()
             && toast_after != toast_before
         {
             if let Some(toast) = &toast_after {
                 debug!(title = %toast.title, body = %toast.context, "forwarding toast notification from API request");
                 self.send_notify_to_foreground_client(
-                    toast_notify_kind(self.app.state.toast_config.delivery)
+                    toast_notify_kind(toast_delivery)
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
@@ -4076,7 +4094,7 @@ impl HeadlessServer {
 
             if !forwarded_toast_from_state
                 && self.app.state.toast_config.delay_seconds == 0
-                && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                && should_forward_toast_to_clients(toast_delivery)
             {
                 if let Some(kind) =
                     crate::app::actions::notification_toast_for_state_change_with_agent_labels(
@@ -4110,7 +4128,7 @@ impl HeadlessServer {
                             *pane_id,
                         );
                         self.send_notify_to_foreground_client(
-                            toast_notify_kind(self.app.state.toast_config.delivery)
+                            toast_notify_kind(toast_delivery)
                                 .expect("toast forwarding requires a client notification kind"),
                             format!("{agent_label} {event_text}"),
                             non_empty_body(&context),
@@ -11647,7 +11665,7 @@ next_tab = ""
     }
 
     #[test]
-    fn system_toast_delivery_forwards_system_notify_kind() {
+    fn hybrid_unfocused_update_forwards_system_notify_kind() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -11657,14 +11675,15 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.sync_foreground_client_state();
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
@@ -11694,7 +11713,7 @@ next_tab = ""
     }
 
     #[test]
-    fn notification_show_api_forwards_system_notification_to_foreground_client() {
+    fn notification_show_api_hybrid_unfocused_forwards_system_notification() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -11704,14 +11723,14 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
@@ -11961,7 +11980,7 @@ next_tab = ""
     }
 
     #[test]
-    fn notification_show_api_forwards_sound_for_herdr_delivery() {
+    fn notification_show_api_hybrid_focused_stays_in_frame() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -11971,14 +11990,14 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(true),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
@@ -12089,7 +12108,7 @@ next_tab = ""
     }
 
     #[test]
-    fn delayed_agent_notification_forwards_after_deadline() {
+    fn delayed_hybrid_unfocused_agent_notification_forwards_system_toast() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
         let pane_id = background.tabs[0].root_pane;
@@ -12099,7 +12118,7 @@ next_tab = ""
         server.app.state.active = Some(1);
         server.app.state.selected = 1;
         server.app.state.mode = crate::app::Mode::Terminal;
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
         server.app.state.toast_config.delay_seconds = 1;
 
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
@@ -12109,7 +12128,7 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
@@ -12175,6 +12194,54 @@ next_tab = ""
             other => panic!("expected delayed system toast, got {other:?}"),
         }
         assert!(server.app.state.pending_agent_notifications.is_empty());
+    }
+
+    #[test]
+    fn hybrid_focused_agent_notification_stays_in_frame() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let pane_id = background.tabs[0].root_pane;
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![background, foreground];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
+        server.app.state.toast_config.delay_seconds = 0;
+        server.app.state.sound.enabled = false;
+
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
+        );
+        assert!(server.app.state.toast.is_some());
+        assert!(client_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]
