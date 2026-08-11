@@ -1,8 +1,15 @@
+#[cfg(test)]
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use super::env::*;
+#[cfg(test)]
+thread_local! {
+    static TEST_PATH: RefCell<Option<OsString>> = const { RefCell::new(None) };
+}
 
 pub(crate) fn integration_target_label(
     target: crate::api::schema::IntegrationTarget,
@@ -125,8 +132,35 @@ pub(crate) fn integration_target_install_layout_available(
     }
 }
 
+fn command_search_path() -> Option<OsString> {
+    #[cfg(test)]
+    if let Some(path) = TEST_PATH.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
+
+    std::env::var_os("PATH")
+}
+
+#[cfg(test)]
+pub(crate) struct TestPathGuard(Option<OsString>);
+
+#[cfg(test)]
+impl Drop for TestPathGuard {
+    fn drop(&mut self) {
+        TEST_PATH.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_path(path: impl Into<OsString>) -> TestPathGuard {
+    let previous = TEST_PATH.with(|slot| slot.replace(Some(path.into())));
+    TestPathGuard(previous)
+}
+
 pub(crate) fn command_available(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
+    let Some(paths) = command_search_path() else {
         return false;
     };
     std::env::split_paths(&paths).any(|dir| {
