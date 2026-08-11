@@ -10,6 +10,16 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Optional compile-time update manifest for fork builds.
+pub fn update_manifest_url() -> Option<&'static str> {
+    non_empty(option_env!("HERDR_BUILD_UPDATE_MANIFEST_URL"))
+}
+
+/// Whether this build must use preview-style update selection.
+pub fn uses_preview_update_manifest() -> bool {
+    update_manifest_url().is_some() || is_preview()
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),
