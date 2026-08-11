@@ -1194,7 +1194,8 @@ fn reconcile_local_client_to_running_server(status: &RemoteServerStatus) -> io::
         .sha256
         .as_deref()
         .expect("validated remote asset has a checksum");
-    crate::update::install_exact_asset_and_reexec(&asset.url, checksum).map_err(io::Error::other)
+    crate::update::install_exact_asset_and_reexec(&build.build_id, &asset.url, checksum)
+        .map_err(io::Error::other)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
