@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -753,6 +753,9 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// Open this validated HTTP(S) URL on the targeted client's local desktop.
+    OpenUrl { url: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,7 +1187,7 @@ mod tests {
             ],
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-        // Freeze the protocol 20 input envelope before it is published.
+        // Freeze the protocol 21 input envelope before it is published.
         assert_eq!(
             encoded,
             vec![
@@ -1641,6 +1644,17 @@ mod tests {
     #[test]
     fn server_terminal_bell_roundtrip() {
         let msg = ServerMessage::TerminalBell { count: 3 };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_open_url_roundtrip() {
+        let msg = ServerMessage::OpenUrl {
+            url: "https://example.com/issues/21".to_owned(),
+        };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();

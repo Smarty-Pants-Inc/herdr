@@ -162,6 +162,9 @@ pub struct App {
     /// The headless server sets this to false: the switch belongs to the foreground client,
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
+    /// Whether this process opens `AppEvent::OpenUrl` on its local desktop.
+    /// The headless server sets this to false and forwards the intent instead.
+    pub(crate) local_url_opening: bool,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
@@ -801,6 +804,7 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             local_input_source_switch: true,
+            local_url_opening: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };

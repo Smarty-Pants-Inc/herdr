@@ -607,10 +607,16 @@ impl App {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
-        if crate::app::actions::safe_web_url(&url).is_some() {
-            if let Err(err) = crate::platform::open_url(&url) {
-                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
-            }
+        if crate::app::actions::safe_web_url(&url).is_some()
+            && self
+                .event_tx
+                .try_send(crate::events::AppEvent::OpenUrl {
+                    url: url.clone(),
+                    source_id,
+                })
+                .is_err()
+        {
+            tracing::warn!(url = %url, "failed to queue pane URL opening");
         }
         true
     }

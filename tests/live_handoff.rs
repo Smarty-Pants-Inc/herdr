@@ -142,8 +142,9 @@ fn spawn_remote_client(
     cmd.env(
         "PATH",
         format!(
-            "{}:{}",
+            "{}:{}:{}",
             fake_bin.display(),
+            remote_bin.parent().unwrap().display(),
             std::env::var("PATH").unwrap_or_default()
         ),
     );

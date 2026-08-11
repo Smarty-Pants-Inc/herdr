@@ -16,7 +16,7 @@
 
 ### Changed
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding.
-- Bumped the client/server protocol version to 20 for pane terminal bell forwarding.
+- Bumped the client/server protocol version to 21 for client-local HTTP(S) link opening.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 - Full-app clients attached to the same session now navigate workspaces, tabs, pane focus, focus history, and zoom independently while continuing to share panes, processes, and output.
 
@@ -34,6 +34,7 @@
 - Claude Code confirmation prompts using `Enter to confirm · Esc to cancel` now report `blocked` instead of `idle`. (#2268)
 - Sidebar agent lists keep scrolling when differently sized clients are attached to the same session. (#2255, thanks @aiworkflowpro)
 - `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+- Remote attaches now open unhandled HTTP(S) pane links on the clicking client's desktop while plugin-handled `file://` links stay in the remote workspace.
 
 ## [0.8.0] - 2026-08-03
 
