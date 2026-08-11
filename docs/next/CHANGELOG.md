@@ -19,6 +19,7 @@
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding.
 - Bumped the client/server protocol version to 20 for pane terminal bell forwarding.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
+- Full-app clients attached to the same session now navigate workspaces, tabs, pane focus, focus history, and zoom independently while continuing to share panes, processes, and output.
 
 ### Fixed
 - `agent prompt` now rejects agents already waiting at approval or question dialogs with `agent_blocked`, without sending text or Enter. (#2788)
