@@ -698,9 +698,8 @@ fn prepare_remote_herdr(
 
     if !remote_binary_matches(ssh, &remote_herdr)? {
         return Err(io::Error::other(format!(
-            "installed remote herdr at {}, but it did not report version {}",
-            remote_herdr.shell_path,
-            current_version()
+            "installed remote herdr at {}, but it did not report protocol {}",
+            remote_herdr.shell_path, CURRENT_PROTOCOL
         )));
     }
     warn_if_remote_bin_not_on_path(ssh)?;
@@ -858,19 +857,12 @@ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<Remo
     if !path.starts_with('/') {
         return None;
     }
-    if is_mise_shim_path(path) {
-        return None;
-    }
     Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
-}
-
-fn is_mise_shim_path(path: &str) -> bool {
-    path.ends_with("/mise/shims/herdr")
 }
 
 fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = format!(
-        "test -x {0} && {0} --version && {0} status client --json",
+        "test -x {0} && {0} status client --json",
         remote_herdr.shell_path
     );
     let output = ssh.sh_output(&command)?;
@@ -878,14 +870,15 @@ fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Res
         return Ok(false);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut lines = stdout.lines();
-    let version = lines.next().unwrap_or_default().trim();
-    let status = lines.next().unwrap_or_default();
-    Ok(version == format!("herdr {}", current_version())
-        && parse_client_status_json(status)
-            .map(|status| status.protocol == CURRENT_PROTOCOL)
-            .unwrap_or(false))
+    Ok(remote_client_status_is_compatible(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+fn remote_client_status_is_compatible(status: &str) -> bool {
+    parse_client_status_json(status)
+        .map(|status| status.protocol == CURRENT_PROTOCOL)
+        .unwrap_or(false)
 }
 
 fn remote_binary_exists(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
@@ -964,24 +957,30 @@ fn resolve_install_source(
         return Ok(InstallSource::persistent(path));
     }
 
-    if *platform == RemotePlatform::local() {
-        let path = std::env::current_exe()?;
-        if !crate::update::is_package_manager_managed_exe_path(&path) {
-            return Ok(InstallSource::persistent(path));
-        }
+    if local_binary_can_seed_remote(platform) {
+        return Ok(InstallSource::persistent(std::env::current_exe()?));
     }
 
     download_release_asset(platform)
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
-    if *platform != RemotePlatform::local() {
-        return false;
-    }
+    let current_exe = std::env::current_exe().ok();
+    local_binary_can_seed_remote_from(
+        platform,
+        crate::build_info::update_manifest_url().is_some(),
+        current_exe.as_deref(),
+    )
+}
 
-    std::env::current_exe()
-        .map(|path| !crate::update::is_package_manager_managed_exe_path(&path))
-        .unwrap_or(false)
+fn local_binary_can_seed_remote_from(
+    platform: &RemotePlatform,
+    has_update_manifest: bool,
+    current_exe: Option<&Path>,
+) -> bool {
+    !has_update_manifest
+        && *platform == RemotePlatform::local()
+        && current_exe.is_some_and(|path| !crate::update::is_package_manager_managed_exe_path(path))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1000,7 +999,6 @@ enum RemoteServerRestartReason {
     ProtocolMismatch,
     DaemonDetachMissing,
     BinaryUpdated,
-    VersionMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1028,12 +1026,9 @@ fn ensure_remote_server_ready(
         return Ok(());
     };
 
-    let Some(reason) = remote_server_restart_reason(
-        version.as_deref(),
-        protocol,
-        detached_server_daemon,
-        remote_binary_changed,
-    ) else {
+    let Some(reason) =
+        remote_server_restart_reason(protocol, detached_server_daemon, remote_binary_changed)
+    else {
         return Ok(());
     };
 
@@ -1059,7 +1054,6 @@ fn ensure_remote_server_ready(
 }
 
 fn remote_server_restart_reason(
-    version: Option<&str>,
     protocol: Option<u32>,
     detached_server_daemon: bool,
     remote_binary_changed: bool,
@@ -1069,9 +1063,6 @@ fn remote_server_restart_reason(
     }
     if !detached_server_daemon {
         return Some(RemoteServerRestartReason::DaemonDetachMissing);
-    }
-    if version != Some(current_version().as_str()) {
-        return Some(RemoteServerRestartReason::VersionMismatch);
     }
     if remote_binary_changed {
         return Some(RemoteServerRestartReason::BinaryUpdated);
@@ -1121,7 +1112,6 @@ fn confirm_remote_install_with_running_server(
         return Ok(false);
     };
     let plan = remote_install_running_server_plan(
-        version.as_deref(),
         *protocol,
         *detached_server_daemon,
         true,
@@ -1191,19 +1181,15 @@ fn confirm_remote_install_with_running_server(
 }
 
 fn remote_install_running_server_plan(
-    version: Option<&str>,
     protocol: Option<u32>,
     detached_server_daemon: bool,
     remote_binary_changed: bool,
     live_handoff: bool,
     live_handoff_enabled: bool,
 ) -> RemoteInstallRunningServerPlan {
-    let Some(reason) = remote_server_restart_reason(
-        version,
-        protocol,
-        detached_server_daemon,
-        remote_binary_changed,
-    ) else {
+    let Some(reason) =
+        remote_server_restart_reason(protocol, detached_server_daemon, remote_binary_changed)
+    else {
         return RemoteInstallRunningServerPlan::KeepRunning;
     };
 
@@ -1314,11 +1300,6 @@ fn confirm_remote_server_stop(
         RemoteServerRestartReason::BinaryUpdated => {
             eprintln!(
                 "the remote herdr binary was installed or replaced. restart the remote server so it uses the prepared binary."
-            );
-        }
-        RemoteServerRestartReason::VersionMismatch => {
-            eprintln!(
-                "the remote server is still running a different herdr version. restart it so it uses the prepared binary."
             );
         }
     }
@@ -2825,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_path_discovery_ignores_mise_shims() {
+    fn remote_path_discovery_accepts_mise_shims() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
@@ -2835,9 +2816,13 @@ mod tests {
             "/home/can/.local/share/mise/shims/herdr\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr\n",
         );
 
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(
             candidates[0].shell_path,
+            "/home/can/.local/share/mise/shims/herdr"
+        );
+        assert_eq!(
+            candidates[1].shell_path,
             "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr"
         );
     }
@@ -3176,22 +3161,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_client_status_accepts_same_protocol_different_version() {
+        assert!(remote_client_status_is_compatible(&format!(
+            r#"{{"version":"older-preview","protocol":{CURRENT_PROTOCOL},"binary":"/bin/herdr"}}"#
+        )));
+    }
+
+    #[test]
+    fn remote_client_status_rejects_protocol_mismatch() {
+        let incompatible_protocol = if CURRENT_PROTOCOL == 0 { 1 } else { 0 };
+        assert!(!remote_client_status_is_compatible(&format!(
+            r#"{{"version":"newer-preview","protocol":{incompatible_protocol},"binary":"/bin/herdr"}}"#
+        )));
+    }
+
+    #[test]
     fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
         assert_eq!(
-            remote_server_restart_reason(Some(&current_version()), Some(0), true, false),
+            remote_server_restart_reason(Some(0), true, false),
             Some(RemoteServerRestartReason::ProtocolMismatch)
         );
     }
 
     #[test]
-    fn remote_server_restart_reason_allows_unchanged_compatible_server() {
+    fn remote_server_restart_reason_allows_compatible_server() {
         assert_eq!(
-            remote_server_restart_reason(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                true,
-                false
-            ),
+            remote_server_restart_reason(Some(CURRENT_PROTOCOL), true, false),
             None
         );
     }
@@ -3199,12 +3194,7 @@ mod tests {
     #[test]
     fn remote_server_restart_reason_requires_restart_for_old_daemon() {
         assert_eq!(
-            remote_server_restart_reason(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                false,
-                false
-            ),
+            remote_server_restart_reason(Some(CURRENT_PROTOCOL), false, false),
             Some(RemoteServerRestartReason::DaemonDetachMissing)
         );
     }
@@ -3212,48 +3202,31 @@ mod tests {
     #[test]
     fn remote_server_restart_reason_requires_restart_after_helper_update() {
         assert_eq!(
-            remote_server_restart_reason(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                true,
-                true
-            ),
+            remote_server_restart_reason(Some(CURRENT_PROTOCOL), true, true),
             Some(RemoteServerRestartReason::BinaryUpdated)
         );
     }
 
     #[test]
-    fn remote_server_restart_reason_offers_restart_for_version_mismatch() {
-        assert_eq!(
-            remote_server_restart_reason(Some("0.0.0"), Some(CURRENT_PROTOCOL), true, false),
-            Some(RemoteServerRestartReason::VersionMismatch)
-        );
-        assert_eq!(
-            remote_server_restart_reason(None, Some(CURRENT_PROTOCOL), true, false),
-            Some(RemoteServerRestartReason::VersionMismatch)
-        );
-    }
+    fn remote_install_plan_keeps_same_protocol_different_version_server() {
+        let RemoteServerStatus::Running {
+            version: Some(version),
+            protocol,
+            detached_server_daemon,
+            ..
+        } = parse_remote_server_status_json(&format!(
+            r#"{{"status":"running","running":true,"version":"older-preview","protocol":{CURRENT_PROTOCOL},"capabilities":{{"live_handoff":false,"detached_server_daemon":true}}}}"#
+        ))
+        .unwrap()
+        else {
+            panic!("expected running server");
+        };
+        assert_eq!(version, "older-preview");
 
-    #[test]
-    fn remote_server_restart_reason_allows_current_server() {
-        assert_eq!(
-            remote_server_restart_reason(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                true,
-                false
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn remote_install_plan_keeps_compatible_running_server() {
         assert_eq!(
             remote_install_running_server_plan(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                true,
+                protocol,
+                detached_server_daemon,
                 false,
                 false,
                 false
@@ -3265,14 +3238,7 @@ mod tests {
     #[test]
     fn remote_install_plan_requires_stop_for_old_daemon() {
         assert_eq!(
-            remote_install_running_server_plan(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                false,
-                true,
-                false,
-                false
-            ),
+            remote_install_running_server_plan(Some(CURRENT_PROTOCOL), false, true, false, false),
             RemoteInstallRunningServerPlan::StopRequired(
                 RemoteServerRestartReason::DaemonDetachMissing
             )
@@ -3282,46 +3248,15 @@ mod tests {
     #[test]
     fn remote_install_plan_requires_stop_after_helper_update() {
         assert_eq!(
-            remote_install_running_server_plan(
-                Some(&current_version()),
-                Some(CURRENT_PROTOCOL),
-                true,
-                true,
-                false,
-                false
-            ),
+            remote_install_running_server_plan(Some(CURRENT_PROTOCOL), true, true, false, false),
             RemoteInstallRunningServerPlan::StopRequired(RemoteServerRestartReason::BinaryUpdated)
         );
     }
 
     #[test]
-    fn remote_install_plan_requires_stop_for_incompatible_running_server() {
+    fn remote_install_plan_uses_live_handoff_after_helper_update() {
         assert_eq!(
-            remote_install_running_server_plan(
-                Some("0.0.0"),
-                Some(CURRENT_PROTOCOL),
-                true,
-                true,
-                false,
-                false
-            ),
-            RemoteInstallRunningServerPlan::StopRequired(
-                RemoteServerRestartReason::VersionMismatch
-            )
-        );
-    }
-
-    #[test]
-    fn remote_install_plan_uses_live_handoff_for_incompatible_running_server() {
-        assert_eq!(
-            remote_install_running_server_plan(
-                Some("0.0.0"),
-                Some(CURRENT_PROTOCOL),
-                true,
-                true,
-                true,
-                true
-            ),
+            remote_install_running_server_plan(Some(CURRENT_PROTOCOL), true, true, true, true),
             RemoteInstallRunningServerPlan::LiveHandoff
         );
     }
@@ -3361,6 +3296,23 @@ mod tests {
                 platform.asset_key()
             )
         );
+    }
+
+    #[test]
+    fn manifest_builds_cannot_seed_remote_from_current_executable() {
+        let platform = RemotePlatform::local();
+        let executable = Path::new("/tmp/herdr");
+
+        assert!(local_binary_can_seed_remote_from(
+            &platform,
+            false,
+            Some(executable)
+        ));
+        assert!(!local_binary_can_seed_remote_from(
+            &platform,
+            true,
+            Some(executable)
+        ));
     }
 
     #[test]
