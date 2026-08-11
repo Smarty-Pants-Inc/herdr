@@ -1962,6 +1962,9 @@ async fn run_client_loop(
                         prefix_input_source.restore();
                     }
                 }
+                ServerMessage::OpenUrl { url } => {
+                    open_safe_url(&url, crate::platform::open_url);
+                }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
                 }
@@ -2389,6 +2392,15 @@ fn recognized_image_extension(extension: &str) -> Option<&'static str> {
     }
 }
 
+/// Opens a server-forwarded URL only when it remains safe on this client.
+fn open_safe_url(url: &str, open: impl FnOnce(&str) -> io::Result<()>) {
+    let Some(url) = crate::web_url::safe_web_url(url) else {
+        return;
+    };
+    if let Err(err) = open(url) {
+        warn!(err = %err, url = %url, "failed to open server URL");
+    }
+}
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
 // ---------------------------------------------------------------------------
@@ -3644,6 +3656,30 @@ mod tests {
                 Some("api workspace".to_string())
             ))
         );
+    }
+
+    #[test]
+    fn open_safe_url_accepts_http_and_https() {
+        let mut opened = Vec::new();
+        for url in ["http://example.com", "https://example.com"] {
+            open_safe_url(url, |url| {
+                opened.push(url.to_owned());
+                Ok(())
+            });
+        }
+        assert_eq!(opened, ["http://example.com", "https://example.com"]);
+    }
+
+    #[test]
+    fn open_safe_url_rejects_file_and_custom_schemes() {
+        let mut calls = 0;
+        for url in ["file:///tmp/example.rs", "mailto:user@example.com"] {
+            open_safe_url(url, |_| {
+                calls += 1;
+                Ok(())
+            });
+        }
+        assert_eq!(calls, 0);
     }
 
     #[test]

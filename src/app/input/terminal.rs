@@ -1008,6 +1008,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ctrl_click_web_url_queues_open_url_effect() {
+        let url = "https://example.com/issues/21";
+        let col = url.find("example").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+
+        app.handle_mouse(modified_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + col,
+            info.inner_rect.y,
+            KeyModifiers::CONTROL,
+        ));
+
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl {
+                url: opened,
+                source_id,
+            } => {
+                assert_eq!(opened, url);
+                assert_eq!(source_id, 0);
+            }
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
@@ -1267,6 +1292,10 @@ mod tests {
         assert!(
             input_rx.try_recv().is_err(),
             "handled file link must not reach pane"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "plugin-handled file link must not queue an OpenUrl event"
         );
     }
 

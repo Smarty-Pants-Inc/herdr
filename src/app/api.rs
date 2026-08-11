@@ -122,6 +122,17 @@ impl App {
             return Vec::new();
         }
 
+        if let AppEvent::OpenUrl { url, source_id } = ev {
+            if source_id == super::LOCAL_INPUT_SOURCE
+                && crate::web_url::safe_web_url(&url).is_some()
+            {
+                if let Err(err) = crate::platform::open_url(&url) {
+                    tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+                }
+            }
+            return Vec::new();
+        }
+
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);

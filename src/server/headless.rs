@@ -2454,6 +2454,12 @@ impl HeadlessServer {
                 });
                 true
             }
+            AppEvent::OpenUrl { url, source_id } => {
+                if crate::web_url::safe_web_url(url).is_some() {
+                    self.send_to_client(*source_id, ServerMessage::OpenUrl { url: url.clone() });
+                }
+                false
+            }
             AppEvent::StateChanged { pane_id, agent, .. } => {
                 // Capture toast before handling.
                 let toast_before = self.app.state.toast.clone();
@@ -2720,18 +2726,19 @@ impl HeadlessServer {
         }
     }
 
-    /// Drains internal events, forwarding clipboard, sound, and toast
+    /// Drains internal events, forwarding clipboard, sound, toast, and URL-opening
     /// notifications to connected clients instead of processing them locally.
     ///
     /// In the monolithic mode:
     /// - `ClipboardWrite` events are written to stdout via `write_osc52_bytes`.
     /// - Sound notifications are played locally via `sound::play`.
     /// - Toast notifications are set on AppState and rendered into the frame.
+    /// - `OpenUrl` events open their safe HTTP(S) URL on the local desktop.
     ///
-    /// In the headless server, there is no stdout terminal or audio subsystem,
+    /// In the headless server, there is no stdout terminal, audio subsystem, or local desktop,
     /// so we:
-    /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the
-    ///   foreground client only.
+    /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the foreground client only.
+    /// - Forward `OpenUrl` as `ServerMessage::OpenUrl` to the originating input client only.
     /// - Detect when a sound would be played and forward as
     ///   `ServerMessage::Notify { kind: Sound }` to the foreground client.
     /// - Detect when a toast is set on AppState and forward as
@@ -11034,6 +11041,76 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "bells without a foreground client must not be retained"
+        );
+    }
+    #[test]
+    fn open_url_targets_originating_client_without_changing_foreground() {
+        let mut server = test_headless_server();
+        let (origin_tx, origin_control_rx, _origin_rx) = test_client_writer();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(origin_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::OpenUrl {
+            url: "https://example.com/issues/21".into(),
+            source_id: 1,
+        });
+
+        assert!(!changed);
+        assert_eq!(server.foreground_client_id, Some(2));
+        match read_server_message(
+            origin_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("originating client open URL message"),
+        ) {
+            ServerMessage::OpenUrl { url } => assert_eq!(url, "https://example.com/issues/21"),
+            other => panic!("expected OpenUrl message, got {other:?}"),
+        }
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "non-originating client should not receive URL opens"
+        );
+        server.handle_internal_event_with_forwarding(AppEvent::OpenUrl {
+            url: "file:///tmp/example.rs".into(),
+            source_id: 1,
+        });
+        assert!(
+            origin_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "server must not forward file URLs to the originating client"
+        );
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "server must not forward file URLs to another client"
         );
     }
 
