@@ -1085,9 +1085,9 @@ fn multi_client_keeps_navigation_and_input_routing_independent() {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let a_first_marker = format!("CLIENT_A_FIRST_{unique}");
-    let a_marker = format!("CLIENT_A_RIGHT_{unique}");
-    let b_marker = format!("CLIENT_B_{unique}");
+    let a_first_marker = format!("A1_{unique:x}");
+    let a_marker = format!("AR_{unique:x}");
+    let b_marker = format!("B_{unique:x}");
     assert!(
         pane_send_input_until_contains(
             &api_socket,
