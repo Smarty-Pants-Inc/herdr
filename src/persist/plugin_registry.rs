@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
@@ -8,12 +10,42 @@ use crate::api::schema::InstalledPluginInfo;
 pub const MANIFEST_UNAVAILABLE_WARNING_PREFIX: &str = "manifest unavailable: ";
 const REGISTRY_LOCK_FILE: &str = ".plugins.lock";
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REGISTRY_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
 fn registry_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_REGISTRY_PATH.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+
     crate::config::config_dir().join("plugins.json")
 }
 
 fn registry_lock_path() -> PathBuf {
-    crate::config::config_dir().join(REGISTRY_LOCK_FILE)
+    registry_path().with_file_name(REGISTRY_LOCK_FILE)
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_registry_path<T>(path: PathBuf, operation: impl FnOnce() -> T) -> T {
+    struct Restore<'a> {
+        slot: &'a RefCell<Option<PathBuf>>,
+        previous: Option<PathBuf>,
+    }
+
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = self.slot.replace(self.previous.take());
+        }
+    }
+
+    TEST_REGISTRY_PATH.with(|slot| {
+        let previous = slot.replace(Some(path));
+        let _restore = Restore { slot, previous };
+        operation()
+    })
 }
 
 fn with_registry_lock<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {

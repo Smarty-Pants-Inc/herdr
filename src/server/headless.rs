@@ -5386,6 +5386,8 @@ mod tests {
         assert!(!server.retained_pty_update_allowed_by_app_state());
     }
 
+    static NEXT_TEST_SERVER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
     fn test_headless_server() -> HeadlessServer {
         test_headless_server_with_event_hub(api::EventHub::default())
     }
@@ -5401,10 +5403,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            NEXT_TEST_SERVER_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("client.sock");
@@ -6366,7 +6365,7 @@ new_tab = "prefix+t"
                 .unwrap_or(0)
         ));
         std::fs::write(&path, "onboarding = false\n").unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -6438,7 +6437,7 @@ next_tab = ""
             "onboarding = false\n[keys]\nnew_workspace = \"x\"\n[ui.toast]\ndelivery = \"off\"\n",
         )
         .unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();

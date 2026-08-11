@@ -2837,6 +2837,8 @@ mod tests {
         ));
     }
 
+    static NEXT_TEMP_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
     struct TempImageFile {
         path: std::path::PathBuf,
     }
@@ -2851,8 +2853,9 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let id = NEXT_TEMP_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "herdr-client-drop-{name_fragment}-{}-{nanos}.{extension}",
+                "herdr-client-drop-{name_fragment}-{}-{nanos}-{id}.{extension}",
                 std::process::id()
             ));
             std::fs::write(&path, bytes).unwrap();
@@ -3459,7 +3462,7 @@ mod tests {
 
     #[test]
     fn reload_local_client_config_refreshes_local_client_presentation_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-client-config-reload-{}-{}.toml",
             std::process::id(),
