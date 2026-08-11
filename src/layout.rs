@@ -117,6 +117,24 @@ impl TileLayout {
     pub fn focused(&self) -> PaneId {
         self.focus
     }
+    /// Change projected focus without rewriting close-navigation history.
+    pub(crate) fn project_focus_state(
+        &mut self,
+        focused: PaneId,
+        previous: Option<PaneId>,
+    ) -> bool {
+        let pane_ids = self.pane_ids();
+        if !pane_ids.contains(&focused) {
+            return false;
+        }
+        self.focus = focused;
+        self.prev_focus = previous.filter(|id| *id != focused && pane_ids.contains(id));
+        true
+    }
+
+    pub(crate) fn previous_focus(&self) -> Option<PaneId> {
+        self.prev_focus
+    }
 
     pub fn pane_count(&self) -> usize {
         count_panes(&self.root)
