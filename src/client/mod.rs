@@ -931,6 +931,65 @@ enum ClientLoopEvent {
     Timer,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct ClientExecutableIdentity {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl ClientExecutableIdentity {
+    fn capture() -> Option<Self> {
+        Self::capture_at(std::env::current_exe().ok()?)
+    }
+
+    fn capture_at(path: std::path::PathBuf) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn was_replaced(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        std::fs::metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() != self.device || metadata.ino() != self.inode)
+    }
+
+    fn exec_replacement(&self) -> io::Error {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(&self.path);
+        command.args(std::env::args_os().skip(1));
+        command.exec()
+    }
+}
+
+#[cfg(unix)]
+fn should_relaunch_updated_client(
+    error: &ClientError,
+    direct_attach_requested: bool,
+    remote_client: bool,
+    executable_replaced: bool,
+) -> bool {
+    if direct_attach_requested || remote_client || !executable_replaced {
+        return false;
+    }
+
+    match error {
+        ClientError::ConnectionLost(_) => true,
+        ClientError::ServerShutdown { reason } => reason.as_deref() != Some("detached"),
+        _ => false,
+    }
+}
+
 /// Runs the thin client: connects to the server, performs the handshake,
 /// and enters the main event loop.
 ///
@@ -1239,6 +1298,11 @@ fn run_client_with_mode(
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    #[cfg(unix)]
+    let client_executable = ClientExecutableIdentity::capture();
+    #[cfg(unix)]
+    let remote_client = std::env::var_os(crate::remote::REATTACH_COMMAND_ENV_VAR).is_some();
+
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
     let loop_config = ClientLoopConfig {
@@ -1364,9 +1428,29 @@ fn run_client_with_mode(
     let terminal_restore_failed = terminal_guard.restore().is_err();
 
     if let Err(err) = result {
-        let _ = writeln!(io::stderr(), "herdr: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
+
+        #[cfg(unix)]
+        if let Some(executable) = client_executable.as_ref().filter(|executable| {
+            should_relaunch_updated_client(
+                &err,
+                direct_attach_requested,
+                remote_client,
+                executable.was_replaced(),
+            )
+        }) {
+            info!(path = %executable.path.display(), "relaunching updated client");
+            let relaunch_error = executable.exec_replacement();
+            let _ = writeln!(io::stderr(), "herdr: {err}");
+            let _ = writeln!(
+                io::stderr(),
+                "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+            );
+            std::process::exit(1);
+        }
+
+        let _ = writeln!(io::stderr(), "herdr: {err}");
 
         let detached = matches!(
             &err,
@@ -3296,6 +3380,62 @@ mod tests {
             AttachInputAction::Forward(bytes) => assert_eq!(bytes, b"\x1b[5;5~"),
             other => panic!("expected modified page key to forward, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_identity_detects_atomic_replacement() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-client-relaunch-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("herdr");
+        let replacement = dir.join("herdr.new");
+        std::fs::write(&executable, b"old").unwrap();
+        let identity = ClientExecutableIdentity::capture_at(executable.clone()).unwrap();
+
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+
+        assert!(identity.was_replaced());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_local_app_client_relaunches_only_after_server_disconnect() {
+        let lost = ClientError::ConnectionLost(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed connection",
+        ));
+        assert!(should_relaunch_updated_client(&lost, false, false, true));
+        assert!(!should_relaunch_updated_client(&lost, true, false, true));
+        assert!(!should_relaunch_updated_client(&lost, false, true, true));
+        assert!(!should_relaunch_updated_client(&lost, false, false, false));
+
+        let shutdown = ClientError::ServerShutdown {
+            reason: Some("live update in progress".into()),
+        };
+        assert!(should_relaunch_updated_client(
+            &shutdown, false, false, true
+        ));
+        let detached = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        assert!(!should_relaunch_updated_client(
+            &detached, false, false, true
+        ));
+        let rejected = ClientError::HandshakeRejected {
+            version: 1,
+            error: "incompatible".into(),
+        };
+        assert!(!should_relaunch_updated_client(
+            &rejected, false, false, true
+        ));
     }
 
     #[test]
