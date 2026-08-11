@@ -412,29 +412,15 @@ test "$sid" = "$$"
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.sock");
 
-        // Create a socket and immediately drop the listener.
-        // This leaves a stale socket file with nobody listening.
-        {
-            let _listener = UnixListener::bind(&path).unwrap();
+        // A concurrently forked child can briefly inherit the listener before
+        // exec closes it, so stale detection is eventually consistent.
+        drop(UnixListener::bind(&path).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while is_server_listening_at(&path) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
         }
 
-        // The socket file exists but nobody is listening.
         assert!(!is_server_listening_at(&path));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn is_server_listening_returns_false_when_listener_dropped() {
-        let dir = unique_test_dir("dropped");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.sock");
-
-        // Bind and immediately drop the listener.
-        drop(UnixListener::bind(&path).unwrap());
-
-        // Socket is stale — should return false.
-        assert!(!is_server_listening_at(&path));
-
         let _ = std::fs::remove_dir_all(dir);
     }
 
