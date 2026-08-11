@@ -1520,17 +1520,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_workspace_ids_are_short_base32_handles() {
+    fn generated_workspace_ids_are_readable_base32_handles() {
         let first = generate_workspace_id();
         let second = generate_workspace_id();
 
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
+
+        let first_number = public_workspace_number(&first).expect("first id must decode");
+        let second_number = public_workspace_number(&second).expect("second id must decode");
         assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
+            second_number > first_number,
+            "workspace ids must increase: {first}, {second}"
         );
     }
 
