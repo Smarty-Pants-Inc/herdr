@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
-    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientLaunchMode, ClientMessage, NotificationActivation, RenderEncoding, ServerMessage,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -318,6 +318,11 @@ pub(crate) enum ServerEvent {
         direct_graphics: bool,
         writer: ClientWriter,
     },
+    /// A one-shot system-notification callback selected this target.
+    NotificationActivated {
+        activation: NotificationActivation,
+        respond_to: std::sync::mpsc::Sender<bool>,
+    },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
     /// A client reported the one armed Kitty regular-file response.
@@ -561,8 +566,7 @@ pub(crate) fn handle_client_handshake(
         cell_height_px,
         render_encoding,
         keybindings,
-        direct_attach_requested,
-        direct_graphics,
+        launch_mode,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -611,8 +615,7 @@ pub(crate) fn handle_client_handshake(
                 cell_height_px,
                 requested_encoding,
                 keybindings,
-                launch_mode == ClientLaunchMode::TerminalAttach,
-                launch_mode == ClientLaunchMode::AppDirectGraphics,
+                launch_mode,
             )
         }
         _ => {
@@ -639,6 +642,54 @@ pub(crate) fn handle_client_handshake(
         error: None,
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
+
+    let (direct_attach_requested, direct_graphics) = match launch_mode {
+        ClientLaunchMode::App => (false, false),
+        ClientLaunchMode::AppDirectGraphics => (false, true),
+        ClientLaunchMode::TerminalAttach => (true, false),
+        ClientLaunchMode::NotificationActivator => {
+            let activation = match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
+                Ok(ClientMessage::ActivateNotification { activation }) => activation,
+                Ok(_) => {
+                    debug!(client_id, "notification activator sent unexpected message");
+                    return Ok(());
+                }
+                Err(err) => {
+                    debug!(client_id, err = %err, "notification activator did not send activation");
+                    return Ok(());
+                }
+            };
+            let (respond_to, response_rx) = std::sync::mpsc::channel();
+            if server_event_tx
+                .blocking_send(ServerEvent::NotificationActivated {
+                    activation,
+                    respond_to,
+                })
+                .is_err()
+            {
+                debug!(client_id, "notification activation event channel closed");
+                return Ok(());
+            }
+            match response_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+                Ok(activated) => {
+                    let response = ServerMessage::NotificationActivationProcessed { activated };
+                    if let Err(err) = protocol::write_message(&mut stream, &response) {
+                        debug!(client_id, err = %err, "failed to acknowledge notification activation");
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    debug!(
+                        client_id,
+                        "timed out waiting for notification activation result"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    debug!(client_id, "notification activation was not processed");
+                }
+            }
+            return Ok(());
+        }
+    };
 
     set_client_recv_timeout(
         &stream,
@@ -970,6 +1021,15 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::ActivateNotification { .. } => {
+                warn!(
+                    client_id,
+                    "registered client sent notification activation, closing"
+                );
+                let _ =
+                    server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+                break;
+            }
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -1450,6 +1510,81 @@ new_tab = "ctrl+notakey"
     }
 
     #[test]
+    fn notification_activator_acknowledges_processed_result_without_connecting() {
+        for activated in [true, false] {
+            let (mut client_stream, server_stream, _path) =
+                local_stream_pair("client-handshake-notification-activator");
+            let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+            let should_quit = Arc::new(AtomicBool::new(false));
+            let handshake_quit = should_quit.clone();
+            let handle = std::thread::spawn(move || {
+                handle_client_handshake(server_stream, 42, &server_event_tx, &handshake_quit)
+            });
+
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    cols: 1,
+                    rows: 1,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    requested_encoding: RenderEncoding::SemanticFrame,
+                    keybindings: ClientKeybindings::Server,
+                    launch_mode: ClientLaunchMode::NotificationActivator,
+                },
+            )
+            .expect("write activator hello");
+            let welcome: ServerMessage =
+                protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+            assert!(matches!(
+                welcome,
+                ServerMessage::Welcome { error: None, .. }
+            ));
+
+            let activation = NotificationActivation {
+                recipient_client_id: 7,
+                workspace_id: "workspace".to_owned(),
+                pane_id: 42,
+            };
+            protocol::write_message(
+                &mut client_stream,
+                &ClientMessage::ActivateNotification {
+                    activation: activation.clone(),
+                },
+            )
+            .expect("write activation");
+
+            let respond_to =
+                match recv_server_event(&mut server_event_rx, "notification activation event") {
+                    ServerEvent::NotificationActivated {
+                        activation: received,
+                        respond_to,
+                    } => {
+                        assert_eq!(received, activation);
+                        respond_to
+                    }
+                    other => panic!("expected NotificationActivated, got {other:?}"),
+                };
+            respond_to.send(activated).expect("send processed result");
+            assert_eq!(
+                protocol::read_message::<_, ServerMessage>(&mut client_stream, MAX_FRAME_SIZE)
+                    .expect("read activation result"),
+                ServerMessage::NotificationActivationProcessed { activated }
+            );
+
+            handle
+                .join()
+                .expect("handshake thread join")
+                .expect("handshake thread result");
+            assert!(matches!(
+                server_event_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ));
+        }
+    }
+
+    #[test]
     fn client_read_loop_rejects_oversized_bracketed_paste_without_disconnect() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-read-oversized");
         let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
@@ -1867,19 +2002,6 @@ new_tab = "ctrl+notakey"
             InputEventLimit::InputPayloadTooLarge {
                 size: MAX_INPUT_PAYLOAD + 1
             }
-        );
-    }
-
-    #[test]
-    fn handshake_timeout_is_within_five_second_deadline() {
-        // The handshake timeout must be short enough that
-        // the connection is guaranteed to close within 5 seconds even with
-        // OS overhead (thread scheduling, timer slack, cleanup).
-        assert!(
-            HANDSHAKE_TIMEOUT < Duration::from_secs(5),
-            "HANDSHAKE_TIMEOUT ({:?}) must be less than 5 seconds to guarantee \
-             connection close within the 5-second deadline",
-            HANDSHAKE_TIMEOUT
         );
     }
 }

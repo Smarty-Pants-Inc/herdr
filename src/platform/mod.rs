@@ -18,6 +18,13 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// Optional callback invoked by a desktop notification activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopNotificationAction {
+    pub executable: std::path::PathBuf,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,

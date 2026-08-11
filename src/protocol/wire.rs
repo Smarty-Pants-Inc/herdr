@@ -61,6 +61,16 @@ pub enum ClientLaunchMode {
     AppDirectGraphics,
     /// Direct terminal attach client.
     TerminalAttach,
+    /// One-shot connection used to activate a notification target.
+    NotificationActivator,
+}
+
+/// Target selected when a system notification activates a remote client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationActivation {
+    pub recipient_client_id: u64,
+    pub workspace_id: String,
+    pub pane_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +459,9 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// Activate the target carried by a system-notification callback.
+    ActivateNotification { activation: NotificationActivation },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,6 +709,8 @@ pub enum ServerMessage {
         message: String,
         /// Optional human-readable notification body.
         body: Option<String>,
+        /// Target to activate when the host system notification is clicked.
+        activation: Option<NotificationActivation>,
     },
 
     /// OSC 52 clipboard data forwarded from a PTY through the server.
@@ -762,6 +777,8 @@ pub enum ServerMessage {
 
     /// Open this validated HTTP(S) URL on the targeted client's local desktop.
     OpenUrl { url: String },
+    /// Result sent only after a notification activation was processed.
+    NotificationActivationProcessed { activated: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1068,21 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_notification_activation_roundtrip() {
+        let msg = ClientMessage::ActivateNotification {
+            activation: NotificationActivation {
+                recipient_client_id: 7,
+                workspace_id: "workspace".to_owned(),
+                pane_id: 42,
+            },
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1410,6 +1442,16 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
     }
+    #[test]
+    fn server_notification_activation_processed_roundtrip() {
+        for activated in [true, false] {
+            let msg = ServerMessage::NotificationActivationProcessed { activated };
+            let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+            let (decoded, _): (ServerMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(msg, decoded);
+        }
+    }
 
     #[test]
     fn server_frame_roundtrip_nontrivial() {
@@ -1514,15 +1556,23 @@ mod tests {
 
     #[test]
     fn server_notify_roundtrip() {
-        for kind in [
-            NotifyKind::Sound,
-            NotifyKind::Toast,
-            NotifyKind::SystemToast,
+        for (kind, activation) in [
+            (NotifyKind::Sound, None),
+            (NotifyKind::Toast, None),
+            (
+                NotifyKind::SystemToast,
+                Some(NotificationActivation {
+                    recipient_client_id: 7,
+                    workspace_id: "workspace".to_owned(),
+                    pane_id: 42,
+                }),
+            ),
         ] {
             let msg = ServerMessage::Notify {
                 kind,
                 message: "agent done".to_owned(),
                 body: None,
+                activation,
             };
             let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
             let (decoded, _): (ServerMessage, _) =

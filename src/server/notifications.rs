@@ -28,7 +28,7 @@ pub(crate) fn toast_message_from_state_change(
     prev_state: AgentState,
     new_state: AgentState,
     previous_agent_label: Option<&str>,
-) -> Option<String> {
+) -> Option<(String, app::state::ToastTarget)> {
     state
         .workspaces
         .iter()
@@ -48,11 +48,17 @@ pub(crate) fn toast_message_from_state_change(
                     Some(agent_label),
                 )?;
                 let workspace_label = ws.display_name_from(&state.terminals, terminal_runtimes);
-                Some(format!(
-                    "{} {}: {}",
-                    agent_label,
-                    toast_event_text(kind),
-                    app::actions::notification_context(ws, &workspace_label, ws_idx, pane_id)
+                Some((
+                    format!(
+                        "{} {}: {}",
+                        agent_label,
+                        toast_event_text(kind),
+                        app::actions::notification_context(ws, &workspace_label, ws_idx, pane_id)
+                    ),
+                    app::state::ToastTarget {
+                        workspace_id: ws.id.clone(),
+                        pane_id,
+                    },
                 ))
             })
         })
@@ -137,7 +143,7 @@ mod tests {
         let mut terminal_runtimes = TerminalRuntimeRegistry::new();
         terminal_runtimes.insert(terminal_id, runtime);
 
-        let message = toast_message_from_state_change(
+        let notification = toast_message_from_state_change(
             &state,
             &terminal_runtimes,
             root,
@@ -148,8 +154,14 @@ mod tests {
         );
 
         assert_eq!(
-            message.as_deref(),
-            Some("codex finished: __herdr_projects__ · 1")
+            notification,
+            Some((
+                "codex finished: __herdr_projects__ · 1".to_owned(),
+                app::state::ToastTarget {
+                    workspace_id: state.workspaces[0].id.clone(),
+                    pane_id: root,
+                },
+            ))
         );
 
         for (_, runtime) in terminal_runtimes.drain() {
