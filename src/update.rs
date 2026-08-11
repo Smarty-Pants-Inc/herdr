@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 #[cfg(not(windows))]
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
@@ -612,6 +614,12 @@ impl Drop for UpdateLock {
 #[cfg(not(windows))]
 fn acquire_update_lock_at(current_exe: &Path, nonblocking: bool) -> Result<UpdateLock, String> {
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create update directory {}: {error}",
+            parent.display()
+        )
+    })?;
     let lock_path = parent.join(".herdr-update.lock");
     let file = fs::OpenOptions::new()
         .create(true)
@@ -759,9 +767,28 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
 }
 
 #[cfg(unix)]
-fn exact_asset_install_allowed_at(current_exe: &Path) -> Result<(), String> {
-    preview_channel_rejection_for_exe_path(current_exe)
-        .map_or(Ok(()), |reason| Err(reason.to_string()))
+fn remote_client_executable_path(state_dir: &Path, build_id: &str) -> PathBuf {
+    let build_hash = format!("{:x}", Sha256::digest(build_id.as_bytes()));
+    state_dir
+        .join("remote")
+        .join("clients")
+        .join(build_hash)
+        .join("herdr")
+}
+
+#[cfg(unix)]
+fn install_exact_asset_for_remote_build_at(
+    state_dir: &Path,
+    build_id: &str,
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    let client_exe = remote_client_executable_path(state_dir, build_id);
+    let _lock = acquire_update_lock_at(&client_exe, true)?;
+    let update = download_update_asset_for_exe(client_exe, download_url, Some(expected_sha256))?;
+    let client_exe = update.current_exe.clone();
+    install_downloaded_update(update)?;
+    Ok(client_exe)
 }
 
 #[cfg(unix)]
@@ -776,19 +803,20 @@ where
 
 #[cfg(unix)]
 pub(crate) fn install_exact_asset_and_reexec(
+    build_id: &str,
     download_url: &str,
     expected_sha256: &str,
 ) -> Result<(), String> {
     use std::os::unix::process::CommandExt as _;
 
-    let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
-    exact_asset_install_allowed_at(&current_exe)?;
-    let _lock = acquire_update_lock(true)?;
-    let update = download_update_asset(download_url, Some(expected_sha256))?;
-    let current_exe = update.current_exe.clone();
-    install_downloaded_update(update)?;
+    let client_exe = install_exact_asset_for_remote_build_at(
+        &crate::config::state_dir(),
+        build_id,
+        download_url,
+        expected_sha256,
+    )?;
 
-    let mut command = reexec_command(&current_exe, env::args_os().skip(1));
+    let mut command = reexec_command(&client_exe, env::args_os().skip(1));
     Err(format!(
         "installed the remote server build but failed to restart Herdr: {}",
         command.exec()
@@ -797,6 +825,7 @@ pub(crate) fn install_exact_asset_and_reexec(
 
 #[cfg(windows)]
 pub(crate) fn install_exact_asset_and_reexec(
+    _build_id: &str,
     _download_url: &str,
     _expected_sha256: &str,
 ) -> Result<(), String> {
@@ -2536,6 +2565,7 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use sha2::{Digest, Sha256};
     use std::os::unix::net::UnixListener;
     use std::sync::{
@@ -3005,23 +3035,29 @@ mod tests {
     }
 
     #[test]
-    fn exact_asset_download_with_matching_checksum_atomically_replaces_local_binary() {
+    fn exact_asset_install_uses_build_scoped_client_without_replacing_launcher() {
         let dir = unique_test_dir("exact-asset");
         fs::create_dir(&dir).unwrap();
         let source = dir.join("server-build");
-        let current_exe = dir.join("herdr");
+        let launcher = dir.join("managed").join("herdr");
+        let state_dir = dir.join("state");
         let asset = b"exact server build";
+        fs::create_dir(launcher.parent().unwrap()).unwrap();
         fs::write(&source, asset).unwrap();
-        fs::write(&current_exe, b"old client build").unwrap();
+        fs::write(&launcher, b"parent-managed launcher").unwrap();
         let checksum = format!("{:x}", Sha256::digest(asset));
         let download_url = format!("file://{}", source.display());
+        let client_exe = install_exact_asset_for_remote_build_at(
+            &state_dir,
+            "server-build",
+            &download_url,
+            &checksum,
+        )
+        .unwrap();
 
-        let update =
-            download_update_asset_for_exe(current_exe.clone(), &download_url, Some(&checksum))
-                .unwrap();
-        install_downloaded_update(update).unwrap();
-
-        assert_eq!(fs::read(&current_exe).unwrap(), asset);
+        assert_eq!(fs::read(&launcher).unwrap(), b"parent-managed launcher");
+        assert_eq!(fs::read(&client_exe).unwrap(), asset);
+        assert!(client_exe.starts_with(state_dir.join("remote").join("clients")));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3068,16 +3104,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exact_asset_install_rejects_managed_paths_before_download() {
-        let homebrew = Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr");
-        let direct = Path::new("/home/user/.local/bin/herdr");
-
-        assert!(exact_asset_install_allowed_at(homebrew)
-            .unwrap_err()
-            .contains("Homebrew"));
-        assert!(exact_asset_install_allowed_at(direct).is_ok());
-    }
     #[test]
     fn update_lock_serializes_installation() {
         let dir = unique_test_dir("update-lock");
