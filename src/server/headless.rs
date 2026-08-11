@@ -52,7 +52,7 @@ use crate::server::client_accept::{
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
-    ClientConnection, ClientConnectionMode, DeferredRender,
+    ClientConnection, ClientConnectionMode, ClientNavigationState, DeferredRender,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -713,6 +713,7 @@ impl HeadlessServer {
                         )))
             {
                 crate::render_prof::event("render.attempt");
+                self.sync_canonical_navigation_to_foreground();
                 let render_request = self.app.render_dirty.take();
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
@@ -763,6 +764,7 @@ impl HeadlessServer {
                 });
                 let rendered_retained = match render_plan {
                     RetainedRenderPlan::Full => false,
+                    RetainedRenderPlan::Graphics if self.app_client_count() > 1 => false,
                     RetainedRenderPlan::Graphics => {
                         match self.render_retained_graphics_update_and_stream() {
                             RetainedGraphicsOutcome::Sent => true,
@@ -774,6 +776,7 @@ impl HeadlessServer {
                         }
                     }
                     RetainedRenderPlan::Pty => self.render_retained_pty_update_and_stream(),
+                    RetainedRenderPlan::HiddenPty if self.app_client_count() > 1 => false,
                     RetainedRenderPlan::HiddenPty => {
                         crate::render_prof::event("render.skipped.hidden_sources");
                         true
@@ -1572,6 +1575,10 @@ impl HeadlessServer {
         let next_foreground = latest_app_client(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
+        if changed {
+            let canonical = ClientNavigationState::capture(&self.app.state);
+            self.restore_foreground_navigation(&canonical);
+        }
         self.sync_foreground_client_state();
         changed
     }
@@ -1594,6 +1601,127 @@ impl HeadlessServer {
 
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
+    }
+    fn reconcile_client_navigation_states(&mut self, canonical: &ClientNavigationState) {
+        let state = &self.app.state;
+        for client in self.clients.values_mut() {
+            if !client.is_full_app_client() {
+                continue;
+            }
+            let navigation = client.navigation.as_ref().unwrap_or(canonical);
+            client.navigation = Some(navigation.reconciled(state, canonical));
+        }
+    }
+
+    /// Canonical AppState is always the foreground projection between client operations.
+    fn sync_canonical_navigation_to_foreground(&mut self) -> ClientNavigationState {
+        let canonical = ClientNavigationState::capture(&self.app.state);
+        if let Some(client) = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get_mut(&client_id))
+            .filter(|client| client.is_full_app_client())
+        {
+            client.navigation = Some(canonical.clone());
+        }
+        self.reconcile_client_navigation_states(&canonical);
+        canonical
+    }
+
+    fn apply_client_navigation(
+        &mut self,
+        client_id: u64,
+        canonical: &ClientNavigationState,
+    ) -> bool {
+        let Some(client) = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())
+        else {
+            return false;
+        };
+        let navigation = client
+            .navigation
+            .as_ref()
+            .unwrap_or(canonical)
+            .reconciled(&self.app.state, canonical);
+        let applied = navigation.apply_to(&mut self.app.state);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.navigation = Some(applied);
+        }
+        true
+    }
+
+    fn restore_foreground_navigation(&mut self, canonical: &ClientNavigationState) {
+        let current = ClientNavigationState::capture(&self.app.state);
+        let canonical = canonical.reconciled(&self.app.state, &current);
+        self.reconcile_client_navigation_states(&canonical);
+        let navigation = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get(&client_id))
+            .filter(|client| client.is_full_app_client())
+            .and_then(|client| client.navigation.clone())
+            .unwrap_or_else(|| canonical.clone());
+        let applied = navigation.apply_to(&mut self.app.state);
+        if let Some(client) = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get_mut(&client_id))
+            .filter(|client| client.is_full_app_client())
+        {
+            client.navigation = Some(applied);
+        }
+    }
+
+    fn begin_client_navigation_scope(&mut self, client_id: u64) -> Option<ClientNavigationState> {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_full_app_client)
+        {
+            return None;
+        }
+        let canonical = self.sync_canonical_navigation_to_foreground();
+        self.apply_client_navigation(client_id, &canonical);
+        Some(canonical)
+    }
+
+    fn finish_client_navigation_scope(&mut self, client_id: u64, canonical: ClientNavigationState) {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_full_app_client)
+        {
+            let navigation = ClientNavigationState::capture(&self.app.state);
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.navigation = Some(navigation);
+            }
+        }
+        self.restore_foreground_navigation(&canonical);
+        self.compute_foreground_navigation_view();
+    }
+
+    fn compute_client_navigation_view(&mut self, client_id: u64) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let (cols, rows) = client.terminal_size;
+        crate::ui::compute_view_without_resizing_panes(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+        );
+    }
+
+    fn compute_foreground_navigation_view(&mut self) {
+        if let Some(client_id) = self.foreground_client_id {
+            self.compute_client_navigation_view(client_id);
+            return;
+        }
+        let (cols, rows) = self.effective_size;
+        crate::ui::compute_view_without_resizing_panes(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+        );
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
@@ -1829,6 +1957,7 @@ impl HeadlessServer {
             return true;
         }
 
+        let navigation_scope = self.begin_client_navigation_scope(client_id);
         let foreground_changed = self.promote_client_to_foreground(client_id);
         if foreground_changed {
             self.resize_shared_runtime_to_effective_size_before_input();
@@ -1836,10 +1965,14 @@ impl HeadlessServer {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.request_semantic_redraw_after_input();
         }
-        self.app.route_client_events(
+        self.app.route_client_events_from(
+            client_id,
             vec![crate::raw_input::RawInputEvent::Paste(path)],
-            self.foreground_client_id == Some(client_id),
+            false,
         );
+        if let Some(canonical) = navigation_scope {
+            self.finish_client_navigation_scope(client_id, canonical);
+        }
         true
     }
 
@@ -1895,6 +2028,7 @@ impl HeadlessServer {
             terminal_id: terminal_id.clone(),
         };
         client.pending_terminal_attach = false;
+        client.navigation = None;
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -2776,6 +2910,7 @@ impl HeadlessServer {
 
     #[cfg(unix)]
     fn disconnect_all_clients_for_handoff(&mut self) {
+        let canonical_navigation = ClientNavigationState::capture(&self.app.state);
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
         for client_id in client_ids {
             self.send_client_graphics_cleanup(client_id);
@@ -2793,6 +2928,7 @@ impl HeadlessServer {
             let _ = self.remove_client(client_id);
         }
         self.foreground_client_id = None;
+        canonical_navigation.apply_to(&mut self.app.state);
         self.sync_foreground_client_state();
         self.resize_shared_runtime_to_effective_size();
     }
@@ -2881,6 +3017,7 @@ impl HeadlessServer {
             terminal_id: terminal_id.clone(),
         };
         client.pending_terminal_attach = false;
+        client.navigation = None;
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -2920,6 +3057,9 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .is_some_and(ClientConnection::is_full_app_client);
+        let navigation_scope = source_is_full_app
+            .then(|| self.begin_client_navigation_scope(client_id))
+            .flatten();
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
@@ -2961,14 +3101,25 @@ impl HeadlessServer {
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
-        let terminal_forward_only = self.app.route_client_events_from(client_id, events, false);
-        if self.app.take_config_reloaded_from_disk() {
+        let mut events = events.into_iter().peekable();
+        let mut terminal_forward_only = events.peek().is_some();
+        while let Some(event) = events.next() {
+            let forwarded_only = self
+                .app
+                .route_client_events_from(client_id, vec![event], false);
+            terminal_forward_only &= forwarded_only;
+            if interaction && events.peek().is_some() && !forwarded_only {
+                self.compute_client_navigation_view(client_id);
+            }
+        }
+        let deferred_requests_changed =
+            navigation_scope.is_some() && self.handle_deferred_requests_headless();
+        let config_reloaded = self.app.take_config_reloaded_from_disk();
+        if config_reloaded {
             self.reload_server_config(false);
-        } else {
-            self.sync_foreground_client_state();
         }
 
-        if self.app.state.detach_requested {
+        let needs_render = if self.app.state.detach_requested {
             self.app.state.detach_requested = false;
             info!(client_id, "client detach requested via keybind");
 
@@ -2979,17 +3130,22 @@ impl HeadlessServer {
                     reason: Some("detached".to_owned()),
                 },
             );
+            self.remove_client_and_resize_if_needed(client_id);
 
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.writer = None;
-            }
-
-            false
+            true
         } else {
-            foreground_changed
+            deferred_requests_changed
+                || foreground_changed
                 || theme_changed
                 || (interaction && !render_neutral_mouse_motion && !terminal_forward_only)
+        };
+        if let Some(canonical) = navigation_scope {
+            self.finish_client_navigation_scope(client_id, canonical);
         }
+        if !config_reloaded {
+            self.sync_foreground_client_state();
+        }
+        needs_render
     }
 
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
@@ -3051,6 +3207,9 @@ impl HeadlessServer {
                 );
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
+                if !direct_attach_requested {
+                    connection.navigation = Some(ClientNavigationState::capture(&self.app.state));
+                }
                 self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -3116,16 +3275,28 @@ impl HeadlessServer {
                             && cell.width_px == geometry.width_px / u32::from(geometry.cols)
                             && cell.height_px == geometry.height_px / u32::from(geometry.rows)
                     });
-                if !valid || self.handoff_in_progress || !self.focused_pane_graphics_demand() {
+                if !valid || self.handoff_in_progress {
+                    return false;
+                }
+                let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
+                    return false;
+                };
+                self.compute_client_navigation_view(client_id);
+                if !self.focused_pane_graphics_demand() {
+                    self.finish_client_navigation_scope(client_id, canonical);
                     return false;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 if foreground_changed {
                     self.resize_shared_runtime_to_effective_size_before_input();
+                    self.compute_client_navigation_view(client_id);
                 }
-                self.app
-                    .route_client_pixel_mouse(client_id, &data, geometry)
-                    || foreground_changed
+                let routed = self
+                    .app
+                    .route_client_pixel_mouse(client_id, &data, geometry);
+                let deferred_requests_changed = self.handle_deferred_requests_headless();
+                self.finish_client_navigation_scope(client_id, canonical);
+                routed || foreground_changed || deferred_requests_changed
             }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
@@ -3302,8 +3473,12 @@ impl HeadlessServer {
                         client.cell_size = observed;
                     }
                 }
+                let navigation_scope = self.begin_client_navigation_scope(client_id);
                 self.promote_client_to_foreground(client_id);
                 self.resize_shared_runtime_to_effective_size();
+                if let Some(canonical) = navigation_scope {
+                    self.finish_client_navigation_scope(client_id, canonical);
+                }
                 true
             }
             ServerEvent::ClientDetach { client_id } => {
@@ -4454,12 +4629,23 @@ impl HeadlessServer {
             );
             return;
         }
+        let canonical_navigation = self.sync_canonical_navigation_to_foreground();
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let preserved_scroll = (is_app_client && !is_foreground).then_some((
+                self.app.state.workspace_scroll,
+                self.app.state.agent_panel_scroll,
+                self.app.state.tab_scroll,
+                self.app.state.mobile_switcher_scroll,
+            ));
+            if is_app_client {
+                self.apply_client_navigation(client_id, &canonical_navigation);
+                self.compute_client_navigation_view(client_id);
+            }
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
@@ -4469,12 +4655,6 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
-                    let preserved_scroll = (!is_foreground).then_some((
-                        self.app.state.workspace_scroll,
-                        self.app.state.agent_panel_scroll,
-                        self.app.state.tab_scroll,
-                        self.app.state.mobile_switcher_scroll,
-                    ));
                     let (buffer, cursor) =
                         crate::server::render_stream::render_virtual_with_runtime_registry(
                             &mut self.app.state,
@@ -4705,6 +4885,8 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
             }
         }
+        self.restore_foreground_navigation(&canonical_navigation);
+        self.compute_foreground_navigation_view();
 
         let (cols, rows) = self.effective_size;
         if !deferred_frame {
@@ -8142,6 +8324,288 @@ next_tab = ""
             server.app.state.host_terminal_theme,
             server.clients[&1].host_terminal_theme
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_new_tab_stays_with_requesting_client_across_following_navigation() {
+        let mut server = test_headless_server();
+        let requester_workspace = crate::workspace::Workspace::test_new("requester");
+        let requester_workspace_id = requester_workspace.id.clone();
+        let following_workspace = crate::workspace::Workspace::test_new("following");
+        server.app.state.workspaces = vec![requester_workspace, following_workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let requester_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let following_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut requester = test_app_client(Some(true), 1);
+        requester.navigation = Some(requester_navigation);
+        server.clients.insert(1, requester);
+        let mut following = test_app_client(Some(true), 2);
+        following.navigation = Some(following_navigation);
+        server.clients.insert(2, following);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        server.app.state.request_new_tab = true;
+        assert!(server.handle_client_input_events(1, vec![]));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 2,
+            cols: 100,
+            rows: 30,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let _ = server.handle_deferred_requests_headless();
+
+        assert_eq!(server.app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(server.app.state.workspaces[1].tabs.len(), 1);
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.app.state.workspaces[1].active_tab, 0);
+        assert!(!server.app.state.request_new_tab);
+        let new_tab_id = crate::workspace::public_tab_id_for_number(&requester_workspace_id, 2);
+        assert_eq!(
+            server.clients[&1]
+                .navigation
+                .as_ref()
+                .and_then(|navigation| navigation
+                    .active_tab_by_workspace
+                    .get(&requester_workspace_id)),
+            Some(&new_tab_id)
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_disconnect_preserves_foreground_navigation_across_removal_order() {
+        let mut server = test_headless_server();
+        let mut first_workspace = crate::workspace::Workspace::test_new("first");
+        let first_second_tab = first_workspace.test_add_tab(Some("first-second"));
+        let mut second_workspace = crate::workspace::Workspace::test_new("second");
+        let second_second_tab = second_workspace.test_add_tab(Some("second-second"));
+        first_workspace.active_tab = first_second_tab;
+        second_workspace.active_tab = 0;
+        server.app.state.workspaces = vec![first_workspace, second_workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        let first_navigation = ClientNavigationState::capture(&server.app.state);
+
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[1].active_tab = second_second_tab;
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let second_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut first = test_app_client(Some(true), 1);
+        first.navigation = Some(first_navigation);
+        server.clients.insert(1, first);
+        let mut second = test_app_client(Some(true), 2);
+        second.navigation = Some(second_navigation);
+        server.clients.insert(2, second);
+
+        let removal_order = server.clients.keys().copied().collect::<Vec<_>>();
+        let original_foreground = removal_order[0];
+        let expected_navigation = server.clients[&original_foreground]
+            .navigation
+            .clone()
+            .unwrap()
+            .apply_to(&mut server.app.state);
+        let expected_workspace = server.app.state.active.unwrap();
+        let expected_tab = server.app.state.workspaces[expected_workspace].active_tab;
+        server.foreground_client_id = Some(original_foreground);
+        server.sync_foreground_client_state();
+
+        server.disconnect_all_clients_for_handoff();
+
+        assert!(server.clients.is_empty());
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(
+            ClientNavigationState::capture(&server.app.state),
+            expected_navigation
+        );
+        assert_eq!(server.app.state.active, Some(expected_workspace));
+        assert_eq!(
+            server.app.state.workspaces[expected_workspace].active_tab,
+            expected_tab
+        );
+    }
+
+    #[test]
+    fn detach_keybind_promotes_and_renders_surviving_client_navigation() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("detach-navigation");
+        let second_tab = workspace.test_add_tab(Some("second"));
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.detach_exits = false;
+
+        let survivor_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = second_tab;
+        let detached_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let (survivor_writer, _survivor_control_rx, survivor_render_rx) = test_client_writer();
+        let mut survivor = ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(survivor_writer),
+        );
+        survivor.navigation = Some(survivor_navigation.clone());
+        server.clients.insert(1, survivor);
+
+        let (detached_writer, detached_control_rx, _detached_render_rx) = test_client_writer();
+        let mut detached = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(detached_writer),
+        );
+        detached.navigation = Some(detached_navigation);
+        server.clients.insert(2, detached);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let key = |code, modifiers| crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char(code),
+            modifiers,
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: 1,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::Synthesized,
+        };
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![key('b', KeyModifiers::CONTROL.bits()), key('q', 0)],
+        }));
+
+        assert!(!server.clients.contains_key(&2));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(
+            ClientNavigationState::capture(&server.app.state),
+            survivor_navigation
+        );
+        match read_server_message(
+            detached_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("detached client shutdown"),
+        ) {
+            ServerMessage::ServerShutdown { reason } => {
+                assert_eq!(reason.as_deref(), Some("detached"));
+            }
+            other => panic!("expected detached shutdown, got {other:?}"),
+        }
+
+        server.render_and_stream();
+        survivor_render_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("surviving client repaint");
+    }
+
+    #[test]
+    fn background_focus_loss_does_not_mark_its_projected_tab_seen() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("focus-loss-navigation");
+        let foreground_pane = workspace.tabs[0].root_pane;
+        let background_tab = workspace.test_add_tab(Some("background"));
+        let background_pane = workspace.tabs[background_tab].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = background_tab;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&foreground_pane)
+            .unwrap()
+            .seen = false;
+        server.app.state.workspaces[0].tabs[background_tab]
+            .panes
+            .get_mut(&background_pane)
+            .unwrap()
+            .seen = false;
+
+        let mut background = test_app_client(Some(true), 1);
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let mut foreground = test_app_client(Some(true), 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        assert!(server.app.state.workspaces[0].tabs[0].panes[&foreground_pane].seen);
+        assert!(!server.app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::FocusLost],
+        }));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.app.state.workspaces[0].active_tab, 0);
+        assert!(!server.app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
+    }
+
+    #[test]
+    fn foreground_disconnect_marks_the_survivors_projected_tab_seen() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("disconnect-navigation");
+        let outgoing_pane = workspace.tabs[0].root_pane;
+        let survivor_tab = workspace.test_add_tab(Some("survivor"));
+        let survivor_pane = workspace.tabs[survivor_tab].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+
+        let outgoing_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = survivor_tab;
+        let survivor_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&outgoing_pane)
+            .unwrap()
+            .seen = false;
+        server.app.state.workspaces[0].tabs[survivor_tab]
+            .panes
+            .get_mut(&survivor_pane)
+            .unwrap()
+            .seen = false;
+
+        let mut survivor = test_app_client(Some(true), 1);
+        survivor.navigation = Some(survivor_navigation);
+        server.clients.insert(1, survivor);
+        let mut outgoing = test_app_client(Some(true), 2);
+        outgoing.navigation = Some(outgoing_navigation);
+        server.clients.insert(2, outgoing);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        assert!(server.app.state.workspaces[0].tabs[0].panes[&outgoing_pane].seen);
+        assert!(!server.app.state.workspaces[0].tabs[survivor_tab].panes[&survivor_pane].seen);
+
+        assert!(server.remove_client(2));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.app.state.workspaces[0].active_tab, survivor_tab);
+        assert!(server.app.state.workspaces[0].tabs[survivor_tab].panes[&survivor_pane].seen);
     }
 
     #[test]
