@@ -105,6 +105,21 @@ impl App {
         changed
     }
 
+    pub(super) fn open_safe_url_with(
+        &mut self,
+        url: &str,
+        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
+    ) {
+        if crate::web_url::safe_web_url(url).is_none() {
+            return;
+        }
+        match open_url(url) {
+            Ok(Some(child)) => self.detached_process_children.push(child),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(err = %err, url, "failed to open pane URL"),
+        }
+    }
+
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
         let _ = self.handle_internal_event_with_pane_updates(ev);
     }
@@ -118,6 +133,13 @@ impl App {
                 crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)
             {
                 tracing::warn!(err = %err, "failed to emit terminal bell");
+            }
+            return Vec::new();
+        }
+
+        if let AppEvent::OpenUrl { url, source_id } = ev {
+            if source_id == super::LOCAL_INPUT_SOURCE {
+                self.open_safe_url_with(&url, crate::platform::open_url);
             }
             return Vec::new();
         }
