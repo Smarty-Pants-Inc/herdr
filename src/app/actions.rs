@@ -2310,12 +2310,8 @@ impl AppState {
     }
 }
 
-pub(crate) fn safe_web_url(url: &str) -> Option<&str> {
-    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
-}
-
 fn safe_osc8_url(url: &str) -> Option<&str> {
-    safe_web_url(url).or_else(|| url.starts_with("file://").then_some(url))
+    crate::web_url::safe_web_url(url).or_else(|| url.starts_with("file://").then_some(url))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2369,7 +2365,7 @@ pub(crate) fn url_at_column(row: &str, col: u16) -> Option<&str> {
         .find(|span| span.contains(clicked_idx))?;
     let start_byte = byte_index_for_cell(row, span.start);
     let end_byte = byte_index_after_cell(row, span.end);
-    safe_web_url(row.get(start_byte..end_byte)?)
+    crate::web_url::safe_web_url(row.get(start_byte..end_byte)?)
 }
 
 fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
@@ -2933,11 +2929,12 @@ impl AppState {
                 }
             }
             // Intercepted before this dispatch — in App::handle_internal_event (monolithic)
-            // or via HeadlessServer forwarding to the foreground client (server); never touch
-            // AppState. Kept for AppEvent exhaustiveness.
+            // or via HeadlessServer forwarding to the originating input client (server); never
+            // touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
+            AppEvent::OpenUrl { .. } => Vec::new(),
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     return Vec::new();
