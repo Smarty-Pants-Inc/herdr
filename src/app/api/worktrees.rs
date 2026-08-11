@@ -801,8 +801,16 @@ mod tests {
     }
 
     fn test_app_with_event_hub(event_hub: crate::api::EventHub) -> App {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&Config::default(), true, None, api_rx, event_hub)
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            event_hub,
+        );
+        app.state.default_shell = if cfg!(unix) { "/bin/cat" } else { test_shell() }.into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        app
     }
 
     #[cfg(windows)]
@@ -895,6 +903,29 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("deferred API request should respond after completion event")
     }
+    #[tokio::test]
+    async fn created_worktree_session_submits_sp_once_and_skips_existing_workspace() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("created")];
+        app.state.ensure_test_terminals();
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(root_pane)
+            .unwrap()
+            .clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        app.launch_created_worktree_session(0, true).unwrap();
+
+        assert_eq!(
+            input.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"sp\r")
+        );
+        assert!(input.try_recv().is_err());
+        app.launch_created_worktree_session(0, false).unwrap();
+        assert!(input.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn api_worktree_create_opens_workspace_and_marks_membership() {
@@ -902,6 +933,24 @@ mod tests {
         let worktree_root = unique_temp_path("api-worktree-create-root");
         let event_hub = crate::api::EventHub::default();
         let mut app = test_app_with_event_hub(event_hub.clone());
+        #[cfg(unix)]
+        let (launch_shell, launch_marker) = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let shell = unique_temp_path("api-worktree-create-shell");
+            let marker = unique_temp_path("api-worktree-create-sp-marker");
+            std::fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\nIFS= read -r line\nprintf '%s' \"$line\" > '{}'\nexec /bin/cat\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            app.state.default_shell = shell.display().to_string();
+            (shell, marker)
+        };
         let mut parent = Workspace::test_new("main");
         parent.identity_cwd = repo.clone();
         app.state.workspaces = vec![parent];
@@ -951,6 +1000,14 @@ mod tests {
                 .is_linked_worktree
         );
         assert!(workspace.worktree.unwrap().is_linked_worktree);
+        #[cfg(unix)]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !launch_marker.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(std::fs::read_to_string(&launch_marker).unwrap(), "sp");
+        }
         let events = event_hub.events_after(0);
         assert!(events.iter().any(|(_, event)| {
             matches!(
@@ -987,6 +1044,11 @@ mod tests {
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(launch_shell);
+            let _ = std::fs::remove_file(launch_marker);
         }
         let remove = crate::worktree::build_worktree_remove_command(
             &repo,
