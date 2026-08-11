@@ -2744,7 +2744,9 @@ impl AppState {
                 self.latest_release_notes_available = true;
                 self.update_dismissed = true;
                 if matches!(
-                    self.toast_config.delivery,
+                    self.toast_config
+                        .delivery
+                        .effective(self.outer_terminal_focus),
                     crate::config::ToastDelivery::Herdr
                 ) {
                     self.toast = Some(ToastNotification {
@@ -2764,7 +2766,9 @@ impl AppState {
                 self.refresh_agent_manifest_summaries();
                 if !updated.is_empty()
                     && matches!(
-                        self.toast_config.delivery,
+                        self.toast_config
+                            .delivery
+                            .effective(self.outer_terminal_focus),
                         crate::config::ToastDelivery::Herdr
                     )
                 {
@@ -3293,7 +3297,9 @@ impl AppState {
         }
 
         if matches!(
-            self.toast_config.delivery,
+            self.toast_config
+                .delivery
+                .effective(self.outer_terminal_focus),
             crate::config::ToastDelivery::Herdr
         ) {
             if let Some(toast) = delivery.toast.clone() {

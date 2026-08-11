@@ -80,6 +80,7 @@ impl App {
         let value = match delivery {
             crate::config::ToastDelivery::Off => "\"off\"",
             crate::config::ToastDelivery::Herdr => "\"herdr\"",
+            crate::config::ToastDelivery::Hybrid => "\"hybrid\"",
             crate::config::ToastDelivery::Terminal => "\"terminal\"",
             crate::config::ToastDelivery::System => "\"system\"",
         };
