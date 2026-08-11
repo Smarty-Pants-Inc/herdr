@@ -2,6 +2,8 @@
 
 pub const BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+const DEFAULT_PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+
 pub fn channel() -> &'static str {
     non_empty(option_env!("HERDR_BUILD_CHANNEL")).unwrap_or("stable")
 }
@@ -13,6 +15,18 @@ pub fn build_id() -> Option<&'static str> {
 /// Optional compile-time update manifest for fork builds.
 pub fn update_manifest_url() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_UPDATE_MANIFEST_URL"))
+}
+
+pub fn effective_update_manifest_url() -> Option<&'static str> {
+    update_manifest_url().or_else(|| is_preview().then_some(DEFAULT_PREVIEW_UPDATE_MANIFEST_URL))
+}
+
+pub fn server_build_identity() -> Option<crate::api::schema::ServerBuildIdentity> {
+    Some(crate::api::schema::ServerBuildIdentity {
+        channel: channel().to_string(),
+        build_id: build_id()?.to_string(),
+        update_manifest_url: effective_update_manifest_url()?.to_string(),
+    })
 }
 
 /// Whether this build must use preview-style update selection.

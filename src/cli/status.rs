@@ -75,6 +75,7 @@ enum ServerRuntimeStatus {
         version: Option<String>,
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
+        build: Option<crate::api::schema::ServerBuildIdentity>,
     },
     NotRunning,
 }
@@ -152,6 +153,7 @@ fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
             version: status.version,
             protocol: status.protocol,
             capabilities: status.capabilities,
+            build: status.build,
         }),
         Err(ApiClientError::Io(err)) if super::server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -218,6 +220,7 @@ struct ServerStatusJson {
     running: bool,
     version: Option<String>,
     protocol: Option<u32>,
+    build: Option<crate::api::schema::ServerBuildIdentity>,
     capabilities: Option<ServerCapabilitiesJson>,
     compatible: Option<bool>,
     socket: String,
@@ -252,6 +255,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version,
             protocol,
             capabilities,
+            build,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -263,6 +267,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
                 }),
+            build: build.clone(),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
@@ -273,6 +278,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             running: false,
             version: None,
             protocol: None,
+            build: None,
             capabilities: None,
             compatible: None,
             socket: api::socket_path().display().to_string(),
@@ -315,4 +321,41 @@ fn print_status_help() {
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
     eprintln!("  herdr status client [--json]  show local client binary status");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_status_json_includes_build_for_running_server() {
+        let server = ServerRuntimeStatus::Running {
+            version: Some("0.1.2".into()),
+            protocol: Some(6),
+            capabilities: None,
+            build: Some(crate::api::schema::ServerBuildIdentity {
+                channel: "stable".into(),
+                build_id: "20260811.1".into(),
+                update_manifest_url: "https://example.com/manifest.json".into(),
+            }),
+        };
+
+        let json = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(
+            json["build"],
+            serde_json::json!({
+                "channel": "stable",
+                "build_id": "20260811.1",
+                "update_manifest_url": "https://example.com/manifest.json",
+            })
+        );
+    }
+
+    #[test]
+    fn server_status_json_has_null_build_when_server_is_stopped() {
+        let json =
+            serde_json::to_value(server_status_json(&ServerRuntimeStatus::NotRunning)).unwrap();
+
+        assert_eq!(json["build"], serde_json::Value::Null);
+    }
 }

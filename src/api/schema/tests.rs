@@ -657,7 +657,7 @@ fn scroll_changed_subscription_event_round_trips() {
 }
 
 #[test]
-fn success_response_round_trips() {
+fn pong_with_build_identity_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
         result: ResponseResult::Pong {
@@ -667,12 +667,31 @@ fn success_response_round_trips() {
                 live_handoff: true,
                 detached_server_daemon: true,
             }),
+            build: Some(ServerBuildIdentity {
+                channel: "stable".into(),
+                build_id: "20260811.1".into(),
+                update_manifest_url: "https://example.com/manifest.json".into(),
+            }),
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["build"]["channel"], "stable");
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn legacy_pong_without_build_deserializes() {
+    let response: SuccessResponse = serde_json::from_str(
+        r#"{"id":"req_1","result":{"type":"pong","version":"0.1.2","protocol":6,"capabilities":{"live_handoff":true,"detached_server_daemon":true}}}"#,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        response.result,
+        ResponseResult::Pong { build: None, .. }
+    ));
 }
 
 #[test]

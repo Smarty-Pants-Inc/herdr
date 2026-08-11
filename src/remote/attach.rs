@@ -178,6 +178,24 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    if let Some((remote_herdr, status)) = probe_running_remote_server(&remote_ssh, &session_name)? {
+        reconcile_local_client_to_running_server(&status)?;
+        if !remote_binary_matches(&remote_ssh, &remote_herdr)? {
+            return Err(io::Error::other(format!(
+                "the running remote server is intact, but {} cannot bridge protocol {CURRENT_PROTOCOL}",
+                remote_herdr.shell_path
+            )));
+        }
+        let _bridge = SshStdioBridge::start(
+            remote.target,
+            remote_herdr,
+            local_socket.clone(),
+            session_name,
+            remote_ssh.options(),
+        )?;
+        return run_client_process(&local_socket, &reattach_command, remote.keybindings);
+    }
+
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -315,6 +333,8 @@ struct RemoteReleaseMetadata {
 
 #[derive(Deserialize)]
 struct RemotePreviewManifest {
+    #[serde(default)]
+    channel: Option<String>,
     build_id: String,
     protocol: u32,
     assets: BTreeMap<String, RemoteAssetRef>,
@@ -763,6 +783,77 @@ fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candid
     }
 }
 
+/// Finds an already-running server without changing the remote machine.
+///
+/// Every discovered helper is queried: an inconclusive status must not fall
+/// through to the remote-install path, because it could replace a helper that
+/// owns a live server.
+fn probe_running_remote_server(
+    ssh: &RemoteSsh,
+    session_name: &str,
+) -> io::Result<Option<(RemoteHerdr, RemoteServerStatus)>> {
+    let remote_herdr = RemoteHerdr::for_platform(detect_remote_platform(ssh)?);
+    let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
+    let mut running = None;
+    let mut status_error = None;
+
+    for candidate in candidates {
+        let status = match remote_server_status_for_session(ssh, &candidate, session_name) {
+            Ok(RemoteServerStatus::NotRunning)
+                if session_name != crate::session::DEFAULT_SESSION_NAME =>
+            {
+                remote_server_status(ssh, &candidate)
+            }
+            status => status,
+        };
+        match status {
+            Ok(status) if matches!(status, RemoteServerStatus::Running { .. }) => {
+                let build = match &status {
+                    RemoteServerStatus::Running { build, .. } => build.as_ref(),
+                    RemoteServerStatus::NotRunning => None,
+                };
+                if let Some((
+                    _,
+                    RemoteServerStatus::Running {
+                        build: Some(current),
+                        ..
+                    },
+                )) = &running
+                {
+                    if build.is_some_and(|build| build != current) {
+                        return Err(io::Error::other(
+                            "remote helpers reported conflicting running-server build identities",
+                        ));
+                    }
+                }
+                let current_has_build = running.as_ref().is_some_and(|(_, status)| {
+                    matches!(status, RemoteServerStatus::Running { build: Some(_), .. })
+                });
+                if running.is_none() || (build.is_some() && !current_has_build) {
+                    running = Some((candidate, status));
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                status_error.get_or_insert_with(|| {
+                    format!(
+                        "could not determine whether remote helper {} owns a running server: {err}",
+                        candidate.shell_path
+                    )
+                });
+            }
+        }
+    }
+
+    if let Some(running) = running {
+        return Ok(Some(running));
+    }
+    if let Some(error) = status_error {
+        return Err(io::Error::other(error));
+    }
+    Ok(None)
+}
+
 fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
     let mut script = String::from(
         r#"home=${HOME:-}
@@ -990,8 +1081,120 @@ enum RemoteServerStatus {
         protocol: Option<u32>,
         live_handoff: bool,
         detached_server_daemon: bool,
+        build: Option<crate::api::schema::ServerBuildIdentity>,
     },
     NotRunning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunningServerClientPlan {
+    Attach,
+    Reexec(crate::api::schema::ServerBuildIdentity),
+}
+
+fn running_server_client_plan(
+    status: &RemoteServerStatus,
+    local_build: Option<&crate::api::schema::ServerBuildIdentity>,
+    local_version: &str,
+) -> io::Result<RunningServerClientPlan> {
+    let RemoteServerStatus::Running {
+        version,
+        protocol,
+        build,
+        ..
+    } = status
+    else {
+        return Err(io::Error::other("remote server is not running"));
+    };
+
+    if build.as_ref() == local_build && build.is_some() {
+        if *protocol == Some(CURRENT_PROTOCOL) {
+            return Ok(RunningServerClientPlan::Attach);
+        }
+        return Err(io::Error::other(format!(
+            "running remote server protocol {} does not match this client protocol {CURRENT_PROTOCOL}",
+            protocol.map_or_else(|| "unknown".to_string(), |protocol| protocol.to_string())
+        )));
+    }
+
+    let Some(build) = build else {
+        if version.as_deref() == Some(local_version) && *protocol == Some(CURRENT_PROTOCOL) {
+            return Ok(RunningServerClientPlan::Attach);
+        }
+        return Err(io::Error::other(format!(
+            "running remote server version {} does not match local version {local_version}, but did not advertise build metadata",
+            version_label(version.as_deref())
+        )));
+    };
+
+    if build.channel.trim().is_empty()
+        || build.build_id.trim().is_empty()
+        || build.update_manifest_url.trim().is_empty()
+    {
+        return Err(io::Error::other(
+            "running remote server advertised incomplete build metadata",
+        ));
+    }
+    if protocol.is_none() {
+        return Err(io::Error::other(
+            "running remote server advertised build metadata without a protocol",
+        ));
+    }
+
+    Ok(RunningServerClientPlan::Reexec(build.clone()))
+}
+
+fn reconcile_local_client_to_running_server(status: &RemoteServerStatus) -> io::Result<()> {
+    let plan = running_server_client_plan(
+        status,
+        crate::build_info::server_build_identity().as_ref(),
+        &current_version(),
+    )?;
+    let RunningServerClientPlan::Reexec(build) = plan else {
+        return Ok(());
+    };
+    let RemoteServerStatus::Running { protocol, .. } = status else {
+        unreachable!("running-server plan requires a running server");
+    };
+    let server_protocol = protocol.expect("running-server plan requires a protocol");
+
+    let manifest_bytes = fetch_remote_manifest(&build.update_manifest_url)?;
+    let manifest: RemotePreviewManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            io::Error::other(format!(
+                "failed to parse running server build manifest JSON: {err}"
+            ))
+        })?;
+    if manifest.channel.as_deref() != Some(build.channel.as_str()) {
+        return Err(io::Error::other(format!(
+            "running server build {} advertises channel {}, but its manifest is for channel {}",
+            build.build_id,
+            build.channel,
+            manifest.channel.as_deref().unwrap_or("unknown")
+        )));
+    }
+    let (manifest_protocol, assets) = preview_assets_for_build(&manifest, &build.build_id)?;
+    if manifest_protocol != server_protocol {
+        return Err(io::Error::other(format!(
+            "running server protocol {server_protocol} does not match manifest protocol {manifest_protocol} for build {}",
+            build.build_id
+        )));
+    }
+
+    let asset_key = RemotePlatform::local().asset_key();
+    let asset = assets.get(&asset_key).ok_or_else(|| {
+        io::Error::other(format!(
+            "running server build {} has no asset for local platform {asset_key}",
+            build.build_id
+        ))
+    })?;
+    let asset = remote_asset_info(asset);
+    validate_remote_asset_checksum(&asset_key, &asset)?;
+    let checksum = asset
+        .sha256
+        .as_deref()
+        .expect("validated remote asset has a checksum");
+    crate::update::install_exact_asset_and_reexec(&asset.url, checksum).map_err(io::Error::other)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,6 +1224,7 @@ fn ensure_remote_server_ready(
         protocol,
         live_handoff,
         detached_server_daemon,
+        ..
     } = status
     else {
         return Ok(());
@@ -1107,6 +1311,7 @@ fn confirm_remote_install_with_running_server(
         protocol,
         live_handoff,
         detached_server_daemon,
+        ..
     } = &status
     else {
         return Ok(false);
@@ -1204,7 +1409,20 @@ fn remote_server_status(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<RemoteServerStatus> {
-    let command = format!("{} status server --json", remote_herdr.shell_path);
+    remote_server_status_for_session(ssh, remote_herdr, crate::session::DEFAULT_SESSION_NAME)
+}
+
+fn remote_server_status_for_session(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<RemoteServerStatus> {
+    let mut command = remote_herdr.shell_path.clone();
+    if session_name != crate::session::DEFAULT_SESSION_NAME {
+        command.push_str(" --session ");
+        command.push_str(&shell_quote(session_name));
+    }
+    command.push_str(" status server --json");
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server status failed", &output));
@@ -1225,6 +1443,8 @@ struct RemoteServerStatusJson {
     version: Option<String>,
     protocol: Option<u32>,
     capabilities: Option<RemoteServerCapabilitiesJson>,
+    #[serde(default)]
+    build: Option<crate::api::schema::ServerBuildIdentity>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1259,6 +1479,7 @@ fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatu
         detached_server_daemon: capabilities
             .as_ref()
             .is_some_and(|capabilities| capabilities.detached_server_daemon),
+        build: parsed.build,
     })
 }
 
@@ -2936,7 +3157,8 @@ mod tests {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
                 live_handoff: true,
-                detached_server_daemon: true
+                detached_server_daemon: true,
+                build: None,
             }
         );
     }
@@ -2952,9 +3174,93 @@ mod tests {
                 version: Some("0.6.0".into()),
                 protocol: Some(8),
                 live_handoff: false,
-                detached_server_daemon: false
+                detached_server_daemon: false,
+                build: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_remote_server_status_json_reads_build_identity() {
+        let RemoteServerStatus::Running { build, .. } = parse_remote_server_status_json(
+            r#"{"running":true,"version":"0.6.0-preview.server","protocol":8,"build":{"channel":"preview","build_id":"server","update_manifest_url":"https://example.com/preview.json"}}"#,
+        )
+        .unwrap()
+        else {
+            panic!("expected running server");
+        };
+
+        assert_eq!(
+            build,
+            Some(crate::api::schema::ServerBuildIdentity {
+                channel: "preview".into(),
+                build_id: "server".into(),
+                update_manifest_url: "https://example.com/preview.json".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn matching_running_server_build_attaches() {
+        let build = crate::api::schema::ServerBuildIdentity {
+            channel: "preview".into(),
+            build_id: "same".into(),
+            update_manifest_url: "https://example.com/preview.json".into(),
+        };
+        let status = RemoteServerStatus::Running {
+            version: Some("0.6.0-preview.same".into()),
+            protocol: Some(CURRENT_PROTOCOL),
+            live_handoff: false,
+            detached_server_daemon: true,
+            build: Some(build.clone()),
+        };
+
+        assert_eq!(
+            running_server_client_plan(&status, Some(&build), "0.6.0-preview.same").unwrap(),
+            RunningServerClientPlan::Attach
+        );
+    }
+
+    #[test]
+    fn mismatched_running_server_build_requires_exact_reexec() {
+        let server_build = crate::api::schema::ServerBuildIdentity {
+            channel: "preview".into(),
+            build_id: "server".into(),
+            update_manifest_url: "https://example.com/preview.json".into(),
+        };
+        let local_build = crate::api::schema::ServerBuildIdentity {
+            build_id: "local".into(),
+            ..server_build.clone()
+        };
+        let status = RemoteServerStatus::Running {
+            version: Some("0.6.0-preview.server".into()),
+            protocol: Some(CURRENT_PROTOCOL),
+            live_handoff: false,
+            detached_server_daemon: true,
+            build: Some(server_build.clone()),
+        };
+
+        assert_eq!(
+            running_server_client_plan(&status, Some(&local_build), "0.6.0-preview.local").unwrap(),
+            RunningServerClientPlan::Reexec(server_build)
+        );
+    }
+
+    #[test]
+    fn missing_server_build_metadata_for_different_version_fails_closed() {
+        let status = RemoteServerStatus::Running {
+            version: Some("0.6.0-preview.server".into()),
+            protocol: Some(CURRENT_PROTOCOL),
+            live_handoff: false,
+            detached_server_daemon: true,
+            build: None,
+        };
+
+        let error = running_server_client_plan(&status, None, "0.6.0-preview.local")
+            .expect_err("must not mutate or attach against an unidentified running server");
+        assert!(error
+            .to_string()
+            .contains("did not advertise build metadata"));
     }
 
     #[test]
@@ -3105,6 +3411,7 @@ mod tests {
                     "2026-06-02-old": {
                         "protocol": 11,
                         "assets": {
+
                             "linux-x86_64": {
                                 "url": "https://example.com/old",
                                 "sha256": "old"
@@ -3122,6 +3429,35 @@ mod tests {
         assert_eq!(protocol, 11);
         assert_eq!(asset.url(), "https://example.com/old");
         assert_eq!(asset.sha256(), Some("old"));
+    }
+    #[test]
+    fn exact_running_server_build_selects_archived_manifest_asset() {
+        let manifest: RemotePreviewManifest = serde_json::from_str(
+            r#"{
+                "build_id": "new",
+                "protocol": 12,
+                "assets": {},
+                "builds": {
+                    "server": {
+                        "protocol": 11,
+                        "assets": {
+                            "macos-aarch64": {
+                                "url": "https://example.com/server",
+                                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (protocol, assets) = preview_assets_for_build(&manifest, "server").unwrap();
+        assert_eq!(protocol, 11);
+        assert_eq!(
+            assets.get("macos-aarch64").and_then(RemoteAssetRef::sha256),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
