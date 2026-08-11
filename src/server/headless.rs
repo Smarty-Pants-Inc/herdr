@@ -76,6 +76,14 @@ use crate::server::client_transport::ClientWriter;
 use std::fs;
 
 const LIVE_HANDOFF_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(6);
+const LIVE_HANDOFF_CLIENT_REASON: &str =
+    "live update in progress; reconnect after handoff completes";
+
+fn live_handoff_client_message() -> ServerMessage {
+    ServerMessage::ServerHandoff {
+        reason: LIVE_HANDOFF_CLIENT_REASON.to_owned(),
+    }
+}
 
 fn wait_for_live_handoff_response_write(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -2890,14 +2898,7 @@ impl HeadlessServer {
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
         for client_id in client_ids {
             self.send_client_graphics_cleanup(client_id);
-            self.send_to_client(
-                client_id,
-                ServerMessage::ServerShutdown {
-                    reason: Some(
-                        "live update in progress; reconnect after handoff completes".to_owned(),
-                    ),
-                },
-            );
+            self.send_to_client(client_id, live_handoff_client_message());
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.writer = None;
             }
@@ -3143,13 +3144,7 @@ impl HeadlessServer {
                 direct_graphics,
             } => {
                 if self.handoff_in_progress {
-                    if let Ok(message) =
-                        Self::frame_server_message(&ServerMessage::ServerShutdown {
-                            reason: Some(
-                                "live update in progress; reconnect after handoff completes"
-                                    .to_owned(),
-                            ),
-                        })
+                    if let Ok(message) = Self::frame_server_message(&live_handoff_client_message())
                     {
                         let _ = writer.control.send(message);
                     }
