@@ -77,8 +77,9 @@ fn toast_delivery_index(delivery: ToastDelivery) -> usize {
     match delivery {
         ToastDelivery::Off => 0,
         ToastDelivery::Herdr => 1,
-        ToastDelivery::Terminal => 2,
-        ToastDelivery::System => 3,
+        ToastDelivery::Hybrid => 2,
+        ToastDelivery::Terminal => 3,
+        ToastDelivery::System => 4,
     }
 }
 
@@ -86,7 +87,8 @@ fn toast_delivery_for_index(idx: usize) -> ToastDelivery {
     match idx {
         0 => ToastDelivery::Off,
         1 => ToastDelivery::Herdr,
-        2 => ToastDelivery::Terminal,
+        2 => ToastDelivery::Hybrid,
+        3 => ToastDelivery::Terminal,
         _ => ToastDelivery::System,
     }
 }
@@ -225,7 +227,7 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
         },
         SettingsSection::Toast => match key.code {
             KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
-            KeyCode::Down | KeyCode::Char('j') => state.settings.list.move_next(4),
+            KeyCode::Down | KeyCode::Char('j') => state.settings.list.move_next(5),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let delivery = toast_delivery_for_index(state.settings.list.selected);
                 return Some(SettingsAction::SaveToastDelivery(delivery));
@@ -388,8 +390,8 @@ impl AppState {
             }
             SettingsSection::Toast => {
                 let list_y = area.y + 3;
-                if row >= list_y && row < list_y + 8 {
-                    Some(((row - list_y) / 2) as usize)
+                if row >= list_y && row < list_y + 5 {
+                    Some((row - list_y) as usize)
                 } else {
                     None
                 }
@@ -552,6 +554,44 @@ mod tests {
         assert_eq!(action, Some(SettingsAction::SaveSound(true)));
         assert!(!state.sound.enabled);
         assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_toast_keyboard_reaches_system_delivery() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Toast);
+        state.settings.list.selected = 3;
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.list.selected, 4);
+        assert_eq!(
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            ),
+            Some(SettingsAction::SaveToastDelivery(ToastDelivery::System))
+        );
+    }
+
+    #[test]
+    fn settings_toast_mouse_reaches_system_delivery() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Toast);
+        let area = app.state.settings_content_rect();
+
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 1,
+            area.y + 7,
+        ));
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveToastDelivery(ToastDelivery::System))
+        );
     }
 
     #[test]
