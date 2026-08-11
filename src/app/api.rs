@@ -367,13 +367,18 @@ impl App {
             self.emit_layout_updated_event(ws_idx, tab_idx);
         }
 
+        let delivery = self
+            .state
+            .toast_config
+            .delivery
+            .effective(self.state.outer_terminal_focus);
         if self.local_terminal_notifications
             && matches!(
-                self.state.toast_config.delivery,
+                delivery,
                 crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
             )
         {
-            let notify = match self.state.toast_config.delivery {
+            let notify = match delivery {
                 crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
                 crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
                 _ => unreachable!("toast delivery was checked above"),
@@ -421,7 +426,10 @@ impl App {
         previous_toast: &Option<crate::app::state::ToastNotification>,
     ) {
         if !matches!(
-            self.state.toast_config.delivery,
+            self.state
+                .toast_config
+                .delivery
+                .effective(self.state.outer_terminal_focus),
             crate::config::ToastDelivery::Herdr
         ) || self.state.toast == *previous_toast
         {
@@ -678,17 +686,22 @@ impl App {
         &self,
         pane_updates: &[crate::app::actions::PaneStateUpdate],
     ) {
+        let delivery = self
+            .state
+            .toast_config
+            .delivery
+            .effective(self.state.outer_terminal_focus);
         if !self.local_terminal_notifications
             || self.state.toast_config.delay_seconds != 0
             || !matches!(
-                self.state.toast_config.delivery,
+                delivery,
                 crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
             )
         {
             return;
         }
 
-        let notify = match self.state.toast_config.delivery {
+        let notify = match delivery {
             crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
             crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
             _ => return,
@@ -766,16 +779,21 @@ impl App {
         &self,
         deliveries: &[crate::app::state::AgentNotificationDelivery],
     ) {
+        let delivery = self
+            .state
+            .toast_config
+            .delivery
+            .effective(self.state.outer_terminal_focus);
         if !self.local_terminal_notifications
             || !matches!(
-                self.state.toast_config.delivery,
+                delivery,
                 crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
             )
         {
             return;
         }
 
-        let notify = match self.state.toast_config.delivery {
+        let notify = match delivery {
             crate::config::ToastDelivery::Terminal => crate::terminal_notify::show_notification,
             crate::config::ToastDelivery::System => crate::platform::show_desktop_notification,
             _ => unreachable!("toast delivery was checked above"),
@@ -1257,7 +1275,12 @@ impl App {
             .as_deref()
             .and_then(|body| sanitized_notification_text(body, 240));
 
-        let reason = match self.state.toast_config.delivery {
+        let delivery = self
+            .state
+            .toast_config
+            .delivery
+            .effective(self.state.outer_terminal_focus);
+        let reason = match delivery {
             crate::config::ToastDelivery::Off => NotificationShowReason::Disabled,
             crate::config::ToastDelivery::Herdr => {
                 if self.state.toast.is_some() {
@@ -1283,7 +1306,7 @@ impl App {
                 if self.api_notification_rate_limited(Instant::now()) {
                     NotificationShowReason::RateLimited
                 } else {
-                    let notify = match self.state.toast_config.delivery {
+                    let notify = match delivery {
                         crate::config::ToastDelivery::Terminal => {
                             crate::terminal_notify::show_notification
                         }
@@ -1301,6 +1324,9 @@ impl App {
                         Ok(false) | Err(_) => NotificationShowReason::NoForegroundClient,
                     }
                 }
+            }
+            crate::config::ToastDelivery::Hybrid => {
+                unreachable!("hybrid delivery must be resolved before notification routing")
             }
         };
 

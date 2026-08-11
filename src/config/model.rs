@@ -60,8 +60,19 @@ pub enum ToastDelivery {
     #[default]
     Off,
     Herdr,
+    Hybrid,
     Terminal,
     System,
+}
+
+impl ToastDelivery {
+    pub fn effective(self, outer_terminal_focus: Option<bool>) -> Self {
+        match (self, outer_terminal_focus) {
+            (Self::Hybrid, Some(false)) => Self::System,
+            (Self::Hybrid, Some(true) | None) => Self::Herdr,
+            _ => self,
+        }
+    }
 }
 
 #[derive(
@@ -1757,6 +1768,37 @@ delivery = "system"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.toast.delivery, ToastDelivery::System);
+    }
+
+    #[test]
+    fn toast_config_parses_hybrid_delivery() {
+        let toml = r#"
+[ui.toast]
+delivery = "hybrid"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.toast.delivery, ToastDelivery::Hybrid);
+        assert_eq!(
+            serde_json::to_string(&config.ui.toast.delivery).unwrap(),
+            "\"hybrid\""
+        );
+    }
+
+    #[test]
+    fn hybrid_toast_delivery_uses_system_only_when_unfocused() {
+        assert_eq!(
+            ToastDelivery::Hybrid.effective(Some(false)),
+            ToastDelivery::System
+        );
+        assert_eq!(
+            ToastDelivery::Hybrid.effective(Some(true)),
+            ToastDelivery::Herdr
+        );
+        assert_eq!(ToastDelivery::Hybrid.effective(None), ToastDelivery::Herdr);
+        assert_eq!(
+            ToastDelivery::System.effective(Some(false)),
+            ToastDelivery::System
+        );
     }
 
     #[test]
