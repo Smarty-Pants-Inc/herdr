@@ -19,3 +19,10 @@ pub struct ServerCapabilities {
     #[serde(default)]
     pub detached_server_daemon: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerBuildIdentity {
+    pub channel: String,
+    pub build_id: String,
+    pub update_manifest_url: String,
+}
