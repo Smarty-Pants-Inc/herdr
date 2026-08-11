@@ -227,6 +227,14 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 }
 
 /// Unsupported platform stub.
-pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
+pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    _title: &str,
+    _body: Option<&str>,
+    _action: Option<&super::DesktopNotificationAction>,
+) -> std::io::Result<bool> {
     Ok(false)
 }
