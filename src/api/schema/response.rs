@@ -15,7 +15,7 @@ use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo, PluginWorkspacePaneInfo,
 };
-use super::server::ServerCapabilities;
+use super::server::{ServerBuildIdentity, ServerCapabilities};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -47,6 +47,8 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<ServerBuildIdentity>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

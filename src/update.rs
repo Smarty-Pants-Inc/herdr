@@ -648,6 +648,7 @@ fn acquire_update_lock(nonblocking: bool) -> Result<UpdateLock, String> {
 }
 
 #[cfg(not(windows))]
+#[derive(Debug)]
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -665,8 +666,24 @@ impl Drop for DownloadedUpdate {
 /// Download a release to a prepared executable temp file without touching the running server.
 #[cfg(not(windows))]
 fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
-    let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
+    download_update_asset(&release.download_url, release.sha256.as_deref())
+}
 
+#[cfg(not(windows))]
+fn download_update_asset(
+    download_url: &str,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadedUpdate, String> {
+    let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
+    download_update_asset_for_exe(current_exe, download_url, expected_sha256)
+}
+
+#[cfg(not(windows))]
+fn download_update_asset_for_exe(
+    current_exe: PathBuf,
+    download_url: &str,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadedUpdate, String> {
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
 
     // Check write permissions early
@@ -688,7 +705,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     let status = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&tmp_path)
-        .arg(&release.download_url)
+        .arg(download_url)
         .status()
         .map_err(|e| format!("download failed: {e}"))?;
 
@@ -697,7 +714,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
-    if let Some(expected) = &release.sha256 {
+    if let Some(expected) = expected_sha256 {
         if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!(
@@ -739,6 +756,51 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn exact_asset_install_allowed_at(current_exe: &Path) -> Result<(), String> {
+    preview_channel_rejection_for_exe_path(current_exe)
+        .map_or(Ok(()), |reason| Err(reason.to_string()))
+}
+
+#[cfg(unix)]
+fn reexec_command<I>(current_exe: &Path, args: I) -> Command
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut command = Command::new(current_exe);
+    command.args(args);
+    command
+}
+
+#[cfg(unix)]
+pub(crate) fn install_exact_asset_and_reexec(
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
+    exact_asset_install_allowed_at(&current_exe)?;
+    let _lock = acquire_update_lock(true)?;
+    let update = download_update_asset(download_url, Some(expected_sha256))?;
+    let current_exe = update.current_exe.clone();
+    install_downloaded_update(update)?;
+
+    let mut command = reexec_command(&current_exe, env::args_os().skip(1));
+    Err(format!(
+        "installed the remote server build but failed to restart Herdr: {}",
+        command.exec()
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn install_exact_asset_and_reexec(
+    _download_url: &str,
+    _expected_sha256: &str,
+) -> Result<(), String> {
+    Err("automatic remote server build alignment is not yet supported on Windows".into())
 }
 
 #[cfg(windows)]
@@ -2474,6 +2536,7 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::os::unix::net::UnixListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -2940,6 +3003,81 @@ mod tests {
         fs::remove_file(executable).unwrap();
         fs::remove_dir(dir).unwrap();
     }
+
+    #[test]
+    fn exact_asset_download_with_matching_checksum_atomically_replaces_local_binary() {
+        let dir = unique_test_dir("exact-asset");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("server-build");
+        let current_exe = dir.join("herdr");
+        let asset = b"exact server build";
+        fs::write(&source, asset).unwrap();
+        fs::write(&current_exe, b"old client build").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let download_url = format!("file://{}", source.display());
+
+        let update =
+            download_update_asset_for_exe(current_exe.clone(), &download_url, Some(&checksum))
+                .unwrap();
+        install_downloaded_update(update).unwrap();
+
+        assert_eq!(fs::read(&current_exe).unwrap(), asset);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_asset_download_rejects_checksum_mismatch_before_local_replacement() {
+        let dir = unique_test_dir("exact-asset-bad-checksum");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("server-build");
+        let current_exe = dir.join("herdr");
+        fs::write(&source, b"wrong server build").unwrap();
+        fs::write(&current_exe, b"old client build").unwrap();
+        let download_url = format!("file://{}", source.display());
+
+        let error = download_update_asset_for_exe(
+            current_exe.clone(),
+            &download_url,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("checksum verification failed"), "{error}");
+        assert_eq!(fs::read(&current_exe).unwrap(), b"old client build");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_asset_reexec_command_preserves_argv_without_execing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            std::ffi::OsString::from("attach"),
+            std::ffi::OsString::from("--remote"),
+            std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()),
+        ];
+        let command = reexec_command(Path::new("/tmp/exact-herdr"), args.clone());
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/tmp/exact-herdr")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            args.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn exact_asset_install_rejects_managed_paths_before_download() {
+        let homebrew = Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr");
+        let direct = Path::new("/home/user/.local/bin/herdr");
+
+        assert!(exact_asset_install_allowed_at(homebrew)
+            .unwrap_err()
+            .contains("Homebrew"));
+        assert!(exact_asset_install_allowed_at(direct).is_ok());
+    }
     #[test]
     fn update_lock_serializes_installation() {
         let dir = unique_test_dir("update-lock");
@@ -3036,6 +3174,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -3093,6 +3232,7 @@ mod tests {
                     live_handoff: true,
                     detached_server_daemon: true,
                 }),
+                build: None,
             },
         };
 
@@ -3279,6 +3419,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
