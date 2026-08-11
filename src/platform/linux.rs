@@ -534,6 +534,14 @@ fn bytes_match_image_signature(extension: &str, bytes: &[u8]) -> bool {
 
 /// Show a native desktop notification through libnotify's command-line helper.
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    title: &str,
+    body: Option<&str>,
+    _action: Option<&super::DesktopNotificationAction>,
+) -> std::io::Result<bool> {
     show_desktop_notification_with_command(title, body, |program| Command::new(program))
 }
 
