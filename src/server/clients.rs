@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::protocol::RenderEncoding;
@@ -26,6 +26,366 @@ pub(crate) enum DeferredRender {
     None,
     Full,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PublicPaneFocusTarget {
+    workspace_id: String,
+    pane_id: String,
+}
+
+/// Client-local projection of navigation fields stored in the shared app model.
+///
+/// Only stable public identities cross projection boundaries. Runtime topology,
+/// terminal state, overlays, selection, and host-terminal concerns remain shared.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClientNavigationState {
+    pub(crate) active_workspace_id: Option<String>,
+    pub(crate) selected_workspace_id: Option<String>,
+    pub(crate) active_tab_by_workspace: HashMap<String, String>,
+    pub(crate) focused_pane_by_tab: HashMap<String, String>,
+    pub(crate) previous_pane_by_tab: HashMap<String, String>,
+    pub(crate) previous_pane_focus: Option<PublicPaneFocusTarget>,
+    pub(crate) zoomed_tabs: HashSet<String>,
+    pub(crate) focused_workspace_plugin_pane: Option<String>,
+}
+
+impl ClientNavigationState {
+    pub(crate) fn capture(state: &crate::app::state::AppState) -> Self {
+        let active_workspace_id = state
+            .active
+            .and_then(|ws_idx| state.workspaces.get(ws_idx))
+            .map(|workspace| workspace.id.clone());
+        let selected_workspace_id = state
+            .workspaces
+            .get(state.selected)
+            .map(|workspace| workspace.id.clone());
+        let mut active_tab_by_workspace = HashMap::new();
+        let mut focused_pane_by_tab = HashMap::new();
+        let mut previous_pane_by_tab = HashMap::new();
+        let mut zoomed_tabs = HashSet::new();
+
+        for workspace in &state.workspaces {
+            if let Some(tab_id) = public_tab_id(workspace, workspace.active_tab) {
+                active_tab_by_workspace.insert(workspace.id.clone(), tab_id);
+            }
+            for (tab_idx, tab) in workspace.tabs.iter().enumerate() {
+                let Some(tab_id) = public_tab_id(workspace, tab_idx) else {
+                    continue;
+                };
+                if let Some(pane_id) = public_pane_id(workspace, tab.layout.focused()) {
+                    focused_pane_by_tab.insert(tab_id.clone(), pane_id);
+                }
+                if let Some(pane_id) = tab
+                    .layout
+                    .previous_focus()
+                    .and_then(|pane_id| public_pane_id(workspace, pane_id))
+                {
+                    previous_pane_by_tab.insert(tab_id.clone(), pane_id);
+                }
+                if tab.zoomed {
+                    zoomed_tabs.insert(tab_id);
+                }
+            }
+        }
+
+        let previous_pane_focus = state.previous_pane_focus.as_ref().and_then(|target| {
+            let workspace = state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == target.workspace_id)?;
+            Some(PublicPaneFocusTarget {
+                workspace_id: workspace.id.clone(),
+                pane_id: public_pane_id(workspace, target.pane_id)?,
+            })
+        });
+        let focused_workspace_plugin_pane = state.workspaces.iter().find_map(|workspace| {
+            state
+                .workspace_plugin_panes
+                .get(&workspace.id)
+                .filter(|pane| pane.focused)
+                .map(|_| format!("{}:plugin", workspace.id))
+        });
+
+        Self {
+            active_workspace_id,
+            selected_workspace_id,
+            active_tab_by_workspace,
+            focused_pane_by_tab,
+            previous_pane_by_tab,
+            previous_pane_focus,
+            zoomed_tabs,
+            focused_workspace_plugin_pane,
+        }
+    }
+
+    /// Drop stale identities and fill new topology from the canonical projection.
+    pub(crate) fn reconciled(&self, state: &crate::app::state::AppState, canonical: &Self) -> Self {
+        let current = Self::capture(state);
+        let active_workspace_id = valid_workspace_id(state, self.active_workspace_id.as_ref())
+            .or_else(|| valid_workspace_id(state, canonical.active_workspace_id.as_ref()))
+            .or(current.active_workspace_id.clone());
+        let selected_workspace_id = valid_workspace_id(state, self.selected_workspace_id.as_ref())
+            .or_else(|| valid_workspace_id(state, canonical.selected_workspace_id.as_ref()))
+            .or_else(|| active_workspace_id.clone())
+            .or(current.selected_workspace_id.clone());
+        let mut active_tab_by_workspace = HashMap::new();
+        let mut focused_pane_by_tab = HashMap::new();
+        let mut previous_pane_by_tab = HashMap::new();
+        let mut zoomed_tabs = HashSet::new();
+
+        for workspace in &state.workspaces {
+            let active_tab_id = self
+                .active_tab_by_workspace
+                .get(&workspace.id)
+                .and_then(|id| valid_tab_id(workspace, id))
+                .or_else(|| {
+                    canonical
+                        .active_tab_by_workspace
+                        .get(&workspace.id)
+                        .and_then(|id| valid_tab_id(workspace, id))
+                })
+                .or_else(|| current.active_tab_by_workspace.get(&workspace.id).cloned());
+            if let Some(active_tab_id) = active_tab_id {
+                active_tab_by_workspace.insert(workspace.id.clone(), active_tab_id);
+            }
+
+            for (tab_idx, _) in workspace.tabs.iter().enumerate() {
+                let Some(tab_id) = public_tab_id(workspace, tab_idx) else {
+                    continue;
+                };
+                let focused_pane_id = self
+                    .focused_pane_by_tab
+                    .get(&tab_id)
+                    .and_then(|id| valid_pane_id(workspace, tab_idx, id))
+                    .or_else(|| {
+                        canonical
+                            .focused_pane_by_tab
+                            .get(&tab_id)
+                            .and_then(|id| valid_pane_id(workspace, tab_idx, id))
+                    })
+                    .or_else(|| current.focused_pane_by_tab.get(&tab_id).cloned());
+                if let Some(focused_pane_id) = focused_pane_id {
+                    focused_pane_by_tab.insert(tab_id.clone(), focused_pane_id);
+                }
+                let previous_pane_id = if self.focused_pane_by_tab.contains_key(&tab_id) {
+                    self.previous_pane_by_tab
+                        .get(&tab_id)
+                        .and_then(|id| valid_pane_id(workspace, tab_idx, id))
+                } else if canonical.focused_pane_by_tab.contains_key(&tab_id) {
+                    canonical
+                        .previous_pane_by_tab
+                        .get(&tab_id)
+                        .and_then(|id| valid_pane_id(workspace, tab_idx, id))
+                } else {
+                    current.previous_pane_by_tab.get(&tab_id).cloned()
+                };
+                if let Some(previous_pane_id) = previous_pane_id {
+                    previous_pane_by_tab.insert(tab_id.clone(), previous_pane_id);
+                }
+
+                let zoomed = if self.focused_pane_by_tab.contains_key(&tab_id) {
+                    self.zoomed_tabs.contains(&tab_id)
+                } else if canonical.focused_pane_by_tab.contains_key(&tab_id) {
+                    canonical.zoomed_tabs.contains(&tab_id)
+                } else {
+                    current.zoomed_tabs.contains(&tab_id)
+                };
+                if zoomed {
+                    zoomed_tabs.insert(tab_id);
+                }
+            }
+        }
+
+        let previous_pane_focus = valid_previous_focus(state, self.previous_pane_focus.as_ref())
+            .or_else(|| valid_previous_focus(state, canonical.previous_pane_focus.as_ref()))
+            .or(current.previous_pane_focus);
+        let focused_workspace_plugin_pane =
+            valid_workspace_plugin_pane(state, self.focused_workspace_plugin_pane.as_ref())
+                .or_else(|| {
+                    valid_workspace_plugin_pane(
+                        state,
+                        canonical.focused_workspace_plugin_pane.as_ref(),
+                    )
+                })
+                .or(current.focused_workspace_plugin_pane);
+
+        Self {
+            active_workspace_id,
+            selected_workspace_id,
+            active_tab_by_workspace,
+            focused_pane_by_tab,
+            previous_pane_by_tab,
+            previous_pane_focus,
+            zoomed_tabs,
+            focused_workspace_plugin_pane,
+        }
+    }
+
+    /// Apply only navigation projection fields, without focus events or persistence effects.
+    pub(crate) fn apply_to(
+        &self,
+        state: &mut crate::app::state::AppState,
+    ) -> ClientNavigationState {
+        let canonical = Self::capture(state);
+        let reconciled = self.reconciled(state, &canonical);
+
+        state.active = reconciled
+            .active_workspace_id
+            .as_ref()
+            .and_then(|id| workspace_index(state, id));
+        state.selected = reconciled
+            .selected_workspace_id
+            .as_ref()
+            .and_then(|id| workspace_index(state, id))
+            .or(state.active)
+            .unwrap_or(0);
+
+        for workspace in &mut state.workspaces {
+            if let Some(tab_idx) = reconciled
+                .active_tab_by_workspace
+                .get(&workspace.id)
+                .and_then(|id| tab_index(workspace, id))
+            {
+                workspace.active_tab = tab_idx;
+            }
+            for tab_idx in 0..workspace.tabs.len() {
+                let Some(tab_id) = public_tab_id(workspace, tab_idx) else {
+                    continue;
+                };
+                let focused_pane_id = reconciled
+                    .focused_pane_by_tab
+                    .get(&tab_id)
+                    .and_then(|id| pane_id(workspace, tab_idx, id));
+                let previous_pane_id = reconciled
+                    .previous_pane_by_tab
+                    .get(&tab_id)
+                    .and_then(|id| pane_id(workspace, tab_idx, id));
+                if let Some(focused_pane_id) = focused_pane_id {
+                    workspace.tabs[tab_idx]
+                        .layout
+                        .project_focus_state(focused_pane_id, previous_pane_id);
+                }
+                workspace.tabs[tab_idx].zoomed = reconciled.zoomed_tabs.contains(&tab_id);
+            }
+        }
+
+        state.previous_pane_focus = reconciled.previous_pane_focus.as_ref().and_then(|target| {
+            let ws_idx = workspace_index(state, &target.workspace_id)?;
+            let workspace = state.workspaces.get(ws_idx)?;
+            let (_, pane_id) = pane_location(workspace, &target.pane_id)?;
+            Some(crate::app::state::PaneFocusTarget {
+                workspace_id: target.workspace_id.clone(),
+                pane_id,
+            })
+        });
+        for pane in state.workspace_plugin_panes.values_mut() {
+            pane.focused = false;
+        }
+        if let Some(plugin_id) = reconciled.focused_workspace_plugin_pane.as_ref() {
+            if let Some(workspace_id) = plugin_id.strip_suffix(":plugin") {
+                if let Some(pane) = state.workspace_plugin_panes.get_mut(workspace_id) {
+                    pane.focused = true;
+                }
+            }
+        }
+
+        reconciled
+    }
+}
+
+fn public_tab_id(workspace: &crate::workspace::Workspace, tab_idx: usize) -> Option<String> {
+    Some(crate::workspace::public_tab_id_for_number(
+        &workspace.id,
+        workspace.public_tab_number(tab_idx)?,
+    ))
+}
+
+fn public_pane_id(
+    workspace: &crate::workspace::Workspace,
+    pane_id: crate::layout::PaneId,
+) -> Option<String> {
+    Some(crate::workspace::public_pane_id_for_number(
+        &workspace.id,
+        workspace.public_pane_number(pane_id)?,
+    ))
+}
+
+fn workspace_index(state: &crate::app::state::AppState, workspace_id: &str) -> Option<usize> {
+    state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id)
+}
+
+fn valid_workspace_id(
+    state: &crate::app::state::AppState,
+    workspace_id: Option<&String>,
+) -> Option<String> {
+    let workspace_id = workspace_id?;
+    workspace_index(state, workspace_id).map(|_| workspace_id.clone())
+}
+
+fn tab_index(workspace: &crate::workspace::Workspace, tab_id: &str) -> Option<usize> {
+    workspace.tabs.iter().enumerate().find_map(|(tab_idx, _)| {
+        (public_tab_id(workspace, tab_idx)?.as_str() == tab_id).then_some(tab_idx)
+    })
+}
+
+fn valid_tab_id(workspace: &crate::workspace::Workspace, tab_id: &str) -> Option<String> {
+    tab_index(workspace, tab_id).map(|_| tab_id.to_owned())
+}
+
+fn pane_id(
+    workspace: &crate::workspace::Workspace,
+    tab_idx: usize,
+    public_id: &str,
+) -> Option<crate::layout::PaneId> {
+    let tab = workspace.tabs.get(tab_idx)?;
+    tab.layout
+        .pane_ids()
+        .into_iter()
+        .find(|&pane_id| public_pane_id(workspace, pane_id).as_deref() == Some(public_id))
+}
+
+fn pane_location(
+    workspace: &crate::workspace::Workspace,
+    public_id: &str,
+) -> Option<(usize, crate::layout::PaneId)> {
+    workspace.tabs.iter().enumerate().find_map(|(tab_idx, _)| {
+        pane_id(workspace, tab_idx, public_id).map(|pane_id| (tab_idx, pane_id))
+    })
+}
+
+fn valid_pane_id(
+    workspace: &crate::workspace::Workspace,
+    tab_idx: usize,
+    public_id: &str,
+) -> Option<String> {
+    pane_id(workspace, tab_idx, public_id).map(|_| public_id.to_owned())
+}
+
+fn valid_previous_focus(
+    state: &crate::app::state::AppState,
+    target: Option<&PublicPaneFocusTarget>,
+) -> Option<PublicPaneFocusTarget> {
+    let target = target?;
+    let workspace = state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == target.workspace_id)?;
+    pane_location(workspace, &target.pane_id)?;
+    Some(target.clone())
+}
+
+fn valid_workspace_plugin_pane(
+    state: &crate::app::state::AppState,
+    pane_id: Option<&String>,
+) -> Option<String> {
+    let pane_id = pane_id?;
+    let workspace_id = pane_id.strip_suffix(":plugin")?;
+    (workspace_index(state, workspace_id).is_some()
+        && state.workspace_plugin_panes.contains_key(workspace_id))
+    .then(|| pane_id.clone())
+}
 
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
@@ -33,6 +393,8 @@ pub(crate) struct ClientConnection {
     pub(crate) mode: ClientConnectionMode,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
     pub(crate) pending_terminal_attach: bool,
+    /// Client-local stable-ID navigation projection for full-app connections.
+    pub(crate) navigation: Option<ClientNavigationState>,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -115,6 +477,7 @@ impl ClientConnection {
         Self {
             mode,
             pending_terminal_attach,
+            navigation: None,
             keybindings,
             terminal_size,
             cell_size,
@@ -313,4 +676,101 @@ pub(crate) fn render_targets(
 
     targets.sort_by_key(|(client_id, _, _, is_foreground, _)| (*is_foreground, *client_id));
     targets
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::ClientNavigationState;
+    use ratatui::layout::Direction;
+
+    fn navigation_state() -> crate::app::state::AppState {
+        let mut state = crate::app::state::AppState::test_new();
+        let mut first = crate::workspace::Workspace::test_new("first");
+        let first_root = first.tabs[0].root_pane;
+        first.test_split(Direction::Horizontal);
+        first.tabs[0].layout.focus_pane(first_root);
+        first.tabs[0].zoomed = true;
+        let second_tab = first.test_add_tab(Some("second tab"));
+        first.active_tab = second_tab;
+
+        let second = crate::workspace::Workspace::test_new("second");
+        let second_root = second.tabs[0].root_pane;
+        let second_id = second.id.clone();
+        state.workspaces = vec![first, second];
+        state.active = Some(0);
+        state.selected = 1;
+        state.previous_pane_focus = Some(crate::app::state::PaneFocusTarget {
+            workspace_id: second_id.clone(),
+            pane_id: second_root,
+        });
+        state.workspace_plugin_panes.insert(
+            second_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "test".into(),
+                entrypoint: "panel".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn navigation_snapshot_survives_reordering_without_dirtying_session() {
+        let mut state = navigation_state();
+        state.session_dirty = false;
+        let snapshot = ClientNavigationState::capture(&state);
+
+        state.workspaces.swap(0, 1);
+        state.active = Some(0);
+        state.selected = 0;
+        for workspace in &mut state.workspaces {
+            workspace.active_tab = 0;
+            for tab in &mut workspace.tabs {
+                let root_pane = tab.root_pane;
+                tab.layout.project_focus_state(root_pane, None);
+                tab.zoomed = false;
+            }
+        }
+        state.previous_pane_focus = None;
+        for pane in state.workspace_plugin_panes.values_mut() {
+            pane.focused = false;
+        }
+
+        let applied = snapshot.apply_to(&mut state);
+        assert_eq!(applied, snapshot);
+        assert_eq!(ClientNavigationState::capture(&state), snapshot);
+        assert!(!state.session_dirty);
+    }
+
+    #[test]
+    fn stale_navigation_ids_fall_back_to_canonical_topology() {
+        let mut state = navigation_state();
+        let stale = ClientNavigationState::capture(&state);
+        state.workspaces.remove(0);
+        state.active = Some(0);
+        state.selected = 0;
+        state.previous_pane_focus = None;
+        let canonical = ClientNavigationState::capture(&state);
+
+        let reconciled = stale.reconciled(&state, &canonical);
+        reconciled.apply_to(&mut state);
+
+        assert_eq!(
+            reconciled.active_workspace_id,
+            canonical.active_workspace_id
+        );
+        assert_eq!(
+            reconciled.selected_workspace_id,
+            canonical.selected_workspace_id
+        );
+        assert_eq!(ClientNavigationState::capture(&state), reconciled);
+        assert!(reconciled
+            .active_tab_by_workspace
+            .keys()
+            .all(|workspace_id| workspace_id.as_str() == state.workspaces[0].id.as_str()));
+    }
 }
