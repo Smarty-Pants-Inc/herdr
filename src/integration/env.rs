@@ -1,7 +1,9 @@
+#[cfg(test)]
+use parking_lot::{Mutex, MutexGuard};
 use std::io;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::LazyLock;
 
 use portable_pty::CommandBuilder;
 
@@ -216,6 +218,6 @@ pub(crate) fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
+    LOCK.lock()
 }
