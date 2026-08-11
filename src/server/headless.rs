@@ -2153,6 +2153,7 @@ impl HeadlessServer {
                     protocol::NotifyKind::Sound,
                     sound_notify_message(sound),
                     None,
+                    None,
                 );
             }
         }
@@ -2185,11 +2186,16 @@ impl HeadlessServer {
             update.ws_idx,
             update.pane_id,
         );
+        let target = crate::app::state::ToastTarget {
+            workspace_id: ws.id.clone(),
+            pane_id: update.pane_id,
+        };
         self.send_notify_to_foreground_client(
             toast_notify_kind(delivery)
                 .expect("toast forwarding requires a client notification kind"),
             format!("{agent_label} {event_text}"),
             non_empty_body(&context),
+            Some(&target),
         );
     }
 
@@ -2208,6 +2214,7 @@ impl HeadlessServer {
                 protocol::NotifyKind::Sound,
                 sound_notify_message(sound),
                 None,
+                None,
             );
         }
 
@@ -2218,6 +2225,7 @@ impl HeadlessServer {
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
+                    toast.target.as_ref(),
                 );
             }
         }
@@ -2228,11 +2236,24 @@ impl HeadlessServer {
         kind: protocol::NotifyKind,
         message: impl Into<String>,
         body: Option<String>,
+        target: Option<&crate::app::state::ToastTarget>,
     ) -> bool {
+        let activation = (kind == protocol::NotifyKind::SystemToast)
+            .then_some(target)
+            .flatten()
+            .zip(self.foreground_client_id)
+            .map(
+                |(target, recipient_client_id)| protocol::NotificationActivation {
+                    recipient_client_id,
+                    workspace_id: target.workspace_id.clone(),
+                    pane_id: target.pane_id.raw(),
+                },
+            );
         self.send_to_foreground_client(ServerMessage::Notify {
             kind,
             message: message.into(),
             body,
+            activation,
         })
     }
 
@@ -2240,9 +2261,10 @@ impl HeadlessServer {
         &mut self,
         kind: protocol::NotifyKind,
         message: impl AsRef<str>,
+        target: Option<&crate::app::state::ToastTarget>,
     ) -> bool {
         let (title, body) = crate::terminal_notify::split_message(message.as_ref());
-        self.send_notify_to_foreground_client(kind, title, body.map(str::to_string))
+        self.send_notify_to_foreground_client(kind, title, body.map(str::to_string), target)
     }
 
     fn handle_notification_show_api(
@@ -2315,7 +2337,7 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
         }
         let kind = toast_notify_kind(delivery).expect("terminal/system delivery has notify kind");
-        let shown = self.send_notify_to_foreground_client(kind, title, body);
+        let shown = self.send_notify_to_foreground_client(kind, title, body, None);
         if shown {
             self.app.mark_api_notification_shown(Instant::now());
             self.forward_api_notification_sound(params.sound);
@@ -2460,6 +2482,7 @@ impl HeadlessServer {
             protocol::NotifyKind::Sound,
             sound_notify_message(sound),
             None,
+            None,
         );
     }
 
@@ -2556,20 +2579,21 @@ impl HeadlessServer {
                             protocol::NotifyKind::Sound,
                             sound_notify_message(sound),
                             None,
+                            None,
                         );
                     }
                 }
 
-                let toast_msg = if !suppress_completion
+                let toast = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
                     && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                        self.app
-                            .state
-                            .toast
-                            .as_ref()
-                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                        self.app.state.toast.as_ref().and_then(|toast| {
+                            toast.target.clone().map(|target| {
+                                (format!("{}: {}", toast.title, toast.context), target)
+                            })
+                        })
                     } else {
                         toast_message_from_state_change(
                             &self.app.state,
@@ -2585,11 +2609,12 @@ impl HeadlessServer {
                     None
                 };
 
-                if let Some(msg) = toast_msg {
+                if let Some((msg, target)) = toast {
                     self.send_flat_toast_to_foreground_client(
                         toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        Some(&target),
                     );
                 }
 
@@ -2649,20 +2674,21 @@ impl HeadlessServer {
                             protocol::NotifyKind::Sound,
                             sound_notify_message(sound),
                             None,
+                            None,
                         );
                     }
                 }
 
-                let toast_msg = if !suppress_completion
+                let toast = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
                     && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                        self.app
-                            .state
-                            .toast
-                            .as_ref()
-                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                        self.app.state.toast.as_ref().and_then(|toast| {
+                            toast.target.clone().map(|target| {
+                                (format!("{}: {}", toast.title, toast.context), target)
+                            })
+                        })
                     } else {
                         toast_message_from_state_change(
                             &self.app.state,
@@ -2678,11 +2704,12 @@ impl HeadlessServer {
                     None
                 };
 
-                if let Some(msg) = toast_msg {
+                if let Some((msg, target)) = toast {
                     self.send_flat_toast_to_foreground_client(
                         toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        Some(&target),
                     );
                 }
 
@@ -2725,6 +2752,7 @@ impl HeadlessServer {
                         toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        None,
                     );
                 }
 
@@ -3170,9 +3198,53 @@ impl HeadlessServer {
         needs_render
     }
 
-    fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
-        if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+    fn activate_notification_target(
+        &mut self,
+        activation: protocol::NotificationActivation,
+    ) -> bool {
+        let pane_id = crate::layout::PaneId::from_raw(activation.pane_id);
+        let Some(ws_idx) = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == activation.workspace_id)
+        else {
             return false;
+        };
+        if self.app.state.workspaces[ws_idx]
+            .find_tab_index_for_pane(pane_id)
+            .is_none()
+            || !self
+                .clients
+                .get(&activation.recipient_client_id)
+                .is_some_and(|client| client.is_full_app_client() && client.writer.is_some())
+        {
+            return false;
+        }
+
+        if self.promote_client_to_foreground(activation.recipient_client_id) {
+            self.resize_shared_runtime_to_effective_size();
+        }
+        self.app.focus_pane_internal_via_api(ws_idx, pane_id);
+        self.app.state.mode = app::Mode::Terminal;
+        self.app.toast_deadline = None;
+        self.app.state.toast = None;
+        if let Some(client) = self.clients.get_mut(&activation.recipient_client_id) {
+            client.request_semantic_redraw_after_input();
+        }
+        true
+    }
+    fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        if self.handoff_in_progress {
+            if let ServerEvent::NotificationActivated { respond_to, .. } = &ev {
+                debug!("rejecting notification activation during live handoff");
+                let _ = respond_to.send(false);
+                return false;
+            }
+            if Self::ignore_client_event_during_handoff(&ev) {
+                return false;
+            }
         }
 
         match ev {
@@ -3237,6 +3309,14 @@ impl HeadlessServer {
                 self.resize_shared_runtime_to_effective_size();
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
+            }
+            ServerEvent::NotificationActivated {
+                activation,
+                respond_to,
+            } => {
+                let activated = self.activate_notification_target(activation);
+                let _ = respond_to.send(activated);
+                activated
             }
             ServerEvent::GraphicsTransmissionResult {
                 client_id,
@@ -3393,6 +3473,7 @@ impl HeadlessServer {
                         body: Some(format!(
                             "Input message is {size} bytes; Herdr's limit is {max} bytes"
                         )),
+                        activation: None,
                     },
                 );
                 false
@@ -4032,6 +4113,7 @@ impl HeadlessServer {
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
+                    toast.target.as_ref(),
                 );
                 true
             } else {
@@ -4121,11 +4203,16 @@ impl HeadlessServer {
                             *ws_idx,
                             *pane_id,
                         );
+                        let target = crate::app::state::ToastTarget {
+                            workspace_id: self.app.state.workspaces[*ws_idx].id.clone(),
+                            pane_id: *pane_id,
+                        };
                         self.send_notify_to_foreground_client(
                             toast_notify_kind(toast_delivery)
                                 .expect("toast forwarding requires a client notification kind"),
                             format!("{agent_label} {event_text}"),
                             non_empty_body(&context),
+                            Some(&target),
                         );
                     }
                 }
@@ -4148,6 +4235,7 @@ impl HeadlessServer {
                     self.send_notify_to_foreground_client(
                         protocol::NotifyKind::Sound,
                         sound_notify_message(sound),
+                        None,
                         None,
                     );
                 }
@@ -6233,6 +6321,136 @@ mod tests {
             control_rx,
             render_rx,
         )
+    }
+
+    fn notification_activation_test_server() -> (HeadlessServer, String, crate::layout::PaneId) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("activation");
+        let target_tab = workspace.test_add_tab(Some("target"));
+        let target_pane = workspace.tabs[target_tab].root_pane;
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces =
+            vec![workspace, crate::workspace::Workspace::test_new("other")];
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = app::Mode::Navigator;
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "done".to_owned(),
+            context: "context".to_owned(),
+            position: None,
+            target: None,
+        });
+        server.app.toast_deadline = Some(Instant::now());
+
+        let (target_writer, _target_control, _target_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(target_writer),
+            ),
+        );
+        let (foreground_writer, _foreground_control, _foreground_render) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_writer),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        (server, workspace_id, target_pane)
+    }
+    fn notification_activation_event(
+        activation: protocol::NotificationActivation,
+    ) -> (ServerEvent, std::sync::mpsc::Receiver<bool>) {
+        let (respond_to, response) = std::sync::mpsc::channel();
+        (
+            ServerEvent::NotificationActivated {
+                activation,
+                respond_to,
+            },
+            response,
+        )
+    }
+
+    #[test]
+    fn notification_activation_promotes_and_focuses_its_target() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: target_pane.raw(),
+        });
+        assert!(server.handle_server_event(event));
+        assert!(response.recv().expect("processed activation result"));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(server.app.state.active, Some(0));
+        assert_eq!(server.app.state.mode, app::Mode::Terminal);
+        assert!(server.app.state.toast.is_none());
+        assert!(server.app.toast_deadline.is_none());
+        assert_eq!(
+            server.app.state.workspaces[0].focused_pane_id(),
+            Some(target_pane)
+        );
+    }
+
+    #[test]
+    fn stale_or_mismatched_notification_activation_is_ignored() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 99,
+            workspace_id: workspace_id.clone(),
+            pane_id: target_pane.raw(),
+        });
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("stale client rejection"));
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: crate::layout::PaneId::alloc().raw(),
+        });
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("stale pane rejection"));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (80, 24));
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.app.state.mode, app::Mode::Navigator);
+        assert!(server.app.state.toast.is_some());
+    }
+    #[test]
+    fn live_handoff_rejects_notification_activation() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+        server.handoff_in_progress = true;
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: target_pane.raw(),
+        });
+
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("handoff rejection"));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.app.state.mode, app::Mode::Navigator);
     }
 
     fn retained_test_server(
@@ -11497,6 +11715,7 @@ next_tab = ""
             kind: protocol::NotifyKind::Toast,
             message: "pi finished".to_string(),
             body: Some("workspace 1".to_string()),
+            activation: None,
         }));
 
         match read_server_message(
@@ -11508,10 +11727,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Toast);
                 assert_eq!(message, "pi finished");
                 assert_eq!(body.as_deref(), Some("workspace 1"));
+                assert!(activation.is_none());
             }
             other => panic!("expected toast notify, got {other:?}"),
         }
@@ -11574,6 +11795,7 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Toast);
                 assert_eq!(message, "Paste rejected");
@@ -11581,6 +11803,7 @@ next_tab = ""
                     body.as_deref(),
                     Some("Input message is 5000012 bytes; Herdr's limit is 1048576 bytes")
                 );
+                assert!(activation.is_none());
             }
             other => panic!("expected paste rejection notification, got {other:?}"),
         }
@@ -11666,6 +11889,7 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "v9.9.9 available");
@@ -11673,6 +11897,7 @@ next_tab = ""
                     body.as_deref(),
                     Some("detach, run `herdr update`, then follow its restart guidance")
                 );
+                assert!(activation.is_none());
             }
             other => panic!("expected system toast notify, got {other:?}"),
         }
@@ -11744,10 +11969,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "build failed");
                 assert_eq!(body.as_deref(), Some("api workspace"));
+                assert!(activation.is_none());
             }
             other => panic!("expected api notification, got {other:?}"),
         }
@@ -11756,10 +11983,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Sound);
                 assert_eq!(message, "agent attention");
                 assert!(body.is_none());
+                assert!(activation.is_none());
             }
             other => panic!("expected api sound, got {other:?}"),
         }
@@ -11824,10 +12053,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "build: failed");
                 assert_eq!(body.as_deref(), Some("api workspace"));
+                assert!(activation.is_none());
             }
             other => panic!("expected api notification, got {other:?}"),
         }
@@ -12005,10 +12236,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Sound);
                 assert_eq!(message, "agent done");
                 assert!(body.is_none());
+                assert!(activation.is_none());
             }
             other => panic!("expected api sound, got {other:?}"),
         }
@@ -12077,6 +12310,7 @@ next_tab = ""
     fn delayed_hybrid_unfocused_agent_notification_forwards_system_toast() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
+        let background_id = background.id.clone();
         let pane_id = background.tabs[0].root_pane;
         let foreground = crate::workspace::Workspace::test_new("foreground");
         server.app.state.workspaces = vec![background, foreground];
@@ -12086,6 +12320,104 @@ next_tab = ""
         server.app.state.mode = crate::app::Mode::Terminal;
         server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
         server.app.state.toast_config.delay_seconds = 1;
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(false),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now()
+            })
+        );
+        assert!(server.app.state.toast.is_none());
+        assert!(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "delayed transition should not notify immediately"
+        );
+        let deadline = server
+            .app
+            .state
+            .next_pending_agent_notification_deadline()
+            .expect("pending notification deadline");
+        assert!(server.handle_scheduled_tasks_headless(deadline, false));
+        let first = read_server_message(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("delayed sound message"),
+        );
+        let second = read_server_message(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("delayed toast message"),
+        );
+        assert!(matches!(
+            first,
+            ServerMessage::Notify {
+                kind: protocol::NotifyKind::Sound,
+                activation: None,
+                ..
+            }
+        ));
+        match second {
+            ServerMessage::Notify {
+                kind,
+                message,
+                body,
+                activation,
+            } => {
+                assert_eq!(kind, protocol::NotifyKind::SystemToast);
+                assert_eq!(message, "pi needs attention");
+                assert_eq!(body.as_deref(), Some("background · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id: background_id,
+                        pane_id: pane_id.raw()
+                    })
+                );
+            }
+            other => panic!("expected delayed system toast, got {other:?}"),
+        }
+        assert!(server.app.state.pending_agent_notifications.is_empty());
+    }
+
+    #[test]
+    fn immediate_hybrid_unfocused_agent_notification_carries_activation_target() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let background_id = background.id.clone();
+        let pane_id = background.tabs[0].root_pane;
+        server.app.state.workspaces = vec![
+            background,
+            crate::workspace::Workspace::test_new("foreground"),
+        ];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
+        server.app.state.toast_config.delay_seconds = 0;
+        server.app.state.sound.enabled = false;
 
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
@@ -12103,63 +12435,43 @@ next_tab = ""
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
 
-        let changed = server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
-            pane_id,
-            agent: Some(crate::detect::Agent::Pi),
-            state: crate::detect::AgentState::Blocked,
-            visible_blocker: false,
-            visible_working: false,
-            process_exited: false,
-            observed_at: Instant::now(),
-        });
-
-        assert!(changed);
-        assert!(server.app.state.toast.is_none());
         assert!(
-            client_control_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
-            "delayed transition should not notify immediately"
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
         );
 
-        let deadline = server
-            .app
-            .state
-            .next_pending_agent_notification_deadline()
-            .expect("pending notification deadline");
-        assert!(server.handle_scheduled_tasks_headless(deadline, false));
-
-        let first = read_server_message(
+        match read_server_message(
             client_control_rx
                 .recv_timeout(Duration::from_millis(100))
-                .expect("delayed sound message"),
-        );
-        let second = read_server_message(
-            client_control_rx
-                .recv_timeout(Duration::from_millis(100))
-                .expect("delayed toast message"),
-        );
-
-        assert!(matches!(
-            first,
-            ServerMessage::Notify {
-                kind: protocol::NotifyKind::Sound,
-                ..
-            }
-        ));
-        match second {
+                .expect("immediate system toast message"),
+        ) {
             ServerMessage::Notify {
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "pi needs attention");
                 assert_eq!(body.as_deref(), Some("background · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id: background_id,
+                        pane_id: pane_id.raw(),
+                    })
+                );
             }
-            other => panic!("expected delayed system toast, got {other:?}"),
+            other => panic!("expected immediate system toast, got {other:?}"),
         }
-        assert!(server.app.state.pending_agent_notifications.is_empty());
     }
 
     #[test]
@@ -12214,6 +12526,7 @@ next_tab = ""
     fn delayed_active_tab_unfocused_agent_notification_forwards_after_deadline() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("active");
+        let workspace_id = workspace.id.clone();
         let pane_id = workspace.tabs[0].root_pane;
         server.app.state.workspaces = vec![workspace];
         server.app.state.ensure_test_terminals();
@@ -12222,7 +12535,6 @@ next_tab = ""
         server.app.state.mode = crate::app::Mode::Terminal;
         server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
         server.app.state.toast_config.delay_seconds = 1;
-
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
             1,
@@ -12238,7 +12550,6 @@ next_tab = ""
         );
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
-
         assert!(
             server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
                 pane_id,
@@ -12247,7 +12558,7 @@ next_tab = ""
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: false,
-                observed_at: Instant::now(),
+                observed_at: Instant::now()
             })
         );
         assert!(server.app.state.toast.is_none());
@@ -12257,14 +12568,12 @@ next_tab = ""
                 .is_err(),
             "delayed transition should not notify immediately"
         );
-
         let deadline = server
             .app
             .state
             .next_pending_agent_notification_deadline()
             .expect("pending notification deadline");
         assert!(server.handle_scheduled_tasks_headless(deadline, false));
-
         let first = read_server_message(
             client_control_rx
                 .recv_timeout(Duration::from_millis(100))
@@ -12275,11 +12584,11 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("delayed toast message"),
         );
-
         assert!(matches!(
             first,
             ServerMessage::Notify {
                 kind: protocol::NotifyKind::Sound,
+                activation: None,
                 ..
             }
         ));
@@ -12288,10 +12597,19 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "pi needs attention");
                 assert_eq!(body.as_deref(), Some("active · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id,
+                        pane_id: pane_id.raw()
+                    })
+                );
             }
             other => panic!("expected delayed system toast, got {other:?}"),
         }
