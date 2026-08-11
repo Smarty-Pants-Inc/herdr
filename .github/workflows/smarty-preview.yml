@@ -117,6 +117,7 @@ jobs:
       HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
       HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
       HERDR_BUILD_UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json
+      HERDR_BUILD_AUTO_UPDATE: 'true'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:

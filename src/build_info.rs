@@ -20,6 +20,14 @@ pub fn uses_preview_update_manifest() -> bool {
     update_manifest_url().is_some() || is_preview()
 }
 
+/// Whether this published build may install preview updates from a running client.
+pub fn client_auto_update_enabled() -> bool {
+    matches!(
+        non_empty(option_env!("HERDR_BUILD_AUTO_UPDATE")),
+        Some("1" | "true")
+    )
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),

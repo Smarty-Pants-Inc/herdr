@@ -1,8 +1,8 @@
 //! Self-update mechanism.
 //!
 //! Checks the hosted herdr.dev update manifest for newer versions.
-//! Manual `herdr update` downloads and installs the binary.
-//! Background checks only surface availability and release notes.
+//! Manual `herdr update` and published preview clients download and install the binary.
+//! Background checks auto-install only for explicitly enabled direct preview builds.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
 //! JSON parsing uses serde_json (already in deps for persistence).
 
@@ -19,6 +19,8 @@ use std::os::fd::AsRawFd;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
@@ -639,10 +641,10 @@ fn acquire_update_lock_at(current_exe: &Path, nonblocking: bool) -> Result<Updat
 }
 
 #[cfg(not(windows))]
-fn acquire_update_lock() -> Result<UpdateLock, String> {
+fn acquire_update_lock(nonblocking: bool) -> Result<UpdateLock, String> {
     let current_exe =
         env::current_exe().map_err(|error| format!("can't find current binary: {error}"))?;
-    acquire_update_lock_at(&current_exe, false)
+    acquire_update_lock_at(&current_exe, nonblocking)
 }
 
 #[cfg(not(windows))]
@@ -926,6 +928,14 @@ struct RunningSessionUpdateOutcome {
     outcome: RunningServerUpdateOutcome,
 }
 
+#[cfg(not(windows))]
+fn automatic_handoff_completed(outcomes: &[RunningSessionUpdateOutcome]) -> bool {
+    !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|outcome| outcome.outcome == RunningServerUpdateOutcome::LiveHandoffComplete)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(not(windows))]
 enum FailedHandoffServerState {
@@ -1094,6 +1104,7 @@ fn target_client_protocol_server_is_running() -> Result<bool, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SelfUpdateOptions {
     pub(crate) live_handoff: bool,
+    automatic: bool,
 }
 
 pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOptions, String> {
@@ -1101,6 +1112,7 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
     for arg in args {
         match arg.as_str() {
             "--handoff" => options.live_handoff = true,
+            "--automatic" => options.automatic = true,
             "--help" | "-h" => {
                 return Err("usage: herdr update [--handoff]".to_string());
             }
@@ -1166,7 +1178,23 @@ fn confirm_running_server_update_action(
     options: SelfUpdateOptions,
 ) -> Result<Vec<RunningServerUpdateDecision>, String> {
     if plans.is_empty() {
-        return Ok(Vec::new());
+        return if options.automatic {
+            Err("automatic update could not find the running Herdr server".to_string())
+        } else {
+            Ok(Vec::new())
+        };
+    }
+
+    if options.automatic {
+        if plans
+            .iter()
+            .any(|plan| !server_supports_live_handoff(&plan.server))
+        {
+            return Err(
+                "automatic update requires live handoff support from every running Herdr server; run `herdr update` manually"
+                    .to_string(),
+            );
+        }
     }
 
     print_running_session_update_summary(&plans, release, options);
@@ -2117,7 +2145,7 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
     #[cfg(not(windows))]
-    let _update_lock = acquire_update_lock()?;
+    let _update_lock = acquire_update_lock(options.live_handoff)?;
 
     eprintln!("checking {} channel for updates...", channel.as_str());
 
@@ -2191,6 +2219,12 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         print_outdated_integration_notice_with_updated_binary(&updated_exe);
 
         print_running_session_update_outcomes(&server_update_outcomes, &release);
+        if options.automatic && !automatic_handoff_completed(&server_update_outcomes) {
+            return Err(
+                "automatic update installed the new binary, but live handoff did not complete for every running Herdr server"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(release.version)
@@ -2206,7 +2240,67 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
     }
 }
 
-/// Background update check: only surface availability and release notes.
+#[cfg(not(windows))]
+fn client_auto_update_allowed(
+    build_enabled: bool,
+    channel: UpdateChannel,
+    install_command: &str,
+) -> bool {
+    build_enabled && channel == UpdateChannel::Preview && install_command == HERDR_UPDATE_COMMAND
+}
+
+#[cfg(not(windows))]
+fn client_auto_update_command(current_exe: &Path) -> Command {
+    let mut command = crate::noninteractive_process::command(current_exe);
+    command
+        .args(["update", "--handoff", "--automatic"])
+        .env_remove(crate::HERDR_ENV_VAR)
+        .stdin(Stdio::null());
+    command
+}
+
+#[cfg(not(windows))]
+fn client_auto_update_result(current_exe: &Path) -> Option<String> {
+    match client_auto_update_command(current_exe).output() {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Some(if stderr.is_empty() {
+                format!("updater exited with {}", output.status)
+            } else {
+                stderr
+            })
+        }
+        Err(error) => Some(format!("failed to start updater: {error}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_client_auto_update(
+    events: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    version: String,
+) {
+    let error = match env::current_exe() {
+        Ok(current_exe) => client_auto_update_result(&current_exe),
+        Err(error) => Some(format!("can't find current binary: {error}")),
+    };
+
+    let Some(error) = error else {
+        return;
+    };
+    if error.contains("another Herdr update is already running") {
+        tracing::info!("another client owns the current Herdr update");
+        return;
+    }
+
+    tracing::warn!(%error, "client-owned update failed; offering manual retry");
+    let _ = events.blocking_send(crate::events::AppEvent::UpdateReady {
+        version,
+        install_command: update_install_command().to_string(),
+    });
+}
+
+/// Background update check and published-preview auto-install entrypoint.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
     crate::logging::update_check_started();
@@ -2272,6 +2366,20 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
 
     if let Err(e) = crate::release_notes::save_pending(release.label(), &release.notes_body) {
         tracing::warn!("failed to save pending release notes: {e}");
+    }
+
+    #[cfg(not(windows))]
+    if client_auto_update_allowed(
+        crate::build_info::client_auto_update_enabled(),
+        release.channel,
+        update_install_command(),
+    ) {
+        tracing::info!(
+            "auto-update check: {} available, starting client-owned install",
+            release.label()
+        );
+        run_client_auto_update(events, release.label().to_string());
+        return;
     }
 
     tracing::info!(
@@ -2763,6 +2871,75 @@ mod tests {
         assert!(!running_inside_herdr_env(None));
         assert!(!running_inside_herdr_env(Some("0")));
     }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_requires_enabled_direct_preview_build() {
+        assert!(client_auto_update_allowed(
+            true,
+            UpdateChannel::Preview,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            false,
+            UpdateChannel::Preview,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            true,
+            UpdateChannel::Stable,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            true,
+            UpdateChannel::Preview,
+            HOMEBREW_UPDATE_COMMAND
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_child_reenters_outside_herdr() {
+        let command = client_auto_update_command(Path::new("/tmp/herdr"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["update", "--handoff", "--automatic"]);
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(crate::HERDR_ENV_VAR) && value.is_none()
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_runs_child_and_captures_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("client-auto-update-child");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$1\" = update ] && [ \"$2\" = --handoff ] && [ \"$3\" = --automatic ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(client_auto_update_result(&executable), None);
+
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho checksum mismatch >&2\nexit 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client_auto_update_result(&executable).as_deref(),
+            Some("checksum mismatch")
+        );
+
+        fs::remove_file(executable).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
     #[test]
     fn update_lock_serializes_installation() {
         let dir = unique_test_dir("update-lock");
@@ -2784,17 +2961,49 @@ mod tests {
         assert_eq!(
             parse_self_update_args(&[]).unwrap(),
             SelfUpdateOptions {
-                live_handoff: false
+                live_handoff: false,
+                automatic: false,
             }
         );
         assert_eq!(
             parse_self_update_args(&["--handoff".to_string()]).unwrap(),
-            SelfUpdateOptions { live_handoff: true }
+            SelfUpdateOptions {
+                live_handoff: true,
+                automatic: false,
+            }
+        );
+        assert_eq!(
+            parse_self_update_args(&["--handoff".to_string(), "--automatic".to_string()]).unwrap(),
+            SelfUpdateOptions {
+                live_handoff: true,
+                automatic: true,
+            }
         );
         assert_eq!(
             parse_self_update_args(&["--unknown".to_string()]).unwrap_err(),
             "unknown update option: --unknown"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn automatic_update_requires_a_complete_live_handoff() {
+        let outcome = |outcome| RunningSessionUpdateOutcome {
+            session_label: "default".to_string(),
+            target_noun: "session",
+            stop_command: "herdr server stop".to_string(),
+            attach_command: Some("herdr".to_string()),
+            server_version: Some("0.8.0-preview.old".to_string()),
+            outcome,
+        };
+
+        assert!(!automatic_handoff_completed(&[]));
+        assert!(automatic_handoff_completed(&[outcome(
+            RunningServerUpdateOutcome::LiveHandoffComplete
+        )]));
+        assert!(!automatic_handoff_completed(&[outcome(
+            RunningServerUpdateOutcome::RestartDeferred
+        )]));
     }
 
     #[test]
@@ -2892,6 +3101,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                automatic: false,
             },
         )
         .unwrap();
@@ -3100,6 +3310,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                automatic: false,
             },
         )
         .unwrap();
