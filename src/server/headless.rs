@@ -1253,7 +1253,6 @@ impl HeadlessServer {
         }
 
         self.handoff_in_progress = true;
-        self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
 
         let mut paused_terminal_ids = Vec::new();
@@ -1404,6 +1403,7 @@ impl HeadlessServer {
             }
             return Err(err);
         }
+        self.disconnect_all_clients_for_handoff();
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
