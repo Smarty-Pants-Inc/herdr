@@ -951,6 +951,14 @@ fn should_relaunch_updated_client(
         _ => false,
     }
 }
+fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> bool {
+    remote_client
+        && matches!(
+            error,
+            ClientError::ServerShutdown { reason: Some(reason) }
+                if reason == "live update in progress; reconnect after handoff completes"
+        )
+}
 
 /// Runs the thin client: connects to the server, performs the handshake,
 /// and enters the main event loop.
@@ -1262,7 +1270,6 @@ fn run_client_with_mode(
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     #[cfg(unix)]
     let client_executable = ClientExecutableIdentity::capture();
-    #[cfg(unix)]
     let remote_client = std::env::var_os(crate::remote::REATTACH_COMMAND_ENV_VAR).is_some();
 
     let kitty_graphics_enabled =
@@ -1412,6 +1419,9 @@ fn run_client_with_mode(
         }
 
         eprintln!("herdr: {err}");
+        if should_request_remote_reconnect(&err, remote_client) {
+            std::process::exit(crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE);
+        }
 
         if matches!(
             err,
@@ -3346,6 +3356,13 @@ mod tests {
         assert!(!should_relaunch_updated_client(
             &rejected, false, false, true
         ));
+
+        let handoff = ClientError::ServerShutdown {
+            reason: Some("live update in progress; reconnect after handoff completes".into()),
+        };
+        assert!(should_request_remote_reconnect(&handoff, true));
+        assert!(!should_request_remote_reconnect(&handoff, false));
+        assert!(!should_request_remote_reconnect(&detached, true));
     }
 
     #[test]
