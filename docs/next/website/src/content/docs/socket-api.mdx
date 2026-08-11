@@ -367,7 +367,7 @@ Show a user notification through the configured toast delivery:
 {"id":"req_notify","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}
 ```
 
-`title` is required and must contain visible text after control characters and repeated whitespace are removed. `body` is optional. Herdr collapses newlines, tabs, carriage returns, and repeated whitespace into spaces, then trims notification text to 80 characters for `title` and 240 characters for `body`. An empty sanitized `title` returns `invalid_params`. `position` is optional and applies only when `ui.toast.delivery = "herdr"`; desktop positions are relative to the full Herdr frame, and omitted positions use `ui.toast.herdr.position`. Terminal, system, and off delivery ignore `position`. `sound` is optional and can be `none`, `done`, or `request`; it defaults to `none` and plays only when the notification is shown.
+`title` is required and must contain visible text after control characters and repeated whitespace are removed. `body` is optional. Herdr collapses newlines, tabs, carriage returns, and repeated whitespace into spaces, then trims notification text to 80 characters for `title` and 240 characters for `body`. An empty sanitized `title` returns `invalid_params`. `position` applies only when the effective toast delivery is `herdr`: configured `hybrid` delivery is in-app while the outer terminal is focused or its focus is unknown, and system delivery while it is unfocused. Desktop positions are relative to the full Herdr frame, and omitted positions use `ui.toast.herdr.position`. Terminal, system, and off delivery ignore `position`. `sound` is optional and can be `none`, `done`, or `request`; it defaults to `none` and plays only when the notification is shown.
 
 The response reports whether anything was shown:
 
@@ -375,7 +375,7 @@ The response reports whether anything was shown:
 {"id":"req_notify","result":{"type":"notification_show","shown":true,"reason":"shown"}}
 ```
 
-Possible reasons are `shown`, `disabled`, `rate_limited`, `no_foreground_client`, and `busy`. `disabled` means `ui.toast.delivery = "off"`. `busy` means an existing in-app toast was not replaced. Terminal and system delivery are best-effort through the current foreground attached Herdr client.
+Possible reasons are `shown`, `disabled`, `rate_limited`, `no_foreground_client`, and `busy`. `disabled` means `ui.toast.delivery = "off"`. `busy` means an existing in-app toast was not replaced. Terminal and system delivery are best-effort through the current foreground attached Herdr client; `hybrid` uses system delivery only when that client's outer terminal is explicitly unfocused.
 
 Set or clear the foreground client's outer terminal window title:
 
