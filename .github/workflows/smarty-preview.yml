@@ -3,7 +3,7 @@ name: Smarty Preview
 on:
   push:
     branches:
-      - patch/remote-compatible-attach
+      - smarty-preview-source
 
 permissions:
   contents: read
