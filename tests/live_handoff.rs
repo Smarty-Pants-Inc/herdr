@@ -94,6 +94,110 @@ fn spawn_server_with_env(
         child,
     }
 }
+fn spawn_remote_client(
+    base: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    client_socket: &Path,
+) -> SpawnedHerdr {
+    let remote_home = base.join("remote-home");
+    let remote_bin = remote_home.join(".local/bin/herdr");
+    fs::create_dir_all(remote_bin.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_herdr"), &remote_bin).unwrap();
+    let mut permissions = fs::metadata(&remote_bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&remote_bin, permissions).unwrap();
+
+    let fake_bin = base.join("fake-bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_ssh = fake_bin.join("ssh");
+    fs::write(
+        &fake_ssh,
+        "#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=$arg; done\nexec /bin/sh -c \"$last\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_ssh).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&fake_ssh, permissions).unwrap();
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("--remote");
+    cmd.arg("fake-host");
+    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", api_socket);
+    cmd.env("HERDR_CLIENT_SOCKET_PATH", client_socket);
+    cmd.env("HOME", &remote_home);
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}:{}",
+            fake_bin.display(),
+            remote_bin.parent().unwrap().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("HERDR_ENV");
+
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    drop(pair.slave);
+    SpawnedHerdr {
+        _master: pair.master,
+        child,
+    }
+}
+
+fn read_pty_until(
+    client: &SpawnedHerdr,
+    timeout: Duration,
+    mut complete: impl FnMut(&str) -> bool,
+) -> String {
+    let fd = client
+        ._master
+        .as_raw_fd()
+        .expect("remote client PTY file descriptor");
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert_ne!(flags, -1, "read remote client PTY flags");
+    assert_ne!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        -1,
+        "make remote client PTY nonblocking"
+    );
+
+    let mut reader = client
+        ._master
+        .try_clone_reader()
+        .expect("clone remote client PTY reader");
+    let mut output = String::new();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut buf = [0u8; 4096];
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => output.push_str(&String::from_utf8_lossy(&buf[..read])),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("read remote client PTY: {err}"),
+        }
+        if complete(&output) {
+            return output;
+        }
+    }
+    panic!("remote client output did not reach expected state: {output:?}");
+}
 
 fn spawn_named_session_server(
     config_home: &Path,
@@ -604,6 +708,56 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn remote_client_reconnects_after_live_handoff() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let mut remote_client = spawn_remote_client(
+        &base,
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+    );
+    let attached = read_pty_until(&remote_client, Duration::from_secs(10), |output| {
+        output.contains("\u{1b}[?1049h")
+    });
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let reconnected = read_pty_until(&remote_client, Duration::from_secs(15), |output| {
+        output.contains("\u{1b}[?1049h")
+    });
+
+    assert!(
+        remote_client.child.try_wait().unwrap().is_none(),
+        "remote launcher exited instead of reconnecting; initial={attached:?}; reconnect={reconnected:?}"
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    ));
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(remote_client);
     drop(spawned);
     cleanup_test_base(&base);
 }
