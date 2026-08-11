@@ -256,6 +256,8 @@ pub enum ClientError {
     HandshakeRejected { version: u32, error: String },
     /// Server shut down.
     ServerShutdown { reason: Option<String> },
+    /// Server is handing live state to a replacement build.
+    ServerHandoff { reason: String },
     /// Lost connection to the server.
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
@@ -302,6 +304,9 @@ impl std::fmt::Display for ClientError {
                     }
                 }
                 Ok(())
+            }
+            ClientError::ServerHandoff { reason } => {
+                write!(f, "server handoff in progress: {reason}")
             }
             ClientError::ConnectionLost(err) => {
                 if let Ok(reattach_command) = std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
@@ -975,10 +980,13 @@ fn should_relaunch_updated_client(
     }
 
     match error {
-        ClientError::ConnectionLost(_) => true,
+        ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. } => true,
         ClientError::ServerShutdown { reason } => reason.as_deref() != Some("detached"),
         _ => false,
     }
+}
+fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> bool {
+    remote_client && matches!(error, ClientError::ServerHandoff { .. })
 }
 
 /// Runs the thin client: connects to the server, performs the handshake,
@@ -1117,6 +1125,19 @@ fn connect_terminal_session_stream(
     Ok(stream)
 }
 
+fn write_terminal_session_closed(
+    stdout: &mut impl io::Write,
+    reason: Option<String>,
+) -> io::Result<()> {
+    let line = serde_json::json!({
+        "type": "terminal.closed",
+        "reason": reason,
+    });
+    serde_json::to_writer(&mut *stdout, &line)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
 fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     loop {
@@ -1137,14 +1158,10 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                 stdout.flush()?;
             }
             Ok(ServerMessage::ServerShutdown { reason }) => {
-                let line = serde_json::json!({
-                    "type": "terminal.closed",
-                    "reason": reason,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-                return Ok(());
+                return write_terminal_session_closed(&mut stdout, reason)
+            }
+            Ok(ServerMessage::ServerHandoff { reason }) => {
+                return write_terminal_session_closed(&mut stdout, Some(reason))
             }
             Ok(ServerMessage::Graphics { .. }) => {}
             Ok(_) => {}
@@ -1291,7 +1308,6 @@ fn run_client_with_mode(
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     #[cfg(unix)]
     let client_executable = ClientExecutableIdentity::capture();
-    #[cfg(unix)]
     let remote_client = std::env::var_os(crate::remote::REATTACH_COMMAND_ENV_VAR).is_some();
 
     let kitty_graphics_enabled =
@@ -1442,6 +1458,9 @@ fn run_client_with_mode(
         }
 
         let _ = writeln!(io::stderr(), "herdr: {err}");
+        if should_request_remote_reconnect(&err, remote_client) {
+            std::process::exit(crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE);
+        }
 
         let detached = matches!(
             &err,
@@ -1918,6 +1937,9 @@ async fn run_client_loop(
                 }
                 ServerMessage::ServerShutdown { reason } => {
                     return Err(ClientError::ServerShutdown { reason });
+                }
+                ServerMessage::ServerHandoff { reason } => {
+                    return Err(ClientError::ServerHandoff { reason });
                 }
                 ServerMessage::Notify {
                     kind,
@@ -3423,6 +3445,13 @@ mod tests {
         assert!(!should_relaunch_updated_client(
             &rejected, false, false, true
         ));
+
+        let handoff = ClientError::ServerHandoff {
+            reason: "live update in progress; reconnect after handoff completes".into(),
+        };
+        assert!(should_request_remote_reconnect(&handoff, true));
+        assert!(!should_request_remote_reconnect(&handoff, false));
+        assert!(!should_request_remote_reconnect(&detached, true));
     }
 
     #[test]
