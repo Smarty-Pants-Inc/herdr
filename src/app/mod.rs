@@ -3599,14 +3599,14 @@ mod tests {
             crate::config::ToastDelivery::Off
         );
 
-        app.save_toast_delivery(crate::config::ToastDelivery::Terminal);
+        app.save_toast_delivery(crate::config::ToastDelivery::Hybrid);
 
         assert_eq!(
             app.state.toast_config.delivery,
-            crate::config::ToastDelivery::Terminal
+            crate::config::ToastDelivery::Hybrid
         );
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("delivery = \"terminal\""));
+        assert!(content.contains("delivery = \"hybrid\""));
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
