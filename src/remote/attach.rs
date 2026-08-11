@@ -380,7 +380,11 @@ fn current_version() -> String {
 }
 
 fn current_channel() -> &'static str {
-    crate::build_info::channel()
+    if crate::build_info::uses_preview_update_manifest() {
+        "preview"
+    } else {
+        crate::build_info::channel()
+    }
 }
 
 struct InstallSource {
@@ -1483,6 +1487,33 @@ fn remote_asset_info(asset: &RemoteAssetRef) -> RemoteReleaseAsset {
     }
 }
 
+fn validate_remote_asset_checksum(asset_key: &str, asset: &RemoteReleaseAsset) -> io::Result<()> {
+    let checksum = asset
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "release manifest asset {asset_key} is missing a SHA-256 checksum"
+            ))
+        })?;
+    if checksum.len() != 64
+        || !checksum
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other(format!(
+            "release manifest asset {asset_key} has an invalid SHA-256 checksum"
+        )));
+    }
+    Ok(())
+}
+
+fn remote_preview_manifest_url(build_manifest_url: Option<&str>) -> &str {
+    build_manifest_url.unwrap_or(PREVIEW_UPDATE_MANIFEST_URL)
+}
+
 fn preview_assets_for_build<'a>(
     manifest: &'a RemotePreviewManifest,
     build_id: &str,
@@ -1499,11 +1530,13 @@ fn preview_assets_for_build<'a>(
 }
 
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
-    if crate::build_info::is_preview() {
+    if crate::build_info::uses_preview_update_manifest() {
         let build_id = crate::build_info::build_id().ok_or_else(|| {
             io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
         })?;
-        let manifest_bytes = fetch_remote_manifest(PREVIEW_UPDATE_MANIFEST_URL)?;
+        let manifest_bytes = fetch_remote_manifest(remote_preview_manifest_url(
+            crate::build_info::update_manifest_url(),
+        ))?;
         let manifest: RemotePreviewManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|err| {
                 io::Error::other(format!("failed to parse preview manifest JSON: {err}"))
@@ -1514,11 +1547,16 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
                 "preview manifest has build {build_id} protocol {protocol}, but this client needs protocol {CURRENT_PROTOCOL}; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching Herdr on the remote host manually"
             )));
         }
-        return assets.get(asset_key).map(remote_asset_info).ok_or_else(|| {
+        let asset = assets.get(asset_key).ok_or_else(|| {
             io::Error::other(format!(
                 "no {asset_key} binary in the preview manifest for build {build_id}"
             ))
-        });
+        })?;
+        let asset = remote_asset_info(asset);
+        if crate::build_info::update_manifest_url().is_some() {
+            validate_remote_asset_checksum(asset_key, &asset)?;
+        }
+        return Ok(asset);
     }
 
     let current_version = current_version();
@@ -1547,11 +1585,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
     asset.sha256 = asset
         .sha256
         .or_else(|| release.sha256.get(asset_key).cloned());
-    if asset.sha256.is_none() {
-        return Err(io::Error::other(format!(
-            "release manifest asset {asset_key} is missing a SHA-256 checksum"
-        )));
-    }
+    validate_remote_asset_checksum(asset_key, &asset)?;
     Ok(asset)
 }
 
@@ -3103,6 +3137,42 @@ mod tests {
         assert_eq!(protocol, 11);
         assert_eq!(asset.url(), "https://example.com/old");
         assert_eq!(asset.sha256(), Some("old"));
+    }
+
+    #[test]
+    fn remote_preview_manifest_url_uses_build_scoped_url_when_present() {
+        const FORK_MANIFEST: &str = "https://example.com/fork-preview.json";
+
+        assert_eq!(
+            remote_preview_manifest_url(Some(FORK_MANIFEST)),
+            FORK_MANIFEST
+        );
+        assert_eq!(
+            remote_preview_manifest_url(None),
+            PREVIEW_UPDATE_MANIFEST_URL
+        );
+    }
+
+    #[test]
+    fn build_scoped_remote_assets_require_valid_checksums() {
+        for (checksum, expected_error) in [
+            (None, Some("missing a SHA-256 checksum")),
+            (Some("deadbeef"), Some("invalid SHA-256 checksum")),
+            (
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                None,
+            ),
+        ] {
+            let asset = RemoteReleaseAsset {
+                url: "https://example.com/herdr".to_string(),
+                sha256: checksum.map(str::to_string),
+            };
+            let result = validate_remote_asset_checksum("linux-x86_64", &asset);
+            match expected_error {
+                Some(expected) => assert!(result.unwrap_err().to_string().contains(expected)),
+                None => result.unwrap(),
+            }
+        }
     }
 
     #[test]
