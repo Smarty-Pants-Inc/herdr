@@ -103,15 +103,24 @@ fn wait_for_file(path: &Path, timeout: Duration) {
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedHerdr {
+    spawn_server_with_config(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        "onboarding = false\n",
+    )
+}
+
+fn spawn_server_with_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    config: &str,
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
-    fs::write(
-        config_home.join("herdr/config.toml"),
-        "onboarding = false\n",
-    )
-    .unwrap();
-
+    fs::write(config_home.join("herdr/config.toml"), config).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -328,6 +337,28 @@ fn pane_read_recent_contains(
             return true;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+fn pane_send_input_until_contains(
+    socket_path: &Path,
+    pane_id: &str,
+    text: &str,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        pane_send_input(socket_path, pane_id, text);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if pane_read_recent_contains(
+            socket_path,
+            pane_id,
+            needle,
+            remaining.min(Duration::from_millis(500)),
+        ) {
+            return true;
+        }
     }
     false
 }
@@ -931,12 +962,11 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
-    let mut client_a = connect_raw_client(&client_socket, 100, 30);
-    let mut client_b = connect_raw_client(&client_socket, 100, 30);
-
     // Ensure we have an active pane that can reflect input changes.
     let (_workspace_id, pane_id) =
         create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b");
+    let mut client_a = connect_raw_client(&client_socket, 100, 30);
+    let mut client_b = connect_raw_client(&client_socket, 100, 30);
 
     // Drain initial frames so we measure the frame caused by new input.
     drain_server_messages(&mut client_a, Duration::from_millis(300));
@@ -970,6 +1000,222 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
         pane_read_recent(&api_socket, &pane_id, 200),
         client_b_frames.join("\n--- frame ---\n"),
         log_tail(&server_log_path(&config_home), 80)
+    );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn multi_client_keeps_navigation_and_input_routing_independent() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        "onboarding = false\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let (workspace_a, a_first_left_pane) = create_workspace_and_root_pane(&api_socket, "client-a");
+    let a_first_right_split = send_json_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"a_first_right_split","method":"pane.split","params":{{"target_pane_id":"{a_first_left_pane}","direction":"right","focus":false}}}}"#
+        ),
+    );
+    assert!(
+        a_first_right_split.get("error").is_none(),
+        "pane.split should succeed: {a_first_right_split}"
+    );
+    let a_first_right_pane = a_first_right_split
+        .pointer("/result/pane/pane_id")
+        .and_then(Value::as_str)
+        .expect("pane.split should return the right pane id")
+        .to_string();
+    let a_second_tab = send_json_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"a_second_tab","method":"tab.create","params":{{"workspace_id":"{workspace_a}","focus":false}}}}"#
+        ),
+    );
+    assert!(
+        a_second_tab.get("error").is_none(),
+        "tab.create should succeed: {a_second_tab}"
+    );
+    let a_second_left_pane = a_second_tab
+        .pointer("/result/root_pane/pane_id")
+        .and_then(Value::as_str)
+        .expect("tab.create should return a root pane id")
+        .to_string();
+    let a_right_split = send_json_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"a_right_split","method":"pane.split","params":{{"target_pane_id":"{a_second_left_pane}","direction":"right","focus":false}}}}"#
+        ),
+    );
+    assert!(
+        a_right_split.get("error").is_none(),
+        "pane.split should succeed: {a_right_split}"
+    );
+    let a_right_pane = a_right_split
+        .pointer("/result/pane/pane_id")
+        .and_then(Value::as_str)
+        .expect("pane.split should return the right pane id")
+        .to_string();
+    let (workspace_b, b_pane) = create_workspace_and_root_pane(&api_socket, "client-b");
+    let b_focus = send_json_request(
+        &api_socket,
+        &format!(
+            r#"{{"id":"focus_client_b","method":"workspace.focus","params":{{"workspace_id":"{workspace_b}"}}}}"#
+        ),
+    );
+    assert!(
+        b_focus.get("error").is_none(),
+        "workspace.focus should select B before clients attach: {b_focus}"
+    );
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let a_first_marker = format!("CLIENT_A_FIRST_{unique}");
+    let a_marker = format!("CLIENT_A_RIGHT_{unique}");
+    let b_marker = format!("CLIENT_B_{unique}");
+    assert!(
+        pane_send_input_until_contains(
+            &api_socket,
+            &a_first_left_pane,
+            &format!("echo {a_first_marker}"),
+            &a_first_marker,
+            Duration::from_secs(10),
+        ),
+        "the A-first marker should be available before clients attach"
+    );
+    assert!(
+        pane_send_input_until_contains(
+            &api_socket,
+            &a_right_pane,
+            &format!("echo {a_marker}"),
+            &a_marker,
+            Duration::from_secs(10),
+        ),
+        "the A-right marker should be available before clients attach"
+    );
+    assert!(
+        pane_send_input_until_contains(
+            &api_socket,
+            &b_pane,
+            &format!("echo {b_marker}"),
+            &b_marker,
+            Duration::from_secs(10),
+        ),
+        "the B marker should be available before clients attach"
+    );
+
+    // Both clients inherit canonical workspace B. Only A navigates away from it.
+    let mut client_a = connect_raw_client(&client_socket, 100, 30);
+    let mut client_b = connect_raw_client(&client_socket, 100, 30);
+    let (b_started_on_b, b_initial_frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_b, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, &b_marker)
+        })
+        .expect("frame decoding should succeed");
+    assert!(
+        b_started_on_b,
+        "client B should initially render workspace B. frames:\n{}",
+        b_initial_frames.join("\n--- frame ---\n")
+    );
+    drain_server_messages(&mut client_a, Duration::from_millis(300));
+    drain_server_messages(&mut client_b, Duration::from_millis(300));
+
+    // Click workspace A and wait until its first split tab is the rendered input geometry.
+    send_client_input(&mut client_a, b"\x1b[<0;5;3M\x1b[<0;5;3m");
+    let (a_opened_first_tab, a_first_tab_frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_a, Duration::from_secs(10), |frame| {
+            frame_contains_text(frame, &a_first_marker)
+        })
+        .expect("frame decoding should succeed");
+    assert!(
+        a_opened_first_tab,
+        "client A should render workspace A's first tab. frames:\n{}",
+        a_first_tab_frames.join("\n--- frame ---\n")
+    );
+    drain_server_messages(&mut client_a, Duration::from_millis(300));
+
+    // Next-tab, pane-right, and terminal input share one transport message. Each
+    // navigation event must refresh geometry before the following event is routed.
+    let input_marker = format!("A_INPUT_{}", unique % 1_000_000);
+    send_client_input(
+        &mut client_a,
+        format!("\x02n\x02lecho {input_marker}\n").as_bytes(),
+    );
+    let (a_navigated, a_navigation_frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_a, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, &a_marker) && frame_contains_text(frame, &input_marker)
+        })
+        .expect("frame decoding should succeed");
+    assert!(
+        a_navigated,
+        "client A should route the batched input to its second tab's right pane. frames:\n{}",
+        a_navigation_frames.join("\n--- frame ---\n")
+    );
+    drain_server_messages(&mut client_a, Duration::from_millis(300));
+    drain_server_messages(&mut client_b, Duration::from_millis(300));
+
+    // Output in both selected panes requires fresh frames without changing navigation.
+    pane_send_input(&api_socket, &a_right_pane, "echo client-a-frame-refresh");
+    pane_send_input(&api_socket, &b_pane, "echo client-b-frame-refresh");
+    let (a_on_right, a_frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_a, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, &a_marker)
+        })
+        .expect("frame decoding should succeed");
+    let (b_stays_on_b, b_frames) =
+        wait_for_frame_matching_with_snapshots(&mut client_b, Duration::from_secs(5), |frame| {
+            frame_contains_text(frame, &b_marker)
+        })
+        .expect("frame decoding should succeed");
+    assert!(
+        a_on_right,
+        "client A should render its selected A-right pane. frames:\n{}",
+        a_frames.join("\n--- frame ---\n")
+    );
+    assert!(
+        b_stays_on_b,
+        "client B should retain workspace B while client A navigates. frames:\n{}",
+        b_frames.join("\n--- frame ---\n")
+    );
+    assert!(
+        pane_read_recent_contains(
+            &api_socket,
+            &a_right_pane,
+            &input_marker,
+            Duration::from_secs(5)
+        ),
+        "client A terminal input must reach the second tab's right pane"
+    );
+    assert!(
+        !pane_read_recent(&api_socket, &a_second_left_pane, 200).contains(&input_marker),
+        "client A terminal input must not reach the second tab's left pane"
+    );
+    assert!(
+        !pane_read_recent(&api_socket, &a_first_left_pane, 200).contains(&input_marker),
+        "client A terminal input must not reach the first tab's left pane"
+    );
+    assert!(
+        !pane_read_recent(&api_socket, &a_first_right_pane, 200).contains(&input_marker),
+        "client A terminal input must not reach the stale first-tab right pane"
+    );
+    assert!(
+        !pane_read_recent(&api_socket, &b_pane, 200).contains(&input_marker),
+        "client A terminal input must not reach client B's pane"
     );
 
     cleanup_spawned_herdr(server, base);
