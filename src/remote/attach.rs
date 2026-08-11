@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use interprocess::local_socket::traits::Listener as _;
-#[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::TryClone as _;
@@ -21,7 +20,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
-#[cfg(windows)]
 const BRIDGE_IO_POLL: Duration = Duration::from_millis(1);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1954,6 +1952,23 @@ impl SshStdioBridge {
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
+        let ssh_options = ssh_options.cloned();
+        Self::start_with_connection_handler(local_socket, move |stream, bridge_stop| {
+            bridge_connection(
+                stream,
+                &target,
+                &remote_herdr,
+                &session_name,
+                ssh_options.as_ref(),
+                &bridge_stop,
+            )
+        })
+    }
+
+    fn start_with_connection_handler<F>(local_socket: PathBuf, connection: F) -> io::Result<Self>
+    where
+        F: Fn(crate::ipc::LocalStream, Arc<AtomicBool>) -> io::Result<()> + Send + Sync + 'static,
+    {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
         })?;
@@ -1972,41 +1987,8 @@ impl SshStdioBridge {
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
-        let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok(stream) => {
-                        let stream = match prepare_remote_bridge_stream(stream) {
-                            Ok(stream) => stream,
-                            Err(err) => {
-                                tracing::error!(
-                                    error = %err,
-                                    "remote bridge failed to prepare client socket"
-                                );
-                                continue;
-                            }
-                        };
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_herdr,
-                            &session_name,
-                            thread_ssh_options.as_ref(),
-                            &thread_stop,
-                        ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
-                        }
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(BRIDGE_ACCEPT_POLL);
-                    }
-                    Err(err) => {
-                        eprintln!("herdr: remote bridge listener failed: {err}");
-                        break;
-                    }
-                }
-            }
+            serve_bridge_connections(listener, thread_stop, connection);
         });
 
         Ok(Self {
@@ -2015,6 +1997,55 @@ impl SshStdioBridge {
             should_stop,
             thread: Some(thread),
         })
+    }
+}
+
+fn serve_bridge_connections<F>(
+    listener: crate::ipc::LocalListener,
+    should_stop: Arc<AtomicBool>,
+    connection: F,
+) where
+    F: Fn(crate::ipc::LocalStream, Arc<AtomicBool>) -> io::Result<()> + Send + Sync + 'static,
+{
+    let connection = Arc::new(connection);
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
+
+    while !should_stop.load(Ordering::Acquire) {
+        workers.retain(|worker| !worker.is_finished());
+
+        match listener.accept() {
+            Ok(stream) => {
+                let stream = match prepare_remote_bridge_stream(stream) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "remote bridge failed to prepare client socket"
+                        );
+                        continue;
+                    }
+                };
+                let connection = Arc::clone(&connection);
+                let worker_stop = Arc::clone(&should_stop);
+                workers.push(thread::spawn(move || {
+                    if let Err(err) = connection(stream, worker_stop) {
+                        eprintln!("herdr: remote bridge failed: {err}");
+                    }
+                }));
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(BRIDGE_ACCEPT_POLL);
+            }
+            Err(err) => {
+                eprintln!("herdr: remote bridge listener failed: {err}");
+                should_stop.store(true, Ordering::Release);
+                break;
+            }
+        }
+    }
+
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
@@ -2094,62 +2125,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     })
 }
 
-#[cfg(unix)]
-fn bridge_connection(
-    stream: crate::ipc::LocalStream,
-    target: &str,
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
-    ssh_options: Option<&ManagedSshOptions>,
-    _bridge_stop: &Arc<AtomicBool>,
-) -> io::Result<()> {
-    let mut command = Command::new("ssh");
-    apply_managed_ssh_options(&mut command, ssh_options);
-    command
-        .arg("-T")
-        .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let mut stream_to_child = stream.try_clone()?;
-    let mut child_to_stream = stream;
-
-    let upload = thread::spawn(move || {
-        let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
-    });
-    let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
-        let _ = crate::ipc::shutdown_local_stream_write(&child_to_stream);
-    });
-
-    let status = child.wait()?;
-    let _ = upload.join();
-    let _ = download.join();
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
-        ))
-    }
-}
-
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
@@ -2225,6 +2201,8 @@ fn bridge_connection(
             &download_stop,
             &download_bridge_stop,
         );
+        #[cfg(unix)]
+        let _ = crate::ipc::shutdown_local_stream_write(&child_to_stream);
         download_done_worker.store(true, Ordering::Release);
         download_upload_stop.store(true, Ordering::Release);
         result
@@ -2299,33 +2277,14 @@ fn bridge_connection(
     }
 }
 
-#[cfg(unix)]
-fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut total = 0;
-
-    loop {
-        let bytes_read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
-            Ok(bytes_read) => bytes_read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-
-        writer.write_all(&buffer[..bytes_read])?;
-        writer.flush()?;
-        total += bytes_read as u64;
-    }
-}
-
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn terminate_bridge_child(mut child: std::process::Child, message: &'static str) -> io::Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     Err(io::Error::new(io::ErrorKind::BrokenPipe, message))
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn copy_reader_to_local_stream<R: io::Read>(
     reader: &mut R,
     stream: &mut crate::ipc::LocalStream,
@@ -2363,7 +2322,7 @@ fn copy_reader_to_local_stream<R: io::Read>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn copy_local_stream_to_writer<W: io::Write>(
     mut stream: crate::ipc::LocalStream,
     writer: &mut W,
@@ -2639,6 +2598,52 @@ mod tests {
         );
 
         drop(managed_config);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bridge_services_second_connection_while_first_remains_open() {
+        use std::sync::mpsc;
+
+        let socket = local_forward_socket_path("bridge-concurrent", "test");
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_accepted = Arc::clone(&accepted);
+        let bridge =
+            SshStdioBridge::start_with_connection_handler(socket.clone(), move |_stream, stop| {
+                match handler_accepted.fetch_add(1, Ordering::AcqRel) {
+                    0 => {
+                        first_started_tx.send(()).expect("report first connection");
+                        while !stop.load(Ordering::Acquire) {
+                            thread::sleep(BRIDGE_IO_POLL);
+                        }
+                    }
+                    1 => second_started_tx
+                        .send(())
+                        .expect("report second connection"),
+                    _ => unreachable!("test connects exactly twice"),
+                }
+                Ok(())
+            })
+            .expect("start bridge listener");
+
+        let first = crate::ipc::connect_local_stream(&socket).expect("connect first client");
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first connection starts");
+
+        let second = crate::ipc::connect_local_stream(&socket).expect("connect second client");
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second connection starts before first closes");
+        assert_eq!(accepted.load(Ordering::Acquire), 2);
+
+        let started = Instant::now();
+        drop(bridge);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(first);
+        drop(second);
+        assert!(!socket.exists());
     }
 
     #[test]

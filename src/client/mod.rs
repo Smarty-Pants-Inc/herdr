@@ -44,8 +44,8 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientMessage, NotificationActivation, NotifyKind, RenderEncoding, ServerMessage,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
 
@@ -1945,8 +1945,15 @@ async fn run_client_loop(
                     kind,
                     message,
                     body,
+                    activation,
                 } => {
-                    handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    handle_notify(
+                        kind,
+                        &message,
+                        body.as_deref(),
+                        activation.as_ref(),
+                        &state.sound_config,
+                    );
                 }
                 ServerMessage::Clipboard { data } => {
                     forward_clipboard(&data);
@@ -2007,6 +2014,9 @@ async fn run_client_loop(
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
+                }
+                ServerMessage::NotificationActivationProcessed { .. } => {
+                    debug!("received unexpected notification activation result in main loop");
                 }
             },
             ClientLoopEvent::ServerDisconnected => {
@@ -2174,19 +2184,45 @@ fn reload_local_client_config(
     }
 }
 
+fn notification_action_args(
+    socket_path: &std::path::Path,
+    activation: &NotificationActivation,
+) -> Vec<String> {
+    vec![
+        "notification".into(),
+        "activate".into(),
+        socket_path.display().to_string(),
+        activation.recipient_client_id.to_string(),
+        activation.workspace_id.clone(),
+        activation.pane_id.to_string(),
+    ]
+}
+
+fn notification_action(
+    activation: &NotificationActivation,
+) -> Option<crate::platform::DesktopNotificationAction> {
+    Some(crate::platform::DesktopNotificationAction {
+        executable: std::env::current_exe().ok()?,
+        args: notification_action_args(&client_socket_path(), activation),
+    })
+}
+
 fn handle_notify(
     kind: NotifyKind,
     message: &str,
     body: Option<&str>,
+    activation: Option<&NotificationActivation>,
     sound_config: &crate::config::SoundConfig,
 ) {
+    let action = activation.and_then(notification_action);
     handle_notify_with_notifiers(
         kind,
         message,
         body,
         sound_config,
         crate::terminal_notify::show_notification,
-        crate::platform::show_desktop_notification,
+        crate::platform::show_desktop_notification_with_action,
+        action.as_ref(),
     );
 }
 
@@ -2196,7 +2232,12 @@ fn handle_notify_with_notifiers(
     body: Option<&str>,
     sound_config: &crate::config::SoundConfig,
     mut show_terminal_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
-    mut show_system_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
+    mut show_system_notification: impl FnMut(
+        &str,
+        Option<&str>,
+        Option<&crate::platform::DesktopNotificationAction>,
+    ) -> io::Result<bool>,
+    action: Option<&crate::platform::DesktopNotificationAction>,
 ) {
     match kind {
         NotifyKind::Sound => {
@@ -2225,7 +2266,7 @@ fn handle_notify_with_notifiers(
                 message = message,
                 "received system toast notification from server"
             );
-            if let Err(err) = show_system_notification(message, body) {
+            if let Err(err) = show_system_notification(message, body, action) {
                 warn!(err = %err, "failed to emit system notification");
             }
         }
@@ -3677,7 +3718,8 @@ mod tests {
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
-            |_, _| Ok(false),
+            |_, _, _| Ok(false),
+            None,
         );
 
         assert_eq!(
@@ -3697,10 +3739,12 @@ mod tests {
             Some("workspace 1"),
             &sound_config,
             |_, _| Ok(false),
-            |title, body| {
+            |title, body, action| {
+                assert!(action.is_none());
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
+            None,
         );
 
         assert_eq!(
@@ -3720,10 +3764,11 @@ mod tests {
             Some("api workspace"),
             &sound_config,
             |_, _| Ok(false),
-            |title, body| {
+            |title, body, _| {
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
+            None,
         );
 
         assert_eq!(
@@ -3757,6 +3802,55 @@ mod tests {
             });
         }
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn system_toast_notify_passes_activation_action_only_to_system_notifier() {
+        let sound_config = crate::config::SoundConfig::default();
+        let activation_action = crate::platform::DesktopNotificationAction {
+            executable: std::path::PathBuf::from("/tmp/herdr"),
+            args: vec!["notification".into(), "activate".into()],
+        };
+        let mut received = false;
+
+        handle_notify_with_notifiers(
+            NotifyKind::SystemToast,
+            "pi finished",
+            None,
+            &sound_config,
+            |_, _| Ok(false),
+            |_, _, action| {
+                received = action == Some(&activation_action);
+                Ok(true)
+            },
+            Some(&activation_action),
+        );
+
+        assert!(received);
+    }
+
+    #[test]
+    fn notification_action_args_preserve_the_explicit_client_socket() {
+        let activation = NotificationActivation {
+            recipient_client_id: 42,
+            workspace_id: "work space;$(bad)".into(),
+            pane_id: 7,
+        };
+
+        assert_eq!(
+            notification_action_args(
+                std::path::Path::new("/tmp/client socket;$(bad)"),
+                &activation,
+            ),
+            vec![
+                "notification".to_owned(),
+                "activate".to_owned(),
+                "/tmp/client socket;$(bad)".to_owned(),
+                "42".to_owned(),
+                "work space;$(bad)".to_owned(),
+                "7".to_owned(),
+            ]
+        );
     }
 
     #[test]
