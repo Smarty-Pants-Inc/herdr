@@ -773,21 +773,26 @@ mod tests {
             .to_string()
     }
 
-    /// Wait for non-empty contents at `path`. Shell `>` creates the file empty
-    /// before the command writes, so waiting on existence alone can read EOF.
+    /// Wait for at least `expected_lines` of non-empty contents at `path`.
+    /// Shell `>` creates the file empty before the command writes, and a
+    /// multi-line `printf` can expose partial output before it completes.
     /// `pump` advances any event loop the command depends on.
-    fn read_capture_when_ready(path: &std::path::Path, mut pump: impl FnMut()) -> String {
+    fn read_capture_when_ready(
+        path: &std::path::Path,
+        expected_lines: usize,
+        mut pump: impl FnMut(),
+    ) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             pump();
             if let Ok(contents) = std::fs::read_to_string(path) {
-                if !contents.is_empty() {
+                if !contents.is_empty() && contents.lines().count() >= expected_lines {
                     return contents;
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "plugin command did not write {} within deadline",
+                "plugin command did not write {expected_lines} line(s) to {} within deadline",
                 path.display()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1575,7 +1580,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n
         };
         assert!(app.state.plugin_panes.contains_key(&opened_pane_id));
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 12, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(lines.next(), Some("example.pane"));
@@ -1677,7 +1682,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
             panic!("expected plugin pane opened response: {open}");
         };
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 3, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(
@@ -2012,7 +2017,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         });
         assert_eq!(response_result(&open), ResponseResult::Ok {});
         assert_eq!(
-            read_capture_when_ready(&env_capture, || {
+            read_capture_when_ready(&env_capture, 1, || {
                 app.drain_internal_events();
             }),
             "unset"
@@ -2131,7 +2136,7 @@ command = ["sh", "-c", "printf %s \"$HERDR_WORKSPACE_ID|${{HERDR_TAB_ID-unset}}|
         );
         assert!(!plugin_pane.focused);
         assert_eq!(
-            read_capture_when_ready(&env_capture, || {
+            read_capture_when_ready(&env_capture, 1, || {
                 app.drain_internal_events();
             }),
             format!("{}|unset|{}", plugin_pane.workspace_id, plugin_pane.pane_id)
@@ -2352,96 +2357,90 @@ command = ["sh", "-c", "printf %s \"$HERDR_WORKSPACE_ID|${{HERDR_TAB_ID-unset}}|
 
     #[test]
     fn non_cli_plugin_consumers_refresh_global_enabled_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
-        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-global-refresh");
-        std::env::set_var("XDG_CONFIG_HOME", &base);
         let root = base.join("plugin");
         write_manifest(&root);
         let plugin = load_plugin_manifest(&root.display().to_string(), false).unwrap();
-        crate::persist::plugin_registry::update(|plugins| {
-            plugins.retain(|entry| entry.plugin_id != plugin.plugin_id);
-            plugins.push(plugin.clone());
-        })
-        .unwrap();
+        crate::persist::plugin_registry::with_test_registry_path(base.join("plugins.json"), || {
+            crate::persist::plugin_registry::update(|plugins| {
+                plugins.retain(|entry| entry.plugin_id != plugin.plugin_id);
+                plugins.push(plugin.clone());
+            })
+            .unwrap();
 
-        let mut app = test_app();
-        app.no_session = false;
-        let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
-        let pane_id = workspace.tabs[0].root_pane;
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
+            let mut app = test_app();
+            app.no_session = false;
+            let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
+            let pane_id = workspace.tabs[0].root_pane;
+            app.state.workspaces = vec![workspace];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
 
-        let make_stale = |app: &mut App| {
-            let mut stale = plugin.clone();
-            stale.enabled = true;
-            app.state
-                .installed_plugins
-                .insert(stale.plugin_id.clone(), stale);
-        };
+            let make_stale = |app: &mut App| {
+                let mut stale = plugin.clone();
+                stale.enabled = true;
+                app.state
+                    .installed_plugins
+                    .insert(stale.plugin_id.clone(), stale);
+            };
 
-        make_stale(&mut app);
-        assert!(app
-            .invoke_plugin_action_from_keybind("bootstrap".into())
-            .unwrap_err()
-            .contains("disabled"));
+            make_stale(&mut app);
+            assert!(app
+                .invoke_plugin_action_from_keybind("bootstrap".into())
+                .unwrap_err()
+                .contains("disabled"));
 
-        make_stale(&mut app);
-        assert!(!app
-            .invoke_plugin_link_handler_for_url(
-                "https://github.com/herdrdev/herdr/issues/1174",
-                pane_id,
-            )
-            .unwrap());
+            make_stale(&mut app);
+            assert!(!app
+                .invoke_plugin_link_handler_for_url(
+                    "https://github.com/herdrdev/herdr/issues/1174",
+                    pane_id,
+                )
+                .unwrap());
 
-        make_stale(&mut app);
-        let pane = app.handle_api_request(Request {
-            id: "pane-disabled".into(),
-            method: Method::PluginPaneOpen(PluginPaneOpenParams {
-                plugin_id: "example.worktree-bootstrap".into(),
-                entrypoint: "board".into(),
-                placement: Some(PluginPanePlacement::Overlay),
-                width: None,
-                height: None,
-                workspace_id: None,
-                target_pane_id: None,
-                direction: None,
-                cwd: None,
-                focus: true,
-                env: std::collections::HashMap::new(),
-            }),
-        });
-        let pane: serde_json::Value = serde_json::from_str(&pane).unwrap();
-        assert_eq!(pane["error"]["code"], "plugin_disabled");
+            make_stale(&mut app);
+            let pane = app.handle_api_request(Request {
+                id: "pane-disabled".into(),
+                method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                    plugin_id: "example.worktree-bootstrap".into(),
+                    entrypoint: "board".into(),
+                    placement: Some(PluginPanePlacement::Overlay),
+                    width: None,
+                    height: None,
+                    workspace_id: None,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd: None,
+                    focus: true,
+                    env: std::collections::HashMap::new(),
+                }),
+            });
+            let pane: serde_json::Value = serde_json::from_str(&pane).unwrap();
+            assert_eq!(pane["error"]["code"], "plugin_disabled");
 
-        make_stale(&mut app);
-        let logs_before = app.state.plugin_command_logs.len();
-        let workspace = app.workspace_info(0);
-        app.run_plugin_event_hooks(&crate::api::schema::EventEnvelope {
-            event: crate::api::schema::EventKind::WorktreeCreated,
-            data: crate::api::schema::EventData::WorktreeCreated {
-                workspace: workspace.clone(),
-                worktree: crate::api::schema::WorktreeInfo {
-                    path: "/tmp/repo".into(),
-                    branch: Some("feature".into()),
-                    is_bare: false,
-                    is_detached: false,
-                    is_prunable: false,
-                    is_linked_worktree: true,
-                    open_workspace_id: Some(workspace.workspace_id),
-                    label: "feature".into(),
+            make_stale(&mut app);
+            let logs_before = app.state.plugin_command_logs.len();
+            let workspace = app.workspace_info(0);
+            app.run_plugin_event_hooks(&crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorktreeCreated,
+                data: crate::api::schema::EventData::WorktreeCreated {
+                    workspace: workspace.clone(),
+                    worktree: crate::api::schema::WorktreeInfo {
+                        path: "/tmp/repo".into(),
+                        branch: Some("feature".into()),
+                        is_bare: false,
+                        is_detached: false,
+                        is_prunable: false,
+                        is_linked_worktree: true,
+                        open_workspace_id: Some(workspace.workspace_id),
+                        label: "feature".into(),
+                    },
                 },
-            },
+            });
+            assert_eq!(app.state.plugin_command_logs.len(), logs_before);
         });
-        assert_eq!(app.state.plugin_command_logs.len(), logs_before);
-
         let _ = std::fs::remove_dir_all(&base);
-        match previous_config_home {
-            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[cfg(unix)]
@@ -2649,7 +2648,7 @@ command = ["sh", "-c", "printf '%s:%s' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVEN
         app.run_plugin_startup_hooks();
 
         assert_eq!(
-            read_capture_when_ready(&capture, || {
+            read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
             }),
             "example.startup:startup"
@@ -2712,7 +2711,7 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         });
 
         let context: PluginInvocationContext =
-            serde_json::from_str(&read_capture_when_ready(&capture, || {
+            serde_json::from_str(&read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
             }))
             .unwrap();

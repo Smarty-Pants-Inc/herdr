@@ -668,11 +668,13 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test(flavor = "current_thread")]
     async fn reload_aborts_an_in_flight_command_task_and_its_descendants() {
-        let descendant_started = unique_temp_path("descendant-started");
+        let ready = unique_temp_path("ready");
+        let release = unique_temp_path("release");
         let survived = unique_temp_path("survived");
         let command = format!(
-            "(printf descendant-started > {}; sleep 0.3; printf survived > {}) & wait",
-            descendant_started.display(),
+            "(printf ready > {}; while [ ! -e {} ]; do sleep 0.01; done; printf survived > {}) & wait",
+            ready.display(),
+            release.display(),
             survived.display()
         );
         let mut app = test_app();
@@ -685,16 +687,13 @@ mod tests {
             " ",
         );
         app.handle_tab_bar_status_tasks(std::time::Instant::now());
-        for _ in 0..50 {
-            if descendant_started.exists() {
+        for _ in 0..100 {
+            if ready.exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            descendant_started.exists(),
-            "status command descendant did not start"
-        );
+        assert!(ready.exists(), "status command descendant did not start");
 
         app.configure_tab_bar_status(
             &[TabBarRightEntryConfig::Text {
@@ -717,6 +716,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        std::fs::write(&release, "release").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!survived.exists(), "status command descendant survived");
+        let _ = std::fs::remove_file(ready);
+        let _ = std::fs::remove_file(release);
+        let _ = std::fs::remove_file(survived);
     }
 
     #[tokio::test]
