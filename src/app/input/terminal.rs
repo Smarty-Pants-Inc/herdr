@@ -901,7 +901,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn ctrl_click_url_reaps_failed_opener() {
+    async fn open_url_effect_reaps_failed_opener() {
         let opener_dir = unique_temp_path("url-opener");
         let record_path = opener_dir.join("record");
         let opener_path = opener_dir.join("xdg-open");
@@ -913,30 +913,18 @@ mod tests {
         .expect("fake opener script");
 
         let url = "https://example.com/akbash-2903";
-        let line = format!("see {url}");
-        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
-        let col = info.inner_rect.x + line.find("example").expect("url host") as u16;
-        let handled = app.handle_modified_url_click_with(
-            41,
-            modified_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                col,
-                info.inner_rect.y,
-                KeyModifiers::CONTROL,
-            ),
-            |clicked_url| {
-                std::process::Command::new("/bin/sh")
-                    .arg(&opener_path)
-                    .arg(clicked_url)
-                    .arg(&record_path)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map(Some)
-            },
-        );
-        assert!(handled);
+        let (mut app, _) = app_with_screen_bytes(b"");
+        app.open_safe_url_with(url, |opened_url| {
+            std::process::Command::new("/bin/sh")
+                .arg(&opener_path)
+                .arg(opened_url)
+                .arg(&record_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(Some)
+        });
 
         let record = wait_for_file(&record_path);
         let mut lines = record.lines();
@@ -1067,6 +1055,31 @@ mod tests {
             input_rx.try_recv().is_err(),
             "focus loss must not clear a pending URL click, so its release must stay out of the pane"
         );
+    }
+
+    #[tokio::test]
+    async fn ctrl_click_web_url_queues_open_url_effect() {
+        let url = "https://example.com/issues/21";
+        let col = url.find("example").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+
+        app.handle_mouse(modified_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + col,
+            info.inner_rect.y,
+            KeyModifiers::CONTROL,
+        ));
+
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl {
+                url: opened,
+                source_id,
+            } => {
+                assert_eq!(opened, url);
+                assert_eq!(source_id, 0);
+            }
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -1328,6 +1341,10 @@ mod tests {
         assert!(
             input_rx.try_recv().is_err(),
             "handled file link must not reach pane"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "plugin-handled file link must not queue an OpenUrl event"
         );
     }
 
