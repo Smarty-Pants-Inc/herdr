@@ -13,6 +13,9 @@ use std::fs;
 use std::io;
 #[cfg(not(windows))]
 use std::io::{BufRead, BufReader, IsTerminal, Write};
+#[cfg(not(windows))]
+use std::os::fd::AsRawFd;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(not(windows))]
@@ -106,10 +109,11 @@ enum UpdateChannel {
 
 impl UpdateChannel {
     fn configured() -> Self {
-        match crate::config::Config::load().config.update.channel {
+        let configured = match crate::config::Config::load().config.update.channel {
             crate::config::UpdateChannelConfig::Stable => Self::Stable,
             crate::config::UpdateChannelConfig::Preview => Self::Preview,
-        }
+        };
+        update_channel_for_build_manifest(crate::build_info::update_manifest_url(), configured)
     }
 
     fn as_str(self) -> &'static str {
@@ -118,6 +122,21 @@ impl UpdateChannel {
             Self::Preview => "preview",
         }
     }
+}
+
+fn update_channel_for_build_manifest(
+    build_manifest_url: Option<&str>,
+    configured_channel: UpdateChannel,
+) -> UpdateChannel {
+    if build_manifest_url.is_some() {
+        UpdateChannel::Preview
+    } else {
+        configured_channel
+    }
+}
+
+fn preview_manifest_url(build_manifest_url: Option<&str>) -> &str {
+    build_manifest_url.unwrap_or(PREVIEW_UPDATE_MANIFEST_URL)
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +343,9 @@ fn fetch_update_manifest() -> Result<UpdateManifest, String> {
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(preview_manifest_url(
+        crate::build_info::update_manifest_url(),
+    ))
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -442,6 +463,20 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
+    release_info_from_preview_manifest_for_build(
+        manifest,
+        crate::build_info::update_manifest_url().is_some(),
+        crate::build_info::uses_preview_update_manifest(),
+        crate::build_info::build_id(),
+    )
+}
+
+fn release_info_from_preview_manifest_for_build(
+    manifest: &PreviewManifest,
+    require_checksum: bool,
+    installed_is_preview: bool,
+    current_build_id: Option<&str>,
+) -> Result<Option<ReleaseInfo>, String> {
     if manifest.channel != "preview" {
         return Err(format!(
             "invalid preview manifest channel: {}",
@@ -452,9 +487,7 @@ fn release_info_from_preview_manifest(
     if build_id.is_empty() {
         return Err("preview manifest build_id is empty".into());
     }
-    if crate::build_info::is_preview()
-        && crate::build_info::build_id().is_some_and(|current| current == build_id)
-    {
+    if installed_is_preview && current_build_id.is_some_and(|current| current == build_id) {
         return Ok(None);
     }
 
@@ -492,7 +525,25 @@ fn release_info_from_preview_manifest(
                 .and_then(|build| build.assets.get(&asset_key))
         })
         .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
-    let download_url = asset.url.clone();
+    let sha256 = asset.sha256.clone();
+    if require_checksum {
+        let checksum = sha256
+            .as_deref()
+            .map(str::trim)
+            .filter(|checksum| !checksum.is_empty())
+            .ok_or_else(|| {
+                format!("preview manifest asset {asset_key} is missing a SHA-256 checksum")
+            })?;
+        if checksum.len() != 64
+            || !checksum
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(format!(
+                "preview manifest asset {asset_key} has an invalid SHA-256 checksum"
+            ));
+        }
+    }
 
     Ok(Some(ReleaseInfo {
         identity: preview_display_version(&manifest.base_version, build_id),
@@ -502,8 +553,8 @@ fn release_info_from_preview_manifest(
         commit: Some(manifest.commit.clone()),
         #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
-        download_url,
-        sha256: asset.sha256.clone(),
+        download_url: asset.url.clone(),
+        sha256,
         #[cfg(windows)]
         package_format: asset.package_format()?,
         notes_body,
@@ -594,6 +645,58 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(windows))]
+#[derive(Debug)]
+struct UpdateLock {
+    file: fs::File,
+}
+
+#[cfg(not(windows))]
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns a valid open descriptor for the lifetime of the lock.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_update_lock_at(current_exe: &Path, nonblocking: bool) -> Result<UpdateLock, String> {
+    let parent = current_exe.parent().ok_or("can't find binary directory")?;
+    let lock_path = parent.join(".herdr-update.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            format!(
+                "failed to open update lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    // SAFETY: `file` owns a valid open descriptor and `operation` contains flock flags only.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err("another Herdr update is already running".into());
+        }
+        return Err(format!(
+            "failed to lock update path {}: {error}",
+            lock_path.display()
+        ));
+    }
+    Ok(UpdateLock { file })
+}
+
+#[cfg(not(windows))]
+fn acquire_update_lock() -> Result<UpdateLock, String> {
+    let current_exe =
+        env::current_exe().map_err(|error| format!("can't find current binary: {error}"))?;
+    acquire_update_lock_at(&current_exe, false)
+}
+
+#[cfg(not(windows))]
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -627,7 +730,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     }
     let _ = fs::remove_file(&test_path);
 
-    // Unique temp file (avoids races with concurrent instances)
+    // Unique temp file avoids collisions after update attempts are serialized.
     let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
 
     // Download the exact asset URL (pinned to the release we checked)
@@ -763,6 +866,7 @@ fn install_windows_update_with_installer(
         // Get-FileHash. Removing it lets 5.1 compute its own default path.
         // See PowerShell/PowerShell#8635.
         .env_remove("PSModulePath");
+
     let status = command
         .status()
         .map_err(|err| format!("failed to run Windows installer: {err}"))?;
@@ -2107,6 +2211,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if running_inside_herdr() {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
+    #[cfg(not(windows))]
+    let _update_lock = acquire_update_lock()?;
 
     eprintln!("checking {} channel for updates...", channel.as_str());
 
@@ -2380,6 +2486,9 @@ mod tests {
             "/tmp/hu-{name}-{}-{nanos}.sock",
             std::process::id()
         ))
+    }
+    fn unique_test_dir(name: &str) -> PathBuf {
+        unique_test_socket_path(name).with_extension("dir")
     }
 
     fn spawn_accept_loop(path: &Path) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -2751,6 +2860,21 @@ mod tests {
         assert!(running_inside_herdr_env(Some(crate::HERDR_ENV_VALUE)));
         assert!(!running_inside_herdr_env(None));
         assert!(!running_inside_herdr_env(Some("0")));
+    }
+    #[test]
+    fn update_lock_serializes_installation() {
+        let dir = unique_test_dir("update-lock");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+
+        let first = acquire_update_lock_at(&executable, true).unwrap();
+        let error = acquire_update_lock_at(&executable, true).unwrap_err();
+        assert_eq!(error, "another Herdr update is already running");
+        drop(first);
+        acquire_update_lock_at(&executable, true).unwrap();
+
+        fs::remove_file(dir.join(".herdr-update.lock")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -3509,6 +3633,61 @@ mod tests {
             &installed_base,
             false
         ));
+    }
+
+    #[test]
+    fn build_manifest_forces_preview_channel_and_preserves_defaults_without_one() {
+        const FORK_MANIFEST: &str = "https://example.com/fork-preview.json";
+
+        assert_eq!(
+            update_channel_for_build_manifest(Some(FORK_MANIFEST), UpdateChannel::Stable),
+            UpdateChannel::Preview
+        );
+        assert_eq!(preview_manifest_url(Some(FORK_MANIFEST)), FORK_MANIFEST);
+        assert_eq!(
+            update_channel_for_build_manifest(None, UpdateChannel::Stable),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            update_channel_for_build_manifest(None, UpdateChannel::Preview),
+            UpdateChannel::Preview
+        );
+        assert_eq!(preview_manifest_url(None), PREVIEW_UPDATE_MANIFEST_URL);
+    }
+
+    #[test]
+    fn build_scoped_preview_manifest_rejects_missing_or_invalid_asset_checksum() {
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+
+        for (asset, expected_error) in [
+            (
+                r#"{"url": "https://example.com/herdr"}"#,
+                "missing a SHA-256 checksum",
+            ),
+            (
+                r#"{"url": "https://example.com/herdr", "sha256": "deadbeef"}"#,
+                "invalid SHA-256 checksum",
+            ),
+        ] {
+            let manifest: PreviewManifest = serde_json::from_str(&format!(
+                r####"{{
+                    "channel": "preview",
+                    "base_version": "9.9.9",
+                    "build_id": "2026-06-02-abcdef123456",
+                    "commit": "abcdef1234567890",
+                    "built_at": "2026-06-02T03:00:00Z",
+                    "protocol": 77,
+                    "notes": "### Fixed\n- One",
+                    "assets": {{ "{asset_key}": {asset} }}
+                }}"####
+            ))
+            .unwrap();
+
+            let error = release_info_from_preview_manifest_for_build(&manifest, true, false, None)
+                .unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+        }
     }
 
     #[test]
