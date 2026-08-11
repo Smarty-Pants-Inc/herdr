@@ -2,11 +2,8 @@
 set -eu
 
 BIN=herdr
-LABEL=ai.smartypants.herdr-auto-update
 MANIFEST_URL="${HERDR_MANIFEST_URL:-https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json}"
 INSTALL_DIR="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
-LAUNCH_AGENTS_DIR="${HERDR_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
-LAUNCHCTL="${HERDR_LAUNCHCTL:-launchctl}"
 PLUTIL="${HERDR_PLUTIL:-/usr/bin/plutil}"
 
 
@@ -34,35 +31,6 @@ sha256() {
     fi
 }
 
-xml_escape() {
-    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
-}
-
-install_launch_agent() {
-    plist="$LAUNCH_AGENTS_DIR/$LABEL.plist"
-    mkdir -p "$LAUNCH_AGENTS_DIR"
-    plist_tmp="$(mktemp "$LAUNCH_AGENTS_DIR/.${LABEL}.XXXXXX")"
-    cat > "$plist_tmp" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key><array>
-    <string>$(xml_escape "$INSTALL_DIR/$BIN")</string>
-    <string>update</string>
-    <string>--handoff</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>300</integer>
-</dict></plist>
-EOF
-    chmod 600 "$plist_tmp"
-    mv "$plist_tmp" "$plist"
-    domain="gui/$(id -u)"
-    "$LAUNCHCTL" bootout "$domain/$LABEL" >/dev/null 2>&1 || true
-    "$LAUNCHCTL" bootstrap "$domain" "$plist"
-    "$LAUNCHCTL" kickstart -k "$domain/$LABEL"
-}
 
 main() {
     [ "$(uname -s)" = Darwin ] || err "Smarty preview installation supports macOS only"
@@ -80,7 +48,6 @@ main() {
     need awk
     need curl
     need mktemp
-    need sed
     [ -x "$PLUTIL" ] || err "requires $PLUTIL"
 
     log "fetching preview manifest"
@@ -112,12 +79,11 @@ main() {
     mv "$install_tmp" "$installed"
     [ -f "$installed" ] && [ ! -L "$installed" ] || err "installed launcher is not a regular file"
 
-    install_launch_agent
     resolved="$(command -v "$BIN" 2>/dev/null || true)"
     if [ "$resolved" != "$installed" ]; then
         warn "'$BIN' resolves to ${resolved:-nothing}, not $installed; add $INSTALL_DIR before other Herdr paths in PATH"
     fi
-    log "installed $installed and activated $LABEL"
+    log "installed self-updating client at $installed"
 }
 
 main "$@"
