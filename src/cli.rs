@@ -110,8 +110,7 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("set") => channel_set(&args[1..]),
         Some("show") if args.len() == 1 => {
-            let config = crate::config::Config::load().config;
-            println!("{}", config.update.channel.as_str());
+            println!("{}", current_channel_name());
             Ok(0)
         }
         Some("help" | "--help" | "-h") => {
@@ -124,6 +123,20 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
         }
     }
 }
+fn effective_channel_name(configured: &str, build_scoped_manifest: bool) -> &str {
+    if build_scoped_manifest {
+        "preview"
+    } else {
+        configured
+    }
+}
+fn current_channel_name() -> &'static str {
+    let configured = crate::config::Config::load().config.update.channel.as_str();
+    effective_channel_name(
+        configured,
+        crate::build_info::update_manifest_url().is_some(),
+    )
+}
 
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
@@ -133,6 +146,7 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Some(reason) = channel_set_rejection(
         channel,
+        crate::build_info::update_manifest_url().is_some(),
         crate::update::preview_channel_rejection_for_current_install(),
     ) {
         eprintln!("{reason}.");
@@ -205,8 +219,15 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
 
 fn channel_set_rejection(
     channel: &str,
+    build_scoped_manifest: bool,
     install_rejection: Option<&'static str>,
 ) -> Option<&'static str> {
+    if build_scoped_manifest && channel == "stable" {
+        return Some(
+            "stable channel is not available for this build; its update manifest is fixed to the Smarty preview channel",
+        );
+    }
+
     if cfg!(windows) && channel == "stable" {
         return Some(
             "stable channel is not available on Windows yet; Windows builds are preview-only",
@@ -1043,13 +1064,20 @@ mod tests {
     }
 
     #[test]
+    fn effective_channel_uses_build_scoped_preview_manifest() {
+        assert_eq!(super::effective_channel_name("stable", true), "preview");
+        assert_eq!(super::effective_channel_name("stable", false), "stable");
+        assert_eq!(super::effective_channel_name("preview", false), "preview");
+    }
+
+    #[test]
     fn channel_set_rejects_package_managed_preview_before_config_write() {
         assert_eq!(
-            super::channel_set_rejection("preview", Some("no preview")),
+            super::channel_set_rejection("preview", false, Some("no preview")),
             Some("no preview")
         );
         assert_eq!(
-            super::channel_set_rejection("stable", Some("no preview")),
+            super::channel_set_rejection("stable", false, Some("no preview")),
             if cfg!(windows) {
                 Some(
                     "stable channel is not available on Windows yet; Windows builds are preview-only",
@@ -1058,13 +1086,23 @@ mod tests {
                 None
             }
         );
-        assert_eq!(super::channel_set_rejection("preview", None), None);
+        assert_eq!(super::channel_set_rejection("preview", false, None), None);
+    }
+
+    #[test]
+    fn channel_set_rejects_stable_for_build_scoped_manifest() {
+        assert_eq!(
+            super::channel_set_rejection("stable", true, None),
+            Some(
+                "stable channel is not available for this build; its update manifest is fixed to the Smarty preview channel",
+            )
+        );
     }
 
     #[test]
     fn channel_set_rejects_stable_only_on_windows() {
         assert_eq!(
-            super::channel_set_rejection("stable", None),
+            super::channel_set_rejection("stable", false, None),
             if cfg!(windows) {
                 Some(
                     "stable channel is not available on Windows yet; Windows builds are preview-only",
