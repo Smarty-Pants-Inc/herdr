@@ -8656,6 +8656,16 @@
           "oneOf": [
             {
               "properties": {
+                "build": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/ServerBuildIdentity"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "capabilities": {
                   "anyOf": [
                     {
@@ -9850,6 +9860,25 @@
               "type": "object"
             }
           ]
+        },
+        "ServerBuildIdentity": {
+          "properties": {
+            "build_id": {
+              "type": "string"
+            },
+            "channel": {
+              "type": "string"
+            },
+            "update_manifest_url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "channel",
+            "build_id",
+            "update_manifest_url"
+          ],
+          "type": "object"
         },
         "ServerCapabilities": {
           "properties": {
