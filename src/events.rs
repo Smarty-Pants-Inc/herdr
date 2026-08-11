@@ -136,6 +136,11 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// Open a safe HTTP(S) URL on the process that owns the originating input source.
+    OpenUrl {
+        url: String,
+        source_id: crate::app::InputSourceId,
+    },
     /// Prefix-mode ASCII input-source request, emitted on entering/leaving the ASCII input
     /// realm. The foreground process applies the host-local TIS switch (`active = true`) /
     /// restore (`active = false`): the client in server mode (via server forwarding), the
