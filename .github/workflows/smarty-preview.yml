@@ -3,7 +3,7 @@ name: Smarty Preview
 on:
   push:
     branches:
-      - patch/smarty-auto-update
+      - patch/remote-compatible-attach
 
 permissions:
   contents: read
@@ -314,8 +314,8 @@ jobs:
           COMMIT: ${{ needs.preflight.outputs.commit }}
         run: |
           set -euo pipefail
-          git fetch origin refs/heads/patch/smarty-auto-update:refs/remotes/origin/patch/smarty-auto-update
-          test "$(git rev-parse refs/remotes/origin/patch/smarty-auto-update)" = "$GITHUB_SHA"
+          git fetch origin "$GITHUB_REF":refs/remotes/origin/release-source
+          test "$(git rev-parse refs/remotes/origin/release-source)" = "$GITHUB_SHA"
           assets=(
             artifacts/herdr-linux-x86_64/herdr-linux-x86_64
             artifacts/herdr-linux-x86_64/herdr-linux-x86_64.sha256
@@ -398,8 +398,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch origin refs/heads/patch/smarty-auto-update:refs/remotes/origin/patch/smarty-auto-update
-          test "$(git rev-parse refs/remotes/origin/patch/smarty-auto-update)" = "$GITHUB_SHA"
+          git fetch origin "$GITHUB_REF":refs/remotes/origin/release-source
+          test "$(git rev-parse refs/remotes/origin/release-source)" = "$GITHUB_SHA"
           mkdir channel
           if previous="$(git ls-remote --exit-code origin refs/heads/smarty-channel)"; then
             previous="${previous%%[[:space:]]*}"
@@ -432,8 +432,8 @@ jobs:
             git -C channel-worktree add preview.json install.sh
             git -C channel-worktree -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "Publish Smarty preview $BUILD_ID"
             git -C channel-worktree merge-base --is-ancestor "$previous" HEAD
-            git fetch origin refs/heads/patch/smarty-auto-update:refs/remotes/origin/patch/smarty-auto-update
-            test "$(git rev-parse refs/remotes/origin/patch/smarty-auto-update)" = "$GITHUB_SHA"
+            git fetch origin "$GITHUB_REF":refs/remotes/origin/release-source
+            test "$(git rev-parse refs/remotes/origin/release-source)" = "$GITHUB_SHA"
             git -C channel-worktree push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/smarty-channel
           else
             git worktree add --detach channel-worktree
@@ -443,7 +443,7 @@ jobs:
             cp channel/install.sh channel-worktree/install.sh
             git -C channel-worktree add preview.json install.sh
             git -C channel-worktree -c user.name=github-actions[bot] -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "Publish Smarty preview $BUILD_ID"
-            git fetch origin refs/heads/patch/smarty-auto-update:refs/remotes/origin/patch/smarty-auto-update
-            test "$(git rev-parse refs/remotes/origin/patch/smarty-auto-update)" = "$GITHUB_SHA"
+            git fetch origin "$GITHUB_REF":refs/remotes/origin/release-source
+            test "$(git rev-parse refs/remotes/origin/release-source)" = "$GITHUB_SHA"
             git -C channel-worktree push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/smarty-channel --force-with-lease=refs/heads/smarty-channel:
           fi
