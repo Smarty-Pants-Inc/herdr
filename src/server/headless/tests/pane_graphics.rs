@@ -254,6 +254,10 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         keybindings: None,
         direct_attach_requested: false,
         direct_graphics: true,
+        omp_pane: false,
+        display_name: None,
+        frontend_profile_id: None,
+        renderer_binding_token: None,
         writer,
     }));
 

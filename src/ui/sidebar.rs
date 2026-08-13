@@ -18,6 +18,22 @@ use crate::app::{AppState, Mode};
 use crate::detect::AgentState;
 use crate::terminal::TerminalRuntimeRegistry;
 
+pub(crate) fn identity_header_rect(area: Rect, identity: &super::IdentityUiState) -> Rect {
+    let Some(name) = identity.committed_name.as_deref() else {
+        return Rect::default();
+    };
+    let reserved = display_width_u16(" spaces").saturating_add(1);
+    let available = area.width.saturating_sub(reserved);
+    if available == 0 {
+        return Rect::default();
+    }
+    let width = display_width_u16(&truncate_end(name, usize::from(available))).min(available);
+    if width == 0 {
+        return Rect::default();
+    }
+    Rect::new(area.right().saturating_sub(width), area.y, width, 1)
+}
+
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
@@ -966,11 +982,28 @@ pub(crate) fn workspace_drop_indicator_row(
         .find_map(|(candidate, row)| (candidate == target).then_some(row))
 }
 
+#[cfg(test)]
 pub(super) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
     area: Rect,
+) {
+    render_sidebar_with_identity(
+        app,
+        terminal_runtimes,
+        frame,
+        area,
+        &super::IdentityUiState::default(),
+    );
+}
+
+pub(super) fn render_sidebar_with_identity(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    area: Rect,
+    identity: &super::IdentityUiState,
 ) {
     let p = &app.palette;
     frame
@@ -988,6 +1021,21 @@ pub(super) fn render_sidebar(
     let (ws_area, detail_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
 
     render_workspace_list(app, terminal_runtimes, frame, ws_area, is_navigating);
+    let rect = identity_header_rect(ws_area, identity);
+    if rect.width > 0 {
+        let name = truncate_end(
+            identity.committed_name.as_deref().unwrap_or_default(),
+            usize::from(rect.width),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                name,
+                Style::default().fg(p.overlay0),
+            )))
+            .alignment(Alignment::Right),
+            rect,
+        );
+    }
     render_agent_detail(app, terminal_runtimes, frame, detail_area);
     render_sidebar_toggle(app, frame, area, false, p);
 }
@@ -3036,6 +3084,57 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     indented: true,
                 },
             ]
+        );
+    }
+    #[test]
+    fn identity_header_reserves_spaces_label_and_uses_attribution_style() {
+        let mut app = AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        let area = Rect::new(0, 0, 26, 20);
+        let identity = super::super::IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..super::super::IdentityUiState::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_sidebar_with_identity(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    area,
+                    &identity,
+                )
+            })
+            .unwrap();
+
+        let header = row_text(
+            terminal.backend().buffer(),
+            area.y,
+            area.width.saturating_sub(1),
+        );
+        assert!(header.starts_with(" spaces"), "header: {header:?}");
+        assert!(header.ends_with("alice"), "header: {header:?}");
+        let spaces = expanded_sidebar_sections(area, app.sidebar_section_split).0;
+        let rect = identity_header_rect(spaces, &identity);
+        for x in rect.x..rect.right() {
+            let style = terminal.backend().buffer()[(x, rect.y)].style();
+            assert_eq!(style.fg, Some(app.palette.overlay0));
+            assert!(!style.add_modifier.contains(Modifier::BOLD));
+        }
+    }
+
+    #[test]
+    fn identity_header_does_not_overwrite_spaces_on_narrow_sidebar() {
+        let identity = super::super::IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..super::super::IdentityUiState::default()
+        };
+
+        assert_eq!(
+            identity_header_rect(Rect::new(0, 0, 8, 5), &identity),
+            Rect::default()
         );
     }
 }

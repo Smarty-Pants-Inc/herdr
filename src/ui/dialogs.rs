@@ -16,6 +16,141 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
+const IDENTITY_POPUP_WIDTH: u16 = 48;
+const IDENTITY_POPUP_HEIGHT: u16 = 9;
+
+pub(crate) fn identity_modal_inner_rect(area: Rect) -> Option<Rect> {
+    let popup = centered_popup_rect(area, IDENTITY_POPUP_WIDTH, IDENTITY_POPUP_HEIGHT)?;
+    Some(Rect::new(
+        popup.x.saturating_add(1),
+        popup.y.saturating_add(1),
+        popup.width.saturating_sub(2),
+        popup.height.saturating_sub(2),
+    ))
+}
+
+pub(crate) fn identity_modal_input_rect(inner: Rect) -> Rect {
+    Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1)
+}
+
+pub(crate) fn identity_modal_button_rects(inner: Rect, cancellable: bool) -> (Rect, Rect) {
+    let buttons = if cancellable {
+        [
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "save",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ]
+    } else {
+        [
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "save",
+            },
+            ActionButtonSpec {
+                hint: None,
+                label: "",
+            },
+        ]
+    };
+    let rects = action_button_row_rects(inner, &buttons[..usize::from(cancellable) + 1], 2, 6);
+    (rects[0], rects.get(1).copied().unwrap_or_default())
+}
+
+pub(super) fn render_identity_overlay(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    identity: &super::IdentityUiState,
+) {
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        IDENTITY_POPUP_WIDTH,
+        IDENTITY_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+    debug_assert_eq!(Some(inner), identity_modal_inner_rect(area));
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "display name",
+        &app.palette,
+    );
+    frame.render_widget(
+        Paragraph::new(" labels your shared prompts")
+            .style(Style::default().fg(app.palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(" name").style(Style::default().fg(app.palette.overlay0)),
+        Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
+    );
+    let input = identity_modal_input_rect(inner);
+    frame.render_widget(Clear, input);
+    frame.render_widget(
+        Paragraph::new(format!(" {}", identity.draft)).style(
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0),
+        ),
+        input,
+    );
+    if input.width > 0 && !identity.saving {
+        let cursor_byte = identity
+            .draft
+            .char_indices()
+            .nth(identity.cursor)
+            .map_or(identity.draft.len(), |(offset, _)| offset);
+        let caret = input
+            .x
+            .saturating_add(1)
+            .saturating_add(display_width_u16(&identity.draft[..cursor_byte]))
+            .min(input.right().saturating_sub(1));
+        frame.set_cursor_position((caret, input.y));
+    }
+    if identity.saving {
+        frame.render_widget(
+            Paragraph::new(" saving…").style(Style::default().fg(app.palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(5), inner.width, 1),
+        );
+    } else if let Some(error) = &identity.error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
+            Rect::new(inner.x, inner.y.saturating_add(5), inner.width, 1),
+        );
+    }
+    let (save, cancel) = identity_modal_button_rects(inner, identity.committed_name.is_some());
+    render_action_button(
+        frame,
+        save,
+        Some("↵"),
+        "save",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    if cancel.width > 0 {
+        render_action_button(
+            frame,
+            cancel,
+            Some("esc"),
+            "cancel",
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
 
 pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
     let rects = action_button_row_rects(
@@ -1154,5 +1289,31 @@ mod tests {
             worktree_overlay_caret("あい"),
             Position::new(input.x + 5, input.y)
         );
+    }
+    #[test]
+    fn identity_modal_geometry_matches_rendered_rows() {
+        let area = Rect::new(0, 0, 80, 20);
+        let inner = super::identity_modal_inner_rect(area).expect("identity modal fits");
+        let input = super::identity_modal_input_rect(inner);
+        let (save, cancel) = super::identity_modal_button_rects(inner, true);
+
+        assert_eq!(inner, Rect::new(17, 6, 46, 7));
+        assert_eq!(input.y, inner.y + 4);
+        assert_eq!(save.y, inner.y + 6);
+        assert_eq!(cancel.y, inner.y + 6);
+        assert_ne!(
+            save.y,
+            inner.y + 5,
+            "buttons must not cover save status/error"
+        );
+    }
+
+    #[test]
+    fn first_launch_identity_modal_has_no_cancel_hit_target() {
+        let inner = super::identity_modal_inner_rect(Rect::new(0, 0, 80, 20)).unwrap();
+        let (save, cancel) = super::identity_modal_button_rects(inner, false);
+
+        assert!(save.width > 0);
+        assert_eq!(cancel, Rect::default());
     }
 }

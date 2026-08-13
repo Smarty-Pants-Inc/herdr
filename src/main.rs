@@ -571,6 +571,58 @@ fn main() -> io::Result<()> {
         return server::headless::run_server();
     }
 
+    // Hidden POC mode: attach one local OMP renderer to a logical pane route.
+    if args.get(1).map(|s| s.as_str()) == Some("__omp-pane") {
+        let (Some(pane_id), Some(omp_session_id)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: herdr __omp-pane <pane-id> <omp-session-id> [generation] [--app-client-id <client-id>]");
+            std::process::exit(2);
+        };
+        let mut index = 4;
+        let route_generation = if args.get(index).map(String::as_str) == Some("--app-client-id") {
+            1
+        } else {
+            match args.get(index) {
+                Some(value) => match value.parse::<u64>() {
+                    Ok(1) => {
+                        index += 1;
+                        1
+                    }
+                    Ok(_) => {
+                        eprintln!("error: OMP route generation is server-owned; only generation 1 is valid in this POC");
+                        std::process::exit(2);
+                    }
+                    Err(_) => {
+                        eprintln!("error: OMP route generation must be an unsigned integer");
+                        std::process::exit(2);
+                    }
+                },
+                None => 1,
+            }
+        };
+        let target_app_client_id = match args.get(index).map(String::as_str) {
+            Some("--app-client-id") => {
+                match args.get(index + 1).and_then(|value| value.parse().ok()) {
+                    Some(client_id) if args.len() == index + 2 => Some(client_id),
+                    _ => {
+                        eprintln!("error: --app-client-id requires exactly one unsigned integer");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Some(_) => {
+                eprintln!("usage: herdr __omp-pane <pane-id> <omp-session-id> [generation] [--app-client-id <client-id>]");
+                std::process::exit(2);
+            }
+            None => None,
+        };
+        return client::run_omp_pane(
+            pane_id.clone(),
+            omp_session_id.clone(),
+            route_generation,
+            target_app_client_id,
+        );
+    }
+
     // Hidden client mode: connect to an existing server's client socket.
     if args.get(1).map(|s| s.as_str()) == Some("client") {
         let loaded_config = config::Config::load();

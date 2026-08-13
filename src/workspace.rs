@@ -199,6 +199,7 @@ pub struct Workspace {
     pub active_tab: usize,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
+    pub(crate) omp_bridge: Option<crate::pane::OmpBridgeEnv>,
 }
 
 impl Deref for Workspace {
@@ -260,6 +261,7 @@ impl Workspace {
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
+            omp_bridge: None,
             tabs: vec![tab],
             active_tab: 0,
             #[cfg(test)]
@@ -294,6 +296,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             Vec::new(),
+            None,
         )
     }
 
@@ -310,6 +313,7 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
         extra_env: Vec<(String, String)>,
+        omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
             initial_cwd,
@@ -324,6 +328,7 @@ impl Workspace {
             render_dirty,
             None,
             extra_env,
+            omp_bridge,
         )
     }
 
@@ -353,6 +358,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             Vec::new(),
+            None,
         )
     }
 
@@ -369,6 +375,7 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
         extra_env: Vec<(String, String)>,
+        omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
             initial_cwd,
@@ -383,6 +390,7 @@ impl Workspace {
             render_dirty,
             Some(argv),
             extra_env,
+            omp_bridge,
         )
     }
 
@@ -400,13 +408,16 @@ impl Workspace {
         render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
+        omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
-        let launch_env = PaneLaunchEnv::from_extra(extra_env).with_identity(
-            id.clone(),
-            public_tab_id_for_number(&id, 1),
-            public_pane_id_for_number(&id, 1),
-        );
+        let launch_env = PaneLaunchEnv::from_extra(extra_env)
+            .with_omp_bridge(omp_bridge.clone())
+            .with_identity(
+                id.clone(),
+                public_tab_id_for_number(&id, 1),
+                public_pane_id_for_number(&id, 1),
+            );
         let (tab, terminal, runtime) = if let Some(argv) = argv {
             Tab::new_argv_command(
                 1,
@@ -459,6 +470,7 @@ impl Workspace {
                 public_pane_numbers,
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
+                omp_bridge,
                 tabs: vec![tab],
                 active_tab: 0,
                 #[cfg(test)]
@@ -1065,11 +1077,13 @@ impl Workspace {
         pane_number: usize,
         extra_env: Vec<(String, String)>,
     ) -> PaneLaunchEnv {
-        PaneLaunchEnv::from_extra(extra_env).with_identity(
-            self.id.clone(),
-            public_tab_id_for_number(&self.id, tab_number),
-            public_pane_id_for_number(&self.id, pane_number),
-        )
+        PaneLaunchEnv::from_extra(extra_env)
+            .with_omp_bridge(self.omp_bridge.clone())
+            .with_identity(
+                self.id.clone(),
+                public_tab_id_for_number(&self.id, tab_number),
+                public_pane_id_for_number(&self.id, pane_number),
+            )
     }
 
     pub fn public_tab_number(&self, tab_idx: usize) -> Option<usize> {
@@ -1297,6 +1311,7 @@ impl Workspace {
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
+            omp_bridge: None,
             tabs: vec![tab],
             active_tab: 0,
             test_runtimes: HashMap::new(),
