@@ -440,6 +440,12 @@
           "description": "Enter keyboard copy mode for the focused pane."
         },
         {
+          "key": "keys.findr",
+          "type": "keybinding",
+          "default": "\"cmd+f\" on macOS; \"ctrl+alt+f\" elsewhere",
+          "description": "Open Findr to search text in the focused pane."
+        },
+        {
           "key": "keys.focus_pane_left",
           "type": "keybinding",
           "default": "\"prefix+h\"",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tracing::warn;
 
 use crate::api::schema::PluginWorkspacePaneInfo;
-use crate::app::{App, Mode};
+use crate::app::App;
 use crate::layout::PaneId;
 use crate::pane::{AgentDetection, PaneLaunchEnv};
 use crate::popup_size::PopupSize;
@@ -170,7 +170,8 @@ impl App {
         let pane = self.state.workspace_plugin_panes.get_mut(&workspace_id)?;
         pane.collapsed = false;
         pane.focused = true;
-        self.state.settle_terminal_mode_after_focus();
+        let pane_id = pane.pane_id;
+        self.state.settle_terminal_mode_for_focus(pane_id);
         self.workspace_plugin_pane_info(&workspace_id)
     }
 
@@ -180,7 +181,7 @@ impl App {
         };
         pane.collapsed = !pane.collapsed;
         pane.focused = false;
-        self.state.mode = Mode::Terminal;
+        self.state.settle_terminal_mode_after_focus();
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
         true
@@ -227,11 +228,9 @@ impl App {
         self.state.terminals.remove(&pane.terminal_id);
         self.shutdown_terminal_runtime(pane.terminal_id);
         if was_active_focused {
-            self.state.mode = if self.state.active.is_some() {
-                Mode::Terminal
-            } else {
-                Mode::Navigate
-            };
+            self.state.settle_terminal_mode_after_focus();
+        } else {
+            self.state.reconcile_focus_lifecycle();
         }
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
@@ -321,7 +320,9 @@ impl App {
         );
         if focus {
             self.state.switch_workspace(ws_idx);
-            self.state.mode = Mode::Terminal;
+            self.state.settle_terminal_mode_for_focus(pane_id);
+        } else {
+            self.state.reconcile_focus_lifecycle();
         }
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
@@ -425,7 +426,7 @@ impl App {
             if let Some(pane) = self.state.workspace_plugin_panes.get_mut(&workspace_id) {
                 pane.focused = true;
             }
-            self.state.mode = Mode::Terminal;
+            self.state.settle_terminal_mode_for_focus(pane_id);
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
         }
@@ -482,5 +483,59 @@ impl App {
             warn!(err = %err, kind = ?mouse.kind, "failed to forward workspace plugin mouse event");
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::{CopyModeSearchState, CopyModeState, Mode};
+
+    #[test]
+    fn plugin_focus_reconciles_against_logical_plugin_before_render() {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("plugin-focus");
+        let workspace_id = workspace.id.clone();
+        let tiled_pane_id = workspace.tabs[0].root_pane;
+        let plugin_pane_id = PaneId::alloc();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Copy;
+        app.state.copy_mode = Some(CopyModeState {
+            pane_id: tiled_pane_id,
+            cursor_row: 0,
+            cursor_col: 0,
+            entry_offset_from_bottom: 0,
+            selection: None,
+            search: CopyModeSearchState::default(),
+        });
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: false,
+                collapsed: true,
+            },
+        );
+
+        let focused = app
+            .focus_workspace_plugin_pane(&public_workspace_plugin_pane_id(&workspace_id))
+            .expect("plugin pane");
+
+        assert!(focused.focused);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.copy_mode.is_some());
+        assert!(app.state.selection.is_none());
     }
 }

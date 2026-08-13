@@ -122,6 +122,35 @@ impl AppState {
             return None;
         }
 
+        if self.mode == Mode::Findr {
+            let area = if self.view.layout == ViewLayout::Desktop
+                && self.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
+                && self.view.tab_bar_rect.height > 0
+            {
+                self.view.tab_bar_rect
+            } else {
+                self.view.terminal_area
+            };
+            let toggle = crate::ui::findr_scrollback_toggle_rect(self, area);
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if mouse.column >= toggle.x
+                        && mouse.column < toggle.x.saturating_add(toggle.width)
+                        && mouse.row == toggle.y =>
+                {
+                    self.toggle_findr_scrollback(terminal_runtimes);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_findr(terminal_runtimes, self.mouse_scroll_lines, true);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_findr(terminal_runtimes, self.mouse_scroll_lines, false);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         if self.mode == Mode::Settings {
             return self.handle_settings_mouse(mouse).map(MouseAction::Settings);
         }

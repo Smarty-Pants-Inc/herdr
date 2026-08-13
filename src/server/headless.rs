@@ -719,6 +719,12 @@ impl HeadlessServer {
                         render_request.pty_sources.len() as u64,
                     );
                 }
+                if self
+                    .app
+                    .refresh_findr_visible_if_needed(&render_request.pty_sources)
+                {
+                    needs_full_render = true;
+                }
                 if render_request.generic {
                     needs_full_render = true;
                     crate::render_prof::event("full_render_cause.generic_dirty");
@@ -4642,27 +4648,19 @@ impl HeadlessServer {
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
         if render_targets.is_empty() {
-            let (cols, rows) = self.effective_size;
-            let area = Rect::new(0, 0, cols, rows);
-            let resize_panes = self.app.state.view.pane_infos.is_empty();
-            let render_started = crate::render_prof::timer();
-            let _ = crate::server::render_stream::render_virtual_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                resize_panes,
-                crate::kitty_graphics::HostCellSize::default(),
-            );
-            crate::render_prof::duration_since("full_render.render_virtual", render_started);
-            self.app.full_redraw_pending = false;
+            // Keep canonical geometry current for clientless work such as
+            // restored agent resumes, without constructing a synthetic frame.
+            self.compute_foreground_navigation_view();
             crate::render_prof::duration_since("full_render.total", full_started);
-            debug!(
-                cols,
-                rows, resize_panes, "rendered virtual frame with no attached clients"
-            );
             return;
         }
         let canonical_navigation = self.sync_canonical_navigation_to_foreground();
+        let foreground_pre_compute_suppresses_focused_terminal_cursor =
+            self.app.state.popup_pane.is_none()
+                && crate::server::render_stream::focused_terminal_suppresses_host_cursor(
+                    &self.app.state,
+                    &self.app.terminal_runtimes,
+                );
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
@@ -4677,7 +4675,6 @@ impl HeadlessServer {
             ));
             if is_app_client {
                 self.apply_client_navigation(client_id, &canonical_navigation);
-                self.compute_client_navigation_view(client_id);
             }
             let mut frame = match mode {
                 ClientConnectionMode::App => {
@@ -4688,24 +4685,25 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_virtual_with_runtime_registry(
+                    let pre_compute_suppresses_focused_terminal_cursor =
+                        is_foreground && foreground_pre_compute_suppresses_focused_terminal_cursor;
+                    if is_foreground {
+                        crate::ui::compute_view_with_cell_size(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             area,
-                            is_foreground,
                             render_cell_size,
                         );
-                    if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
-                        self.app.state.workspace_scroll = workspace;
-                        self.app.state.agent_panel_scroll = agent_panel;
-                        self.app.state.tab_scroll = tab;
-                        self.app.state.mobile_switcher_scroll = mobile_switcher;
+                    } else {
+                        crate::ui::compute_view_without_resizing_panes(
+                            &mut self.app.state,
+                            &self.app.terminal_runtimes,
+                            area,
+                        );
                     }
-                    crate::render_prof::duration_since(
-                        "full_render.render_virtual",
-                        render_started,
-                    );
+                    if is_foreground {
+                        self.app.refresh_findr_visible_if_needed(&HashSet::new());
+                    }
                     let hyperlinks_started = crate::render_prof::timer();
                     let hyperlinks = crate::server::render_stream::visible_hyperlinks(
                         &self.app.state,
@@ -4715,6 +4713,17 @@ impl HeadlessServer {
                         "full_render.visible_hyperlinks",
                         hyperlinks_started,
                     );
+                    let (buffer, cursor) =
+                        crate::server::render_stream::render_precomputed_virtual_with_runtime_registry(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            area,
+                            pre_compute_suppresses_focused_terminal_cursor,
+                        );
+                    crate::render_prof::duration_since(
+                        "full_render.render_virtual",
+                        render_started,
+                    );
                     let frame_started = crate::render_prof::timer();
                     let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
                         &buffer,
@@ -4722,6 +4731,12 @@ impl HeadlessServer {
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
+                    if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
+                        self.app.state.workspace_scroll = workspace;
+                        self.app.state.agent_panel_scroll = agent_panel;
+                        self.app.state.tab_scroll = tab;
+                        self.app.state.mobile_switcher_scroll = mobile_switcher;
+                    }
                     frame
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
@@ -4918,9 +4933,11 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
             }
         }
+        // App targets render background-first and foreground-last, so the final
+        // layout/navigation projection is already canonical for local input.
         self.restore_foreground_navigation(&canonical_navigation);
-        self.compute_foreground_navigation_view();
 
+        self.compute_foreground_navigation_view();
         let (cols, rows) = self.effective_size;
         if !deferred_frame {
             self.app.full_redraw_pending = false;
@@ -4998,6 +5015,8 @@ impl HeadlessServer {
         }
 
         changed |= self.app.clear_due_selection_highlight(now);
+        let findr_changed = self.app.tick_findr_scan(now);
+        changed |= findr_changed && self.has_app_client();
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
@@ -7819,6 +7838,199 @@ next_tab = ""
                     )
             }));
     }
+    #[tokio::test]
+    async fn headless_scheduled_tasks_advance_findr_scrollback_scan_without_requesting_render() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let scrollback = (0..5_000)
+            .map(|row| format!("needle {row}\r\n"))
+            .collect::<String>();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                128 * 1024,
+                scrollback.as_bytes(),
+            ),
+        );
+        let now = Instant::now();
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.scrollback = true;
+        findr.scan_end_row_exclusive = 5_001;
+        findr.visible_range = Some((4_977, 5_001));
+        findr.visible_geometry = Some((80, 24));
+        findr.complete = false;
+        server.app.state.findr = Some(findr);
+        server.app.findr_scan_deadline = Some(now);
+
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
+
+        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        assert!(findr.scan_end_row_exclusive < 5_001);
+        assert!(findr.scan_end_row_exclusive > 0);
+        assert!(!findr.complete);
+        assert_eq!(
+            server.app.findr_scan_deadline,
+            Some(now + crate::app::state::FINDR_SCAN_INTERVAL)
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+    #[tokio::test]
+    async fn headless_render_refreshes_visible_findr_after_foreground_reflow() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"needle"),
+        );
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.visible_geometry = Some((80, 24));
+        server.app.state.findr = Some(findr);
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        server.render_and_stream();
+
+        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        let info = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("pane info");
+        assert_eq!(
+            findr.visible_geometry,
+            Some((info.inner_rect.width, info.inner_rect.height))
+        );
+        assert_ne!(findr.visible_geometry, Some((80, 24)));
+        assert_eq!(findr.matches.len(), 1);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn background_client_render_does_not_replace_foreground_findr_geometry() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr-clients");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let mut scrollback = (0..30)
+            .map(|row| format!("before {row}\r\n"))
+            .collect::<String>();
+        scrollback.push_str("needle-old\r\n");
+        scrollback.extend((0..29).map(|row| format!("after {row}\r\n")));
+        scrollback.push_str("needle-current");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                scrollback.as_bytes(),
+            ),
+        );
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        server.app.state.findr = Some(findr);
+
+        let (background_writer, _background_control, background_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 80),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(background_writer),
+            ),
+        );
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_writer),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        assert!(server.app.refresh_findr_visible_if_needed(&HashSet::new()));
+        let (foreground_geometry, foreground_matches) = {
+            let findr = server.app.state.findr.as_ref().expect("Findr state");
+            (
+                findr.visible_geometry.expect("foreground geometry"),
+                findr.matches.len(),
+            )
+        };
+        assert_eq!(
+            foreground_matches, 1,
+            "only the current match is foreground-visible"
+        );
+
+        server.render_and_stream();
+
+        let background_frame =
+            read_server_frame(background_render.recv().expect("background frame"));
+        let _foreground_frame =
+            read_server_frame(foreground_render.recv().expect("foreground frame"));
+        assert!(
+            frame_text(&background_frame)
+                .contains(&format!("{foreground_matches} visible matches")),
+            "background render must retain foreground Findr results: {}",
+            frame_text(&background_frame),
+        );
+
+        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        let info = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("pane info");
+        assert_eq!(findr.visible_geometry, Some(foreground_geometry));
+        assert_eq!(
+            findr.visible_geometry,
+            Some((info.inner_rect.width, info.inner_rect.height))
+        );
+        assert_eq!(findr.matches.len(), foreground_matches);
+        shutdown_test_runtimes(&mut server);
+    }
 
     #[test]
     fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
@@ -8163,6 +8375,136 @@ next_tab = ""
         );
     }
 
+    #[tokio::test]
+    async fn headless_precomputed_render_hides_cursor_during_synchronized_output_resize() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("sync-resize");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(
+            terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left"),
+        );
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.render_and_stream();
+        let _ = render_rx.recv().expect("initial frame");
+
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("pane runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+        server.clients.get_mut(&1).unwrap().terminal_size = (100, 30);
+
+        server.render_and_stream();
+
+        let frame = read_server_frame(render_rx.recv().expect("resized frame"));
+        assert_eq!(frame.cursor, None);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn foreground_cursor_guard_survives_background_navigation_projection() {
+        let mut server = test_headless_server();
+        let first = crate::workspace::Workspace::test_new("foreground-sync");
+        let first_pane = first.tabs[0].root_pane;
+        let first_terminal = first
+            .terminal_id(first_pane)
+            .expect("first terminal")
+            .clone();
+        let second = crate::workspace::Workspace::test_new("background-view");
+        let second_pane = second.tabs[0].root_pane;
+        let second_terminal = second
+            .terminal_id(second_pane)
+            .expect("second terminal")
+            .clone();
+        server.app.state.workspaces = vec![first, second];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(
+            first_terminal.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"first"),
+        );
+        server.app.terminal_runtimes.insert(
+            second_terminal,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"second"),
+        );
+        crate::ui::compute_view_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 80, 24),
+        );
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+        crate::ui::compute_view_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 80, 24),
+        );
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&first_terminal)
+            .expect("foreground runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+
+        let (background_writer, _background_control, _background_render) = test_client_writer();
+        let mut background = ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(false),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        let mut foreground = ClientConnection::new(
+            (100, 30),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
+        );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        server.render_and_stream();
+
+        let frame = read_server_frame(foreground_render.recv().expect("foreground frame"));
+        assert_eq!(frame.cursor, None);
+        shutdown_test_runtimes(&mut server);
+    }
     #[tokio::test]
     async fn virtual_render_exposes_hidden_pane_cursor_when_reveal_hidden_for_cjk_ime() {
         let mut state = AppState::test_new();

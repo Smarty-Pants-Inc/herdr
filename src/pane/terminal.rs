@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,6 +66,41 @@ pub(crate) struct TerminalTextMatch {
     pub scan_cols: u16,
     pub scan_screen: crate::ghostty::ActiveScreen,
 }
+
+/// Identity of the retained terminal snapshot used by one search chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalTextSearchSnapshot {
+    pub screen: crate::ghostty::ActiveScreen,
+    pub cols: u16,
+    pub total_rows: u32,
+    pub content_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTextSearchChunkStatus {
+    Scanned,
+    SnapshotMismatch,
+    InsufficientBudget,
+    InvalidQuery,
+    Unavailable,
+}
+
+/// Bounded reverse search results for a retained terminal buffer chunk.
+///
+/// Rows use the absolute retained-buffer coordinate system. `start_row..end_row`
+/// is the searched reverse chunk; pass `start_row` as the next exclusive end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalTextSearchChunk {
+    pub matches: Vec<TerminalTextMatch>,
+    pub start_row: u32,
+    pub end_row: u32,
+    pub snapshot: Option<TerminalTextSearchSnapshot>,
+    pub status: TerminalTextSearchChunkStatus,
+}
+
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS: usize = 256;
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_CELLS: usize = 32 * 1024;
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_MATCHES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalWordMotion {
@@ -167,6 +202,7 @@ pub(crate) struct GhosttyPaneTerminal {
 
 pub(crate) struct GhosttyPaneCore {
     pub terminal: crate::ghostty::Terminal,
+    content_generation: u64,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -247,6 +283,98 @@ impl PaneTerminal {
             return Vec::new();
         };
         buffer.search(query, case_sensitive, active_screen)
+    }
+
+    pub(crate) fn search_text_matches_reverse_chunk(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        end_row_exclusive: u32,
+        max_cells: usize,
+        max_matches: usize,
+        expected_snapshot: Option<TerminalTextSearchSnapshot>,
+    ) -> TerminalTextSearchChunk {
+        let unavailable = || TerminalTextSearchChunk {
+            matches: Vec::new(),
+            start_row: 0,
+            end_row: 0,
+            snapshot: None,
+            status: TerminalTextSearchChunkStatus::Unavailable,
+        };
+        let (snapshot, start_row, end_row, buffer) = {
+            let Ok(core) = self.ghostty.core.lock() else {
+                return unavailable();
+            };
+            let (Ok(total_rows), Ok(cols), Ok(screen)) = (
+                core.terminal.total_rows(),
+                core.terminal.cols(),
+                core.terminal.active_screen(),
+            ) else {
+                return unavailable();
+            };
+            let snapshot = TerminalTextSearchSnapshot {
+                screen,
+                cols,
+                total_rows: u32::try_from(total_rows).unwrap_or(u32::MAX),
+                content_generation: core.content_generation,
+            };
+            let end_row = end_row_exclusive.min(snapshot.total_rows);
+            let empty = |status| TerminalTextSearchChunk {
+                matches: Vec::new(),
+                start_row: end_row,
+                end_row,
+                snapshot: Some(snapshot),
+                status,
+            };
+            let query_chars = query.chars().count();
+            if expected_snapshot.is_some_and(|expected| expected != snapshot) {
+                return empty(TerminalTextSearchChunkStatus::SnapshotMismatch);
+            }
+            if query.is_empty()
+                || query_chars > TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS
+                || max_cells == 0
+                || max_matches == 0
+            {
+                return empty(TerminalTextSearchChunkStatus::InvalidQuery);
+            }
+            let cols_usize = usize::from(cols);
+            let query_cells = crate::ghostty::unicode_text_width(query).max(1);
+            let Some((start_row, scan_end_row)) = terminal_text_search_chunk_range(
+                total_rows,
+                end_row as usize,
+                cols_usize,
+                max_cells,
+                query_cells,
+            ) else {
+                return empty(TerminalTextSearchChunkStatus::InsufficientBudget);
+            };
+            let mut buffer = RetainedTextBuffer::new_search_streamed(cols);
+            if core
+                .terminal
+                .visit_screen_text_rows_range(start_row, scan_end_row, |item| {
+                    buffer.push_search_item(item);
+                })
+                .is_err()
+            {
+                return unavailable();
+            }
+            buffer.finish_search_stream();
+            (snapshot, start_row as u32, end_row, buffer)
+        };
+        TerminalTextSearchChunk {
+            matches: buffer.search_bounded_reverse(
+                query,
+                case_sensitive,
+                snapshot.screen,
+                start_row,
+                end_row,
+                max_matches.min(TERMINAL_TEXT_SEARCH_MAX_MATCHES),
+            ),
+            start_row,
+            end_row,
+            snapshot: Some(snapshot),
+            status: TerminalTextSearchChunkStatus::Scanned,
+        }
     }
 
     pub(crate) fn text_match_is_current(&self, text_match: TerminalTextMatch) -> bool {
@@ -387,9 +515,6 @@ impl PaneTerminal {
 
     pub fn input_state(&self) -> Option<InputState> {
         self.ghostty.input_state()
-    }
-    pub fn alternate_screen(&self) -> Option<bool> {
-        self.ghostty.alternate_screen()
     }
 
     pub fn alternate_screen_active(&self) -> bool {
@@ -573,6 +698,32 @@ impl PaneTerminal {
         self.ghostty.encode_mouse_wheel(kind, position, modifiers)
     }
 }
+fn terminal_text_search_chunk_range(
+    total_rows: usize,
+    end_row: usize,
+    cols: usize,
+    max_cells: usize,
+    query_cells: usize,
+) -> Option<(usize, usize)> {
+    if cols == 0 || end_row == 0 {
+        return None;
+    }
+    let row_budget = max_cells.min(TERMINAL_TEXT_SEARCH_MAX_CELLS) / cols;
+    if row_budget == 0 {
+        return None;
+    }
+
+    let wanted_overlap_rows = query_cells.div_ceil(cols);
+    let available_overlap_rows = total_rows.saturating_sub(end_row);
+    let overlap_rows = wanted_overlap_rows.min(available_overlap_rows);
+    if row_budget <= overlap_rows {
+        return None;
+    }
+    let owned_rows = row_budget - overlap_rows;
+    let start_row = end_row.saturating_sub(owned_rows);
+    let scan_end_row = end_row.saturating_add(overlap_rows).min(total_rows);
+    Some((start_row, scan_end_row))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextClass {
@@ -619,6 +770,83 @@ impl RetainedTextBuffer {
         Self::build(cols, rows, row_offset, true, false)
     }
 
+    fn new_search_streamed(cols: u16) -> Self {
+        Self {
+            cols,
+            lines: vec![LogicalTextLine::default()],
+            atoms: Vec::new(),
+        }
+    }
+
+    fn push_search_item(&mut self, item: crate::ghostty::ScreenTextVisit<'_>) {
+        match item {
+            crate::ghostty::ScreenTextVisit::Cell {
+                row,
+                col,
+                wide,
+                graphemes,
+            } => {
+                if matches!(
+                    wide,
+                    crate::ghostty::CellWide::SpacerTail | crate::ghostty::CellWide::SpacerHead
+                ) {
+                    return;
+                }
+                let Ok(row) = u32::try_from(row) else {
+                    return;
+                };
+                let width = if wide == crate::ghostty::CellWide::Wide {
+                    2
+                } else {
+                    1
+                };
+                let line = self.lines.last_mut().expect("search line");
+                let byte_start = line.text.len();
+                append_terminal_cell_text(graphemes, &mut line.text);
+                line.spans.push(TextSpan {
+                    byte_start,
+                    byte_end: line.text.len(),
+                    start: TerminalTextPoint { row, col },
+                    end: TerminalTextPoint {
+                        row,
+                        col: col.saturating_add(width - 1),
+                    },
+                });
+            }
+            crate::ghostty::ScreenTextVisit::RowEnd { soft_wrapped, .. } => {
+                if !soft_wrapped {
+                    Self::trim_search_line(self.lines.last_mut().expect("search line"));
+                    self.lines.push(LogicalTextLine::default());
+                }
+            }
+        }
+    }
+
+    fn finish_search_stream(&mut self) {
+        if let Some(line) = self.lines.last_mut() {
+            Self::trim_search_line(line);
+        }
+        if self
+            .lines
+            .last()
+            .is_some_and(|line| line.text.is_empty() && line.spans.is_empty())
+        {
+            self.lines.pop();
+        }
+    }
+
+    fn trim_search_line(line: &mut LogicalTextLine) {
+        let trimmed_len = line.text.trim_end().len();
+        while line
+            .spans
+            .last()
+            .is_some_and(|span| span.byte_start >= trimmed_len)
+        {
+            line.spans.pop();
+        }
+        line.text.truncate(trimmed_len);
+    }
+
     fn new_words(cols: u16, rows: Vec<crate::ghostty::ScreenTextRow>, row_offset: u32) -> Self {
         Self::build(cols, rows, row_offset, false, true)
     }
@@ -633,6 +861,7 @@ impl RetainedTextBuffer {
         let mut lines = Vec::new();
         let mut line = LogicalTextLine::default();
         let mut atoms: Vec<TextAtom> = Vec::new();
+        let mut cell_text = String::new();
 
         for (row_idx, row) in rows.into_iter().enumerate() {
             let Some(row_idx) = u32::try_from(row_idx).ok() else {
@@ -663,19 +892,19 @@ impl RetainedTextBuffer {
                 } else {
                     1
                 };
-                let text = terminal_cell_text(&cell.graphemes);
                 let start = TerminalTextPoint { row: row_idx, col };
                 let end = TerminalTextPoint {
                     row: row_idx,
                     col: col.saturating_add(width - 1),
                 };
+                cell_text.clear();
+                append_terminal_cell_text(&cell.graphemes, &mut cell_text);
                 if build_lines {
                     let byte_start = line.text.len();
-                    line.text.push_str(&text);
-                    let byte_end = line.text.len();
+                    line.text.push_str(&cell_text);
                     line.spans.push(TextSpan {
                         byte_start,
-                        byte_end,
+                        byte_end: line.text.len(),
                         start,
                         end,
                     });
@@ -684,7 +913,7 @@ impl RetainedTextBuffer {
                     atoms.push(TextAtom {
                         point: Some(start),
                         end_col: end.col,
-                        class: text_class(&text),
+                        class: text_class(&cell_text),
                     });
                 }
             }
@@ -761,6 +990,65 @@ impl RetainedTextBuffer {
                     scan_screen: active_screen,
                 });
             }
+        }
+        matches
+    }
+
+    fn search_bounded_reverse(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        active_screen: crate::ghostty::ActiveScreen,
+        start_row: u32,
+        end_row: u32,
+        max_matches: usize,
+    ) -> Vec<TerminalTextMatch> {
+        if query.is_empty() || max_matches == 0 {
+            return Vec::new();
+        }
+        let Ok(regex) = regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(!case_sensitive)
+            .build()
+        else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        for line in self.lines.iter().rev() {
+            let remaining = max_matches.saturating_sub(matches.len());
+            if remaining == 0 {
+                break;
+            }
+            let mut line_matches = VecDeque::new();
+            for found in regex.find_iter(&line.text) {
+                let Ok(start_index) = line
+                    .spans
+                    .binary_search_by_key(&found.start(), |span| span.byte_start)
+                else {
+                    continue;
+                };
+                let Ok(end_index) = line
+                    .spans
+                    .binary_search_by_key(&found.end(), |span| span.byte_end)
+                else {
+                    continue;
+                };
+                let start_span = &line.spans[start_index];
+                if start_span.start.row < start_row || start_span.start.row >= end_row {
+                    continue;
+                }
+                if line_matches.len() == remaining {
+                    line_matches.pop_front();
+                }
+                let end_span = &line.spans[end_index];
+                line_matches.push_back(TerminalTextMatch {
+                    start: start_span.start,
+                    end: end_span.end,
+                    source_fingerprint: text_fingerprint(found.as_str()),
+                    scan_cols: self.cols,
+                    scan_screen: active_screen,
+                });
+            }
+            matches.extend(line_matches.into_iter().rev());
         }
         matches
     }
@@ -966,16 +1254,18 @@ impl RetainedTextBuffer {
     }
 }
 
-fn terminal_cell_text(graphemes: &[u32]) -> String {
+fn append_terminal_cell_text(graphemes: &[u32], text: &mut String) {
     if graphemes.is_empty()
         || graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
     {
-        return " ".to_string();
+        text.push(' ');
+        return;
     }
-    graphemes
-        .iter()
-        .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect()
+    text.extend(
+        graphemes
+            .iter()
+            .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER)),
+    );
 }
 
 fn text_class(text: &str) -> TextClass {
@@ -1026,6 +1316,7 @@ impl GhosttyPaneTerminal {
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
+                content_generation: 0,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1283,6 +1574,9 @@ impl GhosttyPaneTerminal {
             xtgettcap_responses,
             &mut terminal_responses,
         );
+        if !filtered_bytes.is_empty() {
+            core.content_generation = core.content_generation.wrapping_add(1);
+        }
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
         let reported_cwd = core
@@ -1431,6 +1725,7 @@ impl GhosttyPaneTerminal {
         #[cfg(windows)]
         core.kitty_keyboard.observe(ansi.as_bytes());
         core.terminal.write(ansi.as_bytes());
+        core.content_generation = core.content_generation.wrapping_add(1);
         #[cfg(windows)]
         windows_recent_fallback::update(&mut core);
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
@@ -1516,6 +1811,9 @@ impl GhosttyPaneTerminal {
         if input_state.modify_other_keys {
             core.terminal.write(b"\x1b[>4;2m");
         }
+        if input_state.alternate_screen || input_state.modify_other_keys {
+            core.content_generation = core.content_generation.wrapping_add(1);
+        }
 
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
@@ -1540,6 +1838,7 @@ impl GhosttyPaneTerminal {
         };
         core.kitty_keyboard.observe(ansi.as_bytes());
         core.terminal.write(ansi.as_bytes());
+        core.content_generation = core.content_generation.wrapping_add(1);
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
         }
@@ -1583,6 +1882,7 @@ impl GhosttyPaneTerminal {
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            core.content_generation = core.content_generation.wrapping_add(1);
             let terminal_responses = self.drain_pending_pty_responses();
 
             let bottom_is_blank = ghostty_detection_text(&mut core)
@@ -1758,10 +2058,6 @@ impl GhosttyPaneTerminal {
                 .mode_get(crate::ghostty::MODE_COLOR_SCHEME_REPORT)
                 .ok()?,
         })
-    }
-    pub fn alternate_screen(&self) -> Option<bool> {
-        let core = self.core.lock().ok()?;
-        Some(core.terminal.active_screen().ok()? == crate::ghostty::ActiveScreen::Alternate)
     }
 
     pub fn wheel_routing(&self) -> Option<crate::pane::WheelRouting> {
@@ -3356,7 +3652,7 @@ mod tests {
             },
             crate::ghostty::ScreenTextCell {
                 wide: crate::ghostty::CellWide::SpacerTail,
-                graphemes: Vec::new(),
+                graphemes: Box::default(),
             },
         ]
     }
@@ -3410,6 +3706,221 @@ mod tests {
         assert_eq!(matches[0].end, TerminalTextPoint { row: 1, col: 0 });
         assert!(search_primary(&buffer, "hab", true).is_empty());
     }
+    #[test]
+    fn retained_text_bounded_reverse_search_paginates_and_caps() {
+        let buffer = RetainedTextBuffer::new(
+            6,
+            vec![
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("skip  ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+            ],
+        );
+
+        let newest = buffer.search_bounded_reverse(
+            "hit",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            2,
+            4,
+            1,
+        );
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].start.row, 3);
+
+        let older = buffer.search_bounded_reverse(
+            "hit",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            0,
+            2,
+            4,
+        );
+        assert_eq!(
+            older
+                .into_iter()
+                .map(|text_match| text_match.start.row)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_chunks_cap_overlap_and_paginate_to_zero() {
+        let cols = 80;
+        let total_rows = 900;
+        let cell_budget = TERMINAL_TEXT_SEARCH_MAX_CELLS;
+        let mut end_row = total_rows;
+        let mut matched_rows = Vec::new();
+
+        while end_row > 0 {
+            let (start_row, scan_end_row) = terminal_text_search_chunk_range(
+                total_rows,
+                end_row,
+                cols,
+                cell_budget,
+                "needle".len() * 2,
+            )
+            .unwrap();
+            assert!(start_row < end_row);
+            assert!((scan_end_row - start_row) * cols <= cell_budget);
+
+            let rows = (start_row..scan_end_row)
+                .map(|_| text_row("needle".chars().map(|ch| text_cell(&ch.to_string())), false));
+            let buffer =
+                RetainedTextBuffer::new_search(cols as u16, rows.collect(), start_row as u32);
+            matched_rows.extend(
+                buffer
+                    .search_bounded_reverse(
+                        "needle",
+                        true,
+                        crate::ghostty::ActiveScreen::Primary,
+                        start_row as u32,
+                        end_row as u32,
+                        TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+                    )
+                    .into_iter()
+                    .map(|text_match| text_match.start.row as usize),
+            );
+            end_row = start_row;
+        }
+
+        assert_eq!(matched_rows, (0..total_rows).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn terminal_text_search_overlap_uses_display_cells() {
+        let query = "👩‍💻";
+        let query_cells = crate::ghostty::unicode_text_width(query);
+        assert_eq!(query_cells, 2);
+        assert_eq!(
+            terminal_text_search_chunk_range(10, 7, 4, 8, query_cells),
+            Some((6, 8))
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_rejects_content_changed_between_chunks() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(12, 3, 100).unwrap();
+        terminal.write(b"alpha needle");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap());
+
+        let first = pane.search_text_matches_reverse_chunk(
+            "needle",
+            true,
+            u32::MAX,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+            None,
+        );
+        assert_eq!(first.status, TerminalTextSearchChunkStatus::Scanned);
+
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\roverwrite", &tx);
+        let second = pane.search_text_matches_reverse_chunk(
+            "needle",
+            true,
+            first.start_row,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+            first.snapshot,
+        );
+        assert_eq!(
+            second.status,
+            TerminalTextSearchChunkStatus::SnapshotMismatch
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_chunk_requires_room_for_soft_wrap_overlap() {
+        assert_eq!(terminal_text_search_chunk_range(10, 7, 80, 80, 2), None);
+        assert_eq!(
+            terminal_text_search_chunk_range(10, 10, 80, 80, 2),
+            Some((9, 10))
+        );
+        assert_eq!(terminal_text_search_chunk_range(10, 7, 80, 79, 2), None);
+    }
+
+    #[test]
+    fn terminal_text_search_chunks_keep_soft_wrap_overlap_within_cell_cap() {
+        let cols = 80;
+        let total_rows = 1_000;
+        let end_row = 498;
+        let (start_row, scan_end_row) = terminal_text_search_chunk_range(
+            total_rows,
+            end_row,
+            cols,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            "needle".len() * 2,
+        )
+        .unwrap();
+        assert!((scan_end_row - start_row) * cols <= TERMINAL_TEXT_SEARCH_MAX_CELLS);
+        assert!(scan_end_row > end_row);
+
+        let rows = (start_row..scan_end_row).map(|row| match row {
+            row if row == end_row - 1 => {
+                text_row("nee".chars().map(|ch| text_cell(&ch.to_string())), true)
+            }
+            row if row == end_row => {
+                text_row("dle".chars().map(|ch| text_cell(&ch.to_string())), false)
+            }
+            _ => text_row("skip".chars().map(|ch| text_cell(&ch.to_string())), false),
+        });
+        let buffer = RetainedTextBuffer::new_search(cols as u16, rows.collect(), start_row as u32);
+
+        let matches = buffer.search_bounded_reverse(
+            "needle",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            start_row as u32,
+            end_row as u32,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start.row, (end_row - 1) as u32);
+        assert_eq!(matches[0].end.row, end_row as u32);
+    }
+    #[test]
+    fn retained_text_bounded_reverse_search_keeps_soft_wrap_overlap() {
+        let buffer = RetainedTextBuffer::new(
+            5,
+            vec![
+                text_row("abcde".chars().map(|ch| text_cell(&ch.to_string())), true),
+                text_row("fgh  ".chars().map(|ch| text_cell(&ch.to_string())), false),
+            ],
+        );
+
+        let matches = buffer.search_bounded_reverse(
+            "def",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            0,
+            1,
+            4,
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start, TerminalTextPoint { row: 0, col: 3 });
+        assert_eq!(matches[0].end, TerminalTextPoint { row: 1, col: 0 });
+    }
+
+    #[test]
+    fn retained_text_bounded_reverse_search_handles_empty_limits() {
+        let buffer = RetainedTextBuffer::new(
+            5,
+            vec![text_row(
+                "hit  ".chars().map(|ch| text_cell(&ch.to_string())),
+                false,
+            )],
+        );
+
+        assert!(buffer
+            .search_bounded_reverse("", true, crate::ghostty::ActiveScreen::Primary, 0, 1, 4,)
+            .is_empty());
+        assert!(buffer
+            .search_bounded_reverse("hit", true, crate::ghostty::ActiveScreen::Primary, 0, 1, 0,)
+            .is_empty());
+    }
 
     #[test]
     fn retained_text_search_maps_wide_and_combining_graphemes_to_cells() {
@@ -3434,7 +3945,7 @@ mod tests {
             .collect::<Vec<_>>();
         first.push(crate::ghostty::ScreenTextCell {
             wide: crate::ghostty::CellWide::SpacerHead,
-            graphemes: Vec::new(),
+            graphemes: Box::default(),
         });
         let mut second = wide_text_cells("界").to_vec();
         second.extend("xyz".chars().map(|ch| text_cell(&ch.to_string())));
@@ -3455,7 +3966,7 @@ mod tests {
             .collect::<Vec<_>>();
         first.push(crate::ghostty::ScreenTextCell {
             wide: crate::ghostty::CellWide::SpacerHead,
-            graphemes: Vec::new(),
+            graphemes: Box::default(),
         });
         let mut second = wide_text_cells("界").to_vec();
         second.extend("xyz".chars().map(|ch| text_cell(&ch.to_string())));

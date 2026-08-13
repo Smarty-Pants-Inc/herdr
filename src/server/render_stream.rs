@@ -319,7 +319,41 @@ pub(crate) fn render_virtual_with_runtime_registry(
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || (!popup_visible
             && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+    render_precomputed_virtual_inner(
+        app_state,
+        terminal_runtimes,
+        area,
+        popup_visible,
+        suppress_focused_terminal_cursor,
+    )
+}
 
+pub(crate) fn render_precomputed_virtual_with_runtime_registry(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    pre_compute_suppresses_focused_terminal_cursor: bool,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let popup_visible = app_state.popup_pane.is_some();
+    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
+        || (!popup_visible
+            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+    render_precomputed_virtual_inner(
+        app_state,
+        terminal_runtimes,
+        area,
+        popup_visible,
+        suppress_focused_terminal_cursor,
+    )
+}
+
+fn render_precomputed_virtual_inner(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    popup_visible: bool,
+    suppress_focused_terminal_cursor: bool,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
@@ -463,7 +497,7 @@ fn focused_terminal_owns_host_cursor(
         .is_some()
 }
 
-fn focused_terminal_suppresses_host_cursor(
+pub(crate) fn focused_terminal_suppresses_host_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> bool {

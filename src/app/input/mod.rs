@@ -38,6 +38,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 
 mod clipboard;
 mod copy_mode;
+mod findr;
 mod lease;
 mod modal;
 mod mouse;
@@ -95,11 +96,12 @@ impl App {
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
+            Mode::Findr => self.handle_findr_key(key),
             _ => match self.state.mode {
                 Mode::Onboarding => self.handle_onboarding_key(key_event),
                 Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
                 Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
+                Mode::Prefix | Mode::Navigate | Mode::Copy | Mode::Findr => unreachable!(),
                 Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                     self.handle_rename_key_via_api(key_event)
                 }
@@ -108,9 +110,7 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ContextMenu => {
-                    self.handle_context_menu_key_via_api(key_event);
-                }
+                Mode::ContextMenu => self.handle_context_menu_key_via_api(key_event),
                 Mode::Settings => self.handle_settings_key(key_event),
                 Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
                 Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key),
@@ -269,6 +269,11 @@ impl App {
                     .extend(text.chars().filter(|ch| !ch.is_control()));
                 true
             }
+            Mode::Findr => {
+                self.state.insert_findr_text(&self.terminal_runtimes, text);
+                self.reset_findr_scan_deadline();
+                true
+            }
             _ => false,
         }
     }
@@ -366,6 +371,26 @@ impl App {
 
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
+            return;
+        }
+        if self.state.mode == Mode::Findr {
+            let scan_may_change = matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            );
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.state.workspace_press = None;
+                self.state.tab_press = None;
+                self.state.drag = None;
+                self.state.clear_selection();
+                self.selection_autoscroll_deadline = None;
+            }
+            let _ = self.state.handle_mouse(&mut self.terminal_runtimes, mouse);
+            if scan_may_change {
+                self.reset_findr_scan_deadline();
+            }
             return;
         }
         if self.handle_workspace_plugin_mouse(mouse) {
@@ -743,6 +768,7 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             .copy_mode
             .as_ref()
             .is_some_and(|copy_mode| copy_mode.search.prompt.is_some()),
+        Mode::Findr => true,
         _ => false,
     }
 }
@@ -1076,6 +1102,91 @@ mod tests {
         assert!(!pane.collapsed);
         assert!(!pane.focused);
     }
+    #[test]
+    fn findr_mouse_over_plugin_stays_modal_and_does_not_forward() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-findr-mouse");
+        let workspace_id = workspace.id.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id,
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 1, 25, 19);
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        app.state.mode = Mode::Findr;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 82, 5));
+
+        assert_eq!(app.state.mode, Mode::Findr);
+        assert_eq!(
+            app.state.findr.as_ref().map(|findr| findr.pane_id),
+            Some(pane_id)
+        );
+    }
+
+    #[test]
+    fn findr_mouse_scroll_reschedules_incomplete_scan() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("findr-scroll-deadline");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.complete = false;
+        app.state.findr = Some(findr);
+        app.state.mode = Mode::Findr;
+        app.findr_scan_deadline = None;
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1));
+
+        assert!(app.findr_scan_deadline.is_some());
+    }
+
+    #[test]
+    fn findr_left_release_cancels_inherited_mouse_gesture() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("findr-release");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        app.state.mode = Mode::Findr;
+        app.state.drag = Some(crate::app::state::DragState {
+            target: crate::app::state::DragTarget::SidebarDivider,
+        });
+        app.state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        app.state.selection_autoscroll = Some(crate::app::state::SelectionAutoscroll {
+            direction: crate::app::state::SelectionAutoscrollDirection::Down,
+            last_mouse_screen_col: 0,
+            last_mouse_screen_row: 0,
+            inner_rect: ratatui::layout::Rect::new(0, 0, 1, 1),
+        });
+        app.selection_autoscroll_deadline = Some(std::time::Instant::now());
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 1));
+
+        assert!(app.state.drag.is_none());
+        assert!(app.state.selection.is_none());
+        assert!(app.state.selection_autoscroll.is_none());
+        assert!(app.selection_autoscroll_deadline.is_none());
+    }
+
     #[test]
     fn workspace_plugin_separator_drag_resizes_without_closing() {
         let mut app = app_for_mouse_test();

@@ -308,9 +308,7 @@ impl AppState {
     }
 
     fn sync_selection_after_focus_navigation(&mut self) {
-        if self.copy_mode.is_some() {
-            self.sync_copy_mode_with_focus();
-        } else {
+        if self.copy_mode.is_none() {
             self.clear_selection();
         }
     }
@@ -345,7 +343,7 @@ impl AppState {
             tab.layout.focus_pane(pane_id);
             self.previous_pane_focus = previous;
             self.mark_session_dirty();
-            self.sync_copy_mode_with_focus();
+            self.reconcile_focus_lifecycle();
             return true;
         }
         false
@@ -804,7 +802,7 @@ impl AppState {
                     return false;
                 }
                 self.switch_workspace(ws_idx);
-                self.mode = Mode::Terminal;
+                self.settle_terminal_mode_after_focus();
                 true
             }
             NavigatorTarget::Tab { ws_idx, tab_idx } => {
@@ -819,7 +817,7 @@ impl AppState {
                     return false;
                 }
                 self.switch_workspace_tab(ws_idx, tab_idx);
-                self.mode = Mode::Terminal;
+                self.settle_terminal_mode_after_focus();
                 true
             }
             NavigatorTarget::Pane {
@@ -837,7 +835,7 @@ impl AppState {
                     .is_some_and(|tab| tab.panes.contains_key(&pane_id))
                 {
                     self.focus_pane_in_workspace(ws_idx, pane_id);
-                    self.mode = Mode::Terminal;
+                    self.settle_terminal_mode_after_focus();
                     return true;
                 }
                 false
@@ -1140,6 +1138,7 @@ impl AppState {
             self.refresh_tab_bar_view();
             self.record_pane_focus_after_navigation(previous_focus);
             self.sync_selection_after_focus_navigation();
+            self.reconcile_focus_lifecycle();
         }
     }
 
@@ -1175,6 +1174,7 @@ impl AppState {
         self.refresh_tab_bar_view();
         self.record_pane_focus_after_navigation(previous_focus);
         self.sync_selection_after_focus_navigation();
+        self.reconcile_focus_lifecycle();
         true
     }
 
@@ -1660,6 +1660,7 @@ impl AppState {
     ) {
         let pane_ids = pane_ids.into_iter().collect::<Vec<_>>();
         self.clear_copy_mode_for_removed_panes(pane_ids.iter().copied());
+        self.reconcile_focus_lifecycle_excluding(&pane_ids);
         if self
             .previous_pane_focus
             .as_ref()
@@ -1745,6 +1746,7 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn refresh_tab_bar_view(&mut self) {
@@ -1920,6 +1922,7 @@ impl AppState {
             self.previous_pane_focus = current;
             self.mark_session_dirty();
         }
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn apply_pane_zoom(
@@ -2080,6 +2083,7 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(terminal_ids);
         }
+        self.reconcile_focus_lifecycle();
         false
     }
 
@@ -2136,6 +2140,7 @@ impl AppState {
             crate::logging::tab_closed(&workspace_id, &closing_tab_id);
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
+            self.reconcile_focus_lifecycle();
         }
         false
     }
@@ -3424,6 +3429,7 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);
         }
+        self.reconcile_focus_lifecycle();
     }
 }
 
@@ -4427,6 +4433,75 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn switch_workspace_closes_findr_targeting_previous_workspace() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        state.switch_workspace(1);
+
+        assert_eq!(state.active, Some(1));
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn switch_workspace_tab_closes_findr_when_target_tab_is_left() {
+        let mut state = app_with_workspaces(&["a"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let other_tab = state.workspaces[0].test_add_tab(Some("other"));
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        assert!(state.switch_workspace_tab(0, other_tab));
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn switch_workspace_tab_keeps_findr_when_target_tab_stays_active() {
+        let mut state = app_with_workspaces(&["a"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        assert!(state.switch_workspace_tab(0, 0));
+
+        assert!(state.findr.is_some());
+        assert_eq!(state.mode, Mode::Findr);
+    }
+
+    #[test]
+    fn focus_pane_closes_findr_when_target_pane_is_left() {
+        let mut state = app_with_workspaces(&["a"]);
+        let target = state.workspaces[0].tabs[0].root_pane;
+        let other = state.workspaces[0].test_split(Direction::Horizontal);
+        state.focus_pane_in_workspace(0, target);
+        state.findr = Some(crate::app::state::FindrState::new(target));
+        state.mode = Mode::Findr;
+
+        assert!(state.focus_pane_in_workspace(0, other));
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn focus_pane_keeps_findr_when_target_stays_focused() {
+        let mut state = app_with_workspaces(&["a"]);
+        let target = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(target));
+        state.mode = Mode::Findr;
+
+        assert!(!state.focus_pane_in_workspace(0, target));
+
+        assert!(state.findr.is_some());
+        assert_eq!(state.mode, Mode::Findr);
     }
 
     #[test]
@@ -5959,6 +6034,22 @@ mod tests {
         state.close_pane();
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert!(!state.plugin_panes.contains_key(&closed));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn close_pane_clears_findr_target_and_restores_terminal_mode() {
+        let mut state = app_with_workspaces(&["test"]);
+        let closed = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].layout.focus_pane(closed);
+        state.ensure_test_terminals();
+        state.findr = Some(crate::app::state::FindrState::new(closed));
+        state.mode = Mode::Findr;
+
+        state.close_pane();
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
         state.assert_invariants_for_test();
     }
 
