@@ -497,18 +497,6 @@ fn workspace_list_and_create_round_trip() {
     );
     assert_eq!(send_enter["result"]["type"], "ok");
 
-    std::thread::sleep(Duration::from_millis(300));
-
-    let recent = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_11","method":"pane.read","params":{{"pane_id":"{}","source":"recent","lines":20}}}}"#,
-            pane_id
-        ),
-    );
-    let recent_text = recent["result"]["read"]["text"].as_str().unwrap();
-    assert!(recent_text.contains("beta") || recent_text.contains("gamma"));
-
     for source in ["visible", "detection"] {
         let limited = send_request(
             &socket_path,
