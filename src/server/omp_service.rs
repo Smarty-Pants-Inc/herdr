@@ -651,7 +651,6 @@ impl OmpService {
             .as_deref()?;
         let matches_renderer = |client: &ClientConnection| {
             client.is_full_app_client()
-                && client.committed_identity().is_some()
                 && client.renderer_binding_token.as_deref() == Some(renderer_binding_token)
         };
         if let Some(target_app_client_id) = target_app_client_id {
@@ -1182,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_binding_selects_an_exact_live_committed_app() {
+    fn renderer_binding_selects_an_exact_live_app() {
         let mut service = OmpService::new(None).unwrap();
         let mut clients = HashMap::new();
         clients.insert(
@@ -1207,7 +1206,7 @@ mod tests {
             3,
             client_with_binding(
                 crate::server::clients::ClientConnectionMode::App,
-                Some("Chosen Name"),
+                None,
                 Some("profile-a"),
                 Some("shared-token"),
             ),
@@ -1225,7 +1224,7 @@ mod tests {
         assert_eq!(
             service.bind_app_client(1, Some(3), &clients),
             Some(3),
-            "the exact matching App is selected regardless of names"
+            "an unnamed App with the exact binding token is selected"
         );
         let key = OmpRouteKey {
             pane_id: "pane".into(),
@@ -1268,18 +1267,10 @@ mod tests {
             None,
             "a shared frontend profile ID cannot override a different binding token"
         );
-
-        clients
-            .get_mut(&3)
-            .unwrap()
-            .identity
-            .as_mut()
-            .unwrap()
-            .committed = None;
         assert_eq!(
-            service.bind_app_client(1, Some(3), &clients),
+            service.bind_app_client(1, Some(1), &clients),
             None,
-            "the exact App must have committed identity"
+            "a non-App client cannot be bound as a renderer"
         );
 
         clients.remove(&3);
