@@ -39,6 +39,7 @@ impl App {
         source_id: InputSourceId,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
+        self.clear_hovered_pane_link();
         match self.prepare_popup_key_forward(key.clone()) {
             PreparedPopupInput::NotOpen => {}
             PreparedPopupInput::Consumed => return None,
@@ -500,6 +501,16 @@ mod tests {
         app.state.view.pane_infos = pane_infos;
         (app, info)
     }
+    fn rendered_buffer(app: &App) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(106, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                crate::ui::render_with_runtime_registry(&app.state, &app.terminal_runtimes, frame);
+            })
+            .expect("render test frame");
+        terminal.backend().buffer().clone()
+    }
 
     fn double_click(app: &mut App, col: u16, row: u16) {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
@@ -955,7 +966,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_url_does_not_forward_release_to_mouse_reporting_pane() {
+    async fn single_click_url_does_not_forward_release_to_mouse_reporting_pane() {
         let line = "see https://github.com/herdrdev/herdr/issues/1761";
         let col = line.find("github").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(b"");
@@ -985,7 +996,7 @@ mod tests {
         let up = MouseEventKind::Up(MouseButton::Left);
         let url_x = info.inner_rect.x + col;
 
-        send_mouse(41, down, url_x, KeyModifiers::CONTROL);
+        send_mouse(41, down, url_x, KeyModifiers::empty());
         send_mouse(42, down, info.inner_rect.x, KeyModifiers::empty());
         send_mouse(42, up, info.inner_rect.x, KeyModifiers::empty());
         send_mouse(41, up, url_x, KeyModifiers::empty());
@@ -1007,7 +1018,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn outer_focus_loss_does_not_forward_pending_url_click_release_to_pane() {
+    async fn outer_focus_loss_does_not_forward_pending_single_click_release_to_pane() {
         let line = "see https://github.com/herdrdev/herdr/issues/1761";
         let col = line.find("github").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(b"");
@@ -1035,7 +1046,7 @@ mod tests {
                 MouseEventKind::Down(MouseButton::Left),
                 url_x,
                 info.inner_rect.y,
-                KeyModifiers::CONTROL,
+                KeyModifiers::empty(),
             ),
         );
         assert_eq!(app.state.plugin_command_logs.len(), 1);
@@ -1065,16 +1076,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_click_web_url_queues_open_url_effect() {
+    async fn single_click_web_url_queues_open_url_effect() {
         let url = "https://example.com/issues/21";
         let col = url.find("example").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(url.as_bytes());
 
-        app.handle_mouse(modified_mouse(
+        app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             info.inner_rect.x + col,
             info.inner_rect.y,
-            KeyModifiers::CONTROL,
         ));
 
         match app.event_rx.try_recv().expect("open URL event") {
@@ -1091,45 +1101,29 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
+    async fn single_click_url_invokes_plugin_link_handler() {
         let line = "see https://github.com/herdrdev/herdr/issues/398";
         let col = line.find("github").expect("url host") as u16;
 
-        let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
         install_test_link_handler(
-            &mut ctrl_app,
+            &mut app,
             "github-issue",
             "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
         );
-        ctrl_app.handle_mouse(modified_mouse(
+        app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            ctrl_info.inner_rect.x + col,
-            ctrl_info.inner_rect.y,
-            KeyModifiers::CONTROL,
+            info.inner_rect.x + col,
+            info.inner_rect.y,
         ));
 
-        let ctrl_log = ctrl_app
+        let log = app
             .state
             .plugin_command_logs
             .last()
-            .expect("ctrl-click should start plugin link handler");
-        assert_eq!(ctrl_log.plugin_id, "example.links");
-        assert_eq!(ctrl_log.action_id.as_deref(), Some("open"));
-
-        let (mut super_app, super_info) = app_with_screen_bytes(line.as_bytes());
-        install_test_link_handler(
-            &mut super_app,
-            "github-issue",
-            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
-        );
-        super_app.handle_mouse(modified_mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            super_info.inner_rect.x + col,
-            super_info.inner_rect.y,
-            KeyModifiers::SUPER,
-        ));
-
-        assert!(super_app.state.plugin_command_logs.is_empty());
+            .expect("single-click should start plugin link handler");
+        assert_eq!(log.plugin_id, "example.links");
+        assert_eq!(log.action_id.as_deref(), Some("open"));
     }
 
     #[tokio::test]
@@ -1189,6 +1183,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pane_cell_url_resolver_tracks_wide_cell_spacer_at_soft_wrap() {
+        let (_app, info) = app_with_screen_bytes(b"");
+        let url = "https://example.com/wide";
+        let screen = format!("{}界{url}", "x".repeat(info.inner_rect.width as usize - 1));
+        let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let url_col = 2;
+
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 1, url_col)
+                .as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 1, url_col - 1),
+            None
+        );
+
+        let screen_col = info.inner_rect.x + url_col + 8;
+        let screen_row = info.inner_rect.y + 1;
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, screen_col, screen_row)));
+        let hover = app.state.hovered_link.as_ref().expect("hovered URL");
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col, screen_row)));
+        assert!(!hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col - 1, screen_row)));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            screen_col,
+            screen_row,
+        ));
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl { url: opened, .. } => assert_eq!(opened, url),
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_cell_url_resolver_tracks_zwj_grapheme_before_url() {
+        let url = "https://example.com/zwj";
+        let (mut app, info) = app_with_screen_bytes(format!("👩‍💻 {url}").as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let url_col = 3;
+
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, url_col)
+                .as_deref(),
+            Some(url)
+        );
+
+        let screen_col = info.inner_rect.x + url_col + 8;
+        let screen_row = info.inner_rect.y;
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, screen_col, screen_row)));
+        assert!(app.state.hovered_link.as_ref().is_some_and(|hover| hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col, screen_row))));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            screen_col,
+            screen_row,
+        ));
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl { url: opened, .. } => assert_eq!(opened, url),
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn pane_cell_url_resolver_handles_hard_newline_after_full_row() {
         let (_app, info) = app_with_screen_bytes(b"");
         let full_row = "x".repeat(info.inner_rect.width as usize);
@@ -1238,6 +1307,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hovered_plain_url_underlines_full_link_and_clears_on_leave() {
+        let url = "https://example.com/hover";
+        let screen = format!("\x1b[38;2;10;220;120m\x1b[48;2;20;30;40m{url}\x1b[0m elsewhere");
+        let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
+        let before = rendered_buffer(&app);
+        let row = info.inner_rect.y;
+        let col = info.inner_rect.x + 8;
+
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, col, row)));
+        let hover = app.state.hovered_link.as_ref().expect("hovered link");
+        assert_eq!(hover.cells.len(), url.len());
+        assert!(hover.cells.contains(&(info.inner_rect.x, row)));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + url.len() as u16 - 1, row)));
+
+        let after = rendered_buffer(&app);
+        for x in info.inner_rect.x..info.inner_rect.x + url.len() as u16 {
+            assert_eq!(after[(x, row)].style().fg, before[(x, row)].style().fg);
+            assert_eq!(after[(x, row)].style().bg, before[(x, row)].style().bg);
+            assert!(after[(x, row)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED));
+        }
+
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + url.len() as u16,
+            row,
+        )));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_link_refreshes_after_pty_replaces_its_cell() {
+        let url = "https://example.com/hover";
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+
+        app.state.workspaces[0].test_runtimes[&pane_id].test_process_pty_bytes(b"\rnot-a-link");
+        assert!(app.refresh_hovered_link_for_panes(&std::collections::HashSet::from([pane_id])));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_link_clears_when_scrolling() {
+        let url = "https://example.com/hover";
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_wrapped_url_tracks_every_visible_cell() {
+        let (_app, info) = app_with_screen_bytes(b"");
+        let prefix = "https://example.com/";
+        let padding = "a".repeat(info.inner_rect.width as usize - prefix.len());
+        let url = format!("{prefix}{padding}tail");
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        )));
+        let hover = app
+            .state
+            .hovered_link
+            .as_ref()
+            .expect("hovered wrapped link");
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x, info.inner_rect.y)));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + 1, info.inner_rect.y + 1)));
+    }
+
+    #[tokio::test]
     async fn render_stream_does_not_synthesize_hard_newline_plain_url_hyperlinks() {
         let (_app, info) = app_with_screen_bytes(b"");
         let full_row = "x".repeat(info.inner_rect.width as usize);
@@ -1279,6 +1442,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hovered_osc8_link_crosses_only_soft_wrapped_rows() {
+        let uri = "https://example.com/target";
+        let (_app, info) = app_with_screen_bytes(b"");
+        let padding = "x".repeat(info.inner_rect.width as usize - 1);
+        let soft_wrapped = format!(
+            "{padding}\x1b]8;;{uri}\x1b\\a\x1b]8;;\x1b\\\x1b]8;;{uri}\x1b\\b\x1b]8;;\x1b\\"
+        );
+        let (mut app, info) = app_with_screen_bytes(soft_wrapped.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x,
+            info.inner_rect.y + 1,
+        )));
+        let hover = app.state.hovered_link.as_ref().expect("soft-wrapped hover");
+        assert!(hover.cells.contains(&(
+            info.inner_rect.x + info.inner_rect.width - 1,
+            info.inner_rect.y
+        )));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x, info.inner_rect.y + 1)));
+
+        let hard_newline =
+            format!("\x1b]8;;{uri}\x1b\\a\x1b]8;;\x1b\\\r\n\x1b]8;;{uri}\x1b\\b\x1b]8;;\x1b\\");
+        let (mut app, info) = app_with_screen_bytes(hard_newline.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x,
+            info.inner_rect.y + 1,
+        )));
+        assert_eq!(
+            app.state
+                .hovered_link
+                .as_ref()
+                .expect("hard-newline hover")
+                .cells,
+            vec![(info.inner_rect.x, info.inner_rect.y + 1)]
+        );
+    }
+
+    #[tokio::test]
     async fn pane_cell_url_resolver_prefers_osc8_hyperlink() {
         let (app, _info) = app_with_screen_bytes(
             b"\x1b]8;;https://example.com/hidden-target\x1b\\label\x1b]8;;\x1b\\",
@@ -1295,7 +1499,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_osc8_file_url_invokes_plugin_handler_and_suppresses_release() {
+    async fn single_click_osc8_file_url_invokes_plugin_handler_and_suppresses_release() {
         let uri = "file:///tmp/odd%20file.rs?line=12&col=4";
         let screen =
             format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\");
@@ -1326,7 +1530,7 @@ mod tests {
                 MouseEventKind::Down(MouseButton::Left),
                 x,
                 info.inner_rect.y,
-                KeyModifiers::CONTROL,
+                KeyModifiers::empty(),
             ),
         );
         app.handle_mouse_from_input_source(

@@ -623,6 +623,27 @@ impl PaneTerminal {
         self.ghostty.visible_hyperlinks(area)
     }
 
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportHyperlink> {
+        self.ghostty
+            .hyperlink_at_viewport_cell(col, row, width, height)
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportLogicalLine> {
+        self.ghostty
+            .logical_line_at_viewport_row(row, width, height)
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
@@ -2376,6 +2397,37 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportHyperlink> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|mut core| {
+                ghostty_hyperlink_at_viewport_cell(&mut core, col, row, width, height).ok()
+            })
+            .flatten()
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportLogicalLine> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|mut core| {
+                ghostty_logical_line_at_viewport_row(&mut core, row, width, height).ok()
+            })
+            .flatten()
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
@@ -2602,6 +2654,26 @@ fn cursor_state_from_render_state(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewportHyperlink {
+    pub(crate) uri: String,
+    pub(crate) cells: Vec<(u16, u16)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViewportTextCell {
+    pub(crate) byte_index: usize,
+    pub(crate) viewport_col: u16,
+    pub(crate) viewport_row: u16,
+    pub(crate) width: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewportLogicalLine {
+    pub(crate) text: String,
+    pub(crate) cells: Vec<ViewportTextCell>,
+}
+
 type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
 
 fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, area_height: u16) {
@@ -2777,6 +2849,121 @@ fn ghostty_collect_dirty_patch(
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
         rows: patch_rows
     }));
+}
+
+fn ghostty_hyperlink_at_viewport_cell(
+    core: &mut GhosttyPaneCore,
+    col: u16,
+    row: u16,
+    width: u16,
+    height: u16,
+) -> Result<Option<ViewportHyperlink>, crate::ghostty::Error> {
+    let width = width.min(core.terminal.cols()?);
+    let height = height.min(core.terminal.rows()?);
+    if col >= width || row >= height {
+        return Ok(None);
+    }
+    let Some(uri) = core.terminal.viewport_hyperlink_uri(col, row.into())? else {
+        return Ok(None);
+    };
+    let mut first = (col, row);
+    loop {
+        let candidate = if first.0 > 0 {
+            Some((first.0 - 1, first.1))
+        } else if first.1 > 0 && core.terminal.viewport_wrap_state(first.1.into())?.1 {
+            Some((width - 1, first.1 - 1))
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else {
+            break;
+        };
+        if core
+            .terminal
+            .viewport_hyperlink_uri(candidate.0, candidate.1.into())?
+            .as_deref()
+            != Some(uri.as_str())
+        {
+            break;
+        }
+        first = candidate;
+    }
+    let mut cells = Vec::new();
+    let mut current = first;
+    loop {
+        if core
+            .terminal
+            .viewport_hyperlink_uri(current.0, current.1.into())?
+            .as_deref()
+            != Some(uri.as_str())
+        {
+            break;
+        }
+        cells.push(current);
+        let candidate = if current.0.saturating_add(1) < width {
+            Some((current.0 + 1, current.1))
+        } else if current.1.saturating_add(1) < height
+            && core.terminal.viewport_wrap_state(current.1.into())?.0
+        {
+            Some((0, current.1 + 1))
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else {
+            break;
+        };
+        current = candidate;
+    }
+    Ok(Some(ViewportHyperlink { uri, cells }))
+}
+
+fn ghostty_logical_line_at_viewport_row(
+    core: &mut GhosttyPaneCore,
+    row: u16,
+    width: u16,
+    height: u16,
+) -> Result<Option<ViewportLogicalLine>, crate::ghostty::Error> {
+    let width = width.min(core.terminal.cols()?);
+    let height = height.min(core.terminal.rows()?);
+    if width == 0 || row >= height {
+        return Ok(None);
+    }
+    let mut first = row;
+    while first > 0 && core.terminal.viewport_wrap_state(first.into())?.1 {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < height && core.terminal.viewport_wrap_state(last.into())?.0 {
+        last += 1;
+    }
+    let mut text = String::new();
+    let mut cells = Vec::new();
+    for (row_offset, screen_row) in core
+        .terminal
+        .viewport_text_rows_range(first, last.saturating_add(1))?
+        .into_iter()
+        .enumerate()
+    {
+        let viewport_row = first.saturating_add(row_offset as u16);
+        for (viewport_col, cell) in screen_row.cells.into_iter().enumerate() {
+            let width = match cell.wide {
+                crate::ghostty::CellWide::Wide => 2,
+                crate::ghostty::CellWide::Narrow => 1,
+                crate::ghostty::CellWide::SpacerHead | crate::ghostty::CellWide::SpacerTail => {
+                    continue;
+                }
+            };
+            let byte_index = text.len();
+            append_terminal_cell_text(&cell.graphemes, &mut text);
+            cells.push(ViewportTextCell {
+                byte_index,
+                viewport_col: viewport_col as u16,
+                viewport_row,
+                width,
+            });
+        }
+    }
+    Ok(Some(ViewportLogicalLine { text, cells }))
 }
 
 fn ghostty_visible_hyperlinks(

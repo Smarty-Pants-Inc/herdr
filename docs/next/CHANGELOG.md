@@ -49,6 +49,7 @@
 - Bumped the client/server protocol version to 21 for typed live-handoff reconnect signaling and client-local HTTP(S) link opening.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 - Full-app clients attached to the same session now navigate workspaces, tabs, pane focus, focus history, and zoom independently while continuing to share panes, processes, and output.
+- Pane links now open on a plain left click, with the hovered link underlined before opening.
 
 ### Fixed
 - Live handoff now preserves mouse forwarding for running pane applications. (#3000, thanks @xkrogen)
