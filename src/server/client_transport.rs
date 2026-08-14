@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SendError, TrySendError};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -43,11 +43,14 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Maximum encoded mouse report accepted with pixel geometry.
 const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
+/// Maximum reliable control records buffered per client writer.
+const CONTROL_QUEUE_CAPACITY: usize = 64;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
     /// Reliable control messages such as shutdown, notifications, and clipboard writes.
+    /// Capacity is bounded so semantic messages can fail closed for a stalled client.
     pub(crate) control: ClientControlWriter,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: ClientRenderWriter,
@@ -55,7 +58,7 @@ pub(crate) struct ClientWriter {
 
 impl ClientWriter {
     pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
-        self.render.queue.replace_with_cleanup(data);
+        let _ = self.render.queue.replace_with_cleanup(data);
     }
 
     #[cfg(test)]
@@ -144,7 +147,7 @@ impl ClientControlWriter {
         }
     }
 
-    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+    pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         self.queue.send_control(data)
     }
 }
@@ -215,10 +218,13 @@ impl ClientWriterQueue {
         self.ready.notify_one();
     }
 
-    fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
+    fn send_control(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         if !state.writer_alive {
-            return Err(SendError(data));
+            return Err(TrySendError::Disconnected(data));
+        }
+        if state.control.len() >= CONTROL_QUEUE_CAPACITY {
+            return Err(TrySendError::Full(data));
         }
         state.control.push_back(data);
         self.ready.notify_one();
@@ -254,14 +260,19 @@ impl ClientWriterQueue {
         Ok(())
     }
 
-    fn replace_with_cleanup(&self, data: Vec<u8>) {
+    fn replace_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         state.render = None;
         state.ordered.clear();
-        if state.writer_alive {
-            state.control.push_back(data);
-            self.ready.notify_one();
+        if !state.writer_alive {
+            return Err(TrySendError::Disconnected(data));
         }
+        if state.control.len() >= CONTROL_QUEUE_CAPACITY {
+            return Err(TrySendError::Full(data));
+        }
+        state.control.push_back(data);
+        self.ready.notify_one();
+        Ok(())
     }
 
     fn recv(&self) -> Option<ClientWriteItem> {
@@ -316,12 +327,24 @@ pub(crate) enum ServerEvent {
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
         direct_graphics: bool,
+        omp_pane: bool,
+        display_name: Option<String>,
+        frontend_profile_id: Option<String>,
+        renderer_binding_token: Option<String>,
         writer: ClientWriter,
     },
     /// A one-shot system-notification callback selected this target.
     NotificationActivated {
         activation: NotificationActivation,
         respond_to: std::sync::mpsc::Sender<bool>,
+    },
+    /// The client completed one exact local identity persistence request.
+    IdentityPersistenceAck {
+        client_id: u64,
+        request_id: u64,
+        display_name: String,
+        success: bool,
+        error: Option<String>,
     },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
@@ -396,6 +419,67 @@ pub(crate) enum ServerEvent {
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
+    /// A client attached to an OMP logical pane.
+    OmpPaneAttach {
+        client_id: u64,
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        target_app_client_id: Option<u64>,
+        renderer_capabilities: crate::protocol::OmpRendererCapabilities,
+        renderer_request: crate::protocol::OmpRendererRequest,
+    },
+    /// A client detached from one OMP logical pane attachment.
+    OmpPaneDetach {
+        client_id: u64,
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+    },
+    /// A client requested an OMP controller operation or semantic action.
+    OmpControl {
+        client_id: u64,
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        action: crate::protocol::OmpControlAction,
+    },
+    /// An opaque guest-to-host OMP envelope.
+    OmpFrame {
+        client_id: u64,
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        frame: Vec<u8>,
+    },
+    /// A trusted local OMP host became live for one route.
+    OmpHostStarted {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        host_id: u64,
+        outbound: std::sync::mpsc::SyncSender<String>,
+        socket: std::net::TcpStream,
+    },
+    /// A trusted local OMP host emitted one opaque host-to-guest envelope.
+    OmpHostFrame {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        host_id: u64,
+        target_client_id: Option<u64>,
+        frame: Vec<u8>,
+    },
+    /// The trusted local OMP host bridge closed.
+    OmpHostStopped {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        host_id: u64,
+    },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
@@ -567,6 +651,9 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         launch_mode,
+        display_name,
+        frontend_profile_id,
+        renderer_binding_token,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -577,6 +664,9 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            display_name,
+            frontend_profile_id,
+            renderer_binding_token,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -605,9 +695,34 @@ pub(crate) fn handle_client_handshake(
                     return Ok(());
                 }
             };
-
-            // Clamp size.
             let (clamped_cols, clamped_rows) = clamp_terminal_size(cols, rows);
+            if display_name
+                .as_deref()
+                .is_some_and(|name| crate::config::validate_display_name(name).is_err())
+                || frontend_profile_id.as_deref().is_some_and(|profile_id| {
+                    crate::config::validate_frontend_profile_id(profile_id).is_err()
+                })
+                || renderer_binding_token.as_deref().is_some_and(|token| {
+                    crate::config::validate_frontend_profile_id(token).is_err()
+                })
+                || (launch_mode == ClientLaunchMode::OmpPane
+                    && (display_name.is_some()
+                        || frontend_profile_id.is_none()
+                        || renderer_binding_token.is_none()))
+            {
+                let _ = protocol::write_message(
+                    &mut stream,
+                    &ServerMessage::Welcome {
+                        version: PROTOCOL_VERSION,
+                        encoding: RenderEncoding::SemanticFrame,
+                        error: Some("invalid identity handshake metadata".to_owned()),
+                    },
+                );
+                return Ok(());
+            }
+            let display_name = (launch_mode != ClientLaunchMode::OmpPane)
+                .then_some(display_name)
+                .flatten();
             (
                 clamped_cols,
                 clamped_rows,
@@ -616,6 +731,9 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode,
+                display_name,
+                frontend_profile_id,
+                renderer_binding_token,
             )
         }
         _ => {
@@ -643,10 +761,11 @@ pub(crate) fn handle_client_handshake(
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
 
-    let (direct_attach_requested, direct_graphics) = match launch_mode {
-        ClientLaunchMode::App => (false, false),
-        ClientLaunchMode::AppDirectGraphics => (false, true),
-        ClientLaunchMode::TerminalAttach => (true, false),
+    let (direct_attach_requested, direct_graphics, omp_pane) = match launch_mode {
+        ClientLaunchMode::App => (false, false, false),
+        ClientLaunchMode::AppDirectGraphics => (false, true, false),
+        ClientLaunchMode::TerminalAttach => (true, false, false),
+        ClientLaunchMode::OmpPane => (false, false, true),
         ClientLaunchMode::NotificationActivator => {
             let activation = match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
                 Ok(ClientMessage::ActivateNotification { activation }) => activation,
@@ -728,6 +847,10 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        omp_pane,
+        display_name,
+        frontend_profile_id,
+        renderer_binding_token,
         writer,
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
@@ -1030,6 +1153,74 @@ fn client_read_loop(
                     server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
                 break;
             }
+            ClientMessage::OmpPaneAttach {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                target_app_client_id,
+                renderer_capabilities,
+                renderer_request,
+            } => ServerEvent::OmpPaneAttach {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                target_app_client_id,
+                renderer_capabilities,
+                renderer_request,
+            },
+            ClientMessage::OmpPaneDetach {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+            } => ServerEvent::OmpPaneDetach {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+            },
+            ClientMessage::OmpControl {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+                action,
+            } => ServerEvent::OmpControl {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+                action,
+            },
+            ClientMessage::OmpFrame {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+                frame,
+            } => ServerEvent::OmpFrame {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+                frame,
+            },
+            ClientMessage::IdentityPersistenceAck {
+                request_id,
+                display_name,
+                success,
+                error,
+            } => ServerEvent::IdentityPersistenceAck {
+                client_id,
+                request_id,
+                display_name,
+                success,
+                error,
+            },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -1097,6 +1288,42 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn omp_attach_carries_exact_app_client_id_to_server_event() {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("omp-exact-app-target");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let reader_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &reader_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::OmpPaneAttach {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                target_app_client_id: Some(42),
+                renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                    client_local_native: true,
+                },
+                renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "OMP attach event"),
+            ServerEvent::OmpPaneAttach {
+                client_id: 7,
+                target_app_client_id: Some(42),
+                ..
+            }
+        ));
+        drop(client_stream);
+        handle.join().unwrap().unwrap();
+    }
 
     fn bracketed_paste_with_total_len(total_len: usize) -> Vec<u8> {
         const DELIMITER_BYTES: usize = b"\x1b[200~".len() + b"\x1b[201~".len();
@@ -1139,6 +1366,18 @@ mod tests {
         assert!(matches!(
             writer.render.try_send(second),
             Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn client_writer_queue_bounds_control_records() {
+        let (writer, _queue) = test_queue_writer();
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            writer.control.send(vec![b'x']).expect("control fits");
+        }
+        assert!(matches!(
+            writer.control.send(vec![b'y']),
+            Err(TrySendError::Full(data)) if data == vec![b'y']
         ));
     }
 
@@ -1283,7 +1522,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("writer exits after socket write failure");
 
-        assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
+        assert!(matches!(
+            writer.control.send(vec![b'y']),
+            Err(TrySendError::Disconnected(_))
+        ));
         assert!(matches!(
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
@@ -1390,6 +1632,9 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                display_name: None,
+                frontend_profile_id: None,
+                renderer_binding_token: None,
             },
         )
         .expect("write hello");
@@ -1423,6 +1668,10 @@ new_tab = "ctrl+notakey"
                 keybindings,
                 direct_attach_requested,
                 direct_graphics,
+                omp_pane,
+                display_name,
+                frontend_profile_id,
+                renderer_binding_token,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1432,6 +1681,10 @@ new_tab = "ctrl+notakey"
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
                 assert!(!direct_graphics);
+                assert!(!omp_pane);
+                assert!(display_name.is_none());
+                assert!(frontend_profile_id.is_none());
+                assert!(renderer_binding_token.is_none());
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1467,6 +1720,9 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                display_name: None,
+                frontend_profile_id: None,
+                renderer_binding_token: None,
             },
         )
         .expect("write hello");
@@ -1532,6 +1788,9 @@ new_tab = "ctrl+notakey"
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::NotificationActivator,
+                    display_name: None,
+                    frontend_profile_id: None,
+                    renderer_binding_token: None,
                 },
             )
             .expect("write activator hello");
