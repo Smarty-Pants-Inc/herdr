@@ -27,10 +27,11 @@ use self::dialogs::{
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
+pub(crate) use self::menus::findr_scrollback_toggle_rect;
 use self::menus::{
-    render_context_menu, render_copy_mode_overlay, render_global_launcher_menu,
-    render_navigate_overlay, render_prefix_overlay, render_resize_overlay,
-    render_workspace_plugin_overlay,
+    render_context_menu, render_copy_mode_overlay, render_findr_overlay,
+    render_global_launcher_menu, render_navigate_overlay, render_prefix_overlay,
+    render_resize_overlay, render_workspace_plugin_overlay,
 };
 use self::mobile::{
     compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
@@ -396,6 +397,9 @@ fn compute_view_internal(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    if resize_panes {
+        app.reconcile_focus_lifecycle();
+    }
 }
 
 fn compute_mobile_view(
@@ -461,6 +465,9 @@ fn compute_mobile_view(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    if resize_panes {
+        app.reconcile_focus_lifecycle();
+    }
 }
 
 /// Render the UI — reads AppState but does not mutate it.
@@ -535,6 +542,7 @@ pub(crate) fn render_with_runtime_registry_and_identity(
             Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
             Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
             Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
+            Mode::Findr => render_findr_overlay(app, frame, mode_bar_area),
             Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
             Mode::ConfirmClose => {
                 render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)

@@ -269,10 +269,10 @@ impl OmpRouteRegistry {
         let route = self.route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)?;
         route.attachment(client_id, epoch)?;
         route.require_live()?;
+        if route.controller != Some((client_id, epoch)) {
+            return Err(OmpRouteError::ControllerRequired);
+        }
         validate_route_frame(&frame, OmpFrameDirection::GuestToHost)?;
-        // Raw transport frames carry non-mutating collaboration traffic such as
-        // hello and transcript reads. Mutations use the controller-gated
-        // OmpControl path, so observers must be allowed through here.
         Ok(OmpRouteDelivery::HostFrame { client_id, frame })
     }
 
@@ -414,10 +414,8 @@ mod tests {
         let second = routes.attach(20, &key()).unwrap();
         let second_epoch = epoch(&second, 20);
         assert!(matches!(
-            routes
-                .guest_frame(20, &key(), second_epoch, guest(b"hello"))
-                .unwrap(),
-            OmpRouteDelivery::HostFrame { .. }
+            routes.guest_frame(20, &key(), second_epoch, guest(b"hello")),
+            Err(OmpRouteError::ControllerRequired)
         ));
         assert!(matches!(
             routes.control(
