@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -64,6 +64,30 @@ impl OmpFrameDirection {
 pub struct OmpRendererCapabilities {
     /// This client can render through a locally-owned OMP guest.
     pub client_local_native: bool,
+}
+
+/// One live OMP route offered by the server to an App-owned native renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererRoute {
+    pub pane_id: String,
+    pub omp_session_id: String,
+    pub route_generation: u64,
+}
+
+/// Normalized Herdr prefix metadata retained by the App while native rendering is active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererPrefix {
+    pub code: ClientKeyCode,
+    pub modifiers: u8,
+}
+
+impl OmpRendererPrefix {
+    pub(crate) fn key_combo(&self) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
+        (
+            self.code.to_crossterm(),
+            crossterm::event::KeyModifiers::from_bits_truncate(self.modifiers),
+        )
+    }
 }
 
 /// Renderer policy requested by an OMP pane attachment.
@@ -348,7 +372,6 @@ pub enum ClientKeySource {
 }
 
 impl ClientKeyKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::KeyEventKind) -> Self {
         match kind {
             crossterm::event::KeyEventKind::Press => Self::Press,
@@ -367,7 +390,6 @@ impl ClientKeyKind {
 }
 
 impl ClientKeyCode {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(code: crossterm::event::KeyCode) -> Option<Self> {
         use crossterm::event::KeyCode;
         Some(match code {
@@ -419,7 +441,6 @@ impl ClientKeyCode {
 }
 
 impl ClientMouseButton {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(button: crossterm::event::MouseButton) -> Self {
         match button {
             crossterm::event::MouseButton::Left => Self::Left,
@@ -438,7 +459,6 @@ impl ClientMouseButton {
 }
 
 impl ClientMouseKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::MouseEventKind) -> Option<Self> {
         use crossterm::event::MouseEventKind;
         Some(match kind {
@@ -566,6 +586,8 @@ pub enum ClientMessage {
         frontend_profile_id: Option<String>,
         /// High-entropy capability for binding a client-local renderer to its owning App.
         renderer_binding_token: Option<String>,
+        /// Presentation-only capabilities of this connection's App surface.
+        renderer_capabilities: OmpRendererCapabilities,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -670,6 +692,8 @@ pub enum ClientMessage {
         renderer_capabilities: OmpRendererCapabilities,
         /// Explicit renderer policy for this attachment.
         renderer_request: OmpRendererRequest,
+        /// Server-issued launch identity for exact native sideband acceptance.
+        renderer_launch_id: Option<u64>,
     },
 
     /// Detaches this server-assigned connection from an OMP logical pane.
@@ -704,6 +728,8 @@ pub enum ClientMessage {
         attachment_epoch: u64,
         frame: Vec<u8>,
     },
+    /// The App displayed the first frame for this exact client-local renderer launch.
+    OmpRendererReady { launch_id: u64 },
 }
 
 /// Herdr-owned controller operations; payload bytes remain owned by OMP.
@@ -1064,6 +1090,19 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+
+    /// Server-owned native renderer target for exactly one App connection.
+    OmpRendererTarget {
+        launch_id: u64,
+        target_app_client_id: u64,
+        /// `None` stops the current launch without offering a replacement.
+        route: Option<OmpRendererRoute>,
+        /// True only after the exact launch sideband has attached.
+        bound: bool,
+        /// True only while the bound route owns the App's full surface.
+        surface_active: bool,
+        prefix: OmpRendererPrefix,
+    },
 }
 
 /// Host liveness plus the currently assigned OMP controller, if any.
@@ -1351,34 +1390,107 @@ mod tests {
     // ---- Round-trip: ClientMessage ----
 
     #[test]
-    fn client_message_omp_tags_are_appended() {
+    fn omp_wire_tags_are_appended() {
+        fn tag<T: Serialize>(message: &T) -> u8 {
+            bincode::serde::encode_to_vec(message, bincode::config::standard()).unwrap()[0]
+        }
+
         assert_eq!(
-            bincode::serde::encode_to_vec(
-                &ClientMessage::OmpPaneAttach {
-                    pane_id: "pane".into(),
-                    omp_session_id: "session".into(),
-                    route_generation: 1,
-                    target_app_client_id: Some(42),
-                    renderer_capabilities: OmpRendererCapabilities::default(),
-                    renderer_request: OmpRendererRequest::Independent,
-                },
-                bincode::config::standard(),
-            )
-            .unwrap()[0],
+            tag(&ClientMessage::OmpPaneAttach {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                target_app_client_id: Some(42),
+                renderer_capabilities: OmpRendererCapabilities::default(),
+                renderer_request: OmpRendererRequest::Independent,
+                renderer_launch_id: Some(9),
+            }),
             14
         );
         assert_eq!(
-            bincode::serde::encode_to_vec(
-                &ClientMessage::OmpPaneDetach {
-                    pane_id: "pane".into(),
-                    omp_session_id: "session".into(),
-                    route_generation: 1,
-                    attachment_epoch: 2,
-                },
-                bincode::config::standard(),
-            )
-            .unwrap()[0],
+            tag(&ClientMessage::OmpPaneDetach {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+            }),
             15
+        );
+        assert_eq!(
+            tag(&ClientMessage::IdentityPersistenceAck {
+                request_id: 1,
+                display_name: "Ada".into(),
+                success: true,
+                error: None,
+            }),
+            16
+        );
+        assert_eq!(
+            tag(&ClientMessage::OmpControl {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+                action: OmpControlAction::RequestController,
+            }),
+            17
+        );
+        assert_eq!(
+            tag(&ClientMessage::OmpFrame {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+                frame: Vec::new(),
+            }),
+            18
+        );
+        assert_eq!(tag(&ClientMessage::OmpRendererReady { launch_id: 9 }), 19);
+        assert_eq!(
+            tag(&ServerMessage::OmpPane {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+                renderer_mode: OmpRendererMode::ClientLocalNative,
+                controller: true,
+                state: OmpPaneState::Live {
+                    controller_client_id: Some(42),
+                },
+            }),
+            19
+        );
+        assert_eq!(
+            tag(&ServerMessage::OmpFrame {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+                frame: Vec::new(),
+            }),
+            20
+        );
+        assert_eq!(
+            tag(&ServerMessage::OmpError {
+                pane_id: "pane".into(),
+                code: "unknown_route".into(),
+                message: "unknown_route".into(),
+            }),
+            21
+        );
+        assert_eq!(
+            tag(&ServerMessage::OmpRendererTarget {
+                launch_id: 9,
+                target_app_client_id: 42,
+                route: None,
+                bound: false,
+                surface_active: false,
+                prefix: OmpRendererPrefix {
+                    code: ClientKeyCode::Char('b'),
+                    modifiers: 0,
+                },
+            }),
+            22
         );
     }
 
@@ -1511,11 +1623,46 @@ mod tests {
             display_name: None,
             frontend_profile_id: None,
             renderer_binding_token: None,
+            renderer_capabilities: OmpRendererCapabilities {
+                client_local_native: true,
+            },
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn omp_renderer_target_roundtrip() {
+        let target = ServerMessage::OmpRendererTarget {
+            launch_id: 9,
+            target_app_client_id: 42,
+            route: Some(OmpRendererRoute {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 3,
+            }),
+            bound: true,
+            surface_active: true,
+            prefix: OmpRendererPrefix {
+                code: ClientKeyCode::Char('b'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+            },
+        };
+        let encoded = bincode::serde::encode_to_vec(&target, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(target, decoded);
+    }
+
+    #[test]
+    fn omp_renderer_ready_roundtrip() {
+        let ready = ClientMessage::OmpRendererReady { launch_id: 9 };
+        let encoded = bincode::serde::encode_to_vec(&ready, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(ready, decoded);
     }
 
     #[test]
@@ -1534,8 +1681,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_23_hello_separates_display_profile_and_renderer_binding() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_25_hello_carries_app_renderer_capability() {
+        assert_eq!(PROTOCOL_VERSION, 25);
         let profile = "a".repeat(43);
         let app = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
@@ -1549,6 +1696,9 @@ mod tests {
             display_name: Some("Alice".into()),
             frontend_profile_id: Some(profile.clone()),
             renderer_binding_token: None,
+            renderer_capabilities: OmpRendererCapabilities {
+                client_local_native: true,
+            },
         };
         let pane = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
@@ -1562,6 +1712,7 @@ mod tests {
             display_name: None,
             frontend_profile_id: Some(profile),
             renderer_binding_token: None,
+            renderer_capabilities: OmpRendererCapabilities::default(),
         };
 
         for message in [app, pane] {
@@ -1606,6 +1757,7 @@ mod tests {
                 display_name: None,
                 frontend_profile_id: None,
                 renderer_binding_token: None,
+                renderer_capabilities: OmpRendererCapabilities::default(),
             }),
             0
         );
@@ -2230,6 +2382,7 @@ mod tests {
             display_name: None,
             frontend_profile_id: None,
             renderer_binding_token: None,
+            renderer_capabilities: OmpRendererCapabilities::default(),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2307,6 +2460,7 @@ mod tests {
                     display_name: None,
                     frontend_profile_id: None,
                     renderer_binding_token: None,
+                    renderer_capabilities: OmpRendererCapabilities::default(),
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2746,6 +2900,7 @@ mod tests {
             display_name: None,
             frontend_profile_id: None,
             renderer_binding_token: None,
+            renderer_capabilities: OmpRendererCapabilities::default(),
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2785,6 +2940,7 @@ mod tests {
                 display_name: None,
                 frontend_profile_id: None,
                 renderer_binding_token: None,
+                renderer_capabilities: OmpRendererCapabilities::default(),
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),
