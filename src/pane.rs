@@ -80,10 +80,53 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("COLORTERM", PANE_COLORTERM);
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct OmpBridgeEnv {
+    address: String,
+    secret: [u8; 32],
+}
+
+impl std::fmt::Debug for OmpBridgeEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OmpBridgeEnv")
+            .field("address", &self.address)
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+impl OmpBridgeEnv {
+    pub(crate) fn generate(address: String) -> std::io::Result<Self> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret).map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Self { address, secret })
+    }
+
+    pub(crate) fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub(crate) fn token(&self, pane_id: &str) -> String {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let mut digest = sha2::Sha256::new();
+        digest.update(self.secret);
+        digest.update(pane_id.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
+    }
+
+    pub(crate) fn validates(&self, pane_id: &str, token: &str) -> bool {
+        self.token(pane_id) == token
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
     identity: PaneLaunchIdentity,
+    omp_bridge: Option<OmpBridgeEnv>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,7 +150,13 @@ impl PaneLaunchEnv {
         Self {
             extra,
             identity: PaneLaunchIdentity::Inherit,
+            omp_bridge: None,
         }
+    }
+
+    pub(crate) fn with_omp_bridge(mut self, omp_bridge: Option<OmpBridgeEnv>) -> Self {
+        self.omp_bridge = omp_bridge;
+        self
     }
 
     pub(crate) fn with_identity(
@@ -146,8 +195,8 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
-    match &launch_env.identity {
-        PaneLaunchIdentity::Inherit => {}
+    let pane_id = match &launch_env.identity {
+        PaneLaunchIdentity::Inherit => None,
         PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
@@ -156,6 +205,7 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
             cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
             cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+            Some(pane_id.as_str())
         }
         PaneLaunchIdentity::WorkspaceManaged {
             workspace_id,
@@ -164,10 +214,16 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
             cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
             cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+            Some(pane_id.as_str())
         }
         PaneLaunchIdentity::OmitPane => {
             cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+            None
         }
+    };
+    if let (Some(bridge), Some(pane_id)) = (&launch_env.omp_bridge, pane_id) {
+        cmd.env("HERDR_OMP_BRIDGE", bridge.address());
+        cmd.env("HERDR_OMP_BRIDGE_TOKEN", bridge.token(pane_id));
     }
 }
 
@@ -3136,6 +3192,29 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    #[test]
+    fn omp_bridge_token_is_scoped_to_managed_pane_identity() {
+        let bridge = OmpBridgeEnv::generate("127.0.0.1:12345".into()).unwrap();
+        let launch = PaneLaunchEnv::default()
+            .with_omp_bridge(Some(bridge.clone()))
+            .with_identity("w1".into(), "w1:t1".into(), "w1:p1".into());
+        let mut cmd = CommandBuilder::new("shell");
+
+        apply_pane_launch_env(&mut cmd, &launch);
+
+        assert_eq!(
+            cmd.get_env("HERDR_OMP_BRIDGE")
+                .and_then(std::ffi::OsStr::to_str),
+            Some("127.0.0.1:12345")
+        );
+        let token = cmd
+            .get_env("HERDR_OMP_BRIDGE_TOKEN")
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap();
+        assert!(bridge.validates("w1:p1", token));
+        assert!(!bridge.validates("w1:p2", token));
     }
 
     #[tokio::test]
