@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
+
+/// Maximum UTF-8 bytes in a public OMP route identifier.
+pub const MAX_OMP_ROUTE_ID_BYTES: usize = 256;
 
 /// Maximum allowed server-to-client frame payload when Kitty graphics are enabled.
 /// Normal traffic keeps `MAX_FRAME_SIZE`; this larger cap is only for explicit
@@ -29,6 +32,192 @@ pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// Length of the u32 little-endian length prefix in bytes.
 const LENGTH_PREFIX_BYTES: usize = 4;
+
+/// OMP's logical transport envelope header: version, direction, and u32 payload length.
+pub const OMP_FRAME_HEADER_SIZE: usize = 6;
+
+/// Largest opaque OMP payload that fits the 2 MiB Herdr transport frame after
+/// fixed OMP envelope and bincode message metadata headroom.
+pub const MAX_OMP_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 1024;
+
+/// The only OMP envelope version accepted by this POC route.
+pub const OMP_TRANSPORT_VERSION: u8 = 1;
+
+/// Direction marker in an opaque OMP transport envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmpFrameDirection {
+    HostToGuest = 1,
+    GuestToHost = 2,
+}
+
+impl OmpFrameDirection {
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Independent renderer capabilities available for one OMP pane attachment.
+///
+/// These are presentation capabilities only: they do not identify a client or
+/// grant controller authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererCapabilities {
+    /// This client can render through a locally-owned OMP guest.
+    pub client_local_native: bool,
+}
+
+/// Renderer policy requested by an OMP pane attachment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmpRendererRequest {
+    /// Select only an independent renderer.
+    #[default]
+    Independent,
+    /// Use the shared host PTY only when explicitly requested.
+    LegacySharedHostPty,
+}
+
+/// Renderer selected for exactly one OMP pane attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmpRendererMode {
+    ClientLocalNative,
+    ServerPrivateGuestPty,
+    LegacySharedHostPty,
+}
+
+/// The requested attachment has no usable independent renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmpRendererSelectionError {
+    NoIndependentRenderer,
+}
+
+impl std::fmt::Display for OmpRendererSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no independent OMP renderer is available")
+    }
+}
+
+impl std::error::Error for OmpRendererSelectionError {}
+
+/// Select a renderer from client capability plus server-owned availability.
+///
+/// Client-local native rendering wins; legacy shared-host rendering is only
+/// selected when neither independent renderer is available.
+pub const fn select_omp_renderer(
+    request: OmpRendererRequest,
+    client_capabilities: OmpRendererCapabilities,
+    server_private_guest_pty: bool,
+) -> Result<OmpRendererMode, OmpRendererSelectionError> {
+    match (
+        request,
+        client_capabilities.client_local_native,
+        server_private_guest_pty,
+    ) {
+        (_, true, _) => Ok(OmpRendererMode::ClientLocalNative),
+        (_, false, true) => Ok(OmpRendererMode::ServerPrivateGuestPty),
+        (OmpRendererRequest::LegacySharedHostPty, false, false) => {
+            Ok(OmpRendererMode::LegacySharedHostPty)
+        }
+        (OmpRendererRequest::Independent, false, false) => {
+            Err(OmpRendererSelectionError::NoIndependentRenderer)
+        }
+    }
+}
+
+/// Error returned while validating an OMP transport envelope without inspecting its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OmpFrameError {
+    Oversized {
+        size: usize,
+        max: usize,
+    },
+    Truncated {
+        size: usize,
+    },
+    UnknownVersion {
+        version: u8,
+    },
+    WrongDirection {
+        expected: OmpFrameDirection,
+        actual: u8,
+    },
+    LengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for OmpFrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oversized { size, max } => write!(f, "OMP frame size {size} exceeds {max}"),
+            Self::Truncated { size } => write!(f, "OMP frame size {size} is shorter than header"),
+            Self::UnknownVersion { version } => {
+                write!(f, "unknown OMP transport version {version}")
+            }
+            Self::WrongDirection { expected, actual } => {
+                write!(f, "OMP frame direction {actual} is not {}", expected.byte())
+            }
+            Self::LengthMismatch { declared, actual } => {
+                write!(f, "OMP payload length {declared} does not match {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OmpFrameError {}
+
+/// Builds an opaque OMP transport envelope. The payload is never decoded by Herdr.
+pub fn encode_omp_frame(
+    direction: OmpFrameDirection,
+    payload: &[u8],
+) -> Result<Vec<u8>, OmpFrameError> {
+    if payload.len() > MAX_OMP_FRAME_PAYLOAD {
+        return Err(OmpFrameError::Oversized {
+            size: payload.len(),
+            max: MAX_OMP_FRAME_PAYLOAD,
+        });
+    }
+    let mut frame = Vec::with_capacity(OMP_FRAME_HEADER_SIZE + payload.len());
+    frame.push(OMP_TRANSPORT_VERSION);
+    frame.push(direction.byte());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Validates an OMP transport envelope and returns its opaque payload bytes.
+pub fn validate_omp_frame(
+    frame: &[u8],
+    expected_direction: OmpFrameDirection,
+) -> Result<&[u8], OmpFrameError> {
+    if frame.len() > OMP_FRAME_HEADER_SIZE + MAX_OMP_FRAME_PAYLOAD {
+        return Err(OmpFrameError::Oversized {
+            size: frame.len(),
+            max: OMP_FRAME_HEADER_SIZE + MAX_OMP_FRAME_PAYLOAD,
+        });
+    }
+    if frame.len() < OMP_FRAME_HEADER_SIZE {
+        return Err(OmpFrameError::Truncated { size: frame.len() });
+    }
+    if frame[0] != OMP_TRANSPORT_VERSION {
+        return Err(OmpFrameError::UnknownVersion { version: frame[0] });
+    }
+    if frame[1] != expected_direction.byte() {
+        return Err(OmpFrameError::WrongDirection {
+            expected: expected_direction,
+            actual: frame[1],
+        });
+    }
+    let declared = u32::from_le_bytes([frame[2], frame[3], frame[4], frame[5]]) as usize;
+    let payload = &frame[OMP_FRAME_HEADER_SIZE..];
+    if declared != payload.len() {
+        return Err(OmpFrameError::LengthMismatch {
+            declared,
+            actual: payload.len(),
+        });
+    }
+    Ok(payload)
+}
 
 // ---------------------------------------------------------------------------
 // Client → Server messages
@@ -63,6 +252,8 @@ pub enum ClientLaunchMode {
     TerminalAttach,
     /// One-shot connection used to activate a notification target.
     NotificationActivator,
+    /// Hidden OMP sideband bridge client. It never renders or drives terminal state.
+    OmpPane,
 }
 
 /// Target selected when a system notification activates a remote client.
@@ -369,6 +560,12 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Untrusted display-only identity. OMP sideband clients always omit this.
+        display_name: Option<String>,
+        /// Opaque client-local profile correlation ID. Never an authority credential.
+        frontend_profile_id: Option<String>,
+        /// High-entropy capability for binding a client-local renderer to its owning App.
+        renderer_binding_token: Option<String>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -462,6 +659,62 @@ pub enum ClientMessage {
 
     /// Activate the target carried by a system-notification callback.
     ActivateNotification { activation: NotificationActivation },
+    /// Attaches this server-assigned connection to an OMP logical pane.
+    OmpPaneAttach {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        /// Exact live App connection to bind. The renderer token remains the authority proof.
+        target_app_client_id: Option<u64>,
+        /// Presentation capabilities reported for this attachment.
+        renderer_capabilities: OmpRendererCapabilities,
+        /// Explicit renderer policy for this attachment.
+        renderer_request: OmpRendererRequest,
+    },
+
+    /// Detaches this server-assigned connection from an OMP logical pane.
+    OmpPaneDetach {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+    },
+    /// Client-local identity persistence completed. The acknowledgement must echo the exact request and value.
+    IdentityPersistenceAck {
+        request_id: u64,
+        display_name: String,
+        success: bool,
+        error: Option<String>,
+    },
+
+    /// Requests a Herdr-owned OMP controller transition or semantic action.
+    OmpControl {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        action: OmpControlAction,
+    },
+
+    /// Sends one opaque guest-to-host OMP transport envelope.
+    OmpFrame {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        frame: Vec<u8>,
+    },
+}
+
+/// Herdr-owned controller operations; payload bytes remain owned by OMP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmpControlAction {
+    RequestController,
+    ReleaseController,
+    /// An opaque mutating OMP transport envelope; controller-gated by the route.
+    Mutation {
+        frame: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,6 +935,11 @@ pub enum ServerMessage {
         /// The client should exit with a clear error message.
         error: Option<String>,
     },
+    /// Ask exactly one client to atomically persist a display-only identity.
+    PersistIdentity {
+        request_id: u64,
+        display_name: String,
+    },
 
     /// A rendered frame to be displayed by a semantic-frame client.
     Frame(FrameData),
@@ -779,6 +1037,41 @@ pub enum ServerMessage {
     OpenUrl { url: String },
     /// Result sent only after a notification activation was processed.
     NotificationActivationProcessed { activated: bool },
+    /// Lifecycle and controller state for an OMP logical pane.
+    OmpPane {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        /// Renderer selected for this attachment alone.
+        renderer_mode: OmpRendererMode,
+        controller: bool,
+        state: OmpPaneState,
+    },
+
+    /// One opaque OMP transport envelope from the host.
+    OmpFrame {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+        frame: Vec<u8>,
+    },
+
+    /// A bounded, deterministic OMP route rejection.
+    OmpError {
+        pane_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+/// Host liveness plus the currently assigned OMP controller, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmpPaneState {
+    Starting { controller_client_id: Option<u64> },
+    Live { controller_client_id: Option<u64> },
+    Failed { controller_client_id: Option<u64> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1351,153 @@ mod tests {
     // ---- Round-trip: ClientMessage ----
 
     #[test]
+    fn client_message_omp_tags_are_appended() {
+        assert_eq!(
+            bincode::serde::encode_to_vec(
+                &ClientMessage::OmpPaneAttach {
+                    pane_id: "pane".into(),
+                    omp_session_id: "session".into(),
+                    route_generation: 1,
+                    target_app_client_id: Some(42),
+                    renderer_capabilities: OmpRendererCapabilities::default(),
+                    renderer_request: OmpRendererRequest::Independent,
+                },
+                bincode::config::standard(),
+            )
+            .unwrap()[0],
+            14
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(
+                &ClientMessage::OmpPaneDetach {
+                    pane_id: "pane".into(),
+                    omp_session_id: "session".into(),
+                    route_generation: 1,
+                    attachment_epoch: 2,
+                },
+                bincode::config::standard(),
+            )
+            .unwrap()[0],
+            15
+        );
+    }
+
+    #[test]
+    fn omp_messages_roundtrip() {
+        let client = ClientMessage::OmpFrame {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 2,
+            frame: encode_omp_frame(OmpFrameDirection::GuestToHost, b"opaque").unwrap(),
+        };
+        let server = ServerMessage::OmpPane {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 2,
+            renderer_mode: OmpRendererMode::ClientLocalNative,
+            controller: true,
+            state: OmpPaneState::Live {
+                controller_client_id: Some(7),
+            },
+        };
+        let encoded = bincode::serde::encode_to_vec(&client, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(client, decoded);
+        let encoded = bincode::serde::encode_to_vec(&server, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(server, decoded);
+    }
+
+    #[test]
+    fn omp_frame_limit_leaves_transport_metadata_headroom() {
+        let payload = vec![b' '; MAX_OMP_FRAME_PAYLOAD];
+        let frame = encode_omp_frame(OmpFrameDirection::GuestToHost, &payload).unwrap();
+        assert_eq!(
+            validate_omp_frame(&frame, OmpFrameDirection::GuestToHost).unwrap(),
+            payload
+        );
+        let message = ClientMessage::OmpFrame {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 2,
+            frame,
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        assert!(encoded.len() <= MAX_FRAME_SIZE);
+
+        let oversized = vec![b' '; MAX_OMP_FRAME_PAYLOAD + 1];
+        assert!(matches!(
+            encode_omp_frame(OmpFrameDirection::GuestToHost, &oversized),
+            Err(OmpFrameError::Oversized { .. })
+        ));
+    }
+
+    #[test]
+    fn omp_renderer_selection_prefers_native_then_private_without_identity_inputs() {
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::Independent,
+                OmpRendererCapabilities {
+                    client_local_native: true,
+                },
+                true,
+            ),
+            Ok(OmpRendererMode::ClientLocalNative),
+        );
+
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::Independent,
+                OmpRendererCapabilities {
+                    client_local_native: false,
+                },
+                true,
+            ),
+            Ok(OmpRendererMode::ServerPrivateGuestPty),
+        );
+
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::Independent,
+                OmpRendererCapabilities::default(),
+                false,
+            ),
+            Err(OmpRendererSelectionError::NoIndependentRenderer),
+        );
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::LegacySharedHostPty,
+                OmpRendererCapabilities::default(),
+                false,
+            ),
+            Ok(OmpRendererMode::LegacySharedHostPty),
+        );
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::LegacySharedHostPty,
+                OmpRendererCapabilities {
+                    client_local_native: true,
+                },
+                false,
+            ),
+            Ok(OmpRendererMode::ClientLocalNative),
+        );
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::LegacySharedHostPty,
+                OmpRendererCapabilities::default(),
+                true,
+            ),
+            Ok(OmpRendererMode::ServerPrivateGuestPty),
+        );
+    }
+
+    #[test]
     fn client_hello_roundtrip() {
         let msg = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
@@ -1068,6 +1508,9 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1088,6 +1531,46 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn protocol_23_hello_separates_display_profile_and_renderer_binding() {
+        assert_eq!(PROTOCOL_VERSION, 23);
+        let profile = "a".repeat(43);
+        let app = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            display_name: Some("Alice".into()),
+            frontend_profile_id: Some(profile.clone()),
+            renderer_binding_token: None,
+        };
+        let pane = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::OmpPane,
+            display_name: None,
+            frontend_profile_id: Some(profile),
+            renderer_binding_token: None,
+        };
+
+        for message in [app, pane] {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            let (decoded, _): (ClientMessage, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(decoded, message);
+        }
     }
 
     #[test]
@@ -1120,6 +1603,9 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                display_name: None,
+                frontend_profile_id: None,
+                renderer_binding_token: None,
             }),
             0
         );
@@ -1741,6 +2227,9 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1815,6 +2304,9 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    display_name: None,
+                    frontend_profile_id: None,
+                    renderer_binding_token: None,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -2251,6 +2743,9 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2287,6 +2782,9 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                display_name: None,
+                frontend_profile_id: None,
+                renderer_binding_token: None,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),
