@@ -43,7 +43,9 @@ use self::agent_detection::{
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
-    TerminalTextPoint, TerminalWordMotion,
+    TerminalTextPoint, TerminalTextSearchChunk, TerminalTextSearchChunkStatus,
+    TerminalTextSearchSnapshot, TerminalWordMotion, TERMINAL_TEXT_SEARCH_MAX_CELLS,
+    TERMINAL_TEXT_SEARCH_MAX_MATCHES, TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS,
 };
 pub use self::{
     state::PaneState,
@@ -2758,6 +2760,25 @@ impl PaneRuntime {
         self.terminal.search_text_matches(query, case_sensitive)
     }
 
+    pub(crate) fn search_text_matches_reverse_chunk(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        end_row_exclusive: u32,
+        max_cells: usize,
+        max_matches: usize,
+        expected_snapshot: Option<crate::pane::TerminalTextSearchSnapshot>,
+    ) -> crate::pane::TerminalTextSearchChunk {
+        self.terminal.search_text_matches_reverse_chunk(
+            query,
+            case_sensitive,
+            end_row_exclusive,
+            max_cells,
+            max_matches,
+            expected_snapshot,
+        )
+    }
+
     pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
         self.terminal.text_match_is_current(text_match)
     }
@@ -2782,9 +2803,6 @@ impl PaneRuntime {
         #[cfg(test)]
         AGGREGATE_INPUT_STATE_READS.set(AGGREGATE_INPUT_STATE_READS.get() + 1);
         self.terminal.input_state()
-    }
-    pub fn alternate_screen(&self) -> Option<bool> {
-        self.terminal.alternate_screen()
     }
 
     pub fn alternate_screen_active(&self) -> bool {

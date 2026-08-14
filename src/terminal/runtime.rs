@@ -291,6 +291,25 @@ impl TerminalRuntime {
         self.0.search_text_matches(query, case_sensitive)
     }
 
+    pub(crate) fn search_text_matches_reverse_chunk(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        end_row_exclusive: u32,
+        max_cells: usize,
+        max_matches: usize,
+        expected_snapshot: Option<crate::pane::TerminalTextSearchSnapshot>,
+    ) -> crate::pane::TerminalTextSearchChunk {
+        self.0.search_text_matches_reverse_chunk(
+            query,
+            case_sensitive,
+            end_row_exclusive,
+            max_cells,
+            max_matches,
+            expected_snapshot,
+        )
+    }
+
     pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
         self.0.text_match_is_current(text_match)
     }
@@ -318,9 +337,6 @@ impl TerminalRuntime {
     /// when only one terminal fact is needed.
     pub fn input_state(&self) -> Option<crate::pane::InputState> {
         self.0.input_state()
-    }
-    pub fn alternate_screen(&self) -> Option<bool> {
-        self.0.alternate_screen()
     }
 
     /// Reads only whether the alternate screen is active.
