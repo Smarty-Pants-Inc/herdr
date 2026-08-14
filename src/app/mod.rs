@@ -143,6 +143,7 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
+    pub(crate) findr_scan_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) detached_process_children: Vec<std::process::Child>,
@@ -228,6 +229,7 @@ pub(crate) struct TerminalInputTarget {
 pub(crate) enum TerminalInputContext {
     Pane,
     Popup(crate::terminal::TerminalId),
+    Findr(crate::layout::PaneId),
 }
 
 pub(crate) type InputSourceId = u64;
@@ -605,6 +607,7 @@ impl App {
             keybind_help: state::KeybindHelpState::default(),
             navigator: state::NavigatorState::default(),
             copy_mode: None,
+            findr: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -810,6 +813,7 @@ impl App {
             window_title_template: None,
             selection_autoscroll_deadline: None,
             selection_highlight_clear_deadline: None,
+            findr_scan_deadline: None,
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
             last_presentation_at: None,
@@ -1148,6 +1152,7 @@ impl App {
                             area,
                         );
                     }
+                    self.refresh_findr_visible_if_needed(&render_request.pty_sources);
                     crate::ui::render_with_runtime_registry(
                         &self.state,
                         &self.terminal_runtimes,
@@ -1680,6 +1685,11 @@ impl App {
     pub(crate) fn terminal_input_context(&self) -> Option<TerminalInputContext> {
         if let Some(popup) = &self.state.popup_pane {
             Some(TerminalInputContext::Popup(popup.terminal_id.clone()))
+        } else if self.state.mode == Mode::Findr {
+            self.state
+                .findr
+                .as_ref()
+                .map(|findr| TerminalInputContext::Findr(findr.pane_id))
         } else if self.state.mode == Mode::Terminal {
             Some(TerminalInputContext::Pane)
         } else {
@@ -1756,9 +1766,13 @@ impl App {
                     ) {
                         break;
                     }
-                    if let Some(target) =
+                    let target = if matches!(context, TerminalInputContext::Findr(_)) {
+                        self.handle_findr_key(key.clone());
+                        None
+                    } else {
                         self.handle_terminal_key_headless_from(source_id, key.clone())
-                    {
+                    };
+                    if let Some(target) = target {
                         if tracked {
                             self.input_leases.insert_forwarded(
                                 lease_key,
@@ -1813,6 +1827,7 @@ impl App {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn route_client_events(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
@@ -1842,7 +1857,13 @@ impl App {
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
                             let initial_context = self.terminal_input_context();
-                            let target = if initial_context.is_some() {
+                            let target = if matches!(
+                                initial_context,
+                                Some(TerminalInputContext::Findr(_))
+                            ) {
+                                self.handle_findr_key(key.clone());
+                                None
+                            } else if initial_context.is_some() {
                                 self.handle_terminal_key_headless_from(source_id, key.clone())
                             } else {
                                 self.handle_non_terminal_key_headless(key.clone());
@@ -1979,6 +2000,9 @@ impl App {
             }
             Mode::Copy => {
                 self.handle_copy_mode_key(key);
+            }
+            Mode::Findr => {
+                self.handle_findr_key(key);
             }
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 self.handle_rename_key_via_api(key_event);
