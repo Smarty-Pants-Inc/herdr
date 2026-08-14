@@ -844,6 +844,7 @@ pub enum Mode {
     Prefix,
     Copy,
     Terminal,
+    Findr,
     RenameWorkspace,
     RenameTab,
     RenamePane,
@@ -1018,6 +1019,60 @@ pub(crate) struct CopyModeSearchState {
     pub matches: Vec<crate::pane::TerminalTextMatch>,
     pub current: Option<usize>,
     pub geometry: Option<(u16, u16)>,
+}
+
+pub(crate) const FINDR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(24);
+pub(crate) use crate::pane::{
+    TERMINAL_TEXT_SEARCH_MAX_CELLS as FINDR_SCAN_MAX_CELLS,
+    TERMINAL_TEXT_SEARCH_MAX_MATCHES as FINDR_MAX_MATCHES,
+    TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS as FINDR_MAX_QUERY_CHARS,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FindrState {
+    pub pane_id: PaneId,
+    pub query: String,
+    pub scrollback: bool,
+    pub matches: Vec<crate::pane::TerminalTextMatch>,
+    pub visible_range: Option<(u32, u32)>,
+    pub visible_geometry: Option<(u16, u16)>,
+    pub scan_snapshot: Option<crate::pane::TerminalTextSearchSnapshot>,
+    pub scan_start_row: u32,
+    pub scan_end_row_exclusive: u32,
+    pub complete: bool,
+    pub budget_limited: bool,
+    pub capped: bool,
+}
+
+impl FindrState {
+    pub(crate) fn new(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            query: String::new(),
+            scrollback: false,
+            matches: Vec::new(),
+            visible_range: None,
+            visible_geometry: None,
+            scan_snapshot: None,
+            scan_start_row: 0,
+            scan_end_row_exclusive: 0,
+            complete: true,
+            budget_limited: false,
+            capped: false,
+        }
+    }
+
+    pub(crate) fn reset_scan(&mut self) {
+        self.matches.clear();
+        self.visible_range = None;
+        self.visible_geometry = None;
+        self.scan_snapshot = None;
+        self.scan_start_row = 0;
+        self.scan_end_row_exclusive = 0;
+        self.complete = self.query.is_empty();
+        self.budget_limited = false;
+        self.capped = false;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1441,6 +1496,7 @@ pub struct AppState {
     pub navigator: NavigatorState,
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
+    pub findr: Option<FindrState>,
     pub agent_panel_scroll: usize,
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
@@ -1826,6 +1882,7 @@ impl AppState {
             keybind_help: KeybindHelpState::default(),
             navigator: NavigatorState::default(),
             copy_mode: None,
+            findr: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -2026,6 +2083,10 @@ impl AppState {
                 "empty app state must not keep copy mode"
             );
             assert!(
+                self.findr.is_none(),
+                "empty app state must not keep Findr state"
+            );
+            assert!(
                 self.rename_pane_target.is_none(),
                 "empty app state must not keep rename pane target"
             );
@@ -2168,6 +2229,32 @@ impl AppState {
         }
         if let Some(focus) = &self.previous_pane_focus {
             assert_workspace_pane(&focus.workspace_id, focus.pane_id, "previous pane focus");
+        }
+        if let Some(findr) = &self.findr {
+            assert!(
+                pane_ids.contains(&findr.pane_id)
+                    || self
+                        .workspace_plugin_panes
+                        .values()
+                        .any(|pane| pane.pane_id == findr.pane_id),
+                "Findr references missing pane {:?}",
+                findr.pane_id
+            );
+            assert_eq!(self.mode, Mode::Findr, "Findr state requires Findr mode");
+            assert_eq!(
+                self.active
+                    .and_then(|ws_idx| self.focused_terminal_pane_id(ws_idx)),
+                Some(findr.pane_id),
+                "Findr must target the effective focused terminal pane"
+            );
+            assert!(
+                findr.query.chars().count() <= FINDR_MAX_QUERY_CHARS,
+                "Findr query exceeds limit"
+            );
+            assert!(
+                findr.matches.len() <= FINDR_MAX_MATCHES,
+                "Findr match limit exceeded"
+            );
         }
         if let Some(toast) = &self.toast {
             if let Some(target) = &toast.target {

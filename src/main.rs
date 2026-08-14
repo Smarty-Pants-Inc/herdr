@@ -175,7 +175,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # alt+..., cmd/super, and punctuation-with-modifiers may depend on your terminal/tmux setup.
 # prefix = "ctrl+b"
 
-# Prefix-mode actions
+# Prefix-mode actions (Findr is the direct terminal-mode exception below)
 # help = "prefix+?"
 # settings = "prefix+s"
 # detach = "prefix+q"
@@ -206,6 +206,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_tab = "prefix+shift+x"
 # rename_pane = "prefix+shift+p"
 # edit_scrollback = "prefix+e"
+# Direct terminal-mode action: macOS default; ctrl+alt+f elsewhere
+# findr = "cmd+f"
 # focus_pane_left = "prefix+h"
 # focus_pane_down = "prefix+j"
 # focus_pane_up = "prefix+k"
