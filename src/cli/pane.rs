@@ -1710,7 +1710,13 @@ mod tests {
     #[test]
     fn parse_pane_split_args_rejects_workspace_with_pane_selector() {
         assert!(parse_pane_split_args(
-            &args(&["issue-1", "--workspace", "workspace-1", "--direction", "right"]),
+            &args(&[
+                "issue-1",
+                "--workspace",
+                "workspace-1",
+                "--direction",
+                "right"
+            ]),
             None,
         )
         .is_err());

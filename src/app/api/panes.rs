@@ -108,8 +108,7 @@ impl App {
             );
         }
         if params.focus {
-            self.state
-                .focus_pane_in_workspace(ws_idx, new_pane.pane_id);
+            self.state.focus_pane_in_workspace(ws_idx, new_pane.pane_id);
             self.state.settle_terminal_mode_after_focus();
         }
         self.terminal_runtimes
