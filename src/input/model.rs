@@ -145,14 +145,12 @@ impl TerminalKey {
         self
     }
 
-    #[cfg(any(windows, test))]
     pub(crate) fn vt_bytes(&self) -> Option<&[u8]> {
         match &self.source {
             KeySource::Vt { bytes } => Some(bytes),
             KeySource::Synthesized | KeySource::WindowsConsole { .. } => None,
         }
     }
-
     #[cfg(any(windows, test))]
     pub(crate) fn windows_record(&self) -> Option<WindowsKeyRecord> {
         match self.source {

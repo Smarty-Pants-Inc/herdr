@@ -32,6 +32,16 @@ pub(crate) enum DeferredRender {
     None,
     Full,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OmpRendererTargetState {
+    pub(crate) launch_id: u64,
+    pub(crate) route: Option<crate::protocol::OmpRendererRoute>,
+    pub(crate) bound: bool,
+    pub(crate) ready: bool,
+    pub(crate) prefix: crate::protocol::OmpRendererPrefix,
+    pub(crate) surface_active: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublicPaneFocusTarget {
     workspace_id: String,
@@ -621,6 +631,10 @@ pub(crate) struct ClientConnection {
     pub(crate) frontend_profile_id: Option<String>,
     /// Client-local high-entropy capability used only for native renderer binding.
     pub(crate) renderer_binding_token: Option<String>,
+    /// Presentation-only native renderer capability advertised by this App.
+    pub(crate) omp_renderer_capabilities: crate::protocol::OmpRendererCapabilities,
+    /// Last server-authoritative native renderer target sent to this App.
+    pub(crate) omp_renderer_target: Option<OmpRendererTargetState>,
     /// App-only display identity and local editor state.
     pub(crate) identity: Option<AppIdentity>,
     /// Standalone server-owned OMP guest PTY scoped to this App connection.
@@ -680,6 +694,8 @@ impl ClientConnection {
             frontend_profile_id,
             renderer_binding_token,
             identity,
+            omp_renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
+            omp_renderer_target: None,
             private_omp_guest: None,
             terminal_size,
             cell_size,
