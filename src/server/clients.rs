@@ -618,6 +618,8 @@ pub(crate) struct ClientConnection {
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
     /// Opaque client-local correlation identifier; never used for authority.
+    #[allow(dead_code)]
+    // Retained as a non-authoritative correlation value from the handshake.
     pub(crate) frontend_profile_id: Option<String>,
     /// Client-local high-entropy capability used only for native renderer binding.
     pub(crate) renderer_binding_token: Option<String>,
@@ -655,6 +657,7 @@ impl ClientConnection {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the validated client handshake without an intermediate bag.
     pub(crate) fn new_with_mode(
         mode: ClientConnectionMode,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,

@@ -7,7 +7,7 @@ mod support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -261,7 +261,7 @@ fn app_dir_name() -> &'static str {
     }
 }
 
-fn write_test_identity(config_home: &PathBuf) {
+fn write_test_identity(config_home: &Path) {
     let config_dir = config_home.join(app_dir_name());
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(

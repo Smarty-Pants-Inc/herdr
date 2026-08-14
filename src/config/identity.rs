@@ -96,11 +96,10 @@ pub fn validate_display_name(value: &str) -> Result<(), IdentityError> {
 fn is_disallowed_name_char(ch: char) -> bool {
     matches!(ch, '[' | ']')
         || ch.is_control()
-        || match ch as u32 {
-            0x061c | 0x2028 | 0x2029 | 0xfeff => true,
-            0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2069 => true,
-            _ => false,
-        }
+        || matches!(
+            ch as u32,
+            0x061c | 0x2028 | 0x2029 | 0xfeff | 0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2069
+        )
 }
 
 pub fn validate_frontend_profile_id(value: &str) -> Result<(), IdentityError> {

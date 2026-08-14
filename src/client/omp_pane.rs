@@ -637,9 +637,11 @@ mod tests {
     fn cleanup_frames_wait_for_inflight_guest_frame() {
         use parking_lot::{Condvar, Mutex};
 
+        type BlockingState = (Mutex<(Vec<u8>, bool, bool)>, Condvar);
+
         #[derive(Clone)]
         struct BlockingWriter {
-            state: Arc<(Mutex<(Vec<u8>, bool, bool)>, Condvar)>,
+            state: Arc<BlockingState>,
         }
 
         impl std::io::Write for BlockingWriter {

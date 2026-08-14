@@ -1276,16 +1276,15 @@ fn confirm_running_server_update_action(
         };
     }
 
-    if options.automatic {
-        if plans
+    if options.automatic
+        && plans
             .iter()
             .any(|plan| !server_supports_live_handoff(&plan.server))
-        {
-            return Err(
-                "automatic update requires live handoff support from every running Herdr server; run `herdr update` manually"
-                    .to_string(),
-            );
-        }
+    {
+        return Err(
+            "automatic update requires live handoff support from every running Herdr server; run `herdr update` manually"
+                .to_string(),
+        );
     }
 
     print_running_session_update_summary(&plans, release, options);

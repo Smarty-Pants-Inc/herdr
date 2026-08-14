@@ -208,10 +208,7 @@ fn spawn_host(
             }
             return;
         }
-        loop {
-            let Ok(read) = read_record(&mut reader, &mut line) else {
-                break;
-            };
+        while let Ok(read) = read_record(&mut reader, &mut line) {
             if read == 0 {
                 break;
             }

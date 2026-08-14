@@ -15,11 +15,14 @@ use crate::server::clients::ClientConnection;
 use crate::server::omp_bridge;
 use crate::server::omp_route::{OmpRouteDelivery, OmpRouteError, OmpRouteKey, OmpRouteRegistry};
 
+type OmpHostKey = (String, String, u64);
+type OmpHost = (u64, SyncSender<String>, TcpStream);
+
 pub(crate) struct OmpService {
     listener: TcpListener,
     bridge: crate::pane::OmpBridgeEnv,
     handshakes: omp_bridge::HandshakeLimiter,
-    hosts: HashMap<(String, String, u64), (u64, SyncSender<String>, TcpStream)>,
+    hosts: HashMap<OmpHostKey, OmpHost>,
     renderer_modes: HashMap<u64, OmpRendererMode>,
     bound_apps: HashMap<u64, u64>,
     route_bindings: HashMap<u64, OmpRouteKey>,
