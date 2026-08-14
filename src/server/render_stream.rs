@@ -9,6 +9,25 @@ use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
 use crate::terminal::TerminalRuntimeRegistry;
 
+pub(crate) fn identity_ui_state(
+    identity: Option<&crate::server::clients::AppIdentity>,
+) -> crate::ui::IdentityUiState {
+    let Some(identity) = identity else {
+        return crate::ui::IdentityUiState::default();
+    };
+    crate::ui::IdentityUiState {
+        committed_name: identity
+            .committed
+            .as_ref()
+            .map(|committed| committed.name.clone()),
+        editor_open: identity.editor.open,
+        draft: identity.editor.draft.clone(),
+        cursor: identity.editor.cursor,
+        saving: identity.pending.is_some(),
+        error: identity.editor.error.clone(),
+    }
+}
+
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
@@ -308,6 +327,24 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    render_virtual_with_runtime_registry_and_identity(
+        app_state,
+        terminal_runtimes,
+        area,
+        resize_panes,
+        cell_size,
+        &crate::ui::IdentityUiState::default(),
+    )
+}
+
+pub(crate) fn render_virtual_with_runtime_registry_and_identity(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    identity: &crate::ui::IdentityUiState,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let popup_visible = app_state.popup_pane.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
@@ -325,12 +362,19 @@ pub(crate) fn render_virtual_with_runtime_registry(
 
     terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            crate::ui::render_with_runtime_registry_and_identity(
+                app_state,
+                terminal_runtimes,
+                frame,
+                identity,
+            );
         })
         .expect("render to TestBackend should never fail");
 
     let buffer = terminal.backend().buffer().clone();
-    let cursor = if popup_visible {
+    let cursor = if identity.editor_open {
+        terminal.backend().rendered_cursor()
+    } else if popup_visible {
         popup_terminal_cursor(app_state, terminal_runtimes)
     } else if suppress_focused_terminal_cursor {
         None

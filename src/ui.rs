@@ -23,7 +23,7 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
+    render_confirm_close_overlay, render_identity_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
@@ -58,7 +58,7 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 #[cfg(test)]
 pub(crate) use self::sidebar::workspace_drop_indicator_row;
-use self::sidebar::{render_sidebar, render_sidebar_collapsed};
+use self::sidebar::{identity_header_rect, render_sidebar_collapsed, render_sidebar_with_identity};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
@@ -69,7 +69,8 @@ pub(crate) use self::tab_surface::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect, identity_modal_button_rects,
+        identity_modal_inner_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -106,6 +107,17 @@ pub(crate) use self::{
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
+
+/// Immutable per-client identity data projected into the shared UI render.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdentityUiState {
+    pub(crate) committed_name: Option<String>,
+    pub(crate) editor_open: bool,
+    pub(crate) draft: String,
+    pub(crate) cursor: usize,
+    pub(crate) saving: bool,
+    pub(crate) error: Option<String>,
+}
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
@@ -463,10 +475,24 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
+    render_with_runtime_registry_and_identity(
+        app,
+        terminal_runtimes,
+        frame,
+        &IdentityUiState::default(),
+    );
+}
+
+pub(crate) fn render_with_runtime_registry_and_identity(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    identity: &IdentityUiState,
+) {
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    render_navigation_chrome(app, terminal_runtimes, frame);
+    render_navigation_chrome(app, terminal_runtimes, frame, identity);
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
@@ -494,60 +520,84 @@ pub fn render_with_runtime_registry(
         terminal_area
     };
 
-    match app.mode {
-        Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
-        Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
-        Mode::ProductAnnouncement => render_product_announcement_overlay(app, frame, frame.area()),
-        Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
-            render_mobile_panel(app, terminal_runtimes, frame, frame.area())
+    if identity.editor_open {
+        render_identity_overlay(app, frame, frame.area(), identity);
+    } else {
+        match app.mode {
+            Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
+            Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
+            Mode::ProductAnnouncement => {
+                render_product_announcement_overlay(app, frame, frame.area())
+            }
+            Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
+                render_mobile_panel(app, terminal_runtimes, frame, frame.area())
+            }
+            Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
+            Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
+            Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
+            Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
+            Mode::ConfirmClose => {
+                render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
+            }
+            Mode::ContextMenu => {
+                render_context_menu(app, frame);
+            }
+            Mode::Settings => render_settings_overlay(app, frame, frame.area()),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                render_rename_overlay(app, frame, frame.area())
+            }
+            Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
+            Mode::OpenExistingWorktree => {
+                render_open_existing_worktree_overlay(app, frame, frame.area())
+            }
+            Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
+            Mode::GlobalMenu => render_global_launcher_menu(app, frame),
+            Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
+            Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+            Mode::Terminal if app.focused_workspace_plugin_pane().is_some() => {
+                let outer = app.view.workspace_plugin_pane_outer;
+                let width = outer
+                    .x
+                    .saturating_add(outer.width)
+                    .saturating_sub(mode_bar_area.x);
+                render_workspace_plugin_overlay(
+                    app,
+                    frame,
+                    Rect::new(
+                        mode_bar_area.x,
+                        mode_bar_area.y,
+                        width,
+                        mode_bar_area.height,
+                    ),
+                )
+            }
+            Mode::Terminal => {}
         }
-        Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
-        Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
-        Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
-        Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
-        Mode::ConfirmClose => {
-            render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
-        }
-        Mode::ContextMenu => {
-            render_context_menu(app, frame);
-        }
-        Mode::Settings => render_settings_overlay(app, frame, frame.area()),
-        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-            render_rename_overlay(app, frame, frame.area())
-        }
-        Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
-        Mode::OpenExistingWorktree => {
-            render_open_existing_worktree_overlay(app, frame, frame.area())
-        }
-        Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
-        Mode::GlobalMenu => render_global_launcher_menu(app, frame),
-        Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
-        Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
-        Mode::Terminal if app.focused_workspace_plugin_pane().is_some() => {
-            let outer = app.view.workspace_plugin_pane_outer;
-            let width = outer
-                .x
-                .saturating_add(outer.width)
-                .saturating_sub(mode_bar_area.x);
-            render_workspace_plugin_overlay(
-                app,
-                frame,
-                Rect::new(
-                    mode_bar_area.x,
-                    mode_bar_area.y,
-                    width,
-                    mode_bar_area.height,
-                ),
-            )
-        }
-        Mode::Terminal => {}
     }
+}
+
+pub(crate) fn identity_name_hit_rect(
+    app: &AppState,
+    client_area: Rect,
+    identity: &IdentityUiState,
+) -> Rect {
+    if is_mobile_width(client_area, app.mobile_width_threshold) || app.sidebar_collapsed {
+        return Rect::default();
+    }
+    let sidebar_width = app
+        .sidebar_width
+        .clamp(app.sidebar_min_width, app.sidebar_max_width);
+    let [sidebar, _] = Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(1)])
+        .areas(client_area);
+    let (spaces, _) = expanded_sidebar_sections(sidebar, app.sidebar_section_split);
+    identity_header_rect(spaces, identity)
 }
 
 fn render_navigation_chrome(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
+    identity: &IdentityUiState,
 ) {
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
@@ -555,7 +605,13 @@ fn render_navigation_chrome(
         if app.sidebar_collapsed {
             render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
         } else {
-            render_sidebar(app, terminal_runtimes, frame, app.view.sidebar_rect);
+            render_sidebar_with_identity(
+                app,
+                terminal_runtimes,
+                frame,
+                app.view.sidebar_rect,
+                identity,
+            );
         }
     }
 }
@@ -1725,5 +1781,120 @@ switch_workspace = "ctrl+1..9"
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
         assert_eq!(app.view.workspace_plugin_pane_inner.y, 0);
         assert_eq!(app.view.workspace_plugin_pane_inner.height, 19);
+    }
+    #[test]
+    fn identity_name_hit_rect_uses_client_area_not_shared_view() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mobile_width_threshold = 60;
+        app.sidebar_width = 26;
+        app.sidebar_min_width = 18;
+        app.sidebar_max_width = 36;
+        app.view.layout = ViewLayout::Mobile;
+        app.view.sidebar_rect = Rect::default();
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..IdentityUiState::default()
+        };
+
+        let hit = identity_name_hit_rect(&app, Rect::new(0, 0, 100, 24), &identity);
+        assert_eq!(hit, Rect::new(20, 0, 5, 1));
+        assert_eq!(
+            identity_name_hit_rect(&app, Rect::new(0, 0, 40, 24), &identity),
+            Rect::default()
+        );
+    }
+
+    #[test]
+    fn identity_name_hit_rect_disappears_when_sidebar_is_collapsed_or_name_is_unset() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mobile_width_threshold = 60;
+        let area = Rect::new(0, 0, 100, 24);
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..IdentityUiState::default()
+        };
+
+        app.sidebar_collapsed = true;
+        assert_eq!(
+            identity_name_hit_rect(&app, area, &identity),
+            Rect::default()
+        );
+        app.sidebar_collapsed = false;
+        assert_eq!(
+            identity_name_hit_rect(&app, area, &IdentityUiState::default()),
+            Rect::default()
+        );
+    }
+    #[test]
+    fn identity_editor_renders_client_draft_and_modal_actions() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        let area = Rect::new(0, 0, 80, 20);
+        compute_view(&mut app, area);
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            editor_open: true,
+            draft: "alice two".into(),
+            cursor: 5,
+            saving: false,
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_identity(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    &identity,
+                )
+            })
+            .unwrap();
+        let screen = (0..area.height)
+            .map(|row| buffer_row_text(terminal.backend().buffer(), area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("display name"), "{screen}");
+        assert!(screen.contains("labels your shared prompts"), "{screen}");
+        assert!(screen.contains("alice two"), "{screen}");
+        assert!(screen.contains("↵ save"), "{screen}");
+        assert!(screen.contains("esc cancel"), "{screen}");
+    }
+
+    #[test]
+    fn first_launch_identity_modal_omits_cancel_and_shows_saving_state() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        let area = Rect::new(0, 0, 80, 20);
+        compute_view(&mut app, area);
+        let identity = IdentityUiState {
+            committed_name: None,
+            editor_open: true,
+            draft: "alice".into(),
+            cursor: 5,
+            saving: true,
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_identity(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    &identity,
+                )
+            })
+            .unwrap();
+        let screen = (0..area.height)
+            .map(|row| buffer_row_text(terminal.backend().buffer(), area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("saving…"), "{screen}");
+        assert!(!screen.contains("esc cancel"), "{screen}");
     }
 }

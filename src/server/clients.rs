@@ -8,8 +8,14 @@ use crate::server::render_stream::ClientRenderState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClientConnectionMode {
     App,
-    TerminalAttach { terminal_id: String },
-    TerminalObserve { terminal_id: String },
+    TerminalAttach {
+        terminal_id: String,
+    },
+    TerminalObserve {
+        terminal_id: String,
+    },
+    /// OMP sideband bridge. Deliberately excluded from terminal/UI ownership.
+    OmpPane,
 }
 
 pub(crate) type RenderTarget = (
@@ -387,6 +393,182 @@ fn valid_workspace_plugin_pane(
     .then(|| pane_id.clone())
 }
 
+/// A committed display-only identity snapshot for one App connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommittedIdentity {
+    pub(crate) name: String,
+    pub(crate) revision: u64,
+}
+
+/// The exact client-local persistence request currently awaiting an acknowledgement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingIdentityPersistence {
+    pub(crate) request_id: u64,
+    pub(crate) name: String,
+}
+
+/// Client-local persistence work requested by this server connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdentityPersistenceRequest {
+    pub(crate) request_id: u64,
+    pub(crate) display_name: String,
+}
+
+/// Native identity editor state, isolated to one App connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdentityEditor {
+    pub(crate) open: bool,
+    pub(crate) draft: String,
+    /// Cursor position measured in Unicode scalar values.
+    pub(crate) cursor: usize,
+    pub(crate) error: Option<String>,
+}
+
+/// Per-App identity state. It is attribution only, never an authority token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppIdentity {
+    pub(crate) committed: Option<CommittedIdentity>,
+    pub(crate) editor: IdentityEditor,
+    pub(crate) pending: Option<PendingIdentityPersistence>,
+}
+
+impl AppIdentity {
+    pub(crate) fn new(committed_name: Option<String>) -> Self {
+        let draft = committed_name.clone().unwrap_or_default();
+        let cursor = draft.chars().count();
+        Self {
+            committed: committed_name.map(|name| CommittedIdentity { name, revision: 1 }),
+            editor: IdentityEditor {
+                open: false,
+                draft,
+                cursor,
+                error: None,
+            },
+            pending: None,
+        }
+    }
+
+    pub(crate) fn open_editor(&mut self) {
+        if !self.editor.open {
+            self.editor.draft = self
+                .committed
+                .as_ref()
+                .map_or_else(String::new, |identity| identity.name.clone());
+            self.editor.cursor = self.editor.draft.chars().count();
+            self.editor.error = None;
+            self.editor.open = true;
+        }
+    }
+
+    pub(crate) fn cancel_editor(&mut self) {
+        if self.pending.is_none() {
+            self.editor.open = false;
+            self.editor.error = None;
+        }
+    }
+
+    pub(crate) fn insert_editor_text(&mut self, text: &str) {
+        let offset = scalar_byte_offset(&self.editor.draft, self.editor.cursor);
+        self.editor.draft.insert_str(offset, text);
+        self.editor.cursor += text.chars().count();
+        self.editor.error = None;
+    }
+
+    pub(crate) fn backspace_editor(&mut self) {
+        if self.editor.cursor > 0 {
+            let end = scalar_byte_offset(&self.editor.draft, self.editor.cursor);
+            let start = scalar_byte_offset(&self.editor.draft, self.editor.cursor - 1);
+            self.editor.draft.replace_range(start..end, "");
+            self.editor.cursor -= 1;
+            self.editor.error = None;
+        }
+    }
+
+    pub(crate) fn delete_editor(&mut self) {
+        let count = self.editor.draft.chars().count();
+        if self.editor.cursor < count {
+            let start = scalar_byte_offset(&self.editor.draft, self.editor.cursor);
+            let end = scalar_byte_offset(&self.editor.draft, self.editor.cursor + 1);
+            self.editor.draft.replace_range(start..end, "");
+            self.editor.error = None;
+        }
+    }
+
+    pub(crate) fn move_editor_left(&mut self) {
+        self.editor.cursor = self.editor.cursor.saturating_sub(1);
+    }
+    pub(crate) fn move_editor_right(&mut self) {
+        self.editor.cursor = (self.editor.cursor + 1).min(self.editor.draft.chars().count());
+    }
+    pub(crate) fn move_editor_home(&mut self) {
+        self.editor.cursor = 0;
+    }
+    pub(crate) fn move_editor_end(&mut self) {
+        self.editor.cursor = self.editor.draft.chars().count();
+    }
+
+    /// Begins only one exact local persistence operation; current attribution remains committed.
+    pub(crate) fn begin_save(&mut self, request_id: u64) -> Option<IdentityPersistenceRequest> {
+        if self.pending.is_some() {
+            return None;
+        }
+        if let Err(error) = crate::config::validate_display_name(&self.editor.draft) {
+            self.editor.error = Some(error.to_string());
+            return None;
+        }
+        let name = self.editor.draft.clone();
+        self.pending = Some(PendingIdentityPersistence {
+            request_id,
+            name: name.clone(),
+        });
+        Some(IdentityPersistenceRequest {
+            request_id,
+            display_name: name,
+        })
+    }
+
+    /// Applies only an acknowledgement for the currently pending request and exact value.
+    pub(crate) fn apply_persistence_ack(
+        &mut self,
+        request_id: u64,
+        display_name: &str,
+        result: Result<(), String>,
+    ) -> bool {
+        let Some(pending) = self.pending.as_ref() else {
+            return false;
+        };
+        if pending.request_id != request_id || pending.name != display_name {
+            return false;
+        }
+        self.pending = None;
+        match result {
+            Ok(()) => {
+                let revision = self
+                    .committed
+                    .as_ref()
+                    .map_or(1, |identity| identity.revision + 1);
+                self.committed = Some(CommittedIdentity {
+                    name: display_name.to_owned(),
+                    revision,
+                });
+                self.editor.draft = display_name.to_owned();
+                self.editor.cursor = self.editor.draft.chars().count();
+                self.editor.error = None;
+                self.editor.open = false;
+            }
+            Err(error) => self.editor.error = Some(error),
+        }
+        true
+    }
+}
+
+fn scalar_byte_offset(value: &str, scalar_offset: usize) -> usize {
+    value
+        .char_indices()
+        .nth(scalar_offset)
+        .map_or(value.len(), |(offset, _)| offset)
+}
+
 /// A connected client tracked by the server.
 pub(crate) struct ClientConnection {
     /// Whether this connection is the full app client or a direct terminal attach.
@@ -435,6 +617,14 @@ pub(crate) struct ClientConnection {
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
+    /// Opaque client-local correlation identifier; never used for authority.
+    pub(crate) frontend_profile_id: Option<String>,
+    /// Client-local high-entropy capability used only for native renderer binding.
+    pub(crate) renderer_binding_token: Option<String>,
+    /// App-only display identity and local editor state.
+    pub(crate) identity: Option<AppIdentity>,
+    /// Standalone server-owned OMP guest PTY scoped to this App connection.
+    pub(crate) private_omp_guest: Option<crate::server::omp_private_renderer::PrivateOmpGuest>,
 }
 
 impl ClientConnection {
@@ -451,6 +641,9 @@ impl ClientConnection {
         Self::new_with_mode(
             ClientConnectionMode::App,
             None,
+            None,
+            None,
+            None,
             terminal_size,
             cell_size,
             host_terminal_theme,
@@ -465,6 +658,9 @@ impl ClientConnection {
     pub(crate) fn new_with_mode(
         mode: ClientConnectionMode,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
+        display_name: Option<String>,
+        frontend_profile_id: Option<String>,
+        renderer_binding_token: Option<String>,
         terminal_size: (u16, u16),
         cell_size: crate::kitty_graphics::HostCellSize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
@@ -474,11 +670,17 @@ impl ClientConnection {
         pending_terminal_attach: bool,
         writer: Option<ClientWriter>,
     ) -> Self {
+        let identity =
+            matches!(mode, ClientConnectionMode::App).then(|| AppIdentity::new(display_name));
         Self {
             mode,
             pending_terminal_attach,
             navigation: None,
             keybindings,
+            frontend_profile_id,
+            renderer_binding_token,
+            identity,
+            private_omp_guest: None,
             terminal_size,
             cell_size,
             host_terminal_appearance: host_terminal_theme
@@ -501,6 +703,9 @@ impl ClientConnection {
             staged_clipboard_files: Vec::new(),
             writer,
         }
+    }
+    pub(crate) fn committed_identity(&self) -> Option<&CommittedIdentity> {
+        self.identity.as_ref()?.committed.as_ref()
     }
 
     pub(crate) fn request_repaint(&mut self) {
@@ -772,5 +977,124 @@ mod navigation_tests {
             .active_tab_by_workspace
             .keys()
             .all(|workspace_id| workspace_id.as_str() == state.workspaces[0].id.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_persistence_ack_commits_only_the_exact_pending_request_and_value() {
+        let mut identity = AppIdentity::new(Some("Ada".into()));
+        identity.open_editor();
+        identity.editor.draft = "Grace".into();
+        let request = identity
+            .begin_save(7)
+            .expect("valid name starts persistence");
+        assert_eq!(request.display_name, "Grace");
+        assert_eq!(
+            identity.committed.as_ref().map(|name| name.name.as_str()),
+            Some("Ada")
+        );
+
+        assert!(!identity.apply_persistence_ack(8, "Grace", Ok(())));
+        assert!(!identity.apply_persistence_ack(7, "Ada", Ok(())));
+        assert_eq!(
+            identity.committed.as_ref().map(|name| name.name.as_str()),
+            Some("Ada")
+        );
+        assert_eq!(
+            identity.pending.as_ref().map(|pending| pending.request_id),
+            Some(7)
+        );
+
+        assert!(identity.apply_persistence_ack(7, "Grace", Err("disk full".into())));
+        assert_eq!(
+            identity.committed.as_ref().map(|name| name.name.as_str()),
+            Some("Ada")
+        );
+        assert!(identity.pending.is_none());
+        assert_eq!(identity.editor.error.as_deref(), Some("disk full"));
+
+        let retry = identity
+            .begin_save(9)
+            .expect("failed persistence can retry");
+        assert_eq!(retry.display_name, "Grace");
+        assert!(identity.apply_persistence_ack(9, "Grace", Ok(())));
+        assert_eq!(
+            identity.committed,
+            Some(CommittedIdentity {
+                name: "Grace".into(),
+                revision: 2
+            })
+        );
+        assert!(!identity.editor.open);
+    }
+
+    #[test]
+    fn identities_keep_editor_drafts_and_modals_per_client() {
+        let mut first = AppIdentity::new(Some("Ada".into()));
+        let second = AppIdentity::new(Some("Grace".into()));
+        first.open_editor();
+        first.editor.draft = "Lin".into();
+
+        assert!(first.editor.open);
+        assert_eq!(first.editor.draft, "Lin");
+        assert!(!second.editor.open);
+        assert_eq!(second.editor.draft, "Grace");
+        assert_eq!(
+            second.committed.as_ref().map(|name| name.name.as_str()),
+            Some("Grace")
+        );
+    }
+
+    #[test]
+    fn app_connections_keep_same_named_identities_and_profiles_independent() {
+        let theme = crate::terminal_theme::TerminalTheme::default();
+        let first = ClientConnection::new_with_mode(
+            ClientConnectionMode::App,
+            None,
+            Some("Ada".into()),
+            Some("profile-one".into()),
+            Some("binding-one".into()),
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            theme,
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            false,
+            None,
+        );
+        let second = ClientConnection::new_with_mode(
+            ClientConnectionMode::App,
+            None,
+            Some("Ada".into()),
+            Some("profile-two".into()),
+            Some("binding-two".into()),
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            theme,
+            None,
+            2,
+            RenderEncoding::SemanticFrame,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            first
+                .committed_identity()
+                .map(|identity| identity.name.as_str()),
+            Some("Ada")
+        );
+        assert_eq!(
+            second
+                .committed_identity()
+                .map(|identity| identity.name.as_str()),
+            Some("Ada")
+        );
+        assert_ne!(first.frontend_profile_id, second.frontend_profile_id);
     }
 }
