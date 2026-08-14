@@ -1702,6 +1702,22 @@ impl HeadlessServer {
         canonical
     }
 
+    fn sync_findr_scan_deadline_after_projection(&mut self) {
+        let incomplete = self
+            .app
+            .state
+            .findr
+            .as_ref()
+            .is_some_and(|findr| !findr.complete);
+        if incomplete {
+            if self.app.findr_scan_deadline.is_none() {
+                self.app.findr_scan_deadline = Some(Instant::now());
+            }
+        } else {
+            self.app.findr_scan_deadline = None;
+        }
+    }
+
     fn apply_client_navigation(
         &mut self,
         client_id: u64,
@@ -1720,6 +1736,7 @@ impl HeadlessServer {
             .unwrap_or(canonical)
             .reconciled(&self.app.state, canonical);
         let applied = navigation.apply_to(&mut self.app.state);
+        self.sync_findr_scan_deadline_after_projection();
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.navigation = Some(applied);
         }
@@ -1737,6 +1754,7 @@ impl HeadlessServer {
             .and_then(|client| client.navigation.clone())
             .unwrap_or_else(|| canonical.clone());
         let applied = navigation.apply_to(&mut self.app.state);
+        self.sync_findr_scan_deadline_after_projection();
         if let Some(client) = self
             .foreground_client_id
             .and_then(|client_id| self.clients.get_mut(&client_id))
@@ -3485,13 +3503,22 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };
-        match client.navigation.as_ref() {
-            Some(navigation) => {
-                navigation.focused_workspace_plugin_pane.is_none()
-                    && self.app.state.mode == app::Mode::Terminal
-            }
-            None => self.app.state.mode == app::Mode::Terminal,
-        }
+        let mode = client
+            .navigation
+            .as_ref()
+            .map_or(self.app.state.mode, |navigation| {
+                if navigation.findr.is_some() {
+                    app::Mode::Findr
+                } else {
+                    navigation.non_findr_mode.unwrap_or(self.app.state.mode)
+                }
+            });
+        client
+            .navigation
+            .as_ref()
+            .is_none_or(|navigation| navigation.focused_workspace_plugin_pane.is_none())
+            && mode == app::Mode::Terminal
+            && self.app.state.popup_pane.is_none()
     }
 
     fn client_has_ready_native_renderer(&self, client_id: u64) -> bool {
@@ -3951,6 +3978,9 @@ impl HeadlessServer {
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
+        if !self.client_omp_surface_active(client_id) {
+            return (events, false);
+        }
         let Some(info) = self.independent_omp_pane_info(client_id) else {
             return (events, false);
         };
@@ -4007,6 +4037,9 @@ impl HeadlessServer {
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
+        if !self.client_omp_surface_active(client_id) {
+            return (events, false);
+        }
         let Some(info) = self.private_omp_pane_info(client_id) else {
             return (events, false);
         };
@@ -4608,20 +4641,36 @@ impl HeadlessServer {
                     return false;
                 };
                 self.compute_client_navigation_view(client_id);
+                let omp_surface_active = self.client_omp_surface_active(client_id);
                 let host = crate::input::mouse::HostPixels { x, y, geometry };
-                if self
-                    .native_bound_omp_pane_info(client_id)
-                    .is_some_and(|info| info.inner_rect.contains(cell_position.into()))
+                if omp_surface_active
+                    && self
+                        .native_bound_omp_pane_info(client_id)
+                        .is_some_and(|info| info.inner_rect.contains(cell_position.into()))
                 {
                     self.finish_client_navigation_scope(client_id, canonical);
                     return false;
                 }
-                if self.route_private_omp_pixel_input(client_id, &data, host, cell_position) {
+                if omp_surface_active
+                    && self.route_private_omp_pixel_input(client_id, &data, host, cell_position)
+                {
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.request_semantic_redraw_after_input();
                     }
                     self.finish_client_navigation_scope(client_id, canonical);
                     return true;
+                }
+                if !omp_surface_active {
+                    self.finish_client_navigation_scope(client_id, canonical);
+                    let Some(report) = crate::input::mouse::report_at_cell(
+                        &data,
+                        cell_position.0,
+                        cell_position.1,
+                    ) else {
+                        return false;
+                    };
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&report);
+                    return self.handle_client_input_events(client_id, events);
                 }
                 if !self.focused_pane_graphics_demand() {
                     self.finish_client_navigation_scope(client_id, canonical);
@@ -6051,6 +6100,7 @@ impl HeadlessServer {
             if is_app_client {
                 self.apply_client_navigation(client_id, &canonical_navigation);
             }
+            let mut findr_changed = false;
             let mut frame = match mode {
                 ClientConnectionMode::OmpPane => continue,
                 ClientConnectionMode::App => {
@@ -6082,9 +6132,7 @@ impl HeadlessServer {
                             area,
                         );
                     }
-                    if is_foreground {
-                        self.app.refresh_findr_visible_if_needed(&HashSet::new());
-                    }
+                    findr_changed = self.app.refresh_findr_visible_if_needed(&HashSet::new());
                     let (mut buffer, mut cursor) =
                         crate::server::render_stream::render_precomputed_virtual_with_runtime_registry(
                             &self.app.state,
@@ -6232,9 +6280,17 @@ impl HeadlessServer {
                 }
             };
 
+            let rendered_findr = (is_app_client && findr_changed)
+                .then(|| crate::server::clients::capture_findr(&self.app.state));
+
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
+            if let Some(findr) = rendered_findr {
+                if let Some(navigation) = client.navigation.as_mut() {
+                    navigation.findr = findr;
+                }
+            }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
             let mut encoded = if is_app_client
@@ -7468,6 +7524,42 @@ mod tests {
         shutdown_test_runtimes(&mut server);
     }
 
+    #[test]
+    fn native_surface_activation_uses_client_projection_and_hides_for_popup() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-surface-projection");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        let terminal_navigation = ClientNavigationState::capture(&server.app.state);
+
+        server.app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        server.app.state.mode = app::Mode::Findr;
+        let findr_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut terminal_client = test_identity_client(Some("Ada"), None);
+        terminal_client.navigation = Some(terminal_navigation);
+        server.clients.insert(1, terminal_client);
+        let mut findr_client = test_identity_client(Some("Bea"), None);
+        findr_client.navigation = Some(findr_navigation);
+        server.clients.insert(2, findr_client);
+
+        assert!(server.client_omp_surface_active(1));
+        server.app.state.mode = app::Mode::Terminal;
+        assert!(!server.client_omp_surface_active(2));
+
+        server.app.state.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: crate::layout::PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+        assert!(!server.client_omp_surface_active(1));
+        shutdown_test_runtimes(&mut server);
+    }
+
     #[tokio::test]
     async fn native_renderer_attach_uses_the_bound_background_app_projection() {
         let mut server = test_headless_server();
@@ -7602,6 +7694,12 @@ mod tests {
         }));
         assert!(server.clients[&2].private_omp_guest.is_some());
         server.app.state.mode = crate::app::Mode::Prefix;
+        server
+            .clients
+            .get_mut(&2)
+            .and_then(|client| client.navigation.as_mut())
+            .expect("background projection")
+            .non_findr_mode = Some(crate::app::Mode::Prefix);
         assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
             client_id: 2,
             launch_id: renderer_launch_id,
@@ -7631,12 +7729,22 @@ mod tests {
             }
             message => panic!("expected inactive renderer confirmation, got {message:?}"),
         }
-        assert!(!server.handle_server_event(ServerEvent::ClientInputPixels {
+        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        let (remaining, consumed) = server.partition_native_omp_input(2, vec![key]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(_)]
+        ));
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
             client_id: 2,
             data,
             geometry,
         }));
-        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.foreground_client_id, Some(2));
         assert_eq!(
             server.clients[&2]
                 .committed_identity()
@@ -10415,44 +10523,45 @@ next_tab = ""
         let mut findr = crate::app::state::FindrState::new(pane_id);
         findr.query = "needle".into();
         server.app.state.findr = Some(findr);
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.findr = None;
+        server.app.state.mode = app::Mode::Terminal;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
 
         let (background_writer, _background_control, background_render) = test_client_writer();
-        server.clients.insert(
+        let mut background = ClientConnection::new(
+            (80, 80),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
             1,
-            ClientConnection::new(
-                (80, 80),
-                crate::kitty_graphics::HostCellSize::default(),
-                crate::terminal_theme::TerminalTheme::default(),
-                Some(true),
-                1,
-                RenderEncoding::SemanticFrame,
-                Some(background_writer),
-            ),
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
         );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
         let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
-        server.clients.insert(
+        let mut foreground = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
             2,
-            ClientConnection::new(
-                (80, 24),
-                crate::kitty_graphics::HostCellSize::default(),
-                crate::terminal_theme::TerminalTheme::default(),
-                Some(true),
-                2,
-                RenderEncoding::SemanticFrame,
-                Some(foreground_writer),
-            ),
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
         );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
         server.foreground_client_id = Some(2);
         server.sync_foreground_client_state();
         server.resize_shared_runtime_to_effective_size();
         assert!(server.app.refresh_findr_visible_if_needed(&HashSet::new()));
-        let (foreground_geometry, foreground_matches) = {
-            let findr = server.app.state.findr.as_ref().expect("Findr state");
-            (
-                findr.visible_geometry.expect("foreground geometry"),
-                findr.matches.len(),
-            )
-        };
+        let foreground_findr = server.app.state.findr.clone().expect("Findr state");
+        let foreground_geometry = foreground_findr
+            .visible_geometry
+            .expect("foreground geometry");
+        let foreground_matches = foreground_findr.matches.len();
         assert_eq!(
             foreground_matches, 1,
             "only the current match is foreground-visible"
@@ -10462,27 +10571,177 @@ next_tab = ""
 
         let background_frame =
             read_server_frame(background_render.recv().expect("background frame"));
-        let _foreground_frame =
+        let foreground_frame =
             read_server_frame(foreground_render.recv().expect("foreground frame"));
         assert!(
-            frame_text(&background_frame)
-                .contains(&format!("{foreground_matches} visible matches")),
-            "background render must retain foreground Findr results: {}",
+            !frame_text(&background_frame).contains("visible matches"),
+            "background non-Findr projection must not render foreground Findr state: {}",
             frame_text(&background_frame),
         );
-
-        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        assert!(
+            frame_text(&foreground_frame)
+                .contains(&format!("{foreground_matches} visible matches")),
+            "foreground frame must retain its Findr results: {}",
+            frame_text(&foreground_frame),
+        );
+        assert!(
+            server.clients[&1]
+                .navigation
+                .as_ref()
+                .expect("background projection")
+                .findr
+                .is_none(),
+            "background client state must remain non-Findr",
+        );
+        assert_eq!(
+            server.clients[&2]
+                .navigation
+                .as_ref()
+                .expect("foreground projection")
+                .findr
+                .as_ref()
+                .map(|(_, findr)| findr),
+            Some(&foreground_findr),
+        );
+        assert_eq!(server.app.state.findr.as_ref(), Some(&foreground_findr));
+        assert_eq!(server.app.state.mode, app::Mode::Findr);
         let info = server
             .app
             .state
             .pane_info_by_id(pane_id)
             .expect("pane info");
-        assert_eq!(findr.visible_geometry, Some(foreground_geometry));
         assert_eq!(
-            findr.visible_geometry,
+            server.app.state.findr.as_ref().unwrap().visible_geometry,
+            Some(foreground_geometry)
+        );
+        assert_eq!(
+            server.app.state.findr.as_ref().unwrap().visible_geometry,
             Some((info.inner_rect.width, info.inner_rect.height))
         );
-        assert_eq!(findr.matches.len(), foreground_matches);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn background_findr_render_refreshes_its_projection_without_leaking_foreground() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("background-findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let mut scrollback = (0..30)
+            .map(|row| format!("before {row}\r\n"))
+            .collect::<String>();
+        scrollback.push_str("needle-old\r\n");
+        scrollback.extend((0..29).map(|row| format!("after {row}\r\n")));
+        scrollback.push_str("needle-current");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Prefix;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                scrollback.as_bytes(),
+            ),
+        );
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        server.app.state.findr = Some(findr);
+        server.app.state.mode = app::Mode::Findr;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+
+        let (background_writer, _background_control, background_render) = test_client_writer();
+        let mut background = ClientConnection::new(
+            (80, 80),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        let mut foreground = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
+        );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        server.render_and_stream();
+
+        let background_frame =
+            read_server_frame(background_render.recv().expect("background frame"));
+        let foreground_frame =
+            read_server_frame(foreground_render.recv().expect("foreground frame"));
+        let background_findr = server.clients[&1]
+            .navigation
+            .as_ref()
+            .expect("background projection")
+            .findr
+            .as_ref()
+            .expect("refreshed background Findr")
+            .1
+            .clone();
+        assert_eq!(background_findr.query, "needle");
+        assert_eq!(background_findr.matches.len(), 2);
+        assert!(
+            background_findr
+                .visible_geometry
+                .is_some_and(|(_, height)| height > 24),
+            "background Findr must use its 80-row client geometry"
+        );
+        assert!(frame_text(&background_frame).contains(&format!(
+            "{} visible matches",
+            background_findr.matches.len()
+        )));
+        assert!(!frame_text(&foreground_frame).contains("visible matches"));
+        assert!(server.clients[&2]
+            .navigation
+            .as_ref()
+            .expect("foreground projection")
+            .findr
+            .is_none());
+        assert!(server.app.state.findr.is_none());
+        assert_eq!(server.app.state.mode, app::Mode::Prefix);
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .navigation
+            .as_mut()
+            .unwrap()
+            .findr
+            .as_mut()
+            .unwrap()
+            .1
+            .complete = false;
+        server.app.findr_scan_deadline = None;
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::OuterFocusGained],
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.app.state.mode, app::Mode::Findr);
+        assert!(server
+            .app
+            .state
+            .findr
+            .as_ref()
+            .is_some_and(|findr| !findr.complete));
+        assert!(server.app.findr_scan_deadline.is_some());
         shutdown_test_runtimes(&mut server);
     }
 
