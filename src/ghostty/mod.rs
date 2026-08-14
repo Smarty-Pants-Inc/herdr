@@ -1155,21 +1155,10 @@ impl Terminal {
             let Some(y) = u32::try_from(y).ok() else {
                 break;
             };
-            let mut grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
-            let (soft_wrapped, wrap_continuation) = grid_ref_wrap_state(&grid_ref)?;
-            let mut cells = Vec::with_capacity(usize::from(cols));
-            for x in 0..cols {
-                grid_ref.x = x;
-                cells.push(ScreenTextCell {
-                    wide: grid_ref_wide(&grid_ref)?,
-                    graphemes: grid_ref_graphemes(&grid_ref)?.into_boxed_slice(),
-                });
-            }
-            rows.push(ScreenTextRow {
-                cells,
-                soft_wrapped,
-                wrap_continuation,
-            });
+            rows.push(Self::screen_text_row_from_grid_ref(
+                self.grid_ref(ghostty_screen_point(0, y))?,
+                cols,
+            )?);
         }
         Ok(rows)
     }
@@ -1207,6 +1196,45 @@ impl Terminal {
         Ok(())
     }
 
+    pub(crate) fn viewport_text_rows_range(
+        &self,
+        start_row: u16,
+        end_row_exclusive: u16,
+    ) -> Result<Vec<ScreenTextRow>, Error> {
+        let rows = self.rows()?;
+        let cols = self.cols()?;
+        let start_row = start_row.min(rows);
+        let end_row_exclusive = end_row_exclusive.min(rows).max(start_row);
+        let mut result = Vec::with_capacity(usize::from(end_row_exclusive - start_row));
+        for y in start_row..end_row_exclusive {
+            result.push(Self::screen_text_row_from_grid_ref(
+                self.grid_ref(ghostty_viewport_point(0, y.into()))?,
+                cols,
+            )?);
+        }
+        Ok(result)
+    }
+
+    fn screen_text_row_from_grid_ref(
+        mut grid_ref: ffi::GhosttyGridRef,
+        cols: u16,
+    ) -> Result<ScreenTextRow, Error> {
+        let (soft_wrapped, wrap_continuation) = grid_ref_wrap_state(&grid_ref)?;
+        let mut cells = Vec::with_capacity(usize::from(cols));
+        for x in 0..cols {
+            grid_ref.x = x;
+            cells.push(ScreenTextCell {
+                wide: grid_ref_wide(&grid_ref)?,
+                graphemes: grid_ref_graphemes(&grid_ref)?.into_boxed_slice(),
+            });
+        }
+        Ok(ScreenTextRow {
+            cells,
+            soft_wrapped,
+            wrap_continuation,
+        })
+    }
+
     fn viewport_graphemes_and_style(&self, x: u16, y: u32) -> Result<(Vec<u32>, CellStyle), Error> {
         let grid_ref = self.grid_ref(ghostty_viewport_point(x, y))?;
         let graphemes = grid_ref_graphemes(&grid_ref)?;
@@ -1223,6 +1251,11 @@ impl Terminal {
     pub fn viewport_hyperlink_uri(&self, x: u16, y: u32) -> Result<Option<String>, Error> {
         let grid_ref = self.grid_ref(ghostty_viewport_point(x, y))?;
         grid_ref_hyperlink_uri(&grid_ref)
+    }
+
+    pub(crate) fn viewport_wrap_state(&self, y: u32) -> Result<(bool, bool), Error> {
+        let grid_ref = self.grid_ref(ghostty_viewport_point(0, y))?;
+        grid_ref_wrap_state(&grid_ref)
     }
 
     fn grid_ref(&self, point: ffi::GhosttyPoint) -> Result<ffi::GhosttyGridRef, Error> {

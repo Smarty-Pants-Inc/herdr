@@ -410,6 +410,7 @@ pub(super) fn render_panes(
                 true,
             );
             render_copy_mode_cursor(app, frame, info);
+            render_hovered_link(app, frame, info);
         }
     }
 
@@ -939,6 +940,26 @@ fn paint_terminal_text_match(
                 inner.y.saturating_add(viewport_row),
             )]
                 .set_style(style);
+        }
+    }
+}
+
+fn render_hovered_link(app: &AppState, frame: &mut Frame, info: &PaneInfo) {
+    let Some(link) = app.hovered_link.as_ref() else {
+        return;
+    };
+    if app.mode != Mode::Terminal || link.pane_id != info.id || link.inner_rect != info.inner_rect {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for &(x, y) in &link.cells {
+        if x >= info.inner_rect.x
+            && x < info.inner_rect.x.saturating_add(info.inner_rect.width)
+            && y >= info.inner_rect.y
+            && y < info.inner_rect.y.saturating_add(info.inner_rect.height)
+        {
+            let cell = &mut buf[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
         }
     }
 }
