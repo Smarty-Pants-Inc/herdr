@@ -1001,7 +1001,11 @@ fn should_relaunch_updated_client(
     }
 }
 fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> bool {
-    remote_client && matches!(error, ClientError::ServerHandoff { .. })
+    remote_client
+        && matches!(
+            error,
+            ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. }
+        )
 }
 
 /// Runs the thin client: connects to the server, performs the handshake,
@@ -3637,13 +3641,30 @@ mod tests {
         assert!(!should_relaunch_updated_client(
             &rejected, false, false, true
         ));
+    }
 
+    #[test]
+    fn remote_reconnects_only_for_connection_loss_or_server_handoff() {
+        let connection_lost = ClientError::ConnectionLost(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed connection",
+        ));
         let handoff = ClientError::ServerHandoff {
-            reason: "live update in progress; reconnect after handoff completes".into(),
+            reason: "live update in progress".into(),
         };
-        assert!(should_request_remote_reconnect(&handoff, true));
-        assert!(!should_request_remote_reconnect(&handoff, false));
+        let detached = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        let shutdown = ClientError::ServerShutdown {
+            reason: Some("maintenance".into()),
+        };
+
+        for error in [&connection_lost, &handoff] {
+            assert!(should_request_remote_reconnect(error, true));
+            assert!(!should_request_remote_reconnect(error, false));
+        }
         assert!(!should_request_remote_reconnect(&detached, true));
+        assert!(!should_request_remote_reconnect(&shutdown, true));
     }
 
     #[test]
