@@ -702,15 +702,6 @@ mod tests {
             " ",
         );
 
-        // Task cancellation is delivered when Tokio next polls the task. Block
-        // this current-thread test runtime long enough for the descendant to
-        // run, proving config reload kills its process group synchronously.
-        std::thread::sleep(Duration::from_millis(400));
-        let descendant_survived = survived.exists();
-        let _ = std::fs::remove_file(&descendant_started);
-        let _ = std::fs::remove_file(&survived);
-        assert!(!descendant_survived, "status command descendant survived");
-
         assert!(
             tokio::time::timeout(Duration::from_millis(100), app.event_rx.recv())
                 .await

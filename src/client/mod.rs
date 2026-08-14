@@ -15,11 +15,13 @@
 #[cfg(unix)]
 mod direct_graphics;
 mod input;
+#[cfg(unix)]
+mod omp_pane;
 
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::IsTerminal as _;
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -831,6 +833,15 @@ fn client_launch_mode(
         ClientLaunchMode::App
     }
 }
+fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
+    match crate::config::load_or_create_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("herdr: unable to load client identity: {error}");
+            std::process::exit(1);
+        }
+    }
+}
 
 /// Performs the client→server handshake.
 ///
@@ -842,9 +853,9 @@ fn do_handshake(
     rows: u16,
     cell_width_px: u32,
     cell_height_px: u32,
-    exact_cell_size: bool,
     requested_encoding: RenderEncoding,
-    direct_attach_requested: bool,
+    launch_mode: ClientLaunchMode,
+    identity: &crate::config::ClientIdentity,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -859,12 +870,12 @@ fn do_handshake(
         cell_height_px,
         requested_encoding,
         keybindings: requested_keybindings(),
-        launch_mode: client_launch_mode(
-            direct_attach_requested,
-            exact_cell_size,
-            cell_width_px,
-            cell_height_px,
-        ),
+        launch_mode,
+        display_name: (launch_mode != ClientLaunchMode::OmpPane)
+            .then(|| identity.display_name.clone())
+            .flatten(),
+        frontend_profile_id: Some(identity.frontend_profile_id.clone()),
+        renderer_binding_token: Some(identity.renderer_binding_token.clone()),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -992,6 +1003,34 @@ fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> 
 /// Runs the thin client: connects to the server, performs the handshake,
 /// and enters the main event loop.
 ///
+/// Runs the hidden OMP logical-pane client.
+#[cfg(unix)]
+pub fn run_omp_pane(
+    pane_id: String,
+    omp_session_id: String,
+    route_generation: u64,
+    target_app_client_id: Option<u64>,
+) -> io::Result<()> {
+    omp_pane::run(
+        pane_id,
+        omp_session_id,
+        route_generation,
+        target_app_client_id,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn run_omp_pane(
+    _pane_id: String,
+    _omp_session_id: String,
+    _route_generation: u64,
+    _target_app_client_id: Option<u64>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OMP pane POC is Unix-only",
+    ))
+}
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
     run_client_with_mode(
@@ -1104,9 +1143,9 @@ fn connect_terminal_session_stream(
         rows,
         0,
         0,
-        false,
         RenderEncoding::TerminalAnsi,
-        true,
+        ClientLaunchMode::TerminalAttach,
+        &load_client_identity_or_exit(),
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1299,6 +1338,7 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
+    let identity = load_client_identity_or_exit();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
@@ -1348,9 +1388,14 @@ fn run_client_with_mode(
         rows,
         cell_width_px,
         cell_height_px,
-        exact_cell_size,
         requested_encoding,
-        direct_attach_requested,
+        client_launch_mode(
+            direct_attach_requested,
+            exact_cell_size,
+            cell_width_px,
+            cell_height_px,
+        ),
+        &identity,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
@@ -1935,12 +1980,35 @@ async fn run_client_loop(
                     #[cfg(not(unix))]
                     let _ = (transfer_id, image_id);
                 }
+                ServerMessage::PersistIdentity {
+                    request_id,
+                    display_name,
+                } => {
+                    let result =
+                        crate::config::load_or_create_identity().and_then(|mut identity| {
+                            identity.display_name = Some(display_name.clone());
+                            crate::config::save_identity(&identity)
+                        });
+                    let acknowledgement = ClientMessage::IdentityPersistenceAck {
+                        request_id,
+                        display_name,
+                        success: result.is_ok(),
+                        error: result.err().map(|error| error.to_string()),
+                    };
+                    if let Err(error) = write_to_server(&mut write_stream, &acknowledgement) {
+                        return Err(ClientError::ConnectionLost(error));
+                    }
+                }
                 ServerMessage::ServerShutdown { reason } => {
                     return Err(ClientError::ServerShutdown { reason });
                 }
                 ServerMessage::ServerHandoff { reason } => {
                     return Err(ClientError::ServerHandoff { reason });
                 }
+                // OMP traffic is sideband-only in this POC; never render opaque bytes as ANSI.
+                ServerMessage::OmpPane { .. }
+                | ServerMessage::OmpFrame { .. }
+                | ServerMessage::OmpError { .. } => {}
                 ServerMessage::Notify {
                     kind,
                     message,
