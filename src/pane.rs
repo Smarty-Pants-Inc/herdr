@@ -44,8 +44,9 @@ use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
     TerminalTextPoint, TerminalTextSearchChunk, TerminalTextSearchChunkStatus,
-    TerminalTextSearchSnapshot, TerminalWordMotion, TERMINAL_TEXT_SEARCH_MAX_CELLS,
-    TERMINAL_TEXT_SEARCH_MAX_MATCHES, TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS,
+    TerminalTextSearchSnapshot, TerminalWordMotion, ViewportHyperlink, ViewportLogicalLine,
+    TERMINAL_TEXT_SEARCH_MAX_CELLS, TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+    TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS,
 };
 pub use self::{
     state::PaneState,
@@ -2896,6 +2897,27 @@ impl PaneRuntime {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.terminal.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<terminal::ViewportHyperlink> {
+        self.terminal
+            .hyperlink_at_viewport_cell(col, row, width, height)
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<terminal::ViewportLogicalLine> {
+        self.terminal
+            .logical_line_at_viewport_row(row, width, height)
     }
 
     pub fn kitty_image_placements_with_data_filter<F>(

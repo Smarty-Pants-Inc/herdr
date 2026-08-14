@@ -740,6 +740,12 @@ impl HeadlessServer {
                 crate::render_prof::event("render.attempt");
                 self.sync_canonical_navigation_to_foreground();
                 let render_request = self.app.render_dirty.take();
+                if self
+                    .app
+                    .refresh_hovered_link_for_panes(&render_request.pty_sources)
+                {
+                    needs_full_render = true;
+                }
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
                     crate::render_prof::event("render.attempt.pty_dirty");
@@ -1597,6 +1603,9 @@ impl HeadlessServer {
         client.last_activity = stamp;
 
         let changed = self.foreground_client_id != Some(client_id);
+        if changed {
+            self.app.clear_hovered_pane_link();
+        }
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
         changed
@@ -1607,6 +1616,7 @@ impl HeadlessServer {
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
         if changed {
+            self.app.clear_hovered_pane_link();
             let canonical = ClientNavigationState::capture(&self.app.state);
             self.restore_foreground_navigation(&canonical);
         }
@@ -3932,6 +3942,7 @@ impl HeadlessServer {
         );
         let render_neutral_mouse_motion =
             events_are_render_neutral_mouse_motion(&events, self.app.state.mode);
+        let hover_generation = self.app.hover_generation;
         if let Some(client) = self.clients.get_mut(&client_id) {
             if host_surface_redraw {
                 client.request_repaint();
@@ -3978,6 +3989,12 @@ impl HeadlessServer {
                 self.compute_client_navigation_view(client_id);
             }
         }
+        let hover_changed = self.app.hover_generation != hover_generation;
+        if hover_changed && !host_surface_redraw {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+        }
         let deferred_requests_changed =
             navigation_scope.is_some() && self.handle_deferred_requests_headless();
         let config_reloaded = self.app.take_config_reloaded_from_disk();
@@ -4004,7 +4021,8 @@ impl HeadlessServer {
                 || foreground_changed
                 || theme_changed
                 || self.reconcile_private_omp_guests()
-                || (interaction && !render_neutral_mouse_motion && !terminal_forward_only)
+                || (interaction
+                    && (hover_changed || (!render_neutral_mouse_motion && !terminal_forward_only)))
         };
         if let Some(canonical) = navigation_scope {
             self.finish_client_navigation_scope(client_id, canonical);
@@ -4223,12 +4241,13 @@ impl HeadlessServer {
                 }
                 self.clients.insert(client_id, connection);
                 if !omp_pane && !direct_attach_requested {
-                    self.foreground_client_id = Some(client_id);
+                    self.promote_client_to_foreground(client_id);
+                } else {
+                    self.sync_foreground_client_state();
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
-                self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
                 self.nudge_handoff_panes_on_first_client_attach();
                 if !omp_pane && !direct_attach_requested {
@@ -5595,6 +5614,7 @@ impl HeadlessServer {
         self.app.state.mode == app::Mode::Terminal
             && self.app.state.focused_workspace_plugin_pane().is_none()
             && self.app.state.popup_pane.is_none()
+            && self.app.state.hovered_link.is_none()
             && self.app.state.selection.is_none()
             && self.app.state.copy_mode.is_none()
             && self.app.state.context_menu.is_none()
@@ -5702,6 +5722,14 @@ impl HeadlessServer {
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let foreground_hover = if is_app_client && !is_foreground {
+                Some((
+                    self.app.state.hovered_pane_cell.take(),
+                    self.app.state.hovered_link.take(),
+                ))
+            } else {
+                None
+            };
             let preserved_scroll = (is_app_client && !is_foreground).then_some((
                 self.app.state.workspace_scroll,
                 self.app.state.agent_panel_scroll,
@@ -5773,6 +5801,10 @@ impl HeadlessServer {
                             .render(inner, &mut buffer);
                             cursor = None;
                         }
+                    }
+                    if let Some((position, link)) = foreground_hover {
+                        self.app.state.hovered_pane_cell = position;
+                        self.app.state.hovered_link = link;
                     }
                     if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
@@ -6707,6 +6739,14 @@ mod tests {
 
         server.app.state.mode = app::Mode::Terminal;
         assert!(server.retained_pty_update_allowed_by_app_state());
+
+        server.app.state.hovered_link = Some(crate::app::HoveredPaneLink {
+            pane_id: crate::layout::PaneId::alloc(),
+            inner_rect: Rect::default(),
+            cells: vec![(0, 0)],
+        });
+        assert!(!server.retained_pty_update_allowed_by_app_state());
+        server.app.state.hovered_link = None;
 
         let workspace = crate::workspace::Workspace::test_new("retained-plugin-footer");
         let workspace_id = workspace.id.clone();
@@ -7786,9 +7826,8 @@ mod tests {
             Some(Some("herd".to_string()))
         );
 
-        // ClientConnected assigns the foreground client directly rather than
-        // going through promote_client_to_foreground, so the cache must notice
-        // the new client on its own.
+        // A newly foreground client must receive the current title even when
+        // the title itself has not changed.
         let (client_tx, second_control_rx, _render_rx) = test_client_writer();
         server.clients.insert(
             2,
@@ -11465,6 +11504,239 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn hovering_a_link_requests_headless_render() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+    }
+
+    #[tokio::test]
+    async fn leaving_a_link_requests_headless_render() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 40,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarded_key_clearing_hover_requests_headless_render() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded key"),
+            Bytes::from_static(b"x")
+        );
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('y'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded key"),
+            Bytes::from_static(b"y")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::TextCommit("text".into())],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded text"),
+            Bytes::from_static(b"text")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Paste {
+                text: "paste".into()
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded paste"),
+            Bytes::from_static(b"paste")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_disconnect_clears_inherited_hover_before_rendering_successor() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        let (successor_tx, _successor_control_rx, successor_rx) = test_client_writer();
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(successor_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+
+        assert!(server.remove_client(1));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert!(server.app.state.hovered_link.is_none());
+        assert!(server.app.state.hovered_pane_cell.is_none());
+        server.render_and_stream();
+        let successor_frame = read_server_frame(successor_rx.recv().expect("successor frame"));
+        assert!(!successor_frame.cells.iter().any(|cell| {
+            cell.symbol == "h" && cell.modifier & ratatui::style::Modifier::UNDERLINED.bits() != 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn foreground_connect_clears_inherited_hover() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 2,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            writer,
+        }));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert!(server.app.state.hovered_link.is_none());
+        assert!(server.app.state.hovered_pane_cell.is_none());
+    }
+
+    #[tokio::test]
     async fn passive_mouse_motion_forwards_without_requesting_render() {
         let mut server = test_headless_server();
         let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1003h\x1b[?1006h");
@@ -12045,6 +12317,61 @@ next_tab = ""
                 b: 0x56,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn background_app_frame_does_not_render_or_clear_foreground_hover() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        let (foreground_tx, _foreground_control_rx, foreground_rx) = test_client_writer();
+        let (background_tx, _background_control_rx, background_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (44, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(background_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        let foreground_hover = server.app.state.hovered_link.clone();
+
+        server.render_and_stream();
+
+        let background_frame = read_server_frame(background_rx.recv().expect("background frame"));
+        let _foreground_frame = read_server_frame(foreground_rx.recv().expect("foreground frame"));
+        assert!(!background_frame.cells.iter().any(|cell| {
+            cell.symbol == "h" && cell.modifier & ratatui::style::Modifier::UNDERLINED.bits() != 0
+        }));
+        assert_eq!(server.app.state.hovered_link, foreground_hover);
     }
 
     #[tokio::test]
@@ -12930,6 +13257,49 @@ next_tab = ""
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
         assert_eq!((patched.width, patched.height), (80, 24));
+    }
+
+    #[tokio::test]
+    async fn hovered_plain_url_dirty_row_falls_back_to_full_render() {
+        let url = "https://example.com/link";
+        let initial = format!("{url} old");
+        let update = format!("\r{url} new");
+        let (mut server, client_rx, pane_id) = retained_test_server(initial.as_bytes());
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let pane = server.app.state.view.pane_infos[0].clone();
+        server.app.state.hovered_link = Some(crate::app::HoveredPaneLink {
+            pane_id,
+            inner_rect: pane.inner_rect,
+            cells: (0..url.len() as u16)
+                .map(|col| (pane.inner_rect.x + col, pane.inner_rect.y))
+                .collect(),
+        });
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(update.as_bytes());
+
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        server.render_and_stream();
+        let refreshed = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full hover frame"),
+        );
+        let h = refreshed
+            .cells
+            .iter()
+            .find(|cell| cell.symbol == "h")
+            .expect("URL cell");
+        assert_ne!(h.modifier & ratatui::style::Modifier::UNDERLINED.bits(), 0);
     }
 
     #[tokio::test]

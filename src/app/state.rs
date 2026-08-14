@@ -1487,6 +1487,10 @@ pub struct AppState {
     pub selection: Option<Selection>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub context_menu: Option<ContextMenuState>,
+    /// Pointer cell last resolved for terminal-link hover; reset with the rendered link.
+    pub(crate) hovered_pane_cell: Option<crate::app::PaneHoverPosition>,
+    /// Presentation-only terminal link cells under the pointer.
+    pub(crate) hovered_link: Option<crate::app::HoveredPaneLink>,
     // Notifications
     pub update_available: Option<String>,
     pub update_install_command: String,
@@ -1868,6 +1872,8 @@ impl AppState {
             selection: None,
             selection_autoscroll: None,
             context_menu: None,
+            hovered_pane_cell: None,
+            hovered_link: None,
             update_available: None,
             update_install_command: "herdr update".into(),
             latest_release_notes_available: false,
