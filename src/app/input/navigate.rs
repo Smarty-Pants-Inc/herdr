@@ -21,14 +21,6 @@ use crate::{
     terminal::TerminalRuntimeRegistry,
 };
 
-#[cfg(test)]
-pub(crate) fn terminal_direct_navigation_action(
-    state: &AppState,
-    key: TerminalKey,
-) -> Option<NavigateAction> {
-    action_for_key(state, key, BindingDispatch::Direct)
-}
-
 pub(crate) fn terminal_direct_non_indexed_navigation_action(
     state: &AppState,
     key: &TerminalKey,
@@ -376,6 +368,7 @@ impl App {
                 }
             }
             NavigateAction::EditScrollback => {}
+            NavigateAction::Findr => self.open_findr(),
             NavigateAction::CopyMode => self.state.enter_copy_mode(&self.terminal_runtimes),
             NavigateAction::Zoom => {
                 self.zoom_focused_pane_via_api();
@@ -1438,6 +1431,7 @@ pub(crate) enum NavigateAction {
     SplitHorizontal,
     ClosePane,
     EditScrollback,
+    Findr,
     CopyMode,
     Zoom,
     EnterResizeMode,
@@ -1574,6 +1568,7 @@ fn non_indexed_action_for_key(
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
+        (&kb.findr, NavigateAction::Findr),
         (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
@@ -1828,6 +1823,7 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::EditScrollback => {}
+        NavigateAction::Findr => state.open_findr(),
         NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
@@ -2677,12 +2673,57 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.next_agent = crate::config::ActionKeybinds::direct("alt+a");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::NextAgent));
+    }
+
+    #[test]
+    fn direct_and_prefix_findr_bindings_map_to_findr_action() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+findr = ["ctrl+alt+f", "prefix+f"]
+"#,
+        )
+        .unwrap();
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds = config.keybinds();
+
+        assert_eq!(
+            terminal_direct_non_indexed_navigation_action(
+                &state,
+                &TerminalKey::new(
+                    KeyCode::Char('f'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
+            ),
+            Some(NavigateAction::Findr)
+        );
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty()),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::Findr)
+        );
+    }
+
+    #[test]
+    fn findr_action_opens_findr() {
+        let mut state = state_with_workspaces(&["test"]);
+
+        execute_navigate_action(&mut state, NavigateAction::Findr);
+
+        assert_eq!(state.mode, Mode::Findr);
+        assert_eq!(
+            state.findr.as_ref().map(|findr| findr.pane_id),
+            state.workspaces[0].focused_pane_id()
+        );
     }
 
     #[test]
@@ -2690,9 +2731,9 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.focus_pane_left = crate::config::ActionKeybinds::direct("alt+left");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Left, KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Left, KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::FocusPaneLeft));
@@ -2703,9 +2744,9 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.swap_pane_right = crate::config::ActionKeybinds::direct("alt+shift+l");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
         );
 
         assert_eq!(action, Some(NavigateAction::SwapPaneRight));
@@ -2717,9 +2758,9 @@ navigate_pane_right = "ctrl+l"
         state.keybinds.resize_pane_right =
             crate::config::ActionKeybinds::direct("ctrl+shift+alt+right");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(
+            &TerminalKey::new(
                 KeyCode::Right,
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
             ),
@@ -2754,9 +2795,9 @@ resize_pane_left = "prefix+shift+left"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.move_tab_next = crate::config::ActionKeybinds::direct("alt+shift+right");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &TerminalKey::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
         );
 
         assert_eq!(action, Some(NavigateAction::MoveTabNext));
@@ -2832,9 +2873,9 @@ resize_pane_left = "prefix+shift+left"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.last_pane = crate::config::ActionKeybinds::direct("alt+l");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::LastPane));
@@ -2956,9 +2997,9 @@ last_pane = "prefix+tab"
         let config: Config = toml::from_str("[keys]\nswitch_tab = \"ctrl+3\"\n").unwrap();
         state.keybinds.switch_tab = config.keybinds().switch_tab;
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            &TerminalKey::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
         );
 
         assert_eq!(action, Some(NavigateAction::SwitchTab(2)));
@@ -3123,6 +3164,46 @@ command = "printf literal > '{}'"
         ))
         .await;
         app.handle_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::empty()))
+            .await;
+
+        assert_eq!(wait_for_file(&output_path), "literal");
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.mode, Mode::Terminal);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_literal_symbol_custom_command_runs_before_shifted_indexed_alias() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Terminal;
+
+        let output_path = unique_temp_path("direct-literal-symbol-custom-command");
+        let config: Config = toml::from_str(&format!(
+            r#"
+[keys]
+switch_workspace = "ctrl+shift+1..9"
+
+[[keys.command]]
+key = "ctrl+!"
+command = "printf literal > '{}'"
+"#,
+            output_path.display()
+        ))
+        .unwrap();
+        app.state.keybinds = config.keybinds();
+
+        app.handle_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::CONTROL))
             .await;
 
         assert_eq!(wait_for_file(&output_path), "literal");

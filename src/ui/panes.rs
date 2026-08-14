@@ -356,6 +356,9 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in pane_infos {
+        if info.inner_rect.is_empty() {
+            continue;
+        }
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             let show_cursor = info.is_focused
                 && terminal_active
@@ -376,6 +379,7 @@ pub(super) fn render_panes(
                 }
             }
 
+            render_findr_highlights(app, frame, info, rt);
             let (copy_search_top, copy_search_bottom, copy_search_matches) =
                 validated_copy_mode_search_matches(app, info, rt);
             render_copy_mode_search_highlights(
@@ -499,7 +503,11 @@ pub(super) fn render_workspace_plugin_pane(
         Block::default().style(Style::default().bg(app.palette.sidebar_bg)),
         outer,
     );
-    let input_active = pane.focused && app.mode == crate::app::Mode::Terminal;
+    let input_active = pane.focused
+        && matches!(
+            app.mode,
+            crate::app::Mode::Terminal | crate::app::Mode::Findr
+        );
     render_panel_separator(frame, outer, outer.x, input_active, &app.palette);
     let toggle = workspace_plugin_pane_toggle_rect(outer);
     if !toggle.is_empty() {
@@ -544,6 +552,15 @@ pub(super) fn render_workspace_plugin_pane(
             inner,
             input_active && !pane_is_scrolled_back(runtime),
         );
+        let info = PaneInfo {
+            id: pane.pane_id,
+            rect: outer,
+            inner_rect: inner,
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: pane.focused,
+        };
+        render_findr_highlights(app, frame, &info, runtime);
     }
 }
 
@@ -892,6 +909,40 @@ fn validated_copy_mode_search_matches(
     (top, bottom, matches)
 }
 
+fn paint_terminal_text_match(
+    frame: &mut Frame,
+    inner: Rect,
+    top: u32,
+    bottom: u32,
+    text_match: crate::pane::TerminalTextMatch,
+    style: Style,
+) {
+    if inner.is_empty() || text_match.end.row < top || text_match.start.row > bottom {
+        return;
+    }
+
+    for row in text_match.start.row.max(top)..=text_match.end.row.min(bottom) {
+        let viewport_row = row.saturating_sub(top) as u16;
+        let start_col = if row == text_match.start.row {
+            text_match.start.col
+        } else {
+            0
+        };
+        let end_col = if row == text_match.end.row {
+            text_match.end.col
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        for col in start_col..=end_col.min(inner.width.saturating_sub(1)) {
+            frame.buffer_mut()[(
+                inner.x.saturating_add(col),
+                inner.y.saturating_add(viewport_row),
+            )]
+                .set_style(style);
+        }
+    }
+}
+
 fn render_copy_mode_search_highlights(
     app: &AppState,
     frame: &mut Frame,
@@ -920,26 +971,48 @@ fn render_copy_mode_search_highlights(
         if (current == Some(index)) != current_only {
             continue;
         }
-        let start_row = text_match.start.row.max(top);
-        let end_row = text_match.end.row.min(bottom);
-        for absolute_row in start_row..=end_row {
-            let viewport_row = absolute_row.saturating_sub(top) as u16;
-            let start_col = if absolute_row == text_match.start.row {
-                text_match.start.col
-            } else {
-                0
-            };
-            let end_col = if absolute_row == text_match.end.row {
-                text_match.end.col
-            } else {
-                info.inner_rect.width.saturating_sub(1)
-            };
-            for col in start_col..=end_col.min(info.inner_rect.width.saturating_sub(1)) {
-                let x = info.inner_rect.x.saturating_add(col);
-                let y = info.inner_rect.y.saturating_add(viewport_row);
-                frame.buffer_mut()[(x, y)].set_style(style);
-            }
+        paint_terminal_text_match(frame, info.inner_rect, top, bottom, text_match, style);
+    }
+}
+
+fn render_findr_highlights(
+    app: &AppState,
+    frame: &mut Frame,
+    info: &PaneInfo,
+    rt: &crate::terminal::TerminalRuntime,
+) {
+    let Some(findr) = app.findr.as_ref() else {
+        return;
+    };
+    if info.inner_rect.is_empty()
+        || app.mode != Mode::Findr
+        || findr.query.is_empty()
+        || findr.pane_id != info.id
+    {
+        return;
+    }
+    let Some(metrics) = rt.scroll_metrics() else {
+        return;
+    };
+    let top = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom)
+        .min(u32::MAX as usize) as u32;
+    let bottom = top.saturating_add(u32::from(info.inner_rect.height.saturating_sub(1)));
+
+    for y in info.inner_rect.y..info.inner_rect.y.saturating_add(info.inner_rect.height) {
+        for x in info.inner_rect.x..info.inner_rect.x.saturating_add(info.inner_rect.width) {
+            let cell = &mut frame.buffer_mut()[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::DIM));
         }
+    }
+    let match_style = Style::default()
+        .fg(panel_contrast_fg(&app.palette))
+        .bg(app.palette.accent)
+        .add_modifier(Modifier::BOLD)
+        .remove_modifier(Modifier::DIM);
+    for text_match in findr.matches.iter().copied() {
+        paint_terminal_text_match(frame, info.inner_rect, top, bottom, text_match, match_style);
     }
 }
 
@@ -1780,6 +1853,44 @@ mod tests {
         );
         for (_, runtime) in runtimes.drain() {
             runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn findr_dims_nonmatches_and_highlights_matches() {
+        let pane_id = PaneId::from_raw(1);
+        let runtime = TerminalRuntime::test_with_screen_bytes(20, 2, b"plain needle tail");
+        let mut app = AppState::test_new();
+        app.mode = Mode::Findr;
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".to_string();
+        findr.matches = runtime.search_text_matches("needle", false);
+        app.findr = Some(findr);
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 20, 2),
+            inner_rect: Rect::new(0, 0, 20, 2),
+            scrollbar_rect: None,
+            borders: Borders::empty(),
+            is_focused: true,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 2)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                runtime.render(frame, info.inner_rect, false);
+                render_findr_highlights(&app, frame, &info, &runtime);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(0, 0)].style().add_modifier.contains(Modifier::DIM));
+        for x in 6..12 {
+            let style = buffer[(x, 0)].style();
+            assert_eq!(style.bg, Some(app.palette.accent));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+            assert!(!style.add_modifier.contains(Modifier::DIM));
         }
     }
 }
