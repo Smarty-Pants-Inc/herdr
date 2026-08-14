@@ -56,7 +56,7 @@ impl App {
             .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
     }
 
-    pub(super) fn launch_cwd_for_pane_in_workspace(
+    pub(crate) fn launch_cwd_for_pane_in_workspace(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -256,6 +256,7 @@ impl App {
             self.render_notify.clone(),
             self.render_dirty.clone(),
             extra_env,
+            self.omp_bridge.clone(),
         )?;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
