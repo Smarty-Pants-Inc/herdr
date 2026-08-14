@@ -26,16 +26,6 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
-fn modified_url_click_modifier() -> KeyModifiers {
-    KeyModifiers::CONTROL
-}
-
-#[cfg(test)]
-#[test]
-fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
-    assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
-}
-
 mod clipboard;
 mod copy_mode;
 mod findr;
@@ -80,6 +70,7 @@ impl App {
         &mut self,
         key: TerminalKey,
     ) -> Option<super::TerminalInputTarget> {
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             return self.handle_terminal_key(key).await;
         }
@@ -92,7 +83,10 @@ impl App {
         }
 
         match self.state.mode {
-            Mode::Terminal => return self.handle_terminal_key(key).await,
+            Mode::Terminal => {
+                let target = self.handle_terminal_key(key).await;
+                return target;
+            }
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
@@ -127,6 +121,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
@@ -161,6 +156,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.send_bytes(Bytes::from(text)).await;
@@ -192,6 +188,7 @@ impl App {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.send_paste(text).await;
@@ -343,15 +340,23 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        self.handle_mouse_from_input_source(super::LOCAL_INPUT_SOURCE, mouse);
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.handle_mouse_from_input_source(super::LOCAL_INPUT_SOURCE, mouse)
     }
 
     pub(super) fn handle_mouse_from_input_source(
         &mut self,
         source_id: super::InputSourceId,
         mouse: MouseEvent,
-    ) {
+    ) -> bool {
+        let hover_changed = self.update_hovered_pane_link(mouse)
+            || (matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ) && self.clear_hovered_pane_link());
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pending_url_click_sources.remove(&source_id);
@@ -359,19 +364,19 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left)
                 if self.pending_url_click_sources.contains(&source_id) =>
             {
-                return;
+                return hover_changed;
             }
             MouseEventKind::Up(MouseButton::Left)
                 if self.pending_url_click_sources.remove(&source_id) =>
             {
-                return;
+                return hover_changed;
             }
             _ => {}
         }
 
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
-            return;
+            return hover_changed;
         }
         if self.state.mode == Mode::Findr {
             let scan_may_change = matches!(
@@ -393,13 +398,13 @@ impl App {
             if scan_may_change {
                 self.reset_findr_scan_deadline();
             }
-            return;
+            return hover_changed;
         }
         if self.handle_workspace_plugin_mouse(mouse) {
-            return;
+            return hover_changed;
         }
         if self.handle_overlay_mouse(mouse) {
-            return;
+            return hover_changed;
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -418,12 +423,12 @@ impl App {
                 self.state.sidebar_width_auto = false;
                 self.state.mark_session_dirty();
                 self.state.drag = None;
-                return;
+                return hover_changed;
             }
         }
 
-        if self.handle_modified_url_click(source_id, mouse) {
-            return;
+        if self.handle_url_click(source_id, mouse) {
+            return hover_changed;
         }
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
@@ -519,6 +524,7 @@ impl App {
             self.selection_autoscroll_deadline =
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
+        hover_changed
     }
 
     fn handle_popup_mouse(&mut self, mouse: MouseEvent) {
@@ -604,14 +610,9 @@ impl App {
         self.focus_pane_internal_via_api(ws_idx, pane_id);
     }
 
-    fn handle_modified_url_click(
-        &mut self,
-        source_id: super::InputSourceId,
-        mouse: MouseEvent,
-    ) -> bool {
+    fn handle_url_click(&mut self, source_id: super::InputSourceId, mouse: MouseEvent) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            || !mouse.modifiers.contains(modified_url_click_modifier())
         {
             return false;
         }
@@ -621,21 +622,23 @@ impl App {
         };
         let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
         let col = mouse.column.saturating_sub(info.inner_rect.x);
-        let Some(url) =
-            self.state
-                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
-        else {
+        let Some(link) = self.state.resolved_link_at_pane_cell(
+            &self.terminal_runtimes,
+            info.id,
+            viewport_row,
+            col,
+        ) else {
             return false;
         };
 
-        let plugin_handled = match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+        let plugin_handled = match self.invoke_plugin_link_handler_for_url(&link.url, info.id) {
             Ok(handled) => handled,
             Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+                tracing::warn!(err = %err, url = %link.url, "failed to invoke plugin link handler");
                 false
             }
         };
-        if !plugin_handled && crate::app::actions::safe_web_url(&url).is_none() {
+        if !plugin_handled && crate::app::actions::safe_web_url(&link.url).is_none() {
             return false;
         }
 
@@ -644,15 +647,107 @@ impl App {
         if plugin_handled {
             return true;
         }
-        if crate::web_url::safe_web_url(&url).is_some()
+        if crate::web_url::safe_web_url(&link.url).is_some()
             && self
                 .event_tx
-                .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
+                .try_send(crate::events::AppEvent::OpenUrl {
+                    url: link.url,
+                    source_id,
+                })
                 .is_err()
         {
             tracing::warn!("failed to queue pane URL opening");
         }
         true
+    }
+
+    fn update_hovered_pane_link(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Moved) {
+            return false;
+        }
+        if self.state.mode != Mode::Terminal {
+            return self.clear_hovered_pane_link();
+        }
+        let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
+            return self.clear_hovered_pane_link();
+        };
+        if mouse.column < info.inner_rect.x
+            || mouse.column >= info.inner_rect.x.saturating_add(info.inner_rect.width)
+            || mouse.row < info.inner_rect.y
+            || mouse.row >= info.inner_rect.y.saturating_add(info.inner_rect.height)
+        {
+            return self.clear_hovered_pane_link();
+        }
+
+        let position = crate::app::PaneHoverPosition {
+            pane_id: info.id,
+            inner_rect: info.inner_rect,
+            viewport_row: mouse.row.saturating_sub(info.inner_rect.y),
+            col: mouse.column.saturating_sub(info.inner_rect.x),
+        };
+        if self.state.hovered_pane_cell == Some(position) {
+            return false;
+        }
+        self.state.hovered_pane_cell = Some(position);
+        if self.state.hovered_link.as_ref().is_some_and(|link| {
+            link.pane_id == info.id
+                && link.inner_rect == info.inner_rect
+                && link.cells.contains(&(mouse.column, mouse.row))
+        }) {
+            return false;
+        }
+
+        let hovered_link = self
+            .state
+            .resolved_link_at_pane_cell(
+                &self.terminal_runtimes,
+                info.id,
+                position.viewport_row,
+                position.col,
+            )
+            .map(|link| link.hover);
+        let changed = self.state.hovered_link != hovered_link;
+        self.state.hovered_link = hovered_link;
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
+        }
+        changed
+    }
+
+    pub(crate) fn clear_hovered_pane_link(&mut self) -> bool {
+        self.state.hovered_pane_cell = None;
+        let changed = self.state.hovered_link.take().is_some();
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
+        }
+        changed
+    }
+
+    pub(crate) fn refresh_hovered_link_for_panes(
+        &mut self,
+        pty_sources: &std::collections::HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let Some(position) = self.state.hovered_pane_cell else {
+            return false;
+        };
+        if !pty_sources.contains(&position.pane_id) || self.state.mode != Mode::Terminal {
+            return false;
+        }
+        let hovered_link = self
+            .state
+            .resolved_link_at_pane_cell(
+                &self.terminal_runtimes,
+                position.pane_id,
+                position.viewport_row,
+                position.col,
+            )
+            .map(|link| link.hover);
+        let changed = self.state.hovered_link != hovered_link;
+        self.state.hovered_link = hovered_link;
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
+        }
+        changed
     }
 
     fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {
