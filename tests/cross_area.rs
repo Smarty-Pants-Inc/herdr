@@ -462,6 +462,7 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
         payload.extend_from_slice(&encode_varint_u32(value.len() as u32));
         payload.extend_from_slice(value.as_bytes());
     }
+    payload.extend_from_slice(&encode_varint_u32(0)); // OmpRendererCapabilities::client_local_native
 
     stream
         .write_all(&frame_message(&payload))
