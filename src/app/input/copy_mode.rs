@@ -31,11 +31,7 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return;
         };
-        let Some(pane_id) = self
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.focused_pane_id())
-        else {
+        let Some(pane_id) = self.focused_terminal_pane_id(ws_idx) else {
             return;
         };
         let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
@@ -73,6 +69,7 @@ impl AppState {
             },
         });
         self.mode = Mode::Copy;
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn handle_copy_mode_key(
@@ -757,8 +754,9 @@ impl AppState {
         let Some(copy_mode) = self.copy_mode.as_ref() else {
             return false;
         };
-        self.current_pane_focus_target()
-            .is_some_and(|target| target.pane_id == copy_mode.pane_id)
+        self.active
+            .and_then(|ws_idx| self.focused_terminal_pane_id(ws_idx))
+            .is_some_and(|pane_id| pane_id == copy_mode.pane_id)
     }
 
     pub(crate) fn sync_copy_mode_with_focus(&mut self) {
@@ -782,9 +780,75 @@ impl AppState {
         }
     }
 
-    pub(crate) fn settle_terminal_mode_after_focus(&mut self) {
+    pub(crate) fn reconcile_focus_lifecycle(&mut self) {
+        self.reconcile_focus_lifecycle_excluding(&[]);
+    }
+
+    pub(crate) fn settle_terminal_mode_for_focus(&mut self, pane_id: crate::layout::PaneId) {
         self.mode = Mode::Terminal;
-        self.sync_copy_mode_with_focus();
+        self.reconcile_focus_lifecycle_for(Some(pane_id), &[]);
+    }
+
+    pub(crate) fn reconcile_focus_lifecycle_excluding(
+        &mut self,
+        unavailable_pane_ids: &[crate::layout::PaneId],
+    ) {
+        let effective_focus = self
+            .active
+            .and_then(|ws_idx| self.focused_terminal_pane_id(ws_idx));
+        self.reconcile_focus_lifecycle_for(effective_focus, unavailable_pane_ids);
+    }
+
+    fn reconcile_focus_lifecycle_for(
+        &mut self,
+        effective_focus: Option<crate::layout::PaneId>,
+        unavailable_pane_ids: &[crate::layout::PaneId],
+    ) {
+        let effective_focus =
+            effective_focus.filter(|pane_id| !unavailable_pane_ids.contains(pane_id));
+        let findr_is_current = self.mode == Mode::Findr
+            && self
+                .findr
+                .as_ref()
+                .is_some_and(|findr| Some(findr.pane_id) == effective_focus);
+
+        if self.findr.is_some() && !findr_is_current {
+            self.findr = None;
+        }
+        if self.mode == Mode::Findr && self.findr.is_none() {
+            self.mode = if self.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
+        if self.findr.is_none()
+            && self.copy_mode.is_some()
+            && matches!(self.mode, Mode::Copy | Mode::Terminal | Mode::Navigate)
+        {
+            if self
+                .copy_mode
+                .as_ref()
+                .is_some_and(|copy_mode| Some(copy_mode.pane_id) == effective_focus)
+            {
+                self.mode = Mode::Copy;
+            } else if self.active.is_some() {
+                self.clear_copy_mode_selection();
+                self.mode = Mode::Terminal;
+            } else {
+                self.clear_copy_mode_selection();
+                self.mode = Mode::Navigate;
+            }
+        }
+    }
+
+    pub(crate) fn settle_terminal_mode_after_focus(&mut self) {
+        self.mode = if self.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn sync_copy_mode_search_geometry(&mut self) {
@@ -1205,6 +1269,26 @@ mod tests {
 
         assert_eq!(app.state.mode, Mode::Prefix);
         assert_eq!(copy_mode_offset_from_bottom(&app, pane_id), 0);
+        assert!(app.state.copy_mode.is_some());
+    }
+
+    #[tokio::test]
+    async fn foreground_view_recompute_preserves_copy_mode_prefix_suspension() {
+        let (mut app, _) = app_with_copy_screen(b"alpha\nbeta\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+
+        app.handle_key(TerminalKey::new(
+            app.state.prefix_code,
+            app.state.prefix_mods,
+        ))
+        .await;
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(app.state.mode, Mode::Prefix);
         assert!(app.state.copy_mode.is_some());
     }
 

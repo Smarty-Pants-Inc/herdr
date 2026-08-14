@@ -951,6 +951,8 @@ impl App {
             self.state
                 .record_pane_focus_change(previous_focus, target_ws_idx, moved_pane_id);
             self.state.settle_terminal_mode_after_focus();
+        } else {
+            self.state.reconcile_focus_lifecycle();
         }
         let created_workspace = created_workspace.then(|| self.workspace_info(target_ws_idx));
         let created_tab = if created_tab {

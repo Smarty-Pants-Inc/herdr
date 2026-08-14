@@ -441,7 +441,7 @@ pub enum CellWide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScreenTextCell {
     pub wide: CellWide,
-    pub graphemes: Vec<u32>,
+    pub graphemes: Box<[u32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +449,18 @@ pub(crate) struct ScreenTextRow {
     pub cells: Vec<ScreenTextCell>,
     pub soft_wrapped: bool,
     pub wrap_continuation: bool,
+}
+
+pub(crate) enum ScreenTextVisit<'a> {
+    Cell {
+        row: usize,
+        col: u16,
+        wide: CellWide,
+        graphemes: &'a [u32],
+    },
+    RowEnd {
+        soft_wrapped: bool,
+    },
 }
 
 impl CellWide {
@@ -750,6 +762,24 @@ pub fn unicode_grapheme_width(codepoints: &[u32]) -> (usize, u8) {
         ffi::ghostty_unicode_grapheme_width(codepoints.as_ptr(), codepoints.len(), &mut width)
     };
     (consumed, width)
+}
+
+pub fn unicode_text_width(text: &str) -> usize {
+    let codepoints: Vec<u32> = text.chars().map(u32::from).collect();
+    let mut offset = 0;
+    let mut width = 0usize;
+    while offset < codepoints.len() {
+        let remaining = &codepoints[offset..];
+        let (consumed, grapheme_width) = unicode_grapheme_width(remaining);
+        if consumed == 0 || consumed > remaining.len() {
+            width = width.saturating_add(usize::from(unicode_codepoint_width(remaining[0])));
+            offset += 1;
+        } else {
+            width = width.saturating_add(usize::from(grapheme_width));
+            offset += consumed;
+        }
+    }
+    width
 }
 
 pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
@@ -1132,7 +1162,7 @@ impl Terminal {
                 grid_ref.x = x;
                 cells.push(ScreenTextCell {
                     wide: grid_ref_wide(&grid_ref)?,
-                    graphemes: grid_ref_graphemes(&grid_ref)?,
+                    graphemes: grid_ref_graphemes(&grid_ref)?.into_boxed_slice(),
                 });
             }
             rows.push(ScreenTextRow {
@@ -1142,6 +1172,39 @@ impl Terminal {
             });
         }
         Ok(rows)
+    }
+
+    pub(crate) fn visit_screen_text_rows_range(
+        &self,
+        start_row: usize,
+        end_row_exclusive: usize,
+        mut visitor: impl FnMut(ScreenTextVisit<'_>),
+    ) -> Result<(), Error> {
+        let total_rows = self.total_rows()?;
+        let start_row = start_row.min(total_rows);
+        let end_row_exclusive = end_row_exclusive.min(total_rows).max(start_row);
+        let cols = self.cols()?;
+        let mut graphemes = Vec::new();
+        for row in start_row..end_row_exclusive {
+            let Some(y) = u32::try_from(row).ok() else {
+                break;
+            };
+            let mut grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+            let (soft_wrapped, _) = grid_ref_wrap_state(&grid_ref)?;
+            for col in 0..cols {
+                grid_ref.x = col;
+                let wide = grid_ref_wide(&grid_ref)?;
+                grid_ref_graphemes_into(&grid_ref, &mut graphemes)?;
+                visitor(ScreenTextVisit::Cell {
+                    row,
+                    col,
+                    wide,
+                    graphemes: &graphemes,
+                });
+            }
+            visitor(ScreenTextVisit::RowEnd { soft_wrapped });
+        }
+        Ok(())
     }
 
     fn viewport_graphemes_and_style(&self, x: u16, y: u32) -> Result<(Vec<u32>, CellStyle), Error> {
@@ -1910,22 +1973,31 @@ fn ghostty_screen_point(x: u16, y: u32) -> ffi::GhosttyPoint {
 }
 
 fn grid_ref_graphemes(grid_ref: &ffi::GhosttyGridRef) -> Result<Vec<u32>, Error> {
+    let mut buffer = Vec::new();
+    grid_ref_graphemes_into(grid_ref, &mut buffer)?;
+    Ok(buffer)
+}
+
+fn grid_ref_graphemes_into(
+    grid_ref: &ffi::GhosttyGridRef,
+    buffer: &mut Vec<u32>,
+) -> Result<(), Error> {
     let mut required = 0usize;
     let result =
         unsafe { ffi::ghostty_grid_ref_graphemes(grid_ref, ptr::null_mut(), 0, &mut required) };
     if result != ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE {
         result.into_result()?;
     }
-    let mut buffer = vec![0u32; required];
+    buffer.resize(required, 0);
     if required == 0 {
-        return Ok(buffer);
+        return Ok(());
     }
     unsafe {
         ffi::ghostty_grid_ref_graphemes(grid_ref, buffer.as_mut_ptr(), buffer.len(), &mut required)
             .into_result()?;
     }
     buffer.truncate(required);
-    Ok(buffer)
+    Ok(())
 }
 
 fn grid_ref_wide(grid_ref: &ffi::GhosttyGridRef) -> Result<CellWide, Error> {
@@ -3585,6 +3657,12 @@ mod tests {
     }
 
     #[test]
+    fn unicode_text_width_uses_terminal_grapheme_rules() {
+        assert_eq!(unicode_text_width("e\u{301}👩‍💻"), 3);
+        assert_eq!(unicode_text_width("لالالا"), 6);
+    }
+
+    #[test]
     fn focus_encoding_matches_expected_sequences() {
         assert_eq!(encode_focus(FocusEvent::Gained).unwrap(), b"\x1b[I");
         assert_eq!(encode_focus(FocusEvent::Lost).unwrap(), b"\x1b[O");
@@ -3900,9 +3978,9 @@ mod tests {
         assert!(rows[1].wrap_continuation);
         assert!(!rows[2].wrap_continuation);
         assert_eq!(rows[2].cells[0].wide, CellWide::Wide);
-        assert_eq!(rows[2].cells[0].graphemes, vec!['界' as u32]);
+        assert_eq!(&*rows[2].cells[0].graphemes, &['界' as u32]);
         assert_eq!(rows[2].cells[1].wide, CellWide::SpacerTail);
-        assert_eq!(rows[2].cells[2].graphemes, vec!['e' as u32, 0x301]);
+        assert_eq!(&*rows[2].cells[2].graphemes, &['e' as u32, 0x301]);
     }
 
     #[test]
