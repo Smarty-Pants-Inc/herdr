@@ -17,6 +17,8 @@ mod direct_graphics;
 mod input;
 #[cfg(unix)]
 mod omp_pane;
+#[cfg(unix)]
+mod omp_renderer;
 
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -24,7 +26,7 @@ use std::io::IsTerminal as _;
 use std::io::{self, BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{
@@ -65,6 +67,8 @@ struct ClientLoopConfig {
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    #[cfg(unix)]
+    omp_renderer_enabled: bool,
 }
 
 /// State tracking for the thin client.
@@ -100,6 +104,11 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// Last physical cell size paired with `reported_size`.
+    reported_cell_size_px: (u32, u32),
+    /// App-owned full-surface OMP renderer, when this Unix client advertised support.
+    #[cfg(unix)]
+    omp_renderer: omp_renderer::ClientOmpRenderer,
 }
 
 #[derive(Debug, Default)]
@@ -823,6 +832,29 @@ fn client_launch_mode(
         ClientLaunchMode::App
     }
 }
+
+fn client_omp_renderer_capabilities(
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+) -> crate::protocol::OmpRendererCapabilities {
+    #[cfg(unix)]
+    {
+        omp_renderer::capabilities(
+            requested_encoding,
+            matches!(
+                launch_mode,
+                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+            ),
+            io::stdin().is_terminal(),
+            io::stdout().is_terminal(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (requested_encoding, launch_mode);
+        crate::protocol::OmpRendererCapabilities::default()
+    }
+}
 fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
     match crate::config::load_or_create_identity() {
         Ok(identity) => identity,
@@ -866,6 +898,7 @@ fn do_handshake(
             .flatten(),
         frontend_profile_id: Some(identity.frontend_profile_id.clone()),
         renderer_binding_token: Some(identity.renderer_binding_token.clone()),
+        renderer_capabilities: client_omp_renderer_capabilities(requested_encoding, launch_mode),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1350,6 +1383,16 @@ fn run_client_with_mode(
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
         remote_image_paste_key,
+        #[cfg(unix)]
+        omp_renderer_enabled: client_omp_renderer_capabilities(
+            requested_encoding,
+            if direct_attach_requested {
+                ClientLaunchMode::TerminalAttach
+            } else {
+                ClientLaunchMode::App
+            },
+        )
+        .client_local_native,
     };
 
     let socket_path = client_socket_path();
@@ -1514,6 +1557,73 @@ fn run_client_with_mode(
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
+
+    Ok(())
+}
+fn display_semantic_surface(
+    state: &mut ClientState,
+    frame_data: crate::protocol::FrameData,
+    force_repaint: bool,
+) {
+    state.repaint_pending |= force_repaint;
+    let frame_data = if state.draw_host_cursor {
+        render_ansi::frame_with_drawn_cursor(frame_data)
+    } else {
+        frame_data
+    };
+    let encoded = if state.draw_host_cursor {
+        state
+            .blit_encoder
+            .encode_with_suppressed_visible_cursor(&frame_data, state.repaint_pending)
+    } else {
+        state
+            .blit_encoder
+            .encode(&frame_data, state.repaint_pending)
+    };
+    let mut stdout = io::stdout();
+    let graphics = if state.kitty_graphics_enabled {
+        frame_data.graphics.as_slice()
+    } else {
+        &[]
+    };
+    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+    let _ = stdout.flush();
+    state.blit_encoder.commit(frame_data, encoded);
+    state.repaint_pending = false;
+}
+
+#[cfg(unix)]
+fn display_pending_omp_surface(
+    state: &mut ClientState,
+    write_stream: &mut LocalStream,
+) -> Result<(), ClientError> {
+    if let Some(surface) = state
+        .omp_renderer
+        .next_frame(Instant::now(), state.reported_size)
+    {
+        display_semantic_surface(state, surface.frame, surface.force_repaint);
+    }
+    for effect in state.omp_renderer.take_effects() {
+        match effect {
+            omp_renderer::LocalEffect::Bell(count) => {
+                if let Err(err) =
+                    crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
+                {
+                    warn!(err = %err, "failed to emit local OMP terminal bell");
+                }
+            }
+            omp_renderer::LocalEffect::ClipboardWrite(content) => {
+                crate::selection::write_osc52_bytes(&content);
+                let _ = io::stdout().flush();
+            }
+            omp_renderer::LocalEffect::OpenUrl(url) => {
+                open_safe_url(&url, crate::platform::open_url);
+            }
+        }
+    }
+    for message in state.omp_renderer.take_outbound_messages() {
+        write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
+    }
     Ok(())
 }
 
@@ -1558,6 +1668,9 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
+        #[cfg(unix)]
+        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_renderer_enabled),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1669,8 +1782,8 @@ async fn run_client_loop(
         match event {
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
-                let data = if let Some(attach_escape) = &mut state.attach_escape {
-                    match attach_escape.filter_input(
+                let (data, parsed_events) = if let Some(attach_escape) = &mut state.attach_escape {
+                    let data = match attach_escape.filter_input(
                         data,
                         state.reported_size.1,
                         state.mouse_scroll_lines,
@@ -1702,7 +1815,8 @@ async fn run_client_loop(
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
-                    }
+                    };
+                    (data, None)
                 } else {
                     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                     if crate::raw_input::events_require_host_surface_redraw(
@@ -1720,8 +1834,20 @@ async fn run_client_loop(
                     if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
                         store_reported_cell_size(&reported_cell_size, width_px, height_px);
                     }
-                    data
+                    (data, Some(events))
                 };
+                if state.omp_renderer.owns_input() {
+                    for message in state
+                        .omp_renderer
+                        .route_input(parsed_events.unwrap_or_default())
+                    {
+                        if let Err(error) = write_to_server(&mut write_stream, &message) {
+                            return Err(ClientError::ConnectionLost(error));
+                        }
+                    }
+                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    continue;
+                }
                 if should_bridge_clipboard_image_paste(
                     &data,
                     is_remote_client,
@@ -1757,16 +1883,12 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
-                let message = ClientMessage::InputPixels {
-                    data,
-                    cols: geometry.cols,
-                    rows: geometry.rows,
-                    width_px: geometry.width_px,
-                    height_px: geometry.height_px,
-                };
-                if let Err(err) = write_to_server(&mut write_stream, &message) {
-                    return Err(ClientError::ConnectionLost(err));
+                if let Some(message) = state.omp_renderer.route_pixel_input(data, geometry) {
+                    if let Err(err) = write_to_server(&mut write_stream, &message) {
+                        return Err(ClientError::ConnectionLost(err));
+                    }
                 }
+                display_pending_omp_surface(&mut state, &mut write_stream)?;
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -1807,8 +1929,16 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
-                // Resizing invalidates the host-side blit baseline.
+                state.reported_cell_size_px = (cell_width_px, cell_height_px);
+                // Resizing invalidates both server and local PTY blit baselines.
                 state.request_repaint();
+                #[cfg(unix)]
+                {
+                    state
+                        .omp_renderer
+                        .resize((new_cols, new_rows, cell_width_px, cell_height_px));
+                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                }
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -1821,32 +1951,48 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
-                    let frame_data = if state.draw_host_cursor {
-                        render_ansi::frame_with_drawn_cursor(frame_data)
-                    } else {
-                        frame_data
-                    };
-                    let encoded = if state.draw_host_cursor {
-                        state.blit_encoder.encode_with_suppressed_visible_cursor(
-                            &frame_data,
-                            state.repaint_pending,
-                        )
-                    } else {
-                        state
-                            .blit_encoder
-                            .encode(&frame_data, state.repaint_pending)
-                    };
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                    state.repaint_pending = false;
+                    #[cfg(unix)]
+                    if let Some(surface) = state.omp_renderer.cache_server_frame(frame_data) {
+                        display_semantic_surface(&mut state, surface.frame, surface.force_repaint);
+                    }
+                    #[cfg(not(unix))]
+                    display_semantic_surface(&mut state, frame_data, false);
+                }
+                ServerMessage::OmpRendererTarget {
+                    launch_id,
+                    target_app_client_id,
+                    route,
+                    bound,
+                    surface_active,
+                    prefix,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        state.omp_renderer.apply_target(
+                            launch_id,
+                            target_app_client_id,
+                            route,
+                            bound,
+                            surface_active,
+                            prefix,
+                            (
+                                state.reported_size.0,
+                                state.reported_size.1,
+                                state.reported_cell_size_px.0,
+                                state.reported_cell_size_px.1,
+                            ),
+                        );
+                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (
+                        launch_id,
+                        target_app_client_id,
+                        route,
+                        bound,
+                        surface_active,
+                        prefix,
+                    );
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
@@ -2081,6 +2227,8 @@ async fn run_client_loop(
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
                 }
+                #[cfg(unix)]
+                display_pending_omp_surface(&mut state, &mut write_stream)?;
             }
         }
     }
