@@ -2157,6 +2157,11 @@ impl AppState {
 // Selection
 // ---------------------------------------------------------------------------
 
+pub(crate) struct ResolvedPaneLink {
+    pub(crate) url: String,
+    pub(crate) hover: crate::app::HoveredPaneLink,
+}
+
 impl AppState {
     pub fn clear_selection(&mut self) {
         self.selection = None;
@@ -2241,6 +2246,7 @@ impl AppState {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn url_at_pane_cell(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
@@ -2248,6 +2254,17 @@ impl AppState {
         viewport_row: u16,
         col: u16,
     ) -> Option<String> {
+        self.resolved_link_at_pane_cell(terminal_runtimes, pane_id, viewport_row, col)
+            .map(|link| link.url)
+    }
+
+    pub(crate) fn resolved_link_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<ResolvedPaneLink> {
         let ws_idx = self
             .active
             .filter(|idx| self.workspaces.get(*idx).is_some())?;
@@ -2257,34 +2274,69 @@ impl AppState {
         }
 
         let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
-        let screen_col = info.inner_rect.x.saturating_add(col);
-        let screen_row = info.inner_rect.y.saturating_add(viewport_row);
-        if let Some((_, _, uri)) = rt
-            .visible_hyperlinks(info.inner_rect)
-            .into_iter()
-            .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
-        {
-            return safe_osc8_url(&uri).map(str::to_owned);
+        if let Some(link) = rt.hyperlink_at_viewport_cell(
+            col,
+            viewport_row,
+            info.inner_rect.width,
+            info.inner_rect.height,
+        ) {
+            let url = safe_osc8_url(&link.uri)?.to_owned();
+            return Some(ResolvedPaneLink {
+                hover: crate::app::HoveredPaneLink {
+                    pane_id,
+                    inner_rect: info.inner_rect,
+                    cells: link
+                        .cells
+                        .into_iter()
+                        .map(|(col, row)| {
+                            (
+                                info.inner_rect.x.saturating_add(col),
+                                info.inner_rect.y.saturating_add(row),
+                            )
+                        })
+                        .collect(),
+                },
+                url,
+            });
         }
 
-        let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
-        let visible_selection = Selection::line_range(
-            pane_id,
-            Selection::absolute_row_for_viewport(0, metrics),
-            Selection::absolute_row_for_viewport(info.inner_rect.height.saturating_sub(1), metrics),
-            info.inner_rect.width.saturating_sub(1),
-        );
-        let visible_text = rt.extract_selection(&visible_selection)?;
-        let logical_cell =
-            logical_cell_for_visible_cell(&visible_text, info.inner_rect.width, viewport_row, col)?;
-        let line_start = visible_text[..logical_cell.byte_index]
-            .rfind('\n')
-            .map_or(0, |idx| idx + 1);
-        let line_end = visible_text[logical_cell.byte_index..]
-            .find('\n')
-            .map_or(visible_text.len(), |idx| logical_cell.byte_index + idx);
-        let line = visible_text.get(line_start..line_end)?;
-        url_at_column(line, logical_cell.logical_col).map(str::to_owned)
+        let line = rt.logical_line_at_viewport_row(
+            viewport_row,
+            info.inner_rect.width,
+            info.inner_rect.height,
+        )?;
+        let byte_index = line.cells.iter().find_map(|cell| {
+            (cell.viewport_row == viewport_row
+                && col >= cell.viewport_col
+                && col < cell.viewport_col.saturating_add(cell.width))
+            .then_some(cell.byte_index)
+        })?;
+        let (start, end) = url_byte_span_at_byte_index(&line.text, byte_index)?;
+        let url = crate::web_url::safe_web_url(line.text.get(start..end)?)?.to_owned();
+        let cells = line
+            .cells
+            .into_iter()
+            .filter(|cell| cell.byte_index >= start && cell.byte_index < end)
+            .flat_map(|cell| {
+                (0..cell.width).map(move |offset| {
+                    (
+                        info.inner_rect
+                            .x
+                            .saturating_add(cell.viewport_col)
+                            .saturating_add(offset),
+                        info.inner_rect.y.saturating_add(cell.viewport_row),
+                    )
+                })
+            })
+            .collect();
+        Some(ResolvedPaneLink {
+            url,
+            hover: crate::app::HoveredPaneLink {
+                pane_id,
+                inner_rect: info.inner_rect,
+                cells,
+            },
+        })
     }
 
     pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {
@@ -2316,7 +2368,14 @@ impl AppState {
 }
 
 fn safe_osc8_url(url: &str) -> Option<&str> {
-    crate::web_url::safe_web_url(url).or_else(|| url.starts_with("file://").then_some(url))
+    crate::web_url::safe_web_url(url).or_else(|| {
+        let path = url.strip_prefix("file://")?;
+        (path.starts_with('/')
+            || path
+                .split_once('/')
+                .is_some_and(|(authority, _)| authority.eq_ignore_ascii_case("localhost")))
+        .then_some(url)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2362,15 +2421,38 @@ fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
     Some(span.columns(&cells))
 }
 
+#[cfg(test)]
 pub(crate) fn url_at_column(row: &str, col: u16) -> Option<&str> {
+    let (start, end) = url_byte_span_at_column(row, col)?;
+    crate::web_url::safe_web_url(row.get(start..end)?)
+}
+
+#[cfg(test)]
+fn url_byte_span_at_column(row: &str, col: u16) -> Option<(usize, usize)> {
     let cells = text_cells(row);
-    let clicked_idx = cell_index_at_column(&cells, col)?;
-    let span = url_spans(&cells)
+    url_byte_span_for_cell(row, &cells, cell_index_at_column(&cells, col)?)
+}
+
+fn url_byte_span_at_byte_index(row: &str, byte_index: usize) -> Option<(usize, usize)> {
+    let cells = text_cells(row);
+    let clicked_idx = row
+        .char_indices()
+        .position(|(index, _)| index == byte_index)?;
+    url_byte_span_for_cell(row, &cells, clicked_idx)
+}
+
+fn url_byte_span_for_cell(
+    row: &str,
+    cells: &[TextCell],
+    clicked_idx: usize,
+) -> Option<(usize, usize)> {
+    let span = url_spans(cells)
         .into_iter()
         .find(|span| span.contains(clicked_idx))?;
-    let start_byte = byte_index_for_cell(row, span.start);
-    let end_byte = byte_index_after_cell(row, span.end);
-    crate::web_url::safe_web_url(row.get(start_byte..end_byte)?)
+    Some((
+        byte_index_for_cell(row, span.start),
+        byte_index_after_cell(row, span.end),
+    ))
 }
 
 fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
@@ -2393,82 +2475,6 @@ fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
         }
     }
     spans
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VisibleTextCell {
-    pub(crate) byte_index: usize,
-    pub(crate) ch: char,
-    pub(crate) logical_col: u16,
-    pub(crate) screen_row: u16,
-    pub(crate) screen_col: u16,
-}
-
-pub(crate) fn visible_text_cells(text: &str, pane_width: u16) -> Vec<VisibleTextCell> {
-    if pane_width == 0 {
-        return Vec::new();
-    }
-
-    let mut cells = Vec::new();
-    let mut screen_row = 0u16;
-    let mut screen_col = 0u16;
-    let mut logical_col = 0u16;
-    let mut pending_wrap = false;
-    for (byte_index, ch) in text.char_indices() {
-        if ch == '\n' {
-            screen_row = screen_row.saturating_add(1);
-            screen_col = 0;
-            logical_col = 0;
-            pending_wrap = false;
-            continue;
-        }
-        if pending_wrap {
-            screen_row = screen_row.saturating_add(1);
-            screen_col = 0;
-            pending_wrap = false;
-        }
-
-        let width = u16::from(crate::ghostty::unicode_codepoint_width(ch as u32));
-        cells.push(VisibleTextCell {
-            byte_index,
-            ch,
-            logical_col,
-            screen_row,
-            screen_col,
-        });
-
-        logical_col = logical_col.saturating_add(width);
-        screen_col = screen_col.saturating_add(width);
-        while screen_col > pane_width {
-            screen_col -= pane_width;
-            screen_row = screen_row.saturating_add(1);
-        }
-        if width > 0 && screen_col == pane_width {
-            pending_wrap = true;
-            screen_col = pane_width.saturating_sub(1);
-        }
-    }
-    cells
-}
-
-pub(crate) fn logical_cell_for_visible_cell(
-    text: &str,
-    pane_width: u16,
-    target_row: u16,
-    target_col: u16,
-) -> Option<VisibleTextCell> {
-    visible_text_cells(text, pane_width)
-        .into_iter()
-        .find(|cell| {
-            let width = u16::from(crate::ghostty::unicode_codepoint_width(cell.ch as u32));
-            cell.screen_row == target_row
-                && if width == 0 {
-                    target_col == cell.screen_col
-                } else {
-                    target_col >= cell.screen_col
-                        && target_col < cell.screen_col.saturating_add(width)
-                }
-        })
 }
 
 fn token_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<CellSpan> {
@@ -3688,6 +3694,20 @@ mod tests {
             None
         );
         assert_eq!(selected_url("open file:///tmp/report", "file"), None);
+    }
+
+    #[test]
+    fn osc8_file_urls_require_local_absolute_paths() {
+        assert_eq!(
+            safe_osc8_url("file:///tmp/report.md?line=7"),
+            Some("file:///tmp/report.md?line=7")
+        );
+        assert_eq!(
+            safe_osc8_url("file://localhost/tmp/report.md?line=7"),
+            Some("file://localhost/tmp/report.md?line=7")
+        );
+        assert_eq!(safe_osc8_url("file://attacker/share/report.md"), None);
+        assert_eq!(safe_osc8_url("file://localhost-relative"), None);
     }
 
     #[test]

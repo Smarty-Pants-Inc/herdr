@@ -98,6 +98,20 @@ impl PaneClickState {
             && self.col.abs_diff(next.col) <= 1
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneHoverPosition {
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) inner_rect: Rect,
+    pub(crate) viewport_row: u16,
+    pub(crate) col: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HoveredPaneLink {
+    pub(crate) pane_id: crate::layout::PaneId,
+    pub(crate) inner_rect: Rect,
+    pub(crate) cells: Vec<(u16, u16)>,
+}
 
 pub struct App {
     pub state: AppState,
@@ -133,6 +147,7 @@ pub struct App {
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
+    pub(crate) hover_generation: u64,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
@@ -637,6 +652,8 @@ impl App {
             selection: None,
             selection_autoscroll: None,
             context_menu: None,
+            hovered_pane_cell: None,
+            hovered_link: None,
             update_available,
             update_install_command,
             latest_release_notes_available,
@@ -793,6 +810,7 @@ impl App {
             last_sidebar_divider_click: None,
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
+            hover_generation: 0,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
@@ -1104,6 +1122,7 @@ impl App {
 
             if needs_render && self.can_render_now(now) {
                 let render_request = self.render_dirty.take();
+                self.refresh_hovered_link_for_panes(&render_request.pty_sources);
                 self.sync_terminal_titles(&render_request.terminal_title_sources);
                 if self.window_title_configured() {
                     let title = self
@@ -1917,6 +1936,7 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
+                    self.clear_hovered_pane_link();
                     if self.try_route_paste_to_popup(&text) {
                     } else if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
@@ -4876,12 +4896,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(response["result"]["pane"]["focused"], true);
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), new_pane_id);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.focused(),
+            new_pane_id
+        );
         assert!(!app.state.workspace_plugin_panes[&workspace_id].focused);
         assert_eq!(app.state.mode, Mode::Terminal);
 
         app.state.last_pane();
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), original_pane);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.focused(),
+            original_pane
+        );
 
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {

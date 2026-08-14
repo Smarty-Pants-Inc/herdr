@@ -451,6 +451,25 @@ impl TerminalRuntime {
         self.0.visible_hyperlinks(area)
     }
 
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<crate::pane::ViewportHyperlink> {
+        self.0.hyperlink_at_viewport_cell(col, row, width, height)
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<crate::pane::ViewportLogicalLine> {
+        self.0.logical_line_at_viewport_row(row, width, height)
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
