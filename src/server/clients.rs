@@ -48,10 +48,10 @@ pub(crate) struct PublicPaneFocusTarget {
     pane_id: String,
 }
 
-/// Client-local projection of navigation fields stored in the shared app model.
+/// Client-local projection of navigation and Findr fields stored in the shared app model.
 ///
 /// Only stable public identities cross projection boundaries. Runtime topology,
-/// terminal state, overlays, selection, and host-terminal concerns remain shared.
+/// terminal state, selection, and host-terminal concerns remain shared.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClientNavigationState {
     pub(crate) active_workspace_id: Option<String>,
@@ -62,6 +62,10 @@ pub(crate) struct ClientNavigationState {
     pub(crate) previous_pane_focus: Option<PublicPaneFocusTarget>,
     pub(crate) zoomed_tabs: HashSet<String>,
     pub(crate) focused_workspace_plugin_pane: Option<String>,
+    /// Findr target identity plus its client-local search state.
+    pub(crate) findr: Option<(String, crate::app::state::FindrState)>,
+    /// Shared non-Findr mode to restore after temporarily projecting Findr.
+    pub(crate) non_findr_mode: Option<crate::app::Mode>,
 }
 
 impl ClientNavigationState {
@@ -120,6 +124,8 @@ impl ClientNavigationState {
                 .filter(|pane| pane.focused)
                 .map(|_| format!("{}:plugin", workspace.id))
         });
+        let findr = capture_findr(state);
+        let non_findr_mode = (state.mode != crate::app::Mode::Findr).then_some(state.mode);
 
         Self {
             active_workspace_id,
@@ -130,6 +136,8 @@ impl ClientNavigationState {
             previous_pane_focus,
             zoomed_tabs,
             focused_workspace_plugin_pane,
+            findr,
+            non_findr_mode,
         }
     }
 
@@ -223,17 +231,42 @@ impl ClientNavigationState {
                     )
                 })
                 .or(current.focused_workspace_plugin_pane);
+        let findr = self.findr.as_ref().and_then(|(public_pane_id, findr)| {
+            findr_pane_id(state, public_pane_id).map(|pane_id| {
+                let mut findr = findr.clone();
+                findr.pane_id = pane_id;
+                (public_pane_id.clone(), findr)
+            })
+        });
 
-        Self {
+        let mut reconciled = Self {
             active_workspace_id,
             selected_workspace_id,
             active_tab_by_workspace,
             focused_pane_by_tab,
             previous_pane_by_tab,
-            previous_pane_focus,
             zoomed_tabs,
+            previous_pane_focus,
             focused_workspace_plugin_pane,
+            findr,
+            non_findr_mode: None,
+        };
+        if reconciled
+            .findr
+            .as_ref()
+            .is_some_and(|(public_pane_id, _)| {
+                !findr_matches_navigation(state, &reconciled, public_pane_id)
+            })
+        {
+            reconciled.findr = None;
         }
+        if reconciled.findr.is_none() {
+            reconciled.non_findr_mode = canonical
+                .non_findr_mode
+                .or(current.non_findr_mode)
+                .or(self.non_findr_mode);
+        }
+        reconciled
     }
 
     /// Apply only navigation projection fields, without focus events or persistence effects.
@@ -303,6 +336,24 @@ impl ClientNavigationState {
                 }
             }
         }
+        match reconciled.findr.as_ref().map(|(_, findr)| findr) {
+            Some(findr) => {
+                state.findr = Some(findr.clone());
+                state.mode = crate::app::Mode::Findr;
+            }
+            None => {
+                state.findr = None;
+                if state.mode == crate::app::Mode::Findr {
+                    state.mode = reconciled.non_findr_mode.unwrap_or_else(|| {
+                        if state.active.is_some() {
+                            crate::app::Mode::Terminal
+                        } else {
+                            crate::app::Mode::Navigate
+                        }
+                    });
+                }
+            }
+        }
 
         reconciled
     }
@@ -323,6 +374,83 @@ fn public_pane_id(
         &workspace.id,
         workspace.public_pane_number(pane_id)?,
     ))
+}
+pub(crate) fn capture_findr(
+    state: &crate::app::state::AppState,
+) -> Option<(String, crate::app::state::FindrState)> {
+    (state.mode == crate::app::Mode::Findr)
+        .then_some(state.findr.as_ref())
+        .flatten()
+        .and_then(|findr| {
+            public_findr_pane_id(state, findr.pane_id).map(|pane_id| (pane_id, findr.clone()))
+        })
+}
+
+fn public_findr_pane_id(
+    state: &crate::app::state::AppState,
+    pane_id: crate::layout::PaneId,
+) -> Option<String> {
+    state
+        .workspaces
+        .iter()
+        .find_map(|workspace| public_pane_id(workspace, pane_id))
+        .or_else(|| {
+            state
+                .workspace_plugin_panes
+                .iter()
+                .find_map(|(workspace_id, pane)| {
+                    (pane.pane_id == pane_id).then(|| format!("{workspace_id}:plugin"))
+                })
+        })
+}
+
+fn findr_pane_id(
+    state: &crate::app::state::AppState,
+    public_id: &str,
+) -> Option<crate::layout::PaneId> {
+    public_id
+        .strip_suffix(":plugin")
+        .and_then(|workspace_id| state.workspace_plugin_panes.get(workspace_id))
+        .map(|pane| pane.pane_id)
+        .or_else(|| {
+            state.workspaces.iter().find_map(|workspace| {
+                pane_location(workspace, public_id).map(|(_, pane_id)| pane_id)
+            })
+        })
+}
+
+fn findr_matches_navigation(
+    state: &crate::app::state::AppState,
+    navigation: &ClientNavigationState,
+    public_pane_id: &str,
+) -> bool {
+    let Some(workspace_id) = navigation.active_workspace_id.as_deref() else {
+        return false;
+    };
+    if let Some(plugin_workspace_id) = public_pane_id.strip_suffix(":plugin") {
+        return plugin_workspace_id == workspace_id
+            && navigation.focused_workspace_plugin_pane.as_deref() == Some(public_pane_id);
+    }
+    let Some(workspace) = state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return false;
+    };
+    let Some(tab_id) = navigation.active_tab_by_workspace.get(workspace_id) else {
+        return false;
+    };
+    let Some(tab_idx) = tab_index(workspace, tab_id) else {
+        return false;
+    };
+    navigation
+        .focused_pane_by_tab
+        .get(tab_id)
+        .is_some_and(|focused_pane_id| {
+            focused_pane_id == public_pane_id
+                && pane_id(workspace, tab_idx, public_pane_id).is_some()
+        })
 }
 
 fn workspace_index(state: &crate::app::state::AppState, workspace_id: &str) -> Option<usize> {
@@ -965,6 +1093,64 @@ mod navigation_tests {
         assert_eq!(applied, snapshot);
         assert_eq!(ClientNavigationState::capture(&state), snapshot);
         assert!(!state.session_dirty);
+    }
+
+    #[test]
+    fn findr_stays_client_local_across_navigation_projections() {
+        let mut state = crate::app::state::AppState::test_new();
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        let foreground_pane = foreground.tabs[0].root_pane;
+        let background = crate::workspace::Workspace::test_new("background");
+        let background_pane = background.tabs[0].root_pane;
+        state.workspaces = vec![foreground, background];
+        state.active = Some(0);
+        state.selected = 0;
+        let mut foreground_findr = crate::app::state::FindrState::new(foreground_pane);
+        foreground_findr.query = "foreground query".into();
+        foreground_findr.visible_range = Some((3, 27));
+        state.findr = Some(foreground_findr.clone());
+        state.mode = crate::app::Mode::Findr;
+        let foreground_navigation = ClientNavigationState::capture(&state);
+
+        state.active = Some(1);
+        state.selected = 1;
+        let mut background_findr = crate::app::state::FindrState::new(background_pane);
+        background_findr.query = "background query".into();
+        background_findr.scrollback = true;
+        background_findr.visible_range = Some((0, 99));
+        state.findr = Some(background_findr.clone());
+        let background_navigation = ClientNavigationState::capture(&state);
+
+        foreground_navigation.apply_to(&mut state);
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.mode, crate::app::Mode::Findr);
+        assert_eq!(state.findr.as_ref(), Some(&foreground_findr));
+
+        background_navigation.apply_to(&mut state);
+        assert_eq!(state.active, Some(1));
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.mode, crate::app::Mode::Findr);
+        assert_eq!(state.findr.as_ref(), Some(&background_findr));
+    }
+
+    #[test]
+    fn non_findr_projection_closes_findr_without_replacing_other_modes() {
+        let mut state = navigation_state();
+        state.findr = None;
+        state.mode = crate::app::Mode::Terminal;
+        let navigation = ClientNavigationState::capture(&state);
+
+        let pane_id = state.workspaces[0].tabs[state.workspaces[0].active_tab].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = crate::app::Mode::Findr;
+        navigation.apply_to(&mut state);
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, crate::app::Mode::Terminal);
+
+        state.mode = crate::app::Mode::Settings;
+        navigation.apply_to(&mut state);
+        assert_eq!(state.mode, crate::app::Mode::Settings);
     }
 
     #[test]
