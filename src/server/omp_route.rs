@@ -258,6 +258,20 @@ impl OmpRouteRegistry {
         }
         routes
     }
+    pub(crate) fn disconnect_from_route(
+        &mut self,
+        client_id: u64,
+        key: &OmpRouteKey,
+    ) -> Option<Vec<OmpRouteDelivery>> {
+        let route = self
+            .route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)
+            .ok()?;
+        let epoch = route.attachments.remove(&client_id)?;
+        if route.controller == Some((client_id, epoch)) {
+            route.controller = None;
+        }
+        Some(route.pane_deliveries())
+    }
 
     pub(crate) fn guest_frame(
         &mut self,

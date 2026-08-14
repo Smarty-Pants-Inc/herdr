@@ -94,6 +94,7 @@ fn activate_notification_at_with_timeout(
             display_name: None,
             frontend_profile_id: None,
             renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
         },
     )
     .map_err(notification_activation_io_error)?;
