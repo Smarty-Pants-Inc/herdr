@@ -198,6 +198,7 @@ fn client_handshake(
             &display_name,           // display_name: Some("Test")
             &frontend_profile_id,    // frontend_profile_id: Some(valid token)
             &renderer_binding_token, // renderer_binding_token: Some(valid token)
+            &encode_varint_u32(0),   // OmpRendererCapabilities::client_local_native
         ],
     );
     let framed = frame_message(&hello_payload);
