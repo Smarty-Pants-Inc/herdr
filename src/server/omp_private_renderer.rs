@@ -251,9 +251,20 @@ fn bridge_token() -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn omp_bin() -> String {
+    std::env::var("OMP_BIN").unwrap_or_else(|_| {
+        #[cfg(test)]
+        if let Ok(executable) = std::env::current_exe() {
+            // Routing tests need a spawnable command, not an installed OMP bridge.
+            return executable.to_string_lossy().into_owned();
+        }
+        "omp".to_owned()
+    })
+}
+
 fn guest_argv(address: String, room: String, token: String) -> Vec<String> {
     vec![
-        std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_owned()),
+        omp_bin(),
         "__collab-guest-bridge".into(),
         address,
         room,
