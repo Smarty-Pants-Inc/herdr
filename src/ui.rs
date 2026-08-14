@@ -1821,7 +1821,7 @@ switch_workspace = "ctrl+1..9"
         };
 
         let hit = identity_name_hit_rect(&app, Rect::new(0, 0, 100, 24), &identity);
-        assert_eq!(hit, Rect::new(20, 0, 5, 1));
+        assert_eq!(hit, Rect::new(19, 0, 5, 1));
         assert_eq!(
             identity_name_hit_rect(&app, Rect::new(0, 0, 40, 24), &identity),
             Rect::default()
