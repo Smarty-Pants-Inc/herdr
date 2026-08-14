@@ -20,7 +20,7 @@ use crate::terminal::TerminalRuntime;
 pub(super) const OMP_RENDERER_LAUNCH_ID_ENV: &str = "HERDR_OMP_RENDERER_LAUNCH_ID";
 
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
-const FIRST_DAMAGE_TIMEOUT: Duration = Duration::from_secs(2);
+const FIRST_DAMAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) fn capabilities(
     encoding: RenderEncoding,
@@ -833,6 +833,21 @@ mod tests {
         assert!(!selected(true, true, false, false));
         assert!(!selected(true, true, true, true));
         assert!(selected(true, true, true, false));
+    }
+    #[tokio::test]
+    async fn bound_renderer_allows_cold_start_before_first_damage() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let now = Instant::now();
+        let target = renderer.target.as_mut().unwrap();
+        target.bound_at = Some(now - Duration::from_secs(3));
+        target.first_damage = false;
+        target.ready_reported = false;
+        target.promoted = false;
+        renderer.local_selected = false;
+
+        assert!(renderer.next_frame(now, (80, 24)).is_none());
+        assert!(!renderer.target.as_ref().unwrap().failed);
     }
 
     #[test]
