@@ -190,7 +190,15 @@ impl App {
                 match key.kind {
                     crossterm::event::KeyEventKind::Press => {
                         let initial_context = self.terminal_input_context();
-                        let target = self.handle_key(key.clone()).await;
+                        let target = if matches!(
+                            initial_context,
+                            Some(super::TerminalInputContext::Findr(_))
+                        ) {
+                            self.handle_findr_key(key.clone());
+                            None
+                        } else {
+                            self.handle_key(key.clone()).await
+                        };
                         let resulting_context = self.terminal_input_context();
                         let plan = self.input_leases.complete_press(
                             lease_key,
@@ -367,6 +375,7 @@ impl App {
         }
 
         changed |= self.clear_due_selection_highlight(now);
+        changed |= self.tick_findr_scan(now);
 
         self.start_git_status_refresh_if_due(now);
 
@@ -650,6 +659,7 @@ impl App {
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
+            self.findr_scan_deadline,
             self.selection_highlight_clear_deadline,
             self.next_tab_bar_status_deadline(),
             render_deadline,

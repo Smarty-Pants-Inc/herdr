@@ -1064,6 +1064,88 @@ mod tests {
         drop((first_bridge_clone, second_bridge_clone));
     }
 
+    #[test]
+    fn observer_non_mutating_omp_frame_cannot_reach_host() {
+        let mut service = OmpService::new(None).unwrap();
+        let key = OmpRouteKey {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        service.routes.host_started(key.clone()).unwrap();
+        service.routes.attach(22, &key).unwrap();
+        let observer_epoch = service
+            .routes
+            .attach(33, &key)
+            .unwrap()
+            .into_iter()
+            .find_map(|delivery| match delivery {
+                OmpRouteDelivery::Pane {
+                    client_id: 33,
+                    attachment_epoch,
+                    ..
+                } => Some(attachment_epoch),
+                _ => None,
+            })
+            .unwrap();
+        let (peer, socket) = host_socket_pair();
+        let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(1);
+        service.replace_host(
+            (
+                key.pane_id.clone(),
+                key.omp_session_id.clone(),
+                key.route_generation,
+            ),
+            7,
+            outbound,
+            socket,
+        );
+        service.bound_apps.insert(11, 33);
+
+        let frame =
+            crate::protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, br#"{"t":"hello"}"#)
+                .unwrap();
+        let messages = service.handle_event(
+            ServerEvent::OmpFrame {
+                client_id: 11,
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                attachment_epoch: observer_epoch,
+                frame,
+            },
+            true,
+            &HashMap::from([
+                (
+                    11,
+                    client(
+                        crate::server::clients::ClientConnectionMode::OmpPane,
+                        None,
+                        Some("observer"),
+                    ),
+                ),
+                (
+                    33,
+                    client(
+                        crate::server::clients::ClientConnectionMode::App,
+                        Some("Observer"),
+                        Some("observer"),
+                    ),
+                ),
+            ]),
+        );
+
+        assert!(matches!(
+            messages.as_slice(),
+            [(11, ServerMessage::OmpError { code, .. })] if code == "controller_required"
+        ));
+        assert!(matches!(
+            outbound_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(peer);
+    }
+
     fn client_with_binding(
         mode: crate::server::clients::ClientConnectionMode,
         name: Option<&str>,
