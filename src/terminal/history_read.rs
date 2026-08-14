@@ -204,7 +204,7 @@ mod tests {
                 .chars()
                 .map(|ch| ScreenTextCell {
                     wide: CellWide::Narrow,
-                    graphemes: vec![ch as u32],
+                    graphemes: Box::new([ch as u32]),
                 })
                 .collect(),
             soft_wrapped: false,
