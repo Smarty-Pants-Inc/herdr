@@ -4827,6 +4827,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pane_split_request_focuses_new_tiled_pane_after_workspace_plugin_focus() {
+        let _guard = config_env_lock().lock();
+        let original_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", exiting_test_command());
+
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-split-workspace-plugin-focus");
+        let original_pane = workspace.tabs[0].root_pane;
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 38, 22);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.focus".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_split_workspace_plugin_focus".into(),
+            method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                workspace_id: Some(workspace_id.clone()),
+                target_pane_id: None,
+                direction: crate::api::schema::SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: true,
+                right_click: Default::default(),
+                env: Default::default(),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let (_, new_pane_id) = app
+            .parse_pane_id(response["result"]["pane"]["pane_id"].as_str().unwrap())
+            .unwrap();
+
+        assert_eq!(response["result"]["pane"]["focused"], true);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), new_pane_id);
+        assert!(!app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert_eq!(app.state.mode, Mode::Terminal);
+
+        app.state.last_pane();
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), original_pane);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        match original_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    #[tokio::test]
     async fn pane_split_request_applies_ratio() {
         let _guard = config_env_lock().lock();
         let original_shell = std::env::var_os("SHELL");
