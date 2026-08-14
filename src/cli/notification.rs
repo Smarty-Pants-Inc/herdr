@@ -91,6 +91,9 @@ fn activate_notification_at_with_timeout(
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::NotificationActivator,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
         },
     )
     .map_err(notification_activation_io_error)?;

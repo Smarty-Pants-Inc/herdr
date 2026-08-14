@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+mod identity;
 mod io;
 mod keybinds;
 mod model;
@@ -10,6 +11,10 @@ mod theme;
 mod window_title;
 
 pub use self::{
+    identity::{
+        load_or_create_identity, save_identity, validate_display_name,
+        validate_frontend_profile_id, ClientIdentity,
+    },
     io::{
         config_diagnostic_summary, config_dir, config_path, load_live_config,
         remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,

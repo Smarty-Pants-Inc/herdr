@@ -37,7 +37,7 @@ impl App {
         ))
     }
 
-    pub(super) fn pane_launch_env(
+    pub(crate) fn pane_launch_env(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -49,11 +49,9 @@ impl App {
         let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
         let pane_id = self.public_pane_id(ws_idx, pane_id)?;
         Some(
-            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_identity(
-                workspace_id,
-                tab_id,
-                pane_id,
-            ),
+            crate::pane::PaneLaunchEnv::from_extra(extra_env)
+                .with_omp_bridge(self.omp_bridge.clone())
+                .with_identity(workspace_id, tab_id, pane_id),
         )
     }
 
