@@ -536,6 +536,7 @@ impl HeadlessServer {
             clients: HashMap::new(),
             private_omp_failed_routes: HashMap::new(),
             omp_service,
+            #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
             sent_window_title: None,
