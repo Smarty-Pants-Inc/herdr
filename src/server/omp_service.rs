@@ -1062,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn observer_non_mutating_omp_frame_cannot_reach_host() {
+    fn observer_non_mutating_omp_frame_reaches_host() {
         let mut service = OmpService::new(None).unwrap();
         let key = OmpRouteKey {
             pane_id: "pane".into(),
@@ -1132,14 +1132,11 @@ mod tests {
             ]),
         );
 
-        assert!(matches!(
-            messages.as_slice(),
-            [(11, ServerMessage::OmpError { code, .. })] if code == "controller_required"
-        ));
-        assert!(matches!(
-            outbound_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
+        assert!(messages.is_empty());
+        let record = outbound_rx.try_recv().unwrap();
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["fromPeer"], 33);
+        assert_eq!(record["frame"]["t"], "hello");
         drop(peer);
     }
 
