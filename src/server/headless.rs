@@ -7690,7 +7690,6 @@ mod tests {
         server.clients.insert(1, foreground);
         let mut background = test_identity_client(Some("Bea"), None);
         background.navigation = Some(background_navigation);
-        background.frontend_profile_id = Some("background-profile".into());
         background.renderer_binding_token = Some("background-binding".into());
         background.omp_renderer_capabilities.client_local_native = true;
         server.clients.insert(2, background);
