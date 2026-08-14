@@ -170,17 +170,34 @@ fn client_handshake(
 
     // Encode Hello message using bincode v2 varint format.
     // ClientMessage::Hello is variant 0.
+    let encode_option_string = |value: &str| {
+        [
+            encode_varint_u32(1),
+            encode_varint_u32(value.len() as u32),
+            value.as_bytes().to_vec(),
+        ]
+        .concat()
+    };
+    static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let display_name = encode_option_string("Test");
+    let frontend_profile_id = encode_option_string(&format!("{client_id:043}"));
+    let renderer_binding_token = encode_option_string(&format!("r{client_id:042}"));
+
     let hello_payload = encode_varint_enum(
         0,
         &[
             &encode_varint_u32(version),
             &encode_varint_u16(cols),
             &encode_varint_u16(rows),
-            &encode_varint_u32(8),  // cell_width_px
-            &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
+            &encode_varint_u32(8),   // cell_width_px
+            &encode_varint_u32(16),  // cell_height_px
+            &encode_varint_u32(0),   // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),   // ClientKeybindings::Server
+            &encode_varint_u32(0),   // ClientLaunchMode::App
+            &display_name,           // display_name: Some("Test")
+            &frontend_profile_id,    // frontend_profile_id: Some(valid token)
+            &renderer_binding_token, // renderer_binding_token: Some(valid token)
         ],
     );
     let framed = frame_message(&hello_payload);

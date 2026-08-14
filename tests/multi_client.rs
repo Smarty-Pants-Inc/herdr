@@ -102,6 +102,28 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("socket did not accept connections at {}", path.display());
 }
 
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
+fn write_test_identity(config_home: &Path) {
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("identity.toml"),
+        concat!(
+            "display_name = \"Test\"\n",
+            "frontend_profile_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "renderer_binding_token = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+        ),
+    )
+    .unwrap();
+}
+
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedHerdr {
     spawn_server_with_config(
         config_home,
@@ -117,10 +139,11 @@ fn spawn_server_with_config(
     api_socket_path: &Path,
     config: &str,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
-    fs::write(config_home.join("herdr/config.toml"), config).unwrap();
+    fs::write(config_dir.join("config.toml"), config).unwrap();
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -138,6 +161,7 @@ fn spawn_server_with_config(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -155,6 +179,7 @@ fn spawn_client_process(
     api_socket_path: &Path,
 ) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
+    write_test_identity(config_home);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -173,6 +198,7 @@ fn spawn_client_process(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -185,11 +211,7 @@ fn spawn_client_process(
 }
 
 fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
+    let app_dir = app_dir_name();
     config_home.join(app_dir).join("herdr-server.log")
 }
 
@@ -548,6 +570,20 @@ fn client_handshake(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
 
+    let encode_option_string = |value: &str| {
+        [
+            encode_varint_u32(1),
+            encode_varint_u32(value.len() as u32),
+            value.as_bytes().to_vec(),
+        ]
+        .concat()
+    };
+    static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let display_name = encode_option_string("Test");
+    let frontend_profile_id = encode_option_string(&format!("{client_id:043}"));
+    let renderer_binding_token = encode_option_string(&format!("r{client_id:042}"));
+
     // ClientMessage::Hello = variant 0
     let hello_payload = encode_varint_enum(
         0,
@@ -555,11 +591,14 @@ fn client_handshake(
             &encode_varint_u32(version),
             &encode_varint_u16(cols),
             &encode_varint_u16(rows),
-            &encode_varint_u32(8),  // cell_width_px
-            &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
+            &encode_varint_u32(8),   // cell_width_px
+            &encode_varint_u32(16),  // cell_height_px
+            &encode_varint_u32(0),   // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),   // ClientKeybindings::Server
+            &encode_varint_u32(0),   // ClientLaunchMode::App
+            &display_name,           // display_name: Some("Test")
+            &frontend_profile_id,    // frontend_profile_id: Some(valid token)
+            &renderer_binding_token, // renderer_binding_token: Some(valid token)
         ],
     );
     stream
@@ -723,7 +762,7 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let slice = remaining.min(Duration::from_millis(75));
         match read_server_variant(stream, slice) {
-            Ok(1) => return true, // ServerMessage::Frame
+            Ok(2) => return true, // ServerMessage::Frame
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,
@@ -744,7 +783,7 @@ fn wait_for_frame_matching_with_snapshots(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_message_payload(stream, slice) {
-            Ok((1, frame_payload)) => {
+            Ok((2, frame_payload)) => {
                 let frame = decode_frame_payload(&frame_payload)?;
                 if snapshots.len() == 5 {
                     snapshots.pop_front();

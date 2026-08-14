@@ -101,6 +101,8 @@ impl PaneClickState {
 
 pub struct App {
     pub state: AppState,
+    /// Server-owned OMP bridge credentials used to derive one token per managed pane.
+    pub(crate) omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -746,6 +748,7 @@ impl App {
             copy_feedback_deadline: None,
             last_api_notification_at: None,
             state,
+            omp_bridge: None,
             pane_graphics: pane_graphics::Runtime::default(),
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
             direct_graphics_available: false,
@@ -2017,6 +2020,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
     use std::rc::Rc;
+    #[cfg(windows)]
     use std::sync::Mutex;
 
     fn raw_key(
