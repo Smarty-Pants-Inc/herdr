@@ -642,6 +642,7 @@ fn parse_pane_split_args(
     let args = super::expand_equals_args(args, &["--right-click"]);
     let mut env = std::collections::HashMap::new();
     let mut pane_id = None;
+    let mut workspace_id = None;
     let mut direction = None;
     let mut ratio = None;
     let mut cwd = None;
@@ -658,6 +659,13 @@ fn parse_pane_split_args(
     }
     while index < args.len() {
         match args[index].as_str() {
+            "--workspace" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --workspace".into());
+                };
+                workspace_id = Some(super::normalize_workspace_id(value));
+                index += 2;
+            }
             "--pane" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("missing value for --pane".into());
@@ -728,15 +736,19 @@ fn parse_pane_split_args(
         }
     }
 
+    if workspace_id.is_some() && pane_id.is_some() {
+        return Err("--workspace cannot be combined with a pane selector".into());
+    }
+
     let Some(direction) = direction else {
         return Err(
-            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
+            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
                 .into(),
         );
     };
 
     Ok(PaneSplitParams {
-        workspace_id: None,
+        workspace_id,
         target_pane_id: pane_id,
         direction,
         ratio,
@@ -1684,7 +1696,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane");
     eprintln!(
-        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
+        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
     );
     eprintln!("  herdr pane swap --direction left|right|up|down [--pane ID|--current]");
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
@@ -1722,6 +1734,50 @@ mod tests {
         assert_eq!(params.direction, crate::api::schema::SplitDirection::Right);
         assert_eq!(params.ratio, Some(0.333));
         assert_eq!(params.right_click, PaneRightClickTarget::Herdr);
+    }
+
+    #[test]
+    fn parse_pane_split_args_accepts_workspace_target() {
+        let params = parse_pane_split_args(
+            &args(&["--workspace", "issue-1", "--direction", "right"]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(params.workspace_id, Some("issue-1".into()));
+        assert_eq!(params.target_pane_id, None);
+    }
+
+    #[test]
+    fn parse_pane_split_args_rejects_workspace_with_pane_selector() {
+        assert!(parse_pane_split_args(
+            &args(&["issue-1", "--workspace", "workspace-1", "--direction", "right"]),
+            None,
+        )
+        .is_err());
+        assert!(parse_pane_split_args(
+            &args(&[
+                "--pane",
+                "issue-1",
+                "--workspace",
+                "workspace-1",
+                "--direction",
+                "right",
+            ]),
+            None,
+        )
+        .is_err());
+        assert!(parse_pane_split_args(
+            &args(&[
+                "--current",
+                "--workspace",
+                "workspace-1",
+                "--direction",
+                "right",
+            ]),
+            Some("issue-1"),
+        )
+        .is_err());
     }
 
     #[test]

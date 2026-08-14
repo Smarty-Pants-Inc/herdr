@@ -59,7 +59,6 @@ impl App {
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
         let host_terminal_appearance = self.state.host_terminal_appearance;
-        let previous_focus = self.state.current_pane_focus_target();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
@@ -81,7 +80,7 @@ impl App {
                 host_terminal_appearance,
                 shell_config,
                 extra_env,
-                params.focus,
+                false,
             ),
             None => ws.split_pane(
                 target_pane_id,
@@ -94,7 +93,7 @@ impl App {
                 host_terminal_appearance,
                 shell_config,
                 extra_env,
-                params.focus,
+                false,
             ),
         };
         let (target_tab_idx, new_pane) = match split_result {
@@ -109,9 +108,8 @@ impl App {
             );
         }
         if params.focus {
-            self.state.switch_workspace_tab(ws_idx, target_tab_idx);
             self.state
-                .record_pane_focus_change(previous_focus, ws_idx, new_pane.pane_id);
+                .focus_pane_in_workspace(ws_idx, new_pane.pane_id);
             self.state.settle_terminal_mode_after_focus();
         }
         self.terminal_runtimes
