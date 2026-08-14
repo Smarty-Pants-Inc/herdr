@@ -247,13 +247,14 @@ impl App {
                 ) {
                     self.request_scroll_render();
                 }
-                if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                    self.handle_mouse(mouse);
+                let hover_changed = if self.state.popup_pane.is_some() || self.state.mouse_capture {
+                    self.handle_mouse(mouse)
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
-                }
-                changes_view
+                    false
+                };
+                changes_view || hover_changed
             }
             crate::raw_input::RawInputEvent::OuterFocusGained => {
                 #[cfg(not(windows))]

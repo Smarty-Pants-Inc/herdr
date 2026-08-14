@@ -400,6 +400,21 @@ fn compute_view_internal(
     if resize_panes {
         app.reconcile_focus_lifecycle();
     }
+    clear_hovered_link_if_stale(app);
+}
+
+fn clear_hovered_link_if_stale(app: &mut AppState) {
+    let current =
+        app.hovered_pane_cell.as_ref().is_some_and(|position| {
+            app.mode == Mode::Terminal
+                && app.view.pane_infos.iter().any(|info| {
+                    info.id == position.pane_id && info.inner_rect == position.inner_rect
+                })
+        });
+    if app.hovered_pane_cell.is_some() && !current {
+        app.hovered_pane_cell = None;
+        app.hovered_link = None;
+    }
 }
 
 fn compute_mobile_view(
@@ -468,6 +483,7 @@ fn compute_mobile_view(
     if resize_panes {
         app.reconcile_focus_lifecycle();
     }
+    clear_hovered_link_if_stale(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.
