@@ -331,6 +331,7 @@ pub(crate) enum ServerEvent {
         display_name: Option<String>,
         frontend_profile_id: Option<String>,
         renderer_binding_token: Option<String>,
+        renderer_capabilities: crate::protocol::OmpRendererCapabilities,
         writer: ClientWriter,
     },
     /// A one-shot system-notification callback selected this target.
@@ -419,6 +420,8 @@ pub(crate) enum ServerEvent {
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
+    /// The App displayed the first frame for an exact client-local renderer launch.
+    OmpRendererReady { client_id: u64, launch_id: u64 },
     /// A client attached to an OMP logical pane.
     OmpPaneAttach {
         client_id: u64,
@@ -427,6 +430,7 @@ pub(crate) enum ServerEvent {
         route_generation: u64,
         target_app_client_id: Option<u64>,
         renderer_capabilities: crate::protocol::OmpRendererCapabilities,
+        renderer_launch_id: Option<u64>,
         renderer_request: crate::protocol::OmpRendererRequest,
     },
     /// A client detached from one OMP logical pane attachment.
@@ -654,6 +658,7 @@ pub(crate) fn handle_client_handshake(
         display_name,
         frontend_profile_id,
         renderer_binding_token,
+        renderer_capabilities,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -667,6 +672,7 @@ pub(crate) fn handle_client_handshake(
             display_name,
             frontend_profile_id,
             renderer_binding_token,
+            renderer_capabilities,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -723,6 +729,15 @@ pub(crate) fn handle_client_handshake(
             let display_name = (launch_mode != ClientLaunchMode::OmpPane)
                 .then_some(display_name)
                 .flatten();
+            let renderer_capabilities = if matches!(
+                launch_mode,
+                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+            ) && requested_encoding == RenderEncoding::SemanticFrame
+            {
+                renderer_capabilities
+            } else {
+                crate::protocol::OmpRendererCapabilities::default()
+            };
             (
                 clamped_cols,
                 clamped_rows,
@@ -734,6 +749,7 @@ pub(crate) fn handle_client_handshake(
                 display_name,
                 frontend_profile_id,
                 renderer_binding_token,
+                renderer_capabilities,
             )
         }
         _ => {
@@ -851,6 +867,7 @@ pub(crate) fn handle_client_handshake(
         display_name,
         frontend_profile_id,
         renderer_binding_token,
+        renderer_capabilities,
         writer,
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
@@ -1160,6 +1177,7 @@ fn client_read_loop(
                 target_app_client_id,
                 renderer_capabilities,
                 renderer_request,
+                renderer_launch_id,
             } => ServerEvent::OmpPaneAttach {
                 client_id,
                 pane_id,
@@ -1168,6 +1186,7 @@ fn client_read_loop(
                 target_app_client_id,
                 renderer_capabilities,
                 renderer_request,
+                renderer_launch_id,
             },
             ClientMessage::OmpPaneDetach {
                 pane_id,
@@ -1208,6 +1227,10 @@ fn client_read_loop(
                 route_generation,
                 attachment_epoch,
                 frame,
+            },
+            ClientMessage::OmpRendererReady { launch_id } => ServerEvent::OmpRendererReady {
+                client_id,
+                launch_id,
             },
             ClientMessage::IdentityPersistenceAck {
                 request_id,
@@ -1309,6 +1332,7 @@ mod tests {
                     client_local_native: true,
                 },
                 renderer_request: crate::protocol::OmpRendererRequest::Independent,
+                renderer_launch_id: Some(9),
             },
         )
         .unwrap();
@@ -1319,6 +1343,18 @@ mod tests {
                 client_id: 7,
                 target_app_client_id: Some(42),
                 ..
+            }
+        ));
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::OmpRendererReady { launch_id: 9 },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "OMP renderer ready event"),
+            ServerEvent::OmpRendererReady {
+                client_id: 7,
+                launch_id: 9,
             }
         ));
         drop(client_stream);
@@ -1635,6 +1671,7 @@ new_tab = "ctrl+notakey"
                 display_name: None,
                 frontend_profile_id: None,
                 renderer_binding_token: None,
+                renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             },
         )
         .expect("write hello");
@@ -1672,6 +1709,7 @@ new_tab = "ctrl+notakey"
                 display_name,
                 frontend_profile_id,
                 renderer_binding_token,
+                renderer_capabilities,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1685,6 +1723,10 @@ new_tab = "ctrl+notakey"
                 assert!(display_name.is_none());
                 assert!(frontend_profile_id.is_none());
                 assert!(renderer_binding_token.is_none());
+                assert_eq!(
+                    renderer_capabilities,
+                    crate::protocol::OmpRendererCapabilities::default()
+                );
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1723,6 +1765,7 @@ new_tab = "ctrl+notakey"
                 display_name: None,
                 frontend_profile_id: None,
                 renderer_binding_token: None,
+                renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             },
         )
         .expect("write hello");
@@ -1791,6 +1834,7 @@ new_tab = "ctrl+notakey"
                     display_name: None,
                     frontend_profile_id: None,
                     renderer_binding_token: None,
+                    renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
                 },
             )
             .expect("write activator hello");

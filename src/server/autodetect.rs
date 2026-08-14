@@ -128,6 +128,8 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         launch_mode: crate::protocol::ClientLaunchMode::App,
         display_name: None,
         frontend_profile_id: None,
+        renderer_binding_token: None,
+        renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {

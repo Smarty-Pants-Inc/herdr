@@ -234,8 +234,8 @@ fn accept_omp_guest(
     }
 }
 
-/// Runs the hidden OMP logical-pane client. The spawned OMP guest owns stdin,
-/// stdout, terminal sizing, and rendering; Herdr carries only semantic frames.
+/// Runs the hidden OMP logical-pane client inside its App-owned local PTY.
+/// Its inherited stdio belongs to that PTY, never to the App's real terminal.
 pub(super) fn run(
     pane_id: String,
     omp_session_id: String,
@@ -256,6 +256,9 @@ pub(super) fn run(
         &super::load_client_identity_or_exit(),
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
+    let renderer_launch_id = std::env::var(super::omp_renderer::OMP_RENDERER_LAUNCH_ID_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     write_to_server(
         &mut stream,
         &ClientMessage::OmpPaneAttach {
@@ -264,9 +267,10 @@ pub(super) fn run(
             route_generation,
             target_app_client_id,
             renderer_capabilities: OmpRendererCapabilities {
-                client_local_native: true,
+                client_local_native: renderer_launch_id.is_some(),
             },
             renderer_request: OmpRendererRequest::Independent,
+            renderer_launch_id,
         },
     )?;
 
