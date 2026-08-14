@@ -68,8 +68,6 @@ impl App {
             return None;
         }
 
-        self.state.clear_selection();
-        self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
 
         if let Some(action) =
@@ -82,6 +80,10 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct keybinding before forwarding to pane"
             );
+            if action != super::navigate::NavigateAction::Findr {
+                self.state.clear_selection();
+                self.selection_autoscroll_deadline = None;
+            }
             if action == super::navigate::NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
@@ -89,6 +91,9 @@ impl App {
             }
             return None;
         }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
 
         if let Some(binding) = super::navigate::command_for_key(
             &self.state,
@@ -114,6 +119,8 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct indexed keybinding before forwarding to pane"
             );
+            self.state.clear_selection();
+            self.selection_autoscroll_deadline = None;
             self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
             return None;
         }
@@ -1963,6 +1970,19 @@ mod tests {
         )
     }
 
+    fn physical_up(repeat_count: u16) -> TerminalKey {
+        TerminalKey::new(KeyCode::Up, KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count,
+                virtual_key_code: 0x26,
+                virtual_scan_code: 0x48,
+                unicode: 0,
+                control_key_state: 0x0100,
+            },
+        )
+    }
+
     #[tokio::test]
     async fn page_up_scrolls_plain_shell_pane() {
         let (mut app, pane_id, pane_info) = app_with_plain_scrollback(64);
@@ -2007,6 +2027,95 @@ mod tests {
             pane_scroll_offset(&app, pane_id),
             pane_info.inner_rect.height as usize * 5
         );
+    }
+
+    #[tokio::test]
+    async fn findr_scroll_keys_preserve_separate_and_grouped_repeats() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(256);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let up = physical_up(1);
+
+        assert_eq!(
+            app.terminal_input_context(),
+            Some(crate::app::TerminalInputContext::Findr(pane_id))
+        );
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(up.clone())],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 1);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_kind(KeyEventKind::Repeat),
+            )],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 2);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_repeat_count(3),
+            )],
+            false,
+        );
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.with_repeat_count(1).with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 5);
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_findr_scroll_keys_preserve_separate_and_grouped_repeats() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(256);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let up = physical_up(1);
+
+        for key in [
+            up.clone(),
+            up.clone().with_kind(KeyEventKind::Repeat),
+            up.clone().with_kind(KeyEventKind::Release),
+            up.clone().with_repeat_count(3),
+            up.with_kind(KeyEventKind::Release),
+        ] {
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+                .await;
+        }
+
+        assert_eq!(pane_scroll_offset(&app, pane_id), 5);
+        assert!(app.input_leases.is_empty());
+    }
+    #[tokio::test]
+    async fn native_grouped_findr_character_repeats_append_query_text() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(64);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let key = TerminalKey::new(KeyCode::Char('a'), KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 3,
+                virtual_key_code: 0x41,
+                virtual_scan_code: 0x1e,
+                unicode: 'a' as u16,
+                control_key_state: 0,
+            },
+        );
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+            .await;
+
+        assert_eq!(app.state.findr.as_ref().unwrap().query, "aaa");
     }
 
     #[tokio::test]
