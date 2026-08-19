@@ -1132,6 +1132,7 @@ impl HeadlessServer {
                     id: id.to_string(),
                     method,
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -5396,7 +5397,10 @@ impl HeadlessServer {
             })
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_after_internal_events_drained_with_context(
+                    msg.request,
+                    msg.context,
+                )
         };
         changed |= self.reconcile_omp_renderers();
         if let Some(snapshot) = frozen_alt_screen_read {
@@ -7340,6 +7344,113 @@ mod tests {
         assert_eq!(server.effective_size, server.headless_size);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("headless-input-guard");
+        let source_pane = workspace.tabs[0].root_pane;
+        let target_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let source_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .cloned()
+            .expect("source terminal");
+        let target_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(target_pane)
+            .cloned()
+            .expect("target terminal");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source state")
+            .set_agent_name("source-agent".into());
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source state")
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&target_terminal_id)
+            .expect("target state")
+            .set_agent_name("target-agent".into());
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&target_terminal_id)
+            .expect("target state")
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+
+        let (source_runtime, _source_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        source_runtime.test_set_child_pid(std::process::id());
+        server
+            .app
+            .terminal_runtimes
+            .insert(source_terminal_id.clone(), source_runtime);
+        let (target_runtime, mut target_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(target_terminal_id, target_runtime);
+
+        let workspace_id = server.app.state.workspaces[0].id.clone();
+        let pane_number = server.app.state.workspaces[0]
+            .public_pane_number(target_pane)
+            .expect("target pane number");
+        let target_pane_id =
+            crate::workspace::public_pane_id_for_number(&workspace_id, pane_number);
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "headless-cross-pane".into(),
+                method: api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+                    pane_id: target_pane_id,
+                    text: "blocked".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            context: api::ApiRequestContext {
+                local_peer_pid: Some(std::process::id()),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+
+        let response: api::schema::ErrorResponse =
+            serde_json::from_str(&response_rx.recv().expect("headless response")).unwrap();
+        assert_eq!(response.error.code, "cross_pane_input_denied");
+        assert!(target_rx.try_recv().is_err());
+        server
+            .app
+            .terminal_runtimes
+            .get(&source_terminal_id)
+            .expect("source runtime")
+            .test_set_child_pid(0);
+        shutdown_test_runtimes(&mut server);
+    }
+
     #[tokio::test]
     async fn headless_api_reads_latest_title_without_spinner_event_flooding() {
         let event_hub = api::EventHub::default();
@@ -7409,6 +7520,7 @@ mod tests {
                 id: "list-titles".into(),
                 method: api::schema::Method::PaneList(api::schema::PaneListParams::default()),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -7491,6 +7603,7 @@ mod tests {
                         pane_id: new_route.clone(),
                     }),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -8384,6 +8497,7 @@ mod tests {
                     id: "headless_stop_after_events".into(),
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -15510,6 +15624,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -15601,6 +15716,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -15656,6 +15772,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -15689,6 +15806,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -15727,6 +15845,7 @@ next_tab = ""
                         },
                     ),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -15784,6 +15903,7 @@ next_tab = ""
                         },
                     ),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -16279,6 +16399,7 @@ next_tab = ""
                     agent_session_path: None,
                 }),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
