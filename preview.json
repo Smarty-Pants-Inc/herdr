@@ -2,35 +2,65 @@
   "schema_version": 1,
   "channel": "preview",
   "base_version": "0.8.0",
-  "build_id": "2026-08-14-45ce2f409598",
-  "commit": "45ce2f40959823f3884060635c596c35c74de8a6",
-  "built_at": "2026-08-14T10:22:18-04:00",
+  "build_id": "2026-08-18-46525b2ba32a",
+  "commit": "46525b2ba32ac36bb06bceb0072838e6f2facaee",
+  "built_at": "2026-08-18T22:03:24-04:00",
   "protocol": 25,
-  "notes": "Smarty preview build 2026-08-14-45ce2f409598\n\nBuilt from 45ce2f40959823f3884060635c596c35c74de8a6.",
+  "notes": "Smarty preview build 2026-08-18-46525b2ba32a\n\nBuilt from 46525b2ba32ac36bb06bceb0072838e6f2facaee.",
   "assets": {
     "linux-x86_64": {
-      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-14-45ce2f409598/herdr-linux-x86_64",
-      "sha256": "a7bc0885b86285bee6b33bb4fdd3a8852008c3effac490b90a4e4ee81e1bc311"
+      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-linux-x86_64",
+      "sha256": "d1147dc959ee961675a8ff5e4e2b4fb81ef080692e020dc77c8ff350fc06208d"
     },
     "linux-aarch64": {
-      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-14-45ce2f409598/herdr-linux-aarch64",
-      "sha256": "d0a23972afb622dbd310aacb195732609e3ed5a58b3d9a39a22da17719da02d2"
+      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-linux-aarch64",
+      "sha256": "7ce62c9ec4aa28cb416115fb6c6282c1b47953de64b65d413bb134b0ea4daae4"
     },
     "macos-x86_64": {
-      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-14-45ce2f409598/herdr-macos-x86_64",
-      "sha256": "2b5bd60629955a17e7c3defcd7f561e0a2d7dd1f66a15087da574c5ed252ea14"
+      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-macos-x86_64",
+      "sha256": "0c99d7f2ff6d010f43f179953334d5a0585f8f862d140654da7e1b3c065f8909"
     },
     "macos-aarch64": {
-      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-14-45ce2f409598/herdr-macos-aarch64",
-      "sha256": "ed9c98ee3c49c4be52b87292d6d6d50770f7d6f8e681e3364aed160633a983b6"
+      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-macos-aarch64",
+      "sha256": "65fa76143f767b5f8a4c1b16290ce357e8bce419232cb61719375aca520bd8dc"
     },
     "windows-x86_64": {
-      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-14-45ce2f409598/herdr-windows-x86_64.zip",
-      "sha256": "7adb12761379cdcb7525b77e4c3b32e997a138fe5f81fad53e45f8778889a489",
+      "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-windows-x86_64.zip",
+      "sha256": "e677288b7d55433a370138aab8cb5f61cb93b8e49ddb739966ae66b1a702aab9",
       "format": "zip"
     }
   },
   "builds": {
+    "2026-08-18-46525b2ba32a": {
+      "base_version": "0.8.0",
+      "commit": "46525b2ba32ac36bb06bceb0072838e6f2facaee",
+      "built_at": "2026-08-18T22:03:24-04:00",
+      "protocol": 25,
+      "tag": "smarty-preview-2026-08-18-46525b2ba32a",
+      "assets": {
+        "linux-x86_64": {
+          "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-linux-x86_64",
+          "sha256": "d1147dc959ee961675a8ff5e4e2b4fb81ef080692e020dc77c8ff350fc06208d"
+        },
+        "linux-aarch64": {
+          "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-linux-aarch64",
+          "sha256": "7ce62c9ec4aa28cb416115fb6c6282c1b47953de64b65d413bb134b0ea4daae4"
+        },
+        "macos-x86_64": {
+          "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-macos-x86_64",
+          "sha256": "0c99d7f2ff6d010f43f179953334d5a0585f8f862d140654da7e1b3c065f8909"
+        },
+        "macos-aarch64": {
+          "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-macos-aarch64",
+          "sha256": "65fa76143f767b5f8a4c1b16290ce357e8bce419232cb61719375aca520bd8dc"
+        },
+        "windows-x86_64": {
+          "url": "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-2026-08-18-46525b2ba32a/herdr-windows-x86_64.zip",
+          "sha256": "e677288b7d55433a370138aab8cb5f61cb93b8e49ddb739966ae66b1a702aab9",
+          "format": "zip"
+        }
+      }
+    },
     "2026-08-14-45ce2f409598": {
       "base_version": "0.8.0",
       "commit": "45ce2f40959823f3884060635c596c35c74de8a6",
