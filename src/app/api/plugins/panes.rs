@@ -79,12 +79,13 @@ impl App {
             );
         }
         let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env.clone(), &context)
+            {
                 Ok(env) => env,
                 Err((code, message)) => return encode_error(id, &code, message),
             };
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let width = params.width.or(pane.width);
         if let Err(err) = self.spawn_workspace_plugin_argv_command(
             workspace_id.clone(),

@@ -3250,6 +3250,19 @@ mod tests {
     }
 
     #[test]
+    fn pane_launch_env_removes_requested_variables() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("BUN_OPTIONS", "--preload=attacker.ts");
+
+        apply_pane_launch_env(
+            &mut cmd,
+            &PaneLaunchEnv::default().without_env("BUN_OPTIONS"),
+        );
+
+        assert!(cmd.get_env("BUN_OPTIONS").is_none());
+    }
+
+    #[test]
     fn omp_bridge_token_is_scoped_to_managed_pane_identity() {
         let bridge = OmpBridgeEnv::generate("127.0.0.1:12345".into()).unwrap();
         let launch = PaneLaunchEnv::default()

@@ -423,6 +423,24 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> Self {
+        Self::new_with_omp_bridge(
+            config,
+            no_session,
+            config_diagnostic,
+            api_rx,
+            event_hub,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_omp_bridge(
+        config: &Config,
+        no_session: bool,
+        config_diagnostic: Option<String>,
+        api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+        event_hub: crate::api::EventHub,
+        omp_bridge: Option<crate::pane::OmpBridgeEnv>,
+    ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
@@ -465,6 +483,7 @@ impl App {
                 &config.terminal.default_shell,
                 config.terminal.shell_mode,
                 config.session.resume_agents_on_restore,
+                omp_bridge.clone(),
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -788,7 +807,7 @@ impl App {
             copy_feedback_deadline: None,
             last_api_notification_at: None,
             state,
-            omp_bridge: None,
+            omp_bridge,
             pane_graphics: pane_graphics::Runtime::default(),
             pane_graphics_files: Arc::new(crate::pane_graphics_files::FileStore::default()),
             direct_graphics_available: false,

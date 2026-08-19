@@ -86,10 +86,18 @@ fn platform_state_dir() -> PathBuf {
 
 #[cfg(not(windows))]
 fn platform_state_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
+    platform_state_dir_for_home(std::env::var("HOME").ok().as_deref())
+}
+
+#[cfg(not(windows))]
+fn platform_state_dir_for_home(home: Option<&str>) -> PathBuf {
+    if let Some(home) = home {
         PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
     } else {
-        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+        // The temporary directory is shared; the UID keeps one user from precreating
+        // another user's managed state root.
+        let uid = unsafe { libc::geteuid() };
+        std::env::temp_dir().join(format!("{}-state-{uid}", app_dir_name()))
     }
 }
 
@@ -724,6 +732,17 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn homeless_state_directory_is_scoped_to_effective_user() {
+        let path = platform_state_dir_for_home(None);
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(format!("{}-state-{uid}", app_dir_name()).as_str())
+        );
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
