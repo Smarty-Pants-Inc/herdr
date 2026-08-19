@@ -15,7 +15,7 @@ test "${HERDR_ENV:-}" = 1
 
 If the check fails, say that you are not running inside Herdr and stop. Do not inspect or control the focused Herdr session from outside Herdr.
 
-When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, create terminal layout, start agents and commands, read output, and wait for state changes.
+When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, read output, and wait for state changes. Create layout or issue terminal control only when the user or operator explicitly authorized that action.
 
 ## Learn the current CLI
 
@@ -119,16 +119,20 @@ herdr worktree open --cwd /absolute/main-checkout --path /absolute/existing-work
 
 ## Coordinate existing top-level agents
 
-When `HERDR_ENV=1`, use Herdr for requests such as "ask the main agent", "tell the other agent", or "work with that agent", even when the user did not name Herdr. These are cross-session coordination, not ordinary delegation. OMP `hub` sees only peers in the current OMP session; an empty hub roster does not prove no sibling Herdr agents exist. Never start another terminal manager as a fallback.
+Use Herdr to discover and observe top-level agents, but use the coordination transport provided by the current agent runtime or session for normal peer requests, replies, handoffs, and steering. Herdr does not define a peer-message transport.
 
 1. Run `herdr agent list`; select candidates by verified cwd, workspace, and terminal title.
 2. Run `herdr agent get <target>` and `herdr agent read <target> --source recent-unwrapped --lines 120` to verify the exact repository, worktree, process, and task.
-3. If the recipient must finish its current turn first, run `herdr agent wait <target> --timeout <ms>` and inspect any `blocked` state. Then use `herdr agent prompt <target> "<message>" --wait --timeout <ms>`.
-4. Confirm delivery or response from fresh `agent get` and `agent read` state. A successful send proves transport only.
+3. Address the verified recipient through the available coordination transport and follow that transport's delivery and reply semantics.
+4. Use fresh `agent get`, `agent read`, or `agent wait` state when terminal evidence is needed. A successful transport send proves delivery only according to that transport's contract.
 
-If no matching target exists, start one through Herdr only when the user asked to spawn it or the task explicitly requires an owner in that checkout. Do not substitute an OMP subagent, raw terminal injection, or Orca session.
+If no suitable coordination transport is available, report that limitation. Do not fall back to `agent prompt`, `agent send-keys`, `agent start`, `pane send-text`, `pane send-keys`, or `pane run` for routine peer messaging. Those commands write content into a terminal and are reserved for explicitly authorized recovery or control below.
 
-## Start and coordinate an agent
+If no matching target exists, start one through Herdr only when the user explicitly asked to spawn it or authorized that exact control action. Do not substitute another terminal manager or raw terminal injection.
+
+## Explicitly authorized start, recovery, and control
+
+The commands in this section write content into another pane. Use them only when the direct user or operator instruction authorizes the exact target and action. For an attributed agent caller, pass `--allow-cross-pane` on that request; the flag records the deliberate override but does not create authorization by itself.
 
 Default to a sibling pane in the current tab and the current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.
 
@@ -149,13 +153,13 @@ Replace `right` with `down` when appropriate. Read the new pane ID from `.result
 An available shell pane must be at its interactive prompt, with the shell itself in the foreground and no foreground command, editor, or agent running. Start a supported agent in that pane with a useful unique name:
 
 ```bash
-herdr agent start reviewer --kind codex --pane <returned-pane-id>
+herdr agent start reviewer --kind codex --pane <returned-pane-id> --allow-cross-pane
 ```
 
 Use the kind requested by the user. Run `herdr agent --help` to inspect the installed kind list and options. Pass native agent arguments only after `--`:
 
 ```bash
-herdr agent start reviewer --kind codex --pane <returned-pane-id> -- <agent-args...>
+herdr agent start reviewer --kind codex --pane <returned-pane-id> --allow-cross-pane -- <agent-args...>
 ```
 
 A successful `agent start` returns only after Herdr detects the expected agent in the same pane and considers it ready for interactive input. If the agent is blocked during startup, the command returns `agent_not_ready` immediately but keeps the name available for `agent read` and `agent send-keys`. Wait until the agent becomes idle before prompting it. Startup defaults to a 30-second timeout.
@@ -169,7 +173,7 @@ For a terminal-manager migration, use the exact absolute OMP session JSONL path 
 3. Start the resumed session in the destination pane:
 
 ```bash
-herdr agent start <name> --kind omp --pane <pane-id> -- --resume /absolute/path/to/session.jsonl --cwd /absolute/destination/worktree
+herdr agent start <name> --kind omp --pane <pane-id> --allow-cross-pane -- --resume /absolute/path/to/session.jsonl --cwd /absolute/destination/worktree
 ```
 
 If multiple source processes share one JSONL but hold distinct in-memory branches, do not resume the shared path twice. Quiesce them one at a time, append a unique handoff marker, then run `/fork` inside that source OMP process before `/exit`. Source-side `/fork` atomically writes the exact in-memory branch to a new session file, even if a sibling process replaced the original path and left this process writing an unlinked inode. Record the `Session forked to ...` path and resume that new file in Herdr with `--resume`.
@@ -177,20 +181,20 @@ If multiple source processes share one JSONL but hold distinct in-memory branche
 If a source process is already gone and the remaining on-disk shared file is verified to represent that branch, ensure no process has it open, then use Herdr `--fork` once for that branch:
 
 ```bash
-herdr agent start <name> --kind omp --pane <pane-id> -- --fork /absolute/path/to/shared-session.jsonl --cwd /absolute/destination/worktree
+herdr agent start <name> --kind omp --pane <pane-id> --allow-cross-pane -- --fork /absolute/path/to/shared-session.jsonl --cwd /absolute/destination/worktree
 ```
 
 Verify every destination session path differs from the shared source and from the other branches before migrating the next one.
 
 4. Verify `herdr agent get <name>` reports the expected session path, then read the agent and confirm its transcript marker before treating the migration as complete.
 
-Submit work through the agent surface:
+For an explicitly authorized recovery or control step, submit terminal input through the agent surface:
 
 ```bash
-herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
+herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000 --allow-cross-pane
 ```
 
-`agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending any input. Inspect the blocked UI and ask the user before answering it. For normal agent work, `--wait` is enough: it waits for the first settled `idle`, `done`, or `blocked` state. Do not repeat those defaults with `--until`.
+`agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending input. Inspect the blocked UI and ask the user before answering it. For this explicitly authorized control path, `--wait` waits for the first settled `idle`, `done`, or `blocked` state reached after an accepted submission. Do not repeat those defaults with `--until`.
 
 A prompt sent from a non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
 
@@ -202,11 +206,11 @@ herdr agent wait reviewer --until blocked --timeout 120000
 
 Without `--until`, standalone `agent wait` uses the same settled-state defaults as `agent prompt --wait`.
 
-Use logical keys for interactive agent UI controls:
+For an explicitly authorized interactive recovery, use logical keys:
 
 ```bash
-herdr agent send-keys reviewer esc
-herdr agent send-keys reviewer ctrl+c
+herdr agent send-keys reviewer esc --allow-cross-pane
+herdr agent send-keys reviewer ctrl+c --allow-cross-pane
 ```
 
 Herdr validates all keys before writing any bytes. Read the result through the resolved agent:
@@ -216,9 +220,11 @@ herdr agent get reviewer
 herdr agent read reviewer --source recent-unwrapped --lines 120
 ```
 
-If a wait fails or returns `blocked`, inspect `agent get` and `agent read` before deciding what input to send. Use the pane surface only when raw terminal control is intentional.
+If a wait fails or returns `blocked`, inspect `agent get` and `agent read` before deciding whether the authorized recovery requires more input. Use the pane surface only when raw terminal control was explicitly authorized.
 
-## Run an ordinary command in another pane
+## Explicitly authorized command execution in another pane
+
+This is a control path, not a peer-coordination transport. Confirm the exact target pane and command before sending input.
 
 Create a sibling pane with the same geometry rule, preserve the caller's working directory, and keep user focus unchanged:
 
@@ -229,7 +235,7 @@ herdr pane split --current --direction right --cwd "$PWD" --no-focus
 Read the new pane ID from `.result.pane.pane_id`, then run and inspect the command:
 
 ```bash
-herdr pane run <returned-pane-id> "just test"
+herdr pane run <returned-pane-id> "just test" --allow-cross-pane
 herdr pane wait-output <returned-pane-id> --match "test result" --timeout 120000
 herdr pane read <returned-pane-id> --source recent-unwrapped --lines 120
 ```
@@ -247,10 +253,11 @@ Use `--format ansi` when colors and terminal styling are evidence. Otherwise use
 
 `--lines` asks Herdr for more rows from the pane's available screen and host scrollback. If increasing it does not reveal more of a completed response, the pane is probably running the agent on the terminal's alternate screen. Rows that leave the alternate screen do not enter Herdr's host scrollback, so a larger line count cannot recover them.
 
-After that failed read, ask the agent to write its complete response as Markdown in a temporary directory and reply only with the file path, then read the file directly. Use this only as a fallback; do not request file output in the initial prompt.
+After that failed read, use the normal coordination transport to ask the agent to write its complete response as Markdown in a temporary directory and reply only with the file path, then read the file directly. Do not fall back to terminal injection solely to recover output.
 
 ## Safety and coordination rules
 
+- Cross-pane `agent start`, `agent prompt`, `agent send-keys`, `pane send-text`, `pane send-keys`, and `pane run` are denied for attributed agent callers by default. Use `--allow-cross-pane` only for the exact explicitly authorized recovery or control action; the flag is not authorization.
 - Use `--no-focus` for background work unless the user asked to switch context.
 - Use `--current`, an explicit pane ID, or a unique agent name. Do not rely on another client's focused pane.
 - Parse IDs from JSON responses. Do not derive them from sidebar order or examples.

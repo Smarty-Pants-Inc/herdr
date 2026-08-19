@@ -254,12 +254,18 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysParams {
     pub pane_id: String,
     pub keys: Vec<String>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -269,6 +275,9 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
