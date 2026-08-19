@@ -222,7 +222,9 @@ impl ClientNavigationState {
         let previous_pane_focus = valid_previous_focus(state, self.previous_pane_focus.as_ref())
             .or_else(|| valid_previous_focus(state, canonical.previous_pane_focus.as_ref()))
             .or(current.previous_pane_focus);
-        let focused_workspace_plugin_pane =
+        // `None` is an intentional unfocused state, not a missing value: falling
+        // back to canonical focus makes Escape appear to do nothing in a client.
+        let focused_workspace_plugin_pane = if self.focused_workspace_plugin_pane.is_some() {
             valid_workspace_plugin_pane(state, self.focused_workspace_plugin_pane.as_ref())
                 .or_else(|| {
                     valid_workspace_plugin_pane(
@@ -230,7 +232,10 @@ impl ClientNavigationState {
                         canonical.focused_workspace_plugin_pane.as_ref(),
                     )
                 })
-                .or(current.focused_workspace_plugin_pane);
+                .or(current.focused_workspace_plugin_pane)
+        } else {
+            None
+        };
         let findr = self.findr.as_ref().and_then(|(public_pane_id, findr)| {
             findr_pane_id(state, public_pane_id).map(|pane_id| {
                 let mut findr = findr.clone();
@@ -1179,6 +1184,20 @@ mod navigation_tests {
             .active_tab_by_workspace
             .keys()
             .all(|workspace_id| workspace_id.as_str() == state.workspaces[0].id.as_str()));
+    }
+    #[test]
+    fn explicit_unfocused_workspace_plugin_does_not_fall_back_to_canonical() {
+        let mut state = navigation_state();
+        let canonical = ClientNavigationState::capture(&state);
+        for pane in state.workspace_plugin_panes.values_mut() {
+            pane.focused = false;
+        }
+
+        let client_navigation = ClientNavigationState::capture(&state);
+        assert!(client_navigation.focused_workspace_plugin_pane.is_none());
+        let reconciled = client_navigation.reconciled(&state, &canonical);
+
+        assert!(reconciled.focused_workspace_plugin_pane.is_none());
     }
 }
 
