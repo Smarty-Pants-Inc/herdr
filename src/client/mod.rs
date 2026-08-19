@@ -55,6 +55,8 @@ use crate::protocol::{
 use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+const MOUSE_SHAPE_POINTER_SEQUENCE: &[u8] = b"\x1b]22;pointer\x1b\\";
+const MOUSE_SHAPE_DEFAULT_SEQUENCE: &[u8] = b"\x1b]22;default\x1b\\";
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -70,6 +72,50 @@ struct ClientLoopConfig {
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     #[cfg(unix)]
     omp_executable: Option<crate::update::OmpExecutable>,
+}
+#[derive(Default)]
+struct MousePointerState {
+    cell: Option<(u16, u16)>,
+    link_active: bool,
+}
+
+impl MousePointerState {
+    fn observe_raw_events(&mut self, events: &[crate::raw_input::RawInputEvent]) {
+        for event in events {
+            match event {
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    self.cell = Some((mouse.column, mouse.row));
+                }
+                crate::raw_input::RawInputEvent::OuterFocusLost => self.cell = None,
+                _ => {}
+            }
+        }
+    }
+
+    fn set_cell(&mut self, cell: Option<(u16, u16)>) {
+        self.cell = cell;
+    }
+
+    fn write_for_frame(
+        &mut self,
+        writer: &mut impl io::Write,
+        frame: Option<&crate::protocol::FrameData>,
+    ) -> io::Result<()> {
+        let link_active = self.cell.is_some_and(|(column, row)| {
+            frame.is_some_and(|frame| render_ansi::frame_has_hyperlink_at(frame, column, row))
+        });
+        if link_active == self.link_active {
+            return Ok(());
+        }
+        writer.write_all(if link_active {
+            MOUSE_SHAPE_POINTER_SEQUENCE
+        } else {
+            MOUSE_SHAPE_DEFAULT_SEQUENCE
+        })?;
+        writer.flush()?;
+        self.link_active = link_active;
+        Ok(())
+    }
 }
 
 /// State tracking for the thin client.
@@ -109,6 +155,8 @@ struct ClientState {
     reported_cell_size_px: (u32, u32),
     /// Detached URL opener children owned until they exit.
     detached_process_children: Vec<std::process::Child>,
+    /// Client-local mouse position and emitted OSC 22 hyperlink shape.
+    mouse_pointer: MousePointerState,
     /// App-owned full-surface OMP renderer, when this Unix client advertised support.
     #[cfg(unix)]
     omp_renderer: omp_renderer::ClientOmpRenderer,
@@ -254,6 +302,11 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
+    }
+
+    fn write_mouse_pointer_shape(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
+        self.mouse_pointer
+            .write_for_frame(writer, self.blit_encoder.last_frame())
     }
 }
 
@@ -491,7 +544,8 @@ fn write_terminal_restore_postlude(
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
         )?;
     }
-    // Restore a visible cursor and reset DECSCUSR back to the terminal default.
+    // Restore the terminal-default pointer, a visible cursor, and default DECSCUSR shape.
+    writer.write_all(MOUSE_SHAPE_DEFAULT_SEQUENCE)?;
     writer.write_all(b"\x1b[?25h\x1b[0 q")?;
     writer.flush()
 }
@@ -1820,8 +1874,9 @@ fn display_semantic_surface(
         &[]
     };
     let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-    let _ = stdout.flush();
     state.blit_encoder.commit(frame_data, encoded);
+    let _ = state.write_mouse_pointer_shape(&mut stdout);
+    let _ = stdout.flush();
     state.repaint_pending = false;
 }
 
@@ -1907,6 +1962,7 @@ async fn run_client_loop(
         draw_host_cursor,
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
         detached_process_children: Vec::new(),
+        mouse_pointer: MousePointerState::default(),
         #[cfg(unix)]
         omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
     };
@@ -2064,6 +2120,8 @@ async fn run_client_loop(
                     (data, None)
                 } else {
                     let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    state.mouse_pointer.observe_raw_events(&events);
+                    let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
                         state.redraw_on_focus_gained,
@@ -2128,6 +2186,10 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
+                let cell =
+                    crate::input::mouse::parse_report(&data).and_then(|(x, y)| geometry.cell(x, y));
+                state.mouse_pointer.set_cell(cell);
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 if let Some(message) = state.omp_renderer.route_pixel_input(data, geometry) {
                     if let Err(err) = write_to_server(&mut write_stream, &message) {
                         return Err(ClientError::ConnectionLost(err));
@@ -2161,6 +2223,8 @@ async fn run_client_loop(
                     .iter()
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect::<Vec<_>>();
+                state.mouse_pointer.observe_raw_events(&raw_events);
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 if crate::raw_input::events_require_host_surface_redraw(
                     &raw_events,
                     state.redraw_on_focus_gained,
@@ -2431,6 +2495,10 @@ async fn run_client_loop(
                         }
                     }
                     state.mouse_capture_active = enabled;
+                    if !enabled {
+                        state.mouse_pointer.set_cell(None);
+                        let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                    }
                     host_mouse_capture_active.store(enabled, Ordering::Release);
                     host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
                 }
@@ -3990,10 +4058,53 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_postlude_restores_visible_default_cursor() {
+    fn mouse_pointer_shape_tracks_link_cells_without_repeating_output() {
+        let frame = crate::protocol::FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: " ".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                },
+                crate::protocol::CellData {
+                    symbol: "L".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: Some(0),
+                },
+            ],
+            width: 2,
+            height: 1,
+            cursor: None,
+            hyperlinks: vec!["https://example.com".into()],
+            graphics: Vec::new(),
+        };
+        let mut pointer = MousePointerState::default();
+        let mut output = Vec::new();
+
+        pointer.set_cell(Some((1, 0)));
+        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+
+        output.clear();
+        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        assert!(output.is_empty());
+
+        pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
+        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+    }
+
+    #[test]
+    fn terminal_restore_postlude_restores_default_pointer_and_visible_default_cursor() {
         let mut output = Vec::new();
         write_terminal_restore_postlude(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[?25h\x1b[0 q");
+        assert_eq!(output, b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
     }
 
     #[test]
@@ -4005,7 +4116,7 @@ mod tests {
         expected.extend_from_slice(
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
         );
-        expected.extend_from_slice(b"\x1b[?25h\x1b[0 q");
+        expected.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
         assert_eq!(output, expected);
     }
 

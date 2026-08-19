@@ -357,21 +357,8 @@ impl App {
                     | MouseEventKind::ScrollLeft
                     | MouseEventKind::ScrollRight
             ) && self.clear_hovered_pane_link());
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.pending_url_click_sources.remove(&source_id);
-            }
-            MouseEventKind::Drag(MouseButton::Left)
-                if self.pending_url_click_sources.contains(&source_id) =>
-            {
-                return hover_changed;
-            }
-            MouseEventKind::Up(MouseButton::Left)
-                if self.pending_url_click_sources.remove(&source_id) =>
-            {
-                return hover_changed;
-            }
-            _ => {}
+        if self.suppress_pending_url_click_mouse(source_id, mouse.kind) {
+            return hover_changed;
         }
 
         if self.state.popup_pane.is_some() {
@@ -610,6 +597,69 @@ impl App {
         self.focus_pane_internal_via_api(ws_idx, pane_id);
     }
 
+    pub(crate) fn suppress_pending_url_click_mouse(
+        &mut self,
+        source_id: super::InputSourceId,
+        kind: MouseEventKind,
+    ) -> bool {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pending_url_click_sources.remove(&source_id);
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.pending_url_click_sources.contains(&source_id)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.pending_url_click_sources.remove(&source_id)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn activate_link_click(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+    ) -> bool {
+        self.last_pane_click = None;
+        self.pending_url_click_sources.insert(source_id);
+        if self.activate_resolved_link(source_id, pane_id, url) {
+            true
+        } else {
+            self.pending_url_click_sources.remove(&source_id);
+            false
+        }
+    }
+
+    pub(crate) fn activate_resolved_link(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+    ) -> bool {
+        let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
+            return false;
+        };
+        match self.invoke_plugin_link_handler_for_url(&url, pane_id) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+            }
+        }
+        if crate::web_url::safe_web_url(&url).is_some()
+            && self
+                .event_tx
+                .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
+                .is_err()
+        {
+            tracing::warn!("failed to queue pane URL opening");
+        }
+        true
+    }
+
     fn handle_url_click(&mut self, source_id: super::InputSourceId, mouse: MouseEvent) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -631,27 +681,7 @@ impl App {
             return false;
         };
 
-        self.last_pane_click = None;
-        self.pending_url_click_sources.insert(source_id);
-        match self.invoke_plugin_link_handler_for_url(&link.url, info.id) {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(err = %err, url = %link.url, "failed to invoke plugin link handler");
-            }
-        }
-        if crate::web_url::safe_web_url(&link.url).is_some()
-            && self
-                .event_tx
-                .try_send(crate::events::AppEvent::OpenUrl {
-                    url: link.url,
-                    source_id,
-                })
-                .is_err()
-        {
-            tracing::warn!("failed to queue pane URL opening");
-        }
-        true
+        self.activate_link_click(source_id, info.id, link.url)
     }
 
     fn update_hovered_pane_link(&mut self, mouse: MouseEvent) -> bool {

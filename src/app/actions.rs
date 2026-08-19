@@ -2155,6 +2155,46 @@ pub(crate) struct ResolvedPaneLink {
     pub(crate) hover: crate::app::HoveredPaneLink,
 }
 
+pub(crate) struct ResolvedTerminalLink {
+    pub(crate) url: String,
+    pub(crate) cells: Vec<(u16, u16)>,
+}
+
+pub(crate) fn resolved_terminal_link_at_cell(
+    runtime: &crate::terminal::TerminalRuntime,
+    viewport_row: u16,
+    col: u16,
+    width: u16,
+    height: u16,
+) -> Option<ResolvedTerminalLink> {
+    if let Some(link) = runtime.hyperlink_at_viewport_cell(col, viewport_row, width, height) {
+        return Some(ResolvedTerminalLink {
+            url: safe_osc8_url(&link.uri)?.to_owned(),
+            cells: link.cells,
+        });
+    }
+
+    let line = runtime.logical_line_at_viewport_row(viewport_row, width, height)?;
+    let byte_index = line.cells.iter().find_map(|cell| {
+        (cell.viewport_row == viewport_row
+            && col >= cell.viewport_col
+            && col < cell.viewport_col.saturating_add(cell.width))
+        .then_some(cell.byte_index)
+    })?;
+    let (start, end) = url_byte_span_at_byte_index(&line.text, byte_index)?;
+    let url = crate::web_url::safe_web_url(line.text.get(start..end)?)?.to_owned();
+    let cells = line
+        .cells
+        .into_iter()
+        .filter(|cell| cell.byte_index >= start && cell.byte_index < end)
+        .flat_map(|cell| {
+            (0..cell.width)
+                .map(move |offset| (cell.viewport_col.saturating_add(offset), cell.viewport_row))
+        })
+        .collect();
+    Some(ResolvedTerminalLink { url, cells })
+}
+
 impl AppState {
     pub fn clear_selection(&mut self) {
         self.selection = None;
@@ -2267,67 +2307,28 @@ impl AppState {
         }
 
         let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
-        if let Some(link) = rt.hyperlink_at_viewport_cell(
+        let link = resolved_terminal_link_at_cell(
+            rt,
+            viewport_row,
             col,
-            viewport_row,
-            info.inner_rect.width,
-            info.inner_rect.height,
-        ) {
-            let url = safe_osc8_url(&link.uri)?.to_owned();
-            return Some(ResolvedPaneLink {
-                hover: crate::app::HoveredPaneLink {
-                    pane_id,
-                    inner_rect: info.inner_rect,
-                    cells: link
-                        .cells
-                        .into_iter()
-                        .map(|(col, row)| {
-                            (
-                                info.inner_rect.x.saturating_add(col),
-                                info.inner_rect.y.saturating_add(row),
-                            )
-                        })
-                        .collect(),
-                },
-                url,
-            });
-        }
-
-        let line = rt.logical_line_at_viewport_row(
-            viewport_row,
             info.inner_rect.width,
             info.inner_rect.height,
         )?;
-        let byte_index = line.cells.iter().find_map(|cell| {
-            (cell.viewport_row == viewport_row
-                && col >= cell.viewport_col
-                && col < cell.viewport_col.saturating_add(cell.width))
-            .then_some(cell.byte_index)
-        })?;
-        let (start, end) = url_byte_span_at_byte_index(&line.text, byte_index)?;
-        let url = crate::web_url::safe_web_url(line.text.get(start..end)?)?.to_owned();
-        let cells = line
-            .cells
-            .into_iter()
-            .filter(|cell| cell.byte_index >= start && cell.byte_index < end)
-            .flat_map(|cell| {
-                (0..cell.width).map(move |offset| {
-                    (
-                        info.inner_rect
-                            .x
-                            .saturating_add(cell.viewport_col)
-                            .saturating_add(offset),
-                        info.inner_rect.y.saturating_add(cell.viewport_row),
-                    )
-                })
-            })
-            .collect();
         Some(ResolvedPaneLink {
-            url,
+            url: link.url,
             hover: crate::app::HoveredPaneLink {
                 pane_id,
                 inner_rect: info.inner_rect,
-                cells,
+                cells: link
+                    .cells
+                    .into_iter()
+                    .map(|(col, row)| {
+                        (
+                            info.inner_rect.x.saturating_add(col),
+                            info.inner_rect.y.saturating_add(row),
+                        )
+                    })
+                    .collect(),
             },
         })
     }
@@ -2360,13 +2361,26 @@ impl AppState {
     }
 }
 
-fn safe_osc8_url(url: &str) -> Option<&str> {
+pub(crate) fn safe_osc8_url(url: &str) -> Option<&str> {
     crate::web_url::safe_web_url(url).or_else(|| {
-        let path = url.strip_prefix("file://")?;
-        (path.starts_with('/')
-            || path
-                .split_once('/')
-                .is_some_and(|(authority, _)| authority.eq_ignore_ascii_case("localhost")))
+        if url.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
+            return None;
+        }
+        let remainder = url.strip_prefix("file://")?;
+        let path_after_root = if let Some(path) = remainder.strip_prefix('/') {
+            path
+        } else {
+            let (authority, path) = remainder.split_once('/')?;
+            if !authority.eq_ignore_ascii_case("localhost") {
+                return None;
+            }
+            path
+        };
+        let folded = path_after_root.to_ascii_lowercase();
+        (!path_after_root.starts_with('/')
+            && !path_after_root.starts_with('\\')
+            && !folded.starts_with("%2f")
+            && !folded.starts_with("%5c"))
         .then_some(url)
     })
 }
@@ -3699,6 +3713,16 @@ mod tests {
         );
         assert_eq!(safe_osc8_url("file://attacker/share/report.md"), None);
         assert_eq!(safe_osc8_url("file://localhost-relative"), None);
+        for unsafe_url in [
+            "file:////attacker/share/report.md",
+            "file://localhost//attacker/share/report.md",
+            "file:///%2Fattacker/share/report.md",
+            "file:///%5C%5Cattacker/share/report.md",
+            "file:///\\\\attacker\\share\\report.md",
+            "file:///tmp/report.md\nHERDR_PLUGIN_CLICKED_URL=forged",
+        ] {
+            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url}");
+        }
     }
 
     #[test]

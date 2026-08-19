@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -731,6 +731,8 @@ pub enum ClientMessage {
     },
     /// The App displayed the first frame for this exact client-local renderer launch.
     OmpRendererReady { launch_id: u64 },
+    /// Request activation of a safe link from this client-local OMP renderer launch.
+    ActivateOmpLink { launch_id: u64, url: String },
 }
 
 /// Herdr-owned controller operations; payload bytes remain owned by OMP.
@@ -1448,6 +1450,13 @@ mod tests {
         );
         assert_eq!(tag(&ClientMessage::OmpRendererReady { launch_id: 9 }), 19);
         assert_eq!(
+            tag(&ClientMessage::ActivateOmpLink {
+                launch_id: 9,
+                url: "https://example.com".into(),
+            }),
+            20
+        );
+        assert_eq!(
             tag(&ServerMessage::OmpPane {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
@@ -1667,6 +1676,18 @@ mod tests {
     }
 
     #[test]
+    fn activate_omp_link_roundtrip() {
+        let message = ClientMessage::ActivateOmpLink {
+            launch_id: 9,
+            url: "file:///tmp/report.md?line=7".into(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
     fn client_notification_activation_roundtrip() {
         let msg = ClientMessage::ActivateNotification {
             activation: NotificationActivation {
@@ -1682,8 +1703,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_25_hello_carries_app_renderer_capability() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_26_hello_carries_app_renderer_capability() {
+        assert_eq!(PROTOCOL_VERSION, 26);
         let profile = "a".repeat(43);
         let app = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
