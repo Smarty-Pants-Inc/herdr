@@ -20,6 +20,9 @@ pub struct AgentReadParams {
 pub struct AgentSendKeysParams {
     pub target: String,
     pub keys: Vec<String>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -170,6 +173,9 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -178,6 +184,9 @@ pub struct AgentPromptParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

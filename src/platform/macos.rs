@@ -19,6 +19,25 @@ pub(crate) use super::unix_common::{
     remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
 };
 
+pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<libc::pid_t>() as libc::socklen_t {
+        return None;
+    }
+
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
@@ -776,6 +795,11 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     drop(stdin);
 
     child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let parent_pid = process_bsdinfo(pid)?.pbi_ppid;
+    (parent_pid > 0).then_some(parent_pid)
 }
 
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {

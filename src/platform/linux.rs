@@ -19,6 +19,27 @@ pub(crate) use super::unix_common::{
     remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
 };
 
+pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return None;
+    }
+
+    // SAFETY: SO_PEERCRED populated the exact-size output buffer above.
+    let pid = unsafe { credentials.assume_init().pid };
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -343,6 +364,17 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)
+}
+
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_parent_pid_from_stat(&stat)
+}
+
+fn process_parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(1)?.parse().ok()
 }
 
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
@@ -1001,6 +1033,14 @@ mod tests {
         assert_eq!(
             process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string()))
+        );
+    }
+
+    #[test]
+    fn proc_stat_parsing_reads_parent_after_a_complex_process_name() {
+        assert_eq!(
+            process_parent_pid_from_stat("123 (name with ) paren) S 42 456 789 0 456"),
+            Some(42)
         );
     }
 

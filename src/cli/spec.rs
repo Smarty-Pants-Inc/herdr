@@ -46,6 +46,25 @@ pub(super) fn command() -> Command {
     configure_help(command, 0)
 }
 
+pub(super) fn parse_leaf_args(
+    path: &[&str],
+    args: &[String],
+) -> Result<clap::ArgMatches, clap::Error> {
+    let mut selected = command();
+    for segment in path {
+        selected = selected
+            .find_subcommand(segment)
+            .expect("runtime parser path must exist in the public CLI spec")
+            .clone();
+    }
+    selected.set_bin_name(format!("herdr {}", path.join(" ")));
+    let binary = selected
+        .get_bin_name()
+        .unwrap_or(selected.get_name())
+        .to_string();
+    selected.try_get_matches_from(std::iter::once(binary).chain(args.iter().cloned()))
+}
+
 fn configure_help(command: Command, depth: usize) -> Command {
     let command = if depth == 0 {
         command
@@ -333,8 +352,12 @@ fn agent_command() -> Command {
             Command::new("send-keys")
                 .about("Send key presses to an agent")
                 .arg(required("target", "TARGET"))
-                .arg(required("key", "KEY").num_args(1..))
-                .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
+                .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
+                .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
         .subcommand(
             Command::new("prompt")
@@ -357,6 +380,10 @@ fn agent_command() -> Command {
                     option("timeout", "MS")
                         .requires("wait")
                         .help("Fail after this many milliseconds"),
+                )
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
                 )
                 .after_help(
                     "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait first requires an observed state change within 5000ms; otherwise it returns agent_prompt_stalled. A shorter --timeout returns timeout instead. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match. Without --timeout, the settled-state wait is indefinite.",
@@ -419,7 +446,12 @@ fn agent_command() -> Command {
                 )
                 .arg(
                     option("timeout", "MS")
+                        .value_parser(clap::value_parser!(u64))
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
+                )
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
                 )
                 .arg(
                     Arg::new("agent_args")
@@ -582,17 +614,25 @@ fn pane_command() -> Command {
             Command::new("send-text")
                 .about("Send literal text to a pane")
                 .arg(required("pane_id", "PANE_ID"))
-                .arg(required("text", "TEXT"))
+                .arg(required("text", "TEXT").num_args(1..).action(ArgAction::Append))
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
                 .after_help(
-                    "next: herdr pane run <PANE_ID> <COMMAND> sends text and Enter in one call",
+                    "Use -- before TEXT when the payload matches an option.\n\nnext: herdr pane run <PANE_ID> <COMMAND> sends text and Enter in one call",
                 ),
         )
         .subcommand(
             Command::new("send-keys")
                 .about("Send key presses to a pane")
                 .arg(required("pane_id", "PANE_ID"))
-                .arg(required("key", "KEY").num_args(1..))
-                .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
+                .arg(required("key", "KEY").num_args(1..).action(ArgAction::Append))
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
+                .after_help("Use esc as the canonical Escape key name; escape is also accepted. Use -- before payload arguments that match an option."),
         )
         .subcommand(
             Command::new("wait-output")
@@ -627,7 +667,12 @@ fn pane_command() -> Command {
             Command::new("run")
                 .about("Run a command in a pane")
                 .arg(required("pane_id", "PANE_ID"))
-                .arg(required("command", "COMMAND").num_args(1..)),
+                .arg(required("command", "COMMAND").num_args(1..).action(ArgAction::Append))
+                .arg(
+                    flag("allow-cross-pane")
+                        .help("Deliberately allow an agent-originated request to target another pane"),
+                )
+                .after_help("Use -- before command arguments that match an option."),
         )
         .subcommand(report_agent_command())
         .subcommand(report_agent_session_command())
@@ -1298,6 +1343,7 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
+        assert!(has_option(agent_start, "allow-cross-pane"));
         for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }

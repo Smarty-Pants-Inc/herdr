@@ -76,6 +76,66 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
     }
 }
 
+/// Returns the PID connected to a Unix-domain socket when the platform exposes
+/// it. Unsupported or unavailable attribution deliberately returns `None`.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_pid_platform(fd);
+
+    #[cfg(target_os = "macos")]
+    return macos::local_socket_peer_pid_platform(fd);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
+/// Returns whether `descendant_pid` currently descends from `ancestor_pid`.
+/// Missing process information and unsupported platforms deliberately return false.
+pub fn process_is_descendant_of(descendant_pid: u32, ancestor_pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    return process_is_descendant_of_with(descendant_pid, ancestor_pid, linux::process_parent_pid);
+
+    #[cfg(target_os = "macos")]
+    return process_is_descendant_of_with(descendant_pid, ancestor_pid, macos::process_parent_pid);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (descendant_pid, ancestor_pid);
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_descendant_of_with(
+    descendant_pid: u32,
+    ancestor_pid: u32,
+    mut parent_pid: impl FnMut(u32) -> Option<u32>,
+) -> bool {
+    if descendant_pid == 0 || ancestor_pid == 0 || descendant_pid == ancestor_pid {
+        return false;
+    }
+
+    let mut current = descendant_pid;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        let Some(parent) = parent_pid(current) else {
+            return false;
+        };
+        if parent == ancestor_pid {
+            return true;
+        }
+        if parent == 0 {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
 #[cfg(not(windows))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())
