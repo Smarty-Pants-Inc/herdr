@@ -43,6 +43,8 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Maximum encoded mouse report accepted with pixel geometry.
 const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
+/// Maximum encoded URL accepted from a client-local renderer.
+const MAX_LINK_URL_LENGTH: usize = 16 * 1024;
 /// Maximum reliable control records buffered per client writer.
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 
@@ -487,6 +489,11 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         route: crate::server::omp_route::OmpRouteKey,
         retry_id: u64,
+    /// A client-local OMP renderer activated one resolved link.
+    ActivateOmpLink {
+        client_id: u64,
+        launch_id: u64,
+        url: String,
     },
     /// A client attached to an OMP logical pane.
     OmpPaneAttach {
@@ -1306,6 +1313,24 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
+            ClientMessage::ActivateOmpLink { launch_id, url } => {
+                if url.len() > MAX_LINK_URL_LENGTH {
+                    warn!(
+                        client_id,
+                        size = url.len(),
+                        max = MAX_LINK_URL_LENGTH,
+                        "oversized OMP link activation from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ActivateOmpLink {
+                    client_id,
+                    launch_id,
+                    url,
+                }
+            }
             ClientMessage::IdentityPersistenceAck {
                 request_id,
                 display_name,
