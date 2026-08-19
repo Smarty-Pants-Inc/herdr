@@ -31,11 +31,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OMP_GUEST_BRIDGE_TOKEN_ENV: &str = "HERDR_OMP_GUEST_BRIDGE_TOKEN";
+
 const INBOUND_QUEUE_CAPACITY: usize = 256;
 
 /// Static inputs for a server-private OMP guest and its private PTY.
 pub(crate) struct PrivateOmpGuestConfig {
     pub(crate) route: OmpRouteKey,
+    /// Retained through launch so managed identity can be reverified at the spawn boundary.
+    pub(crate) omp_executable: crate::update::OmpExecutable,
     pub(crate) attachment_epoch: u64,
     pub(crate) controller: bool,
     pub(crate) pane_id: PaneId,
@@ -81,27 +85,30 @@ pub(crate) struct PrivateOmpGuest {
     guest: Arc<Mutex<Option<TcpStream>>>,
     outbound: mpsc::SyncSender<OutboundRecord>,
     inbound: mpsc::Receiver<PrivateOmpGuestRecord>,
+    bridge_ready: Arc<AtomicBool>,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
 }
 
 impl PrivateOmpGuest {
     pub(crate) fn spawn(config: PrivateOmpGuestConfig) -> io::Result<Self> {
+        config.omp_executable.verify().map_err(io::Error::other)?;
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0")?);
         listener.set_nonblocking(true)?;
         let token = bridge_token()?;
         let argv = guest_argv(
+            config.omp_executable.executable().to_path_buf(),
             listener.local_addr()?.to_string(),
             room_id(&config.route, config.attachment_epoch),
-            token.clone(),
         );
+        let launch_env = omp_guest_launch_env(config.launch_env, token.clone());
         let runtime = TerminalRuntime::spawn_argv_command(
             config.pane_id,
             config.rows,
             config.cols,
             config.cwd,
             &argv,
-            &config.launch_env,
+            &launch_env,
             AgentDetection::Disabled,
             config.scrollback_limit_bytes,
             config.terminal_theme,
@@ -113,6 +120,7 @@ impl PrivateOmpGuest {
         let (outbound, outbound_rx) = mpsc::sync_channel(OUTBOUND_QUEUE_CAPACITY);
         let (inbound_tx, inbound) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let bridge_ready = Arc::new(AtomicBool::new(false));
         let bridge_failed = Arc::new(AtomicBool::new(false));
         let guest = Arc::new(Mutex::new(None));
         spawn_bridge_thread(
@@ -121,6 +129,7 @@ impl PrivateOmpGuest {
             Arc::clone(&guest),
             outbound_rx,
             inbound_tx,
+            Arc::clone(&bridge_ready),
             Arc::clone(&bridge_failed),
             Arc::clone(&shutting_down),
         );
@@ -134,6 +143,7 @@ impl PrivateOmpGuest {
             guest,
             outbound,
             inbound,
+            bridge_ready,
             bridge_failed,
             shutting_down,
         })
@@ -181,6 +191,16 @@ impl PrivateOmpGuest {
     /// does not set this, so callers can distinguish an expected shutdown.
     pub(crate) fn bridge_failed(&self) -> bool {
         self.bridge_failed.load(Ordering::Acquire)
+    }
+
+    /// True once the guest has authenticated and the private route can receive input.
+    pub(crate) fn bridge_ready(&self) -> bool {
+        self.bridge_ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_bridge_ready(&self) {
+        self.bridge_ready.store(true, Ordering::Release);
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.
@@ -251,30 +271,31 @@ fn bridge_token() -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn omp_bin() -> String {
-    std::env::var("OMP_BIN").unwrap_or_else(|_| {
-        #[cfg(test)]
-        if let Ok(executable) = std::env::current_exe() {
-            // Routing tests need a spawnable command, not an installed OMP bridge.
-            return executable.to_string_lossy().into_owned();
-        }
-        "omp".to_owned()
-    })
-}
-
-fn guest_argv(address: String, room: String, token: String) -> Vec<String> {
+fn guest_argv(omp_executable: PathBuf, address: String, room: String) -> Vec<String> {
     vec![
-        omp_bin(),
+        omp_executable.to_string_lossy().into_owned(),
         "__collab-guest-bridge".into(),
         address,
         room,
-        token,
+        "--token-env".into(),
         "--no-tools".into(),
         "--no-lsp".into(),
         "--no-skills".into(),
         "--no-rules".into(),
         "--no-extensions".into(),
     ]
+}
+
+fn omp_guest_launch_env(launch_env: PaneLaunchEnv, token: String) -> PaneLaunchEnv {
+    launch_env
+        .without_env("BUN_OPTIONS")
+        .without_env("BUN_INSPECT_PRELOAD")
+        .without_env("BUN_BE_BUN")
+        .without_env("NODE_OPTIONS")
+        .without_env("HERDR_OMP_BRIDGE")
+        .without_env("HERDR_OMP_BRIDGE_TOKEN")
+        .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+        .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, token)
 }
 
 fn room_id(route: &OmpRouteKey, attachment_epoch: u64) -> String {
@@ -291,6 +312,7 @@ fn spawn_bridge_thread(
     guest: Arc<Mutex<Option<TcpStream>>>,
     outbound: mpsc::Receiver<OutboundRecord>,
     inbound: mpsc::SyncSender<PrivateOmpGuestRecord>,
+    bridge_ready: Arc<AtomicBool>,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
 ) {
@@ -310,6 +332,7 @@ fn spawn_bridge_thread(
             fail_bridge(&guest, &bridge_failed, &shutting_down);
             return;
         }
+        bridge_ready.store(true, Ordering::Release);
         let reader_failed = Arc::clone(&bridge_failed);
         let reader_shutdown = Arc::clone(&shutting_down);
         let reader_guest = Arc::clone(&guest);
@@ -571,6 +594,34 @@ fn write_guest_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guest_bridge_token_is_not_exposed_in_argv() {
+        let argv = guest_argv(
+            PathBuf::from("/tmp/omp"),
+            "127.0.0.1:1234".into(),
+            "room".into(),
+        );
+        assert!(argv.iter().any(|arg| arg == "--token-env"));
+        assert!(!argv.iter().any(|arg| arg == "bridge-secret"));
+    }
+
+    #[test]
+    fn guest_launch_strips_host_startup_and_identity_env() {
+        let launch_env = omp_guest_launch_env(PaneLaunchEnv::default(), "bridge-secret".into());
+        assert_eq!(
+            launch_env,
+            PaneLaunchEnv::default()
+                .without_env("BUN_OPTIONS")
+                .without_env("BUN_INSPECT_PRELOAD")
+                .without_env("BUN_BE_BUN")
+                .without_env("NODE_OPTIONS")
+                .without_env("HERDR_OMP_BRIDGE")
+                .without_env("HERDR_OMP_BRIDGE_TOKEN")
+                .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+                .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, "bridge-secret")
+        );
+    }
+
     #[test]
     fn trickling_candidate_expires_before_authenticated_guest() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

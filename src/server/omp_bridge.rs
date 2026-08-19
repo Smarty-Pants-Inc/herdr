@@ -7,11 +7,12 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 
-use crate::server::client_transport::ServerEvent;
+use crate::server::client_transport::{OmpHostAdmission, ServerEvent};
 
 static NEXT_HOST_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ROUTE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const INITIAL_ROUTE_GENERATION: u64 = 1;
 const HOST_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
@@ -76,6 +77,8 @@ enum HostRecord {
         #[serde(rename = "routeGeneration")]
         route_generation: u64,
         token: String,
+        #[serde(default, rename = "ompBuildId")]
+        omp_build_id: String,
     },
 }
 
@@ -112,7 +115,13 @@ pub(crate) fn accept_pending(
                     tracing::warn!(err = %err, "OMP bridge stream setup failed");
                     continue;
                 }
-                spawn_host(stream, bridge.clone(), event_tx.clone(), permit);
+                spawn_host(
+                    stream,
+                    bridge.clone(),
+                    event_tx.clone(),
+                    permit,
+                    crate::build_info::omp_build_id(),
+                );
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
             Err(err) => {
@@ -124,13 +133,13 @@ pub(crate) fn accept_pending(
 }
 
 fn spawn_host(
-    stream: TcpStream,
+    mut stream: TcpStream,
     bridge: crate::pane::OmpBridgeEnv,
     event_tx: tokio::sync::mpsc::Sender<ServerEvent>,
     permit: HandshakePermit,
+    expected_omp_build_id: Option<&'static str>,
 ) {
     std::thread::spawn(move || {
-        let permit = permit;
         let Ok(read_stream) = stream.try_clone() else {
             return;
         };
@@ -147,6 +156,11 @@ fn spawn_host(
             .filter(|read| *read > 0)
             .is_none()
         {
+            write_host_error(
+                &mut stream,
+                "host-announcement-invalid",
+                "OMP host announcement was missing or exceeded the deadline",
+            );
             return;
         }
         let Ok(HostRecord::Host {
@@ -154,12 +168,23 @@ fn spawn_host(
             omp_session_id,
             route_generation,
             token,
+            omp_build_id,
         }) = serde_json::from_str(&line)
         else {
+            write_host_error(
+                &mut stream,
+                "host-announcement-invalid",
+                "OMP host announcement is invalid",
+            );
             return;
         };
         if !bridge.validates(&pane_id, &token) {
             tracing::warn!(pane_id, "rejected unauthenticated OMP bridge host");
+            write_host_error(
+                &mut stream,
+                "host-authentication-failed",
+                "OMP host bridge token was rejected",
+            );
             return;
         }
         if route_generation != INITIAL_ROUTE_GENERATION {
@@ -168,46 +193,142 @@ fn spawn_host(
                 route_generation,
                 "rejected caller-chosen OMP route generation"
             );
+            write_host_error(
+                &mut stream,
+                "route-generation-invalid",
+                "OMP host route generation must be 1",
+            );
+            return;
+        }
+        if expected_omp_build_id.is_some_and(|expected| omp_build_id != expected) {
+            let expected = expected_omp_build_id.expect("paired build ID checked above");
+            tracing::warn!(
+                pane_id,
+                expected_omp_build_id = expected,
+                announced_omp_build_id = omp_build_id,
+                "rejected mismatched OMP bridge host build"
+            );
+            let message = format!(
+                "OMP build mismatch: Herdr requires {expected}, host announced {}",
+                if omp_build_id.is_empty() {
+                    "no build ID"
+                } else {
+                    omp_build_id.as_str()
+                }
+            );
+            write_host_error(&mut stream, "omp-build-mismatch", &message);
             return;
         }
         drop(permit);
         if reader.get_mut().set_read_timeout(None).is_err() {
+            write_host_error(
+                &mut stream,
+                "host-announcement-invalid",
+                "OMP host bridge could not clear its announcement timeout",
+            );
             return;
         }
         let Ok(socket) = reader.get_ref().try_clone() else {
+            write_host_error(
+                &mut stream,
+                "server-unavailable",
+                "Herdr could not retain the OMP host bridge",
+            );
             return;
         };
         let host_id = NEXT_HOST_ID.fetch_add(1, Ordering::Relaxed);
         let (outbound, outbound_rx) =
             std_mpsc::sync_channel::<String>(HOST_OUTBOUND_QUEUE_CAPACITY);
-        let mut write_stream = stream;
-        std::thread::spawn(move || {
-            for line in outbound_rx {
-                if write_stream
-                    .write_all(line.as_bytes())
-                    .and_then(|_| write_stream.write_all(b"\n"))
-                    .and_then(|_| write_stream.flush())
-                    .is_err()
-                {
-                    let _ = write_stream.shutdown(std::net::Shutdown::Both);
+        let (admission, admitted) = std_mpsc::sync_channel(1);
+        if event_tx
+            .blocking_send(ServerEvent::OmpHostStarted {
+                pane_id: pane_id.clone(),
+                omp_session_id: omp_session_id.clone(),
+                route_generation,
+                host_id,
+                outbound,
+                socket,
+                admission,
+            })
+            .is_err()
+        {
+            write_host_error(
+                &mut stream,
+                "server-unavailable",
+                "Herdr is not accepting OMP host routes",
+            );
+            return;
+        }
+        match admitted.recv_timeout(ROUTE_ADMISSION_TIMEOUT) {
+            Ok(OmpHostAdmission::Accepted) => {
+                if write_host_ready(&mut stream).is_err() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    notify_host_stopped(
+                        &event_tx,
+                        &pane_id,
+                        &omp_session_id,
+                        route_generation,
+                        host_id,
+                    );
                     return;
                 }
             }
-            let _ = write_stream.shutdown(std::net::Shutdown::Both);
-        });
-        if let Err(error) = event_tx.blocking_send(ServerEvent::OmpHostStarted {
-            pane_id: pane_id.clone(),
-            omp_session_id: omp_session_id.clone(),
-            route_generation,
-            host_id,
-            outbound,
-            socket,
-        }) {
-            if let ServerEvent::OmpHostStarted { socket, .. } = error.0 {
-                let _ = socket.shutdown(std::net::Shutdown::Both);
+            Ok(OmpHostAdmission::Rejected { code, message }) => {
+                write_host_error(&mut stream, &code, &message);
+                notify_host_stopped(
+                    &event_tx,
+                    &pane_id,
+                    &omp_session_id,
+                    route_generation,
+                    host_id,
+                );
+                return;
             }
-            return;
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                write_host_error(
+                    &mut stream,
+                    "route-admission-timeout",
+                    "Herdr did not admit the OMP host route before the deadline",
+                );
+                notify_host_stopped(
+                    &event_tx,
+                    &pane_id,
+                    &omp_session_id,
+                    route_generation,
+                    host_id,
+                );
+                return;
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                write_host_error(
+                    &mut stream,
+                    "server-unavailable",
+                    "Herdr stopped before admitting the OMP host route",
+                );
+                notify_host_stopped(
+                    &event_tx,
+                    &pane_id,
+                    &omp_session_id,
+                    route_generation,
+                    host_id,
+                );
+                return;
+            }
         }
+        std::thread::spawn(move || {
+            for line in outbound_rx {
+                if stream
+                    .write_all(line.as_bytes())
+                    .and_then(|_| stream.write_all(b"\n"))
+                    .and_then(|_| stream.flush())
+                    .is_err()
+                {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
         while let Ok(read) = read_record(&mut reader, &mut line) {
             if read == 0 {
                 break;
@@ -245,13 +366,47 @@ fn spawn_host(
                 frame,
             });
         }
-        let _ = event_tx.blocking_send(ServerEvent::OmpHostStopped {
-            pane_id,
-            omp_session_id,
+        notify_host_stopped(
+            &event_tx,
+            &pane_id,
+            &omp_session_id,
             route_generation,
             host_id,
-        });
+        );
     });
+}
+
+fn notify_host_stopped(
+    event_tx: &tokio::sync::mpsc::Sender<ServerEvent>,
+    pane_id: &str,
+    omp_session_id: &str,
+    route_generation: u64,
+    host_id: u64,
+) {
+    let _ = event_tx.blocking_send(ServerEvent::OmpHostStopped {
+        pane_id: pane_id.to_owned(),
+        omp_session_id: omp_session_id.to_owned(),
+        route_generation,
+        host_id,
+    });
+}
+
+fn write_host_ready(stream: &mut TcpStream) -> io::Result<()> {
+    stream
+        .write_all(b"{\"t\":\"ready\"}\n")
+        .and_then(|_| stream.flush())
+}
+
+fn write_host_error(stream: &mut TcpStream, code: &str, message: &str) {
+    let record = serde_json::json!({
+        "t": "error",
+        "code": code,
+        "message": message,
+    });
+    if let Err(error) = writeln!(stream, "{record}").and_then(|_| stream.flush()) {
+        tracing::debug!(%error, "failed to report OMP host bridge rejection");
+    }
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 pub(crate) fn guest_record(
@@ -345,10 +500,99 @@ mod tests {
         )
         .unwrap();
         accept_pending(&listener, &bridge, event_tx, &limiter);
-        assert!(matches!(
-            event_rx.blocking_recv(),
-            Some(ServerEvent::OmpHostStarted { .. })
-        ));
+        let admission = match event_rx.blocking_recv() {
+            Some(ServerEvent::OmpHostStarted { admission, .. }) => admission,
+            event => panic!("expected OMP host start, got {event:?}"),
+        };
+        admission.send(OmpHostAdmission::Accepted).unwrap();
+        later
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(later.try_clone().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["t"],
+            "ready"
+        );
+    }
+
+    #[test]
+    fn mismatched_omp_build_is_rejected_before_route_activation() {
+        let (listener, bridge) = bind().unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let token = bridge.token("pane");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        spawn_host(
+            server,
+            bridge,
+            event_tx,
+            HandshakeLimiter::new(1).try_acquire().unwrap(),
+            Some("required-build"),
+        );
+
+        writeln!(
+            client,
+            r#"{{"t":"host","paneId":"pane","ompSessionId":"session","routeGeneration":1,"token":"{token}","ompBuildId":"other-build"}}"#
+        )
+        .unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["code"], "omp-build-mismatch");
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn host_route_admission_rejection_reports_structured_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let bridge = crate::pane::OmpBridgeEnv::generate("unused".into()).unwrap();
+        let token = bridge.token("pane");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        spawn_host(
+            server,
+            bridge,
+            event_tx,
+            HandshakeLimiter::new(1).try_acquire().unwrap(),
+            None,
+        );
+
+        writeln!(
+            client,
+            r#"{{"t":"host","paneId":"pane","ompSessionId":"session","routeGeneration":1,"token":"{token}"}}"#
+        )
+        .unwrap();
+        let admission = match event_rx.blocking_recv() {
+            Some(ServerEvent::OmpHostStarted { admission, .. }) => admission,
+            event => panic!("expected OMP host start, got {event:?}"),
+        };
+        admission
+            .send(OmpHostAdmission::Rejected {
+                code: "route_busy".into(),
+                message: "OMP host route is already active".into(),
+            })
+            .unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["t"], "error");
+        assert_eq!(response["code"], "route_busy");
+        assert_eq!(response["message"], "OMP host route is already active");
     }
 
     #[test]
@@ -401,6 +645,7 @@ mod tests {
             bridge,
             event_tx,
             HandshakeLimiter::new(1).try_acquire().unwrap(),
+            None,
         );
 
         writeln!(
@@ -408,10 +653,22 @@ mod tests {
             r#"{{"t":"host","paneId":"pane","ompSessionId":"session","routeGeneration":1,"token":"{token}"}}"#
         )
         .unwrap();
-        assert!(matches!(
-            event_rx.blocking_recv(),
-            Some(ServerEvent::OmpHostStarted { .. })
-        ));
+        let admission = match event_rx.blocking_recv() {
+            Some(ServerEvent::OmpHostStarted { admission, .. }) => admission,
+            event => panic!("expected OMP host start, got {event:?}"),
+        };
+        admission.send(OmpHostAdmission::Accepted).unwrap();
+        let mut ready = String::new();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        BufReader::new(client.try_clone().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["t"],
+            "ready"
+        );
 
         let payload = "x".repeat(crate::protocol::MAX_OMP_FRAME_PAYLOAD);
         let _ = writeln!(
