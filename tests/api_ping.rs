@@ -497,7 +497,6 @@ fn workspace_list_and_create_round_trip() {
     );
     assert_eq!(send_enter["result"]["type"], "ok");
 
-
     for source in ["visible", "detection"] {
         let limited = send_request(
             &socket_path,
