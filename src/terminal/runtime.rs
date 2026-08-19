@@ -343,6 +343,11 @@ impl TerminalRuntime {
         self.0.keyboard_report_all_requested()
     }
 
+    #[cfg(unix)]
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.0.focus_reporting_enabled()
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.0.bracketed_paste_enabled()
     }
