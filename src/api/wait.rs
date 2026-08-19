@@ -9,12 +9,12 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_timeout, should_stop_connection, APP_RESPONSE_TIMEOUT,
-    CONNECTION_POLL_INTERVAL,
+    dispatch_to_app_with_timeout, dispatch_to_app_with_timeout_and_context, should_stop_connection,
+    APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
-use crate::api::{ApiRequestSender, EventHub};
+use crate::api::{ApiRequestContext, ApiRequestSender, EventHub};
 use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
@@ -177,19 +177,21 @@ pub(super) fn wait_for_agent(
 pub(super) fn prompt_agent(
     request_id: String,
     params: crate::api::schema::AgentPromptParams,
+    context: ApiRequestContext,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
     let Some(wait) = params.wait.clone() else {
-        return Ok(Some(dispatch_to_app_with_timeout(
+        return Ok(Some(dispatch_to_app_with_timeout_and_context(
             Request {
                 id: request_id,
                 method: Method::AgentPrompt(params),
             },
             api_tx,
             None,
+            context,
         )));
     };
 
@@ -203,13 +205,14 @@ pub(super) fn prompt_agent(
         }
     };
     let target = params.target.clone();
-    let prompt_response = dispatch_to_app_with_timeout(
+    let prompt_response = dispatch_to_app_with_timeout_and_context(
         Request {
             id: request_id.clone(),
             method: Method::AgentPrompt(params),
         },
         api_tx,
         None,
+        context,
     );
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
