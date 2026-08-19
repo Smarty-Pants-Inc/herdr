@@ -193,6 +193,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             )?;
             prepared_remote.remote_herdr
         };
+    let managed_omp = prepare_remote_omp_companion();
 
     loop {
         let bridge = SshStdioBridge::start(
@@ -202,7 +203,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             session_name.clone(),
             remote_ssh.options(),
         )?;
-        let client_exit = run_client_process(&local_socket, &reattach_command, remote.keybindings);
+        let client_exit = run_client_process(
+            &local_socket,
+            &reattach_command,
+            remote.keybindings,
+            managed_omp.as_ref(),
+        );
         drop(bridge);
 
         match client_exit? {
@@ -217,6 +223,51 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             }
         }
     }
+}
+
+fn render_encoding_allows_native_omp(value: Option<&std::ffi::OsStr>) -> bool {
+    !matches!(
+        value.and_then(std::ffi::OsStr::to_str),
+        Some("terminal-ansi" | "terminal_ansi" | "ansi")
+    )
+}
+
+fn remote_native_omp_eligible(
+    render_encoding: Option<&std::ffi::OsStr>,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> bool {
+    render_encoding_allows_native_omp(render_encoding) && stdin_tty && stdout_tty
+}
+
+fn prepare_remote_omp_companion_with(
+    eligible: bool,
+    resolve: impl FnOnce() -> Result<Option<crate::update::ManagedOmpCompanion>, String>,
+) -> Option<crate::update::ManagedOmpCompanion> {
+    if !eligible || std::env::var_os("OMP_BIN").is_some() {
+        return None;
+    }
+    match resolve() {
+        Ok(companion) => companion,
+        Err(error) => {
+            eprintln!(
+                "herdr: managed OMP companion unavailable ({error}); using server-side rendering"
+            );
+            None
+        }
+    }
+}
+
+fn prepare_remote_omp_companion() -> Option<crate::update::ManagedOmpCompanion> {
+    let eligible = remote_native_omp_eligible(
+        std::env::var_os("HERDR_RENDER_ENCODING").as_deref(),
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    );
+    prepare_remote_omp_companion_with(
+        eligible,
+        crate::update::managed_omp_companion_for_current_build,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,7 +364,6 @@ impl RemoteAssetRef {
         }
     }
 }
-
 #[derive(Deserialize)]
 struct RemoteUpdateManifest {
     version: String,
@@ -2370,26 +2420,58 @@ fn classify_remote_client_process_exit(
     }
 }
 
-fn run_client_process(
+fn remote_client_default_encoding(native_omp_available: bool) -> Option<&'static str> {
+    (std::env::var_os("HERDR_RENDER_ENCODING").is_none() && !native_omp_available)
+        .then_some("terminal-ansi")
+}
+
+fn remote_client_command(
+    exe: &Path,
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
-) -> io::Result<RemoteClientProcessExit> {
-    let exe = std::env::current_exe()?;
-    let status = Command::new(exe)
+    managed_omp: Option<&crate::update::ManagedOmpCompanion>,
+) -> Command {
+    let mut command = Command::new(exe);
+    command
         .arg("client")
         .env(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
             local_socket,
         )
-        .env("HERDR_RENDER_ENCODING", "terminal-ansi")
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()?;
+        .stderr(Stdio::inherit());
+    if let Some(encoding) = remote_client_default_encoding(
+        managed_omp.is_some() || std::env::var_os("OMP_BIN").is_some(),
+    ) {
+        command.env("HERDR_RENDER_ENCODING", encoding);
+    }
+    if let Some(companion) = managed_omp {
+        companion.apply_to_command(&mut command);
+    } else if crate::build_info::omp_build_id().is_some() && std::env::var_os("OMP_BIN").is_none() {
+        command.env(crate::update::MANAGED_OMP_DISABLED_ENV_VAR, "1");
+    }
+    command
+}
+
+fn run_client_process(
+    local_socket: &Path,
+    reattach_command: &str,
+    keybindings: RemoteKeybindings,
+    managed_omp: Option<&crate::update::ManagedOmpCompanion>,
+) -> io::Result<RemoteClientProcessExit> {
+    let status = remote_client_command(
+        &std::env::current_exe()?,
+        local_socket,
+        reattach_command,
+        keybindings,
+        managed_omp,
+    )
+    .status()?;
 
     classify_remote_client_process_exit(status.success(), status.code()).ok_or_else(|| {
         io::Error::new(
@@ -3755,9 +3837,127 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn remote_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn remote_env_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_client_command_uses_semantic_encoding_for_native_omp_and_preserves_override() {
+        let _guard = remote_env_lock().lock();
+        let prior = std::env::var_os("HERDR_RENDER_ENCODING");
+        let prior_omp_bin = std::env::var_os("OMP_BIN");
+        std::env::remove_var("HERDR_RENDER_ENCODING");
+        std::env::remove_var("OMP_BIN");
+        let command = remote_client_command(
+            Path::new("/tmp/herdr"),
+            Path::new("/tmp/herdr.sock"),
+            "herdr --remote host",
+            RemoteKeybindings::Local,
+            None,
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("HERDR_RENDER_ENCODING")
+                && value == Some(std::ffi::OsStr::new("terminal-ansi"))
+        }));
+        assert_eq!(remote_client_default_encoding(true), None);
+
+        std::env::set_var("OMP_BIN", std::env::current_exe().unwrap());
+        let command = remote_client_command(
+            Path::new("/tmp/herdr"),
+            Path::new("/tmp/herdr.sock"),
+            "herdr --remote host",
+            RemoteKeybindings::Local,
+            None,
+        );
+        assert!(!command
+            .get_envs()
+            .any(|(key, _)| key == std::ffi::OsStr::new("HERDR_RENDER_ENCODING")));
+
+        std::env::set_var("HERDR_RENDER_ENCODING", "semantic-frame");
+        let command = remote_client_command(
+            Path::new("/tmp/herdr"),
+            Path::new("/tmp/herdr.sock"),
+            "herdr --remote host",
+            RemoteKeybindings::Local,
+            None,
+        );
+        assert!(!command
+            .get_envs()
+            .any(|(key, _)| key == std::ffi::OsStr::new("HERDR_RENDER_ENCODING")));
+        assert_eq!(remote_client_default_encoding(false), None);
+        assert_eq!(remote_client_default_encoding(true), None);
+
+        match prior {
+            Some(value) => std::env::set_var("HERDR_RENDER_ENCODING", value),
+            None => std::env::remove_var("HERDR_RENDER_ENCODING"),
+        }
+        match prior_omp_bin {
+            Some(value) => std::env::set_var("OMP_BIN", value),
+            None => std::env::remove_var("OMP_BIN"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ineligible_remote_clients_skip_optional_omp_resolution() {
+        let _guard = remote_env_lock().lock();
+        let prior = std::env::var_os("HERDR_RENDER_ENCODING");
+        let prior_omp_bin = std::env::var_os("OMP_BIN");
+        std::env::remove_var("OMP_BIN");
+
+        for encoding in ["terminal-ansi", "terminal_ansi", "ansi"] {
+            std::env::set_var("HERDR_RENDER_ENCODING", encoding);
+            let eligible = remote_native_omp_eligible(
+                std::env::var_os("HERDR_RENDER_ENCODING").as_deref(),
+                true,
+                true,
+            );
+            assert!(!eligible);
+            let mut called = false;
+            assert!(prepare_remote_omp_companion_with(eligible, || {
+                called = true;
+                panic!("forced ANSI rendering must not resolve a native OMP companion")
+            })
+            .is_none());
+            assert!(!called);
+        }
+        for (stdin_tty, stdout_tty) in [(false, true), (true, false)] {
+            let eligible = remote_native_omp_eligible(
+                Some(std::ffi::OsStr::new("semantic-frame")),
+                stdin_tty,
+                stdout_tty,
+            );
+            assert!(!eligible);
+            let mut called = false;
+            assert!(prepare_remote_omp_companion_with(eligible, || {
+                called = true;
+                panic!("non-TTY remote client must not resolve a native OMP companion")
+            })
+            .is_none());
+            assert!(!called);
+        }
+        assert!(remote_native_omp_eligible(
+            Some(std::ffi::OsStr::new("semantic-frame")),
+            true,
+            true,
+        ));
+        assert!(render_encoding_allows_native_omp(Some(
+            std::ffi::OsStr::new("semantic-frame")
+        )));
+        assert!(render_encoding_allows_native_omp(Some(
+            std::ffi::OsStr::new("ANSI")
+        )));
+
+        match prior {
+            Some(value) => std::env::set_var("HERDR_RENDER_ENCODING", value),
+            None => std::env::remove_var("HERDR_RENDER_ENCODING"),
+        }
+        match prior_omp_bin {
+            Some(value) => std::env::set_var("OMP_BIN", value),
+            None => std::env::remove_var("OMP_BIN"),
+        }
     }
 
     #[cfg(unix)]
@@ -3769,7 +3969,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_uses_readable_name_when_it_fits() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_lock().lock();
         // Short target + session leave plenty of room — keep the human-
         // readable form so the socket path stays grep-friendly.
         let path = local_forward_socket_path("dev", "default");
@@ -3794,7 +3994,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_fits_in_sun_path() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_lock().lock();
         // Worst case for the readable form: macOS-style 49-char TMPDIR +
         // max-length sanitized components. Should fall back to the hashed
         // short name, which fits under TMPDIR.
@@ -3812,7 +4012,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
-        let _guard = remote_env_lock().lock().unwrap();
+        let _guard = remote_env_lock().lock();
         // Force a TMPDIR long enough that even the hashed short name cannot
         // fit inside it. The fallback should drop to /tmp.
         let prior = std::env::var_os("TMPDIR");

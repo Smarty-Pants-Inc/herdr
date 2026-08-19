@@ -50,7 +50,8 @@ impl HeadlessServer {
         let direct_client = self
             .direct_graphics_available()
             .then_some(self.foreground_client_id)
-            .flatten();
+            .flatten()
+            .filter(|&client_id| !self.native_omp_surface_active(client_id));
         let gate_busy = self
             .app
             .pane_graphics
@@ -93,7 +94,10 @@ impl HeadlessServer {
                             &self.app.pane_graphics,
                             self.app.state.view.tab_surface(),
                             client.cell_size,
-                            !internal_changed,
+                            !internal_changed
+                                && self
+                                    .replaced_omp_pane_info(client_id)
+                                    .is_none_or(|info| info.id != key.0),
                             &client.graphics_cache,
                             &key,
                         )
@@ -439,26 +443,135 @@ impl HeadlessServer {
         }
     }
 
-    pub(super) fn retire_direct_graphics_for_client(&mut self, client_id: u64) {
-        let keys = self
-            .app
+    fn direct_graphics_keys_for_client(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) -> Vec<crate::app::pane_graphics::Key> {
+        self.app
             .pane_graphics
             .slots
             .iter()
             .filter_map(|(key, slot)| {
-                let layer = slot.layer.as_ref()?;
-                let owned = layer.resident_client() == Some(client_id)
-                    || (layer.direct_lease().is_some()
+                let owned_gate = slot
+                    .direct_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.client_id == client_id);
+                let owned_resident = slot.layer.as_ref().is_some_and(|layer| {
+                    layer.terminal_only() && layer.resident_client() == Some(client_id)
+                });
+                let removable = owned_gate
+                    || (owned_resident
                         && slot
                             .direct_gate
                             .as_ref()
-                            .is_some_and(|gate| gate.client_id == client_id));
-                (layer.terminal_only() && owned).then(|| key.clone())
+                            .is_none_or(|gate| gate.client_id == client_id));
+                (removable && pane_id.is_none_or(|pane_id| key.0 == pane_id)).then(|| key.clone())
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn direct_graphics_cleanup_for_client_scope(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) -> Vec<u8> {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
+        let mut cleanup = Vec::new();
+        for key in keys {
+            if self
+                .app
+                .pane_graphics
+                .slots
+                .get(&key)
+                .and_then(|slot| slot.direct_gate.as_ref())
+                .is_some_and(|gate| gate.client_id == client_id)
+            {
+                let image_id = self.app.pane_graphics.slots[&key].host_image_id;
+                crate::kitty_graphics::encode_delete_image(&mut cleanup, image_id);
+            }
+        }
+        cleanup
+    }
+
+    pub(super) fn direct_graphics_retirement_messages_for_client(
+        &self,
+        client_id: u64,
+    ) -> Vec<ServerMessage> {
+        self.direct_graphics_keys_for_client(client_id, None)
+            .into_iter()
+            .filter_map(|key| {
+                let slot = self.app.pane_graphics.slots.get(&key)?;
+                let gate = slot
+                    .direct_gate
+                    .as_ref()
+                    .filter(|gate| gate.client_id == client_id)?;
+                Some(ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id: gate.transfer_id,
+                    image_id: slot.host_image_id,
+                })
+            })
+            .collect()
+    }
+
+    fn retire_direct_graphics_for_client_scope(
+        &mut self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
+        for key in keys {
+            let retired = self.app.pane_graphics.slots.get(&key).and_then(|slot| {
+                slot.direct_gate
+                    .as_ref()
+                    .filter(|gate| gate.client_id == client_id)
+                    .map(|gate| (gate.transfer_id, slot.host_image_id))
+            });
+            self.retire_direct_gate(&key);
+            if let Some((transfer_id, image_id)) = retired {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(super) fn direct_graphics_cleanup_for_client(&self, client_id: u64) -> Vec<u8> {
+        self.direct_graphics_cleanup_for_client_scope(client_id, None)
+    }
+
+    pub(super) fn retire_direct_graphics_for_client(&mut self, client_id: u64) {
+        self.retire_direct_graphics_for_client_scope(client_id, None);
+    }
+
+    pub(super) fn retire_direct_graphics_for_client_without_notifications(
+        &mut self,
+        client_id: u64,
+    ) {
+        let keys = self.direct_graphics_keys_for_client(client_id, None);
         for key in keys {
             self.retire_direct_gate(&key);
         }
+    }
+
+    pub(super) fn direct_graphics_cleanup_for_client_pane(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> Vec<u8> {
+        self.direct_graphics_cleanup_for_client_scope(client_id, Some(pane_id))
+    }
+
+    pub(super) fn retire_direct_graphics_for_client_pane(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) {
+        self.retire_direct_graphics_for_client_scope(client_id, Some(pane_id));
     }
 
     pub(super) fn render_retained_graphics_update_and_stream(&mut self) -> RetainedGraphicsOutcome {
@@ -484,9 +597,12 @@ impl HeadlessServer {
         let mut prepared = Vec::new();
 
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
-            if !matches!(mode, ClientConnectionMode::App) {
+            if !matches!(mode, ClientConnectionMode::App)
+                || self.native_omp_surface_active(client_id)
+            {
                 continue;
             }
+            let excluded_graphics_pane = self.replaced_omp_pane_info(client_id).map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 crate::render_prof::event("retained_graphics_fallback.client_missing");
                 return RetainedGraphicsOutcome::Fallback;
@@ -520,6 +636,7 @@ impl HeadlessServer {
                 &self.app.terminal_runtimes,
                 self.app.state.view.tab_surface(),
                 cell_size,
+                excluded_graphics_pane,
                 Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
                 &mut next_graphics_cache,
             );

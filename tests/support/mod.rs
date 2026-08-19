@@ -100,12 +100,12 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
 pub fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             return;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("file did not appear at {}", path.display());
+    panic!("non-empty file did not appear at {}", path.display());
 }
 
 pub fn encode_varint_u32(v: u32) -> Vec<u8> {

@@ -57,8 +57,12 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
-    pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
-        let _ = self.render.queue.replace_with_cleanup(data);
+    pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) -> bool {
+        self.render.queue.replace_with_cleanup(data).is_ok()
+    }
+
+    pub(crate) fn replace_render_with_cleanup(&self, data: Vec<u8>) -> bool {
+        self.render.queue.replace_render_with_cleanup(data).is_ok()
     }
 
     #[cfg(test)]
@@ -69,6 +73,38 @@ impl ClientWriter {
     #[cfg(test)]
     pub(crate) fn test_close(&self) {
         self.render.queue.close_writer();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backpressured() -> Self {
+        let queue = ClientWriterQueue::new();
+        Self {
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fill_control(&self, data: Vec<u8>) {
+        for _ in 0..CONTROL_QUEUE_CAPACITY {
+            self.control.send(data.clone()).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pop_control(&self) -> Option<Vec<u8>> {
+        self.control.queue.lock_state().control.pop_front()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_control_records(&self) -> Vec<Vec<u8>> {
+        self.control
+            .queue
+            .lock_state()
+            .control
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[cfg(test)]
@@ -261,14 +297,28 @@ impl ClientWriterQueue {
     }
 
     fn replace_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        self.replace_cleanup(data, true)
+    }
+
+    fn replace_render_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        self.replace_cleanup(data, false)
+    }
+
+    fn replace_cleanup(
+        &self,
+        data: Vec<u8>,
+        clear_ordered: bool,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
-        state.render = None;
-        state.ordered.clear();
         if !state.writer_alive {
             return Err(TrySendError::Disconnected(data));
         }
         if state.control.len() >= CONTROL_QUEUE_CAPACITY {
             return Err(TrySendError::Full(data));
+        }
+        state.render = None;
+        if clear_ordered {
+            state.ordered.clear();
         }
         state.control.push_back(data);
         self.ready.notify_one();
@@ -311,6 +361,12 @@ impl ClientWriterQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum OmpHostAdmission {
+    Accepted,
+    Rejected { code: String, message: String },
 }
 
 /// Internal event sent from client transport threads to the main event loop.
@@ -422,6 +478,16 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// The App displayed the first frame for an exact client-local renderer launch.
     OmpRendererReady { client_id: u64, launch_id: u64 },
+    /// A background managed OMP companion resolution completed for the server-private fallback.
+    OmpPrivateCompanionResolved {
+        result: Result<crate::update::OmpExecutable, String>,
+    },
+    /// A delayed retry may clear one transient private companion resolution failure.
+    OmpPrivateCompanionRetry {
+        client_id: u64,
+        route: crate::server::omp_route::OmpRouteKey,
+        retry_id: u64,
+    },
     /// A client attached to an OMP logical pane.
     OmpPaneAttach {
         client_id: u64,
@@ -459,6 +525,7 @@ pub(crate) enum ServerEvent {
         attachment_epoch: u64,
         frame: Vec<u8>,
     },
+
     /// A trusted local OMP host became live for one route.
     OmpHostStarted {
         pane_id: String,
@@ -467,6 +534,7 @@ pub(crate) enum ServerEvent {
         host_id: u64,
         outbound: std::sync::mpsc::SyncSender<String>,
         socket: std::net::TcpStream,
+        admission: std::sync::mpsc::SyncSender<OmpHostAdmission>,
     },
     /// A trusted local OMP host emitted one opaque host-to-guest envelope.
     OmpHostFrame {
@@ -484,6 +552,8 @@ pub(crate) enum ServerEvent {
         route_generation: u64,
         host_id: u64,
     },
+    /// A client writer popped a control record and can accept another control record.
+    ClientWriterControlDrained { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
@@ -903,7 +973,11 @@ fn client_writer_loop(
 ) {
     while let Some(item) = writer_queue.recv() {
         let written = match item {
-            ClientWriteItem::Control(data) => write_framed_bytes(&mut stream, &data),
+            ClientWriteItem::Control(data) => {
+                let _ = server_event_tx
+                    .blocking_send(ServerEvent::ClientWriterControlDrained { client_id });
+                write_framed_bytes(&mut stream, &data)
+            }
             ClientWriteItem::Render(data) => {
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
@@ -1406,6 +1480,53 @@ mod tests {
     }
 
     #[test]
+    fn client_writer_cleanup_replaces_queued_render_and_ordered_work() {
+        let (writer, queue) = test_queue_writer();
+        writer.render.try_send(b"old-render".to_vec()).unwrap();
+        writer
+            .render
+            .send_ordered(b"ordered-graphics".to_vec())
+            .unwrap();
+        writer.render.try_send(b"new-render".to_vec()).unwrap();
+
+        writer.replace_with_cleanup(b"graphics-cleanup".to_vec());
+
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Control(b"graphics-cleanup".to_vec()))
+        );
+        let state = queue.lock_state();
+        assert!(state.ordered.is_empty());
+        assert!(state.render.is_none());
+    }
+    #[test]
+    fn pane_cleanup_preserves_unrelated_ordered_graphics() {
+        let (writer, queue) = test_queue_writer();
+        writer.render.try_send(b"old-render".to_vec()).unwrap();
+        writer
+            .render
+            .send_ordered(b"unrelated-graphics".to_vec())
+            .unwrap();
+        writer.render.try_send(b"new-render".to_vec()).unwrap();
+
+        assert!(writer.replace_render_with_cleanup(b"pane-cleanup".to_vec()));
+
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Control(b"pane-cleanup".to_vec()))
+        );
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Render(b"old-render".to_vec()))
+        );
+        assert_eq!(
+            queue.recv(),
+            Some(ClientWriteItem::Render(b"unrelated-graphics".to_vec()))
+        );
+        assert!(queue.lock_state().render.is_none());
+    }
+
+    #[test]
     fn client_writer_queue_bounds_control_records() {
         let (writer, _queue) = test_queue_writer();
         for _ in 0..CONTROL_QUEUE_CAPACITY {
@@ -1442,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn client_writer_prioritizes_control_and_reports_render_drain() {
+    fn client_writer_prioritizes_control_and_reports_capacity_drains() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-writer-priority");
         let (writer, queue) = test_queue_writer();
         writer
@@ -1469,12 +1590,13 @@ mod tests {
             ServerMessage::WindowTitle { title } => assert_eq!(title.as_deref(), Some("render")),
             other => panic!("expected render message second, got {other:?}"),
         }
-        match server_event_rx
-            .blocking_recv()
-            .expect("writer drained render slot")
-        {
+        match recv_server_event(&mut server_event_rx, "writer freed control capacity") {
+            ServerEvent::ClientWriterControlDrained { client_id } => assert_eq!(client_id, 9),
+            other => panic!("expected control drain event, got {other:?}"),
+        }
+        match recv_server_event(&mut server_event_rx, "writer drained render slot") {
             ServerEvent::ClientWriterDrained { client_id } => assert_eq!(client_id, 9),
-            other => panic!("expected writer drained event, got {other:?}"),
+            other => panic!("expected render drain event, got {other:?}"),
         }
 
         drop(writer);
