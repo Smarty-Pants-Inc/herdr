@@ -76,6 +76,23 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
     }
 }
 
+/// Returns the PID connected to a Unix-domain socket when the platform exposes
+/// it. Unsupported or unavailable attribution deliberately returns `None`.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_pid_platform(fd);
+
+    #[cfg(target_os = "macos")]
+    return macos::local_socket_peer_pid_platform(fd);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 #[cfg(not(windows))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())

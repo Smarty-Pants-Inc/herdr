@@ -125,10 +125,12 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
+            allow_cross_pane: false,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
     assert_eq!(start_json["method"], "agent.start");
+    assert!(start_json["params"].get("allow_cross_pane").is_none());
     assert_eq!(start_json["params"]["pane_id"], "w1:p2");
     assert_eq!(
         serde_json::from_value::<Request>(start_json).unwrap(),
@@ -141,6 +143,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
+            allow_cross_pane: false,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -159,6 +162,7 @@ fn agent_start_and_prompt_requests_round_trip() {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
             }),
+            allow_cross_pane: false,
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
