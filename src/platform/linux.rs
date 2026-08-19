@@ -19,6 +19,27 @@ pub(crate) use super::unix_common::{
     remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
 };
 
+pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return None;
+    }
+
+    // SAFETY: SO_PEERCRED populated the exact-size output buffer above.
+    let pid = unsafe { credentials.assume_init().pid };
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;

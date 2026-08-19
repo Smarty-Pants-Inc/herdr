@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod env;
+mod input_guard;
 mod integrations;
 mod layouts;
 mod pane_graphics;
@@ -969,19 +970,40 @@ impl App {
     }
 
     pub(crate) fn handle_api_request(&mut self, request: crate::api::schema::Request) -> String {
+        self.handle_api_request_with_context(request, crate::api::ApiRequestContext::default())
+    }
+
+    pub(crate) fn handle_api_request_with_context(
+        &mut self,
+        request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
         self.drain_all_internal_events();
-        self.handle_api_request_after_internal_events_drained(request)
+        self.handle_api_request_after_internal_events_drained_with_context(request, context)
     }
 
     pub(crate) fn handle_api_request_after_internal_events_drained(
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        self.handle_api_request_after_internal_events_drained_with_context(
+            request,
+            crate::api::ApiRequestContext::default(),
+        )
+    }
+
+    pub(crate) fn handle_api_request_after_internal_events_drained_with_context(
+        &mut self,
+        request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+    ) -> String {
         self.sync_pending_terminal_titles();
+        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+            return response;
+        }
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
-
         let response = match request.method {
             Method::ServerStop(_) => {
                 self.state.should_quit = true;

@@ -1224,6 +1224,10 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
             "target": {
               "type": "string"
             },
@@ -1316,6 +1320,10 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3013,6 +3021,10 @@
         },
         "PaneSendInputParams": {
           "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3033,6 +3045,10 @@
         },
         "PaneSendKeysParams": {
           "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -3051,6 +3067,10 @@
         },
         "PaneSendTextParams": {
           "properties": {
+            "allow_cross_pane": {
+              "description": "Deliberately allow an agent-originated request to target another pane.",
+              "type": "boolean"
+            },
             "pane_id": {
               "type": "string"
             },

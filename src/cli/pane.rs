@@ -1035,39 +1035,60 @@ fn pane_close(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr pane send-text <pane_id> <text>");
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("usage: herdr pane send-text <pane_id> [--allow-cross-pane] <text>");
+        return Ok(2);
+    };
+    let (text, allow_cross_pane) =
+        super::take_leading_boolean_flag(&args[1..], "--allow-cross-pane");
+    if text.is_empty() {
+        eprintln!("usage: herdr pane send-text <pane_id> [--allow-cross-pane] <text>");
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
-    let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams { pane_id, text }))
+    super::send_ok_request(Method::PaneSendText(PaneSendTextParams {
+        pane_id: super::normalize_pane_id(raw_pane_id),
+        text: text.join(" "),
+        allow_cross_pane,
+    }))
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr pane send-keys <pane_id> <key> [key ...]");
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("usage: herdr pane send-keys <pane_id> [--allow-cross-pane] <key> [key ...]");
+        return Ok(2);
+    };
+    let (keys, allow_cross_pane) =
+        super::take_leading_boolean_flag(&args[1..], "--allow-cross-pane");
+    if keys.is_empty() {
+        eprintln!("usage: herdr pane send-keys <pane_id> [--allow-cross-pane] <key> [key ...]");
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
-    let keys = args[1..].to_vec();
-    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams {
+        pane_id: super::normalize_pane_id(raw_pane_id),
+        keys,
+        allow_cross_pane,
+    }))
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr pane run <pane_id> <command>");
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("usage: herdr pane run <pane_id> [--allow-cross-pane] <command>");
+        return Ok(2);
+    };
+    let (command, allow_cross_pane) =
+        super::take_leading_boolean_flag(&args[1..], "--allow-cross-pane");
+    if command.is_empty() {
+        eprintln!("usage: herdr pane run <pane_id> [--allow-cross-pane] <command>");
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
-    let text = args[1..].join(" ");
     super::send_ok_request(Method::PaneSendInput(PaneSendInputParams {
-        pane_id,
-        text,
+        pane_id: super::normalize_pane_id(raw_pane_id),
+        text: command.join(" "),
         keys: vec!["Enter".into()],
+        allow_cross_pane,
     }))
 }
 
@@ -1663,14 +1684,13 @@ fn print_pane_help() {
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane close <pane_id>");
-    eprintln!("  herdr pane send-text <pane_id> <text>");
-    eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
+    eprintln!("  herdr pane send-text <pane_id> [--allow-cross-pane] <text>");
+    eprintln!("  herdr pane send-keys <pane_id> [--allow-cross-pane] <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
-    eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
-    eprintln!("  herdr pane run <pane_id> <command>");
+    eprintln!("  herdr pane run <pane_id> [--allow-cross-pane] <command>");
 }
 
 #[cfg(test)]

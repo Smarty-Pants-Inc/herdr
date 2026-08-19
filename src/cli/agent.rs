@@ -757,7 +757,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
         );
         return Ok(2);
     };
@@ -768,6 +768,7 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
+    let mut allow_cross_pane = false;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -801,6 +802,11 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
+
             option => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -821,22 +827,29 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
             text: text.clone(),
             wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
+            allow_cross_pane,
         }),
     })?;
     super::print_response(&response)
 }
-
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
+    let Some(target) = args.first() else {
+        eprintln!("usage: herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
+        return Ok(2);
+    };
+    let (keys, allow_cross_pane) =
+        super::take_leading_boolean_flag(&args[1..], "--allow-cross-pane");
+    if keys.is_empty() {
+        eprintln!("usage: herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
-            target: args[0].clone(),
-            keys: args[1..].to_vec(),
+            target: target.clone(),
+            keys,
+            allow_cross_pane,
         }),
     })?)
 }
@@ -910,8 +923,8 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
+    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");

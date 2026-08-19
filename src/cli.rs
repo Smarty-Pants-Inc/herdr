@@ -943,6 +943,14 @@ pub(super) fn parse_u64_flag(flag: &str, value: &str) -> std::io::Result<u64> {
         .map_err(|_| std::io::Error::other(format!("invalid value for {flag}: {value}")))
 }
 
+pub(super) fn take_leading_boolean_flag(args: &[String], flag: &str) -> (Vec<String>, bool) {
+    if args.first().is_some_and(|arg| arg == flag) {
+        (args[1..].to_vec(), true)
+    } else {
+        (args.to_vec(), false)
+    }
+}
+
 /// Expand `--flag=value` tokens into separate `--flag` and `value` tokens so
 /// the hand-rolled subcommand parsers accept the same `--flag=value` form the
 /// clap-generated help and completions imply. Only `value_options` are split:
@@ -1077,6 +1085,22 @@ mod tests {
         assert_eq!(super::effective_channel_name("stable", true), "preview");
         assert_eq!(super::effective_channel_name("stable", false), "stable");
         assert_eq!(super::effective_channel_name("preview", false), "preview");
+    }
+
+    #[test]
+    fn leading_boolean_flag_does_not_consume_payload_tokens() {
+        let flag = "--allow-cross-pane";
+        let args = vec![flag.to_string(), "echo".to_string(), flag.to_string()];
+        assert_eq!(
+            super::take_leading_boolean_flag(&args, flag),
+            (vec!["echo".to_string(), flag.to_string()], true)
+        );
+
+        let payload = vec!["echo".to_string(), flag.to_string()];
+        assert_eq!(
+            super::take_leading_boolean_flag(&payload, flag),
+            (payload, false)
+        );
     }
 
     #[test]
