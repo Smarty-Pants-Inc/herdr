@@ -7133,6 +7133,79 @@ mod tests {
         assert!(!server.retained_pty_update_allowed_by_app_state());
     }
 
+    #[tokio::test]
+    async fn clicking_workspace_plugin_then_escape_returns_to_tiled_pane() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("plugin-focus-escape");
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let (plugin_runtime, _plugin_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(40, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(plugin_terminal_id.clone(), plugin_runtime);
+        server.app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.compute_client_navigation_view(1);
+        let plugin_inner = server.app.state.view.workspace_plugin_pane_inner;
+        assert!(!plugin_inner.is_empty());
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: plugin_inner.x.saturating_add(1),
+                row: plugin_inner.y.saturating_add(1),
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.workspace_plugin_panes[&workspace_id].focused);
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(!server.app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert!(server
+            .clients
+            .get(&1)
+            .and_then(|client| client.navigation.as_ref())
+            .is_some_and(|navigation| navigation.focused_workspace_plugin_pane.is_none()));
+
+        shutdown_test_runtimes(&mut server);
+    }
+
     static NEXT_TEST_SERVER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     fn test_headless_server() -> HeadlessServer {
