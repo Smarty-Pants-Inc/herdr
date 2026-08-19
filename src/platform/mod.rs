@@ -93,6 +93,49 @@ pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     }
 }
 
+/// Returns whether `descendant_pid` currently descends from `ancestor_pid`.
+/// Missing process information and unsupported platforms deliberately return false.
+pub fn process_is_descendant_of(descendant_pid: u32, ancestor_pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    return process_is_descendant_of_with(descendant_pid, ancestor_pid, linux::process_parent_pid);
+
+    #[cfg(target_os = "macos")]
+    return process_is_descendant_of_with(descendant_pid, ancestor_pid, macos::process_parent_pid);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (descendant_pid, ancestor_pid);
+        false
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_descendant_of_with(
+    descendant_pid: u32,
+    ancestor_pid: u32,
+    mut parent_pid: impl FnMut(u32) -> Option<u32>,
+) -> bool {
+    if descendant_pid == 0 || ancestor_pid == 0 || descendant_pid == ancestor_pid {
+        return false;
+    }
+
+    let mut current = descendant_pid;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current) {
+        let Some(parent) = parent_pid(current) else {
+            return false;
+        };
+        if parent == ancestor_pid {
+            return true;
+        }
+        if parent == 0 {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
 #[cfg(not(windows))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())
@@ -469,6 +512,23 @@ mod tests {
     fn parse_agent_env_hint_ignores_missing_or_unknown_agents() {
         assert_eq!(parse_agent_env_hint(b"PATH=/bin\0TERM=xterm\0"), None);
         assert_eq!(parse_agent_env_hint(b"HERDR_AGENT=not-an-agent\0"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_ancestry_is_strict_and_cycle_safe() {
+        let parent = |pid| match pid {
+            30 => Some(20),
+            20 => Some(10),
+            40 => Some(50),
+            50 => Some(40),
+            _ => None,
+        };
+
+        assert!(process_is_descendant_of_with(30, 10, parent));
+        assert!(!process_is_descendant_of_with(10, 10, parent));
+        assert!(!process_is_descendant_of_with(40, 10, parent));
+        assert!(!process_is_descendant_of_with(30, 99, parent));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

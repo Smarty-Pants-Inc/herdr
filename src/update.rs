@@ -11,6 +11,8 @@ use std::env;
 use std::fs;
 #[cfg(not(windows))]
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 #[cfg(not(windows))]
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 #[cfg(not(windows))]
@@ -20,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(not(windows))]
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
@@ -40,6 +44,14 @@ const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
 const DEFAULT_FAKE_UPDATE_NOTES_VERSION: &str = "0.3.0";
+const OMP_BIN_ENV_VAR: &str = "OMP_BIN";
+pub(crate) const MANAGED_OMP_BIN_ENV_VAR: &str = "HERDR_MANAGED_OMP_BIN";
+pub(crate) const MANAGED_OMP_BUILD_ID_ENV_VAR: &str = "HERDR_MANAGED_OMP_BUILD_ID";
+pub(crate) const MANAGED_OMP_SHA256_ENV_VAR: &str = "HERDR_MANAGED_OMP_SHA256";
+pub(crate) const MANAGED_OMP_COMMIT_ENV_VAR: &str = "HERDR_MANAGED_OMP_COMMIT";
+pub(crate) const MANAGED_OMP_TREE_ENV_VAR: &str = "HERDR_MANAGED_OMP_TREE";
+pub(crate) const MANAGED_OMP_VERSION_ENV_VAR: &str = "HERDR_MANAGED_OMP_VERSION";
+pub(crate) const MANAGED_OMP_DISABLED_ENV_VAR: &str = "HERDR_MANAGED_OMP_DISABLED";
 #[cfg(not(windows))]
 const SERVER_STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
@@ -261,6 +273,9 @@ struct PreviewManifest {
     protocol: u32,
     notes: String,
     assets: BTreeMap<String, AssetRef>,
+    #[cfg(unix)]
+    #[serde(default)]
+    omp: Option<OmpCompanionMetadata>,
     #[serde(default)]
     builds: BTreeMap<String, PreviewBuildMetadata>,
 }
@@ -272,6 +287,52 @@ struct PreviewBuildMetadata {
     built_at: String,
     protocol: u32,
     assets: BTreeMap<String, AssetRef>,
+    #[cfg(unix)]
+    #[serde(default)]
+    omp: Option<OmpCompanionMetadata>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Deserialize)]
+struct OmpCompanionMetadata {
+    build_id: String,
+    commit: String,
+    tree: String,
+    version: String,
+    assets: BTreeMap<String, AssetRef>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OmpBuildIdentity<'a> {
+    build_id: &'a str,
+    commit: &'a str,
+    tree: &'a str,
+    version: &'a str,
+}
+
+#[cfg(unix)]
+fn compiled_omp_identity() -> Result<Option<OmpBuildIdentity<'static>>, String> {
+    let identity = match (
+        crate::build_info::omp_build_id(),
+        crate::build_info::omp_commit(),
+        crate::build_info::omp_tree(),
+        crate::build_info::omp_version(),
+    ) {
+        (None, None, None, None) => return Ok(None),
+        (Some(build_id), Some(commit), Some(tree), Some(version)) => OmpBuildIdentity {
+            build_id,
+            commit,
+            tree,
+            version,
+        },
+        _ => return Err("paired Herdr build has incomplete compiled OMP identity".into()),
+    };
+    validate_omp_source_value("build_id", identity.build_id)?;
+    validate_omp_git_oid("commit", identity.commit)?;
+    validate_omp_git_oid("tree", identity.tree)?;
+    validate_omp_source_value("version", identity.version)?;
+    Ok(Some(identity))
 }
 
 #[derive(Deserialize)]
@@ -376,6 +437,188 @@ where
 
     serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
+}
+
+#[cfg(unix)]
+fn preview_omp_metadata_for_build<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+) -> Result<&'a OmpCompanionMetadata, String> {
+    if manifest.build_id == herdr_build_id {
+        return manifest.omp.as_ref().ok_or_else(|| {
+            format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+        });
+    }
+    manifest
+        .builds
+        .get(herdr_build_id)
+        .ok_or_else(|| format!("preview manifest has no retained build {herdr_build_id}"))?
+        .omp
+        .as_ref()
+        .ok_or_else(|| {
+            format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+        })
+}
+
+#[cfg(unix)]
+fn validate_omp_source_value(field: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains("REPLACE_WITH_") {
+        return Err(format!(
+            "paired OMP {field} is missing or still a replacement placeholder"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_omp_git_oid(field: &str, value: &str) -> Result<(), String> {
+    validate_omp_source_value(field, value)?;
+    if value.len() != 40 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(format!(
+            "paired OMP {field} must be a 40-character Git object ID"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preview_omp_asset_for_build<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+) -> Result<(&'a OmpCompanionMetadata, &'a AssetRef, &'a str), String> {
+    let omp = preview_omp_metadata_for_build(manifest, herdr_build_id)?;
+    validate_omp_source_value("build_id", &omp.build_id)?;
+    validate_omp_git_oid("commit", &omp.commit)?;
+    validate_omp_git_oid("tree", &omp.tree)?;
+    validate_omp_source_value("version", &omp.version)?;
+    if omp.build_id != expected.build_id
+        || omp.commit != expected.commit
+        || omp.tree != expected.tree
+        || omp.version != expected.version
+    {
+        return Err(format!(
+            "paired OMP identity mismatch: Herdr requires {}/{}/{}/{}",
+            expected.build_id, expected.commit, expected.tree, expected.version
+        ));
+    }
+    let asset = omp.assets.get(asset_key).ok_or_else(|| {
+        format!(
+            "paired OMP build {} has no asset for {asset_key}",
+            omp.build_id
+        )
+    })?;
+    let checksum = asset
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| format!("paired OMP asset {asset_key} is missing a SHA-256 checksum"))?;
+    if checksum.len() != 64
+        || !checksum
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "paired OMP asset {asset_key} has an invalid SHA-256 checksum"
+        ));
+    }
+    Ok((omp, asset, checksum))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedOmpCompanion {
+    executable: PathBuf,
+    build_id: String,
+    sha256: String,
+    commit: String,
+    tree: String,
+    version: String,
+}
+
+impl ManagedOmpCompanion {
+    #[cfg(unix)]
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[cfg(unix)]
+    fn verify(&self) -> Result<(), String> {
+        validate_managed_omp(&self.executable, &self.sha256)
+    }
+
+    pub(crate) fn apply_to_command(&self, command: &mut Command) {
+        command
+            .env(MANAGED_OMP_BIN_ENV_VAR, &self.executable)
+            .env(MANAGED_OMP_BUILD_ID_ENV_VAR, &self.build_id)
+            .env(MANAGED_OMP_COMMIT_ENV_VAR, &self.commit)
+            .env(MANAGED_OMP_TREE_ENV_VAR, &self.tree)
+            .env(MANAGED_OMP_VERSION_ENV_VAR, &self.version)
+            .env(MANAGED_OMP_SHA256_ENV_VAR, &self.sha256)
+            .env_remove(MANAGED_OMP_DISABLED_ENV_VAR);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
+        env.extend([
+            (
+                MANAGED_OMP_BIN_ENV_VAR.to_string(),
+                self.executable.to_string_lossy().into_owned(),
+            ),
+            (
+                MANAGED_OMP_BUILD_ID_ENV_VAR.to_string(),
+                self.build_id.clone(),
+            ),
+            (MANAGED_OMP_COMMIT_ENV_VAR.to_string(), self.commit.clone()),
+            (MANAGED_OMP_TREE_ENV_VAR.to_string(), self.tree.clone()),
+            (
+                MANAGED_OMP_VERSION_ENV_VAR.to_string(),
+                self.version.clone(),
+            ),
+            (MANAGED_OMP_SHA256_ENV_VAR.to_string(), self.sha256.clone()),
+        ]);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OmpExecutable {
+    Explicit(PathBuf),
+    #[cfg(unix)]
+    Managed(ManagedOmpCompanion),
+}
+
+impl OmpExecutable {
+    pub(crate) fn executable(&self) -> &Path {
+        match self {
+            Self::Explicit(path) => path,
+            #[cfg(unix)]
+            Self::Managed(companion) => companion.executable(),
+        }
+    }
+
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            match self {
+                Self::Explicit(path) => validate_executable(path),
+                Self::Managed(companion) => companion.verify(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
+        if let Self::Managed(companion) = self {
+            companion.append_launch_env(env);
+        }
+    }
 }
 
 fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>) {
@@ -665,25 +908,40 @@ impl Drop for UpdateLock {
 #[cfg(not(windows))]
 fn acquire_update_lock_at(current_exe: &Path, nonblocking: bool) -> Result<UpdateLock, String> {
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
-    fs::create_dir_all(parent).map_err(|error| {
+    let lock_path = parent.join(".herdr-update.lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path).map_err(|error| {
         format!(
-            "failed to create update directory {}: {error}",
-            parent.display()
+            "failed to open update lock {}: {error}",
+            lock_path.display()
         )
     })?;
-    let lock_path = parent.join(".herdr-update.lock");
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = file.metadata().map_err(|error| {
             format!(
-                "failed to open update lock {}: {error}",
+                "failed to inspect update lock {}: {error}",
                 lock_path.display()
             )
         })?;
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.uid() != euid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "update lock is not a private current-user file: {}",
+                lock_path.display()
+            ));
+        }
+    }
     let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     // SAFETY: `file` owns a valid open descriptor and `operation` contains flock flags only.
     if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
@@ -744,22 +1002,27 @@ fn download_update_asset_for_exe(
     expected_sha256: Option<&str>,
 ) -> Result<DownloadedUpdate, String> {
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
-
-    // Check write permissions early
-    let test_path = parent.join(".herdr-write-test");
-    if let Err(e) = fs::write(&test_path, b"") {
-        let _ = fs::remove_file(&test_path);
-        return Err(format!(
-            "install directory not writable: {} ({}). Try running with appropriate permissions.",
-            parent.display(),
-            e
-        ));
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| format!("failed to create update temp name: {error}"))?;
+    let tmp_path = parent.join(format!(
+        ".herdr-update-{}-{:x}.tmp",
+        std::process::id(),
+        Sha256::digest(nonce)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let _ = fs::remove_file(&test_path);
-
-    // Unique temp file avoids collisions after update attempts are serialized.
-    let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
-
+    options.open(&tmp_path).map_err(|error| {
+        format!(
+            "failed to create update temp file {}: {error}",
+            tmp_path.display()
+        )
+    })?;
     // Download the exact asset URL (pinned to the release we checked)
     let status = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--max-time", "120", "-o"])
@@ -818,13 +1081,247 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
 }
 
 #[cfg(unix)]
-fn remote_client_executable_path(state_dir: &Path, build_id: &str) -> PathBuf {
+fn private_managed_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    let was_missing = match fs::symlink_metadata(state_dir) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect managed state directory {}: {error}",
+                state_dir.display()
+            ));
+        }
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(state_dir).map_err(|error| {
+        format!(
+            "failed to create managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    if was_missing {
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed to make newly created managed state directory private {}: {error}",
+                state_dir.display()
+            )
+        })?;
+    }
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(state_dir)
+        .map_err(|error| {
+            format!(
+                "failed to open managed state directory without following links {}: {error}",
+                state_dir.display()
+            )
+        })?;
+    let opened = directory.metadata().map_err(|error| {
+        format!(
+            "failed to inspect managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let euid = unsafe { libc::geteuid() };
+    if !opened.is_dir() || opened.uid() != euid {
+        return Err(format!(
+            "managed state directory is not owned by the current user: {}",
+            state_dir.display()
+        ));
+    }
+    let opened_mode = opened.permissions().mode();
+    if opened_mode & 0o022 != 0 {
+        return Err(format!(
+            "managed state directory is group- or world-writable: {}",
+            state_dir.display()
+        ));
+    }
+    if opened_mode & 0o077 != 0 {
+        let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+        if result != 0 {
+            return Err(format!(
+                "failed to make managed state directory private {}: {}",
+                state_dir.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    }
+
+    let canonical = fs::canonicalize(state_dir).map_err(|error| {
+        format!(
+            "failed to canonicalize managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+        format!(
+            "failed to inspect canonical managed state directory {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if opened.dev() != canonical_metadata.dev() || opened.ino() != canonical_metadata.ino() {
+        return Err(format!(
+            "managed state directory changed while it was being validated: {}",
+            state_dir.display()
+        ));
+    }
+
+    let mut current = PathBuf::new();
+    for component in canonical.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "failed to inspect managed state directory ancestor {}: {error}",
+                current.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "managed state directory ancestor is not a directory: {}",
+                current.display()
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if current == canonical {
+            if metadata.uid() != euid {
+                return Err(format!(
+                    "managed state directory is not owned by the current user: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 {
+                return Err(format!(
+                    "managed state directory is group- or world-writable: {}",
+                    current.display()
+                ));
+            }
+        } else {
+            if metadata.uid() != 0 && metadata.uid() != euid {
+                return Err(format!(
+                    "managed state directory has an untrusted owner on ancestor: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(format!(
+                    "managed state directory has an unsafe writable ancestor: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn private_managed_subdir(state_dir: &Path, components: &[&str]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    let euid = unsafe { libc::geteuid() };
+    let mut current = state_dir.to_path_buf();
+    for component in components {
+        let next = current.join(component);
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        let created = match builder.create(&next) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create managed state subdirectory {}: {error}",
+                    next.display()
+                ));
+            }
+        };
+        if created {
+            fs::set_permissions(&next, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                format!(
+                    "failed to make newly created managed state subdirectory private {}: {error}",
+                    next.display()
+                )
+            })?;
+        }
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&next)
+            .map_err(|error| {
+                format!(
+                    "failed to open managed state subdirectory without following links {}: {error}",
+                    next.display()
+                )
+            })?;
+        let opened = directory.metadata().map_err(|error| {
+            format!(
+                "failed to inspect managed state subdirectory {}: {error}",
+                next.display()
+            )
+        })?;
+        if !opened.is_dir() || opened.uid() != euid || opened.permissions().mode() & 0o022 != 0 {
+            return Err(format!(
+                "managed state subdirectory is not private and current-user-owned: {}",
+                next.display()
+            ));
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
+            let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+            if result != 0 {
+                return Err(format!(
+                    "failed to make managed state subdirectory private {}: {}",
+                    next.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        let canonical = fs::canonicalize(&next).map_err(|error| {
+            format!(
+                "failed to canonicalize managed state subdirectory {}: {error}",
+                next.display()
+            )
+        })?;
+        let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+            format!(
+                "failed to inspect canonical managed state subdirectory {}: {error}",
+                canonical.display()
+            )
+        })?;
+        if canonical.parent() != Some(current.as_path())
+            || opened.dev() != canonical_metadata.dev()
+            || opened.ino() != canonical_metadata.ino()
+        {
+            return Err(format!(
+                "managed state subdirectory changed while it was being validated: {}",
+                next.display()
+            ));
+        }
+        current = canonical;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn private_remote_client_build_dir(state_dir: &Path, build_id: &str) -> Result<PathBuf, String> {
     let build_hash = format!("{:x}", Sha256::digest(build_id.as_bytes()));
-    state_dir
-        .join("remote")
-        .join("clients")
-        .join(build_hash)
-        .join("herdr")
+    private_managed_subdir(state_dir, &["remote", "clients", &build_hash])
+}
+
+#[cfg(all(test, unix))]
+fn remote_client_build_dir(state_dir: &Path, build_id: &str) -> PathBuf {
+    let build_hash = format!("{:x}", Sha256::digest(build_id.as_bytes()));
+    state_dir.join("remote").join("clients").join(build_hash)
+}
+
+#[cfg(all(test, unix))]
+fn remote_omp_executable_path(state_dir: &Path, build_id: &str) -> PathBuf {
+    remote_client_build_dir(state_dir, build_id).join("omp")
 }
 
 #[cfg(unix)]
@@ -834,12 +1331,555 @@ fn install_exact_asset_for_remote_build_at(
     download_url: &str,
     expected_sha256: &str,
 ) -> Result<PathBuf, String> {
-    let client_exe = remote_client_executable_path(state_dir, build_id);
+    let state_dir = private_managed_state_dir(state_dir)?;
+    let client_exe = private_remote_client_build_dir(&state_dir, build_id)?.join("herdr");
     let _lock = acquire_update_lock_at(&client_exe, true)?;
     let update = download_update_asset_for_exe(client_exe, download_url, Some(expected_sha256))?;
     let client_exe = update.current_exe.clone();
     install_downloaded_update(update)?;
+    validate_private_managed_executable(&client_exe)?;
+    crate::checksum::verify_sha256(&client_exe, expected_sha256)
+        .map_err(|error| format!("installed remote Herdr checksum verification failed: {error}"))?;
     Ok(client_exe)
+}
+
+#[cfg(unix)]
+fn validate_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "OMP executable path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("OMP executable {} is unavailable: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("OMP executable is not a file: {}", path.display()));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "OMP executable is not executable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_managed_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "managed executable path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "managed executable {} is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    let euid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode();
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || (metadata.uid() != 0 && metadata.uid() != euid)
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
+        return Err(format!(
+            "managed executable is not a trusted regular executable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_managed_omp(path: &Path, expected_sha256: &str) -> Result<(), String> {
+    validate_private_managed_executable(path)?;
+    crate::checksum::verify_sha256(path, expected_sha256)
+        .map_err(|error| format!("OMP companion checksum verification failed: {error}"))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedReleaseMetadata {
+    #[serde(rename = "assetUrl")]
+    asset_url: String,
+    #[serde(rename = "buildId")]
+    build_id: String,
+    commit: String,
+    omp: SealedOmpMetadata,
+    platform: String,
+    protocol: u32,
+    schema: u32,
+    sha256: String,
+    version: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedOmpMetadata {
+    #[serde(rename = "assetUrl")]
+    asset_url: String,
+    #[serde(rename = "buildId")]
+    build_id: String,
+    commit: String,
+    platform: String,
+    sha256: String,
+    tree: String,
+    version: String,
+}
+
+#[cfg(unix)]
+struct SealedPairExpectation<'a> {
+    herdr_build_id: &'a str,
+    herdr_commit: &'a str,
+    herdr_platform: String,
+    herdr_version: String,
+    omp: OmpBuildIdentity<'a>,
+    omp_platform: String,
+}
+
+#[cfg(unix)]
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(format!("{label} must be a 64-character SHA-256 digest"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_value(label: &str, value: &str) -> Result<(), String> {
+    validate_omp_source_value(label, value)?;
+    if value.contains('\r') || value.contains('\n') {
+        return Err(format!("{label} must be one line"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_member(path: &Path, label: &str, directory: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("sealed OMP release {label} is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        }
+    {
+        return Err(format!("sealed OMP release {label} must not be a symlink"));
+    }
+    if metadata.permissions().mode() & 0o222 != 0 {
+        return Err(format!("sealed OMP release {label} is writable"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_release_ancestry(release_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let euid = unsafe { libc::geteuid() };
+    let mut current = PathBuf::new();
+    for component in release_dir.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "failed to inspect sealed OMP release ancestor {}: {error}",
+                current.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "sealed OMP release ancestor is not a directory: {}",
+                current.display()
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if current == release_dir {
+            if metadata.uid() != euid {
+                return Err(format!(
+                    "sealed OMP release directory is not owned by the current user: {}",
+                    current.display()
+                ));
+            }
+        } else {
+            if metadata.uid() != 0 && metadata.uid() != euid {
+                return Err(format!(
+                    "sealed OMP release has an untrusted owner on ancestor: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(format!(
+                    "sealed OMP release has an unsafe writable ancestor: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sealed_member_present(path: &Path, label: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "sealed OMP release {label} is unavailable: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn sealed_sibling_omp_companion(
+    current_exe: &Path,
+    expected: &SealedPairExpectation<'_>,
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    let current_exe = fs::canonicalize(current_exe)
+        .map_err(|error| format!("failed to canonicalize running Herdr executable: {error}"))?;
+    let Some(release_dir) = current_exe.parent() else {
+        return Ok(None);
+    };
+    let herdr = release_dir.join("herdr");
+    let omp = release_dir.join("omp");
+    let metadata = release_dir.join("release.json");
+    let has_metadata = sealed_member_present(&metadata, "release metadata")?;
+    if !has_metadata {
+        return Ok(None);
+    }
+    if !sealed_member_present(&omp, "OMP executable")? {
+        return Err("sealed OMP release is incomplete".into());
+    }
+    validate_sealed_member(release_dir, "directory", true)?;
+    validate_sealed_release_ancestry(release_dir)?;
+    validate_sealed_member(&herdr, "Herdr executable", false)?;
+    validate_sealed_member(&omp, "OMP executable", false)?;
+    validate_sealed_member(&metadata, "release metadata", false)?;
+    if fs::canonicalize(&herdr).map_err(|error| error.to_string())? != current_exe {
+        return Err(
+            "sealed OMP release Herdr executable does not match the running Herdr binary".into(),
+        );
+    }
+    let metadata: SealedReleaseMetadata = serde_json::from_slice(
+        &fs::read(&metadata)
+            .map_err(|error| format!("failed to read sealed OMP release metadata: {error}"))?,
+    )
+    .map_err(|error| format!("invalid sealed OMP release metadata: {error}"))?;
+    if metadata.schema != 2 {
+        return Err("sealed OMP release metadata has an unsupported schema".into());
+    }
+    validate_sealed_value("sealed Herdr asset URL", &metadata.asset_url)?;
+    validate_sealed_value("sealed Herdr build ID", &metadata.build_id)?;
+    validate_omp_git_oid("sealed Herdr commit", &metadata.commit)?;
+    validate_sealed_value("sealed Herdr platform", &metadata.platform)?;
+    validate_sha256("sealed Herdr SHA-256", &metadata.sha256)?;
+    validate_sealed_value("sealed Herdr version", &metadata.version)?;
+    validate_sealed_value("sealed OMP asset URL", &metadata.omp.asset_url)?;
+    validate_sealed_value("sealed OMP build ID", &metadata.omp.build_id)?;
+    validate_omp_git_oid("sealed OMP commit", &metadata.omp.commit)?;
+    validate_sealed_value("sealed OMP platform", &metadata.omp.platform)?;
+    validate_sha256("sealed OMP SHA-256", &metadata.omp.sha256)?;
+    validate_omp_git_oid("sealed OMP tree", &metadata.omp.tree)?;
+    validate_sealed_value("sealed OMP version", &metadata.omp.version)?;
+    if metadata.build_id != expected.herdr_build_id
+        || metadata.commit != expected.herdr_commit
+        || metadata.platform != expected.herdr_platform
+        || metadata.protocol != crate::protocol::PROTOCOL_VERSION
+        || metadata.version != expected.herdr_version
+    {
+        return Err("sealed OMP release metadata does not match this Herdr build".into());
+    }
+    if metadata.omp.build_id != expected.omp.build_id
+        || metadata.omp.commit != expected.omp.commit
+        || metadata.omp.tree != expected.omp.tree
+        || metadata.omp.version != expected.omp.version
+        || metadata.omp.platform != expected.omp_platform
+    {
+        return Err("sealed OMP release metadata does not match this Herdr OMP companion".into());
+    }
+    validate_executable(&herdr)?;
+    crate::checksum::verify_sha256(&herdr, &metadata.sha256)
+        .map_err(|error| format!("sealed Herdr checksum verification failed: {error}"))?;
+    validate_managed_omp(&omp, &metadata.omp.sha256)?;
+    Ok(Some(ManagedOmpCompanion {
+        executable: omp,
+        build_id: metadata.omp.build_id,
+        commit: metadata.omp.commit,
+        tree: metadata.omp.tree,
+        version: metadata.omp.version,
+        sha256: metadata.omp.sha256,
+    }))
+}
+
+#[cfg(unix)]
+fn install_exact_omp_asset_for_remote_build_at(
+    state_dir: &Path,
+    herdr_build_id: &str,
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    let state_dir = private_managed_state_dir(state_dir)?;
+    let omp_exe = private_remote_client_build_dir(&state_dir, herdr_build_id)?.join("omp");
+    if validate_managed_omp(&omp_exe, expected_sha256).is_ok() {
+        return Ok(omp_exe);
+    }
+
+    let _lock = acquire_update_lock_at(&omp_exe, false)?;
+    if validate_managed_omp(&omp_exe, expected_sha256).is_ok() {
+        return Ok(omp_exe);
+    }
+    let update =
+        download_update_asset_for_exe(omp_exe.clone(), download_url, Some(expected_sha256))?;
+    install_downloaded_update(update)?;
+    validate_managed_omp(&omp_exe, expected_sha256)?;
+    Ok(omp_exe)
+}
+
+#[cfg(all(test, unix))]
+fn install_omp_companion_from_manifest_at(
+    state_dir: &Path,
+    manifest: &PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+) -> Result<ManagedOmpCompanion, String> {
+    let (omp, asset, checksum) =
+        preview_omp_asset_for_build(manifest, herdr_build_id, expected, asset_key)?;
+    let executable = install_exact_omp_asset_for_remote_build_at(
+        state_dir,
+        herdr_build_id,
+        &asset.url,
+        checksum,
+    )?;
+    Ok(ManagedOmpCompanion {
+        executable,
+        build_id: omp.build_id.clone(),
+        commit: omp.commit.clone(),
+        tree: omp.tree.clone(),
+        version: omp.version.clone(),
+        sha256: checksum.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn current_sealed_pair_expectation(
+    omp: OmpBuildIdentity<'static>,
+    omp_platform: &str,
+) -> Result<SealedPairExpectation<'static>, String> {
+    let herdr_build_id =
+        crate::build_info::build_id().ok_or("paired Herdr build has no immutable build ID")?;
+    let herdr_commit =
+        crate::build_info::commit().ok_or("paired Herdr build has no immutable source commit")?;
+    validate_sealed_value("compiled Herdr build ID", herdr_build_id)?;
+    validate_omp_git_oid("compiled Herdr commit", herdr_commit)?;
+    let (os, arch) = platform_target();
+    Ok(SealedPairExpectation {
+        herdr_build_id,
+        herdr_commit,
+        herdr_platform: format!("{os}-{arch}"),
+        herdr_version: format!("herdr {}", crate::build_info::version()),
+        omp,
+        omp_platform: omp_platform.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn load_current_omp_companion() -> Result<Option<ManagedOmpCompanion>, String> {
+    let Some(omp) = compiled_omp_identity()? else {
+        return Ok(None);
+    };
+    let Some(omp_platform) = omp_platform_target() else {
+        return Ok(None);
+    };
+    let expected = current_sealed_pair_expectation(omp, &omp_platform)?;
+    if let Ok(current_exe) = env::current_exe() {
+        match sealed_sibling_omp_companion(&current_exe, &expected) {
+            Ok(Some(companion)) => return Ok(Some(companion)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if crate::build_info::update_manifest_url().is_none() {
+        return Err("paired Herdr build has no build-authored preview manifest URL".into());
+    }
+    let manifest = fetch_preview_manifest()?;
+    if manifest.channel != "preview" {
+        return Err(format!(
+            "paired Herdr build manifest has unexpected channel {}",
+            manifest.channel
+        ));
+    }
+    let (omp_metadata, asset, checksum) = preview_omp_asset_for_build(
+        &manifest,
+        expected.herdr_build_id,
+        expected.omp,
+        &omp_platform,
+    )?;
+    let executable = install_exact_omp_asset_for_remote_build_at(
+        &crate::config::state_dir(),
+        expected.herdr_build_id,
+        &asset.url,
+        checksum,
+    )?;
+    Ok(Some(ManagedOmpCompanion {
+        executable,
+        build_id: omp_metadata.build_id.clone(),
+        commit: omp_metadata.commit.clone(),
+        tree: omp_metadata.tree.clone(),
+        version: omp_metadata.version.clone(),
+        sha256: checksum.to_string(),
+    }))
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_omp_companion_for_current_build(
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    load_current_omp_companion()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn managed_omp_companion_for_current_build(
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn explicit_omp_executable() -> Result<Option<PathBuf>, String> {
+    let Some(path) = env::var_os(OMP_BIN_ENV_VAR).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    validate_executable(&path)?;
+    Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn server_private_omp_fallback_executable() -> Result<OmpExecutable, String> {
+    let Some(path) = env::var_os("PATH") else {
+        return Err(
+            "server-private OMP fallback executable `omp` is unavailable because PATH is unset"
+                .into(),
+        );
+    };
+    for directory in env::split_paths(&path) {
+        let Ok(candidate) = fs::canonicalize(directory.join("omp")) else {
+            continue;
+        };
+        if validate_executable(&candidate).is_ok() {
+            return Ok(OmpExecutable::Explicit(candidate));
+        }
+    }
+    Err("server-private OMP fallback executable `omp` is unavailable on PATH".into())
+}
+
+#[cfg(unix)]
+fn managed_omp_companion_from_env() -> Result<Option<ManagedOmpCompanion>, String> {
+    let path = env::var_os(MANAGED_OMP_BIN_ENV_VAR);
+    let build_id = env::var(MANAGED_OMP_BUILD_ID_ENV_VAR).ok();
+    let commit = env::var(MANAGED_OMP_COMMIT_ENV_VAR).ok();
+    let tree = env::var(MANAGED_OMP_TREE_ENV_VAR).ok();
+    let version = env::var(MANAGED_OMP_VERSION_ENV_VAR).ok();
+    let sha256 = env::var(MANAGED_OMP_SHA256_ENV_VAR).ok();
+    if path.is_none()
+        && build_id.is_none()
+        && commit.is_none()
+        && tree.is_none()
+        && version.is_none()
+        && sha256.is_none()
+    {
+        return Ok(None);
+    }
+    let path = path
+        .map(PathBuf::from)
+        .ok_or("managed OMP launch environment is missing its executable path")?;
+    let build_id = build_id.ok_or("managed OMP launch environment is missing its build ID")?;
+    let commit = commit.ok_or("managed OMP launch environment is missing its commit")?;
+    let tree = tree.ok_or("managed OMP launch environment is missing its tree")?;
+    let version = version.ok_or("managed OMP launch environment is missing its version")?;
+    let sha256 = sha256.ok_or("managed OMP launch environment is missing its checksum")?;
+    let expected = compiled_omp_identity()?
+        .ok_or("unpaired Herdr build cannot accept a managed OMP companion")?;
+    if build_id != expected.build_id
+        || commit != expected.commit
+        || tree != expected.tree
+        || version != expected.version
+    {
+        return Err(format!(
+            "managed OMP identity mismatch: Herdr requires {}/{}/{}/{}",
+            expected.build_id, expected.commit, expected.tree, expected.version
+        ));
+    }
+    validate_managed_omp(&path, &sha256)?;
+    Ok(Some(ManagedOmpCompanion {
+        executable: path,
+        build_id,
+        commit,
+        tree,
+        version,
+        sha256,
+    }))
+}
+
+#[cfg(unix)]
+pub(crate) fn native_omp_executable() -> Result<OmpExecutable, String> {
+    if let Some(path) = explicit_omp_executable()? {
+        return Ok(OmpExecutable::Explicit(path));
+    }
+    if env::var_os(MANAGED_OMP_DISABLED_ENV_VAR).is_some() {
+        return Err("managed OMP companion is disabled for this client attach".into());
+    }
+    if omp_platform_target().is_none() {
+        return Err("managed OMP companion is unavailable for this platform".into());
+    }
+    if let Some(companion) = managed_omp_companion_from_env()? {
+        return Ok(OmpExecutable::Managed(companion));
+    }
+    managed_omp_companion_for_current_build()?
+        .map(OmpExecutable::Managed)
+        .ok_or_else(|| "this Herdr build has no paired OMP companion".into())
+}
+
+#[cfg(unix)]
+pub(crate) fn server_private_omp_executable() -> Result<OmpExecutable, String> {
+    if let Some(path) = explicit_omp_executable()? {
+        return Ok(OmpExecutable::Explicit(path));
+    }
+    if compiled_omp_identity()?.is_some() {
+        if omp_platform_target().is_none() {
+            return Err(
+                "paired Herdr build has no managed OMP companion for this server platform".into(),
+            );
+        }
+        return managed_omp_companion_for_current_build()?
+            .map(OmpExecutable::Managed)
+            .ok_or_else(|| "paired Herdr build has no managed OMP companion".into());
+    }
+    #[cfg(test)]
+    if let Ok(executable) = env::current_exe() {
+        return Ok(OmpExecutable::Explicit(executable));
+    }
+    server_private_omp_fallback_executable()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn server_private_omp_executable() -> Result<OmpExecutable, String> {
+    Ok(OmpExecutable::Explicit(
+        env::var_os(OMP_BIN_ENV_VAR)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("omp")),
+    ))
 }
 
 #[cfg(unix)]
@@ -2654,6 +3694,176 @@ fn platform_target() -> (&'static str, &'static str) {
 
     (os, arch)
 }
+#[cfg(unix)]
+fn omp_asset_key_for_target(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        ("macos", "x86_64") => Some("macos-x86_64".into()),
+        ("macos", "aarch64") => Some("macos-aarch64".into()),
+        ("linux", "x86_64") => Some("linux-x86_64".into()),
+        ("linux", "aarch64") => Some("linux-aarch64".into()),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxHostLibc {
+    Glibc,
+    Musl,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn omp_asset_key_for_linux_host(arch: &str, libc: LinuxHostLibc) -> Option<String> {
+    match libc {
+        LinuxHostLibc::Glibc => omp_asset_key_for_target("linux", arch),
+        LinuxHostLibc::Musl => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_from_getconf_gnu_libc_version(output: &[u8]) -> Option<LinuxHostLibc> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("musl") {
+        return Some(LinuxHostLibc::Musl);
+    }
+    output
+        .trim_start()
+        .starts_with("glibc ")
+        .then_some(LinuxHostLibc::Glibc)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_from_ldd_version(output: &[u8]) -> Option<LinuxHostLibc> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("musl") {
+        return Some(LinuxHostLibc::Musl);
+    }
+    (output.contains("glibc") || output.contains("gnu libc") || output.contains("gnu c library"))
+        .then_some(LinuxHostLibc::Glibc)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_with_probes(
+    getconf: impl FnOnce() -> Option<Vec<u8>>,
+    ldd: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<LinuxHostLibc> {
+    getconf()
+        .as_deref()
+        .and_then(linux_host_libc_from_getconf_gnu_libc_version)
+        .or_else(|| ldd().as_deref().and_then(linux_host_libc_from_ldd_version))
+}
+
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_OUTPUT_LIMIT: usize = 8 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_limited_libc_probe_output<R>(mut reader: R) -> std::sync::mpsc::Receiver<Option<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::with_capacity(LIBC_PROBE_OUTPUT_LIMIT / 2);
+        let mut buffer = [0_u8; 1024];
+        let result = loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(_) => break None,
+            };
+            if read == 0 {
+                break Some(output);
+            }
+            if output.len().saturating_add(read) > LIBC_PROBE_OUTPUT_LIMIT / 2 {
+                break None;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+#[cfg(target_os = "linux")]
+fn linux_libc_probe_output(command: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let stdout = read_limited_libc_probe_output(stdout);
+    let stderr = read_limited_libc_probe_output(stderr);
+    let deadline = Instant::now() + LIBC_PROBE_TIMEOUT;
+    let completed = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Err(_) => break false,
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break false;
+                }
+                std::thread::sleep((deadline - now).min(LIBC_PROBE_POLL_INTERVAL));
+            }
+        }
+    };
+    if !completed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let mut output = stdout
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()??;
+    let stderr = stderr
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()??;
+    output.extend_from_slice(&stderr);
+    Some(output)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_getconf_gnu_libc_version_output() -> Option<Vec<u8>> {
+    linux_libc_probe_output("/usr/bin/getconf", &["GNU_LIBC_VERSION"])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ldd_version_output() -> Option<Vec<u8>> {
+    linux_libc_probe_output("/usr/bin/ldd", &["--version"])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_host_libc() -> Option<LinuxHostLibc> {
+    static HOST_LIBC: LazyLock<Option<LinuxHostLibc>> = LazyLock::new(|| {
+        linux_host_libc_with_probes(
+            linux_getconf_gnu_libc_version_output,
+            linux_ldd_version_output,
+        )
+    });
+    *HOST_LIBC
+}
+
+#[cfg(target_os = "linux")]
+fn omp_platform_target() -> Option<String> {
+    let (_, arch) = platform_target();
+    linux_host_libc().and_then(|libc| omp_asset_key_for_linux_host(arch, libc))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn omp_platform_target() -> Option<String> {
+    let (os, arch) = platform_target();
+    omp_asset_key_for_target(os, arch)
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2661,6 +3871,7 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(all(test, unix))]
 mod tests {
+
     use super::*;
     #[cfg(unix)]
     use sha2::{Digest, Sha256};
@@ -2677,6 +3888,22 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    struct UmaskGuard(libc::mode_t);
+
+    impl UmaskGuard {
+        fn set(mode: libc::mode_t) -> Self {
+            Self(unsafe { libc::umask(mode) })
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2689,6 +3916,126 @@ mod tests {
     }
     fn unique_test_dir(name: &str) -> PathBuf {
         unique_test_socket_path(name).with_extension("dir")
+    }
+
+    fn paired_omp_manifest_value(url: &str, checksum: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "channel": "preview",
+            "base_version": "0.8.0",
+            "build_id": "herdr-build",
+            "commit": "herdr-commit",
+            "built_at": "2026-08-19T00:00:00Z",
+            "protocol": 77,
+            "notes": "paired build",
+            "assets": {},
+            "omp": {
+                "build_id": "omp-build",
+                "commit": "a".repeat(40),
+                "tree": "b".repeat(40),
+                "version": "17.3.7",
+                "assets": {
+                    "macos-aarch64": {
+                        "url": url,
+                        "sha256": checksum,
+                    }
+                }
+            }
+        })
+    }
+
+    fn test_omp_identity() -> OmpBuildIdentity<'static> {
+        OmpBuildIdentity {
+            build_id: "omp-build",
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            version: "17.3.7",
+        }
+    }
+
+    fn sealed_pair_expectation() -> SealedPairExpectation<'static> {
+        SealedPairExpectation {
+            herdr_build_id: "herdr-build",
+            herdr_commit: "cccccccccccccccccccccccccccccccccccccccc",
+            herdr_platform: "macos-aarch64".into(),
+            herdr_version: "herdr 0.8.0".into(),
+            omp: test_omp_identity(),
+            omp_platform: "macos-aarch64".into(),
+        }
+    }
+
+    fn sealed_pair_metadata(herdr: &Path, omp: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "assetUrl": "https://example.invalid/herdr",
+            "buildId": "herdr-build",
+            "commit": "cccccccccccccccccccccccccccccccccccccccc",
+            "omp": {
+                "assetUrl": "https://example.invalid/omp",
+                "buildId": "omp-build",
+                "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "platform": "macos-aarch64",
+                "sha256": format!("{:x}", Sha256::digest(fs::read(omp).unwrap())),
+                "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "version": "17.3.7",
+            },
+            "platform": "macos-aarch64",
+            "protocol": crate::protocol::PROTOCOL_VERSION,
+            "schema": 2,
+            "sha256": format!("{:x}", Sha256::digest(fs::read(herdr).unwrap())),
+            "version": "herdr 0.8.0",
+        })
+    }
+
+    fn seal_pair(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(dir.join("herdr"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(dir.join("omp"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(dir.join("release.json"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn unseal_pair(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("omp"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("release.json"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn write_sealed_pair_metadata(dir: &Path, metadata: &serde_json::Value) {
+        unseal_pair(dir);
+        fs::write(
+            dir.join("release.json"),
+            serde_json::to_vec(metadata).unwrap(),
+        )
+        .unwrap();
+        seal_pair(dir);
+    }
+
+    fn create_sealed_pair_at(dir: PathBuf) -> (PathBuf, PathBuf, PathBuf) {
+        fs::create_dir(&dir).unwrap();
+        let herdr = dir.join("herdr");
+        let omp = dir.join("omp");
+        fs::write(&herdr, b"#!/bin/sh\necho herdr\n").unwrap();
+        fs::write(&omp, b"#!/bin/sh\necho omp\n").unwrap();
+        let metadata = sealed_pair_metadata(&herdr, &omp);
+        fs::write(
+            dir.join("release.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        seal_pair(&dir);
+        (dir, herdr, omp)
+    }
+
+    fn create_sealed_pair(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        create_sealed_pair_at(unique_test_dir(name))
+    }
+
+    fn remove_sealed_pair(dir: &Path) {
+        unseal_pair(dir);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn spawn_accept_loop(path: &Path) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -3132,6 +4479,118 @@ mod tests {
     }
 
     #[test]
+    fn managed_state_root_is_private_and_rejects_symlinks_and_unsafe_ancestors() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = unique_test_dir("managed-state-root");
+        fs::create_dir(&dir).unwrap();
+        let real = dir.join("real-state");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            private_managed_state_dir(&real).unwrap(),
+            real.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let alias = dir.join("state-link");
+        symlink(&real, &alias).unwrap();
+        assert!(private_managed_state_dir(&alias)
+            .unwrap_err()
+            .contains("without following links"));
+
+        let unsafe_parent = dir.join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let unsafe_state = unsafe_parent.join("state");
+        fs::create_dir(&unsafe_state).unwrap();
+        fs::set_permissions(&unsafe_state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_managed_state_dir(&unsafe_state)
+            .unwrap_err()
+            .contains("unsafe writable ancestor"));
+
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let escaped = dir.join("escaped");
+        fs::create_dir(&escaped).unwrap();
+        let remote_link = real.join("remote");
+        symlink(&escaped, &remote_link).unwrap();
+        assert!(
+            private_remote_client_build_dir(&real.canonicalize().unwrap(), "build")
+                .unwrap_err()
+                .contains("without following links")
+        );
+        fs::remove_file(&remote_link).unwrap();
+
+        let build_dir =
+            private_remote_client_build_dir(&real.canonicalize().unwrap(), "build").unwrap();
+        let escaped_lock = escaped.join("lock");
+        fs::write(&escaped_lock, b"").unwrap();
+        symlink(&escaped_lock, build_dir.join(".herdr-update.lock")).unwrap();
+        assert!(acquire_update_lock_at(&build_dir.join("omp"), true)
+            .unwrap_err()
+            .contains("failed to open update lock"));
+        fs::remove_file(build_dir.join(".herdr-update.lock")).unwrap();
+
+        let escaped_omp = escaped.join("omp");
+        fs::write(&escaped_omp, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&escaped_omp, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&escaped_omp, build_dir.join("omp")).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(fs::read(&escaped_omp).unwrap()));
+        assert!(validate_managed_omp(&build_dir.join("omp"), &checksum)
+            .unwrap_err()
+            .contains("trusted regular executable"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newly_created_managed_state_directories_are_exactly_private_for_any_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD_ENV: &str = "HERDR_TEST_MANAGED_STATE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::tests::newly_created_managed_state_directories_are_exactly_private_for_any_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = unique_test_dir("managed-state-umask");
+        fs::create_dir(&dir).unwrap();
+        let state = dir.join("state");
+        let umask = UmaskGuard::set(0o777);
+
+        let state = private_managed_state_dir(&state).unwrap();
+        let build = private_remote_client_build_dir(&state, "build").unwrap();
+        for path in [
+            state.clone(),
+            state.join("remote"),
+            state.join("remote").join("clients"),
+            build,
+        ] {
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
+
+        drop(umask);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn exact_asset_install_uses_build_scoped_client_without_replacing_launcher() {
         let dir = unique_test_dir("exact-asset");
         fs::create_dir(&dir).unwrap();
@@ -3154,7 +4613,258 @@ mod tests {
 
         assert_eq!(fs::read(&launcher).unwrap(), b"parent-managed launcher");
         assert_eq!(fs::read(&client_exe).unwrap(), asset);
-        assert!(client_exe.starts_with(state_dir.join("remote").join("clients")));
+        assert!(client_exe.starts_with(
+            state_dir
+                .canonicalize()
+                .unwrap()
+                .join("remote")
+                .join("clients")
+        ));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paired_omp_manifest_requires_build_identity_and_asset_checksum() {
+        let value = paired_omp_manifest_value("file:///tmp/omp", Some(&"c".repeat(64)));
+        let manifest: PreviewManifest = serde_json::from_value(value.clone()).unwrap();
+        let (omp, _, checksum) = preview_omp_asset_for_build(
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+        assert_eq!(omp.build_id, "omp-build");
+        assert_eq!(checksum, "c".repeat(64));
+
+        let mut missing_build_id = value;
+        missing_build_id["omp"]
+            .as_object_mut()
+            .unwrap()
+            .remove("build_id");
+        assert!(serde_json::from_value::<PreviewManifest>(missing_build_id).is_err());
+
+        let missing_checksum: PreviewManifest =
+            serde_json::from_value(paired_omp_manifest_value("file:///tmp/omp", None)).unwrap();
+        let error = preview_omp_asset_for_build(
+            &missing_checksum,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap_err();
+        assert!(error.contains("missing a SHA-256 checksum"), "{error}");
+    }
+
+    #[test]
+    fn sealed_sibling_pair_resolves_without_manifest_network() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-offline");
+
+        let companion = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .unwrap()
+            .expect("sealed sibling pair");
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+        companion.verify().unwrap();
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_lookup_uses_canonical_running_executable_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-canonical-exe");
+        let alias_dir = unique_test_dir("sealed-omp-canonical-alias");
+        fs::create_dir(&alias_dir).unwrap();
+        let alias = alias_dir.join("herdr");
+        symlink(&herdr, &alias).unwrap();
+
+        let companion = sealed_sibling_omp_companion(&alias, &sealed_pair_expectation())
+            .unwrap()
+            .expect("canonical sealed sibling pair");
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+
+        fs::remove_file(alias).unwrap();
+        fs::remove_dir(alias_dir).unwrap();
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_rejects_unsafe_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unsafe_parent = unique_test_dir("sealed-omp-unsafe-ancestor");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let moved = unsafe_parent.join("release");
+        create_sealed_pair_at(moved.clone());
+
+        let error = sealed_sibling_omp_companion(&moved.join("herdr"), &sealed_pair_expectation())
+            .expect_err("writable ancestor must fail closed");
+        assert!(error.contains("unsafe writable ancestor"), "{error}");
+
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_sealed_pair(&moved);
+        fs::remove_dir(unsafe_parent).unwrap();
+    }
+
+    #[test]
+    fn malformed_sealed_sibling_metadata_does_not_fall_back() {
+        let (dir, herdr, _omp) = create_sealed_pair("sealed-omp-malformed");
+        write_sealed_pair_metadata(&dir, &serde_json::json!({ "schema": 2 }));
+
+        let error = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .expect_err("malformed adjacent metadata must fail closed");
+        assert!(
+            error.contains("invalid sealed OMP release metadata"),
+            "{error}"
+        );
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_rejects_mismatched_compiled_omp_identity() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-identity");
+        let mut metadata = sealed_pair_metadata(&herdr, &omp);
+        metadata["omp"]["commit"] = serde_json::Value::String("d".repeat(40));
+        write_sealed_pair_metadata(&dir, &metadata);
+
+        let error = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .expect_err("wrong OMP identity must fail closed");
+        assert!(
+            error.contains("does not match this Herdr OMP companion"),
+            "{error}"
+        );
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_resolution_retries_after_repair_and_rejects_later_corruption() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-retry");
+        let mut invalid = sealed_pair_metadata(&herdr, &omp);
+        invalid["omp"]["sha256"] = serde_json::Value::String("0".repeat(64));
+        write_sealed_pair_metadata(&dir, &invalid);
+        assert!(sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation()).is_err());
+
+        write_sealed_pair_metadata(&dir, &sealed_pair_metadata(&herdr, &omp));
+        let companion = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .unwrap()
+            .expect("repaired sealed pair");
+        companion.verify().unwrap();
+
+        unseal_pair(&dir);
+        fs::write(&omp, b"corrupt after verification").unwrap();
+        seal_pair(&dir);
+        assert!(sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation()).is_err());
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn unsealed_cached_omp_falls_back_to_manifest_cache_validation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("unsealed-cached-omp");
+        let state_dir = dir.join("state");
+        let cache_dir = remote_client_build_dir(&state_dir, "herdr-build");
+        let herdr = cache_dir.join("herdr");
+        let omp = cache_dir.join("omp");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&herdr, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&omp, asset).unwrap();
+        fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&omp, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+                .unwrap()
+                .is_none()
+        );
+
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let manifest: PreviewManifest = serde_json::from_value(paired_omp_manifest_value(
+            "file:///missing-omp-asset",
+            Some(&checksum),
+        ))
+        .unwrap();
+        let companion = install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+        companion.verify().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_omp_install_is_build_scoped_and_repairs_invalid_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("managed-omp");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("omp-source");
+        let state_dir = dir.join("state");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::write(&source, asset).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let manifest: PreviewManifest = serde_json::from_value(paired_omp_manifest_value(
+            &format!("file://{}", source.display()),
+            Some(&checksum),
+        ))
+        .unwrap();
+
+        let companion = install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+        let executable = companion.executable().to_path_buf();
+        assert_eq!(
+            executable,
+            remote_omp_executable_path(&state_dir.canonicalize().unwrap(), "herdr-build")
+        );
+        assert_eq!(fs::read(&executable).unwrap(), asset);
+
+        fs::write(&executable, b"corrupt").unwrap();
+        install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), asset);
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+        assert_ne!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+            0
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3212,6 +4922,31 @@ mod tests {
         assert_eq!(error, "another Herdr update is already running");
         drop(first);
         acquire_update_lock_at(&executable, true).unwrap();
+
+        fs::remove_file(dir.join(".herdr-update.lock")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn blocking_update_lock_waits_for_existing_installer() {
+        let dir = unique_test_dir("blocking-update-lock");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+        let first = acquire_update_lock_at(&executable, true).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiting_executable = executable.clone();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = acquire_update_lock_at(&waiting_executable, false).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
 
         fs::remove_file(dir.join(".herdr-update.lock")).unwrap();
         fs::remove_dir(dir).unwrap();
@@ -3790,6 +5525,69 @@ mod tests {
         let (os, arch) = platform_target();
         assert!(os == "linux" || os == "macos", "os: {os}");
         assert!(arch == "x86_64" || arch == "aarch64", "arch: {arch}");
+    }
+
+    #[test]
+    fn linux_getconf_accepts_gnu_pair_when_ldd_is_unavailable() {
+        let glibc = linux_host_libc_with_probes(|| Some(b"glibc 2.39\n".to_vec()), || None);
+
+        assert_eq!(glibc, Some(LinuxHostLibc::Glibc));
+        assert_eq!(
+            glibc
+                .and_then(|libc| omp_asset_key_for_linux_host("x86_64", libc))
+                .as_deref(),
+            Some("linux-x86_64")
+        );
+    }
+
+    #[test]
+    fn linux_libc_probe_falls_back_to_ldd_and_fails_closed_for_musl() {
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || Some(b"unknown getconf output\n".to_vec()),
+                || Some(b"ldd (Debian GLIBC 2.39-1) 2.39\n".to_vec()),
+            ),
+            Some(LinuxHostLibc::Glibc)
+        );
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || Some(b"musl libc\n".to_vec()),
+                || panic!("musl getconf output must not fall back to ldd"),
+            ),
+            Some(LinuxHostLibc::Musl)
+        );
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || None,
+                || Some(b"musl libc\nldd (GNU libc) 2.39\n".to_vec()),
+            ),
+            Some(LinuxHostLibc::Musl)
+        );
+        assert_eq!(linux_host_libc_with_probes(|| None, || None), None);
+    }
+
+    #[test]
+    fn omp_platform_selection_reuses_manifest_keys_and_keeps_libc_gate_local() {
+        assert_eq!(
+            omp_asset_key_for_target("linux", "x86_64").as_deref(),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            omp_asset_key_for_target("linux", "aarch64").as_deref(),
+            Some("linux-aarch64")
+        );
+        assert_eq!(
+            omp_asset_key_for_linux_host("x86_64", LinuxHostLibc::Glibc).as_deref(),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            omp_asset_key_for_linux_host("aarch64", LinuxHostLibc::Musl),
+            None
+        );
+        assert_eq!(
+            omp_asset_key_for_target("macos", "aarch64").as_deref(),
+            Some("macos-aarch64")
+        );
     }
 
     #[test]

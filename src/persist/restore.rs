@@ -38,6 +38,7 @@ struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
+    omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -62,6 +63,8 @@ type RestoredTab = (
 type RestoreFailures<T> = (T, usize);
 
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
+/// The entrypoint keeps persisted geometry, launch policy, and runtime services explicit.
+#[allow(clippy::too_many_arguments)]
 pub fn restore(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
@@ -71,23 +74,28 @@ pub fn restore(
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
     resume_agents_on_restore: bool,
+    omp_bridge: Option<crate::pane::OmpBridgeEnv>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     let mut imported_panes = HashMap::new();
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config: crate::pane::PaneShellConfig::new(default_shell, shell_mode),
+        resume_agents_on_restore,
+        omp_bridge,
+        events,
+        render_notify,
+        render_dirty,
+    };
     restore_with_imports(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        resume_agents_on_restore,
+        &runtime_context,
         &mut imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
 }
 
@@ -102,19 +110,16 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
-        snapshot,
-        None,
-        24,
-        80,
+    let runtime_context = RestoreRuntimeContext {
         scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        true,
-        imports,
+        shell_config: crate::pane::PaneShellConfig::new(default_shell, shell_mode),
+        resume_agents_on_restore: true,
+        omp_bridge: None,
         events,
         render_notify,
         render_dirty,
-    )
+    };
+    restore_with_imports_strict(snapshot, None, 24, 80, &runtime_context, imports)
 }
 
 #[cfg(unix)]
@@ -190,26 +195,16 @@ fn restore_with_imports_strict(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
     let (restored, failed_imports) = restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
+        runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     );
     if failed_imports > 0 {
         return Err(std::io::Error::other(format!(
@@ -230,26 +225,16 @@ fn restore_with_imports(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
+        runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
     .0
 }
@@ -259,13 +244,8 @@ fn restore_with_imports_and_failures(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
@@ -273,20 +253,12 @@ fn restore_with_imports_and_failures(
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
-        let runtime_context = RestoreRuntimeContext {
-            scrollback_limit_bytes,
-            shell_config,
-            resume_agents_on_restore,
-            events: events.clone(),
-            render_notify: render_notify.clone(),
-            render_dirty: render_dirty.clone(),
-        };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
-            &runtime_context,
+            runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
         );
@@ -423,7 +395,7 @@ fn restore_workspace(
             public_pane_numbers,
             next_public_pane_number,
             next_public_tab_number,
-            omp_bridge: None,
+            omp_bridge: runtime_context.omp_bridge.clone(),
             active_tab: snap.active_tab.min(tabs.len().saturating_sub(1)),
             tabs,
             #[cfg(test)]
@@ -520,11 +492,13 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
-                    workspace_id.to_string(),
-                    crate::workspace::public_tab_id_for_number(workspace_id, number),
-                    pane_id.to_string(),
-                )
+                PaneLaunchEnv::from_extra(Vec::new())
+                    .with_omp_bridge(runtime_context.omp_bridge.clone())
+                    .with_identity(
+                        workspace_id.to_string(),
+                        crate::workspace::public_tab_id_for_number(workspace_id, number),
+                        pane_id.to_string(),
+                    )
             })
             .unwrap_or_default();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
@@ -1240,6 +1214,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            None,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1333,6 +1308,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            None,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1440,6 +1416,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            None,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1551,6 +1528,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             true,
+            None,
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1614,6 +1592,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            None,
             events,
             render_notify,
             render_dirty,
@@ -1652,6 +1631,7 @@ mod tests {
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
             false,
+            None,
             events,
             render_notify,
             render_dirty,
@@ -1673,6 +1653,63 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn restored_shell_inherits_omp_bridge() {
+        let (snapshot, _history) = snapshot_with_saved_pane_history();
+        let bridge = crate::pane::OmpBridgeEnv::generate("127.0.0.1:43210".into()).unwrap();
+        let expected_token = bridge.token("workspace:p1");
+        let (events, _events_rx) = mpsc::channel(8);
+
+        let (workspaces, _terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            5,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            Some(bridge.clone()),
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        assert_eq!(workspaces[0].omp_bridge.as_ref(), Some(&bridge));
+        let runtime = runtimes
+            .values()
+            .next()
+            .expect("restored runtime should exist");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.cwd().is_none() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let command = concat!(
+            "printf '__HERDR_BRIDGE__%s\\n__HERDR_TOKEN__%s\\n' ",
+            "\"$HERDR_OMP_BRIDGE\" \"$HERDR_OMP_BRIDGE_TOKEN\"; exit\n"
+        );
+        runtime
+            .try_send_bytes(bytes::Bytes::from(command))
+            .expect("restored shell should accept bridge probe");
+
+        let expected_bridge = format!("__HERDR_BRIDGE__{}", bridge.address());
+        let expected_token = format!("__HERDR_TOKEN__{expected_token}");
+        let output_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let output = runtime.recent_unwrapped_text(20);
+            if output.contains(&expected_bridge) && output.contains(&expected_token) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < output_deadline,
+                "restored shell did not receive its OMP bridge environment: {output:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {
