@@ -133,6 +133,11 @@ pub struct PaneProcessInfoParams {
     pub pane_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneOmpBridgeParams {
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct LayoutExportParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

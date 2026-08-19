@@ -28,6 +28,11 @@ jobs:
       built_at: ${{ steps.plan.outputs.built_at }}
       base_version: ${{ steps.plan.outputs.base_version }}
       protocol: ${{ steps.plan.outputs.protocol }}
+      omp_repository: ${{ steps.plan.outputs.omp_repository }}
+      omp_commit: ${{ steps.plan.outputs.omp_commit }}
+      omp_tree: ${{ steps.plan.outputs.omp_tree }}
+      omp_version: ${{ steps.plan.outputs.omp_version }}
+      omp_build_id: ${{ steps.plan.outputs.omp_build_id }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -44,7 +49,7 @@ jobs:
           commit="$(git rev-parse HEAD)"
           short_sha="$(git rev-parse --short=12 HEAD)"
           day="$(git show -s --format=%cs HEAD)"
-          base_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          base_version="$(python3 -c 'import re; print(re.search(r"^version = \"(.*)\"$", open("Cargo.toml").read(), re.M).group(1))')"
           protocol="$(python3 -c 'import re; print(re.search(r"pub const PROTOCOL_VERSION: u32 = (\d+);", open("src/protocol/wire.rs").read()).group(1))')"
           {
             echo "commit=$commit"
@@ -54,6 +59,16 @@ jobs:
             echo "base_version=$base_version"
             echo "protocol=$protocol"
           } >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from scripts.preview import read_omp_source
+
+          source = read_omp_source(Path('.github/smarty-omp-source.json'))
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
+              for field, value in source.items():
+                  output.write(f'omp_{field}={value}\n')
+          PY
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -95,20 +110,35 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: herdr-linux-x86_64
+            omp_target: linux-x64
+            omp_native_targets: linux-x64-baseline linux-x64-modern
+            omp_asset: omp-linux-x86_64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             name: herdr-linux-aarch64
+            omp_target: linux-arm64
+            omp_native_targets: linux-arm64
+            omp_asset: omp-linux-aarch64
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             name: herdr-macos-x86_64
+            omp_target: darwin-x64
+            omp_native_targets: darwin-x64-baseline
+            omp_asset: omp-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             name: herdr-macos-aarch64
+            omp_target: darwin-arm64
+            omp_native_targets: darwin-arm64
+            omp_asset: omp-macos-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: herdr-windows-x86_64.zip
+            omp_target: ''
+            omp_native_targets: ''
+            omp_asset: ''
     runs-on: ${{ matrix.os }}
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
@@ -117,12 +147,41 @@ jobs:
       HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
       HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
       HERDR_BUILD_UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json
+      HERDR_BUILD_OMP_BUILD_ID: ${{ matrix.omp_target != '' && needs.preflight.outputs.omp_build_id || '' }}
+      HERDR_BUILD_OMP_COMMIT: ${{ matrix.omp_target != '' && needs.preflight.outputs.omp_commit || '' }}
+      HERDR_BUILD_OMP_TREE: ${{ matrix.omp_target != '' && needs.preflight.outputs.omp_tree || '' }}
+      HERDR_BUILD_OMP_VERSION: ${{ matrix.omp_target != '' && needs.preflight.outputs.omp_version || '' }}
       HERDR_BUILD_AUTO_UPDATE: 'true'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.preflight.outputs.commit }}
           persist-credentials: false
+
+      - name: Checkout paired OMP source
+        if: matrix.omp_target != ''
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ needs.preflight.outputs.omp_repository }}
+          ref: ${{ needs.preflight.outputs.omp_commit }}
+          path: omp-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify paired OMP source identity
+        if: matrix.omp_target != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C omp-source rev-parse HEAD)" = "${{ needs.preflight.outputs.omp_commit }}"
+          test "$(git -C omp-source rev-parse HEAD^{tree})" = "${{ needs.preflight.outputs.omp_tree }}"
+          test "$(python3 -c 'import json; print(json.load(open("omp-source/packages/coding-agent/package.json"))["version"])')" = "${{ needs.preflight.outputs.omp_version }}"
+
+      - name: Install Bun for OMP
+        if: matrix.omp_target != ''
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
@@ -178,7 +237,7 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: smarty-preview-${{ matrix.target }}
+          key: smarty-preview-${{ matrix.os }}-${{ matrix.target }}
 
       - name: Remove Zig caches
         if: runner.os != 'Windows'
@@ -195,6 +254,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Build paired OMP binary
+        if: matrix.omp_target != ''
+        working-directory: omp-source
+        shell: bash
+        env:
+          OMP_BUILD_ID: ${{ needs.preflight.outputs.omp_build_id }}
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+          read -r -a native_targets <<< "${{ matrix.omp_native_targets }}"
+          bun scripts/bazel-natives.ts "${native_targets[@]}" --dest packages/natives/native
+          bun scripts/ci-release-build-binaries.ts --targets "${{ matrix.omp_target }}"
       - name: Package artifact
         if: runner.os != 'Windows'
         shell: bash
@@ -207,6 +279,27 @@ jobs:
           path = Path('${{ matrix.name }}')
           print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
           PY
+          cp "omp-source/packages/coding-agent/binaries/omp-${{ matrix.omp_target }}" "${{ matrix.omp_asset }}"
+          python3 - <<'PY' | tee "${{ matrix.omp_asset }}.sha256"
+          import hashlib
+          import os
+          from pathlib import Path
+          path = Path(os.environ["OMP_ASSET"])
+          print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          PY
+        env:
+          OMP_ASSET: ${{ matrix.omp_asset }}
+
+      - name: Verify paired OMP build identity
+        if: matrix.omp_target != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          omp_binary="omp-source/packages/coding-agent/binaries/omp-${{ matrix.omp_target }}"
+          omp_id="$("$omp_binary" __build-id)"
+          test "$omp_id" = "${{ needs.preflight.outputs.omp_build_id }}"
+          omp_version="$("$omp_binary" --version)"
+          test "$omp_version" = "omp/${{ needs.preflight.outputs.omp_version }}"
 
       - name: Package artifact
         if: runner.os == 'Windows'
@@ -223,7 +316,19 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.name }}).Hash.ToLowerInvariant()
           "$hash  ${{ matrix.name }}" | Out-File -Encoding ascii ${{ matrix.name }}.sha256
 
-      - name: Upload artifact
+      - name: Upload paired artifact
+        if: matrix.omp_target != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+            ${{ matrix.omp_asset }}
+            ${{ matrix.omp_asset }}.sha256
+
+      - name: Upload Windows artifact
+        if: matrix.omp_target == ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.name }}
@@ -270,35 +375,34 @@ jobs:
           import json
           from pathlib import Path
 
+          from scripts.preview import EXPECTED_ASSET_NAMES, OMP_EXPECTED_ASSET_NAMES
+
           source = Path('artifacts')
-          asset_names = {
-              'herdr-linux-x86_64',
-              'herdr-linux-aarch64',
-              'herdr-macos-x86_64',
-              'herdr-macos-aarch64',
-              'herdr-windows-x86_64.zip',
-          }
+          herdr_assets = EXPECTED_ASSET_NAMES
+          omp_assets = OMP_EXPECTED_ASSET_NAMES
+          asset_names = set(herdr_assets.values()) | set(omp_assets.values())
+          expected_names = asset_names | {f'{name}.sha256' for name in asset_names}
+          paths = list(source.glob('*/*'))
+          if len(paths) != len(expected_names) or {path.name for path in paths} != expected_names:
+              raise SystemExit('local build artifacts do not exactly match the 18-asset release contract')
+          files = {path.name: path for path in paths}
           digests = {}
-          for asset in source.glob('herdr-*/*'):
-              if asset.name.endswith('.sha256'):
-                  continue
-              sidecar = asset.with_name(f'{asset.name}.sha256')
+          for name in asset_names:
+              asset = files[name]
+              sidecar = files[f'{name}.sha256']
               fields = sidecar.read_text(encoding='utf-8').split()
-              if len(fields) != 2 or fields[1] != asset.name:
+              if len(fields) != 2 or fields[1] != name:
                   raise SystemExit(f'invalid checksum sidecar: {sidecar}')
               digest = fields[0].lower()
               if len(digest) != 64 or any(character not in '0123456789abcdef' for character in digest):
                   raise SystemExit(f'invalid checksum digest: {sidecar}')
               if hashlib.sha256(asset.read_bytes()).hexdigest() != digest:
-                  raise SystemExit(f'local checksum mismatch: {asset.name}')
-              digests[asset.name] = digest
-          if set(digests) != asset_names:
-              raise SystemExit('local build artifacts do not exactly match the release contract')
-          shas = {
-              name.removeprefix('herdr-').removesuffix('.zip'): digest
-              for name, digest in digests.items()
-          }
-          Path('preview-sha256.json').write_text(json.dumps(shas, indent=2) + '\n', encoding='utf-8')
+                  raise SystemExit(f'local checksum mismatch: {name}')
+              digests[name] = digest
+          herdr_shas = {target: digests[name] for target, name in herdr_assets.items()}
+          omp_shas = {target: digests[name] for target, name in omp_assets.items()}
+          Path('preview-sha256.json').write_text(json.dumps(herdr_shas, indent=2) + '\n', encoding='utf-8')
+          Path('preview-omp-sha256.json').write_text(json.dumps(omp_shas, indent=2) + '\n', encoding='utf-8')
           PY
           cat > PREVIEW_NOTES.md <<EOF
           Smarty preview build ${{ needs.preflight.outputs.build_id }}
@@ -320,12 +424,20 @@ jobs:
           assets=(
             artifacts/herdr-linux-x86_64/herdr-linux-x86_64
             artifacts/herdr-linux-x86_64/herdr-linux-x86_64.sha256
+            artifacts/herdr-linux-x86_64/omp-linux-x86_64
+            artifacts/herdr-linux-x86_64/omp-linux-x86_64.sha256
             artifacts/herdr-linux-aarch64/herdr-linux-aarch64
             artifacts/herdr-linux-aarch64/herdr-linux-aarch64.sha256
+            artifacts/herdr-linux-aarch64/omp-linux-aarch64
+            artifacts/herdr-linux-aarch64/omp-linux-aarch64.sha256
             artifacts/herdr-macos-x86_64/herdr-macos-x86_64
             artifacts/herdr-macos-x86_64/herdr-macos-x86_64.sha256
+            artifacts/herdr-macos-x86_64/omp-macos-x86_64
+            artifacts/herdr-macos-x86_64/omp-macos-x86_64.sha256
             artifacts/herdr-macos-aarch64/herdr-macos-aarch64
             artifacts/herdr-macos-aarch64/herdr-macos-aarch64.sha256
+            artifacts/herdr-macos-aarch64/omp-macos-aarch64
+            artifacts/herdr-macos-aarch64/omp-macos-aarch64.sha256
             artifacts/herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
             artifacts/herdr-windows-x86_64.zip/herdr-windows-x86_64.zip.sha256
           )
@@ -345,24 +457,22 @@ jobs:
           test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" = "$COMMIT"
           test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)" = true
           mkdir published-assets
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published-assets --pattern 'herdr-*'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir published-assets
           python3 - <<'PY'
           import hashlib
           import json
           from pathlib import Path
 
+          from scripts.preview import EXPECTED_ASSET_NAMES, OMP_EXPECTED_ASSET_NAMES
+
           source = Path('artifacts')
           published = Path('published-assets')
-          asset_names = {
-              'herdr-linux-x86_64',
-              'herdr-linux-aarch64',
-              'herdr-macos-x86_64',
-              'herdr-macos-aarch64',
-              'herdr-windows-x86_64.zip',
-          }
+          herdr_assets = EXPECTED_ASSET_NAMES
+          omp_assets = OMP_EXPECTED_ASSET_NAMES
+          asset_names = set(herdr_assets.values()) | set(omp_assets.values())
           expected_names = asset_names | {f'{name}.sha256' for name in asset_names}
           if {path.name for path in published.iterdir()} != expected_names:
-              raise SystemExit('published release assets do not exactly match the release contract')
+              raise SystemExit('published release assets do not exactly match the 18-asset release contract')
           digests = {}
           for name in asset_names:
               asset = published / name
@@ -377,14 +487,13 @@ jobs:
                   raise SystemExit(f'published asset checksum mismatch: {name}')
               digests[name] = digest
           if Path('release-created').exists():
-              for asset in source.glob('herdr-*/*'):
+              for asset in source.glob('*/*'):
                   if not asset.name.endswith('.sha256') and hashlib.sha256(asset.read_bytes()).hexdigest() != digests[asset.name]:
                       raise SystemExit(f'published asset mismatch: {asset.name}')
-          shas = {
-              name.removeprefix('herdr-').removesuffix('.zip'): digest
-              for name, digest in digests.items()
-          }
-          Path('preview-sha256.json').write_text(json.dumps(shas, indent=2) + '\n', encoding='utf-8')
+          herdr_shas = {target: digests[name] for target, name in herdr_assets.items()}
+          omp_shas = {target: digests[name] for target, name in omp_assets.items()}
+          Path('preview-sha256.json').write_text(json.dumps(herdr_shas, indent=2) + '\n', encoding='utf-8')
+          Path('preview-omp-sha256.json').write_text(json.dumps(omp_shas, indent=2) + '\n', encoding='utf-8')
           PY
 
       - name: Advance Smarty channel
@@ -423,7 +532,9 @@ jobs:
             --base-version "$BASE_VERSION" \
             --protocol "$PROTOCOL" \
             --notes PREVIEW_NOTES.md \
-            --sha-file preview-sha256.json
+            --sha-file preview-sha256.json \
+            --omp-source .github/smarty-omp-source.json \
+            --omp-sha-file preview-omp-sha256.json
           cp scripts/install-smarty.sh channel/install.sh
           if [ "$existing_channel" = true ]; then
             git worktree add --detach channel-worktree "$previous"

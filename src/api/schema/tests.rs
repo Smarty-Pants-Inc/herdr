@@ -512,6 +512,36 @@ fn pane_process_info_request_round_trips() {
 }
 
 #[test]
+fn pane_omp_bridge_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_omp_bridge".into(),
+        method: Method::PaneOmpBridge(PaneOmpBridgeParams {
+            pane_id: "w1:p1".into(),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.omp_bridge");
+    assert_eq!(json["params"]["pane_id"], "w1:p1");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    let response = SuccessResponse {
+        id: "req_omp_bridge".into(),
+        result: ResponseResult::PaneOmpBridge {
+            pane_id: "w1:p1".into(),
+            address: "127.0.0.1:1234".into(),
+            token: "opaque".into(),
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "pane_omp_bridge");
+    assert_eq!(json["result"]["pane_id"], "w1:p1");
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn event_envelope_round_trips() {
     let events = [
         EventEnvelope {
