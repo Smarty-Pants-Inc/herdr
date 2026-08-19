@@ -20,6 +20,8 @@ use interprocess::TryClone as _;
 
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const SERVER_TO_GUEST_QUEUE_CAPACITY: usize = 64;
+const OMP_GUEST_BRIDGE_TOKEN_ENV: &str = "HERDR_OMP_GUEST_BRIDGE_TOKEN";
+
 #[derive(Deserialize)]
 struct GuestRecord {
     t: String,
@@ -236,6 +238,32 @@ fn accept_omp_guest(
 
 /// Runs the hidden OMP logical-pane client inside its App-owned local PTY.
 /// Its inherited stdio belongs to that PTY, never to the App's real terminal.
+fn configure_omp_guest_command(command: &mut Command, address: &str, room: &str, token: &str) {
+    command
+        .args([
+            "__collab-guest-bridge",
+            address,
+            room,
+            "--token-env",
+            "--no-tools",
+            "--no-lsp",
+            "--no-skills",
+            "--no-rules",
+            "--no-extensions",
+        ])
+        .env(OMP_GUEST_BRIDGE_TOKEN_ENV, token)
+        .env_remove("BUN_OPTIONS")
+        .env_remove("BUN_INSPECT_PRELOAD")
+        .env_remove("BUN_BE_BUN")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("HERDR_OMP_BRIDGE")
+        .env_remove("HERDR_OMP_BRIDGE_TOKEN")
+        .env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+}
+
 pub(super) fn run(
     pane_id: String,
     omp_session_id: String,
@@ -316,25 +344,11 @@ pub(super) fn run(
     getrandom::fill(&mut bridge_token_bytes)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let bridge_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bridge_token_bytes);
-    let omp_bin = std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_owned());
-    let mut child = OmpGuestChild(
-        Command::new(omp_bin)
-            .args([
-                "__collab-guest-bridge",
-                &address,
-                &room_id,
-                &bridge_token,
-                "--no-tools",
-                "--no-lsp",
-                "--no-skills",
-                "--no-rules",
-                "--no-extensions",
-            ])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?,
-    );
+    let omp = crate::update::native_omp_executable().map_err(io::Error::other)?;
+    omp.verify().map_err(io::Error::other)?;
+    let mut command = Command::new(omp.executable());
+    configure_omp_guest_command(&mut command, &address, &room_id, &bridge_token);
+    let mut child = OmpGuestChild(command.spawn()?);
     listener.set_nonblocking(true)?;
     let accept_deadline = Instant::now() + Duration::from_secs(30);
     let (guest, mut guest_reader) = accept_omp_guest(
@@ -540,6 +554,34 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guest_bridge_token_is_environment_only() {
+        let mut command = Command::new("/tmp/omp");
+        configure_omp_guest_command(&mut command, "127.0.0.1:1234", "room", "bridge-secret");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--token-env"));
+        assert!(!args.iter().any(|arg| arg == "bridge-secret"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(OMP_GUEST_BRIDGE_TOKEN_ENV)
+                && value == Some(std::ffi::OsStr::new("bridge-secret"))
+        }));
+        for name in [
+            "BUN_OPTIONS",
+            "BUN_INSPECT_PRELOAD",
+            "BUN_BE_BUN",
+            "NODE_OPTIONS",
+            "HERDR_OMP_BRIDGE",
+            "HERDR_OMP_BRIDGE_TOKEN",
+            crate::integration::HERDR_PANE_ID_ENV_VAR,
+        ] {
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() }));
+        }
+    }
 
     #[test]
     fn trickling_candidate_expires_before_authenticated_guest() {

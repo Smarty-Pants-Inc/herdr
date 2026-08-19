@@ -371,6 +371,17 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_parent_pid_from_stat(&stat)
+}
+
+fn process_parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(1)?.parse().ok()
+}
+
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_pgrp_and_comm_from_stat(&stat)
