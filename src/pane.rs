@@ -128,6 +128,7 @@ impl OmpBridgeEnv {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
+    remove: Vec<String>,
     identity: PaneLaunchIdentity,
     omp_bridge: Option<OmpBridgeEnv>,
 }
@@ -152,9 +153,19 @@ impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
+            remove: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
             omp_bridge: None,
         }
+    }
+    pub(crate) fn with_extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra.push((key.into(), value.into()));
+        self
+    }
+
+    pub(crate) fn without_env(mut self, key: impl Into<String>) -> Self {
+        self.remove.push(key.into());
+        self
     }
 
     pub(crate) fn with_omp_bridge(mut self, omp_bridge: Option<OmpBridgeEnv>) -> Self {
@@ -192,6 +203,9 @@ impl PaneLaunchEnv {
 
 fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env_remove("CODEX_THREAD_ID");
+    for key in &launch_env.remove {
+        cmd.env_remove(key);
+    }
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
@@ -3236,6 +3250,19 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    #[test]
+    fn pane_launch_env_removes_requested_variables() {
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env("BUN_OPTIONS", "--preload=attacker.ts");
+
+        apply_pane_launch_env(
+            &mut cmd,
+            &PaneLaunchEnv::default().without_env("BUN_OPTIONS"),
+        );
+
+        assert!(cmd.get_env("BUN_OPTIONS").is_none());
     }
 
     #[test]

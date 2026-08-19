@@ -27,13 +27,15 @@ pub(super) fn capabilities(
     app_surface: bool,
     stdin_tty: bool,
     stdout_tty: bool,
+    omp_executable: bool,
 ) -> OmpRendererCapabilities {
     OmpRendererCapabilities {
         client_local_native: cfg!(unix)
             && app_surface
             && encoding == RenderEncoding::SemanticFrame
             && stdin_tty
-            && stdout_tty,
+            && stdout_tty
+            && omp_executable,
     }
 }
 
@@ -71,12 +73,14 @@ struct LocalTarget {
 
 impl LocalTarget {
     fn spawn(
+        omp_executable: &crate::update::OmpExecutable,
         launch_id: u64,
         target_app_client_id: u64,
         route: OmpRendererRoute,
         prefix: OmpRendererPrefix,
         size: (u16, u16, u32, u32),
     ) -> std::io::Result<Self> {
+        let (cols, rows, cell_width_px, cell_height_px) = size;
         let pane_id = PaneId::alloc();
         let (events_tx, events) = mpsc::channel(16);
         let render_notify = Arc::new(Notify::new());
@@ -91,12 +95,9 @@ impl LocalTarget {
             "--app-client-id".into(),
             target_app_client_id.to_string(),
         ];
-        let launch_env = crate::pane::PaneLaunchEnv::from_extra(vec![(
-            OMP_RENDERER_LAUNCH_ID_ENV.into(),
-            launch_id.to_string(),
-        )])
-        .without_pane_identity();
-        let (cols, rows, cell_width_px, cell_height_px) = size;
+        let mut extra_env = vec![(OMP_RENDERER_LAUNCH_ID_ENV.into(), launch_id.to_string())];
+        omp_executable.append_launch_env(&mut extra_env);
+        let launch_env = crate::pane::PaneLaunchEnv::from_extra(extra_env).without_pane_identity();
         let runtime = TerminalRuntime::spawn_argv_command(
             pane_id,
             rows.max(1),
@@ -212,7 +213,7 @@ impl LocalTarget {
 
 #[derive(Default)]
 pub(super) struct ClientOmpRenderer {
-    enabled: bool,
+    omp_executable: Option<crate::update::OmpExecutable>,
     latest_launch_id: u64,
     attempted_launches: HashSet<u64>,
     target: Option<LocalTarget>,
@@ -229,9 +230,9 @@ pub(super) struct ClientOmpRenderer {
 }
 
 impl ClientOmpRenderer {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(omp_executable: Option<crate::update::OmpExecutable>) -> Self {
         Self {
-            enabled,
+            omp_executable,
             latest_launch_id: 0,
             attempted_launches: HashSet::new(),
             target: None,
@@ -259,7 +260,7 @@ impl ClientOmpRenderer {
         prefix: OmpRendererPrefix,
         size: (u16, u16, u32, u32),
     ) {
-        if !self.enabled || launch_id < self.latest_launch_id {
+        if self.omp_executable.is_none() || launch_id < self.latest_launch_id {
             return;
         }
         if route.is_none() {
@@ -284,9 +285,18 @@ impl ClientOmpRenderer {
             if !self.attempted_launches.insert(launch_id) {
                 return;
             }
-            self.target =
-                LocalTarget::spawn(launch_id, target_app_client_id, route, prefix.clone(), size)
-                    .ok();
+            let target = self.omp_executable.as_ref().and_then(|omp_executable| {
+                LocalTarget::spawn(
+                    omp_executable,
+                    launch_id,
+                    target_app_client_id,
+                    route,
+                    prefix.clone(),
+                    size,
+                )
+                .ok()
+            });
+            self.target = target;
             self.needs_render = true;
         }
         if !bound {
@@ -724,9 +734,7 @@ fn forward_local_pixel_event(
 }
 
 fn forward_local_focus_event(runtime: &TerminalRuntime, event: crate::ghostty::FocusEvent) -> bool {
-    runtime
-        .input_state()
-        .is_none_or(|state| !state.focus_reporting)
+    !runtime.focus_reporting_enabled()
         || crate::ghostty::encode_focus(event)
             .is_ok_and(|bytes| runtime.try_send_bytes(Bytes::from(bytes)).is_ok())
 }
@@ -774,13 +782,17 @@ mod tests {
         }
     }
 
+    fn test_omp_executable() -> crate::update::OmpExecutable {
+        crate::update::OmpExecutable::Explicit("/tmp/pre-resolved-omp".into())
+    }
+
     fn active_renderer(
         runtime: TerminalRuntime,
         prefix: OmpRendererPrefix,
     ) -> (ClientOmpRenderer, mpsc::Sender<AppEvent>, PaneId) {
         let pane_id = PaneId::alloc();
         let (events_tx, events) = mpsc::channel(8);
-        let mut renderer = ClientOmpRenderer::new(true);
+        let mut renderer = ClientOmpRenderer::new(Some(test_omp_executable()));
         renderer.latest_launch_id = 1;
         renderer.attempted_launches.insert(1);
         renderer.local_selected = true;
@@ -813,14 +825,72 @@ mod tests {
 
     #[test]
     fn capability_requires_semantic_app_tty() {
-        assert!(capabilities(RenderEncoding::SemanticFrame, true, true, true).client_local_native);
-        assert!(!capabilities(RenderEncoding::TerminalAnsi, true, true, true).client_local_native);
         assert!(
-            !capabilities(RenderEncoding::SemanticFrame, false, true, true).client_local_native
+            capabilities(RenderEncoding::SemanticFrame, true, true, true, true).client_local_native
         );
         assert!(
-            !capabilities(RenderEncoding::SemanticFrame, true, false, true).client_local_native
+            !capabilities(RenderEncoding::TerminalAnsi, true, true, true, true).client_local_native
         );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, true, true, true, false)
+                .client_local_native
+        );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, false, true, true, true)
+                .client_local_native
+        );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, true, false, true, true)
+                .client_local_native
+        );
+    }
+
+    #[test]
+    fn target_handling_reuses_pre_resolved_omp_without_resolving() {
+        let calls = std::cell::Cell::new(0);
+        let expected = std::env::current_exe().expect("current test executable");
+        let executable = super::super::resolve_client_omp_executable_with(
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(crate::update::OmpExecutable::Explicit(expected.clone()))
+            },
+            |_| {},
+        )
+        .expect("resolved test executable");
+        let mut renderer = ClientOmpRenderer::new(Some(executable));
+
+        renderer.apply_target(1, 2, None, false, false, test_prefix(), (80, 24, 0, 0));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            renderer
+                .omp_executable
+                .as_ref()
+                .map(|executable| executable.executable()),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn target_handling_ignores_native_target_without_pre_resolved_executable() {
+        let mut renderer = ClientOmpRenderer::new(None);
+        renderer.apply_target(
+            1,
+            2,
+            Some(OmpRendererRoute {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            false,
+            false,
+            test_prefix(),
+            (80, 24, 0, 0),
+        );
+
+        assert!(renderer.target.is_none());
+        assert_eq!(renderer.latest_launch_id, 0);
     }
 
     #[test]
@@ -933,6 +1003,25 @@ mod tests {
             renderer.take_outbound_messages().as_slice(),
             [ClientMessage::InputEvents { events }] if events.len() == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn native_child_death_releases_surface_after_server_fallback_confirmation() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let prefix = test_prefix();
+        let (mut renderer, events, pane_id) = active_renderer(runtime, prefix.clone());
+        let route = renderer.target.as_ref().unwrap().route.clone();
+
+        events.try_send(AppEvent::PaneDied { pane_id }).unwrap();
+        assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
+        assert!(renderer.target.as_ref().unwrap().failed);
+        assert!(!renderer.local_selected);
+        assert!(renderer.awaiting_fallback);
+
+        renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 0, 0));
+
+        assert!(!renderer.awaiting_fallback);
+        assert!(renderer.target.as_ref().unwrap().fallback_confirmed);
     }
 
     #[tokio::test]

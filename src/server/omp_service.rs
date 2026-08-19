@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::protocol::{
     select_omp_renderer, OmpControlAction, OmpFrameDirection, OmpRendererMode, ServerMessage,
 };
-use crate::server::client_transport::ServerEvent;
+use crate::server::client_transport::{OmpHostAdmission, ServerEvent};
 use crate::server::clients::ClientConnection;
 use crate::server::omp_bridge;
 use crate::server::omp_route::{OmpRouteDelivery, OmpRouteError, OmpRouteKey, OmpRouteRegistry};
@@ -485,10 +485,14 @@ impl OmpService {
                 host_id,
                 outbound,
                 socket,
+                admission,
             } => {
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     tracing::warn!("rejected oversized OMP host route identifier");
-                    let _ = socket.shutdown(Shutdown::Both);
+                    let _ = admission.send(OmpHostAdmission::Rejected {
+                        code: OmpRouteError::UnknownRoute.code().to_owned(),
+                        message: "OMP host route identifier is invalid".into(),
+                    });
                     return messages;
                 }
                 let key = OmpRouteKey {
@@ -504,6 +508,14 @@ impl OmpService {
                 match self.routes.host_started(key.clone()) {
                     Ok(deliveries) => {
                         self.replace_host(route_key, host_id, outbound, socket);
+                        if admission.send(OmpHostAdmission::Accepted).is_err() {
+                            self.remove_host(&key);
+                            if let Ok(deliveries) = self.routes.host_stopped(&key) {
+                                self.deliver(&key, deliveries, &mut messages, clients);
+                                self.routes.remove_if_inactive_and_empty(&key);
+                            }
+                            return messages;
+                        }
                         if self.sync_authority(&key, &deliveries, &mut messages, clients) {
                             self.deliver(&key, deliveries, &mut messages, clients);
                         }
@@ -516,7 +528,10 @@ impl OmpService {
                             code = error.code(),
                             "rejected OMP bridge host"
                         );
-                        let _ = socket.shutdown(Shutdown::Both);
+                        let _ = admission.send(OmpHostAdmission::Rejected {
+                            code: error.code().to_owned(),
+                            message: host_rejection_message(&error).into(),
+                        });
                     }
                 }
             }
@@ -987,6 +1002,18 @@ fn valid_route_id(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn host_rejection_message(error: &OmpRouteError) -> &'static str {
+    match error {
+        OmpRouteError::UnknownRoute => "OMP host route is unknown",
+        OmpRouteError::StaleGeneration => "OMP host route generation is stale",
+        OmpRouteError::StaleAttachment => "OMP host attachment is stale",
+        OmpRouteError::HostUnavailable => "OMP host is unavailable",
+        OmpRouteError::RouteBusy => "OMP host route is already active",
+        OmpRouteError::ControllerRequired => "OMP host controller is required",
+        OmpRouteError::InvalidFrame(_) => "OMP host frame is invalid",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1022,56 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn host_route_admission_reports_acceptance_and_route_busy_rejection() {
+        let mut service = OmpService::new(None).unwrap();
+        let clients = HashMap::new();
+        let (peer, socket) = host_socket_pair();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (admission, admitted) = std::sync::mpsc::sync_channel(1);
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                host_id: 1,
+                outbound,
+                socket,
+                admission,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(
+            admitted.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(OmpHostAdmission::Accepted)
+        ));
+
+        let (replacement_peer, replacement_socket) = host_socket_pair();
+        let (replacement_outbound, _replacement_outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (replacement_admission, replacement_admitted) = std::sync::mpsc::sync_channel(1);
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                host_id: 2,
+                outbound: replacement_outbound,
+                socket: replacement_socket,
+                admission: replacement_admission,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(
+            replacement_admitted.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(OmpHostAdmission::Rejected { code, message })
+                if code == "route_busy" && message == "OMP host route is already active"
+        ));
+        drop(peer);
+        drop(replacement_peer);
     }
 
     #[test]
