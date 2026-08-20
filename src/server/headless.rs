@@ -4520,10 +4520,7 @@ impl HeadlessServer {
                     }
                     let position = crate::input::mouse::Position::Cell { column, row };
                     let bytes = match mouse.kind {
-                        MouseEventKind::ScrollUp
-                        | MouseEventKind::ScrollDown
-                        | MouseEventKind::ScrollLeft
-                        | MouseEventKind::ScrollRight => {
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                             runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
                         }
                         MouseEventKind::Moved => {
@@ -4534,6 +4531,7 @@ impl HeadlessServer {
                         | MouseEventKind::Drag(_) => {
                             runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
                         }
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
                     };
                     if let Some(bytes) = bytes {
                         let _ = guest.input(Bytes::from(bytes));
@@ -4607,10 +4605,7 @@ impl HeadlessServer {
             })
             .unwrap_or(fallback);
         let bytes = match mouse.kind {
-            MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown
-            | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight => {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
             }
             MouseEventKind::Moved => {
@@ -4619,6 +4614,7 @@ impl HeadlessServer {
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
                 runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
             }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
         };
         if let Some(bytes) = bytes {
             let _ = guest.input(Bytes::from(bytes));
