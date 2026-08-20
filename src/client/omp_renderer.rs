@@ -1013,14 +1013,14 @@ fn encode_local_mouse(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
     match kind {
-        MouseEventKind::ScrollUp
-        | MouseEventKind::ScrollDown
-        | MouseEventKind::ScrollLeft
-        | MouseEventKind::ScrollRight => runtime.encode_mouse_wheel(kind, position, modifiers),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            runtime.encode_mouse_wheel(kind, position, modifiers)
+        }
         MouseEventKind::Moved => runtime.encode_mouse_motion(kind, position, modifiers),
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
             runtime.encode_mouse_button(kind, position, modifiers)
         }
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
     }
 }
 
@@ -1332,31 +1332,6 @@ mod tests {
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
         assert!(renderer.route_pixel_input(data, geometry, 0).is_none());
         assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<35;161;121M");
-    }
-
-    #[tokio::test]
-    async fn horizontal_wheel_reaches_the_local_pty_for_cell_and_pixel_input() {
-        let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
-        runtime.resize(12, 40, 10, 20);
-        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h");
-        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
-        renderer.target.as_mut().unwrap().size = (40, 12, 10, 20);
-
-        assert!(renderer
-            .route_input(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollLeft,
-                column: 3,
-                row: 4,
-                modifiers: KeyModifiers::empty(),
-            })])
-            .is_empty());
-        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<66;4;5M");
-
-        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        assert!(renderer
-            .route_pixel_input(b"\x1b[<67;321;241M".to_vec(), geometry, 0)
-            .is_none());
-        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<67;161;121M");
     }
 
     #[tokio::test]
