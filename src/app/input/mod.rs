@@ -623,7 +623,6 @@ impl App {
         pane_id: crate::layout::PaneId,
         url: String,
     ) -> bool {
-        self.last_pane_click = None;
         self.pending_url_click_sources.insert(source_id);
         if self.activate_resolved_link(source_id, pane_id, url) {
             true
@@ -639,6 +638,7 @@ impl App {
         pane_id: crate::layout::PaneId,
         url: String,
     ) -> bool {
+        self.last_pane_click = None;
         let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
             return false;
         };

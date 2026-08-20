@@ -4497,6 +4497,17 @@ impl HeadlessServer {
             .or_else(|| self.independent_omp_pane_info(client_id))
     }
 
+    fn private_omp_frame_link_at_cell(
+        runtime: &crate::terminal::TerminalRuntime,
+        row: u16,
+        column: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<String> {
+        let link = runtime.hyperlink_at_viewport_cell(column, row, width, height)?;
+        crate::app::actions::safe_osc8_url(&link.uri).map(str::to_owned)
+    }
+
     fn partition_private_omp_input(
         &mut self,
         client_id: u64,
@@ -4567,23 +4578,24 @@ impl HeadlessServer {
                     let row = mouse.row.saturating_sub(info.inner_rect.y);
                     if terminal_mode
                         && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                        && crate::app::actions::resolved_terminal_link_at_cell(
+                        && Self::private_omp_frame_link_at_cell(
                             runtime,
                             row,
                             column,
                             info.inner_rect.width,
                             info.inner_rect.height,
                         )
-                        .is_some_and(|link| {
-                            self.app.activate_link_click(client_id, info.id, link.url)
-                        })
+                        .is_some_and(|url| self.app.activate_link_click(client_id, info.id, url))
                     {
                         consumed = true;
                         continue;
                     }
                     let position = crate::input::mouse::Position::Cell { column, row };
                     let bytes = match mouse.kind {
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollLeft
+                        | MouseEventKind::ScrollRight => {
                             runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
                         }
                         MouseEventKind::Moved => {
@@ -4594,7 +4606,6 @@ impl HeadlessServer {
                         | MouseEventKind::Drag(_) => {
                             runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
                         }
-                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
                     };
                     if let Some(bytes) = bytes {
                         let _ = guest.input(Bytes::from(bytes));
@@ -4649,14 +4660,14 @@ impl HeadlessServer {
         let row = cell.1.saturating_sub(info.inner_rect.y);
         if self.app.state.mode == crate::app::Mode::Terminal
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && crate::app::actions::resolved_terminal_link_at_cell(
+            && Self::private_omp_frame_link_at_cell(
                 runtime,
                 row,
                 column,
                 info.inner_rect.width,
                 info.inner_rect.height,
             )
-            .is_some_and(|link| self.app.activate_link_click(client_id, info.id, link.url))
+            .is_some_and(|url| self.app.activate_link_click(client_id, info.id, url))
         {
             return true;
         }
@@ -4668,7 +4679,10 @@ impl HeadlessServer {
             })
             .unwrap_or(fallback);
         let bytes = match mouse.kind {
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
                 runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
             }
             MouseEventKind::Moved => {
@@ -4677,7 +4691,6 @@ impl HeadlessServer {
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
                 runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
             }
-            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
         };
         if let Some(bytes) = bytes {
             let _ = guest.input(Bytes::from(bytes));
@@ -4707,8 +4720,8 @@ impl HeadlessServer {
         if navigation_scope.is_some() {
             self.compute_client_navigation_view(client_id);
         }
-        let (events, native_consumed) = self.partition_native_omp_input(client_id, events);
         let (events, private_consumed) = self.partition_private_omp_input(client_id, events);
+        let (events, native_consumed) = self.partition_native_omp_input(client_id, events);
         if native_consumed || private_consumed {
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.request_semantic_redraw_after_input();
@@ -5214,14 +5227,6 @@ impl HeadlessServer {
                 let omp_surface_active = self.client_omp_surface_active(client_id);
                 let host = crate::input::mouse::HostPixels { x, y, geometry };
                 if omp_surface_active
-                    && self
-                        .independent_omp_pane_info(client_id)
-                        .is_some_and(|info| info.inner_rect.contains(cell_position.into()))
-                {
-                    self.finish_client_navigation_scope(client_id, canonical);
-                    return false;
-                }
-                if omp_surface_active
                     && self.route_private_omp_pixel_input(client_id, &data, host, cell_position)
                 {
                     if let Some(client) = self.clients.get_mut(&client_id) {
@@ -5229,6 +5234,14 @@ impl HeadlessServer {
                     }
                     self.finish_client_navigation_scope(client_id, canonical);
                     return true;
+                }
+                if omp_surface_active
+                    && self
+                        .independent_omp_pane_info(client_id)
+                        .is_some_and(|info| info.inner_rect.contains(cell_position.into()))
+                {
+                    self.finish_client_navigation_scope(client_id, canonical);
+                    return false;
                 }
                 if !omp_surface_active {
                     self.finish_client_navigation_scope(client_id, canonical);
@@ -9613,6 +9626,38 @@ mod tests {
             borders: ratatui::widgets::Borders::NONE,
             is_focused: true,
         }];
+        let canonical = server.begin_client_navigation_scope(1).unwrap();
+        server.compute_client_navigation_view(1);
+        let host_inner = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .expect("host pane info")
+            .inner_rect;
+        server.finish_client_navigation_scope(1, canonical);
+        let host_click = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: host_inner.x + 1,
+                row: host_inner.y + 2,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        let _ = server.handle_client_input_events(
+            1,
+            vec![
+                host_click(MouseEventKind::Down(MouseButton::Left)),
+                host_click(MouseEventKind::Up(MouseButton::Left)),
+            ],
+        );
+        let pane_click_candidate = server
+            .app
+            .last_pane_click
+            .take()
+            .expect("ordinary pane click candidate");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _host_peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -9679,14 +9724,75 @@ mod tests {
             .handle_client_input_events(1, vec![click(MouseEventKind::Drag(MouseButton::Left))]));
         assert!(server
             .handle_client_input_events(1, vec![click(MouseEventKind::Up(MouseButton::Left))]));
-        let private_event = server.app.event_rx.try_recv();
+        let mut private_events = Vec::new();
+        while let Ok(event) = server.app.event_rx.try_recv() {
+            private_events.push(event);
+        }
         assert!(
-            matches!(
-                private_event,
-                Ok(AppEvent::OpenUrl { ref url, source_id: 1 }) if url == private_url
-            ),
-            "unexpected private link event: {private_event:?}"
+            private_events.iter().any(|event| matches!(
+                event,
+                AppEvent::OpenUrl { url, source_id: 1 } if url == private_url
+            )),
+            "private link did not queue OpenUrl: {private_events:?}"
         );
+        let private_plain_url = "https://example.com/private-plain";
+        server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .unwrap()
+            .runtime()
+            .test_process_pty_bytes(format!("\x1b[3;1H{private_plain_url}").as_bytes());
+        let private_runtime = server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .unwrap()
+            .runtime();
+        assert_eq!(
+            crate::app::actions::resolved_terminal_link_at_cell(
+                private_runtime,
+                2,
+                1,
+                private_inner.width,
+                private_inner.height,
+            )
+            .map(|link| link.url),
+            Some(private_plain_url.to_owned())
+        );
+        assert_eq!(
+            HeadlessServer::private_omp_frame_link_at_cell(
+                private_runtime,
+                2,
+                1,
+                private_inner.width,
+                private_inner.height,
+            ),
+            None
+        );
+        let plain_click = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: private_inner.x + 1,
+                row: private_inner.y + 2,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        assert!(server.handle_client_input_events(
+            1,
+            vec![plain_click(MouseEventKind::Down(MouseButton::Left))]
+        ));
+        assert!(server.handle_client_input_events(
+            1,
+            vec![plain_click(MouseEventKind::Up(MouseButton::Left))]
+        ));
+        let mut private_plain_events = Vec::new();
+        while let Ok(event) = server.app.event_rx.try_recv() {
+            private_plain_events.push(event);
+        }
+        assert!(!private_plain_events.iter().any(|event| matches!(
+            event,
+            AppEvent::OpenUrl { url, source_id: 1 } if url == private_plain_url
+        )));
+
         let private_pixel_url = "https://example.com/private-pixel";
         server.clients[&1]
             .private_omp_guest
@@ -9715,10 +9821,37 @@ mod tests {
                 geometry,
             }));
         }
-        assert!(matches!(
-            server.app.event_rx.try_recv(),
-            Ok(AppEvent::OpenUrl { url, source_id: 1 }) if url == private_pixel_url
-        ));
+        let mut private_pixel_events = Vec::new();
+        while let Ok(event) = server.app.event_rx.try_recv() {
+            private_pixel_events.push(event);
+        }
+        assert!(
+            private_pixel_events.iter().any(|event| matches!(
+                event,
+                AppEvent::OpenUrl { url, source_id: 1 } if url == private_pixel_url
+            )),
+            "private pixel link did not queue OpenUrl: {private_pixel_events:?}"
+        );
+        let plain_y = u32::from(private_inner.y + 2) * 20 + 1;
+        for data in [
+            format!("\x1b[<0;{x};{plain_y}M").into_bytes(),
+            format!("\x1b[<0;{x};{plain_y}m").into_bytes(),
+        ] {
+            assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+                client_id: 1,
+                data,
+                geometry,
+            }));
+        }
+        let mut private_plain_pixel_events = Vec::new();
+        while let Ok(event) = server.app.event_rx.try_recv() {
+            private_plain_pixel_events.push(event);
+        }
+        assert!(!private_plain_pixel_events.iter().any(|event| matches!(
+            event,
+            AppEvent::OpenUrl { url, source_id: 1 } if url == private_plain_url
+        )));
+
         assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
             client_id: 2,
             pane_id: route.clone(),
@@ -9752,11 +9885,15 @@ mod tests {
             .graphics_cache
             .test_mark_non_empty();
         let native_url = "https://example.com/native";
+        server.app.last_pane_click = Some(pane_click_candidate);
+        assert!(!server.app.pending_url_click_sources.contains(&1));
         assert!(server.handle_server_event(ServerEvent::ActivateOmpLink {
             client_id: 1,
             launch_id: renderer_launch_id,
             url: native_url.into(),
         }));
+        assert!(server.app.last_pane_click.is_none());
+        assert!(!server.app.pending_url_click_sources.contains(&1));
         let mut native_events = Vec::new();
         while let Ok(event) = server.app.event_rx.try_recv() {
             native_events.push(event);

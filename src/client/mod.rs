@@ -23,6 +23,8 @@ mod omp_renderer;
 use std::collections::HashSet;
 use std::io::IsTerminal as _;
 use std::io::{self, BufRead as _, Write as _};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -79,17 +81,277 @@ struct MousePointerState {
     link_active: bool,
 }
 
+#[cfg(unix)]
+const HOST_INPUT_CAPTURE: u64 = 0b01;
+#[cfg(unix)]
+const HOST_INPUT_SGR_PIXELS: u64 = 0b10;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostInputSnapshot {
+    packed: u64,
+    stable: bool,
+}
+
+#[cfg(unix)]
+impl HostInputSnapshot {
+    fn from_parts(generation: u64, capture_active: bool, sgr_pixels_active: bool) -> Self {
+        let mut packed = generation << 2;
+        if capture_active {
+            packed |= HOST_INPUT_CAPTURE;
+            if sgr_pixels_active {
+                packed |= HOST_INPUT_SGR_PIXELS;
+            }
+        }
+        Self {
+            packed,
+            stable: true,
+        }
+    }
+
+    fn continued_with(mut self, next: Self) -> Self {
+        self.stable &= next.stable && self.packed == next.packed;
+        self
+    }
+
+    fn generation(self) -> u64 {
+        self.packed >> 2
+    }
+
+    fn capture_active(self) -> bool {
+        self.packed & HOST_INPUT_CAPTURE != 0
+    }
+
+    fn sgr_pixels_active(self) -> bool {
+        self.packed & HOST_INPUT_SGR_PIXELS != 0
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct HostInputBoundary {
+    stale_bytes: usize,
+    stale_snapshot: HostInputSnapshot,
+}
+
+#[cfg(unix)]
+struct HostInputState {
+    packed: AtomicU64,
+    event_order: Mutex<HostInputBoundary>,
+    input_fd: Option<RawFd>,
+    wake_reader: Option<crate::pty::fd::WakeWriter>,
+}
+
+#[cfg(unix)]
+impl HostInputState {
+    fn new(capture_active: bool, sgr_pixels_active: bool) -> Self {
+        let snapshot = HostInputSnapshot::from_parts(0, capture_active, sgr_pixels_active);
+        Self {
+            packed: AtomicU64::new(snapshot.packed),
+            event_order: Mutex::new(HostInputBoundary {
+                stale_bytes: 0,
+                stale_snapshot: snapshot,
+            }),
+            input_fd: None,
+            wake_reader: None,
+        }
+    }
+
+    fn with_input_fd(
+        capture_active: bool,
+        sgr_pixels_active: bool,
+        input_fd: RawFd,
+    ) -> io::Result<(Self, OwnedFd)> {
+        let wake = crate::pty::fd::create_wake_pipe()?;
+        let mut state = Self::new(capture_active, sgr_pixels_active);
+        state.input_fd = Some(input_fd);
+        state.wake_reader = Some(wake.writer);
+        Ok((state, wake.read_fd))
+    }
+
+    fn load(&self) -> HostInputSnapshot {
+        HostInputSnapshot {
+            packed: self.packed.load(Ordering::Acquire),
+            stable: true,
+        }
+    }
+
+    fn capture_input_boundary(&self, boundary: &mut HostInputBoundary) -> io::Result<()> {
+        boundary.stale_snapshot = self.load();
+        boundary.stale_bytes = self
+            .input_fd
+            .map(input::pending_input_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        Ok(())
+    }
+
+    fn wake_input_reader(&self) -> io::Result<()> {
+        self.wake_reader
+            .as_ref()
+            .map(crate::pty::fd::WakeWriter::wake)
+            .transpose()
+            .map(|_| ())
+    }
+
+    fn read_input(&self, scratch: &mut [u8]) -> io::Result<(usize, HostInputSnapshot)> {
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = boundary.stale_bytes > 0;
+        let input_state = if stale {
+            boundary.stale_snapshot
+        } else {
+            self.load()
+        };
+        let limit = if stale {
+            boundary.stale_bytes.min(scratch.len())
+        } else {
+            scratch.len()
+        };
+        let input_fd = self.input_fd.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "stdin reader is not configured")
+        })?;
+        let read = unsafe { libc::read(input_fd, scratch.as_mut_ptr().cast(), limit) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read = read as usize;
+        if stale {
+            boundary.stale_bytes = boundary.stale_bytes.saturating_sub(read);
+        }
+        Ok((read, input_state))
+    }
+
+    fn advance_generation(&self) -> HostInputSnapshot {
+        let previous = self.packed.fetch_add(1 << 2, Ordering::AcqRel);
+        HostInputSnapshot {
+            packed: previous.wrapping_add(1 << 2),
+            stable: true,
+        }
+    }
+
+    fn transition_mouse_mode(
+        &self,
+        capture_active: bool,
+        sgr_pixels_active: bool,
+        apply: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<HostInputSnapshot> {
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.capture_input_boundary(&mut boundary)?;
+        apply()?;
+        let mut current = self.packed.load(Ordering::Acquire);
+        let snapshot = loop {
+            let generation = (current >> 2).wrapping_add(1);
+            let next =
+                HostInputSnapshot::from_parts(generation, capture_active, sgr_pixels_active).packed;
+            match self.packed.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    break HostInputSnapshot {
+                        packed: next,
+                        stable: true,
+                    };
+                }
+                Err(observed) => current = observed,
+            }
+        };
+        self.wake_input_reader()?;
+        Ok(snapshot)
+    }
+
+    fn reserve_event_slot(
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    ) -> io::Result<tokio::sync::mpsc::Permit<'_, ClientLoopEvent>> {
+        loop {
+            match event_tx.try_reserve() {
+                Ok(permit) => return Ok(permit),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "client event loop closed",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn send_event(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        event: ClientLoopEvent,
+    ) -> io::Result<()> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let _guard = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        permit.send(event);
+        Ok(())
+    }
+
+    fn send_resize(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        new_size: (u16, u16, u32, u32),
+    ) -> io::Result<()> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.capture_input_boundary(&mut boundary)?;
+        let generation = self.advance_generation().generation();
+        permit.send(ClientLoopEvent::Resize(
+            new_size.0, new_size.1, new_size.2, new_size.3, generation,
+        ));
+        self.wake_input_reader()
+    }
+}
+
+#[cfg(unix)]
+fn mouse_input_is_current(
+    input: HostInputSnapshot,
+    current: HostInputSnapshot,
+    applied_generation: u64,
+    require_capture: bool,
+) -> bool {
+    input.stable
+        && input.generation() == applied_generation
+        && (!require_capture || current.capture_active())
+}
+
 impl MousePointerState {
-    fn observe_raw_events(&mut self, events: &[crate::raw_input::RawInputEvent]) {
+    fn observe_raw_events(
+        &mut self,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> Option<Option<(u16, u16)>> {
+        let mut update = None;
         for event in events {
             match event {
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     self.cell = Some((mouse.column, mouse.row));
+                    update = Some(self.cell);
                 }
-                crate::raw_input::RawInputEvent::OuterFocusLost => self.cell = None,
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    self.cell = None;
+                    update = Some(None);
+                }
                 _ => {}
             }
         }
+        update
     }
 
     fn set_cell(&mut self, cell: Option<(u16, u16)>) {
@@ -100,9 +362,12 @@ impl MousePointerState {
         &mut self,
         writer: &mut impl io::Write,
         frame: Option<&crate::protocol::FrameData>,
+        link_active_override: Option<bool>,
     ) -> io::Result<()> {
-        let link_active = self.cell.is_some_and(|(column, row)| {
-            frame.is_some_and(|frame| render_ansi::frame_has_hyperlink_at(frame, column, row))
+        let link_active = link_active_override.unwrap_or_else(|| {
+            self.cell.is_some_and(|(column, row)| {
+                frame.is_some_and(|frame| render_ansi::frame_has_hyperlink_at(frame, column, row))
+            })
         });
         if link_active == self.link_active {
             return Ok(());
@@ -124,6 +389,8 @@ struct ClientState {
     blit_encoder: render_ansi::BlitEncoder,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
+    /// Whether host mouse reports use SGR pixel coordinates.
+    sgr_pixels_active: bool,
     /// Whether the host terminal currently reports all keys as Kitty sequences.
     keyboard_report_all_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -305,8 +572,15 @@ impl ClientState {
     }
 
     fn write_mouse_pointer_shape(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
-        self.mouse_pointer
-            .write_for_frame(writer, self.blit_encoder.last_frame())
+        #[cfg(unix)]
+        let native_link_active = self.omp_renderer.native_link_active();
+        #[cfg(not(unix))]
+        let native_link_active = None;
+        self.mouse_pointer.write_for_frame(
+            writer,
+            self.blit_encoder.last_frame(),
+            native_link_active,
+        )
     }
 }
 
@@ -1130,17 +1404,21 @@ fn do_handshake_with_renderer_capabilities(
 enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     #[cfg(unix)]
-    StdinInput(Vec<u8>),
-    /// One confirmed SGR pixel report with geometry captured by the reader.
+    StdinInput(Vec<u8>, HostInputSnapshot),
+    /// One confirmed SGR pixel report with geometry and input snapshot captured by the reader.
     #[cfg(unix)]
-    PixelMouse(Vec<u8>, crate::input::mouse::HostGeometry),
+    PixelMouse(
+        Vec<u8>,
+        crate::input::mouse::HostGeometry,
+        HostInputSnapshot,
+    ),
     #[cfg(unix)]
     DirectGraphicsResponse(direct_graphics::Response),
     /// Structured input events from platforms without Unix-style stdin bytes.
     #[cfg(windows)]
     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
     /// Terminal resize detected.
-    Resize(u16, u16, u32, u32),
+    Resize(u16, u16, u32, u32, u64),
     /// Server message received.
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
@@ -1948,6 +2226,7 @@ async fn run_client_loop(
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
         sound_config: config.sound_config,
+        sgr_pixels_active: false,
         kitty_graphics_enabled: config.kitty_graphics_enabled,
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
@@ -1967,11 +2246,17 @@ async fn run_client_loop(
         omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
     };
     debug!(?negotiated_encoding, "client render encoding active");
-    let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
-    let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let (host_input_state, stdin_input_wake) =
+        HostInputState::with_input_fd(state.mouse_capture_active, false, io::stdin().as_raw_fd())
+            .map_err(ClientError::ConnectionFailed)?;
+    #[cfg(unix)]
+    let host_input_state = Arc::new(host_input_state);
+    #[cfg(unix)]
+    let mut applied_host_input_generation = host_input_state.load().generation();
 
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -1985,8 +2270,8 @@ async fn run_client_loop(
         && host_cell_size_query_required(state.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
-    let stdin_mouse_capture_active = host_mouse_capture_active.clone();
-    let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
+    #[cfg(unix)]
+    let stdin_host_input_state = host_input_state.clone();
     #[cfg(unix)]
     let stdin_direct_response = state.direct_graphics_response.clone();
     #[cfg(unix)]
@@ -2000,8 +2285,10 @@ async fn run_client_loop(
             &stdin_quit,
             will_query_host_terminal_theme,
             will_query_host_cell_size,
-            stdin_mouse_capture_active,
-            stdin_sgr_pixels_active,
+            #[cfg(unix)]
+            stdin_host_input_state,
+            #[cfg(unix)]
+            stdin_input_wake,
             #[cfg(unix)]
             stdin_direct_response,
             #[cfg(unix)]
@@ -2021,6 +2308,8 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
+    #[cfg(unix)]
+    let resize_input_state = host_input_state.clone();
     let kitty_graphics_enabled = state.kitty_graphics_enabled;
     std::thread::spawn(move || {
         resize_poll_loop(
@@ -2031,6 +2320,8 @@ async fn run_client_loop(
             initial_cell_height_px,
             kitty_graphics_enabled,
             &resize_cell_size,
+            #[cfg(unix)]
+            &resize_input_state,
             &resize_quit,
         );
     });
@@ -2075,7 +2366,23 @@ async fn run_client_loop(
 
         match event {
             #[cfg(unix)]
-            ClientLoopEvent::StdinInput(data) => {
+            ClientLoopEvent::StdinInput(data, input_state) => {
+                let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                let has_mouse = events
+                    .iter()
+                    .any(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)));
+                let attach_mode = state.attach_escape.is_some();
+                let current_input_state = host_input_state.load();
+                if has_mouse
+                    && !mouse_input_is_current(
+                        input_state,
+                        current_input_state,
+                        applied_host_input_generation,
+                        !attach_mode,
+                    )
+                {
+                    continue;
+                }
                 let (data, parsed_events) = if let Some(attach_escape) = &mut state.attach_escape {
                     let data = match attach_escape.filter_input(
                         data,
@@ -2119,8 +2426,9 @@ async fn run_client_loop(
                     };
                     (data, None)
                 } else {
-                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-                    state.mouse_pointer.observe_raw_events(&events);
+                    if let Some(cell) = state.mouse_pointer.observe_raw_events(&events) {
+                        state.omp_renderer.observe_pointer_cell(cell);
+                    }
                     let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
@@ -2140,10 +2448,10 @@ async fn run_client_loop(
                     (data, Some(events))
                 };
                 if state.omp_renderer.owns_input() {
-                    for message in state
-                        .omp_renderer
-                        .route_input(parsed_events.unwrap_or_default())
-                    {
+                    for message in state.omp_renderer.route_input_at_generation(
+                        parsed_events.unwrap_or_default(),
+                        input_state.generation(),
+                    ) {
                         if let Err(error) = write_to_server(&mut write_stream, &message) {
                             return Err(ClientError::ConnectionLost(error));
                         }
@@ -2185,12 +2493,26 @@ async fn run_client_loop(
                 }
             }
             #[cfg(unix)]
-            ClientLoopEvent::PixelMouse(data, geometry) => {
+            ClientLoopEvent::PixelMouse(data, geometry, input_state) => {
+                let current_input_state = host_input_state.load();
+                if !mouse_input_is_current(
+                    input_state,
+                    current_input_state,
+                    applied_host_input_generation,
+                    true,
+                ) || !current_input_state.sgr_pixels_active()
+                {
+                    continue;
+                }
                 let cell =
                     crate::input::mouse::parse_report(&data).and_then(|(x, y)| geometry.cell(x, y));
                 state.mouse_pointer.set_cell(cell);
+                let message =
+                    state
+                        .omp_renderer
+                        .route_pixel_input(data, geometry, input_state.generation());
                 let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                if let Some(message) = state.omp_renderer.route_pixel_input(data, geometry) {
+                if let Some(message) = message {
                     if let Err(err) = write_to_server(&mut write_stream, &message) {
                         return Err(ClientError::ConnectionLost(err));
                     }
@@ -2223,7 +2545,7 @@ async fn run_client_loop(
                     .iter()
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect::<Vec<_>>();
-                state.mouse_pointer.observe_raw_events(&raw_events);
+                let _ = state.mouse_pointer.observe_raw_events(&raw_events);
                 let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 if crate::raw_input::events_require_host_surface_redraw(
                     &raw_events,
@@ -2236,16 +2558,33 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+            ClientLoopEvent::Resize(
+                new_cols,
+                new_rows,
+                cell_width_px,
+                cell_height_px,
+                resize_generation,
+            ) => {
+                #[cfg(unix)]
+                {
+                    applied_host_input_generation =
+                        applied_host_input_generation.max(resize_generation);
+                }
+                #[cfg(windows)]
+                let _ = resize_generation;
                 state.reported_size = (new_cols, new_rows);
                 state.reported_cell_size_px = (cell_width_px, cell_height_px);
                 // Resizing invalidates both server and local PTY blit baselines.
                 state.request_repaint();
                 #[cfg(unix)]
                 {
-                    state
-                        .omp_renderer
-                        .resize((new_cols, new_rows, cell_width_px, cell_height_px));
+                    let host_geometry = crate::input::mouse::HostGeometry::current()
+                        .filter(|geometry| geometry.cols == new_cols && geometry.rows == new_rows);
+                    state.omp_renderer.resize(
+                        (new_cols, new_rows, cell_width_px, cell_height_px),
+                        host_geometry,
+                        applied_host_input_generation,
+                    );
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                 }
                 let msg = ClientMessage::Resize {
@@ -2290,6 +2629,7 @@ async fn run_client_loop(
                                 state.reported_cell_size_px.0,
                                 state.reported_cell_size_px.1,
                             ),
+                            applied_host_input_generation,
                         );
                         display_pending_omp_surface(&mut state, &mut write_stream)?;
                     }
@@ -2485,8 +2825,18 @@ async fn run_client_loop(
                 } => {
                     let next_sgr_pixels = enabled && sgr_pixels;
                     let mouse_mode_changed = enabled != state.mouse_capture_active
-                        || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        || next_sgr_pixels != state.sgr_pixels_active;
                     if mouse_mode_changed {
+                        #[cfg(unix)]
+                        {
+                            applied_host_input_generation = host_input_state
+                                .transition_mouse_mode(enabled, next_sgr_pixels, || {
+                                    set_mouse_capture(enabled, next_sgr_pixels)
+                                })
+                                .map_err(ClientError::ConnectionFailed)?
+                                .generation();
+                        }
+                        #[cfg(not(unix))]
                         set_mouse_capture(enabled, next_sgr_pixels)
                             .map_err(ClientError::ConnectionFailed)?;
                         #[cfg(windows)]
@@ -2495,12 +2845,16 @@ async fn run_client_loop(
                         }
                     }
                     state.mouse_capture_active = enabled;
+                    state.sgr_pixels_active = next_sgr_pixels;
                     if !enabled {
                         state.mouse_pointer.set_cell(None);
+                        #[cfg(unix)]
+                        {
+                            state.omp_renderer.observe_pointer_cell(None);
+                            display_pending_omp_surface(&mut state, &mut write_stream)?;
+                        }
                         let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     }
-                    host_mouse_capture_active.store(enabled, Ordering::Release);
-                    host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
                 }
                 ServerMessage::KittyKeyboardReportAll { enabled } => {
                     if enabled != state.keyboard_report_all_active {
@@ -3221,6 +3575,11 @@ fn resize_report_required(
     signalled || new_size != last_size
 }
 
+#[cfg(windows)]
+fn resize_event(new_size: (u16, u16, u32, u32)) -> ClientLoopEvent {
+    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0)
+}
+
 /// Watches the terminal size and sends resize events when it changes.
 ///
 /// The baseline cell size must match what the handshake sent to the server:
@@ -3234,6 +3593,7 @@ fn resize_poll_loop(
     initial_cell_height: u32,
     kitty_graphics_enabled: bool,
     reported_cell_size: &AtomicU64,
+    #[cfg(unix)] host_input_state: &HostInputState,
     should_quit: &Arc<AtomicBool>,
 ) {
     crate::platform::watch_terminal_resize_signal();
@@ -3253,12 +3613,11 @@ fn resize_poll_loop(
         );
         if resize_report_required(signalled, new_size, last_size) {
             last_size = new_size;
-            if resize_tx
-                .blocking_send(ClientLoopEvent::Resize(
-                    new_size.0, new_size.1, new_size.2, new_size.3,
-                ))
-                .is_err()
-            {
+            #[cfg(unix)]
+            let send_result = host_input_state.send_resize(&resize_tx, new_size);
+            #[cfg(windows)]
+            let send_result = resize_tx.blocking_send(resize_event(new_size));
+            if send_result.is_err() {
                 break; // Main loop gone.
             }
         }
@@ -3366,6 +3725,97 @@ mod tests {
         assert!(!resize_report_required(false, size, size));
         assert!(resize_report_required(false, (120, 41, 8, 16), size));
         assert!(resize_report_required(false, (120, 40, 9, 18), size));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_event_advances_generation_before_dispatch() {
+        let input_state = HostInputState::new(true, true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        input_state
+            .send_resize(&tx, (120, 40, 8, 16))
+            .expect("resize dispatch");
+        assert_eq!(input_state.load().generation(), 1);
+        let ClientLoopEvent::Resize(120, 40, 8, 16, generation) = rx.try_recv().unwrap() else {
+            panic!("expected resize event");
+        };
+        assert_eq!(generation, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_is_enqueued_before_new_generation_input() {
+        let input_state = HostInputState::new(true, true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        input_state.send_resize(&tx, (120, 40, 8, 16)).unwrap();
+        let snapshot = input_state.load();
+        input_state
+            .send_event(
+                &tx,
+                ClientLoopEvent::StdinInput(b"mouse".to_vec(), snapshot),
+            )
+            .unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Resize(..))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientLoopEvent::StdinInput(_, captured)) if captured == snapshot
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_event_queue_reserves_capacity_before_input_order_lock() {
+        let input_state = Arc::new(HostInputState::new(true, true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.blocking_send(ClientLoopEvent::Timer).unwrap();
+        let order_guard = input_state
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sender_state = input_state.clone();
+        let sender_tx = tx.clone();
+        let sender = std::thread::spawn(move || {
+            sender_state.send_event(
+                &sender_tx,
+                ClientLoopEvent::StdinInput(b"mouse".to_vec(), sender_state.load()),
+            )
+        });
+
+        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while tx.capacity() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(tx.capacity(), 0, "sender did not reserve queue capacity");
+
+        drop(order_guard);
+        sender.join().unwrap().unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientLoopEvent::StdinInput(data, _)) if data == b"mouse"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_mode_transition_is_one_versioned_snapshot() {
+        let input_state = HostInputState::new(false, false);
+        let pixels = input_state
+            .transition_mouse_mode(true, true, || Ok(()))
+            .unwrap();
+        assert_eq!(pixels.generation(), 1);
+        assert!(pixels.capture_active());
+        assert!(pixels.sgr_pixels_active());
+        assert_eq!(input_state.load(), pixels);
+
+        let cells = input_state
+            .transition_mouse_mode(true, false, || Ok(()))
+            .unwrap();
+        assert_eq!(cells.generation(), 2);
+        assert!(cells.capture_active());
+        assert!(!cells.sgr_pixels_active());
+        assert_eq!(input_state.load(), cells);
     }
 
     #[test]
@@ -4058,7 +4508,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_pointer_shape_tracks_link_cells_without_repeating_output() {
+    fn mouse_pointer_shape_tracks_frame_and_native_link_hits_without_repeating_output() {
         let frame = crate::protocol::FrameData {
             cells: vec![
                 crate::protocol::CellData {
@@ -4088,16 +4538,89 @@ mod tests {
         let mut output = Vec::new();
 
         pointer.set_cell(Some((1, 0)));
-        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
         assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
 
         output.clear();
-        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
         assert!(output.is_empty());
 
-        pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
-        pointer.write_for_frame(&mut output, Some(&frame)).unwrap();
+        assert_eq!(
+            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
+            Some(None)
+        );
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
         assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+
+        output.clear();
+        pointer.set_cell(Some((0, 0)));
+        pointer
+            .write_for_frame(&mut output, Some(&frame), Some(true))
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_unapplied_and_capture_disabled_mouse_input_is_rejected() {
+        let captured = HostInputSnapshot::from_parts(7, true, false);
+        let current = HostInputSnapshot::from_parts(7, true, false);
+        assert!(mouse_input_is_current(captured, current, 7, true));
+        assert!(!mouse_input_is_current(captured, current, 6, true));
+
+        let published_later = HostInputSnapshot::from_parts(8, true, false);
+        assert!(mouse_input_is_current(captured, published_later, 7, true,));
+
+        let stale = HostInputSnapshot::from_parts(6, true, false);
+        assert!(!mouse_input_is_current(stale, current, 7, true));
+
+        let capture_disabled = HostInputSnapshot::from_parts(7, false, false);
+        assert!(!mouse_input_is_current(
+            capture_disabled,
+            capture_disabled,
+            7,
+            true,
+        ));
+        assert!(mouse_input_is_current(
+            capture_disabled,
+            capture_disabled,
+            7,
+            false,
+        ));
+
+        let mut unstable = captured;
+        unstable.stable = false;
+        assert!(!mouse_input_is_current(unstable, current, 7, false));
+    }
+    #[test]
+    fn raw_pointer_observation_reports_only_pointer_changes() {
+        let mut pointer = MousePointerState::default();
+        pointer.set_cell(Some((1, 0)));
+
+        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(pointer.observe_raw_events(&[key]), None);
+        assert_eq!(pointer.cell, Some((1, 0)));
+
+        let mouse = crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 2,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert_eq!(pointer.observe_raw_events(&[mouse]), Some(Some((2, 0))));
+        assert_eq!(
+            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
+            Some(None)
+        );
     }
 
     #[test]
