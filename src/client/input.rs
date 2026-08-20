@@ -107,17 +107,22 @@ fn unix_stdin_reader_loop(
                 let input_state = direct_pending_state
                     .take()
                     .unwrap_or_else(|| host_input_state.load());
-                if !send_framed_input(
+                let mut events = Vec::new();
+                frame_input(
                     &data,
                     input_state,
                     None,
                     &mut framer,
                     &mut pending_input_state,
                     &mut last_geometry,
-                    &event_tx,
                     &mut pending_palette,
-                    &host_input_state,
-                ) {
+                    &mut events,
+                );
+                if !events.is_empty()
+                    && host_input_state
+                        .send_event(&event_tx, ClientLoopEvent::OrderedInput(events))
+                        .is_err()
+                {
                     return;
                 }
             }
@@ -135,26 +140,23 @@ fn unix_stdin_reader_loop(
         if !readiness.pty_read_ready {
             continue;
         }
-        match host_input_state.read_input(&mut scratch) {
-            Ok((0, _)) => break,
-            Ok((n, input_state)) => {
+        let read =
+            host_input_state.read_input_and_send(&event_tx, &mut scratch, |bytes, input_state| {
                 let observed_geometry = crate::input::mouse::HostGeometry::current();
                 let _ = input_geometry(&mut last_geometry, input_state, observed_geometry);
+                let mut events = Vec::new();
                 let filtered = filter_direct_input(
-                    &scratch[..n],
+                    bytes,
                     &mut direct_filter,
                     &direct_response,
                     &direct_response_active,
                 );
                 if let Some((raw_chunks, responses, pending_uses_old)) = filtered {
-                    for response in responses {
-                        if event_tx
-                            .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
+                    events.extend(
+                        responses
+                            .into_iter()
+                            .map(ClientLoopEvent::DirectGraphicsResponse),
+                    );
                     let filter_pending_state = direct_pending_state.unwrap_or(input_state);
                     direct_pending_state =
                         direct_filter.has_pending().then_some(if pending_uses_old {
@@ -163,51 +165,48 @@ fn unix_stdin_reader_loop(
                             input_state
                         });
                     for chunk in raw_chunks {
-                        if chunk.pending_bytes > 0
-                            && !send_framed_input(
+                        if chunk.pending_bytes > 0 {
+                            frame_input(
                                 &chunk.data[..chunk.pending_bytes],
                                 filter_pending_state,
                                 None,
                                 &mut framer,
                                 &mut pending_input_state,
                                 &mut last_geometry,
-                                &event_tx,
                                 &mut pending_palette,
-                                &host_input_state,
-                            )
-                        {
-                            return;
+                                &mut events,
+                            );
                         }
-                        if chunk.pending_bytes < chunk.data.len()
-                            && !send_framed_input(
+                        if chunk.pending_bytes < chunk.data.len() {
+                            frame_input(
                                 &chunk.data[chunk.pending_bytes..],
                                 input_state,
                                 observed_geometry,
                                 &mut framer,
                                 &mut pending_input_state,
                                 &mut last_geometry,
-                                &event_tx,
                                 &mut pending_palette,
-                                &host_input_state,
-                            )
-                        {
-                            return;
+                                &mut events,
+                            );
                         }
                     }
-                } else if !send_framed_input(
-                    &scratch[..n],
-                    input_state,
-                    observed_geometry,
-                    &mut framer,
-                    &mut pending_input_state,
-                    &mut last_geometry,
-                    &event_tx,
-                    &mut pending_palette,
-                    &host_input_state,
-                ) {
-                    return;
+                } else {
+                    frame_input(
+                        bytes,
+                        input_state,
+                        observed_geometry,
+                        &mut framer,
+                        &mut pending_input_state,
+                        &mut last_geometry,
+                        &mut pending_palette,
+                        &mut events,
+                    );
                 }
-
+                (!events.is_empty()).then_some(ClientLoopEvent::OrderedInput(events))
+            });
+        match read {
+            Ok(0) => break,
+            Ok(_) => {
                 let timeout_ms = idle_flush_timeout_ms(
                     &framer,
                     pending_input_state
@@ -222,21 +221,15 @@ fn unix_stdin_reader_loop(
                     let held_escape = had_pending && chunks.is_empty();
                     pending_input_state = framer.has_pending_input().then_some(input_state);
                     let geometry = input_geometry(&mut last_geometry, input_state, None);
-                    if !send_unix_input_chunks(
+                    let mut events = Vec::new();
+                    append_unix_input_chunks(
                         chunks,
-                        &event_tx,
                         &mut pending_palette,
-                        &host_input_state,
                         input_state,
                         geometry,
-                    ) || !flush_unix_palette_input(
-                        &event_tx,
-                        &mut pending_palette,
-                        &host_input_state,
-                        input_state,
-                    ) {
-                        return;
-                    }
+                        &mut events,
+                    );
+                    flush_unix_palette_input(&mut pending_palette, input_state, &mut events);
                     if held_escape
                         && poll_read_ready(
                             stdin_fd,
@@ -248,16 +241,20 @@ fn unix_stdin_reader_loop(
                         let chunks = framer.flush_timeout();
                         pending_input_state = framer.has_pending_input().then_some(input_state);
                         let geometry = input_geometry(&mut last_geometry, input_state, None);
-                        if !send_unix_input_chunks(
+                        append_unix_input_chunks(
                             chunks,
-                            &event_tx,
                             &mut pending_palette,
-                            &host_input_state,
                             input_state,
                             geometry,
-                        ) {
-                            return;
-                        }
+                            &mut events,
+                        );
+                    }
+                    if !events.is_empty()
+                        && host_input_state
+                            .send_event(&event_tx, ClientLoopEvent::OrderedInput(events))
+                            .is_err()
+                    {
+                        return;
                     }
                 }
             }
@@ -304,17 +301,16 @@ fn filter_direct_input(
 
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-fn send_framed_input(
+fn frame_input(
     bytes: &[u8],
     input_state: HostInputSnapshot,
     observed_geometry: Option<crate::input::mouse::HostGeometry>,
     framer: &mut crate::raw_input::RawInputByteFramer,
     pending_input_state: &mut Option<HostInputSnapshot>,
     last_geometry: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
-    event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
-    host_input_state: &HostInputState,
-) -> bool {
+    events: &mut Vec<ClientLoopEvent>,
+) {
     let mut offset = 0;
     if let Some(pending_state) = *pending_input_state {
         let continued_state = pending_state.continued_with(input_state);
@@ -329,49 +325,38 @@ fn send_framed_input(
                     .saturating_sub(framer.pending_len());
                 old_pending_bytes = old_pending_bytes.saturating_sub(consumed);
                 let geometry = input_geometry(last_geometry, continued_state, None);
-                if !send_unix_input_chunks(
+                append_unix_input_chunks(
                     chunks,
-                    event_tx,
                     pending_palette,
-                    host_input_state,
                     continued_state,
                     geometry,
-                ) {
-                    return false;
-                }
+                    events,
+                );
             }
             if old_pending_bytes > 0 {
                 *pending_input_state = Some(continued_state);
-                return true;
+                return;
             }
             *pending_input_state = framer.has_pending_input().then_some(input_state);
             if offset == bytes.len() {
-                return true;
+                return;
             }
         }
     }
     let chunks = framer.push(&bytes[offset..]);
     *pending_input_state = framer.has_pending_input().then_some(input_state);
     let geometry = input_geometry(last_geometry, input_state, observed_geometry);
-    send_unix_input_chunks(
-        chunks,
-        event_tx,
-        pending_palette,
-        host_input_state,
-        input_state,
-        geometry,
-    )
+    append_unix_input_chunks(chunks, pending_palette, input_state, geometry, events);
 }
 
 #[cfg(unix)]
-fn send_unix_input_chunks(
+fn append_unix_input_chunks(
     chunks: Vec<Vec<u8>>,
-    event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
-    host_input_state: &HostInputState,
     input_state: HostInputSnapshot,
     geometry: Option<crate::input::mouse::HostGeometry>,
-) -> bool {
+    events: &mut Vec<ClientLoopEvent>,
+) {
     for data in chunks {
         let palette_response = std::str::from_utf8(&data)
             .ok()
@@ -379,15 +364,8 @@ fn send_unix_input_chunks(
             .is_some();
         if palette_response {
             pending_palette.push(data);
-            if pending_palette.len() == 256
-                && !flush_unix_palette_input(
-                    event_tx,
-                    pending_palette,
-                    host_input_state,
-                    input_state,
-                )
-            {
-                return false;
+            if pending_palette.len() == 256 {
+                flush_unix_palette_input(pending_palette, input_state, events);
             }
             continue;
         }
@@ -395,19 +373,13 @@ fn send_unix_input_chunks(
             .ok()
             .and_then(crate::terminal_theme::parse_default_color_response)
             .is_some();
-        if !default_color_response
-            && !flush_unix_palette_input(event_tx, pending_palette, host_input_state, input_state)
-        {
-            return false;
+        if !default_color_response {
+            flush_unix_palette_input(pending_palette, input_state, events);
         }
-        let Some(event) = classify_unix_input(data, input_state, geometry) else {
-            continue;
-        };
-        if host_input_state.send_event(event_tx, event).is_err() {
-            return false;
+        if let Some(event) = classify_unix_input(data, input_state, geometry) {
+            events.push(event);
         }
     }
-    true
 }
 
 #[cfg(unix)]
@@ -442,18 +414,15 @@ fn classify_unix_input(
 
 #[cfg(unix)]
 fn flush_unix_palette_input(
-    event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
-    host_input_state: &HostInputState,
     input_state: HostInputSnapshot,
-) -> bool {
+    events: &mut Vec<ClientLoopEvent>,
+) {
     if pending_palette.is_empty() {
-        return true;
+        return;
     }
     let data = std::mem::take(pending_palette).concat();
-    host_input_state
-        .send_event(event_tx, ClientLoopEvent::StdinInput(data, input_state))
-        .is_ok()
+    events.push(ClientLoopEvent::StdinInput(data, input_state));
 }
 
 #[cfg(unix)]
@@ -979,6 +948,64 @@ mod tests {
     }
 
     #[test]
+    fn stdin_read_is_published_before_a_resize_boundary() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let down = b"\x1b[<0;4;4M";
+        let up = b"\x1b[<0;4;4m";
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .write_all(&[down.as_slice(), up.as_slice()].concat())
+            .unwrap();
+        let (input_state, _wake) =
+            HostInputState::with_input_fd(true, false, reader.as_raw_fd()).unwrap();
+        let input_state = Arc::new(input_state);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let reader_state = input_state.clone();
+        let reader_tx = event_tx.clone();
+        let reader_thread = std::thread::spawn(move || {
+            let mut scratch = [0; 64];
+            reader_state.read_input_and_send(&reader_tx, &mut scratch, |bytes, snapshot| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Some(ClientLoopEvent::OrderedInput(vec![
+                    ClientLoopEvent::StdinInput(bytes[..down.len()].to_vec(), snapshot),
+                    ClientLoopEvent::StdinInput(bytes[down.len()..].to_vec(), snapshot),
+                ]))
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let resize_state = input_state.clone();
+        let resize_tx = event_tx.clone();
+        let resize_thread =
+            std::thread::spawn(move || resize_state.send_resize(&resize_tx, (120, 40, 8, 16)));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reader_thread.join().unwrap().unwrap(),
+            down.len() + up.len()
+        );
+        resize_thread.join().unwrap().unwrap();
+
+        let ClientLoopEvent::OrderedInput(events) = event_rx.try_recv().unwrap() else {
+            panic!("stdin batch must be published first");
+        };
+        assert!(matches!(
+            events.as_slice(),
+            [ClientLoopEvent::StdinInput(first, _), ClientLoopEvent::StdinInput(second, _)]
+                if first == down && second == up
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ClientLoopEvent::Resize(..))
+        ));
+    }
+
+    #[test]
     fn only_raw_framer_pending_input_retains_a_snapshot() {
         let input_state = HostInputSnapshot::from_parts(7, true, false);
         let mut framer = crate::raw_input::RawInputByteFramer::default();
@@ -1009,43 +1036,41 @@ mod tests {
         let mut pending_input_state = None;
         let mut last_geometry = None;
         let mut pending_palette = Vec::new();
-        let (tx, mut rx) = mpsc::channel(4);
+        let mut events = Vec::new();
 
-        assert!(send_framed_input(
+        frame_input(
             b"\x1b",
             old,
             Some(geometry),
             &mut framer,
             &mut pending_input_state,
             &mut last_geometry,
-            &tx,
             &mut pending_palette,
-            &host_input_state,
-        ));
+            &mut events,
+        );
         assert_eq!(pending_input_state, Some(old));
-        assert!(rx.try_recv().is_err());
+        assert!(events.is_empty());
 
         let current = host_input_state.advance_generation();
-        assert!(send_framed_input(
+        frame_input(
             b"[A\x1b[<0;2;2M",
             current,
             Some(geometry),
             &mut framer,
             &mut pending_input_state,
             &mut last_geometry,
-            &tx,
             &mut pending_palette,
-            &host_input_state,
-        ));
+            &mut events,
+        );
 
-        let ClientLoopEvent::StdinInput(arrow, arrow_state) = rx.try_recv().unwrap() else {
+        assert_eq!(events.len(), 2);
+        let ClientLoopEvent::StdinInput(arrow, arrow_state) = events.remove(0) else {
             panic!("expected old arrow input");
         };
         assert_eq!(arrow, b"\x1b[A");
         assert_eq!(arrow_state.generation(), old.generation());
         assert!(!arrow_state.stable);
-        let ClientLoopEvent::PixelMouse(report, captured_geometry, mouse_state) =
-            rx.try_recv().unwrap()
+        let ClientLoopEvent::PixelMouse(report, captured_geometry, mouse_state) = events.remove(0)
         else {
             panic!("expected fresh pixel mouse input");
         };
@@ -1064,40 +1089,38 @@ mod tests {
         let mut pending_input_state = None;
         let mut last_geometry = None;
         let mut pending_palette = Vec::new();
-        let (tx, mut rx) = mpsc::channel(4);
+        let mut events = Vec::new();
 
-        assert!(send_framed_input(
+        frame_input(
             b"\x1b",
             old,
             Some(geometry),
             &mut framer,
             &mut pending_input_state,
             &mut last_geometry,
-            &tx,
             &mut pending_palette,
-            &host_input_state,
-        ));
+            &mut events,
+        );
         let current = host_input_state.advance_generation();
-        assert!(send_framed_input(
+        frame_input(
             b"\x1b[<0;2;2M",
             current,
             Some(geometry),
             &mut framer,
             &mut pending_input_state,
             &mut last_geometry,
-            &tx,
             &mut pending_palette,
-            &host_input_state,
-        ));
+            &mut events,
+        );
 
-        let ClientLoopEvent::StdinInput(escape, escape_state) = rx.try_recv().unwrap() else {
+        assert_eq!(events.len(), 2);
+        let ClientLoopEvent::StdinInput(escape, escape_state) = events.remove(0) else {
             panic!("expected old escape input");
         };
         assert_eq!(escape, b"\x1b");
         assert_eq!(escape_state.generation(), old.generation());
         assert!(!escape_state.stable);
-        let ClientLoopEvent::PixelMouse(report, captured_geometry, mouse_state) =
-            rx.try_recv().unwrap()
+        let ClientLoopEvent::PixelMouse(report, captured_geometry, mouse_state) = events.remove(0)
         else {
             panic!("expected fresh pixel mouse input");
         };
@@ -1110,29 +1133,22 @@ mod tests {
     #[test]
     fn palette_replies_are_forwarded_as_one_input_batch() {
         let input_state = HostInputSnapshot::from_parts(7, false, false);
-        let host_input_state = HostInputState::new(false, false);
-        let (tx, mut rx) = mpsc::channel(4);
         let mut pending = Vec::new();
-        assert!(send_unix_input_chunks(
+        let mut events = Vec::new();
+        append_unix_input_chunks(
             vec![
                 b"\x1b]4;0;rgb:1111/2222/3333\x1b\\".to_vec(),
                 b"\x1b]4;1;rgb:4444/5555/6666\x1b\\".to_vec(),
             ],
-            &tx,
             &mut pending,
-            &host_input_state,
             input_state,
             None,
-        ));
-        assert!(rx.try_recv().is_err());
+            &mut events,
+        );
+        assert!(events.is_empty());
 
-        assert!(flush_unix_palette_input(
-            &tx,
-            &mut pending,
-            &host_input_state,
-            input_state,
-        ));
-        let ClientLoopEvent::StdinInput(data, captured_state) = rx.try_recv().unwrap() else {
+        flush_unix_palette_input(&mut pending, input_state, &mut events);
+        let ClientLoopEvent::StdinInput(data, captured_state) = events.remove(0) else {
             panic!("expected palette input batch");
         };
         assert_eq!(
@@ -1143,6 +1159,7 @@ mod tests {
         );
         assert_eq!(captured_state, input_state);
         assert!(pending.is_empty());
+        assert!(events.is_empty());
     }
 
     #[test]

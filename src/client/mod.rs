@@ -21,6 +21,8 @@ mod omp_pane;
 mod omp_renderer;
 
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::io::IsTerminal as _;
 use std::io::{self, BufRead as _, Write as _};
 #[cfg(unix)]
@@ -194,11 +196,11 @@ impl HostInputState {
             .map(|_| ())
     }
 
-    fn read_input(&self, scratch: &mut [u8]) -> io::Result<(usize, HostInputSnapshot)> {
-        let mut boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn read_input_locked(
+        &self,
+        boundary: &mut HostInputBoundary,
+        scratch: &mut [u8],
+    ) -> io::Result<(usize, HostInputSnapshot)> {
         let stale = boundary.stale_bytes > 0;
         let input_state = if stale {
             boundary.stale_snapshot
@@ -222,6 +224,35 @@ impl HostInputState {
             boundary.stale_bytes = boundary.stale_bytes.saturating_sub(read);
         }
         Ok((read, input_state))
+    }
+
+    #[cfg(test)]
+    fn read_input(&self, scratch: &mut [u8]) -> io::Result<(usize, HostInputSnapshot)> {
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.read_input_locked(&mut boundary, scratch)
+    }
+
+    fn read_input_and_send(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        scratch: &mut [u8],
+        build: impl FnOnce(&[u8], HostInputSnapshot) -> Option<ClientLoopEvent>,
+    ) -> io::Result<usize> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (read, input_state) = self.read_input_locked(&mut boundary, scratch)?;
+        if read > 0 {
+            if let Some(event) = build(&scratch[..read], input_state) {
+                permit.send(event);
+            }
+        }
+        Ok(read)
     }
 
     fn advance_generation(&self) -> HostInputSnapshot {
@@ -1405,6 +1436,9 @@ enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     #[cfg(unix)]
     StdinInput(Vec<u8>, HostInputSnapshot),
+    /// Framed events from one stdin read, published as one ordering unit.
+    #[cfg(unix)]
+    OrderedInput(Vec<ClientLoopEvent>),
     /// One confirmed SGR pixel report with geometry and input snapshot captured by the reader.
     #[cfg(unix)]
     PixelMouse(
@@ -2356,15 +2390,36 @@ async fn run_client_loop(
     // (implemented on macOS and Windows; a no-op on other platforms).
     use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+    #[cfg(unix)]
+    let mut ordered_input = VecDeque::new();
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
-        let event = tokio::select! {
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+        let event = {
+            #[cfg(unix)]
+            if let Some(event) = ordered_input.pop_front() {
+                event
+            } else {
+                tokio::select! {
+                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+                }
+            }
         };
 
         match event {
+            #[cfg(unix)]
+            ClientLoopEvent::OrderedInput(events) => {
+                ordered_input.extend(events);
+                continue;
+            }
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data, input_state) => {
                 let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
@@ -2574,6 +2629,7 @@ async fn run_client_loop(
                 let _ = resize_generation;
                 state.reported_size = (new_cols, new_rows);
                 state.reported_cell_size_px = (cell_width_px, cell_height_px);
+                state.mouse_pointer.set_cell(None);
                 // Resizing invalidates both server and local PTY blit baselines.
                 state.request_repaint();
                 #[cfg(unix)]
@@ -2587,6 +2643,7 @@ async fn run_client_loop(
                     );
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                 }
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -4564,6 +4621,13 @@ mod tests {
             .write_for_frame(&mut output, Some(&frame), Some(true))
             .unwrap();
         assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+
+        output.clear();
+        pointer.set_cell(None);
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
     }
 
     #[cfg(unix)]
