@@ -20,7 +20,8 @@ use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
     ClientLaunchMode, ClientMessage, NotificationActivation, RenderEncoding, ServerMessage,
-    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, MAX_LINK_URL_LENGTH,
+    PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -43,8 +44,6 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Maximum encoded mouse report accepted with pixel geometry.
 const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
-/// Maximum encoded URL accepted from a client-local renderer.
-const MAX_LINK_URL_LENGTH: usize = 16 * 1024;
 /// Maximum reliable control records buffered per client writer.
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 
@@ -489,6 +488,7 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         route: crate::server::omp_route::OmpRouteKey,
         retry_id: u64,
+    },
     /// A client-local OMP renderer activated one resolved link.
     ActivateOmpLink {
         client_id: u64,

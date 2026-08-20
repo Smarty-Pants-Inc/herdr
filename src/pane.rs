@@ -203,6 +203,10 @@ impl PaneLaunchEnv {
 
 fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env_remove("CODEX_THREAD_ID");
+    // Outer mux markers no longer describe the process launched inside Herdr.
+    for key in ["TMUX", "STY", "ZELLIJ"] {
+        cmd.env_remove(key);
+    }
     for key in &launch_env.remove {
         cmd.env_remove(key);
     }
@@ -3263,6 +3267,33 @@ mod tests {
         );
 
         assert!(cmd.get_env("BUN_OPTIONS").is_none());
+    }
+
+    #[test]
+    fn pane_launch_env_clears_only_inherited_mux_markers() {
+        let mut cmd = CommandBuilder::new("shell");
+        for key in ["TMUX", "STY", "ZELLIJ"] {
+            cmd.env(key, "outer");
+        }
+
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+
+        for key in ["TMUX", "STY", "ZELLIJ"] {
+            assert!(
+                cmd.get_env(key).is_none(),
+                "inherited {key} marker survived"
+            );
+        }
+
+        let mut nested = CommandBuilder::new("shell");
+        apply_pane_launch_env(
+            &mut nested,
+            &PaneLaunchEnv::from_extra(vec![("TMUX".into(), "fresh".into())]),
+        );
+        assert_eq!(
+            nested.get_env("TMUX").and_then(std::ffi::OsStr::to_str),
+            Some("fresh")
+        );
     }
 
     #[test]

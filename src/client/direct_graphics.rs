@@ -121,6 +121,11 @@ impl ResponseMatcher {
     }
 }
 
+pub(super) struct FilteredInput {
+    pub(super) data: Vec<u8>,
+    pub(super) pending_bytes: usize,
+}
+
 #[derive(Default)]
 pub(super) struct InputFilter {
     pending: Vec<u8>,
@@ -139,13 +144,17 @@ impl InputFilter {
         &mut self,
         bytes: &[u8],
         matcher: &mut ResponseMatcher,
-    ) -> (Vec<Vec<u8>>, Vec<Response>) {
+    ) -> (Vec<FilteredInput>, Vec<Response>, bool) {
+        let mut old_pending = self.pending.len();
         self.pending.extend_from_slice(bytes);
         let mut output = Vec::new();
         let mut responses = Vec::new();
         if !matcher.interested() {
-            output.push(std::mem::take(&mut self.pending));
-            return (output, responses);
+            output.push(FilteredInput {
+                data: std::mem::take(&mut self.pending),
+                pending_bytes: old_pending,
+            });
+            return (output, responses, false);
         }
         loop {
             let Some(start) = self
@@ -159,12 +168,20 @@ impl InputFilter {
                     .unwrap_or(0);
                 let emit = self.pending.len().saturating_sub(keep);
                 if emit > 0 {
-                    output.push(self.pending.drain(..emit).collect());
+                    output.push(drain_filtered_input(
+                        &mut self.pending,
+                        emit,
+                        &mut old_pending,
+                    ));
                 }
                 break;
             };
             if start > 0 {
-                output.push(self.pending.drain(..start).collect());
+                output.push(drain_filtered_input(
+                    &mut self.pending,
+                    start,
+                    &mut old_pending,
+                ));
             }
             let end = self
                 .pending
@@ -172,18 +189,36 @@ impl InputFilter {
                 .position(|window| window == KITTY_SUFFIX);
             let Some(end) = end else {
                 if self.pending.len() > MAX_RESPONSE_BYTES {
-                    output.push(std::mem::take(&mut self.pending));
+                    let len = self.pending.len();
+                    output.push(drain_filtered_input(
+                        &mut self.pending,
+                        len,
+                        &mut old_pending,
+                    ));
                 }
                 break;
             };
-            let command: Vec<u8> = self.pending.drain(..end + 2).collect();
-            match matcher.consume(&command) {
+            let command = drain_filtered_input(&mut self.pending, end + 2, &mut old_pending);
+            match matcher.consume(&command.data) {
                 Some(Some(response)) => responses.push(response),
                 Some(None) => {}
                 None => output.push(command),
             }
         }
-        (output, responses)
+        (output, responses, old_pending > 0)
+    }
+}
+
+fn drain_filtered_input(
+    pending: &mut Vec<u8>,
+    len: usize,
+    old_pending: &mut usize,
+) -> FilteredInput {
+    let pending_bytes = (*old_pending).min(len);
+    *old_pending -= pending_bytes;
+    FilteredInput {
+        data: pending.drain(..len).collect(),
+        pending_bytes,
     }
 }
 
@@ -381,17 +416,55 @@ mod tests {
             b"\x1b_Ga=p,i=49;OK\x1b\\".as_slice(),
             b"\x1b_Gi=49oops;OK\x1b\\",
         ] {
-            let (output, responses) = filter.push(foreign, &mut matcher);
-            assert_eq!(output, [foreign.to_vec()]);
+            let (output, responses, _) = filter.push(foreign, &mut matcher);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].data, foreign);
+            assert_eq!(output[0].pending_bytes, 0);
             assert!(responses.is_empty());
         }
-        let (output, responses) = filter.push(b"typed\x1b_Gi=49;", &mut matcher);
-        assert_eq!(output, [b"typed".to_vec()]);
+        let (output, responses, _) = filter.push(b"typed\x1b_Gi=49;", &mut matcher);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].data, b"typed");
+        assert_eq!(output[0].pending_bytes, 0);
         assert!(responses.is_empty());
-        let (output, responses) = filter.push(b"OK\x1b\\tail", &mut matcher);
-        assert_eq!(output, [b"tail".to_vec()]);
+        let (output, responses, _) = filter.push(b"OK\x1b\\tail", &mut matcher);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].data, b"tail");
+        assert_eq!(output[0].pending_bytes, 0);
         assert_eq!(responses[0].transfer_id, 19);
         assert!(responses[0].success);
+    }
+
+    #[test]
+    fn output_marks_bytes_that_started_in_the_pending_buffer() {
+        let mut matcher = ResponseMatcher::default();
+        let mut filter = InputFilter::default();
+        matcher.arm(19, 49);
+
+        let (output, responses, _) = filter.push(b"\x1b", &mut matcher);
+        assert!(output.is_empty());
+        assert!(responses.is_empty());
+        let (output, responses, _) = filter.push(b"[<0;1;1M", &mut matcher);
+        assert!(responses.is_empty());
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].data, b"\x1b[<0;1;1M");
+        assert_eq!(output[0].pending_bytes, 1);
+    }
+
+    #[test]
+    fn retained_fresh_suffix_does_not_inherit_old_pending_provenance() {
+        let mut matcher = ResponseMatcher::default();
+        let mut filter = InputFilter::default();
+        matcher.arm(19, 49);
+
+        let (_, _, pending_uses_old) = filter.push(b"\x1b_Gi=49;", &mut matcher);
+        assert!(!pending_uses_old);
+        let (output, responses, pending_uses_old) = filter.push(b"OK\x1b\\\x1b", &mut matcher);
+
+        assert!(output.is_empty());
+        assert_eq!(responses.len(), 1);
+        assert!(filter.has_pending());
+        assert!(!pending_uses_old);
     }
 
     #[test]
@@ -404,8 +477,10 @@ mod tests {
             b"\x1b_Ga=p,i=50;OK\x1b\\".as_slice(),
             b"\x1b_Gi=50oops;OK\x1b\\",
         ] {
-            let (output, responses) = filter.push(foreign, &mut matcher);
-            assert_eq!(output, [foreign.to_vec()]);
+            let (output, responses, _) = filter.push(foreign, &mut matcher);
+            assert_eq!(output.len(), 1);
+            assert_eq!(output[0].data, foreign);
+            assert_eq!(output[0].pending_bytes, 0);
             assert!(responses.is_empty());
         }
         assert!(filter

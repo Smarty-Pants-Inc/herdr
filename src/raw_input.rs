@@ -247,6 +247,11 @@ impl RawInputByteFramer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_split_coalesced_escape() -> Self {
+        Self::with_host_input_policy(false)
+    }
+
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         self.buffer.extend_from_slice(data);
         self.drain_available_chunks()
@@ -291,6 +296,10 @@ impl RawInputByteFramer {
 
     pub(crate) fn has_pending_input(&self) -> bool {
         !self.buffer.is_empty()
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.buffer.len()
     }
 
     #[cfg(any(not(windows), test))]

@@ -19,6 +19,9 @@ pub const PROTOCOL_VERSION: u32 = 26;
 /// rejected to prevent denial-of-service via oversized length prefixes.
 pub const MAX_FRAME_SIZE: usize = 2 * 1024 * 1024;
 
+/// Maximum UTF-8 bytes in a client-local link activation URL.
+pub const MAX_LINK_URL_LENGTH: usize = 16 * 1024;
+
 /// Maximum UTF-8 bytes in a public OMP route identifier.
 pub const MAX_OMP_ROUTE_ID_BYTES: usize = 256;
 
