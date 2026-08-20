@@ -98,6 +98,29 @@ impl PaneClickState {
             && self.col.abs_diff(next.col) <= 1
     }
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct LinkClickState {
+    source_id: InputSourceId,
+    pane_id: crate::layout::PaneId,
+    url: String,
+    at: Instant,
+}
+
+impl LinkClickState {
+    fn is_duplicate_for(
+        &self,
+        source_id: InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: &str,
+        at: Instant,
+    ) -> bool {
+        self.source_id == source_id
+            && self.pane_id == pane_id
+            && self.url == url
+            && at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneHoverPosition {
     pub(crate) pane_id: crate::layout::PaneId,
@@ -146,6 +169,7 @@ pub struct App {
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
+    pub(crate) last_link_click: Option<LinkClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) hover_generation: u64,
     pub(crate) next_resize_poll: Instant,
@@ -811,6 +835,7 @@ impl App {
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
+            last_link_click: None,
             pending_url_click_sources: HashSet::new(),
             hover_generation: 0,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,

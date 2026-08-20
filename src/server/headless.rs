@@ -4349,7 +4349,7 @@ impl HeadlessServer {
         let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
             return false;
         };
-        let activated = self.app.activate_resolved_link(client_id, pane_id, url);
+        let activated = self.app.activate_link_once(client_id, pane_id, url);
         self.finish_client_navigation_scope(client_id, canonical);
         activated
     }
@@ -9657,6 +9657,13 @@ mod tests {
             }),
             "native link did not queue OpenUrl: {native_events:?}"
         );
+        assert!(server.handle_server_event(ServerEvent::ActivateOmpLink {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+            url: native_url.into(),
+        }));
+        assert!(!server.app.pending_url_click_sources.contains(&1));
+        assert!(server.app.event_rx.try_recv().is_err());
         assert!(!server.handle_server_event(ServerEvent::ActivateOmpLink {
             client_id: 1,
             launch_id: renderer_launch_id + 1,

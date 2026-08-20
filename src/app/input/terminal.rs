@@ -1126,6 +1126,37 @@ mod tests {
         assert_eq!(log.action_id.as_deref(), Some("open"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn double_click_url_invokes_plugin_link_handler_once() {
+        let line = "see https://github.com/herdrdev/herdr/issues/398";
+        let col = line.find("github").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
+        let x = info.inner_rect.x + col;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(mouse(kind, x, info.inner_rect.y));
+        }
+
+        assert_eq!(
+            app.state
+                .plugin_command_logs
+                .iter()
+                .filter(|log| log.action_id.as_deref() == Some("open"))
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn pane_cell_url_resolver_finds_visible_url() {
         let line = "see https://example.com/pr/307.";

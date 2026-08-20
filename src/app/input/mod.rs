@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tracing::warn;
 
-use crate::app::PaneClickState;
+use crate::app::{LinkClickState, PaneClickState};
 use crate::input::TerminalKey;
 #[cfg(test)]
 use ratatui::layout::Direction;
@@ -624,10 +624,41 @@ impl App {
         url: String,
     ) -> bool {
         self.pending_url_click_sources.insert(source_id);
-        if self.activate_resolved_link(source_id, pane_id, url) {
+        if self.activate_link_once(source_id, pane_id, url) {
             true
         } else {
             self.pending_url_click_sources.remove(&source_id);
+            false
+        }
+    }
+
+    pub(crate) fn activate_link_once(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+    ) -> bool {
+        let at = std::time::Instant::now();
+        if self
+            .last_link_click
+            .as_ref()
+            .is_some_and(|last| last.is_duplicate_for(source_id, pane_id, &url, at))
+        {
+            if let Some(last) = self.last_link_click.as_mut() {
+                last.at = at;
+            }
+            return true;
+        }
+        self.last_link_click = None;
+        if self.activate_resolved_link(source_id, pane_id, url.clone()) {
+            self.last_link_click = Some(LinkClickState {
+                source_id,
+                pane_id,
+                url,
+                at,
+            });
+            true
+        } else {
             false
         }
     }
