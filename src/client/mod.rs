@@ -853,25 +853,9 @@ fn client_omp_renderer_eligible(
     stdin_tty: bool,
     stdout_tty: bool,
 ) -> bool {
-    #[cfg(unix)]
-    {
-        omp_renderer::capabilities(
-            requested_encoding,
-            matches!(
-                launch_mode,
-                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
-            ),
-            stdin_tty,
-            stdout_tty,
-            true,
-        )
+    let _ = launch_mode;
+    omp_renderer::capabilities(requested_encoding, false, stdin_tty, stdout_tty, true)
         .client_local_native
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (requested_encoding, launch_mode, stdin_tty, stdout_tty);
-        false
-    }
 }
 
 fn client_omp_renderer_capabilities(
@@ -883,12 +867,10 @@ fn client_omp_renderer_capabilities(
 ) -> crate::protocol::OmpRendererCapabilities {
     #[cfg(unix)]
     {
+        let _ = launch_mode;
         omp_renderer::capabilities(
             requested_encoding,
-            matches!(
-                launch_mode,
-                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
-            ),
+            false,
             stdin_tty,
             stdout_tty,
             omp_executable.is_some(),
@@ -3354,28 +3336,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_omp_is_resolved_once_after_renderer_eligibility() {
+    fn pane_local_omp_skips_native_companion_resolution() {
         let calls = std::cell::Cell::new(0);
-        let expected = std::env::current_exe().expect("current test executable");
         let eligible = client_omp_renderer_eligible(
             RenderEncoding::SemanticFrame,
             ClientLaunchMode::App,
             true,
             true,
         );
-        assert!(eligible);
-        let resolved = resolve_client_omp_executable_with(
+        assert!(!eligible);
+        let executable = crate::update::OmpExecutable::Explicit(
+            std::env::current_exe().expect("current test executable"),
+        );
+        assert!(
+            !client_omp_renderer_capabilities(
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                true,
+                true,
+                Some(&executable),
+            )
+            .client_local_native
+        );
+        assert!(resolve_client_omp_executable_with(
             eligible,
             || {
                 calls.set(calls.get() + 1);
-                Ok(crate::update::OmpExecutable::Explicit(expected.clone()))
+                panic!("pane-local OMP must not resolve a full-surface companion")
             },
             |_| {},
         )
-        .expect("resolved test executable");
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(resolved.executable(), expected);
+        .is_none());
+        assert_eq!(calls.get(), 0);
     }
     #[cfg(unix)]
     #[test]
