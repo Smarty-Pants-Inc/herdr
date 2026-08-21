@@ -321,6 +321,8 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    #[cfg(test)]
+    independent_omp_renderers_enabled: bool,
     /// Routes whose server-private guest failed; retain the normal pane fallback
     /// instead of immediately respawning a blank replacement for the same route.
     private_omp_failed_routes: HashMap<u64, OmpRouteKey>,
@@ -563,6 +565,8 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            #[cfg(test)]
+            independent_omp_renderers_enabled: false,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -595,6 +599,20 @@ impl HeadlessServer {
             server_event_rx,
             server_event_tx,
         })
+    }
+
+    // Independent renderers either replace the full client surface or restart a
+    // focus-scoped guest. Keep the live host PTY pane-local until they can compose
+    // inside a pane and retain one process per route.
+    fn independent_omp_renderers_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.independent_omp_renderers_enabled
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Runs the headless server event loop until shutdown.
@@ -3999,6 +4017,9 @@ impl HeadlessServer {
     }
 
     fn reconcile_omp_renderers(&mut self) -> bool {
+        if !self.independent_omp_renderers_enabled() {
+            return false;
+        }
         let mut changed = self.reconcile_native_omp_renderers();
         changed |= self.reconcile_private_omp_guests();
         changed | self.reconcile_native_omp_renderers()
@@ -4707,7 +4728,7 @@ impl HeadlessServer {
             deferred_requests_changed
                 || foreground_changed
                 || theme_changed
-                || self.reconcile_private_omp_guests()
+                || (self.independent_omp_renderers_enabled() && self.reconcile_private_omp_guests())
                 || (interaction
                     && (hover_changed || (!render_neutral_mouse_motion && !terminal_forward_only)))
         };
@@ -7810,6 +7831,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            independent_omp_renderers_enabled: true,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -9310,6 +9332,128 @@ mod tests {
             Some(foreground_pane)
         );
         assert_eq!(server.app.state.mode, app::Mode::Terminal);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn pane_local_omp_keeps_host_runtime_chrome_input_and_scrollback() {
+        let mut server = test_headless_server();
+        server.independent_omp_renderers_enabled = false;
+        let mut workspace = crate::workspace::Workspace::test_new("pane-local-omp");
+        let omp_pane = workspace.tabs[0].root_pane;
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let other_pane = workspace.tabs[0]
+            .layout
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id| *pane_id != omp_pane)
+            .expect("split pane");
+        workspace.tabs[0].layout.focus_pane(omp_pane);
+        let terminal_id = workspace.terminal_id(omp_pane).unwrap().clone();
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let mut output = Vec::new();
+        for line in 0..80 {
+            output.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        output.extend_from_slice(b"LIVE OMP\r\n");
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 4096, &output, 8,
+            );
+        runtime.test_set_child_pid(4242);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(1, client);
+        server.foreground_client_id = Some(1);
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route, "session", 1);
+
+        assert!(server.clients[&1].omp_renderer_target.is_none());
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(server.private_omp_pending_routes.is_empty());
+        assert!(control_rx.try_recv().is_err());
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let text = frame_text(&frame);
+        assert!(text.contains("LIVE OMP"));
+        assert!(!text.contains("native renderer"));
+
+        let inner = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == omp_pane)
+            .expect("OMP pane info")
+            .inner_rect;
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: inner.x,
+                    row: inner.y,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        ));
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .scroll_metrics()
+                .unwrap()
+                .offset_from_bottom,
+            server.app.state.mouse_scroll_lines
+        );
+        assert!(host_input.try_recv().is_err());
+
+        let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert!(server.handle_client_input_events(1, vec![ordinary_key]));
+        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"x");
+        let prefix = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            server.app.state.prefix_code,
+            server.app.state.prefix_mods,
+        ));
+        assert!(server.handle_client_input_events(1, vec![prefix]));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        server.render_and_stream();
+        let prefix_frame =
+            read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        assert!(frame_text(&prefix_frame).contains("LIVE OMP"));
+
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(other_pane);
+        assert!(!server.reconcile_omp_renderers());
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(omp_pane);
+        assert!(!server.reconcile_omp_renderers());
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .child_pid(),
+            Some(4242)
+        );
+        assert!(server.clients[&1].private_omp_guest.is_none());
         shutdown_test_runtimes(&mut server);
     }
 
