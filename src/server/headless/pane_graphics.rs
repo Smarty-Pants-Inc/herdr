@@ -141,7 +141,7 @@ impl HeadlessServer {
                                         framed,
                                     ));
                                 };
-                                writer.render.send_ordered(framed)
+                                writer.render.send_ordered(key.0, framed)
                             });
                     match send {
                         Ok(()) => {
@@ -494,11 +494,12 @@ impl HeadlessServer {
         cleanup
     }
 
-    pub(super) fn direct_graphics_retirement_messages_for_client(
+    fn direct_graphics_retirement_messages_for_client_scope(
         &self,
         client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
     ) -> Vec<ServerMessage> {
-        self.direct_graphics_keys_for_client(client_id, None)
+        self.direct_graphics_keys_for_client(client_id, pane_id)
             .into_iter()
             .filter_map(|key| {
                 let slot = self.app.pane_graphics.slots.get(&key)?;
@@ -512,6 +513,21 @@ impl HeadlessServer {
                 })
             })
             .collect()
+    }
+
+    pub(super) fn direct_graphics_retirement_messages_for_client(
+        &self,
+        client_id: u64,
+    ) -> Vec<ServerMessage> {
+        self.direct_graphics_retirement_messages_for_client_scope(client_id, None)
+    }
+
+    pub(super) fn direct_graphics_retirement_messages_for_client_pane(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> Vec<ServerMessage> {
+        self.direct_graphics_retirement_messages_for_client_scope(client_id, Some(pane_id))
     }
 
     fn retire_direct_graphics_for_client_scope(
@@ -548,14 +564,33 @@ impl HeadlessServer {
         self.retire_direct_graphics_for_client_scope(client_id, None);
     }
 
+    fn retire_direct_graphics_for_client_scope_without_notifications(
+        &mut self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
+        for key in keys {
+            self.retire_direct_gate(&key);
+        }
+    }
+
     pub(super) fn retire_direct_graphics_for_client_without_notifications(
         &mut self,
         client_id: u64,
     ) {
-        let keys = self.direct_graphics_keys_for_client(client_id, None);
-        for key in keys {
-            self.retire_direct_gate(&key);
-        }
+        self.retire_direct_graphics_for_client_scope_without_notifications(client_id, None);
+    }
+
+    pub(super) fn retire_direct_graphics_for_client_pane_without_notifications(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) {
+        self.retire_direct_graphics_for_client_scope_without_notifications(
+            client_id,
+            Some(pane_id),
+        );
     }
 
     pub(super) fn direct_graphics_cleanup_for_client_pane(
@@ -564,14 +599,6 @@ impl HeadlessServer {
         pane_id: crate::layout::PaneId,
     ) -> Vec<u8> {
         self.direct_graphics_cleanup_for_client_scope(client_id, Some(pane_id))
-    }
-
-    pub(super) fn retire_direct_graphics_for_client_pane(
-        &mut self,
-        client_id: u64,
-        pane_id: crate::layout::PaneId,
-    ) {
-        self.retire_direct_graphics_for_client_scope(client_id, Some(pane_id));
     }
 
     pub(super) fn render_retained_graphics_update_and_stream(&mut self) -> RetainedGraphicsOutcome {

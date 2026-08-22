@@ -149,6 +149,89 @@ async fn pending_private_omp_cancels_inflight_graphics_and_suppresses_placements
     assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
 }
 
+#[tokio::test]
+async fn pending_private_omp_retries_cleanup_after_control_backpressure() {
+    let (mut server, _initial_client_rx, pane_id) = retained_test_server(b"host");
+    let writer = ClientWriter::test_backpressured();
+    writer.test_fill_control(vec![b'x']);
+    server
+        .clients
+        .insert(1, test_identity_client(Some("Ada"), Some(writer.clone())));
+    set_graphics_layer(&mut server, pane_id, vec![1, 2, 3, 4]);
+    let key = graphics_key(pane_id);
+    let slot = &server.app.pane_graphics.slots[&key];
+    server
+        .clients
+        .get_mut(&1)
+        .unwrap()
+        .graphics_cache
+        .trust_pane_layer(&key, slot.host_image_id, slot.layer.as_ref().unwrap());
+    let direct_image_id = slot.host_image_id;
+    let direct_transfer_id = 41;
+    let (direct_respond_to, direct_response_rx) = std::sync::mpsc::channel();
+    server
+        .app
+        .pane_graphics
+        .slots
+        .get_mut(&key)
+        .unwrap()
+        .direct_gate = Some(crate::app::pane_graphics::DirectGate {
+        transfer_id: direct_transfer_id,
+        client_id: 1,
+        deadline: std::time::Instant::now() + Duration::from_secs(60),
+        written: true,
+        success_response: "ack".into(),
+        respond_to: direct_respond_to,
+    });
+    let workspace_id = server.app.state.workspaces[0].id.clone();
+    let route = OmpRouteKey {
+        pane_id: crate::workspace::public_pane_id_for_number(&workspace_id, 1),
+        omp_session_id: "session".into(),
+        route_generation: 1,
+    };
+    server.private_omp_test_executable = None;
+    server.private_omp_resolving = Some((1, route.clone()));
+    let (_host, _host_messages) =
+        start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+
+    assert!(!server.private_omp_pending_routes.contains_key(&1));
+    assert!(server.clients[&1]
+        .graphics_cache
+        .test_has_pane_source(pane_id));
+    assert_eq!(writer.test_pop_control(), Some(vec![b'x']));
+
+    assert!(server.handle_server_event(ServerEvent::ClientWriterControlDrained { client_id: 1 }));
+    assert_eq!(server.private_omp_pending_routes.get(&1), Some(&route));
+    assert!(!server.clients[&1]
+        .graphics_cache
+        .test_has_pane_source(pane_id));
+    assert!(server.clients.contains_key(&1));
+    assert!(!server.app.pane_graphics.slots.contains_key(&key));
+    assert!(matches!(
+        direct_response_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Disconnected)
+    ));
+    let control_records = writer.test_control_records();
+    assert_eq!(control_records.len(), 64);
+    assert!(control_records[..63].iter().all(|message| message == b"x"));
+    let combined = control_records.last().expect("retried cleanup");
+    let mut cursor = std::io::Cursor::new(combined.as_slice());
+    assert!(matches!(
+        protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_GRAPHICS_FRAME_SIZE)
+            .expect("graphics cleanup frame"),
+        ServerMessage::Graphics { .. }
+    ));
+    assert!(matches!(
+        protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_GRAPHICS_FRAME_SIZE)
+            .expect("direct graphics retirement frame"),
+        ServerMessage::GraphicsTransmissionRetired {
+            transfer_id,
+            image_id,
+        } if transfer_id == direct_transfer_id && image_id == direct_image_id
+    ));
+    assert_eq!(cursor.position() as usize, combined.len());
+}
+
 fn set_stream_owner(server: &mut HeadlessServer, pane_id: crate::layout::PaneId, owner: &str) {
     let key = graphics_key(pane_id);
     if let Some(slot) = server.app.pane_graphics.slots.get_mut(&key) {
@@ -1206,8 +1289,8 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
         .insert(unrelated_gate_key.clone(), unrelated_gate_slot);
 
     add_direct_client(&mut server, 7);
-    let (writer, control_rx, _render_rx) = test_client_writer();
-    server.clients.get_mut(&7).unwrap().writer = Some(writer);
+    let writer = ClientWriter::test_backpressured();
+    server.clients.get_mut(&7).unwrap().writer = Some(writer.clone());
     let (app, clients) = (&server.app, &mut server.clients);
     for key in [&target_resident_key, &unrelated_resident_key] {
         let slot = &app.pane_graphics.slots[key];
@@ -1217,8 +1300,32 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
             .graphics_cache
             .trust_pane_layer(key, slot.host_image_id, slot.layer.as_ref().unwrap());
     }
+    let unrelated_render = HeadlessServer::frame_server_message(&ServerMessage::Frame(FrameData {
+        cells: Vec::new(),
+        width: 0,
+        height: 0,
+        cursor: None,
+        hyperlinks: Vec::new(),
+        graphics: format!("\x1b_Ga=t,i={unrelated_resident_image_id};payload\x1b\\").into_bytes(),
+    }))
+    .expect("unrelated pane upload");
+    writer.test_fill_render(unrelated_render.clone());
+    let stale_direct = HeadlessServer::frame_server_message(&ServerMessage::GraphicsFile {
+        path: "stale-target.rgba".into(),
+        expected_len: 4,
+        image_id: target_image_id,
+        transfer_id: target_transfer_id,
+        leading: Vec::new(),
+        control: "a=t,f=32,s=1,v=1,q=0".into(),
+    })
+    .expect("stale target direct graphics");
+    writer
+        .render
+        .send_ordered(target_pane, stale_direct)
+        .expect("ordered target direct graphics");
 
     server.begin_omp_graphics_replacement(7, target_pane);
+    assert!(!writer.test_has_render_records());
 
     assert!(!server.app.pane_graphics.slots.contains_key(&target_key));
     assert!(!server
@@ -1249,11 +1356,17 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
     assert!(!server.start_direct_graphics_response(7, target_transfer_id, target_image_id));
     assert!(!server.complete_direct_graphics(7, target_transfer_id, target_image_id, true));
 
-    match read_server_message(
-        control_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("target pane graphics cleanup"),
-    ) {
+    let control_records = writer.test_control_records();
+    assert_eq!(control_records.len(), 1);
+    let mut record = std::io::Cursor::new(control_records[0].as_slice());
+    assert_eq!(
+        protocol::read_message::<_, ServerMessage>(&mut record, MAX_GRAPHICS_FRAME_SIZE)
+            .expect("preserved unrelated frame"),
+        read_server_message(unrelated_render)
+    );
+    match protocol::read_message::<_, ServerMessage>(&mut record, MAX_GRAPHICS_FRAME_SIZE)
+        .expect("target cleanup frame")
+    {
         ServerMessage::Graphics { bytes } => {
             let cleanup = String::from_utf8_lossy(&bytes);
             assert!(
@@ -1276,16 +1389,14 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
         other => panic!("expected target pane graphics cleanup, got {other:?}"),
     }
     assert!(matches!(
-        read_server_message(
-            control_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("unstarted direct graphics retirement"),
-        ),
+        protocol::read_message::<_, ServerMessage>(&mut record, MAX_GRAPHICS_FRAME_SIZE)
+            .expect("direct graphics retirement frame"),
         ServerMessage::GraphicsTransmissionRetired {
             transfer_id: actual_transfer_id,
             image_id: actual_image_id,
         } if actual_transfer_id == target_transfer_id && actual_image_id == target_image_id
     ));
+    assert_eq!(record.position(), control_records[0].len() as u64);
 }
 
 #[cfg(unix)]

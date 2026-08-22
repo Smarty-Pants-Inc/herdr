@@ -273,6 +273,7 @@ struct PreviewManifest {
     protocol: u32,
     notes: String,
     assets: BTreeMap<String, AssetRef>,
+    #[cfg(unix)]
     #[serde(default)]
     omp: Option<OmpCompanionMetadata>,
     #[serde(default)]
@@ -286,10 +287,12 @@ struct PreviewBuildMetadata {
     built_at: String,
     protocol: u32,
     assets: BTreeMap<String, AssetRef>,
+    #[cfg(unix)]
     #[serde(default)]
     omp: Option<OmpCompanionMetadata>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Deserialize)]
 struct OmpCompanionMetadata {
     build_id: String,
@@ -299,6 +302,7 @@ struct OmpCompanionMetadata {
     assets: BTreeMap<String, AssetRef>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OmpBuildIdentity<'a> {
     build_id: &'a str,
@@ -307,6 +311,7 @@ struct OmpBuildIdentity<'a> {
     version: &'a str,
 }
 
+#[cfg(unix)]
 fn compiled_omp_identity() -> Result<Option<OmpBuildIdentity<'static>>, String> {
     let identity = match (
         crate::build_info::omp_build_id(),
@@ -434,6 +439,7 @@ where
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
 }
 
+#[cfg(unix)]
 fn preview_omp_metadata_for_build<'a>(
     manifest: &'a PreviewManifest,
     herdr_build_id: &str,
@@ -454,6 +460,7 @@ fn preview_omp_metadata_for_build<'a>(
         })
 }
 
+#[cfg(unix)]
 fn validate_omp_source_value(field: &str, value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() || value.contains("REPLACE_WITH_") {
@@ -464,6 +471,7 @@ fn validate_omp_source_value(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_omp_git_oid(field: &str, value: &str) -> Result<(), String> {
     validate_omp_source_value(field, value)?;
     if value.len() != 40 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
@@ -474,6 +482,7 @@ fn validate_omp_git_oid(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn preview_omp_asset_for_build<'a>(
     manifest: &'a PreviewManifest,
     herdr_build_id: &str,
@@ -530,6 +539,7 @@ pub(crate) struct ManagedOmpCompanion {
 }
 
 impl ManagedOmpCompanion {
+    #[cfg(unix)]
     pub(crate) fn executable(&self) -> &Path {
         &self.executable
     }
@@ -550,6 +560,7 @@ impl ManagedOmpCompanion {
             .env_remove(MANAGED_OMP_DISABLED_ENV_VAR);
     }
 
+    #[cfg(unix)]
     pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
         env.extend([
             (
@@ -574,6 +585,7 @@ impl ManagedOmpCompanion {
 #[derive(Debug, Clone)]
 pub(crate) enum OmpExecutable {
     Explicit(PathBuf),
+    #[cfg(unix)]
     Managed(ManagedOmpCompanion),
 }
 
@@ -581,6 +593,7 @@ impl OmpExecutable {
     pub(crate) fn executable(&self) -> &Path {
         match self {
             Self::Explicit(path) => path,
+            #[cfg(unix)]
             Self::Managed(companion) => companion.executable(),
         }
     }
@@ -600,6 +613,7 @@ impl OmpExecutable {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
         if let Self::Managed(companion) = self {
             companion.append_launch_env(env);
@@ -1194,7 +1208,7 @@ fn private_managed_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
                     current.display()
                 ));
             }
-            if mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0 {
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
                 return Err(format!(
                     "managed state directory has an unsafe writable ancestor: {}",
                     current.display()
@@ -1507,7 +1521,7 @@ fn validate_sealed_release_ancestry(release_dir: &Path) -> Result<(), String> {
                     current.display()
                 ));
             }
-            if mode & 0o022 != 0 && mode & libc::S_ISVTX as u32 == 0 {
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
                 return Err(format!(
                     "sealed OMP release has an unsafe writable ancestor: {}",
                     current.display()
@@ -3680,6 +3694,7 @@ fn platform_target() -> (&'static str, &'static str) {
 
     (os, arch)
 }
+#[cfg(unix)]
 fn omp_asset_key_for_target(os: &str, arch: &str) -> Option<String> {
     match (os, arch) {
         ("macos", "x86_64") => Some("macos-x86_64".into()),
@@ -3690,14 +3705,14 @@ fn omp_asset_key_for_target(os: &str, arch: &str) -> Option<String> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxHostLibc {
     Glibc,
     Musl,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn omp_asset_key_for_linux_host(arch: &str, libc: LinuxHostLibc) -> Option<String> {
     match libc {
         LinuxHostLibc::Glibc => omp_asset_key_for_target("linux", arch),
@@ -3705,7 +3720,7 @@ fn omp_asset_key_for_linux_host(arch: &str, libc: LinuxHostLibc) -> Option<Strin
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn linux_host_libc_from_getconf_gnu_libc_version(output: &[u8]) -> Option<LinuxHostLibc> {
     let output = String::from_utf8_lossy(output).to_ascii_lowercase();
     if output.contains("musl") {
@@ -3717,7 +3732,7 @@ fn linux_host_libc_from_getconf_gnu_libc_version(output: &[u8]) -> Option<LinuxH
         .then_some(LinuxHostLibc::Glibc)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn linux_host_libc_from_ldd_version(output: &[u8]) -> Option<LinuxHostLibc> {
     let output = String::from_utf8_lossy(output).to_ascii_lowercase();
     if output.contains("musl") {
@@ -3727,7 +3742,7 @@ fn linux_host_libc_from_ldd_version(output: &[u8]) -> Option<LinuxHostLibc> {
         .then_some(LinuxHostLibc::Glibc)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn linux_host_libc_with_probes(
     getconf: impl FnOnce() -> Option<Vec<u8>>,
     ldd: impl FnOnce() -> Option<Vec<u8>>,
@@ -3844,7 +3859,7 @@ fn omp_platform_target() -> Option<String> {
     linux_host_libc().and_then(|libc| omp_asset_key_for_linux_host(arch, libc))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn omp_platform_target() -> Option<String> {
     let (os, arch) = platform_target();
     omp_asset_key_for_target(os, arch)

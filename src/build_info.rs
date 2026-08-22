@@ -12,6 +12,7 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+#[cfg(unix)]
 pub fn commit() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_COMMIT"))
 }
@@ -20,14 +21,17 @@ pub fn omp_build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_OMP_BUILD_ID"))
 }
 
+#[cfg(unix)]
 pub fn omp_commit() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_OMP_COMMIT"))
 }
 
+#[cfg(unix)]
 pub fn omp_tree() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_OMP_TREE"))
 }
 
+#[cfg(unix)]
 pub fn omp_version() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_OMP_VERSION"))
 }
@@ -55,6 +59,7 @@ pub fn uses_preview_update_manifest() -> bool {
 }
 
 /// Whether this published build may install preview updates from a running client.
+#[cfg(not(windows))]
 pub fn client_auto_update_enabled() -> bool {
     matches!(
         non_empty(option_env!("HERDR_BUILD_AUTO_UPDATE")),

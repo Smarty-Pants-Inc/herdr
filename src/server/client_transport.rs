@@ -62,8 +62,15 @@ impl ClientWriter {
         self.render.queue.replace_with_cleanup(data).is_ok()
     }
 
-    pub(crate) fn replace_render_with_cleanup(&self, data: Vec<u8>) -> bool {
-        self.render.queue.replace_render_with_cleanup(data).is_ok()
+    pub(crate) fn replace_with_pane_cleanup(
+        &self,
+        pane_id: crate::layout::PaneId,
+        data: Vec<u8>,
+    ) -> bool {
+        self.render
+            .queue
+            .replace_with_pane_cleanup(pane_id, data)
+            .is_ok()
     }
 
     #[cfg(test)]
@@ -106,6 +113,12 @@ impl ClientWriter {
             .iter()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_render_records(&self) -> bool {
+        let state = self.control.queue.lock_state();
+        !state.ordered.is_empty() || state.render.is_some()
     }
 
     #[cfg(test)]
@@ -207,8 +220,12 @@ impl ClientRenderWriter {
         self.queue.try_send_render(data)
     }
 
-    pub(crate) fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        self.queue.send_ordered(data)
+    pub(crate) fn send_ordered(
+        &self,
+        pane_id: crate::layout::PaneId,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        self.queue.send_ordered(pane_id, data)
     }
 }
 
@@ -221,10 +238,16 @@ struct ClientWriterQueue {
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
-    ordered: VecDeque<Vec<u8>>,
+    ordered: VecDeque<ClientOrderedRender>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
+}
+
+#[derive(Debug)]
+struct ClientOrderedRender {
+    pane_id: Option<crate::layout::PaneId>,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -281,7 +304,11 @@ impl ClientWriterQueue {
         Ok(())
     }
 
-    fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+    fn send_ordered(
+        &self,
+        pane_id: crate::layout::PaneId,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         if !state.writer_alive {
             return Err(TrySendError::Disconnected(data));
@@ -290,25 +317,35 @@ impl ClientWriterQueue {
             return Err(TrySendError::Full(data));
         }
         if let Some(older) = state.render.take() {
-            state.ordered.push_back(older);
+            state.ordered.push_back(ClientOrderedRender {
+                pane_id: None,
+                data: older,
+            });
         }
-        state.ordered.push_back(data);
+        state.ordered.push_back(ClientOrderedRender {
+            pane_id: Some(pane_id),
+            data,
+        });
         self.ready.notify_one();
         Ok(())
     }
 
     fn replace_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        self.replace_cleanup(data, true)
+        self.replace_cleanup(data, None)
     }
 
-    fn replace_render_with_cleanup(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        self.replace_cleanup(data, false)
+    fn replace_with_pane_cleanup(
+        &self,
+        pane_id: crate::layout::PaneId,
+        data: Vec<u8>,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        self.replace_cleanup(data, Some(pane_id))
     }
 
     fn replace_cleanup(
         &self,
         data: Vec<u8>,
-        clear_ordered: bool,
+        pane_id: Option<crate::layout::PaneId>,
     ) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
         if !state.writer_alive {
@@ -317,10 +354,25 @@ impl ClientWriterQueue {
         if state.control.len() >= CONTROL_QUEUE_CAPACITY {
             return Err(TrySendError::Full(data));
         }
-        state.render = None;
-        if clear_ordered {
+        let data = if let Some(pane_id) = pane_id {
+            // Full renders commit graphics cache state when enqueued. Preserve their wire
+            // payload, plus unrelated ordered work, before deleting the target pane.
+            let mut combined = Vec::new();
+            for render in state.ordered.drain(..) {
+                if render.pane_id != Some(pane_id) {
+                    combined.extend(render.data);
+                }
+            }
+            if let Some(render) = state.render.take() {
+                combined.extend(render);
+            }
+            combined.extend(data);
+            combined
+        } else {
+            state.render = None;
             state.ordered.clear();
-        }
+            data
+        };
         state.control.push_back(data);
         self.ready.notify_one();
         Ok(())
@@ -332,9 +384,9 @@ impl ClientWriterQueue {
             if let Some(data) = state.control.pop_front() {
                 return Some(ClientWriteItem::Control(data));
             }
-            if let Some(data) = state.ordered.pop_front() {
+            if let Some(render) = state.ordered.pop_front() {
                 self.ready.notify_one();
-                return Some(ClientWriteItem::Render(data));
+                return Some(ClientWriteItem::Render(render.data));
             }
             if let Some(data) = state.render.take() {
                 return Some(ClientWriteItem::Render(data));
@@ -1507,14 +1559,15 @@ mod tests {
     #[test]
     fn client_writer_cleanup_replaces_queued_render_and_ordered_work() {
         let (writer, queue) = test_queue_writer();
+        let pane_id = crate::layout::PaneId::alloc();
         writer.render.try_send(b"old-render".to_vec()).unwrap();
         writer
             .render
-            .send_ordered(b"ordered-graphics".to_vec())
+            .send_ordered(pane_id, b"ordered-graphics".to_vec())
             .unwrap();
         writer.render.try_send(b"new-render".to_vec()).unwrap();
 
-        writer.replace_with_cleanup(b"graphics-cleanup".to_vec());
+        assert!(writer.replace_with_cleanup(b"graphics-cleanup".to_vec()));
 
         assert_eq!(
             queue.recv(),
@@ -1524,31 +1577,54 @@ mod tests {
         assert!(state.ordered.is_empty());
         assert!(state.render.is_none());
     }
+
     #[test]
-    fn pane_cleanup_preserves_unrelated_ordered_graphics() {
+    fn pane_cleanup_preserves_unscoped_and_unrelated_work_before_cleanup() {
         let (writer, queue) = test_queue_writer();
-        writer.render.try_send(b"old-render".to_vec()).unwrap();
+        let replaced_pane_id = crate::layout::PaneId::alloc();
+        let unrelated_pane_id = crate::layout::PaneId::alloc();
+        writer.render.try_send(b"stale-render".to_vec()).unwrap();
         writer
             .render
-            .send_ordered(b"unrelated-graphics".to_vec())
+            .send_ordered(unrelated_pane_id, b"unrelated-graphics".to_vec())
             .unwrap();
         writer.render.try_send(b"new-render".to_vec()).unwrap();
 
-        assert!(writer.replace_render_with_cleanup(b"pane-cleanup".to_vec()));
+        assert!(writer.replace_with_pane_cleanup(replaced_pane_id, b"pane-cleanup".to_vec()));
 
         assert_eq!(
             queue.recv(),
-            Some(ClientWriteItem::Control(b"pane-cleanup".to_vec()))
+            Some(ClientWriteItem::Control(
+                b"stale-renderunrelated-graphicsnew-renderpane-cleanup".to_vec()
+            ))
         );
+        let state = queue.lock_state();
+        assert!(state.ordered.is_empty());
+        assert!(state.render.is_none());
+    }
+
+    #[test]
+    fn pane_cleanup_preserves_unscoped_work_and_drops_replaced_pane() {
+        let (writer, queue) = test_queue_writer();
+        let pane_id = crate::layout::PaneId::alloc();
+        writer.render.try_send(b"stale-render".to_vec()).unwrap();
+        writer
+            .render
+            .send_ordered(pane_id, b"stale-direct-graphics".to_vec())
+            .unwrap();
+        writer.render.try_send(b"new-render".to_vec()).unwrap();
+
+        assert!(writer.replace_with_pane_cleanup(pane_id, b"pane-cleanup".to_vec()));
+
         assert_eq!(
             queue.recv(),
-            Some(ClientWriteItem::Render(b"old-render".to_vec()))
+            Some(ClientWriteItem::Control(
+                b"stale-rendernew-renderpane-cleanup".to_vec()
+            ))
         );
-        assert_eq!(
-            queue.recv(),
-            Some(ClientWriteItem::Render(b"unrelated-graphics".to_vec()))
-        );
-        assert!(queue.lock_state().render.is_none());
+        let state = queue.lock_state();
+        assert!(state.ordered.is_empty());
+        assert!(state.render.is_none());
     }
 
     #[test]
@@ -1566,10 +1642,14 @@ mod tests {
     #[test]
     fn ordered_direct_follows_older_render_and_stays_bounded() {
         let (writer, queue) = test_queue_writer();
+        let pane_id = crate::layout::PaneId::alloc();
         writer.render.try_send(b"old".to_vec()).unwrap();
-        writer.render.send_ordered(b"direct".to_vec()).unwrap();
+        writer
+            .render
+            .send_ordered(pane_id, b"direct".to_vec())
+            .unwrap();
         assert!(matches!(
-            writer.render.send_ordered(b"second".to_vec()),
+            writer.render.send_ordered(pane_id, b"second".to_vec()),
             Err(TrySendError::Full(_))
         ));
         writer.render.try_send(b"new".to_vec()).unwrap();
@@ -1582,7 +1662,7 @@ mod tests {
         }
         queue.close_writer();
         assert!(matches!(
-            writer.render.send_ordered(b"closed".to_vec()),
+            writer.render.send_ordered(pane_id, b"closed".to_vec()),
             Err(TrySendError::Disconnected(_))
         ));
     }

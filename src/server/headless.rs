@@ -302,6 +302,12 @@ enum AltScreenReadConflict {
     Defer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateOmpRetryState {
+    Pending(u64),
+    Consumed,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -315,11 +321,13 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    #[cfg(test)]
+    independent_omp_renderers_enabled: bool,
     /// Routes whose server-private guest failed; retain the normal pane fallback
     /// instead of immediately respawning a blank replacement for the same route.
     private_omp_failed_routes: HashMap<u64, OmpRouteKey>,
-    /// Exact route and ticket that already consumed its single transient-failure retry.
-    private_omp_retry_attempted_routes: HashMap<u64, (OmpRouteKey, u64)>,
+    /// Exact route and state of its single transient-failure retry.
+    private_omp_retry_attempted_routes: HashMap<u64, (OmpRouteKey, PrivateOmpRetryState)>,
     next_private_omp_retry_id: u64,
     /// Routes waiting on the single private companion resolver; keep their host pane masked.
     private_omp_pending_routes: HashMap<u64, OmpRouteKey>,
@@ -551,6 +559,8 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            #[cfg(test)]
+            independent_omp_renderers_enabled: false,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -583,6 +593,20 @@ impl HeadlessServer {
             server_event_rx,
             server_event_tx,
         })
+    }
+
+    // Independent renderers either replace the full client surface or restart a
+    // focus-scoped guest. Keep the live host PTY pane-local until they can compose
+    // inside a pane and retain one process per route.
+    fn independent_omp_renderers_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.independent_omp_renderers_enabled
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Runs the headless server event loop until shutdown.
@@ -1921,17 +1945,25 @@ impl HeadlessServer {
         client_id: u64,
         pane_id: Option<crate::layout::PaneId>,
         additional_cleanup: &[u8],
-        preserve_ordered: bool,
+        trailing_messages: &[ServerMessage],
     ) -> Option<crate::kitty_graphics::HostGraphicsCache> {
         let (next_graphics_cache, bytes) =
             self.prepare_client_graphics_cleanup(client_id, pane_id, additional_cleanup)?;
-        if bytes.is_empty() {
+        let has_cleanup = !bytes.is_empty();
+        let mut serialized = if has_cleanup {
+            Self::frame_server_message(&ServerMessage::Graphics { bytes }).ok()?
+        } else {
+            Vec::new()
+        };
+        for message in trailing_messages {
+            serialized.extend(Self::frame_server_message(message).ok()?);
+        }
+        if serialized.is_empty() {
             return Some(next_graphics_cache);
         }
         let writer = self.clients.get(&client_id)?.writer.as_ref()?;
-        let serialized = Self::frame_server_message(&ServerMessage::Graphics { bytes }).ok()?;
-        let queued = if preserve_ordered {
-            writer.replace_render_with_cleanup(serialized)
+        let queued = if let Some(pane_id) = pane_id {
+            writer.replace_with_pane_cleanup(pane_id, serialized)
         } else {
             writer.replace_with_cleanup(serialized)
         };
@@ -1951,7 +1983,7 @@ impl HeadlessServer {
     fn send_client_graphics_cleanup(&mut self, client_id: u64) -> bool {
         let direct_cleanup = self.direct_graphics_cleanup_for_client(client_id);
         let Some(next_graphics_cache) =
-            self.queue_client_graphics_cleanup(client_id, None, &direct_cleanup, false)
+            self.queue_client_graphics_cleanup(client_id, None, &direct_cleanup, &[])
         else {
             return false;
         };
@@ -1997,15 +2029,25 @@ impl HeadlessServer {
         queued.then_some(next_graphics_cache)
     }
 
-    fn begin_omp_graphics_replacement(&mut self, client_id: u64, pane_id: crate::layout::PaneId) {
+    fn begin_omp_graphics_replacement(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
         let direct_cleanup = self.direct_graphics_cleanup_for_client_pane(client_id, pane_id);
-        let Some(next_graphics_cache) =
-            self.queue_client_graphics_cleanup(client_id, Some(pane_id), &direct_cleanup, true)
-        else {
-            return;
+        let retirement_messages =
+            self.direct_graphics_retirement_messages_for_client_pane(client_id, pane_id);
+        let Some(next_graphics_cache) = self.queue_client_graphics_cleanup(
+            client_id,
+            Some(pane_id),
+            &direct_cleanup,
+            &retirement_messages,
+        ) else {
+            return false;
         };
-        self.retire_direct_graphics_for_client_pane(client_id, pane_id);
+        self.retire_direct_graphics_for_client_pane_without_notifications(client_id, pane_id);
         self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
+        true
     }
 
     fn send_all_clients_graphics_cleanup(&mut self) {
@@ -3658,6 +3700,17 @@ impl HeadlessServer {
             .and_then(|client| client.private_omp_guest.as_ref())
             .is_some_and(|guest| guest.route() == route && guest.bridge_ready())
     }
+
+    fn private_omp_fallback_terminally_failed(&self, client_id: u64, route: &OmpRouteKey) -> bool {
+        self.private_omp_failed_routes.get(&client_id) == Some(route)
+            && self
+                .private_omp_retry_attempted_routes
+                .get(&client_id)
+                .is_some_and(|(attempted, state)| {
+                    attempted == route && matches!(state, PrivateOmpRetryState::Consumed)
+                })
+    }
+
     fn private_omp_resolution_is_current(&self, client_id: u64, route: &OmpRouteKey) -> bool {
         let eligible = self.clients.get(&client_id).is_some_and(|client| {
             client.is_full_app_client()
@@ -3834,6 +3887,7 @@ impl HeadlessServer {
                 && target.bound
                 && target.ready
                 && !self.private_omp_fallback_ready(client_id, key)
+                && !self.private_omp_fallback_terminally_failed(client_id, key)
             {
                 continue;
             }
@@ -3888,7 +3942,9 @@ impl HeadlessServer {
         let Some((_, pane_id)) = self.app.parse_pane_id(&route.pane_id) else {
             return false;
         };
-        self.begin_omp_graphics_replacement(client_id, pane_id);
+        if !self.begin_omp_graphics_replacement(client_id, pane_id) {
+            return false;
+        }
         self.private_omp_pending_routes
             .insert(client_id, route.clone());
         if let Some(client) = self.clients.get_mut(&client_id) {
@@ -3918,8 +3974,10 @@ impl HeadlessServer {
         if should_retry {
             let retry_id = self.next_private_omp_retry_id;
             self.next_private_omp_retry_id = retry_id.wrapping_add(1).max(1);
-            self.private_omp_retry_attempted_routes
-                .insert(client_id, (route.clone(), retry_id));
+            self.private_omp_retry_attempted_routes.insert(
+                client_id,
+                (route.clone(), PrivateOmpRetryState::Pending(retry_id)),
+            );
             let event_tx = self.server_event_tx.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(PRIVATE_OMP_COMPANION_RETRY_DELAY);
@@ -3953,8 +4011,12 @@ impl HeadlessServer {
     }
 
     fn reconcile_omp_renderers(&mut self) -> bool {
-        let native_changed = self.reconcile_native_omp_renderers();
-        self.reconcile_private_omp_guests() || native_changed
+        if !self.independent_omp_renderers_enabled() {
+            return false;
+        }
+        let mut changed = self.reconcile_native_omp_renderers();
+        changed |= self.reconcile_private_omp_guests();
+        changed | self.reconcile_native_omp_renderers()
     }
 
     fn try_attach_private_omp_guest(&mut self, client_id: u64, route: OmpRouteKey) -> bool {
@@ -3980,6 +4042,9 @@ impl HeadlessServer {
             return false;
         }
         let mut changed = self.set_private_omp_pending_route(client_id, &route);
+        if self.private_omp_pending_routes.get(&client_id) != Some(&route) {
+            return changed;
+        }
         let Some(omp_executable) = self.private_omp_executable_for_launch(client_id, &route) else {
             return changed;
         };
@@ -4161,6 +4226,7 @@ impl HeadlessServer {
             for client_id in failed_clients {
                 self.detach_failed_private_omp_guest(client_id);
             }
+            self.reconcile_native_omp_renderers();
             return true;
         }
 
@@ -4743,7 +4809,7 @@ impl HeadlessServer {
             deferred_requests_changed
                 || foreground_changed
                 || theme_changed
-                || self.reconcile_private_omp_guests()
+                || (self.independent_omp_renderers_enabled() && self.reconcile_private_omp_guests())
                 || (interaction
                     && (hover_changed || (!render_neutral_mouse_motion && !terminal_forward_only)))
         };
@@ -4894,9 +4960,16 @@ impl HeadlessServer {
                     || !self
                         .private_omp_retry_attempted_routes
                         .get(&client_id)
-                        .is_some_and(|(attempted, id)| attempted == &route && *id == retry_id)
+                        .is_some_and(|(attempted, state)| {
+                            attempted == &route && *state == PrivateOmpRetryState::Pending(retry_id)
+                        })
                 {
                     return false;
+                }
+                if let Some((_, state)) =
+                    self.private_omp_retry_attempted_routes.get_mut(&client_id)
+                {
+                    *state = PrivateOmpRetryState::Consumed;
                 }
                 self.private_omp_failed_routes.remove(&client_id);
                 let mut changed = true;
@@ -7844,6 +7917,7 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            independent_omp_renderers_enabled: true,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -8012,7 +8086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_companion_resolution_failure_keeps_host_pane_masked() {
+    async fn private_companion_retry_masks_then_releases_stale_native_target() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-resolution-failure");
         let pane_id = workspace.tabs[0].root_pane;
@@ -8033,13 +8107,28 @@ mod tests {
             borders: ratatui::widgets::Borders::NONE,
             is_focused: true,
         }];
-        server
-            .clients
-            .insert(7, test_identity_client(Some("Ada"), None));
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.renderer_binding_token = Some("binding".into());
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(7, client);
         server.private_omp_test_executable = None;
         server.private_omp_resolving = Some((7, route.clone()));
         let (_host, _host_messages) =
             start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+        // The native child is gone from OmpService, but its last target is still bound.
+        let target = server.clients[&7]
+            .omp_renderer_target
+            .clone()
+            .expect("server offers the focused native route");
+        let renderer_launch_id = target.launch_id;
+        server.clients.get_mut(&7).unwrap().omp_renderer_target = Some(OmpRendererTargetState {
+            bound: true,
+            ready: true,
+            surface_active: true,
+            ..target
+        });
+        while control_rx.try_recv().is_ok() {}
         assert_eq!(server.private_omp_pending_routes.get(&7), Some(&route));
 
         assert!(
@@ -8049,9 +8138,22 @@ mod tests {
         );
         assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
         let retry_id = match server.private_omp_retry_attempted_routes.get(&7) {
-            Some((attempted, retry_id)) if attempted == &route => *retry_id,
+            Some((attempted, PrivateOmpRetryState::Pending(retry_id))) if attempted == &route => {
+                *retry_id
+            }
             other => panic!("unexpected retry state: {other:?}"),
         };
+        let native_target = server.clients[&7]
+            .omp_renderer_target
+            .as_ref()
+            .expect("stale native target remains masked during retry delay");
+        assert!(native_target.bound);
+        assert!(native_target.ready);
+        assert!(native_target.surface_active);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         assert!(server.independent_omp_pane_info(7).is_some());
 
         let (remaining, consumed) = server.partition_native_omp_input(
@@ -8063,6 +8165,11 @@ mod tests {
         assert!(consumed);
         assert!(remaining.is_empty());
 
+        server.private_omp_test_executable = Some(
+            server
+                .client_socket_path
+                .with_extension("missing-private-omp"),
+        );
         assert!(
             server.handle_server_event(ServerEvent::OmpPrivateCompanionRetry {
                 client_id: 7,
@@ -8070,22 +8177,35 @@ mod tests {
                 retry_id,
             })
         );
-        assert!(!server.private_omp_failed_routes.contains_key(&7));
-        assert_eq!(server.private_omp_pending_routes.get(&7), Some(&route));
-        assert!(matches!(
-            server.private_omp_resolving.as_ref(),
-            Some((7, resolving_route)) if resolving_route == &route
-        ));
-        assert!(
-            server.handle_server_event(ServerEvent::OmpPrivateCompanionResolved {
-                result: Err("OMP companion still unavailable".into()),
-            })
-        );
         assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
         assert_eq!(
             server.private_omp_retry_attempted_routes.get(&7),
-            Some(&(route.clone(), retry_id))
+            Some(&(route.clone(), PrivateOmpRetryState::Consumed))
         );
+        let fallback_target = server.clients[&7]
+            .omp_renderer_target
+            .as_ref()
+            .expect("terminal fallback failure releases the stale native target");
+        assert!(!fallback_target.bound);
+        assert!(!fallback_target.ready);
+        assert!(!fallback_target.surface_active);
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("terminal failure target release"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                route: Some(released_route),
+                bound: false,
+                surface_active: false,
+                ..
+            } => {
+                assert_eq!(launch_id, renderer_launch_id);
+                assert_eq!(released_route, HeadlessServer::omp_renderer_route(&route));
+            }
+            message => panic!("expected unbound renderer target, got {message:?}"),
+        }
     }
 
     #[test]
@@ -8124,7 +8244,7 @@ mod tests {
         server.private_omp_failed_routes.insert(7, route.clone());
         server
             .private_omp_retry_attempted_routes
-            .insert(7, (route.clone(), 2));
+            .insert(7, (route.clone(), PrivateOmpRetryState::Pending(2)));
 
         assert!(
             !server.handle_server_event(ServerEvent::OmpPrivateCompanionRetry {
@@ -8136,7 +8256,7 @@ mod tests {
         assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
         assert_eq!(
             server.private_omp_retry_attempted_routes.get(&7),
-            Some(&(route, 2))
+            Some(&(route, PrivateOmpRetryState::Pending(2)))
         );
     }
 
@@ -9298,6 +9418,128 @@ mod tests {
             Some(foreground_pane)
         );
         assert_eq!(server.app.state.mode, app::Mode::Terminal);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn pane_local_omp_keeps_host_runtime_chrome_input_and_scrollback() {
+        let mut server = test_headless_server();
+        server.independent_omp_renderers_enabled = false;
+        let mut workspace = crate::workspace::Workspace::test_new("pane-local-omp");
+        let omp_pane = workspace.tabs[0].root_pane;
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let other_pane = workspace.tabs[0]
+            .layout
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id| *pane_id != omp_pane)
+            .expect("split pane");
+        workspace.tabs[0].layout.focus_pane(omp_pane);
+        let terminal_id = workspace.terminal_id(omp_pane).unwrap().clone();
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let mut output = Vec::new();
+        for line in 0..80 {
+            output.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        output.extend_from_slice(b"LIVE OMP\r\n");
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 4096, &output, 8,
+            );
+        runtime.test_set_child_pid(4242);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(1, client);
+        server.foreground_client_id = Some(1);
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route, "session", 1);
+
+        assert!(server.clients[&1].omp_renderer_target.is_none());
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(server.private_omp_pending_routes.is_empty());
+        assert!(control_rx.try_recv().is_err());
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let text = frame_text(&frame);
+        assert!(text.contains("LIVE OMP"));
+        assert!(!text.contains("native renderer"));
+
+        let inner = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == omp_pane)
+            .expect("OMP pane info")
+            .inner_rect;
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: inner.x,
+                    row: inner.y,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        ));
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .scroll_metrics()
+                .unwrap()
+                .offset_from_bottom,
+            server.app.state.mouse_scroll_lines
+        );
+        assert!(host_input.try_recv().is_err());
+
+        let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert!(server.handle_client_input_events(1, vec![ordinary_key]));
+        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"x");
+        let prefix = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            server.app.state.prefix_code,
+            server.app.state.prefix_mods,
+        ));
+        assert!(server.handle_client_input_events(1, vec![prefix]));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        server.render_and_stream();
+        let prefix_frame =
+            read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        assert!(frame_text(&prefix_frame).contains("LIVE OMP"));
+
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(other_pane);
+        assert!(!server.reconcile_omp_renderers());
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(omp_pane);
+        assert!(!server.reconcile_omp_renderers());
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .child_pid(),
+            Some(4242)
+        );
+        assert!(server.clients[&1].private_omp_guest.is_none());
         shutdown_test_runtimes(&mut server);
     }
 
