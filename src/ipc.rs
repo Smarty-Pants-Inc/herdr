@@ -1,7 +1,9 @@
 use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -173,11 +175,12 @@ pub(crate) fn shutdown_local_stream_write(stream: &LocalStream) -> io::Result<()
     }
 }
 
-/// Binds a listener for private terminal traffic. Unix callers restrict the
-/// socket file after binding; Windows must set the named-pipe DACL at creation.
+/// Binds a listener for private local traffic. Unix makes the listener's
+/// containing directory owner-only before bind; Windows sets the pipe DACL at creation.
 pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
+        ensure_private_socket_parent(path)?;
         bind_local_listener(path)
     }
 
@@ -201,6 +204,122 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
     }
+}
+
+#[cfg(unix)]
+fn ensure_private_socket_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent"))?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let before = directory.metadata()?;
+    if !before.is_dir() || before.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent is not an owner-controlled directory",
+        ));
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let after = directory.metadata()?;
+    let named = fs::symlink_metadata(parent)?;
+    if named.file_type().is_symlink()
+        || !named.is_dir()
+        || named.dev() != after.dev()
+        || named.ino() != after.ino()
+        || after.uid() != unsafe { libc::geteuid() }
+        || after.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent changed while being secured",
+        ));
+    }
+    validate_socket_parent_acl(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_socket_parent_acl(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let size = unsafe { libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut names = vec![0u8; size as usize];
+    if size != 0 {
+        let read =
+            unsafe { libc::llistxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        names.truncate(read as usize);
+    }
+    if names.split(|byte| *byte == 0).any(|name| {
+        name.windows(3)
+            .any(|window| window.eq_ignore_ascii_case(b"acl"))
+    }) {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent has an access control list",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_socket_parent_acl(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    type Acl = *mut libc::c_void;
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_int) -> Acl;
+        fn acl_get_entry(acl: Acl, entry_id: libc::c_int, entry: *mut Acl) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let mut entry = std::ptr::null_mut();
+    let result = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let free_result = unsafe { acl_free(acl) };
+    if free_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if result == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket parent has an access control list",
+        ))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn validate_socket_parent_acl(_: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "socket parent ACL validation is unsupported",
+    ))
 }
 
 pub(crate) fn poll_local_stream_read(
@@ -382,9 +501,9 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(windows)]
+    #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
-    #[cfg(windows)]
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]
@@ -423,6 +542,46 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_listener_secures_parent_before_accepting_connections() {
+        let dir = temp_socket_marker_path("private-parent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("listener.sock");
+
+        let listener = bind_private_local_listener(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let client = connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+
+        drop(client);
+        drop(server);
+        drop(listener);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_listener_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_socket_marker_path("linked-parent");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("real")).unwrap();
+        symlink(base.join("real"), base.join("link")).unwrap();
+        let path = base.join("link/listener.sock");
+
+        assert!(bind_private_local_listener(&path).is_err());
+        assert!(!base.join("real/listener.sock").exists());
+
+        let _ = fs::remove_dir_all(base);
+    }
     #[cfg(windows)]
     #[test]
     fn private_named_pipe_accepts_same_user() {
@@ -493,8 +652,19 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(unix, windows))]
     fn temp_socket_marker_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("herdr-{name}-{}.sock", std::process::id()))
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let root = std::env::temp_dir();
+        root.join(format!(
+            "herdr-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
     }
 }

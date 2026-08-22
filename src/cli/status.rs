@@ -232,6 +232,7 @@ struct ServerStatusJson {
 struct ServerCapabilitiesJson {
     live_handoff: bool,
     detached_server_daemon: bool,
+    omp_maintenance: bool,
 }
 
 #[derive(Serialize)]
@@ -266,6 +267,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
                     detached_server_daemon: capabilities.detached_server_daemon,
+                    omp_maintenance: capabilities.omp_maintenance,
                 }),
             build: build.clone(),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),

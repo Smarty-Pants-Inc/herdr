@@ -11,6 +11,7 @@ pub mod headless;
 pub(crate) mod keybindings;
 pub(crate) mod notifications;
 pub(crate) mod omp_bridge;
+pub(crate) mod omp_maintenance;
 pub(crate) mod omp_private_renderer;
 pub(crate) mod omp_route;
 pub(crate) mod omp_service;
