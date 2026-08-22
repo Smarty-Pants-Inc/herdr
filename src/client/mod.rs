@@ -108,6 +108,8 @@ struct ClientState {
     draw_host_cursor: bool,
     /// Last physical cell size paired with `reported_size`.
     reported_cell_size_px: (u32, u32),
+    /// URL opener children that must be reaped without blocking the client loop.
+    detached_process_children: Vec<std::process::Child>,
     /// App-owned full-surface OMP renderer, when this Unix client advertised support.
     #[cfg(unix)]
     omp_renderer: omp_renderer::ClientOmpRenderer,
@@ -1623,7 +1625,11 @@ fn display_pending_omp_surface(
                 let _ = io::stdout().flush();
             }
             omp_renderer::LocalEffect::OpenUrl(url) => {
-                open_safe_url(&url, |url| crate::platform::open_url(url).map(|_| ()));
+                open_safe_url(
+                    &url,
+                    &mut state.detached_process_children,
+                    crate::platform::open_url,
+                );
             }
         }
     }
@@ -1675,6 +1681,7 @@ async fn run_client_loop(
         repaint_pending: false,
         draw_host_cursor,
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
+        detached_process_children: Vec::new(),
         #[cfg(unix)]
         omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_renderer_enabled),
     };
@@ -2213,7 +2220,11 @@ async fn run_client_loop(
                     }
                 }
                 ServerMessage::OpenUrl { url } => {
-                    open_safe_url(&url, |url| crate::platform::open_url(url).map(|_| ()));
+                    open_safe_url(
+                        &url,
+                        &mut state.detached_process_children,
+                        crate::platform::open_url,
+                    );
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
@@ -2229,6 +2240,7 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
+                reap_finished_detached_processes(&mut state.detached_process_children);
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
@@ -2679,13 +2691,32 @@ fn recognized_image_extension(extension: &str) -> Option<&'static str> {
 }
 
 /// Opens a server-forwarded URL only when it remains safe on this client.
-fn open_safe_url(url: &str, open: impl FnOnce(&str) -> io::Result<()>) {
+fn open_safe_url(
+    url: &str,
+    detached_process_children: &mut Vec<std::process::Child>,
+    open: impl FnOnce(&str) -> io::Result<Option<std::process::Child>>,
+) {
     let Some(url) = crate::web_url::safe_web_url(url) else {
         return;
     };
-    if let Err(err) = open(url) {
-        warn!(err = %err, url = %url, "failed to open server URL");
+    match open(url) {
+        Ok(Some(child)) => detached_process_children.push(child),
+        Ok(None) => {}
+        Err(err) => warn!(err = %err, url = %url, "failed to open server URL"),
     }
+}
+
+/// Reaps exited URL opener children without blocking the client loop.
+fn reap_finished_detached_processes(detached_process_children: &mut Vec<std::process::Child>) {
+    detached_process_children.retain_mut(|child| match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => true,
+        Err(err) => {
+            warn!(pid = child.id(), err = %err, "failed to reap detached process");
+            false
+        }
+    });
 }
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
@@ -3972,11 +4003,12 @@ mod tests {
 
     #[test]
     fn open_safe_url_accepts_http_and_https() {
+        let mut children = Vec::new();
         let mut opened = Vec::new();
         for url in ["http://example.com", "https://example.com"] {
-            open_safe_url(url, |url| {
+            open_safe_url(url, &mut children, |url| {
                 opened.push(url.to_owned());
-                Ok(())
+                Ok(None)
             });
         }
         assert_eq!(opened, ["http://example.com", "https://example.com"]);
@@ -3984,14 +4016,53 @@ mod tests {
 
     #[test]
     fn open_safe_url_rejects_file_and_custom_schemes() {
+        let mut children = Vec::new();
         let mut calls = 0;
         for url in ["file:///tmp/example.rs", "mailto:user@example.com"] {
-            open_safe_url(url, |_| {
+            open_safe_url(url, &mut children, |_| {
                 calls += 1;
-                Ok(())
+                Ok(None)
             });
         }
         assert_eq!(calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_safe_url_retains_and_reaps_opener_child() {
+        let mut children = Vec::new();
+        let mut opener_pid = None;
+        open_safe_url("https://example.com", &mut children, |_| {
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 3")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            opener_pid = Some(child.id());
+            Ok(Some(child))
+        });
+
+        let pid = opener_pid.expect("opener child pid");
+        let retained = children.iter().any(|child| child.id() == pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::platform::process_exists(pid) && Instant::now() < deadline {
+            reap_finished_detached_processes(&mut children);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        reap_finished_detached_processes(&mut children);
+
+        let reaped = !crate::platform::process_exists(pid);
+        if !reaped {
+            unsafe {
+                libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+            }
+        }
+
+        assert!(retained, "client dropped URL opener child {pid}");
+        assert!(reaped, "client failed to reap URL opener child {pid}");
+        assert!(children.is_empty(), "reaped child {pid} remained retained");
     }
 
     #[test]
