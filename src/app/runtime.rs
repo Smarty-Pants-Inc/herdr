@@ -556,6 +556,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_rendered(&mut self, now: Instant) {
         self.record_render_attempt(now, true);
     }
