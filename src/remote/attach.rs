@@ -3909,35 +3909,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pane_local_remote_attach_skips_native_companion_resolution() {
+    fn remote_attach_resolves_native_companion_only_when_eligible() {
         let _guard = remote_env_lock().lock();
         let prior_encoding = std::env::var_os("HERDR_RENDER_ENCODING");
         let prior_omp_bin = std::env::var_os("OMP_BIN");
         std::env::remove_var("OMP_BIN");
 
-        for encoding in [None, Some("semantic-frame"), Some("terminal-ansi")] {
+        for (encoding, expected_eligible) in [
+            (None, true),
+            (Some("semantic-frame"), true),
+            (Some("terminal-ansi"), false),
+        ] {
             match encoding {
                 Some(encoding) => std::env::set_var("HERDR_RENDER_ENCODING", encoding),
                 None => std::env::remove_var("HERDR_RENDER_ENCODING"),
             }
             let eligible = remote_client_omp_renderer_eligible(true, true);
-            assert!(!eligible);
-            let mut called = false;
+            assert_eq!(eligible, expected_eligible);
+            let called = std::cell::Cell::new(false);
             assert!(prepare_remote_omp_companion_with(eligible, || {
-                called = true;
-                panic!("pane-local remote attach must not resolve a native OMP companion")
+                called.set(true);
+                Ok(None)
             })
             .is_none());
-            assert!(!called);
+            assert_eq!(called.get(), expected_eligible);
         }
 
-        let mut test_capability_called = false;
+        std::env::set_var(
+            "OMP_BIN",
+            std::env::current_exe().expect("current test executable"),
+        );
+        let called = std::cell::Cell::new(false);
         assert!(prepare_remote_omp_companion_with(true, || {
-            test_capability_called = true;
+            called.set(true);
             Ok(None)
         })
         .is_none());
-        assert!(test_capability_called);
+        assert!(!called.get());
 
         match prior_encoding {
             Some(value) => std::env::set_var("HERDR_RENDER_ENCODING", value),
