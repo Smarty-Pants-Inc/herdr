@@ -81,6 +81,7 @@ pub struct OmpRendererPrefix {
     pub modifiers: u8,
 }
 
+#[cfg(unix)]
 impl OmpRendererPrefix {
     pub(crate) fn key_combo(&self) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
         (
