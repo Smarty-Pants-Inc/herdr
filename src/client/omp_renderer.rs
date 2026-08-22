@@ -519,8 +519,7 @@ impl ClientOmpRenderer {
             return;
         };
         let cell = match self.target.as_ref() {
-            Some(target) => local_pixel_position(pointer, target.size)
-                .and_then(|position| target_position_cell(position, target.size)),
+            Some(target) => local_pixel_cell(pointer, target.size),
             None => pointer.geometry.cell(pointer.x, pointer.y),
         };
         self.set_pointer_cell(cell);
@@ -1049,21 +1048,18 @@ fn local_pixel_position(
     )
 }
 
-fn target_position_cell(
-    position: crate::input::mouse::Position,
+fn local_pixel_cell(
+    pointer: crate::input::mouse::HostPixels,
     size: (u16, u16, u32, u32),
 ) -> Option<(u16, u16)> {
-    let (cols, rows, cell_width_px, cell_height_px) = size;
-    match position {
-        crate::input::mouse::Position::Cell { column, row } => {
-            (column < cols && row < rows).then_some((column, row))
-        }
-        crate::input::mouse::Position::Pixels { x, y } => {
-            let width_px = u32::from(cols).checked_mul(cell_width_px)?;
-            let height_px = u32::from(rows).checked_mul(cell_height_px)?;
-            crate::input::mouse::HostGeometry::new(cols, rows, width_px, height_px)?.cell(x, y)
-        }
-    }
+    let (cols, rows, _, _) = size;
+    crate::input::mouse::HostGeometry::new(
+        cols,
+        rows,
+        pointer.geometry.width_px,
+        pointer.geometry.height_px,
+    )?
+    .cell(pointer.x, pointer.y)
 }
 
 fn decode_local_pixel_mouse(
@@ -1073,8 +1069,9 @@ fn decode_local_pixel_mouse(
 ) -> Option<LocalPixelMouse> {
     let (x, y) = crate::input::mouse::parse_report(data)?;
     let mouse = decode_pixel_mouse(data)?;
-    let position = local_pixel_position(crate::input::mouse::HostPixels { x, y, geometry }, size)?;
-    let cell = target_position_cell(position, size)?;
+    let pointer = crate::input::mouse::HostPixels { x, y, geometry };
+    let position = local_pixel_position(pointer, size)?;
+    let cell = local_pixel_cell(pointer, size)?;
     Some(LocalPixelMouse {
         mouse,
         position,
@@ -1378,6 +1375,7 @@ mod tests {
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
         renderer.target.as_mut().unwrap().size = (40, 1, 10, 20);
         let geometry = crate::input::mouse::HostGeometry::new(80, 1, 800, 20).unwrap();
+        assert_eq!(geometry.cell(21, 1), Some((2, 0)));
 
         let message = renderer
             .route_pixel_input(b"\x1b[<0;21;1M".to_vec(), geometry, 0)
@@ -1414,7 +1412,7 @@ mod tests {
         let geometry = crate::input::mouse::HostGeometry::new(80, 1, 801, 20).unwrap();
 
         assert!(matches!(
-            renderer.route_pixel_input(b"\x1b[<35;12;1M".to_vec(), geometry, 0),
+            renderer.route_pixel_input(b"\x1b[<35;11;1M".to_vec(), geometry, 0),
             Some(ClientMessage::InputPixels { .. })
         ));
         assert!(renderer.pointer_pixels.is_some());
