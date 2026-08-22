@@ -627,6 +627,46 @@ test("Oh My Pi reasserts working when a continuation starts a tool without agent
   expect(requestStates(requests)).toEqual(["working", "idle", "working"]);
 });
 
+test("Oh My Pi reports a rejected stale-todo closure as blocked without an idle transition", async () => {
+  const requests = await startRecordingServer("omp-stale-todo-closure");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("agent_end")?.(
+    {
+      messages: [],
+      closureRejected: {
+        reason: "stale_todos",
+        todos: [
+          { content: "Finish implementation", status: "pending" },
+          { content: "Verify integration", status: "in_progress" },
+        ],
+      },
+    },
+    context,
+  );
+  await waitFor(() => requestStates(requests).length === 2);
+
+  expect(requestStates(requests)).toEqual(["working", "blocked"]);
+  const blocked = requests.at(-1);
+  if (!isRecord(blocked) || !isRecord(blocked.params)) throw new Error("expected blocked state report");
+  expect(blocked.params.message).toBe("completion rejected: 2 incomplete todo item(s) remain");
+});
+
 test("Oh My Pi stays working when a continuation agent_end arrives after tool start", async () => {
   const requests = await startRecordingServer("omp-nonterminal-agent-end");
   process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";

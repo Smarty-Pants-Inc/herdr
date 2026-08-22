@@ -1,0 +1,20 @@
+merge_queue:
+  mode: serial
+  max_parallel_checks: 2
+  reset_on_external_merge: always
+
+queue_rules:
+  - name: default
+    batch_size: 1
+    checks_timeout: 30 min
+    max_checks_retries: 0
+    merge_method: merge
+    queue_conditions:
+      - 'base ~= ^landing/(agent-peer-prompt-guard|remote-omp-managed-delivery)-[0-9a-f]{12}$'
+      - -draft
+      - '#commits-behind = 0'
+      - check-success = smarty-review
+      - check-success = smarty-land-ready
+      - check-success = smarty-ci
+    merge_conditions:
+      - check-success = smarty-ci

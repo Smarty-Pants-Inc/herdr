@@ -35,6 +35,7 @@ pub fn uses_preview_update_manifest() -> bool {
 }
 
 /// Whether this published build may install preview updates from a running client.
+#[cfg(not(windows))]
 pub fn client_auto_update_enabled() -> bool {
     matches!(
         non_empty(option_env!("HERDR_BUILD_AUTO_UPDATE")),

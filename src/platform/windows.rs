@@ -1803,7 +1803,43 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
     }
 
     let snapshot = ProcessSnapshot::new(snapshot_processes());
-    session_processes_from_snapshot(child_pid, &snapshot)
+    session_processes_from_snapshot_with_runtime_inspection(
+        child_pid,
+        &snapshot,
+        |shell| process_is_git_bash(shell.pid),
+        |entry| process_runtime_marker(entry.pid),
+    )
+}
+
+fn session_processes_from_snapshot_with_runtime_inspection(
+    child_pid: u32,
+    snapshot: &ProcessSnapshot,
+    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
+    runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> Vec<u32> {
+    let mut pids = session_processes_from_snapshot(child_pid, snapshot);
+    let Some(foreground) = select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+        child_pid,
+        snapshot,
+        shell_is_git_bash,
+        runtime_marker,
+    ) else {
+        return pids;
+    };
+    if pids.contains(&foreground.process_group_id) {
+        return pids;
+    }
+
+    // Git Bash can exec an agent outside the pane shell's child tree. The
+    // foreground selector already applies the runtime marker's same-agent and
+    // ambiguity checks, so include only that selected process chain.
+    pids.push(foreground.process_group_id);
+    pids.extend(
+        descendant_entries(foreground.process_group_id, snapshot)
+            .into_iter()
+            .map(|entry| entry.pid),
+    );
+    pids
 }
 
 fn session_processes_from_snapshot(child_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
@@ -3699,6 +3735,53 @@ mod tests {
         pids.sort_unstable();
 
         assert_eq!(pids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn windows_session_processes_include_selected_escaped_agent_chain() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry(30, 20, "herdr.exe", &["herdr.exe", "pane", "send-text"]),
+            test_entry(40, 98, "claude.exe", &["claude.exe"]),
+            test_entry(50, 97, "unrelated.exe", &["unrelated.exe"]),
+        ]);
+
+        let mut pids = super::session_processes_from_snapshot_with_runtime_inspection(
+            10,
+            &snapshot,
+            |_| true,
+            |entry| {
+                Some(
+                    match entry.pid {
+                        10 | 20 | 30 | 50 => "pane-a",
+                        _ => "pane-b",
+                    }
+                    .to_string(),
+                )
+            },
+        );
+        pids.sort_unstable();
+
+        assert_eq!(pids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn windows_session_processes_reject_ambiguous_escaped_agents() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry(30, 98, "claude.exe", &["claude.exe"]),
+        ]);
+
+        let pids = super::session_processes_from_snapshot_with_runtime_inspection(
+            10,
+            &snapshot,
+            |_| true,
+            |_| Some("pane-a".to_string()),
+        );
+
+        assert_eq!(pids, vec![10]);
     }
 
     #[test]
