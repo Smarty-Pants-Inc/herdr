@@ -71,6 +71,10 @@ pub(crate) fn load_plugin_manifest(
 ) -> Result<crate::api::schema::InstalledPluginInfo, (&'static str, String)> {
     api::plugins::load_plugin_manifest(path, enabled)
 }
+pub(crate) use api::plugins::{
+    effective_platforms, ensure_platform_supported, ensure_plugin_user_dirs, plugin_path_env,
+    ClientPrivatePluginPopupSpec,
+};
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
 #[derive(Debug, Clone)]
@@ -1774,6 +1778,7 @@ impl App {
     fn execute_repeat_plan_headless(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         lease_key: input::InputLeaseKey,
         key: crate::input::TerminalKey,
         plan: input::RepeatPlan,
@@ -1816,7 +1821,7 @@ impl App {
                         self.handle_findr_key(key.clone());
                         None
                     } else {
-                        self.handle_terminal_key_headless_from(source_id, key.clone())
+                        self.handle_terminal_key_headless_from_view(source_id, view_id, key.clone())
                     };
                     if let Some(target) = target {
                         if tracked {
@@ -1851,6 +1856,7 @@ impl App {
     pub(crate) fn route_client_pixel_mouse(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         data: &[u8],
         geometry: crate::input::mouse::HostGeometry,
     ) -> bool {
@@ -1868,7 +1874,7 @@ impl App {
             return false;
         }
         self.state.host_mouse_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
-        self.route_client_events_from(source_id, std::mem::take(&mut events), false);
+        self.route_client_events_from_view(source_id, view_id, std::mem::take(&mut events), false);
         self.state.host_mouse_pixels = None;
         true
     }
@@ -1885,6 +1891,16 @@ impl App {
     pub(crate) fn route_client_events_from(
         &mut self,
         source_id: InputSourceId,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) -> bool {
+        self.route_client_events_from_view(source_id, None, events, apply_host_terminal_theme)
+    }
+
+    pub(crate) fn route_client_events_from_view(
+        &mut self,
+        source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
     ) -> bool {
@@ -1910,9 +1926,16 @@ impl App {
                                 self.handle_findr_key(key.clone());
                                 None
                             } else if initial_context.is_some() {
-                                self.handle_terminal_key_headless_from(source_id, key.clone())
+                                self.handle_terminal_key_headless_from_view(
+                                    source_id,
+                                    view_id,
+                                    key.clone(),
+                                )
                             } else {
-                                self.handle_non_terminal_key_headless(key.clone());
+                                self.handle_non_terminal_key_headless_for_view(
+                                    key.clone(),
+                                    view_id,
+                                );
                                 None
                             };
                             event_forwarded = target.is_some();
@@ -1924,7 +1947,9 @@ impl App {
                                 resulting_context.as_ref(),
                                 target,
                             );
-                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            self.execute_repeat_plan_headless(
+                                source_id, view_id, lease_key, key, plan,
+                            );
                         }
                         crossterm::event::KeyEventKind::Repeat => {
                             let current_context = self.terminal_input_context();
@@ -1933,8 +1958,9 @@ impl App {
                                 &key,
                                 current_context.as_ref(),
                             );
-                            event_forwarded =
-                                self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            event_forwarded = self.execute_repeat_plan_headless(
+                                source_id, view_id, lease_key, key, plan,
+                            );
                         }
                         crossterm::event::KeyEventKind::Release => {
                             if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
@@ -1956,7 +1982,7 @@ impl App {
                         self.request_scroll_render();
                     }
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                        self.handle_mouse_event_headless(source_id, mouse);
+                        self.handle_mouse_event_headless(source_id, view_id, mouse);
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -2027,7 +2053,11 @@ impl App {
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
     /// since the server doesn't have the async context of the monolithic App.
-    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
+    fn handle_non_terminal_key_headless_for_view(
+        &mut self,
+        key: crate::input::TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key_event = key.as_key_event();
         if input::modal_paste_target_active(&self.state)
             && input::is_modal_paste_shortcut(&key_event)
@@ -2040,10 +2070,10 @@ impl App {
 
         match self.state.mode {
             Mode::Prefix => {
-                self.handle_prefix_key(key);
+                self.handle_prefix_key_for_view(key, view_id);
             }
             Mode::Navigate => {
-                self.handle_navigate_key(key);
+                self.handle_navigate_key_for_view(key, view_id);
             }
             Mode::Copy => {
                 self.handle_copy_mode_key(key);
@@ -2107,9 +2137,10 @@ impl App {
     fn handle_mouse_event_headless(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         mouse: crossterm::event::MouseEvent,
     ) {
-        self.handle_mouse_from_input_source(source_id, mouse);
+        self.handle_mouse_from_input_source_for_view(source_id, view_id, mouse);
     }
 }
 
@@ -2123,8 +2154,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
     use std::rc::Rc;
-    #[cfg(windows)]
-    use std::sync::Mutex;
 
     fn raw_key(
         code: KeyCode,
@@ -4707,9 +4736,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4788,9 +4819,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4849,9 +4882,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: Some(workspace_id.clone()),
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4907,9 +4942,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: Some(0.333),
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: crate::api::schema::PaneRightClickTarget::Pane,
                 env: Default::default(),
@@ -4962,9 +4999,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),

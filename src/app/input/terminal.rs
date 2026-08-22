@@ -34,9 +34,19 @@ impl App {
         self.handle_terminal_key_headless_from(crate::app::LOCAL_INPUT_SOURCE, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_terminal_key_headless_from(
         &mut self,
         source_id: InputSourceId,
+        key: TerminalKey,
+    ) -> Option<TerminalInputTarget> {
+        self.handle_terminal_key_headless_from_view(source_id, None, key)
+    }
+
+    pub(crate) fn handle_terminal_key_headless_from_view(
+        &mut self,
+        source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
         self.clear_hovered_pane_link();
@@ -52,7 +62,7 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(source_id, key)?;
+        let input = self.prepare_terminal_key_forward(source_id, view_id, key)?;
         let sent = self
             .terminal_input_runtime(&input.target)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
@@ -62,6 +72,7 @@ impl App {
     fn prepare_terminal_key_forward(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
     ) -> Option<PreparedPaneInput> {
         let key_event = key.as_key_event();
@@ -108,7 +119,11 @@ impl App {
                 command = %binding.label,
                 "intercepted terminal direct custom command before forwarding to pane"
             );
-            self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
+            self.launch_custom_command_for_view(
+                binding,
+                super::navigate::ActionContext::Direct,
+                view_id,
+            );
             return None;
         }
 
@@ -416,7 +431,7 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
+        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, None, key)?;
         let sent = if let Some(runtime) = self.terminal_input_runtime(&input.target) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
@@ -1124,6 +1139,68 @@ mod tests {
             .expect("single-click should start plugin link handler");
         assert_eq!(log.plugin_id, "example.links");
         assert_eq!(log.action_id.as_deref(), Some("open"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pixel_click_url_preserves_view_for_plugin_link_handler() {
+        let line = "see https://github.com/herdrdev/herdr/issues/398";
+        let col = line.find("github").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
+        app.state
+            .installed_plugins
+            .get_mut("example.links")
+            .expect("test plugin")
+            .actions[0]
+            .command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s' \"$HERDR_VIEW_ID\"".into(),
+        ];
+
+        let view_id = crate::api::schema::ViewId::from_opaque("view-pixel").unwrap();
+        let geometry = crate::input::mouse::HostGeometry::new(106, 20, 1_060, 400).unwrap();
+        let x = u32::from(info.inner_rect.x + col) * 10 + 1;
+        let y = u32::from(info.inner_rect.y) * 20 + 1;
+        let report = format!("\x1b[<0;{x};{y}M");
+
+        assert!(app.route_client_pixel_mouse(7, Some(&view_id), report.as_bytes(), geometry,));
+        let log_id = app
+            .state
+            .plugin_command_logs
+            .last()
+            .expect("pixel click should start plugin link handler")
+            .log_id
+            .clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.drain_all_internal_events();
+            if app.state.plugin_command_logs.iter().any(|entry| {
+                entry.log_id == log_id
+                    && entry.status != crate::api::schema::PluginCommandStatus::Running
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let finished = app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log_id)
+            .expect("plugin command log");
+        assert_eq!(
+            finished.status,
+            crate::api::schema::PluginCommandStatus::Succeeded
+        );
+        assert_eq!(finished.stdout.as_deref(), Some("view-pixel"));
     }
 
     #[cfg(unix)]

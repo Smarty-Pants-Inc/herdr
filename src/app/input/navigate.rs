@@ -50,6 +50,14 @@ impl App {
     }
 
     pub(crate) fn handle_prefix_key(&mut self, raw_key: TerminalKey) {
+        self.handle_prefix_key_for_view(raw_key, None);
+    }
+
+    pub(crate) fn handle_prefix_key_for_view(
+        &mut self,
+        raw_key: TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key = raw_key.as_key_event();
         self.state.update_dismissed = true;
 
@@ -76,7 +84,7 @@ impl App {
             Some(PrefixBindingMatch::Action(action)) => self.execute_prefix_key_action(action),
             Some(PrefixBindingMatch::Command(binding)) => {
                 self.cancel_copy_mode_if_active();
-                self.launch_custom_command(binding, ActionContext::Prefix);
+                self.launch_custom_command_for_view(binding, ActionContext::Prefix, view_id);
             }
             None => leave_command_mode(&mut self.state),
         }
@@ -104,6 +112,14 @@ impl App {
     }
 
     pub(crate) fn handle_navigate_key(&mut self, raw_key: TerminalKey) {
+        self.handle_navigate_key_for_view(raw_key, None);
+    }
+
+    pub(crate) fn handle_navigate_key_for_view(
+        &mut self,
+        raw_key: TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key = raw_key.as_key_event();
         self.state.update_dismissed = true;
 
@@ -149,7 +165,7 @@ impl App {
         }
 
         if let Some(binding) = command_for_key(&self.state, &raw_key, BindingDispatch::Prefix) {
-            self.launch_custom_command(binding, ActionContext::Navigate);
+            self.launch_custom_command_for_view(binding, ActionContext::Navigate, view_id);
             return;
         }
 
@@ -593,9 +609,11 @@ impl App {
             crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -810,21 +828,24 @@ impl App {
         true
     }
 
-    pub(super) fn launch_custom_command(
+    pub(super) fn launch_custom_command_for_view(
         &mut self,
         binding: crate::config::CustomCommandKeybind,
         context: ActionContext,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) {
         let previous_mode = self.state.mode;
         let previous_toast = self.state.toast.clone();
         let result = match binding.action {
-            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(&binding),
+            crate::config::CustomCommandAction::Shell => {
+                self.spawn_custom_command(&binding, view_id)
+            }
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
             crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(&binding),
             crate::config::CustomCommandAction::PluginAction => self
-                .invoke_plugin_action_from_keybind(binding.command.clone())
+                .invoke_plugin_action_from_keybind_for_view(binding.command.clone(), view_id)
                 .map_err(std::io::Error::other),
         };
         match result {
@@ -859,10 +880,20 @@ impl App {
     }
 
     pub(crate) fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
+        self.custom_command_env_for_view(None)
+    }
+
+    fn custom_command_env_for_view(
+        &self,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
         let mut env = vec![(
             crate::api::SOCKET_PATH_ENV_VAR.to_string(),
             crate::api::socket_path().display().to_string(),
         )];
+        if let Some(view_id) = view_id {
+            env.push(("HERDR_VIEW_ID".to_string(), view_id.to_string()));
+        }
         if let Ok(current_exe) = std::env::current_exe() {
             env.push((
                 "HERDR_BIN_PATH".to_string(),
@@ -905,13 +936,14 @@ impl App {
     fn spawn_custom_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> std::io::Result<()> {
         let mut command = crate::platform::detached_custom_command_process(&binding.command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (env, cwd) = self.custom_command_env();
+        let (env, cwd) = self.custom_command_env_for_view(view_id);
         command.envs(env);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -1078,6 +1110,47 @@ impl App {
         extra_env: Vec<(String, String)>,
         temp_files: Vec<std::path::PathBuf>,
     ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        self.spawn_overlay_command(
+            argv,
+            cwd,
+            &crate::execution::ExecutionTarget::Local,
+            None,
+            extra_env,
+            temp_files,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_overlay_plugin_command(
+        &mut self,
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        self.spawn_overlay_command(
+            local_argv,
+            cwd,
+            execution_target,
+            Some((plugin_id, entrypoint)),
+            extra_env,
+            temp_files,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_overlay_command(
+        &mut self,
+        local_argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        plugin: Option<(&str, &str)>,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
         let Some(ws_idx) = self.state.active else {
             return Err(std::io::Error::other("no active workspace"));
         };
@@ -1111,19 +1184,38 @@ impl App {
                 .get_mut(ws_idx)
                 .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
             let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
-            let result = ws.split_pane_argv_command(
-                previous_focus,
-                Direction::Horizontal,
-                new_rows,
-                new_cols,
-                cwd,
-                argv,
-                extra_env,
-                self.state.pane_scrollback_limit_bytes,
-                self.state.host_terminal_theme,
-                self.state.host_terminal_appearance,
-                true,
-            );
+            let result = if let Some((plugin_id, entrypoint)) = plugin {
+                ws.split_pane_plugin_command(
+                    previous_focus,
+                    Direction::Horizontal,
+                    new_rows,
+                    new_cols,
+                    cwd,
+                    execution_target,
+                    plugin_id,
+                    entrypoint,
+                    local_argv,
+                    extra_env,
+                    self.state.pane_scrollback_limit_bytes,
+                    self.state.host_terminal_theme,
+                    self.state.host_terminal_appearance,
+                    true,
+                )
+            } else {
+                ws.split_pane_argv_command(
+                    previous_focus,
+                    Direction::Horizontal,
+                    new_rows,
+                    new_cols,
+                    cwd,
+                    local_argv,
+                    extra_env,
+                    self.state.pane_scrollback_limit_bytes,
+                    self.state.host_terminal_theme,
+                    self.state.host_terminal_appearance,
+                    true,
+                )
+            };
             let (tab_idx, new_pane) = match result {
                 Some(Ok(result)) => result,
                 Some(Err(err)) => return Err(err),
@@ -3644,6 +3736,30 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(app.state.selected, 0);
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn custom_command_env_carries_the_invoking_view() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let view_id = crate::api::schema::ViewId::from_opaque("view-test").unwrap();
+
+        let (env, _) = app.custom_command_env_for_view(Some(&view_id));
+
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "HERDR_VIEW_ID" && value == "view-test"));
+        assert!(!app
+            .custom_command_env()
+            .0
+            .iter()
+            .any(|(key, _)| key == "HERDR_VIEW_ID"));
     }
 
     #[cfg(unix)]

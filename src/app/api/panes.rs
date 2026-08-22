@@ -27,9 +27,77 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+fn split_cwd_for_target(
+    explicit_cwd: Option<String>,
+    execution_target: &crate::execution::ExecutionTarget,
+    source_target: &crate::execution::ExecutionTarget,
+    local_policy: &crate::config::NewTerminalCwdConfig,
+    source_cwd: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(cwd) = explicit_cwd {
+        return cwd.into();
+    }
+    if execution_target.is_local() {
+        let follow_cwd = (execution_target == source_target)
+            .then_some(source_cwd)
+            .flatten();
+        return crate::app::creation::resolve_new_terminal_cwd(local_policy, follow_cwd);
+    }
+    if execution_target == source_target {
+        return source_cwd.unwrap_or_default();
+    }
+    std::path::PathBuf::new()
+}
+
+fn workspace_plugin_pane_split_source(
+    app: &App,
+    caller_pane_id: Option<&str>,
+) -> Option<(
+    crate::execution::ExecutionTarget,
+    Option<std::path::PathBuf>,
+)> {
+    let caller_pane_id = caller_pane_id?;
+    let plugin_pane =
+        app.state
+            .workspace_plugin_panes
+            .iter()
+            .find_map(|(workspace_id, plugin_pane)| {
+                (caller_pane_id
+                    == crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(
+                        workspace_id,
+                    ))
+                .then_some(plugin_pane)
+            })?;
+    let terminal = app.state.terminals.get(&plugin_pane.terminal_id)?;
+    Some((
+        terminal.execution_target.clone(),
+        crate::app::creation::launch_cwd_for_terminal(
+            &plugin_pane.terminal_id,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+        ),
+    ))
+}
+
+fn pane_split_source(
+    app: &App,
+    ws_idx: usize,
+    target_pane_id: PaneId,
+) -> (
+    crate::execution::ExecutionTarget,
+    Option<std::path::PathBuf>,
+) {
+    (
+        app.execution_target_for_pane_in_workspace(ws_idx, target_pane_id)
+            .unwrap_or_default(),
+        app.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id),
+    )
+}
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
+        let caller_source =
+            workspace_plugin_pane_split_source(self, params.caller_pane_id.as_deref());
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
@@ -50,11 +118,20 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        let (source_target, source_cwd) =
+            caller_source.unwrap_or_else(|| pane_split_source(self, ws_idx, target_pane_id));
+        let execution_target = params
+            .execution_target
+            .clone()
+            .unwrap_or_else(|| source_target.clone());
         let (rows, cols) = self.state.estimate_pane_size();
-        let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
-            let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
-            Some(self.resolve_new_terminal_cwd(follow_cwd))
-        });
+        let split_cwd = Some(split_cwd_for_target(
+            params.cwd,
+            &execution_target,
+            &source_target,
+            &self.state.new_terminal_cwd,
+            source_cwd,
+        ));
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
@@ -68,13 +145,14 @@ impl App {
         };
         let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
         let split_result = match params.ratio {
-            Some(ratio) => ws.split_pane_with_ratio(
+            Some(ratio) => ws.split_pane_with_ratio_on(
                 target_pane_id,
                 direction,
                 ratio,
                 rows,
                 cols,
                 split_cwd,
+                &execution_target,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
@@ -82,12 +160,13 @@ impl App {
                 extra_env,
                 false,
             ),
-            None => ws.split_pane(
+            None => ws.split_pane_on(
                 target_pane_id,
                 direction,
                 rows,
                 cols,
                 split_cwd,
+                &execution_target,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
@@ -205,6 +284,16 @@ impl App {
         let Some((ws_idx, pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref()) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
+        if self
+            .execution_target_for_pane_in_workspace(ws_idx, pane_id)
+            .is_some_and(|target| !target.is_local())
+        {
+            return encode_error(
+                id,
+                "pane_process_info_unsupported",
+                "pane.process-info is unavailable for remote execution targets",
+            );
+        }
         let Some((runtime, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
@@ -1921,6 +2010,128 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn split_cwd_does_not_cross_execution_targets() {
+        let local = crate::execution::ExecutionTarget::Local;
+        let remote = crate::execution::ExecutionTarget::ssh("remote.example").unwrap();
+        let local_policy = crate::config::NewTerminalCwdConfig::Path("/local/default".into());
+
+        assert_eq!(
+            split_cwd_for_target(
+                None,
+                &remote,
+                &local,
+                &local_policy,
+                Some("/local/source".into()),
+            ),
+            std::path::PathBuf::new()
+        );
+        assert_eq!(
+            split_cwd_for_target(
+                None,
+                &local,
+                &remote,
+                &local_policy,
+                Some("/remote/source".into()),
+            ),
+            std::path::PathBuf::from("/local/default")
+        );
+    }
+
+    #[test]
+    fn split_cwd_follows_same_remote_target_and_honors_explicit_cwd() {
+        let remote = crate::execution::ExecutionTarget::ssh("remote.example").unwrap();
+        let policy = crate::config::NewTerminalCwdConfig::Home;
+
+        assert_eq!(
+            split_cwd_for_target(
+                None,
+                &remote,
+                &remote,
+                &policy,
+                Some("/remote/source".into()),
+            ),
+            std::path::PathBuf::from("/remote/source")
+        );
+        assert_eq!(
+            split_cwd_for_target(
+                Some("/remote/explicit".into()),
+                &remote,
+                &crate::execution::ExecutionTarget::Local,
+                &policy,
+                Some("/local/source".into()),
+            ),
+            std::path::PathBuf::from("/remote/explicit")
+        );
+    }
+
+    #[test]
+    fn pane_split_uses_cross_workspace_plugin_caller_locality() {
+        let (mut app, _) = app_with_test_workspace();
+        let workspace_id = app.public_workspace_id(0);
+        app.state
+            .workspaces
+            .push(Workspace::test_new("destination"));
+        app.state.ensure_test_terminals();
+        let target_pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let plugin_target = crate::execution::ExecutionTarget::ssh("remote.example").unwrap();
+        let plugin_cwd = std::path::PathBuf::from("/remote/worktree");
+        let mut terminal =
+            crate::terminal::TerminalState::new(plugin_terminal_id.clone(), plugin_cwd.clone());
+        terminal.execution_target = plugin_target.clone();
+        app.state
+            .terminals
+            .insert(plugin_terminal_id.clone(), terminal);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: false,
+                collapsed: false,
+            },
+        );
+        let caller =
+            crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
+
+        let (source_target, source_cwd) = workspace_plugin_pane_split_source(&app, Some(&caller))
+            .unwrap_or_else(|| pane_split_source(&app, 1, target_pane_id));
+
+        assert_eq!(source_target, plugin_target);
+        assert_eq!(source_cwd, Some(plugin_cwd));
+    }
+
+    #[test]
+    fn pane_process_info_rejects_remote_execution_target() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("primary").unwrap();
+
+        let response = app.handle_pane_process_info(
+            "remote-process-info".into(),
+            PaneProcessInfoParams {
+                pane_id: Some(public_pane_id),
+            },
+        );
+        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response.error.code, "pane_process_info_unsupported");
     }
 
     #[test]

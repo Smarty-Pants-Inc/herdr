@@ -582,9 +582,11 @@ fn pane_command() -> Command {
                 .about("Split a pane")
                 .arg(Arg::new("pane_id").value_name("PANE_ID"))
                 .args(current_pane_args())
+                .arg(option("workspace", "ID"))
                 .arg(split_direction_option())
                 .arg(option("ratio", "FLOAT"))
                 .arg(path_option("cwd", "PATH"))
+                .arg(option("target", "TARGET"))
                 .arg(env_option())
                 .arg(option("right-click", "TARGET").value_parser(["herdr", "pane"]))
                 .arg(flag("focus"))
@@ -916,6 +918,7 @@ fn plugin_command() -> Command {
                             "tab",
                             "zoomed",
                         ]))
+                        .arg(option("scope", "SCOPE").value_parser(["shared", "client-private"]))
                         .arg(option("width", "SIZE"))
                         .arg(option("height", "SIZE"))
                         .arg(option("workspace", "ID"))
@@ -1281,6 +1284,7 @@ mod tests {
             .get_arguments()
             .any(|arg| arg.get_long() == Some("entrypoint")));
         assert!(option_values(open, "placement").contains(&"workspace-right".to_string()));
+        assert!(has_option(open, "scope"));
         assert!(has_option(open, "width"));
         assert!(has_option(open, "height"));
     }

@@ -145,6 +145,22 @@ pub(crate) struct HandoffRuntimeState {
     pub cell_width_px: u32,
     pub cell_height_px: u32,
     #[serde(default)]
+    pub remote_execution_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_hostname: Option<String>,
+    #[serde(default)]
+    pub remote_exec_ready_filter: crate::pane::RemoteExecReadyFilter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    #[serde(default)]
+    pub pending_agent_resume_attempt_live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_agent_resume_attempt_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_agent_resume_retired_pids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respawn_shell_on_exit: Option<bool>,
+    #[serde(default)]
     pub keyboard_protocol_flags: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_protocol_ansi: Option<String>,
@@ -172,4 +188,61 @@ pub(crate) struct ImportedHandoffRuntime {
     pub master_fd: std::os::fd::RawFd,
     #[cfg(unix)]
     pub state: HandoffRuntimeState,
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::HandoffRuntimeState;
+
+    #[test]
+    fn remote_execution_state_serializes_and_defaults_for_older_handoffs() {
+        let older = r#"{
+            "pane_id": 7,
+            "child_pid": 42,
+            "rows": 24,
+            "cols": 80,
+            "cell_width_px": 0,
+            "cell_height_px": 0
+        }"#;
+        let older: HandoffRuntimeState = serde_json::from_str(older).unwrap();
+        assert!(!older.remote_execution_ready);
+        assert_eq!(older.remote_hostname, None);
+        assert!(older.pending_agent_resume_plan.is_none());
+        assert!(!older.pending_agent_resume_attempt_live);
+        assert!(older.pending_agent_resume_attempt_pid.is_none());
+        assert!(older.pending_agent_resume_retired_pids.is_empty());
+        assert!(older.respawn_shell_on_exit.is_none());
+
+        let current = serde_json::json!({
+            "pane_id": 7,
+            "child_pid": 42,
+            "rows": 24,
+            "cols": 80,
+            "cell_width_px": 0,
+            "cell_height_px": 0,
+            "remote_execution_ready": true,
+            "remote_hostname": "actual-node",
+            "pending_agent_resume_plan": {
+                "agent": "codex",
+                "argv": ["codex", "resume", "session-1"],
+                "dedupe_key": "codex:id:session-1"
+            },
+            "pending_agent_resume_attempt_live": true,
+            "pending_agent_resume_attempt_pid": 42,
+            "pending_agent_resume_retired_pids": [40, 41],
+            "respawn_shell_on_exit": false
+        });
+        let current: HandoffRuntimeState = serde_json::from_value(current).unwrap();
+        let encoded = serde_json::to_value(current).unwrap();
+        assert_eq!(encoded["remote_execution_ready"], true);
+        assert_eq!(encoded["remote_hostname"], "actual-node");
+        assert_eq!(encoded["pending_agent_resume_plan"]["agent"], "codex");
+        assert_eq!(encoded["pending_agent_resume_attempt_live"], true);
+        assert_eq!(encoded["pending_agent_resume_attempt_pid"], 42);
+        assert_eq!(
+            encoded["pending_agent_resume_retired_pids"],
+            serde_json::json!([40, 41])
+        );
+        assert_eq!(encoded["respawn_shell_on_exit"], false);
+    }
 }

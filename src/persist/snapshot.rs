@@ -8,8 +8,8 @@ use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
-/// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+/// Current snapshot format version. Version 4 adds persisted pane execution targets.
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -97,6 +97,8 @@ pub struct TabSnapshot {
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -363,6 +365,9 @@ fn capture_tab(
             id.raw(),
             PaneSnapshot {
                 cwd,
+                execution_target: terminal
+                    .map(|terminal| terminal.execution_target.clone())
+                    .unwrap_or_default(),
                 label,
                 agent_name,
                 managed_agent_kind,
@@ -643,6 +648,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
+                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -654,6 +660,7 @@ mod tests {
             1,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/website"),
+                execution_target: crate::execution::ExecutionTarget::ssh("primary").unwrap(),
                 label: Some("website".into()),
                 agent_name: None,
                 managed_agent_kind: None,
@@ -696,6 +703,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
+        assert_eq!(snapshot_file_version(&json), Some(4));
         let restored = parse_snapshot(&json).unwrap();
 
         assert_eq!(restored.workspaces.len(), 1);
@@ -714,12 +722,16 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&1].label.as_deref(),
             Some("website")
         );
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&1].execution_target,
+            crate::execution::ExecutionTarget::ssh("primary").unwrap()
+        );
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
     }
 
     #[test]
-    fn current_session_fixture_parses() {
+    fn v3_session_fixture_migrates_missing_execution_target_to_local() {
         let snap = parse_snapshot(session_fixture("current-herdr")).unwrap();
 
         assert_eq!(snap.version, 3);
@@ -729,6 +741,10 @@ mod tests {
         assert_eq!(snap.sidebar_width, None);
         assert_eq!(snap.sidebar_section_split, None);
         assert_eq!(snap.workspaces[0].tabs.len(), 2);
+        assert_eq!(
+            snap.workspaces[0].tabs[0].panes[&1].execution_target,
+            crate::execution::ExecutionTarget::Local
+        );
         assert_eq!(
             snap.workspaces[1].identity_cwd,
             PathBuf::from("/home/test/projects/project-b")
@@ -1183,9 +1199,12 @@ mod tests {
     }
 
     #[test]
-    fn future_version_is_rejected() {
-        let json = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
-        assert!(parse_snapshot(json).is_err());
+    fn v5_snapshot_is_rejected() {
+        let json = r#"{"version":5,"workspaces":[],"active":null,"selected":0}"#;
+        let Err(error) = parse_snapshot(json) else {
+            panic!("v5 snapshots must be rejected");
+        };
+        assert_eq!(error, "snapshot version 5 is newer than supported 4");
     }
 
     #[test]
@@ -1202,6 +1221,7 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
+                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1215,6 +1235,7 @@ mod tests {
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
+                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

@@ -349,6 +349,15 @@ impl App {
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) -> bool {
+        self.handle_mouse_from_input_source_for_view(source_id, None, mouse)
+    }
+
+    pub(super) fn handle_mouse_from_input_source_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        mouse: MouseEvent,
+    ) -> bool {
         let hover_changed = self.update_hovered_pane_link(mouse)
             || (matches!(
                 mouse.kind,
@@ -414,7 +423,7 @@ impl App {
             }
         }
 
-        if self.handle_url_click(source_id, mouse) {
+        if self.handle_url_click_for_view(source_id, view_id, mouse) {
             return hover_changed;
         }
 
@@ -622,9 +631,10 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
         self.pending_url_click_sources.insert(source_id);
-        if self.activate_link_once(source_id, pane_id, url) {
+        if self.activate_link_once(source_id, pane_id, url, view_id) {
             true
         } else {
             self.pending_url_click_sources.remove(&source_id);
@@ -637,6 +647,7 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
         let at = std::time::Instant::now();
         if self
@@ -650,7 +661,7 @@ impl App {
             return true;
         }
         self.last_link_click = None;
-        if self.activate_resolved_link(source_id, pane_id, url.clone()) {
+        if self.activate_resolved_link(source_id, pane_id, url.clone(), view_id) {
             self.last_link_click = Some(LinkClickState {
                 source_id,
                 pane_id,
@@ -668,12 +679,13 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
         self.last_pane_click = None;
         let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
             return false;
         };
-        match self.invoke_plugin_link_handler_for_url(&url, pane_id) {
+        match self.invoke_plugin_link_handler_for_url_for_view(&url, pane_id, view_id) {
             Ok(true) => return true,
             Ok(false) => {}
             Err(err) => {
@@ -691,7 +703,12 @@ impl App {
         true
     }
 
-    fn handle_url_click(&mut self, source_id: super::InputSourceId, mouse: MouseEvent) -> bool {
+    fn handle_url_click_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        mouse: MouseEvent,
+    ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -712,7 +729,7 @@ impl App {
             return false;
         };
 
-        self.activate_link_click(source_id, info.id, link.url)
+        self.activate_link_click(source_id, info.id, link.url, view_id)
     }
 
     fn update_hovered_pane_link(&mut self, mouse: MouseEvent) -> bool {

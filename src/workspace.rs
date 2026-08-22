@@ -572,6 +572,59 @@ impl Workspace {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_tab_plugin_command(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        cwd: PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
+        extra_env: Vec<(String, String)>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+    ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
+        let number = self.next_public_tab_number;
+        self.next_public_tab_number += 1;
+        let pane_number = self.next_public_pane_number;
+        let launch_env = self.launch_env_for_new_pane(number, pane_number, extra_env);
+        let events = self
+            .active_tab()
+            .map(|tab| tab.events.clone())
+            .expect("workspace must always have at least one tab");
+        let render_notify = self
+            .active_tab()
+            .map(|tab| tab.render_notify.clone())
+            .expect("workspace must always have at least one tab");
+        let render_dirty = self
+            .active_tab()
+            .map(|tab| tab.render_dirty.clone())
+            .expect("workspace must always have at least one tab");
+        let (tab, terminal, runtime) = Tab::new_plugin_command_on(
+            number,
+            cwd,
+            execution_target,
+            rows,
+            cols,
+            plugin_id,
+            entrypoint,
+            local_argv,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            &launch_env,
+            events,
+            render_notify,
+            render_dirty,
+        )?;
+        self.register_new_pane_with_number(tab.root_pane, pane_number);
+        self.tabs.push(tab);
+        Ok((self.tabs.len() - 1, terminal, runtime))
+    }
+
     fn create_tab_with_runtime(
         &mut self,
         rows: u16,
@@ -758,14 +811,16 @@ impl Workspace {
     }
 
     // Workspace split routing carries pane identity, geometry, host context, and focus policy.
+
     #[allow(clippy::too_many_arguments)]
-    pub fn split_pane(
+    pub fn split_pane_on(
         &mut self,
         pane_id: PaneId,
         direction: Direction,
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -780,12 +835,14 @@ impl Workspace {
             rows,
             cols,
             cwd,
+            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
             shell_config,
             extra_env,
             focus_new_pane,
+            None,
             None,
         )
     }
@@ -813,12 +870,50 @@ impl Workspace {
             rows,
             cols,
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
             shell_config,
             extra_env,
             focus_new_pane,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_pane_with_ratio_on(
+        &mut self,
+        pane_id: PaneId,
+        direction: Direction,
+        ratio: f32,
+        rows: u16,
+        cols: u16,
+        cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        extra_env: Vec<(String, String)>,
+        focus_new_pane: bool,
+    ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
+        self.split_pane_with_runtime(
+            pane_id,
+            direction,
+            Some(ratio),
+            rows,
+            cols,
+            cwd,
+            execution_target,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            extra_env,
+            focus_new_pane,
+            None,
             None,
         )
     }
@@ -845,6 +940,7 @@ impl Workspace {
             rows,
             cols,
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -852,6 +948,44 @@ impl Workspace {
             extra_env,
             focus_new_pane,
             Some(argv),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_pane_plugin_command(
+        &mut self,
+        pane_id: PaneId,
+        direction: Direction,
+        rows: u16,
+        cols: u16,
+        cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
+        extra_env: Vec<(String, String)>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        focus_new_pane: bool,
+    ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
+        self.split_pane_with_runtime(
+            pane_id,
+            direction,
+            None,
+            rows,
+            cols,
+            cwd,
+            execution_target,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
+            extra_env,
+            focus_new_pane,
+            Some(local_argv),
+            Some((plugin_id, entrypoint)),
         )
     }
 
@@ -878,6 +1012,7 @@ impl Workspace {
             rows,
             cols,
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -885,6 +1020,7 @@ impl Workspace {
             extra_env,
             focus_new_pane,
             Some(argv),
+            None,
         )
     }
 
@@ -897,6 +1033,7 @@ impl Workspace {
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -904,14 +1041,15 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
         argv: Option<&[String]>,
+        plugin: Option<(&str, &str)>,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
         let pane_number = self.next_public_pane_number;
         let tab_number = self.tabs[tab_idx].number;
         let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
         let tab = &mut self.tabs[tab_idx];
-        let new_pane = match if let Some(argv) = argv {
-            tab.split_pane_argv(
+        let new_pane = match if let Some((plugin_id, entrypoint)) = plugin {
+            tab.split_pane_plugin_on(
                 pane_id,
                 focus_new_pane,
                 direction,
@@ -919,6 +1057,25 @@ impl Workspace {
                 rows,
                 cols,
                 cwd,
+                execution_target,
+                plugin_id,
+                entrypoint,
+                argv.expect("plugin split requires local argv"),
+                &launch_env,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+            )
+        } else if let Some(argv) = argv {
+            tab.split_pane_argv_on(
+                pane_id,
+                focus_new_pane,
+                direction,
+                ratio,
+                rows,
+                cols,
+                cwd,
+                execution_target,
                 argv,
                 &launch_env,
                 scrollback_limit_bytes,
@@ -926,7 +1083,7 @@ impl Workspace {
                 host_terminal_appearance,
             )
         } else {
-            tab.split_pane_shell(
+            tab.split_pane_shell_on(
                 pane_id,
                 focus_new_pane,
                 direction,
@@ -934,6 +1091,7 @@ impl Workspace {
                 rows,
                 cols,
                 cwd,
+                execution_target,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,

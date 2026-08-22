@@ -445,8 +445,11 @@ fn restore_tab(
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let execution_target = saved_pane
+            .map(|pane| pane.execution_target.clone())
+            .unwrap_or_default();
 
-        let cwd = if saved_cwd.exists() {
+        let cwd = if !execution_target.is_local() || saved_cwd.exists() {
             saved_cwd
         } else {
             warn!(
@@ -477,7 +480,12 @@ fn restore_tab(
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
             };
-            pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
+            pane_restore_startup(
+                saved_agent_session,
+                saved_history,
+                &execution_target,
+                &mut agent_restore,
+            )
         };
         let restored_agent_session =
             restored_terminal_agent_session(saved_agent_session, startup.duplicate_agent_session);
@@ -506,6 +514,22 @@ fn restore_tab(
         let imported_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let imported_remote_resume_state = imported_runtime.as_ref().map(|imported| {
+            let state = &imported.state;
+            (
+                state.remote_execution_ready,
+                state.respawn_shell_on_exit,
+                state.pending_agent_resume_plan.clone(),
+                state.pending_agent_resume_attempt_live,
+                state.pending_agent_resume_attempt_pid.or_else(|| {
+                    state
+                        .pending_agent_resume_attempt_live
+                        .then_some(state.child_pid)
+                }),
+                state.pending_agent_resume_retired_pids.clone(),
+            )
+        });
         let was_imported = imported_runtime.is_some();
         let pending_native_agent_restore = if was_imported {
             None
@@ -515,6 +539,7 @@ fn restore_tab(
         if let Some(plan) = pending_native_agent_restore {
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                .with_execution_target(execution_target.clone())
                 .with_pending_agent_resume_plan(plan);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
@@ -559,6 +584,7 @@ fn restore_tab(
                         master_fd: imported.master_fd,
                         state: imported.state.with_pane_id(*id),
                     },
+                    &execution_target,
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,
@@ -566,12 +592,29 @@ fn restore_tab(
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
                 )
-            } else {
+            } else if execution_target.is_local() {
                 TerminalRuntime::spawn_with_initial_history(
                     *id,
                     rows,
                     cols,
                     cwd.clone(),
+                    runtime_context.scrollback_limit_bytes,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    runtime_context.shell_config,
+                    &launch_env,
+                    startup.initial_history_ansi,
+                    runtime_context.events.clone(),
+                    runtime_context.render_notify.clone(),
+                    runtime_context.render_dirty.clone(),
+                )
+            } else {
+                TerminalRuntime::spawn_with_initial_history_on(
+                    *id,
+                    rows,
+                    cols,
+                    cwd.clone(),
+                    &execution_target,
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,
@@ -586,31 +629,77 @@ fn restore_tab(
 
             #[cfg(not(unix))]
             {
-                TerminalRuntime::spawn_with_initial_history(
-                    *id,
-                    rows,
-                    cols,
-                    cwd.clone(),
-                    runtime_context.scrollback_limit_bytes,
-                    crate::terminal_theme::TerminalTheme::default(),
-                    None,
-                    runtime_context.shell_config,
-                    &launch_env,
-                    startup.initial_history_ansi,
-                    runtime_context.events.clone(),
-                    runtime_context.render_notify.clone(),
-                    runtime_context.render_dirty.clone(),
-                )
+                if execution_target.is_local() {
+                    TerminalRuntime::spawn_with_initial_history(
+                        *id,
+                        rows,
+                        cols,
+                        cwd.clone(),
+                        runtime_context.scrollback_limit_bytes,
+                        crate::terminal_theme::TerminalTheme::default(),
+                        None,
+                        runtime_context.shell_config,
+                        &launch_env,
+                        startup.initial_history_ansi,
+                        runtime_context.events.clone(),
+                        runtime_context.render_notify.clone(),
+                        runtime_context.render_dirty.clone(),
+                    )
+                } else {
+                    TerminalRuntime::spawn_with_initial_history_on(
+                        *id,
+                        rows,
+                        cols,
+                        cwd.clone(),
+                        &execution_target,
+                        runtime_context.scrollback_limit_bytes,
+                        crate::terminal_theme::TerminalTheme::default(),
+                        None,
+                        runtime_context.shell_config,
+                        &launch_env,
+                        startup.initial_history_ansi,
+                        runtime_context.events.clone(),
+                        runtime_context.render_notify.clone(),
+                        runtime_context.render_dirty.clone(),
+                    )
+                }
             }
         };
 
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_execution_target(execution_target.clone());
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
+                    }
+                }
+                #[cfg(unix)]
+                if let Some((
+                    remote_execution_ready,
+                    respawn_shell_on_exit,
+                    pending_plan,
+                    pending_attempt_live,
+                    pending_attempt_pid,
+                    retired_attempt_pids,
+                )) = imported_remote_resume_state
+                {
+                    let has_pending_plan = pending_plan.is_some();
+                    terminal.restore_pending_agent_resume_handoff(
+                        pending_plan,
+                        pending_attempt_live,
+                        pending_attempt_pid,
+                        retired_attempt_pids,
+                    );
+                    if !has_pending_plan {
+                        if let Some(respawn_shell_on_exit) = respawn_shell_on_exit {
+                            terminal.respawn_shell_on_exit = respawn_shell_on_exit;
+                        }
+                    }
+                    if remote_execution_ready {
+                        terminal.confirm_remote_execution_ready();
                     }
                 }
                 if let Some(label) = saved_label {
@@ -656,6 +745,27 @@ fn restore_tab(
                 terminals.push(terminal);
             }
             Err(e) => {
+                if !execution_target.is_local() && !was_imported {
+                    warn!(
+                        tab = ?snap.custom_name,
+                        pane_id = id.raw(),
+                        err = %e,
+                        "failed to restore remote pane, preserving it for a later retry"
+                    );
+                    let terminal_id = TerminalId::alloc();
+                    let mut terminal = TerminalState::new(terminal_id.clone(), cwd)
+                        .with_execution_target(execution_target)
+                        .with_respawn_shell_on_exit();
+                    if let Some(label) = saved_label {
+                        terminal.set_manual_label(label);
+                    }
+                    if let Some(session) = restored_agent_session {
+                        terminal.set_persisted_agent_session(session);
+                    }
+                    panes.insert(*id, PaneState::new(terminal_id));
+                    terminals.push(terminal);
+                    continue;
+                }
                 if let Some(key) = startup.reserved_agent_session.as_deref() {
                     resumed_agent_sessions.remove(key);
                 }
@@ -727,9 +837,17 @@ fn restore_tab(
     )
 }
 
+fn native_resume_dedupe_key(
+    plan: &crate::agent_resume::AgentResumePlan,
+    execution_target: &crate::execution::ExecutionTarget,
+) -> String {
+    format!("{execution_target}\0{}", plan.dedupe_key)
+}
+
 fn pane_restore_startup<'a>(
     session: Option<&PaneAgentSessionSnapshot>,
     history: Option<&'a PaneHistorySnapshot>,
+    execution_target: &crate::execution::ExecutionTarget,
     agent_restore: &mut AgentRestoreState<'_>,
 ) -> PaneRestoreStartup<'a> {
     // Native agent resume owns the conversation history. If a pane has a
@@ -744,11 +862,9 @@ fn pane_restore_startup<'a>(
     // back if runtime spawn fails before any agent process is started.
     let mut reserved_agent_session = None;
     let duplicate_agent_session = restore_plan.as_ref().is_some_and(|plan| {
-        if agent_restore
-            .resumed_sessions
-            .insert(plan.dedupe_key.clone())
-        {
-            reserved_agent_session = Some(plan.dedupe_key.clone());
+        let dedupe_key = native_resume_dedupe_key(plan, execution_target);
+        if agent_restore.resumed_sessions.insert(dedupe_key.clone()) {
+            reserved_agent_session = Some(dedupe_key);
             false
         } else {
             true
@@ -808,10 +924,12 @@ fn restored_terminal_agent_session(
 fn take_restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    execution_target: &crate::execution::ExecutionTarget,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore)
-        .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
+    restore_plan_for_snapshot(session, resume_agents_on_restore).filter(|plan| {
+        resumed_agent_sessions.insert(native_resume_dedupe_key(plan, execution_target))
+    })
 }
 
 pub(super) fn prune_restored_node(node: Node, surviving: &HashSet<PaneId>) -> Option<Node> {
@@ -925,6 +1043,113 @@ mod tests {
     fn test_restore_shell() -> &'static str {
         "/bin/sh"
     }
+    #[cfg(unix)]
+    fn remote_handoff_snapshot() -> SessionSnapshot {
+        let cwd = PathBuf::from("/remote/worktree");
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            execution_target: crate::execution::ExecutionTarget::ssh("build-alias")
+                                .unwrap(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn handoff_runtime_state() -> crate::handoff_runtime::HandoffRuntimeState {
+        crate::handoff_runtime::HandoffRuntimeState {
+            pane_id: 0,
+            child_pid: 0,
+            rows: 24,
+            cols: 80,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            remote_execution_ready: false,
+            remote_hostname: None,
+            remote_exec_ready_filter: crate::pane::RemoteExecReadyFilter::default(),
+            pending_agent_resume_plan: None,
+            pending_agent_resume_attempt_live: false,
+            pending_agent_resume_attempt_pid: None,
+            pending_agent_resume_retired_pids: Vec::new(),
+            respawn_shell_on_exit: None,
+            keyboard_protocol_flags: 0,
+            keyboard_protocol_ansi: None,
+            input_state: None,
+            terminal_title: None,
+            initial_history_ansi: None,
+            agent_state: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn imported_handoff_runtime(
+        mut state: crate::handoff_runtime::HandoffRuntimeState,
+    ) -> (
+        HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+        Box<dyn portable_pty::Child + Send + Sync>,
+        u32,
+    ) {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let master_fd =
+            crate::pty::fd::duplicate_cloexec_fd(pair.master.as_raw_fd().expect("PTY master fd"))
+                .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let child_pid = child.process_id().expect("child pid");
+        state.child_pid = child_pid;
+        if state.pending_agent_resume_attempt_live {
+            state.pending_agent_resume_attempt_pid = Some(child_pid);
+        }
+        drop(pair);
+        (
+            HashMap::from([(
+                0,
+                crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state },
+            )]),
+            child,
+            child_pid,
+        )
+    }
 
     #[test]
     fn capture_and_restore_node_round_trip() {
@@ -1035,17 +1260,41 @@ mod tests {
             value: pi_session_path.clone(),
         };
         let mut resumed = HashSet::new();
+        let execution_target = crate::execution::ExecutionTarget::Local;
 
-        assert!(take_restore_plan_for_snapshot(&session, false, &mut resumed).is_none());
+        assert!(
+            take_restore_plan_for_snapshot(&session, false, &execution_target, &mut resumed)
+                .is_none()
+        );
         assert!(resumed.is_empty());
 
-        let first = take_restore_plan_for_snapshot(&session, true, &mut resumed)
+        let first = take_restore_plan_for_snapshot(&session, true, &execution_target, &mut resumed)
             .expect("first restore should get a plan");
         assert_eq!(
             first.argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
+        assert!(
+            take_restore_plan_for_snapshot(&session, true, &execution_target, &mut resumed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_resume_dedupe_includes_execution_target() {
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: test_session_path("pi-session.jsonl"),
+        };
+        let primary = crate::execution::ExecutionTarget::ssh("primary").unwrap();
+        let secondary = crate::execution::ExecutionTarget::ssh("secondary").unwrap();
+        let mut resumed = HashSet::new();
+
+        assert!(take_restore_plan_for_snapshot(&session, true, &primary, &mut resumed).is_some());
+        assert!(take_restore_plan_for_snapshot(&session, true, &secondary, &mut resumed).is_some());
+        assert!(take_restore_plan_for_snapshot(&session, true, &primary, &mut resumed).is_none());
     }
 
     #[test]
@@ -1061,12 +1310,18 @@ mod tests {
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let execution_target = crate::execution::ExecutionTarget::Local;
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
         };
 
-        let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let startup = pane_restore_startup(
+            Some(&session),
+            Some(&history),
+            &execution_target,
+            &mut agent_restore,
+        );
 
         assert!(startup.restore_plan.is_some());
         assert!(startup.initial_history_ansi.is_none());
@@ -1086,13 +1341,24 @@ mod tests {
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let execution_target = crate::execution::ExecutionTarget::Local;
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
         };
 
-        let first = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
-        let duplicate = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let first = pane_restore_startup(
+            Some(&session),
+            Some(&history),
+            &execution_target,
+            &mut agent_restore,
+        );
+        let duplicate = pane_restore_startup(
+            Some(&session),
+            Some(&history),
+            &execution_target,
+            &mut agent_restore,
+        );
 
         assert!(first.restore_plan.is_some());
         assert!(first.initial_history_ansi.is_none());
@@ -1114,12 +1380,18 @@ mod tests {
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let execution_target = crate::execution::ExecutionTarget::Local;
         let mut agent_restore = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
         };
 
-        let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
+        let startup = pane_restore_startup(
+            Some(&session),
+            Some(&history),
+            &execution_target,
+            &mut agent_restore,
+        );
 
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
@@ -1152,8 +1424,15 @@ mod tests {
             value: test_session_path("pi-session.jsonl"),
         };
         let mut resumed = HashSet::new();
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
-        assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
+        let execution_target = crate::execution::ExecutionTarget::Local;
+        assert!(
+            take_restore_plan_for_snapshot(&session, true, &execution_target, &mut resumed)
+                .is_some()
+        );
+        assert!(
+            take_restore_plan_for_snapshot(&session, true, &execution_target, &mut resumed)
+                .is_none()
+        );
 
         assert!(restored_terminal_agent_session(Some(&session), true).is_none());
     }
@@ -1179,6 +1458,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            execution_target: crate::execution::ExecutionTarget::Local,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
                             managed_agent_kind: Some("opencode".into()),
@@ -1266,6 +1546,7 @@ mod tests {
                             10,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                execution_target: crate::execution::ExecutionTarget::Local,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -1277,6 +1558,7 @@ mod tests {
                             20,
                             super::super::snapshot::PaneSnapshot {
                                 cwd: cwd.clone(),
+                                execution_target: crate::execution::ExecutionTarget::Local,
                                 label: None,
                                 agent_name: None,
                                 managed_agent_kind: None,
@@ -1331,6 +1613,7 @@ mod tests {
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
                     cwd: cwd.clone(),
+                    execution_target: crate::execution::ExecutionTarget::Local,
                     label: None,
                     agent_name: None,
                     managed_agent_kind: None,
@@ -1341,6 +1624,7 @@ mod tests {
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
             cwd: cwd.clone(),
+            execution_target: crate::execution::ExecutionTarget::Local,
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
             managed_agent_kind: None,
@@ -1471,6 +1755,142 @@ mod tests {
         assert_eq!(next_public_pane_number, 3);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_remote_shell_restore_keeps_pane_pending_for_retry() {
+        let snapshot = TabSnapshot {
+            custom_name: Some("remote".into()),
+            layout: LayoutSnapshot::Pane(0),
+            panes: HashMap::from([(
+                0,
+                super::super::snapshot::PaneSnapshot {
+                    cwd: PathBuf::from("/remote/worktree"),
+                    execution_target: crate::execution::ExecutionTarget::Ssh {
+                        host: "-invalid".into(),
+                    },
+                    label: Some("remote shell".into()),
+                    agent_name: None,
+                    managed_agent_kind: None,
+                    agent_session: None,
+                    launch_argv: None,
+                },
+            )]),
+            zoomed: false,
+            focused: Some(0),
+            root_pane: Some(0),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        let runtime_context = RestoreRuntimeContext {
+            scrollback_limit_bytes: 0,
+            shell_config: crate::pane::PaneShellConfig::new(
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+            ),
+            resume_agents_on_restore: false,
+            omp_bridge: None,
+            events,
+            render_notify: Arc::new(Notify::new()),
+            render_dirty: Arc::new(RenderSignal::new()),
+        };
+        let mut resumed_sessions = HashSet::new();
+        let mut imported_panes = HashMap::new();
+
+        let (restored, failed_imports) = restore_tab(
+            &snapshot,
+            None,
+            1,
+            "workspace",
+            24,
+            80,
+            &runtime_context,
+            &mut resumed_sessions,
+            &mut imported_panes,
+            &HashMap::new(),
+        );
+
+        assert_eq!(failed_imports, 0);
+        let (tab, terminals, runtimes, _) = restored.expect("remote pane should be retained");
+        assert_eq!(tab.panes.len(), 1);
+        assert!(runtimes.is_empty());
+        let terminal = terminals.first().expect("terminal state should survive");
+        assert!(terminal.respawn_shell_on_exit);
+        assert_eq!(terminal.manual_label.as_deref(), Some("remote shell"));
+        assert!(!terminal.execution_target.is_local());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_handoff_preserves_unconfirmed_remote_agent_resume_attempt() {
+        let session_ref = crate::agent_resume::AgentSessionRef::id("codex-session").unwrap();
+        let plan = crate::agent_resume::plan("herdr:codex", "codex", &session_ref).unwrap();
+        let mut state = handoff_runtime_state();
+        state.pending_agent_resume_plan = Some(plan.clone());
+        state.pending_agent_resume_attempt_live = true;
+        state.pending_agent_resume_retired_pids = vec![41, 42];
+        state.respawn_shell_on_exit = Some(false);
+        let (mut imports, mut child, child_pid) = imported_handoff_runtime(state);
+        let (events, _event_rx) = mpsc::channel(8);
+
+        let (_workspaces, terminals, runtimes) = restore_handoff(
+            &remote_handoff_snapshot(),
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .expect("live handoff should restore the imported remote runtime");
+
+        let terminal = terminals.values().next().expect("terminal should restore");
+        assert_eq!(terminal.pending_agent_resume_plan.as_ref(), Some(&plan));
+        assert!(terminal.pending_agent_resume_attempt_live());
+        assert!(terminal.pending_agent_resume_attempt_matches_peer(Some(child_pid)));
+        assert_eq!(terminal.pending_agent_resume_retired_pids(), &[41, 42]);
+        assert!(!terminal.respawn_shell_on_exit);
+        assert!(imports.is_empty());
+        for runtime in runtimes.into_values() {
+            runtime.shutdown();
+        }
+        child.wait().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_handoff_reconciles_ready_remote_shell_before_event_dispatch() {
+        let mut state = handoff_runtime_state();
+        state.remote_execution_ready = true;
+        state.remote_hostname = Some("actual-node".into());
+        state.respawn_shell_on_exit = Some(true);
+        let (mut imports, mut child, _) = imported_handoff_runtime(state);
+        let (events, _event_rx) = mpsc::channel(8);
+
+        let (_workspaces, terminals, runtimes) = restore_handoff(
+            &remote_handoff_snapshot(),
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .expect("live handoff should restore the imported remote runtime");
+
+        let terminal = terminals.values().next().expect("terminal should restore");
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(!terminal.pending_agent_resume_attempt_live());
+        assert!(
+            !terminal.respawn_shell_on_exit,
+            "an imported runtime that already saw the ready marker must not retry its SSH shell"
+        );
+        for runtime in runtimes.into_values() {
+            runtime.shutdown();
+        }
+        child.wait().unwrap();
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
@@ -1493,6 +1913,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             cwd,
+                            execution_target: crate::execution::ExecutionTarget::Local,
                             label: None,
                             agent_name: None,
                             managed_agent_kind: None,
@@ -1719,6 +2140,7 @@ mod tests {
             0,
             super::super::snapshot::PaneSnapshot {
                 cwd: cwd.clone(),
+                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,

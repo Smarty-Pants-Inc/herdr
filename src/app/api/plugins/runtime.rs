@@ -22,36 +22,49 @@ impl App {
         context: &PluginInvocationContext,
         event_json: Option<String>,
     ) -> Result<PluginCommandLogInfo, (&'static str, String)> {
-        let Some(program) = command.first().cloned() else {
-            return Err((
-                "invalid_plugin_command",
-                "command must not be empty".to_string(),
-            ));
+        let execution_target = if action_id.is_some() && event.is_none() {
+            self.plugin_command_execution_target(context)
+        } else {
+            crate::execution::ExecutionTarget::Local
         };
-        let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
+        let local_command = if execution_target.is_local() {
+            let Some(program) = command.first().cloned() else {
+                return Err((
+                    "invalid_plugin_command",
+                    "command must not be empty".to_string(),
+                ));
+            };
+            let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
+            super::env::ensure_plugin_user_dirs(plugin)
+                .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
+            Some((program, args))
+        } else {
+            None
+        };
         let context_json = serde_json::to_string(context)
             .map_err(|err| ("invalid_plugin_context", err.to_string()))?;
-        super::env::ensure_plugin_user_dirs(plugin)
-            .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
         let log_id = format!("plugin-log-{}", self.state.next_plugin_command_log_id);
         self.state.next_plugin_command_log_id += 1;
         let started_unix_ms = current_unix_ms();
-        let mut env = super::env::plugin_path_env(plugin);
-        env.extend([
-            (
+        let mut env = Vec::new();
+        if execution_target.is_local() {
+            env.extend(super::env::plugin_path_env(plugin));
+            env.push((
                 crate::api::SOCKET_PATH_ENV_VAR.to_string(),
                 crate::api::socket_path().display().to_string(),
-            ),
+            ));
+            if let Ok(current_exe) = std::env::current_exe() {
+                env.push((
+                    "HERDR_BIN_PATH".to_string(),
+                    current_exe.display().to_string(),
+                ));
+            }
+        }
+        env.extend([
             ("HERDR_ENV".to_string(), "1".to_string()),
             ("HERDR_PLUGIN_ID".to_string(), plugin.plugin_id.clone()),
             ("HERDR_PLUGIN_CONTEXT_JSON".to_string(), context_json),
         ]);
-        if let Ok(current_exe) = std::env::current_exe() {
-            env.push((
-                "HERDR_BIN_PATH".to_string(),
-                current_exe.display().to_string(),
-            ));
-        }
         if let Some(action_id) = action_id.as_ref() {
             env.push(("HERDR_PLUGIN_ACTION_ID".to_string(), action_id.clone()));
         }
@@ -69,6 +82,9 @@ impl App {
         }
         if let Some(pane_id) = context.focused_pane_id.as_ref() {
             env.push(("HERDR_PANE_ID".to_string(), pane_id.clone()));
+        }
+        if let Some(view_id) = context.view_id.as_ref() {
+            env.push(("HERDR_VIEW_ID".to_string(), view_id.to_string()));
         }
         if let Some(clicked_url) = context.clicked_url.as_ref() {
             env.push(("HERDR_PLUGIN_CLICKED_URL".to_string(), clicked_url.clone()));
@@ -101,6 +117,7 @@ impl App {
             return Err(("plugin_command_limit_reached", message));
         }
         let plugin_root = std::path::PathBuf::from(&plugin.plugin_root);
+        let action_id_for_launch = action_id.clone();
         let log = PluginCommandLogInfo {
             log_id: log_id.clone(),
             plugin_id: plugin.plugin_id.clone(),
@@ -117,14 +134,38 @@ impl App {
         };
         self.push_plugin_command_log(log.clone());
         self.state.plugin_commands_in_flight += 1;
+        let plugin_id = plugin.plugin_id.clone();
+        let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let child =
+            let child = if let Some((program, args)) = local_command {
                 crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
+                    .env_remove("HERDR_VIEW_ID")
                     .envs(env)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
-                    .spawn();
+                    .spawn()
+            } else {
+                let action_id = action_id_for_launch.expect("remote plugin action requires id");
+                crate::execution::ssh_process_command(
+                    &execution_target,
+                    std::path::Path::new(""),
+                    crate::execution::RemoteCommand::Plugin {
+                        plugin_id,
+                        target: crate::plugin_command::PluginCommandTarget::Action {
+                            action_id,
+                            link_handler_id,
+                        },
+                    },
+                    env,
+                )
+                .and_then(|mut command| {
+                    command
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                })
+            };
             let finished = match child {
                 Ok(mut child) => {
                     let stdout = child.stdout.take();
@@ -178,6 +219,20 @@ impl App {
             let _ = event_tx.blocking_send(finished);
         });
         Ok(log)
+    }
+
+    pub(super) fn plugin_command_execution_target(
+        &self,
+        context: &PluginInvocationContext,
+    ) -> crate::execution::ExecutionTarget {
+        context
+            .focused_pane_id
+            .as_deref()
+            .and_then(|pane_id| {
+                self.plugin_context_and_execution_target_for_source_pane(pane_id, "plugin-target")
+            })
+            .map(|(_, target)| target)
+            .unwrap_or_default()
     }
 
     pub(crate) fn run_plugin_startup_hooks(&mut self) {

@@ -215,6 +215,11 @@ impl LocalTarget {
                 AppEvent::ClipboardWrite { content } if self.promoted => {
                     effects.push(LocalEffect::ClipboardWrite(content));
                 }
+                AppEvent::PaneClipboardWrite { pane_id, content }
+                    if self.promoted && pane_id == self.pane_id =>
+                {
+                    effects.push(LocalEffect::ClipboardWrite(content));
+                }
                 AppEvent::OpenUrl { url, .. } if self.promoted => {
                     effects.push(LocalEffect::OpenUrl(url));
                 }

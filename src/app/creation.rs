@@ -38,14 +38,14 @@ pub(super) fn launch_cwd_for_terminal(
     >,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> Option<PathBuf> {
+    let terminal = terminals.get(terminal_id)?;
+    if !terminal.execution_target.is_local() {
+        return Some(terminal.cwd.clone());
+    }
     terminal_runtimes
         .get(terminal_id)
         .and_then(|runtime| runtime.follow_cwd())
-        .or_else(|| {
-            terminals
-                .get(terminal_id)
-                .map(|terminal| terminal.cwd.clone())
-        })
+        .or_else(|| Some(terminal.cwd.clone()))
 }
 
 impl App {
@@ -70,6 +70,22 @@ impl App {
             &self.state.terminals,
             &self.terminal_runtimes,
         )
+    }
+
+    pub(super) fn execution_target_for_pane_in_workspace(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::execution::ExecutionTarget> {
+        let workspace = self.state.workspaces.get(ws_idx)?;
+        let tab = workspace
+            .tabs
+            .get(workspace.find_tab_index_for_pane(pane_id)?)?;
+        let terminal_id = tab.terminal_id(pane_id)?;
+        self.state
+            .terminals
+            .get(terminal_id)
+            .map(|terminal| terminal.execution_target.clone())
     }
 
     pub(super) fn focused_pane_cwd_in_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
@@ -452,8 +468,12 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+            execution_target: terminal.execution_target.clone(),
+            foreground_cwd: terminal
+                .execution_target
+                .is_local()
+                .then(|| ws.tabs[tab_idx].foreground_cwd_for_pane(pane_id, &self.terminal_runtimes))
+                .flatten()
                 .map(|cwd| cwd.display().to_string()),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),

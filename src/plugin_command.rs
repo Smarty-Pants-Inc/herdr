@@ -11,6 +11,158 @@ pub(crate) fn command_for_argv_in_dir(program: &str, args: &[String], cwd: &Path
     command
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PluginCommandTarget {
+    Pane {
+        entrypoint: String,
+    },
+    Action {
+        action_id: String,
+        link_handler_id: Option<String>,
+    },
+}
+
+#[cfg(windows)]
+const _: () = {
+    let _ = crate::app::effective_platforms;
+    let _ = crate::app::ensure_platform_supported;
+    let _ = crate::app::plugin_path_env;
+};
+
+#[cfg(unix)]
+pub(crate) struct ResolvedPluginCommand {
+    pub command: Vec<String>,
+    pub cwd: std::path::PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+#[cfg(unix)]
+pub(crate) fn resolve_installed_plugin_command(
+    plugin_id: &str,
+    target: &PluginCommandTarget,
+) -> std::io::Result<ResolvedPluginCommand> {
+    let stored = crate::persist::plugin_registry::try_load()?
+        .into_iter()
+        .find(|plugin| plugin.plugin_id == plugin_id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("plugin {plugin_id} is not installed"),
+            )
+        })?;
+    let plugin = crate::app::load_plugin_manifest(&stored.manifest_path, stored.enabled)
+        .map_err(|(_, message)| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+    if !plugin.enabled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("plugin {plugin_id} is disabled"),
+        ));
+    }
+
+    let (command, subject, target_env) = match target {
+        PluginCommandTarget::Pane { entrypoint } => {
+            let pane = plugin
+                .panes
+                .iter()
+                .find(|pane| pane.id == *entrypoint)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("plugin pane {plugin_id}.{entrypoint} was not found"),
+                    )
+                })?;
+            let subject = format!("plugin pane {plugin_id}.{entrypoint}");
+            crate::app::ensure_platform_supported(
+                crate::app::effective_platforms(&pane.platforms, &plugin.platforms),
+                &subject,
+            )
+            .map_err(|(_, message)| {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+            })?;
+            (
+                pane.command.clone(),
+                subject,
+                Some(("HERDR_PLUGIN_ENTRYPOINT_ID", entrypoint.as_str())),
+            )
+        }
+        PluginCommandTarget::Action {
+            action_id,
+            link_handler_id,
+        } => {
+            let action = plugin
+                .actions
+                .iter()
+                .find(|action| action.id == *action_id)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("plugin action {plugin_id}.{action_id} was not found"),
+                    )
+                })?;
+            if let Some(link_handler_id) = link_handler_id {
+                let handler = plugin
+                    .link_handlers
+                    .iter()
+                    .find(|handler| handler.id == *link_handler_id)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "plugin link handler {plugin_id}.{link_handler_id} was not found"
+                            ),
+                        )
+                    })?;
+                if handler.action != *action_id {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "plugin link handler {plugin_id}.{link_handler_id} does not invoke action {action_id}"
+                        ),
+                    ));
+                }
+                crate::app::ensure_platform_supported(
+                    crate::app::effective_platforms(&handler.platforms, &plugin.platforms),
+                    &format!("plugin link handler {plugin_id}.{link_handler_id}"),
+                )
+                .map_err(|(_, message)| {
+                    std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+                })?;
+            }
+            let subject = format!("plugin action {plugin_id}.{action_id}");
+            crate::app::ensure_platform_supported(
+                crate::app::effective_platforms(&action.platforms, &plugin.platforms),
+                &subject,
+            )
+            .map_err(|(_, message)| {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+            })?;
+            (
+                action.command.clone(),
+                subject,
+                Some(("HERDR_PLUGIN_ACTION_ID", action_id.as_str())),
+            )
+        }
+    };
+    crate::app::ensure_plugin_user_dirs(&plugin)?;
+    if command.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{subject} has an empty command"),
+        ));
+    }
+
+    let mut env = crate::app::plugin_path_env(&plugin);
+    env.push(("HERDR_PLUGIN_ID".into(), plugin.plugin_id.clone()));
+    if let Some((key, value)) = target_env {
+        env.push((key.into(), value.into()));
+    }
+    Ok(ResolvedPluginCommand {
+        command,
+        cwd: std::path::PathBuf::from(plugin.plugin_root),
+        env,
+    })
+}
+
 fn program_for_cwd(program: &str, cwd: &Path) -> OsString {
     let path = Path::new(program);
     let has_separator = program.contains('/') || (cfg!(windows) && program.contains('\\'));

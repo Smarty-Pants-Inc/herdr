@@ -341,6 +341,8 @@ pub struct HeadlessServer {
     /// Fresh server-owned launch identity for each App-local native renderer offer.
     next_omp_renderer_launch_id: u64,
     omp_service: OmpService,
+    /// Process-unique private pane ids retained to consume late or duplicate actor events.
+    retired_private_pane_ids: HashSet<crate::layout::PaneId>,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -577,6 +579,7 @@ impl HeadlessServer {
             private_omp_test_executable: None,
             next_omp_renderer_launch_id: 1,
             omp_service,
+            retired_private_pane_ids: HashSet::new(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -1406,6 +1409,10 @@ impl HeadlessServer {
                 paused_terminal_ids.push(terminal_id.clone());
             }
         }
+        // Pausing a reader can synchronously parse final bytes and enqueue ready/cwd
+        // events. Reconcile them before terminal state and runtime filter state are
+        // captured into the handoff manifest.
+        self.drain_all_internal_events_with_forwarding();
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
@@ -1427,6 +1434,19 @@ impl HeadlessServer {
             let terminal = self.app.state.terminals.get(terminal_id);
             handoff_runtime.agent_state = terminal
                 .map(|terminal| crate::handoff_runtime::HandoffAgentState::capture(terminal, seen));
+            if let Some(terminal) = terminal {
+                handoff_runtime.pending_agent_resume_plan =
+                    terminal.pending_agent_resume_plan.clone();
+                handoff_runtime.pending_agent_resume_attempt_live =
+                    terminal.pending_agent_resume_attempt_live();
+                handoff_runtime.pending_agent_resume_attempt_pid =
+                    terminal.pending_agent_resume_attempt_pid();
+                handoff_runtime.pending_agent_resume_retired_pids =
+                    terminal.pending_agent_resume_retired_pids().to_vec();
+                if !terminal.execution_target.is_local() && terminal.launch_argv.is_none() {
+                    handoff_runtime.respawn_shell_on_exit = Some(terminal.respawn_shell_on_exit);
+                }
+            }
             let has_agent_session =
                 terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
             if !has_agent_session {
@@ -1873,7 +1893,11 @@ impl HeadlessServer {
         self.private_omp_failed_routes.remove(&client_id);
         self.private_omp_retry_attempted_routes.remove(&client_id);
         self.private_omp_pending_routes.remove(&client_id);
-        if let Some(removed) = removed {
+        if let Some(mut removed) = removed {
+            if let Some(surface) = removed.private_surface.take() {
+                self.retired_private_pane_ids.insert(surface.pane_id());
+                surface.shutdown();
+            }
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
@@ -2881,6 +2905,64 @@ impl HeadlessServer {
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
     fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
+        let private_pane_id = match &ev {
+            AppEvent::PaneDied { pane_id }
+            | AppEvent::TerminalBell { pane_id, .. }
+            | AppEvent::PaneClipboardWrite { pane_id, .. }
+            | AppEvent::TerminalCwdReported { pane_id, .. } => Some(*pane_id),
+            _ => None,
+        };
+        if private_pane_id.is_some_and(|pane_id| self.retired_private_pane_ids.contains(&pane_id)) {
+            return false;
+        }
+        if let Some(owner_id) = private_pane_id.and_then(|pane_id| {
+            self.clients.iter().find_map(|(&client_id, client)| {
+                client
+                    .private_surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.pane_id() == pane_id)
+                    .then_some(client_id)
+            })
+        }) {
+            match ev {
+                AppEvent::PaneDied { .. } => {
+                    if let Some(client) = self.clients.get_mut(&owner_id) {
+                        if let Some(surface) = client.private_surface.take() {
+                            self.retired_private_pane_ids.insert(surface.pane_id());
+                            surface.shutdown();
+                        }
+                        client.request_repaint();
+                        client.defer_full_render();
+                    }
+                    if self.foreground_client_id == Some(owner_id) {
+                        self.sync_foreground_client_state();
+                        self.resize_shared_runtime_to_effective_size();
+                    }
+                    let _ = self.reconcile_omp_renderers();
+                    return true;
+                }
+                AppEvent::TerminalBell { count, .. } => {
+                    self.send_to_client(owner_id, ServerMessage::TerminalBell { count });
+                    return false;
+                }
+                AppEvent::TerminalCwdReported { cwd, .. } => {
+                    if let Some(surface) = self
+                        .clients
+                        .get_mut(&owner_id)
+                        .and_then(|client| client.private_surface.as_mut())
+                    {
+                        surface.update_cwd(cwd);
+                    }
+                    return false;
+                }
+                AppEvent::PaneClipboardWrite { content, .. } => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+                    self.send_to_client(owner_id, ServerMessage::Clipboard { data });
+                    return false;
+                }
+                _ => {}
+            }
+        }
         match &ev {
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
@@ -2891,9 +2973,9 @@ impl HeadlessServer {
                 }
                 false
             }
-            AppEvent::ClipboardWrite { content } => {
-                // Clipboard writes are client-local side effects. Forward them only to
-                // the foreground client instead of broadcasting to every attached client.
+            AppEvent::ClipboardWrite { content } | AppEvent::PaneClipboardWrite { content, .. } => {
+                // Clipboard writes are client-local side effects. Shared panes route to the
+                // foreground client; private panes returned above route to their owner.
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
                 if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
                     self.app.show_clipboard_feedback();
@@ -3492,6 +3574,72 @@ impl HeadlessServer {
             client.pending_terminal_attach && matches!(client.mode, ClientConnectionMode::App)
         })
     }
+    fn handle_private_surface_input_events(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> bool {
+        let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
+            &events,
+            self.app.state.redraw_on_focus_gained,
+        );
+        let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
+        let mut link_clicks = Vec::new();
+        let Some(view_id) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone())
+        else {
+            return false;
+        };
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.update_outer_focus_from_events(&events);
+        let theme_changed = client.update_host_theme_from_events(&events);
+        if host_surface_redraw {
+            client.request_repaint();
+            client.defer_full_render();
+        } else if !events.is_empty() {
+            client.request_semantic_redraw_after_input();
+        }
+        let theme = client.host_terminal_theme;
+        let appearance = client.host_terminal_appearance;
+        let Some(surface) = client.private_surface.as_mut() else {
+            return false;
+        };
+        if theme_changed {
+            surface.apply_host_theme(theme, appearance);
+        }
+        for event in events {
+            if let Some(click) = surface.route_event(event, mouse_scroll_lines) {
+                link_clicks.push(click);
+            }
+        }
+
+        for click in link_clicks {
+            let handled = match self.app.invoke_plugin_link_handler_for_url_from_source(
+                &click.url,
+                &click.source_pane_id,
+                &view_id,
+            ) {
+                Ok(handled) => handled,
+                Err(err) => {
+                    warn!(err = %err, url = %click.url, "failed to invoke private popup link handler");
+                    false
+                }
+            };
+            if !handled && crate::web_url::safe_web_url(&click.url).is_some() {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::OpenUrl {
+                        url: click.url.clone(),
+                    },
+                );
+            }
+        }
+        true
+    }
 
     /// Handles a server event. Returns true if the event requires a re-render.
     fn apply_omp_messages(&mut self, messages: Vec<(u64, ServerMessage)>) -> bool {
@@ -3677,10 +3825,11 @@ impl HeadlessServer {
                     navigation.non_findr_mode.unwrap_or(self.app.state.mode)
                 }
             });
-        client
-            .navigation
-            .as_ref()
-            .is_none_or(|navigation| navigation.focused_workspace_plugin_pane.is_none())
+        client.private_surface.is_none()
+            && client
+                .navigation
+                .as_ref()
+                .is_none_or(|navigation| navigation.focused_workspace_plugin_pane.is_none())
             && mode == app::Mode::Terminal
             && self.app.state.popup_pane.is_none()
     }
@@ -4418,10 +4567,16 @@ impl HeadlessServer {
         let Some((_ws_idx, pane_id)) = self.app.parse_pane_id(&route.pane_id) else {
             return false;
         };
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
         let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
             return false;
         };
-        let activated = self.app.activate_link_once(client_id, pane_id, url);
+        let activated = self
+            .app
+            .activate_link_once(client_id, pane_id, url, view_id.as_ref());
         self.finish_client_navigation_scope(client_id, canonical);
         activated
     }
@@ -4521,6 +4676,10 @@ impl HeadlessServer {
         };
         let keyboard_target = info.is_focused;
         let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
         let Some(guest) = self
             .clients
             .get(&client_id)
@@ -4585,7 +4744,10 @@ impl HeadlessServer {
                             info.inner_rect.width,
                             info.inner_rect.height,
                         )
-                        .is_some_and(|url| self.app.activate_link_click(client_id, info.id, url))
+                        .is_some_and(|url| {
+                            self.app
+                                .activate_link_click(client_id, info.id, url, view_id.as_ref())
+                        })
                     {
                         consumed = true;
                         continue;
@@ -4628,6 +4790,10 @@ impl HeadlessServer {
         if !info.inner_rect.contains(cell.into()) {
             return false;
         }
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
         let Some(guest) = self
             .clients
             .get(&client_id)
@@ -4665,7 +4831,10 @@ impl HeadlessServer {
                 info.inner_rect.width,
                 info.inner_rect.height,
             )
-            .is_some_and(|url| self.app.activate_link_click(client_id, info.id, url))
+            .is_some_and(|url| {
+                self.app
+                    .activate_link_click(client_id, info.id, url, view_id.as_ref())
+            })
         {
             return true;
         }
@@ -4699,6 +4868,14 @@ impl HeadlessServer {
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> bool {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.private_surface.is_some())
+        {
+            return self.handle_private_surface_input_events(client_id, events);
+        }
+
         let (events, identity_changed) = self.intercept_identity_input(client_id, events);
         if events.is_empty() && identity_changed {
             if let Some(client) = self.clients.get_mut(&client_id) {
@@ -4773,12 +4950,19 @@ impl HeadlessServer {
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
         let mut events = events.into_iter().peekable();
         let mut terminal_forward_only = events.peek().is_some();
         while let Some(event) = events.next() {
-            let forwarded_only = self
-                .app
-                .route_client_events_from(client_id, vec![event], false);
+            let forwarded_only = self.app.route_client_events_from_view(
+                client_id,
+                view_id.as_ref(),
+                vec![event],
+                false,
+            );
             terminal_forward_only &= forwarded_only;
             if interaction && events.peek().is_some() && !forwarded_only {
                 self.compute_client_navigation_view(client_id);
@@ -5216,6 +5400,10 @@ impl HeadlessServer {
                 if !valid || self.handoff_in_progress {
                     return false;
                 }
+                let view_id = self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.view_id.clone());
                 let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
                     return false;
                 };
@@ -5260,9 +5448,9 @@ impl HeadlessServer {
                     self.resize_shared_runtime_to_effective_size_before_input();
                     self.compute_client_navigation_view(client_id);
                 }
-                let routed = self
-                    .app
-                    .route_client_pixel_mouse(client_id, &data, geometry);
+                let routed =
+                    self.app
+                        .route_client_pixel_mouse(client_id, view_id.as_ref(), &data, geometry);
                 let deferred_requests_changed = self.handle_deferred_requests_headless();
                 self.finish_client_navigation_scope(client_id, canonical);
                 routed || foreground_changed || deferred_requests_changed
@@ -5440,6 +5628,25 @@ impl HeadlessServer {
                         *cell_size = observed;
                     }
                     render_state.request_repaint();
+                    return true;
+                }
+                if self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.private_surface.is_some())
+                {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.terminal_size = (cols, rows);
+                        let observed = crate::kitty_graphics::HostCellSize {
+                            width_px: cell_width_px,
+                            height_px: cell_height_px,
+                        };
+                        if observed.is_known() {
+                            client.cell_size = observed;
+                        }
+                        client.request_repaint();
+                        client.defer_full_render();
+                    }
                     return true;
                 }
                 if let Some(client) = self.clients.get_mut(&client_id) {
@@ -5844,6 +6051,150 @@ impl HeadlessServer {
             RenderImpact::None
         }
     }
+    fn refresh_plugin_registry_for_private_pane_scope(&mut self) -> std::io::Result<()> {
+        if self.app.no_session {
+            return Ok(());
+        }
+        let entries = crate::persist::plugin_registry::try_load()?;
+        let entries =
+            crate::persist::plugin_registry::reload_manifests(entries, |path, enabled| {
+                crate::app::load_plugin_manifest(path, enabled).map_err(|(_, message)| message)
+            });
+        self.app.state.installed_plugins = entries
+            .into_iter()
+            .map(|plugin| (plugin.plugin_id.clone(), plugin))
+            .collect();
+        Ok(())
+    }
+
+    fn private_popup_terminal_area_for_owner(&mut self, owner_id: u64) -> Option<Rect> {
+        let canonical_navigation = self.begin_client_navigation_scope(owner_id)?;
+        self.compute_client_navigation_view(owner_id);
+        let area = self.app.state.view.terminal_area;
+        self.finish_client_navigation_scope(owner_id, canonical_navigation);
+        Some(area)
+    }
+
+    fn client_private_plugin_popup_spec_for_owner(
+        &mut self,
+        owner_id: u64,
+        params: &api::schema::PluginPaneOpenParams,
+    ) -> Result<crate::app::ClientPrivatePluginPopupSpec, (&'static str, String)> {
+        let canonical_navigation = ClientNavigationState::capture(&self.app.state);
+        if let Some(navigation) = self
+            .clients
+            .get(&owner_id)
+            .and_then(|client| client.navigation.as_ref())
+        {
+            navigation.apply_to(&mut self.app.state);
+        }
+        let spec = self.app.client_private_plugin_popup_spec(params);
+        canonical_navigation.apply_to(&mut self.app.state);
+        spec
+    }
+
+    fn handle_client_private_plugin_pane_open(
+        &mut self,
+        id: String,
+        params: api::schema::PluginPaneOpenParams,
+    ) -> (String, bool) {
+        let error = |code: &str, message: String| {
+            serde_json::to_string(&api::schema::ErrorResponse {
+                id: id.clone(),
+                error: api::schema::ErrorBody {
+                    code: code.to_string(),
+                    message,
+                },
+            })
+            .unwrap_or_else(|_| "{}".to_string())
+        };
+        let Some(requested_view_id) = params.view_id.as_ref() else {
+            return (
+                error(
+                    "view_id_required",
+                    "client-private plugin panes require view_id".to_string(),
+                ),
+                false,
+            );
+        };
+        let owner_id = self.clients.iter().find_map(|(&client_id, client)| {
+            (client.is_full_app_client()
+                && client.writer.is_some()
+                && client.view_id.as_ref() == Some(requested_view_id))
+            .then_some(client_id)
+        });
+        let Some(owner_id) = owner_id else {
+            return (
+                error(
+                    "view_not_found",
+                    format!("view {requested_view_id} is not connected"),
+                ),
+                false,
+            );
+        };
+
+        let spec = match self.client_private_plugin_popup_spec_for_owner(owner_id, &params) {
+            Ok(spec) => spec,
+            Err((code, message)) => return (error(code, message), false),
+        };
+        let Some(area) = self.private_popup_terminal_area_for_owner(owner_id) else {
+            return (
+                error(
+                    "view_not_found",
+                    "view disconnected during request".to_string(),
+                ),
+                false,
+            );
+        };
+        let Some((cell_size, theme, appearance)) = self.clients.get(&owner_id).map(|client| {
+            (
+                client.cell_size,
+                client.host_terminal_theme,
+                client.host_terminal_appearance,
+            )
+        }) else {
+            return (
+                error(
+                    "view_not_found",
+                    "view disconnected during request".to_string(),
+                ),
+                false,
+            );
+        };
+
+        match crate::server::private_surface::PrivateSurface::spawn(
+            spec, area, cell_size, theme, appearance, &self.app,
+        ) {
+            Ok(surface) => {
+                let Some(client) = self.clients.get_mut(&owner_id) else {
+                    self.retired_private_pane_ids.insert(surface.pane_id());
+                    surface.shutdown();
+                    return (
+                        error(
+                            "view_not_found",
+                            "view disconnected during request".to_string(),
+                        ),
+                        false,
+                    );
+                };
+                if let Some(previous) = client.private_surface.replace(surface) {
+                    self.retired_private_pane_ids.insert(previous.pane_id());
+                    previous.shutdown();
+                }
+                client.graphics_surface_reset_pending = true;
+                client.request_repaint();
+                client.defer_full_render();
+                let response = serde_json::to_string(&api::schema::SuccessResponse {
+                    id,
+                    result: api::schema::ResponseResult::Ok {},
+                })
+                .unwrap_or_else(|_| "{}".to_string());
+                let _ = self.reconcile_omp_renderers();
+                (response, true)
+            }
+            Err(err) => (error("plugin_pane_open_failed", err.to_string()), false),
+        }
+    }
 
     fn handle_api_request_with_shutdown_check_inner(
         &mut self,
@@ -5866,12 +6217,35 @@ impl HeadlessServer {
             let _ = msg.respond_to.send(response);
             return false;
         }
+        let mut changed = self.drain_all_internal_events_with_forwarding();
+        if let api::schema::Method::PluginPaneOpen(params) = &msg.request.method {
+            if let Err(err) = self.refresh_plugin_registry_for_private_pane_scope() {
+                let response = serde_json::to_string(&api::schema::ErrorResponse {
+                    id: msg.request.id.clone(),
+                    error: api::schema::ErrorBody {
+                        code: "plugin_registry_load_failed".to_string(),
+                        message: err.to_string(),
+                    },
+                })
+                .unwrap_or_else(|_| "{}".to_string());
+                let _ = msg.respond_to.send(response);
+                return changed;
+            }
+            if self.app.plugin_pane_effective_scope(params)
+                == api::schema::PluginPaneScope::ClientPrivate
+            {
+                let (response, plugin_changed) = self
+                    .handle_client_private_plugin_pane_open(msg.request.id.clone(), params.clone());
+                let _ = msg.respond_to.send(response);
+                return changed | plugin_changed;
+            }
+        }
 
         if let api::schema::Method::PaneOmpBridge(params) = &msg.request.method {
             let response =
                 self.handle_pane_omp_bridge_api(msg.request.id.clone(), params, msg.context);
             let _ = msg.respond_to.send(response);
-            return false;
+            return changed;
         }
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
@@ -5879,7 +6253,7 @@ impl HeadlessServer {
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
             AltScreenReadConflict::Defer => {
                 self.deferred_alt_screen_reads.push(msg);
-                return false;
+                return changed;
             }
         };
 
@@ -5947,14 +6321,13 @@ impl HeadlessServer {
                 | api::schema::Method::PaneGraphicsStreamClose(_)
         )
         .then_some(self.app.pane_graphics.revision());
-        let mut changed = metadata_expired
+        changed |= metadata_expired
             | (pane_graphics_revision_before.is_none() && api::request_changes_ui(&msg.request));
         let skip_default_workspace = skip_default_workspace_for_request
             || matches!(
                 &msg.request.method,
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
-        changed |= self.drain_all_internal_events_with_forwarding();
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
@@ -6253,10 +6626,9 @@ impl HeadlessServer {
             .app
             .state
             .should_capture_host_mouse_from(&self.app.terminal_runtimes);
-        let pixel_mouse_requested = self
-            .clients
-            .values()
-            .any(|client| client.is_full_app_client() && client.pixel_mouse);
+        let pixel_mouse_requested = self.clients.values().any(|client| {
+            client.is_full_app_client() && client.private_surface.is_none() && client.pixel_mouse
+        });
         let sgr_pixels = pixel_mouse_requested
             && self.focused_pane_graphics_demand()
             && self
@@ -6283,8 +6655,10 @@ impl HeadlessServer {
             if !client.is_full_app_client() {
                 continue;
             }
-            let client_sgr_pixels = sgr_pixels && client.pixel_mouse;
-            if client.host_mouse_capture_active == Some(enabled)
+            let client_enabled = client.private_surface.is_some() || enabled;
+            let client_sgr_pixels =
+                client.private_surface.is_none() && sgr_pixels && client.pixel_mouse;
+            if client.host_mouse_capture_active == Some(client_enabled)
                 && client.host_sgr_pixels_active == Some(client_sgr_pixels)
             {
                 continue;
@@ -6293,7 +6667,7 @@ impl HeadlessServer {
                 continue;
             };
             let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture {
-                enabled,
+                enabled: client_enabled,
                 sgr_pixels: client_sgr_pixels,
             }) {
                 Ok(framed) => framed,
@@ -6310,7 +6684,7 @@ impl HeadlessServer {
                 broken_clients.push(client_id);
                 continue;
             }
-            client.host_mouse_capture_active = Some(enabled);
+            client.host_mouse_capture_active = Some(client_enabled);
             client.host_sgr_pixels_active = Some(client_sgr_pixels);
         }
 
@@ -6321,27 +6695,36 @@ impl HeadlessServer {
 
     fn stream_host_keyboard_enhancement_flags(&mut self) {
         let report_all_keys = self.app.host_keyboard_report_all_requested();
-        let serialized = match Self::frame_server_message(&ServerMessage::KittyKeyboardReportAll {
-            enabled: report_all_keys,
-        }) {
-            Ok(framed) => framed,
-            Err(err) => {
-                warn!(err = %err, "failed to serialize keyboard enhancement flags for clients");
-                return;
-            }
-        };
 
         let mut broken_clients = Vec::new();
         for (&client_id, client) in &mut self.clients {
-            if !client.is_full_app_client()
-                || client.host_keyboard_report_all_active == Some(report_all_keys)
-            {
+            if !client.is_full_app_client() {
+                continue;
+            }
+            let client_report_all = client
+                .private_surface
+                .as_ref()
+                .map_or(report_all_keys, |surface| {
+                    surface.keyboard_report_all_requested()
+                });
+            if client.host_keyboard_report_all_active == Some(client_report_all) {
                 continue;
             }
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            let serialized = match Self::frame_server_message(
+                &ServerMessage::KittyKeyboardReportAll {
+                    enabled: client_report_all,
+                },
+            ) {
+                Ok(framed) => framed,
+                Err(err) => {
+                    warn!(client_id, err = %err, "failed to serialize keyboard enhancement flags for client");
+                    continue;
+                }
+            };
+            if writer.control.send(serialized).is_err() {
                 debug!(
                     client_id,
                     "client writer channel closed during keyboard enhancement update"
@@ -6349,7 +6732,7 @@ impl HeadlessServer {
                 broken_clients.push(client_id);
                 continue;
             }
-            client.host_keyboard_report_all_active = Some(report_all_keys);
+            client.host_keyboard_report_all_active = Some(client_report_all);
         }
 
         for client_id in broken_clients {
@@ -6372,6 +6755,16 @@ impl HeadlessServer {
         } else {
             HashSet::new()
         };
+        pane_ids.extend(self.clients.values().filter_map(|client| {
+            (client.writer.is_some() && client.is_full_app_client())
+                .then(|| {
+                    client
+                        .private_surface
+                        .as_ref()
+                        .map(|surface| surface.pane_id())
+                })
+                .flatten()
+        }));
         if !direct_terminal_targets.is_empty() {
             for workspace in &self.app.state.workspaces {
                 for tab in &workspace.tabs {
@@ -6428,6 +6821,17 @@ impl HeadlessServer {
         &self,
         sources: &HashSet<crate::layout::PaneId>,
     ) -> bool {
+        if sources.iter().any(|pane_id| {
+            self.clients.values().any(|client| {
+                client.writer.is_some()
+                    && client
+                        .private_surface
+                        .as_ref()
+                        .is_some_and(|surface| surface.pane_id() == *pane_id)
+            })
+        }) {
+            return true;
+        }
         let (has_app_target, direct_terminal_targets) = self.pty_render_targets();
         if !has_app_target && direct_terminal_targets.is_empty() {
             return false;
@@ -6525,6 +6929,9 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(client_id) else {
             retained_fallback!("client_missing");
         };
+        if client.private_surface.is_some() {
+            retained_fallback!("private_surface");
+        }
         if client.deferred_render() != DeferredRender::None {
             retained_fallback!("render_pending");
         }
@@ -6747,6 +7154,14 @@ impl HeadlessServer {
                 self.apply_client_navigation(client_id, &canonical_navigation);
             }
             let mut findr_changed = false;
+            let mut private_surface = is_app_client
+                .then(|| {
+                    self.clients
+                        .get_mut(&client_id)
+                        .and_then(|client| client.private_surface.take())
+                })
+                .flatten();
+            let has_private_surface = private_surface.is_some();
             let mut frame = match mode {
                 ClientConnectionMode::OmpPane => continue,
                 ClientConnectionMode::App => {
@@ -6780,12 +7195,13 @@ impl HeadlessServer {
                     }
                     findr_changed = self.app.refresh_findr_visible_if_needed(&HashSet::new());
                     let (mut buffer, mut cursor) =
-                        crate::server::render_stream::render_precomputed_virtual_with_runtime_registry(
+                        crate::server::render_stream::render_precomputed_virtual_with_runtime_registry_and_private_surface(
                             &self.app.state,
                             &self.app.terminal_runtimes,
                             area,
                             pre_compute_suppresses_focused_terminal_cursor,
                             &identity,
+                            private_surface.as_ref(),
                         );
                     if let Some(info) = self.independent_omp_pane_info(client_id) {
                         let inner = info.inner_rect;
@@ -6877,6 +7293,23 @@ impl HeadlessServer {
                             );
                         }
                     }
+                    if let Some(surface) = private_surface.as_mut() {
+                        let private_area = self.app.state.view.terminal_area;
+                        surface.resize(private_area, cell_size);
+                        crate::server::render_stream::overlay_private_surface(
+                            &mut buffer,
+                            surface,
+                            &self.app.state.palette,
+                            private_area,
+                        );
+                        cursor = surface.cursor(private_area);
+                        if let Some(outer) = surface.outer_rect(private_area) {
+                            hyperlinks.retain(|((x, y), _, _)| {
+                                !outer.contains(ratatui::layout::Position::new(*x, *y))
+                            });
+                        }
+                        hyperlinks.extend(surface.visible_hyperlinks(private_area));
+                    }
                     crate::render_prof::duration_since(
                         "full_render.visible_hyperlinks",
                         hyperlinks_started,
@@ -6931,7 +7364,8 @@ impl HeadlessServer {
             let rendered_findr = (is_app_client && findr_changed)
                 .then(|| crate::server::clients::capture_findr(&self.app.state));
 
-            let native_omp_surface_active = self.native_omp_surface_active(client_id);
+            let native_omp_surface_active =
+                !has_private_surface && self.native_omp_surface_active(client_id);
             let excluded_graphics_pane = (!native_omp_surface_active)
                 .then(|| self.replaced_omp_pane_info(client_id).map(|info| info.id))
                 .flatten();
@@ -6943,11 +7377,19 @@ impl HeadlessServer {
                     navigation.findr = findr;
                 }
             }
+            if let Some(surface) = private_surface {
+                client.private_surface = Some(surface);
+            }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
             let mut encoded = if native_omp_surface_active {
                 crate::kitty_graphics::EncodedGraphics {
                     bytes: Vec::new(),
+                    incomplete: false,
+                }
+            } else if has_private_surface {
+                crate::kitty_graphics::EncodedGraphics {
+                    bytes: next_graphics_cache.clear_bytes(),
                     incomplete: false,
                 }
             } else if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known()
@@ -7367,7 +7809,12 @@ impl Drop for HeadlessServer {
         let staged_files = self
             .clients
             .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
+            .flat_map(|(_, mut client)| {
+                if let Some(surface) = client.private_surface.take() {
+                    surface.shutdown();
+                }
+                client.staged_clipboard_files
+            })
             .collect::<Vec<_>>();
         crate::server::clipboard_image::remove_files(staged_files);
         let _ = self.cleanup_sockets();
@@ -7711,6 +8158,7 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Read as _;
 
     fn test_host_admission_sender(
@@ -7937,6 +8385,7 @@ mod tests {
             next_omp_renderer_launch_id: 1,
             omp_service: OmpService::new(Some(omp_bridge::bind().expect("bind test OMP bridge")))
                 .expect("create test OMP service"),
+            retired_private_pane_ids: HashSet::new(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -8738,10 +9187,12 @@ mod tests {
             .insert(1, test_identity_client(Some("Ada"), None));
 
         let mut host_receivers = Vec::new();
+        let mut host_peers = Vec::new();
         let mut host_socket = |host_id| {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
-            let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            let peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
                 .expect("connect OMP host peer");
+            host_peers.push(peer);
             let (socket, _) = listener.accept().expect("accept OMP host peer");
             let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(1);
             host_receivers.push(outbound_rx);
@@ -14695,6 +15146,40 @@ next_tab = ""
             None,
         )
     }
+    fn test_private_popup_params(
+        view_id: Option<crate::api::schema::ViewId>,
+    ) -> crate::api::schema::PluginPaneOpenParams {
+        crate::api::schema::PluginPaneOpenParams {
+            plugin_id: "test.private".to_string(),
+            entrypoint: "popup".to_string(),
+            placement: Some(crate::api::schema::PluginPanePlacement::Popup),
+            scope: Some(crate::api::schema::PluginPaneScope::ClientPrivate),
+            view_id,
+            width: None,
+            height: None,
+            workspace_id: None,
+            target_pane_id: None,
+            direction: None,
+            cwd: None,
+            focus: false,
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    fn private_popup_error_code(
+        server: &mut HeadlessServer,
+        view_id: Option<crate::api::schema::ViewId>,
+    ) -> String {
+        let (response, changed) = server.handle_client_private_plugin_pane_open(
+            "private-test".to_string(),
+            test_private_popup_params(view_id),
+        );
+        assert!(!changed);
+        serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("private popup error response")
+            .error
+            .code
+    }
 
     fn test_identity_client(
         display_name: Option<&str>,
@@ -17003,6 +17488,69 @@ next_tab = ""
         );
     }
 
+    #[tokio::test]
+    async fn private_clipboard_write_targets_private_surface_owner() {
+        let mut server = test_headless_server();
+        let (owner_tx, owner_control_rx, _owner_rx) = test_client_writer();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        let mut owner = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(owner_tx),
+        );
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                "w1:p1",
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: private_pane_id,
+                content: b"private".to_vec(),
+            }),
+            "private clipboard writes should not change shared visual state"
+        );
+        assert!(
+            server.app.state.copy_feedback.is_none(),
+            "private clipboard writes must not set shared copy feedback"
+        );
+
+        match read_server_message(
+            owner_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap(),
+        ) {
+            ServerMessage::Clipboard { data } => assert_eq!(data, "cHJpdmF0ZQ=="),
+            other => panic!("expected clipboard message, got {other:?}"),
+        }
+        assert!(foreground_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+    }
+
     #[test]
     fn clipboard_write_without_foreground_client_does_not_show_feedback() {
         let mut server = test_headless_server();
@@ -18207,6 +18755,455 @@ next_tab = ""
                 .is_err(),
             "stale idle report must not forward a done sound"
         );
+    }
+    #[test]
+    fn reconnecting_full_app_client_gets_a_distinct_view_id() {
+        let first = test_app_client(None, 1).view_id.expect("first view id");
+        let second = test_app_client(None, 2).view_id.expect("second view id");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn private_popup_requires_a_view_id() {
+        let mut server = test_headless_server();
+
+        assert_eq!(
+            private_popup_error_code(&mut server, None),
+            "view_id_required"
+        );
+    }
+
+    #[test]
+    fn private_popup_rejects_an_unknown_view_id() {
+        let mut server = test_headless_server();
+        let unknown = crate::api::schema::ViewId::from_opaque("view_unknown").unwrap();
+
+        assert_eq!(
+            private_popup_error_code(&mut server, Some(unknown)),
+            "view_not_found"
+        );
+    }
+
+    #[test]
+    fn private_popup_rejects_a_stale_disconnected_view_id() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        let stale = client.view_id.clone().expect("connected view id");
+        server.clients.insert(1, client);
+        assert_eq!(server.clients[&1].view_id.as_ref(), Some(&stale));
+        server.clients.remove(&1);
+
+        assert_eq!(
+            private_popup_error_code(&mut server, Some(stale)),
+            "view_not_found"
+        );
+    }
+
+    #[test]
+    fn untargeted_private_popup_uses_owner_navigation_source() {
+        let mut server = test_headless_server();
+        let owner_workspace = crate::workspace::Workspace::test_new("owner");
+        let owner_workspace_id = owner_workspace.id.clone();
+        let foreground_workspace = crate::workspace::Workspace::test_new("foreground");
+        let foreground_workspace_id = foreground_workspace.id.clone();
+        server.app.state.workspaces = vec![owner_workspace, foreground_workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let owner_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        let mut owner = test_app_client(None, 1);
+        owner.navigation = Some(owner_navigation);
+        server.clients.insert(1, owner);
+        let mut foreground = test_app_client(None, 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "test.private",
+                "name": "Private test",
+                "version": "1.0.0",
+                "manifest_path": "/tmp/test.private/herdr-plugin.toml",
+                "plugin_root": "/tmp/test.private",
+                "enabled": true,
+                "panes": [{
+                    "id": "popup",
+                    "title": "Private test",
+                    "placement": "popup",
+                    "scope": "client_private",
+                    "command": ["true"]
+                }]
+            }))
+            .unwrap();
+        server
+            .app
+            .state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let spec = server
+            .client_private_plugin_popup_spec_for_owner(1, &test_private_popup_params(None))
+            .expect("private popup spec");
+
+        assert_eq!(spec.source_pane_id, format!("{owner_workspace_id}:p1"));
+        assert_eq!(
+            server.app.state.active,
+            server
+                .app
+                .state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == foreground_workspace_id)
+        );
+    }
+
+    #[test]
+    fn private_popup_geometry_uses_owner_terminal_area() {
+        let mut server = test_headless_server();
+        let owner_workspace = crate::workspace::Workspace::test_new("owner");
+        let foreground_workspace = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![owner_workspace, foreground_workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let owner_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut owner = test_app_client(None, 1);
+        owner.terminal_size = (120, 40);
+        owner.navigation = Some(owner_navigation);
+        server.clients.insert(1, owner);
+        let mut foreground = test_app_client(None, 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        let area = server
+            .private_popup_terminal_area_for_owner(1)
+            .expect("owner terminal area");
+
+        assert_eq!(area, Rect::new(26, 1, 94, 39));
+        assert_ne!(area, Rect::new(0, 0, 120, 40));
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.effective_size, (80, 24));
+    }
+
+    #[tokio::test]
+    async fn failed_private_popup_replacement_keeps_the_existing_surface() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("source");
+        let source_pane_id = format!("{}:p1", workspace.id);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "test.private",
+                "name": "Private test",
+                "version": "1.0.0",
+                "manifest_path": "/tmp/test.private/herdr-plugin.toml",
+                "plugin_root": "/tmp/test.private",
+                "enabled": true,
+                "panes": [{
+                    "id": "popup",
+                    "title": "Private test",
+                    "placement": "popup",
+                    "scope": "client_private",
+                    "command": ["true"]
+                }]
+            }))
+            .unwrap();
+        server
+            .app
+            .state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let mut client = ClientConnection::new(
+            (1, 1),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        let view_id = client.view_id.clone().expect("connected view id");
+        client.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                &source_pane_id,
+                b"existing",
+            ),
+        );
+        let existing_pane_id = client.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, client);
+
+        let mut params = test_private_popup_params(Some(view_id));
+        params.target_pane_id = Some(source_pane_id);
+        let (response, changed) =
+            server.handle_client_private_plugin_pane_open("replace-private".to_string(), params);
+        let response = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("private popup launch error");
+
+        assert!(!changed);
+        assert_eq!(response.error.code, "plugin_pane_open_failed");
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(existing_pane_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn private_pane_died_removes_only_the_owner_surface() {
+        let mut server = test_headless_server();
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                "w1:p1",
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        server.clients.insert(2, test_app_client(None, 2));
+        let shared_counts = (
+            server.app.state.workspaces.len(),
+            server.app.state.terminals.len(),
+        );
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: private_pane_id,
+            })
+        );
+
+        assert!(server.clients[&1].private_surface.is_none());
+        assert!(server.clients.contains_key(&2));
+        assert_eq!(
+            (
+                server.app.state.workspaces.len(),
+                server.app.state.terminals.len(),
+            ),
+            shared_counts,
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_private_pane_death_resynchronizes_shared_runtime() {
+        let (mut server, _render_rx, pane_id) = retained_test_server(b"shared");
+        let private_pane_id = {
+            let client = server.clients.get_mut(&1).expect("foreground owner");
+            client.private_surface = Some(
+                crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                    Rect::new(0, 0, 80, 24),
+                    "w1:p1",
+                    b"private",
+                ),
+            );
+            client.private_surface.as_ref().unwrap().pane_id()
+        };
+        let initial_shared_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("shared runtime")
+            .current_size();
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        assert_eq!(server.effective_size, (80, 24));
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .expect("shared runtime")
+                .current_size(),
+            initial_shared_size,
+        );
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: private_pane_id,
+            })
+        );
+
+        let terminal_area = server.app.state.view.terminal_area;
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .expect("resized shared runtime")
+                .current_size(),
+            (terminal_area.height, terminal_area.width.saturating_sub(1),),
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn disconnected_private_pane_died_event_is_consumed() {
+        let mut server = test_headless_server();
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                "w1:p1",
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+
+        server.remove_client(1);
+        assert!(server.retired_private_pane_ids.contains(&private_pane_id));
+
+        for _ in 0..2 {
+            assert!(
+                !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                    pane_id: private_pane_id,
+                })
+            );
+        }
+        assert!(server.retired_private_pane_ids.contains(&private_pane_id));
+    }
+
+    #[tokio::test]
+    async fn private_resize_does_not_promote_or_resize_shared_runtime() {
+        let (mut server, _render_rx, pane_id) = retained_test_server(b"shared");
+        server.clients.insert(2, test_app_client(None, 2));
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let source_pane_id = "w1:p1";
+        server.clients.get_mut(&1).unwrap().private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                source_pane_id,
+                b"private",
+            ),
+        );
+        let shared_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap()
+            .current_size();
+        let effective_size = server.effective_size;
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 100,
+            rows: 30,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        server.render_and_stream();
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, effective_size);
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .unwrap()
+                .current_size(),
+            shared_size,
+        );
+        let surface = server.clients[&1].private_surface.as_ref().unwrap();
+        let render_area = surface.render_area_for_test();
+        assert_ne!(render_area, Rect::new(0, 0, 100, 30));
+        let expected = crate::popup_size::resolve_popup_geometry(None, None, render_area)
+            .unwrap()
+            .inner;
+        assert_eq!(
+            surface.runtime_size_for_test(),
+            Some((expected.height, expected.width)),
+        );
+    }
+
+    #[tokio::test]
+    async fn private_render_cursor_and_hyperlinks_are_owner_only() {
+        let (mut server, owner_rx, _pane_id) = retained_test_server(b"shared");
+        let (observer_tx, _observer_control_rx, observer_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(observer_tx),
+            ),
+        );
+        let source_pane_id = "w1:p1";
+        server.clients.get_mut(&1).unwrap().private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                source_pane_id,
+                b"\x1b[3;4H\x1b]8;;file:///tmp/private.txt\x1b\\private\x1b]8;;\x1b\\",
+            ),
+        );
+
+        server.render_and_stream();
+
+        let owner = read_server_frame(owner_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let observer = read_server_frame(
+            observer_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap(),
+        );
+        assert!(owner
+            .hyperlinks
+            .iter()
+            .any(|url| url == "file:///tmp/private.txt"));
+        assert!(!observer
+            .hyperlinks
+            .iter()
+            .any(|url| url == "file:///tmp/private.txt"));
+        let expected_cursor = server.clients[&1]
+            .private_surface
+            .as_ref()
+            .unwrap()
+            .cursor(server.app.state.view.terminal_area);
+        assert_eq!(owner.cursor, expected_cursor);
+        assert_ne!(observer.cursor, expected_cursor);
     }
 
     /// Verify that no direct calls to `self.app.handle_internal_event`

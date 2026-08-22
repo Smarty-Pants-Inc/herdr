@@ -58,6 +58,7 @@ impl App {
     ) -> std::io::Result<()> {
         self.spawn_popup_command(
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             extra_env,
             geometry,
             |pane_id, rows, cols, cwd, launch_env, app| {
@@ -81,24 +82,32 @@ impl App {
         )
     }
 
-    pub(crate) fn spawn_popup_argv_command(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_popup_plugin_command(
         &mut self,
-        argv: &[String],
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         extra_env: Vec<(String, String)>,
         geometry: PopupGeometry,
     ) -> std::io::Result<()> {
         self.spawn_popup_command(
             cwd,
+            execution_target,
             extra_env,
             geometry,
             |pane_id, rows, cols, cwd, launch_env, app| {
-                TerminalRuntime::spawn_argv_command(
+                TerminalRuntime::spawn_plugin_command_on(
                     pane_id,
                     rows,
                     cols,
                     cwd,
-                    argv,
+                    execution_target,
+                    plugin_id,
+                    entrypoint,
+                    local_argv,
                     launch_env,
                     crate::pane::AgentDetection::Disabled,
                     app.state.pane_scrollback_limit_bytes,
@@ -108,7 +117,7 @@ impl App {
                     app.render_notify.clone(),
                     app.render_dirty.clone(),
                 )
-                .map(|runtime| (runtime, Some(argv.to_vec())))
+                .map(|runtime| (runtime, Some(local_argv.to_vec())))
             },
         )
     }
@@ -116,6 +125,7 @@ impl App {
     fn spawn_popup_command<F>(
         &mut self,
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         extra_env: Vec<(String, String)>,
         geometry: PopupGeometry,
         spawn: F,
@@ -171,8 +181,11 @@ impl App {
         let cols = resolved_geometry.inner.width;
         let (runtime, launch_argv) = spawn(pane_id, rows, cols, cwd.clone(), &launch_env, self)?;
         let terminal = match launch_argv {
-            Some(argv) => TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv),
-            None => TerminalState::new(terminal_id.clone(), cwd),
+            Some(argv) => TerminalState::new(terminal_id.clone(), cwd)
+                .with_execution_target(execution_target.clone())
+                .with_launch_argv(argv),
+            None => TerminalState::new(terminal_id.clone(), cwd)
+                .with_execution_target(execution_target.clone()),
         };
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         self.state.terminals.insert(terminal_id.clone(), terminal);

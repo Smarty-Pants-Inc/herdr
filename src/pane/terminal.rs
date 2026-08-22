@@ -33,7 +33,8 @@ use super::{
         maybe_filter_primary_screen_scrollback_clear, parse_reported_cwd,
         restore_host_terminal_theme_if_needed, write_host_terminal_theme_selective,
         AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
-        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker,
+        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker, RemoteExecReady,
+        RemoteExecReadyFilter, ReportedCwd,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -187,7 +188,8 @@ pub(crate) struct ProcessBytesResult {
     pub terminal_title_changed: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
-    pub reported_cwd: Option<std::path::PathBuf>,
+    pub reported_cwd: Option<ReportedCwd>,
+    pub remote_exec_ready: Option<RemoteExecReady>,
     pub terminal_responses: Vec<Bytes>,
 }
 
@@ -219,6 +221,7 @@ pub(crate) struct GhosttyPaneCore {
     pub child_default_foreground_changed: bool,
     pub child_default_background_changed: bool,
     pub osc_debug_tracker: OscDebugTracker,
+    remote_exec_ready_filter: RemoteExecReadyFilter,
     pub agent_osc_state: AgentOscStateTracker,
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
     decscusr_tracker: DecscusrTracker,
@@ -244,6 +247,15 @@ impl PaneTerminal {
     ) -> ProcessBytesResult {
         self.ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
+    }
+    #[cfg(unix)]
+    pub(crate) fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
+        self.ghostty.remote_exec_ready_filter_state()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn seed_remote_exec_ready_filter(&self, state: RemoteExecReadyFilter) {
+        self.ghostty.seed_remote_exec_ready_filter(state);
     }
 
     pub fn resize(
@@ -1375,6 +1387,7 @@ impl GhosttyPaneTerminal {
                 child_default_foreground_changed: false,
                 child_default_background_changed: false,
                 osc_debug_tracker: OscDebugTracker::default(),
+                remote_exec_ready_filter: RemoteExecReadyFilter::default(),
                 agent_osc_state: AgentOscStateTracker::default(),
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
                 decscusr_tracker: DecscusrTracker::default(),
@@ -1527,6 +1540,20 @@ impl GhosttyPaneTerminal {
             core.agent_osc_state.clear_retained();
         }
     }
+    #[cfg(unix)]
+    fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
+        self.core
+            .lock()
+            .map(|core| core.remote_exec_ready_filter.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn seed_remote_exec_ready_filter(&self, state: RemoteExecReadyFilter) {
+        if let Ok(mut core) = self.core.lock() {
+            core.remote_exec_ready_filter = state.validated_handoff_state();
+        }
+    }
 
     pub fn process_pty_bytes(
         &self,
@@ -1545,6 +1572,7 @@ impl GhosttyPaneTerminal {
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
                 reported_cwd: None,
+                remote_exec_ready: None,
                 terminal_responses: Vec::new(),
             };
         };
@@ -1554,7 +1582,10 @@ impl GhosttyPaneTerminal {
         // Those effects must not be delivered as live pane output.
         let _ = core.terminal.take_bell_count();
         let _ = core.terminal.take_clipboard_writes();
-        let default_color_observation = core.default_color_tracker.observe(bytes);
+        let filtered_remote_exec = core.remote_exec_ready_filter.filter(bytes);
+        let remote_exec_ready = filtered_remote_exec.ready;
+        let bytes = filtered_remote_exec.bytes;
+        let default_color_observation = core.default_color_tracker.observe(bytes.as_ref());
         if shell_pid > 0 && default_color_observation {
             if let Some(owner_pgid) = current_transient_default_color_owner(shell_pid) {
                 core.transient_default_color_owner_pgid = Some(owner_pgid);
@@ -1565,7 +1596,7 @@ impl GhosttyPaneTerminal {
             }
         }
 
-        core.osc_debug_tracker.observe(bytes);
+        core.osc_debug_tracker.observe(bytes.as_ref());
         for event in core.osc_debug_tracker.drain_pending() {
             debug!(
                 pane = pane_id.raw(),
@@ -1574,7 +1605,7 @@ impl GhosttyPaneTerminal {
                 "agent OSC evidence observed"
             );
         }
-        let terminal_title_changed = core.agent_osc_state.observe(bytes);
+        let terminal_title_changed = core.agent_osc_state.observe(bytes.as_ref());
 
         let alternate_screen = core
             .terminal
@@ -1582,16 +1613,17 @@ impl GhosttyPaneTerminal {
             .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
             .unwrap_or(false);
         let filtered_bytes = if shell_pid > 0 {
-            let foreground_job = (!alternate_screen && contains_scrollback_clear_sequence(bytes))
-                .then(|| crate::detect::foreground_job(shell_pid))
-                .flatten();
+            let foreground_job = (!alternate_screen
+                && contains_scrollback_clear_sequence(bytes.as_ref()))
+            .then(|| crate::detect::foreground_job(shell_pid))
+            .flatten();
             maybe_filter_primary_screen_scrollback_clear(
-                bytes,
+                bytes.as_ref(),
                 alternate_screen,
                 foreground_job.as_ref(),
             )
         } else {
-            Cow::Borrowed(bytes)
+            Cow::Borrowed(bytes.as_ref())
         };
         if filtered_bytes.len() != bytes.len() {
             debug!(
@@ -1655,18 +1687,24 @@ impl GhosttyPaneTerminal {
         }
         #[cfg(windows)]
         let reported_cwd = if core.windows_powershell_prompt_cwd_reporting {
-            reported_cwd.or_else(|| windows_powershell_current_prompt_cwd(&mut core))
+            reported_cwd
+                .or_else(|| windows_powershell_current_prompt_cwd(&mut core).map(|cwd| (cwd, None)))
         } else {
             reported_cwd
         };
 
-        let request_render = !synchronized_output;
-        let render_delay = render_delay_after_pty_write(
-            synchronized_output,
-            has_kitty_graphics_sequence,
-            cursor_position_settle_pending(&core),
-            CURSOR_POSITION_SETTLE_ENABLED,
-        );
+        let has_terminal_bytes = !filtered_bytes.is_empty();
+        let request_render = has_terminal_bytes && !synchronized_output;
+        let render_delay = has_terminal_bytes
+            .then(|| {
+                render_delay_after_pty_write(
+                    synchronized_output,
+                    has_kitty_graphics_sequence,
+                    cursor_position_settle_pending(&core),
+                    CURSOR_POSITION_SETTLE_ENABLED,
+                )
+            })
+            .flatten();
         if request_render {
             crate::render_prof::event("pty.request_render");
         }
@@ -1682,6 +1720,7 @@ impl GhosttyPaneTerminal {
             terminal_title_changed,
             terminal_bells,
             clipboard_writes,
+            remote_exec_ready,
             reported_cwd,
             terminal_responses,
         }
@@ -4491,19 +4530,26 @@ mod tests {
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
 
-        let partial = pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file:///tmp/herdr%20", &tx);
+        let partial =
+            pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file://build-host/tmp/herdr%20", &tx);
         assert_eq!(partial.reported_cwd, None);
 
         let completed = pane.process_pty_bytes(pane_id, 0, b"repo\x07", &tx);
         #[cfg(not(windows))]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("/tmp/herdr repo"))
+            Some((
+                std::path::PathBuf::from("/tmp/herdr repo"),
+                Some("build-host".into())
+            ))
         );
         #[cfg(windows)]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("\\tmp\\herdr repo"))
+            Some((
+                std::path::PathBuf::from("\\tmp\\herdr repo"),
+                Some("build-host".into())
+            ))
         );
 
         let latest = pane.process_pty_bytes(
@@ -4514,8 +4560,40 @@ mod tests {
         );
         assert_eq!(
             latest.reported_cwd,
-            Some(std::path::PathBuf::from("/tmp/iterm2"))
+            Some((std::path::PathBuf::from("/tmp/iterm2"), None))
         );
+    }
+    #[test]
+    fn process_pty_bytes_consumes_split_remote_ready_marker_without_rendering_it() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        let first = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"\x1b]6973;herdr-remote-exec-ready={\"hostname\":\"build",
+            &tx,
+        );
+        assert!(!first.request_render);
+        assert_eq!(first.remote_exec_ready, None);
+
+        let second = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"-node\",\"cwd\":\"/remote/plugin-root\"}\x1b\\",
+            &tx,
+        );
+        assert!(!second.request_render);
+        assert_eq!(
+            second.remote_exec_ready,
+            Some(RemoteExecReady {
+                hostname: Some("build-node".into()),
+                cwd: Some("/remote/plugin-root".into()),
+            })
+        );
+        assert!(pane.detection_text().trim().is_empty());
     }
 
     #[test]
@@ -4654,7 +4732,7 @@ mod tests {
 
         let result = process_windows_powershell_prompt_bytes(bytes.as_bytes(), 80, 24, true);
 
-        assert_eq!(result.reported_cwd.as_ref(), Some(&cwd));
+        assert_eq!(result.reported_cwd.as_ref(), Some(&(cwd, None)));
     }
 
     #[cfg(windows)]
@@ -4665,7 +4743,7 @@ mod tests {
 
         let result = process_windows_powershell_prompt_bytes(bytes.as_bytes(), 12, 8, true);
 
-        assert_eq!(result.reported_cwd.as_ref(), Some(&cwd));
+        assert_eq!(result.reported_cwd.as_ref(), Some(&(cwd, None)));
     }
 
     #[cfg(windows)]

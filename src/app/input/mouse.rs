@@ -2975,7 +2975,7 @@ mod tests {
         );
         app.state.host_mouse_pixels = None;
 
-        assert!(app.route_client_pixel_mouse(7, report.as_bytes(), geometry));
+        assert!(app.route_client_pixel_mouse(7, None, report.as_bytes(), geometry));
         assert_eq!(
             input_rx.try_recv().expect("forwarded exact mouse motion"),
             Bytes::from_static(b"\x1b[<35;28;69M")

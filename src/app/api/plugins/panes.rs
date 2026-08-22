@@ -3,11 +3,153 @@ use ratatui::layout::Direction;
 use super::super::responses::{encode_error, encode_success};
 use crate::api::schema::{
     InstalledPluginInfo, PluginInvocationContext, PluginManifestPane, PluginPaneInfo,
-    PluginPaneOpenParams, PluginPanePlacement, ResponseResult,
+    PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope, ResponseResult,
 };
 use crate::app::App;
+#[derive(Debug, Clone)]
+pub(crate) struct ClientPrivatePluginPopupSpec {
+    pub(crate) plugin: InstalledPluginInfo,
+    pub(crate) entrypoint: String,
+    pub(crate) title: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) execution_target: crate::execution::ExecutionTarget,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) width: Option<crate::popup_size::PopupSize>,
+    pub(crate) height: Option<crate::popup_size::PopupSize>,
+    pub(crate) source_pane_id: String,
+}
 
 impl App {
+    pub(crate) fn plugin_pane_effective_scope(
+        &self,
+        params: &PluginPaneOpenParams,
+    ) -> PluginPaneScope {
+        params.scope.unwrap_or_else(|| {
+            let plugin_id = super::normalize_plugin_id(&params.plugin_id);
+            let entrypoint = super::normalize_action_id(&params.entrypoint);
+            plugin_id
+                .as_ref()
+                .and_then(|plugin_id| self.state.installed_plugins.get(plugin_id))
+                .and_then(|plugin| {
+                    entrypoint.as_ref().and_then(|entrypoint| {
+                        plugin.panes.iter().find(|pane| pane.id == *entrypoint)
+                    })
+                })
+                .map(|pane| pane.scope)
+                .unwrap_or_default()
+        })
+    }
+
+    pub(crate) fn client_private_plugin_popup_spec(
+        &self,
+        params: &PluginPaneOpenParams,
+    ) -> Result<ClientPrivatePluginPopupSpec, (&'static str, String)> {
+        if params
+            .placement
+            .is_some_and(|placement| placement != PluginPanePlacement::Popup)
+        {
+            return Err((
+                "invalid_params",
+                "client-private plugin panes only support popup placement".to_string(),
+            ));
+        }
+        if params.workspace_id.is_some() || params.direction.is_some() {
+            return Err((
+                "invalid_params",
+                "client-private plugin popups support target_pane_id but not workspace_id or direction"
+                    .to_string(),
+            ));
+        }
+        let Some(plugin_id) = super::normalize_plugin_id(&params.plugin_id) else {
+            return Err(("invalid_plugin_id", "invalid plugin id".to_string()));
+        };
+        let Some(plugin) = self.state.installed_plugins.get(&plugin_id).cloned() else {
+            return Err(("plugin_not_found", "plugin not found".to_string()));
+        };
+        if !super::plugin_manifest_available(&plugin) {
+            return Err((
+                "plugin_manifest_unavailable",
+                format!("plugin {plugin_id} manifest is unavailable"),
+            ));
+        }
+        if !plugin.enabled {
+            return Err(("plugin_disabled", format!("plugin {plugin_id} is disabled")));
+        }
+        let Some(entrypoint) = super::normalize_action_id(&params.entrypoint) else {
+            return Err((
+                "invalid_plugin_entrypoint",
+                "invalid entrypoint id".to_string(),
+            ));
+        };
+        let Some(pane) = plugin
+            .panes
+            .iter()
+            .find(|pane| pane.id == entrypoint)
+            .cloned()
+        else {
+            return Err((
+                "plugin_pane_not_found",
+                format!("plugin pane entrypoint '{entrypoint}' not found"),
+            ));
+        };
+        if params.scope.unwrap_or(pane.scope) != PluginPaneScope::ClientPrivate {
+            return Err((
+                "invalid_params",
+                "pane scope must be client_private".to_string(),
+            ));
+        }
+        let placement = params.placement.unwrap_or(pane.placement);
+        if placement != PluginPanePlacement::Popup {
+            return Err((
+                "invalid_params",
+                "client-private plugin panes only support popup placement".to_string(),
+            ));
+        }
+        let (mut context, execution_target) = self.plugin_pane_source_context(
+            params.target_pane_id.as_deref(),
+            self.current_plugin_context("plugin-pane"),
+        )?;
+        let source_pane_id = context.focused_pane_id.clone().ok_or_else(|| {
+            (
+                "no_active_pane",
+                "client-private plugin popup requires a source pane".to_string(),
+            )
+        })?;
+        context.view_id = params.view_id.clone();
+        validate_plugin_pane_platform(&plugin, &pane, &execution_target)?;
+        let cwd = self.plugin_pane_cwd(&plugin, params.cwd.clone(), &execution_target);
+        let env = self
+            .plugin_pane_launch_env_without_setup(
+                &plugin,
+                &pane.id,
+                &cwd,
+                &execution_target,
+                params.env.clone(),
+                &context,
+            )
+            .map_err(|(code, message)| {
+                let code = match code.as_str() {
+                    "invalid_plugin_context" => "invalid_plugin_context",
+                    "invalid_env" => "invalid_env",
+                    _ => "invalid_params",
+                };
+                (code, message)
+            })?;
+        Ok(ClientPrivatePluginPopupSpec {
+            plugin,
+            entrypoint: pane.id,
+            title: pane.title,
+            command: pane.command,
+            cwd,
+            execution_target,
+            env,
+            width: params.width.or(pane.width),
+            height: params.height.or(pane.height),
+            source_pane_id,
+        })
+    }
+
     pub(super) fn open_plugin_popup_pane(
         &mut self,
         id: String,
@@ -15,18 +157,38 @@ impl App {
         plugin: &InstalledPluginInfo,
         pane: PluginManifestPane,
     ) -> String {
-        let context = self.current_plugin_context("plugin-pane");
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
-                Ok(env) => env,
-                Err((code, message)) => return encode_error(id, &code, message),
-            };
+        let (context, execution_target) = match self.plugin_pane_source_context(
+            params.target_pane_id.as_deref(),
+            self.current_plugin_context("plugin-pane"),
+        ) {
+            Ok(source) => source,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        if let Err((code, message)) =
+            validate_plugin_pane_platform(plugin, &pane, &execution_target)
+        {
+            return encode_error(id, code, message);
+        }
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
+        let extra_env = match self.plugin_pane_launch_env(
+            plugin,
+            &pane.id,
+            &cwd,
+            &execution_target,
+            params.env,
+            &context,
+        ) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
         let width = params.width.or(pane.width);
         let height = params.height.or(pane.height);
-        if let Err(err) = self.spawn_popup_argv_command(
+        if let Err(err) = self.spawn_popup_plugin_command(
+            &plugin.plugin_id,
+            &pane.id,
             &pane.command,
             Some(cwd),
+            &execution_target,
             extra_env,
             crate::app::popup::PopupGeometry { width, height },
         ) {
@@ -78,19 +240,36 @@ impl App {
                 ResponseResult::PluginWorkspacePaneOpened { plugin_pane },
             );
         }
-        let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env.clone(), &context)
-            {
-                Ok(env) => env,
-                Err((code, message)) => return encode_error(id, &code, message),
-            };
+        let (context, execution_target) = match self.plugin_pane_source_context(
+            params.target_pane_id.as_deref(),
+            self.plugin_context_for_workspace(ws_idx, "plugin-pane"),
+        ) {
+            Ok(source) => source,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        if let Err((code, message)) =
+            validate_plugin_pane_platform(plugin, &pane, &execution_target)
+        {
+            return encode_error(id, code, message);
+        }
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
+        let extra_env = match self.plugin_pane_launch_env(
+            plugin,
+            &pane.id,
+            &cwd,
+            &execution_target,
+            params.env.clone(),
+            &context,
+        ) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
         let width = params.width.or(pane.width);
         if let Err(err) = self.spawn_workspace_plugin_argv_command(
             workspace_id.clone(),
             plugin.plugin_id.clone(),
             pane.id.clone(),
+            &execution_target,
             &pane.command,
             cwd,
             extra_env,
@@ -129,16 +308,36 @@ impl App {
         plugin: &InstalledPluginInfo,
         pane: PluginManifestPane,
     ) -> String {
-        let context = self.current_plugin_context("plugin-pane");
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
-                Ok(env) => env,
-                Err((code, message)) => return encode_error(id, &code, message),
-            };
-        let (ws_idx, new_pane) = match self.spawn_overlay_argv_command(
+        let (context, execution_target) = match self.plugin_pane_source_context(
+            params.target_pane_id.as_deref(),
+            self.current_plugin_context("plugin-pane"),
+        ) {
+            Ok(source) => source,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        if let Err((code, message)) =
+            validate_plugin_pane_platform(plugin, &pane, &execution_target)
+        {
+            return encode_error(id, code, message);
+        }
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
+        let extra_env = match self.plugin_pane_launch_env(
+            plugin,
+            &pane.id,
+            &cwd,
+            &execution_target,
+            params.env,
+            &context,
+        ) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        let (ws_idx, new_pane) = match self.spawn_overlay_plugin_command(
+            &plugin.plugin_id,
+            &pane.id,
             &pane.command,
             Some(cwd),
+            &execution_target,
             extra_env,
             Vec::new(),
         ) {
@@ -182,13 +381,27 @@ impl App {
                 format!("pane {target_pane_id} not found"),
             );
         };
+        let execution_target = self
+            .execution_target_for_pane_in_workspace(ws_idx, target_pane)
+            .unwrap_or_default();
+        if let Err((code, message)) =
+            validate_plugin_pane_platform(plugin, &pane, &execution_target)
+        {
+            return encode_error(id, code, message);
+        }
         let context = self.plugin_context_for_pane(ws_idx, target_pane, "plugin-pane");
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
-                Ok(env) => env,
-                Err((code, message)) => return encode_error(id, &code, message),
-            };
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
+        let extra_env = match self.plugin_pane_launch_env(
+            plugin,
+            &pane.id,
+            &cwd,
+            &execution_target,
+            params.env,
+            &context,
+        ) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
         let direction = match params
             .direction
             .unwrap_or(crate::api::schema::SplitDirection::Right)
@@ -201,12 +414,15 @@ impl App {
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
-        let result = ws.split_pane_argv_command(
+        let result = ws.split_pane_plugin_command(
             target_pane,
             direction,
             rows.max(4),
             cols.max(10),
             Some(cwd),
+            &execution_target,
+            &plugin.plugin_id,
+            &pane.id,
             &pane.command,
             extra_env,
             self.state.pane_scrollback_limit_bytes,
@@ -269,21 +485,41 @@ impl App {
                 None => return encode_error(id, "no_active_workspace", "no active workspace"),
             },
         };
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
-        let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
-                Ok(env) => env,
-                Err((code, message)) => return encode_error(id, &code, message),
-            };
+        let (context, execution_target) = match self.plugin_pane_source_context(
+            params.target_pane_id.as_deref(),
+            self.plugin_context_for_workspace(ws_idx, "plugin-pane"),
+        ) {
+            Ok(source) => source,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        if let Err((code, message)) =
+            validate_plugin_pane_platform(plugin, &pane, &execution_target)
+        {
+            return encode_error(id, code, message);
+        }
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
+        let extra_env = match self.plugin_pane_launch_env(
+            plugin,
+            &pane.id,
+            &cwd,
+            &execution_target,
+            params.env,
+            &context,
+        ) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
         let (rows, cols) = self.state.estimate_pane_size();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
-        let (tab_idx, terminal, runtime) = match ws.create_tab_argv_command(
+        let (tab_idx, terminal, runtime) = match ws.create_tab_plugin_command(
             rows.max(4),
             cols.max(10),
             cwd,
+            &execution_target,
+            &plugin.plugin_id,
+            &pane.id,
             &pane.command,
             extra_env,
             self.state.pane_scrollback_limit_bytes,
@@ -313,28 +549,73 @@ impl App {
             pane,
         )
     }
+    pub(super) fn plugin_pane_source_context(
+        &self,
+        source_pane_id: Option<&str>,
+        fallback_context: PluginInvocationContext,
+    ) -> Result<(PluginInvocationContext, crate::execution::ExecutionTarget), (&'static str, String)>
+    {
+        let Some(source_pane_id) = source_pane_id else {
+            let execution_target = self.plugin_command_execution_target(&fallback_context);
+            return Ok((fallback_context, execution_target));
+        };
+        self.plugin_context_and_execution_target_for_source_pane(source_pane_id, "plugin-pane")
+            .ok_or_else(|| ("pane_not_found", format!("pane {source_pane_id} not found")))
+    }
 
     fn plugin_pane_launch_env(
         &self,
         plugin: &InstalledPluginInfo,
         entrypoint: &str,
         cwd: &std::path::Path,
+        execution_target: &crate::execution::ExecutionTarget,
+        env: std::collections::HashMap<String, String>,
+        context: &PluginInvocationContext,
+    ) -> Result<Vec<(String, String)>, (String, String)> {
+        if execution_target.is_local() {
+            super::env::ensure_plugin_user_dirs(plugin)
+                .map_err(|err| ("plugin_user_dir_create_failed".to_string(), err.to_string()))?;
+        }
+        self.plugin_pane_launch_env_without_setup(
+            plugin,
+            entrypoint,
+            cwd,
+            execution_target,
+            env,
+            context,
+        )
+    }
+
+    fn plugin_pane_launch_env_without_setup(
+        &self,
+        plugin: &InstalledPluginInfo,
+        entrypoint: &str,
+        cwd: &std::path::Path,
+        execution_target: &crate::execution::ExecutionTarget,
         env: std::collections::HashMap<String, String>,
         context: &PluginInvocationContext,
     ) -> Result<Vec<(String, String)>, (String, String)> {
         let mut env = super::super::env::normalize_launch_env(env)?;
-        crate::platform::set_default_plugin_pane_pwd(&mut env, cwd);
+        if !cwd.as_os_str().is_empty() {
+            crate::platform::set_default_plugin_pane_pwd(&mut env, cwd);
+        }
         let context_json = serde_json::to_string(&context)
             .map_err(|err| ("invalid_plugin_context".to_string(), err.to_string()))?;
-        super::env::ensure_plugin_user_dirs(plugin)
-            .map_err(|err| ("plugin_user_dir_create_failed".to_string(), err.to_string()))?;
         env.retain(|(key, _)| !plugin_pane_protected_env_key(key));
-        env.extend(super::env::plugin_path_env(plugin));
         env.extend(plugin_theme_env(&self.state.palette));
-        env.push((
-            crate::api::SOCKET_PATH_ENV_VAR.to_string(),
-            crate::api::socket_path().display().to_string(),
-        ));
+        if execution_target.is_local() {
+            env.extend(super::env::plugin_path_env(plugin));
+            env.push((
+                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+                crate::api::socket_path().display().to_string(),
+            ));
+            if let Ok(current_exe) = std::env::current_exe() {
+                env.push((
+                    "HERDR_BIN_PATH".to_string(),
+                    current_exe.display().to_string(),
+                ));
+            }
+        }
         env.push(("HERDR_ENV".to_string(), "1".to_string()));
         env.push(("HERDR_PLUGIN_ID".to_string(), plugin.plugin_id.clone()));
         env.push((
@@ -342,11 +623,8 @@ impl App {
             entrypoint.to_string(),
         ));
         env.push(("HERDR_PLUGIN_CONTEXT_JSON".to_string(), context_json));
-        if let Ok(current_exe) = std::env::current_exe() {
-            env.push((
-                "HERDR_BIN_PATH".to_string(),
-                current_exe.display().to_string(),
-            ));
+        if let Some(view_id) = context.view_id.as_ref() {
+            env.push(("HERDR_VIEW_ID".to_string(), view_id.to_string()));
         }
         Ok(env)
     }
@@ -412,10 +690,17 @@ impl App {
         &self,
         plugin: &InstalledPluginInfo,
         override_cwd: Option<String>,
+        execution_target: &crate::execution::ExecutionTarget,
     ) -> std::path::PathBuf {
         override_cwd
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(&plugin.plugin_root))
+            .unwrap_or_else(|| {
+                if execution_target.is_local() {
+                    std::path::PathBuf::from(&plugin.plugin_root)
+                } else {
+                    std::path::PathBuf::new()
+                }
+            })
     }
 
     fn current_public_pane_id(&self) -> Option<String> {
@@ -425,11 +710,29 @@ impl App {
     }
 }
 
+fn validate_plugin_pane_platform(
+    plugin: &InstalledPluginInfo,
+    pane: &PluginManifestPane,
+    execution_target: &crate::execution::ExecutionTarget,
+) -> Result<(), (&'static str, String)> {
+    if execution_target.is_local() {
+        super::manifest::ensure_platform_supported(
+            super::manifest::effective_platforms(&pane.platforms, &plugin.platforms),
+            "plugin pane",
+        )
+    } else {
+        Ok(())
+    }
+}
+
 fn plugin_pane_protected_env_key(key: &str) -> bool {
     key.starts_with("HERDR_THEME_")
         || matches!(
             key,
             crate::api::SOCKET_PATH_ENV_VAR
+                | crate::integration::HERDR_WORKSPACE_ID_ENV_VAR
+                | crate::integration::HERDR_TAB_ID_ENV_VAR
+                | crate::integration::HERDR_PANE_ID_ENV_VAR
                 | "HERDR_ENV"
                 | "HERDR_PLUGIN_ID"
                 | "HERDR_PLUGIN_ROOT"
@@ -438,6 +741,7 @@ fn plugin_pane_protected_env_key(key: &str) -> bool {
                 | "HERDR_PLUGIN_ENTRYPOINT_ID"
                 | "HERDR_PLUGIN_CONTEXT_JSON"
                 | "HERDR_BIN_PATH"
+                | "HERDR_VIEW_ID"
         )
 }
 
@@ -489,5 +793,97 @@ fn plugin_theme_color(color: ratatui::style::Color) -> String {
         Color::White => "white".to_string(),
         Color::Indexed(index) => format!("indexed:{index}"),
         Color::Rgb(red, green, blue) => format!("#{red:02x}{green:02x}{blue:02x}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_pane_env_rejects_spoofed_identity_but_keeps_context_and_explicit_view() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let plugin = InstalledPluginInfo {
+            plugin_id: "example.identity-boundary".into(),
+            name: "Identity Boundary".into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "/tmp/example.identity-boundary/herdr-plugin.toml".into(),
+            plugin_root: "/tmp/example.identity-boundary".into(),
+            enabled: true,
+            platforms: None,
+            build: Vec::new(),
+            startup: Vec::new(),
+            actions: Vec::new(),
+            events: Vec::new(),
+            panes: Vec::new(),
+            link_handlers: Vec::new(),
+            source: Default::default(),
+            warnings: Vec::new(),
+        };
+        let context = PluginInvocationContext {
+            workspace_id: Some("source-workspace".into()),
+            workspace_label: None,
+            workspace_cwd: None,
+            worktree: None,
+            tab_id: Some("source-tab".into()),
+            tab_label: None,
+            focused_pane_id: Some("source-pane".into()),
+            focused_pane_cwd: None,
+            focused_pane_agent: None,
+            focused_pane_status: None,
+            selected_text: None,
+            invocation_source: Some("plugin-pane".into()),
+            correlation_id: None,
+            clicked_url: None,
+            link_handler_id: None,
+            view_id: crate::api::schema::ViewId::from_opaque("view-private"),
+        };
+        let env = app
+            .plugin_pane_launch_env_without_setup(
+                &plugin,
+                "board",
+                std::path::Path::new(""),
+                &crate::execution::ExecutionTarget::ssh("plugin-host").unwrap(),
+                std::collections::HashMap::from([
+                    (
+                        crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.into(),
+                        "spoofed-workspace".into(),
+                    ),
+                    (
+                        crate::integration::HERDR_TAB_ID_ENV_VAR.into(),
+                        "spoofed-tab".into(),
+                    ),
+                    (
+                        crate::integration::HERDR_PANE_ID_ENV_VAR.into(),
+                        "spoofed-pane".into(),
+                    ),
+                    ("HERDR_VIEW_ID".into(), "spoofed-view".into()),
+                ]),
+                &context,
+            )
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for key in [
+            crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
+            crate::integration::HERDR_TAB_ID_ENV_VAR,
+            crate::integration::HERDR_PANE_ID_ENV_VAR,
+        ] {
+            assert!(!env.contains_key(key), "{key} should be protected");
+        }
+        assert_eq!(env.get("HERDR_VIEW_ID"), Some(&"view-private".to_string()));
+        let serialized_context: PluginInvocationContext =
+            serde_json::from_str(&env["HERDR_PLUGIN_CONTEXT_JSON"]).unwrap();
+        assert_eq!(serialized_context, context);
     }
 }

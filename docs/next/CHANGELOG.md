@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+### Added
+- On Unix, panes can now execute locally or on a trusted SSH host while sharing one Herdr layout; new panes created from an existing pane, such as splits and plugin child surfaces, inherit the source pane's execution target unless explicitly overridden. Whole-server `herdr --remote` remains available on Windows clients connecting to supported Linux and macOS hosts.
+- Plugin popups can now be scoped to one connected app client, with independent rendering, input, links, and lifecycle per client.
+
 ### Fixed
 - Retained mouse selections now copy when Ctrl+C or Cmd+C arrives before a delayed mouse release instead of forwarding the copy shortcut to the pane. (#3100, thanks @moret)
 - Removing a background worktree workspace no longer changes focus to its parent workspace. (#3098)
 - Prefix bindings such as `prefix+|` now recognize characters produced by macOS Option and custom keyboard layouts, while exact chords such as `prefix+alt+w` keep priority. (#3079, thanks @vlcinsky)
 - Direct terminal attaches now preserve multiline pastes as one paste instead of submitting each line separately. (#3054)
+- Unix SSH-backed workspace-right plugin panes now keep their managed workspace identity, and file-opening splits inherit the plugin's execution target instead of an unrelated tiled pane's locality.
 - Windows panes now keep bare `cursor-agent` launches detected after Cursor hands off to its bundled Node process. (#3032)
 - Oversized Kitty images no longer prevent smaller images shown later in the same pane from rendering. (#3033)
 - Claude Code panes now use visible turn, background shell, and background agent activity as working-state fallbacks when OSC titles are unavailable or disabled. (#1630, #2241)

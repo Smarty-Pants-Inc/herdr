@@ -41,7 +41,9 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
-pub(crate) use self::panes::{popup_pane_rects, workspace_plugin_pane_toggle_rect};
+pub(crate) use self::panes::{
+    popup_pane_rects, render_popup_runtime, workspace_plugin_pane_toggle_rect,
+};
 use self::panes::{
     render_empty, render_popup_pane, render_workspace_plugin_pane, resize_popup_pane,
     resize_workspace_plugin_pane,
