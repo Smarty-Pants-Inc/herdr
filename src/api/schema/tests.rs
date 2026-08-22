@@ -288,6 +288,59 @@ fn request_round_trips_for_server_agent_manifests() {
 }
 
 #[test]
+fn omp_maintenance_requests_round_trip_and_reject_unknown_fields() {
+    let operation_id = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    let requests = [
+        Request {
+            id: "acquire".into(),
+            method: Method::ServerOmpMaintenanceAcquire(ServerOmpMaintenanceAcquireParams {
+                operation_id: operation_id.into(),
+            }),
+        },
+        Request {
+            id: "status".into(),
+            method: Method::ServerOmpMaintenanceStatus(EmptyParams::default()),
+        },
+        Request {
+            id: "inspect".into(),
+            method: Method::ServerOmpMaintenanceInspect(EmptyParams::default()),
+        },
+        Request {
+            id: "permit".into(),
+            method: Method::ServerOmpMaintenancePermit(ServerOmpMaintenancePermitParams {
+                operation_id: operation_id.into(),
+                session: "proof".into(),
+                pane_id: "w1:p1".into(),
+            }),
+        },
+        Request {
+            id: "release".into(),
+            method: Method::ServerOmpMaintenanceRelease(ServerOmpMaintenanceReleaseParams {
+                operation_id: operation_id.into(),
+            }),
+        },
+    ];
+
+    let methods = [
+        "server.omp_maintenance.acquire",
+        "server.omp_maintenance.status",
+        "server.omp_maintenance.inspect",
+        "server.omp_maintenance.permit",
+        "server.omp_maintenance.release",
+    ];
+    for (request, method) in requests.into_iter().zip(methods) {
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], method);
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+    }
+
+    assert!(serde_json::from_str::<Request>(
+        r#"{"id":"bad","method":"server.omp_maintenance.acquire","params":{"operation_id":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","unexpected":true}}"#,
+    )
+    .is_err());
+}
+
+#[test]
 fn request_round_trips_for_agent_explain() {
     let request = Request {
         id: "req_agent_explain".into(),
@@ -728,6 +781,7 @@ fn pong_with_build_identity_round_trips() {
             capabilities: Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                omp_maintenance: true,
             }),
             build: Some(ServerBuildIdentity {
                 channel: "stable".into(),

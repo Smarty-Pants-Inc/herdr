@@ -13,6 +13,11 @@ use crate::protocol::{
 use crate::server::client_transport::{OmpHostAdmission, ServerEvent};
 use crate::server::clients::ClientConnection;
 use crate::server::omp_bridge;
+#[cfg(unix)]
+use crate::server::omp_maintenance::OmpMaintenanceHandoffState;
+use crate::server::omp_maintenance::{
+    OmpMaintenance, OmpMaintenanceAdmissionError, OmpMaintenanceError,
+};
 use crate::server::omp_route::{OmpRouteDelivery, OmpRouteError, OmpRouteKey, OmpRouteRegistry};
 
 type OmpHostKey = (String, String, u64);
@@ -27,12 +32,37 @@ pub(crate) struct OmpService {
     bound_apps: HashMap<u64, u64>,
     route_bindings: HashMap<u64, OmpRouteKey>,
     routes: OmpRouteRegistry,
+    maintenance: Result<OmpMaintenance, OmpMaintenanceError>,
+    pending_maintenance_unregisters: Vec<OmpRouteKey>,
 }
 
 impl OmpService {
     pub(crate) fn new(
         prepared: Option<(TcpListener, crate::pane::OmpBridgeEnv)>,
     ) -> io::Result<Self> {
+        let session = crate::session::active_name()
+            .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
+        #[cfg(not(test))]
+        let maintenance = OmpMaintenance::host(session);
+        #[cfg(test)]
+        let maintenance = Ok(OmpMaintenance::for_test(
+            &session,
+            crate::server::omp_maintenance::TestOmpMaintenanceStore::new(),
+        ));
+        Self::with_maintenance(prepared, maintenance)
+    }
+
+    fn with_maintenance(
+        prepared: Option<(TcpListener, crate::pane::OmpBridgeEnv)>,
+        maintenance: Result<OmpMaintenance, OmpMaintenanceError>,
+    ) -> io::Result<Self> {
+        if let Err(error) = &maintenance {
+            tracing::warn!(
+                code = error.code(),
+                message = %error.message(),
+                "OMP maintenance store is unavailable; OMP host admissions are disabled"
+            );
+        }
         let (listener, bridge) = match prepared {
             Some(prepared) => prepared,
             None => omp_bridge::bind()?,
@@ -46,7 +76,22 @@ impl OmpService {
             bound_apps: HashMap::new(),
             route_bindings: HashMap::new(),
             routes: OmpRouteRegistry::default(),
+            maintenance,
+            pending_maintenance_unregisters: Vec::new(),
         })
+    }
+
+    fn maintenance(&self) -> Result<&OmpMaintenance, OmpMaintenanceError> {
+        self.maintenance.as_ref().map_err(Clone::clone)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_maintenance(
+        prepared: Option<(TcpListener, crate::pane::OmpBridgeEnv)>,
+        session: &str,
+        store: crate::server::omp_maintenance::TestOmpMaintenanceStore,
+    ) -> io::Result<Self> {
+        Self::with_maintenance(prepared, Ok(OmpMaintenance::for_test(session, store)))
     }
 
     pub(crate) fn bridge(&self) -> &crate::pane::OmpBridgeEnv {
@@ -179,6 +224,87 @@ impl OmpService {
                 route_generation: *route_generation,
             })
             .collect()
+    }
+
+    pub(crate) fn maintenance_status(
+        &self,
+    ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
+        self.maintenance()?.status()
+    }
+
+    pub(crate) fn inspect_maintenance(
+        &self,
+    ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
+        self.maintenance()?.inspect()
+    }
+
+    pub(crate) fn acquire_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
+        self.maintenance()?.acquire(operation_id)
+    }
+
+    pub(crate) fn grant_maintenance_permit(
+        &self,
+        operation_id: &str,
+        session: &str,
+        pane_id: &str,
+    ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
+        self.maintenance()?
+            .grant_permit(operation_id, session, pane_id)
+    }
+
+    pub(crate) fn release_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
+        self.maintenance()?.release(operation_id)
+    }
+
+    pub(crate) fn enforce_maintenance(
+        &mut self,
+        clients: &HashMap<u64, ClientConnection>,
+    ) -> Vec<(u64, ServerMessage)> {
+        self.retry_maintenance_unregisters();
+        let local_routes = self.live_route_keys();
+        if local_routes.is_empty() {
+            return Vec::new();
+        }
+        let drain = match self
+            .maintenance()
+            .and_then(|maintenance| maintenance.routes_to_drain(&local_routes))
+        {
+            Ok(routes) => routes,
+            Err(error) => {
+                tracing::warn!(
+                    code = error.code(),
+                    message = %error.message(),
+                    "OMP maintenance state unavailable; draining routes"
+                );
+                local_routes
+            }
+        };
+        let mut messages = Vec::new();
+        for key in drain {
+            self.close_host_route(&key, &mut messages, clients);
+        }
+        messages
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn maintenance_handoff_state(
+        &self,
+    ) -> Result<Option<OmpMaintenanceHandoffState>, OmpMaintenanceError> {
+        self.maintenance()?.handoff_state()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_maintenance_handoff_state(
+        &self,
+        expected: Option<&OmpMaintenanceHandoffState>,
+    ) -> Result<(), OmpMaintenanceError> {
+        self.maintenance()?.validate_handoff_state(expected)
     }
 
     pub(crate) fn detach_private_app(
@@ -505,8 +631,25 @@ impl OmpService {
                     key.omp_session_id.clone(),
                     key.route_generation,
                 );
-                match self.routes.host_started(key.clone()) {
+                let mut route_started = false;
+                let admission_result: Result<
+                    Vec<OmpRouteDelivery>,
+                    OmpMaintenanceAdmissionError<OmpRouteError>,
+                > = match self.maintenance.as_ref() {
+                    Ok(maintenance) => {
+                        let routes = &mut self.routes;
+                        maintenance.admit(&key, || {
+                            let deliveries = routes.host_started(key.clone())?;
+                            route_started = true;
+                            Ok(deliveries)
+                        })
+                    }
+                    Err(error) => Err(OmpMaintenanceAdmissionError::State(error.clone())),
+                };
+                match admission_result {
                     Ok(deliveries) => {
+                        self.pending_maintenance_unregisters
+                            .retain(|pending| pending != &key);
                         self.replace_host(route_key, host_id, outbound, socket);
                         if admission.send(OmpHostAdmission::Accepted).is_err() {
                             self.remove_host(&key);
@@ -520,7 +663,43 @@ impl OmpService {
                             self.deliver(&key, deliveries, &mut messages, clients);
                         }
                     }
-                    Err(error) => {
+                    Err(OmpMaintenanceAdmissionError::Active) => {
+                        tracing::warn!(
+                            pane_id = %key.pane_id,
+                            omp_session_id = %key.omp_session_id,
+                            route_generation = key.route_generation,
+                            "rejected OMP bridge host during maintenance"
+                        );
+                        let _ = admission.send(OmpHostAdmission::Rejected {
+                            code: "omp_maintenance_active".into(),
+                            message: "OMP host admission is disabled during maintenance".into(),
+                        });
+                    }
+                    Err(OmpMaintenanceAdmissionError::State(error)) => {
+                        if route_started {
+                            if let Ok(deliveries) = self.routes.host_stopped(&key) {
+                                self.deliver(&key, deliveries, &mut messages, clients);
+                                self.routes.remove_if_inactive_and_empty(&key);
+                                self.unregister_maintenance_route(
+                                    &key,
+                                    "failed to roll back rejected OMP maintenance route",
+                                );
+                            }
+                        }
+                        tracing::warn!(
+                            pane_id = %key.pane_id,
+                            omp_session_id = %key.omp_session_id,
+                            route_generation = key.route_generation,
+                            code = error.code(),
+                            message = %error.message(),
+                            "rejected OMP bridge host because maintenance state is unavailable"
+                        );
+                        let _ = admission.send(OmpHostAdmission::Rejected {
+                            code: error.code().into(),
+                            message: error.message(),
+                        });
+                    }
+                    Err(OmpMaintenanceAdmissionError::Route(error)) => {
                         tracing::warn!(
                             pane_id = %key.pane_id,
                             omp_session_id = %key.omp_session_id,
@@ -985,13 +1164,66 @@ impl OmpService {
         )) {
             let _ = socket.shutdown(Shutdown::Both);
         }
+        self.unregister_maintenance_route(key, "failed to unregister closed OMP route");
+    }
+
+    fn unregister_maintenance_route(&mut self, key: &OmpRouteKey, message: &'static str) {
+        let Ok(maintenance) = self.maintenance.as_ref() else {
+            return;
+        };
+        match maintenance.unregister_route(key) {
+            Ok(()) => {
+                self.pending_maintenance_unregisters
+                    .retain(|pending| pending != key);
+            }
+            Err(error) => {
+                if !self
+                    .pending_maintenance_unregisters
+                    .iter()
+                    .any(|pending| pending == key)
+                {
+                    self.pending_maintenance_unregisters.push(key.clone());
+                }
+                tracing::warn!(
+                    code = error.code(),
+                    message = %error.message(),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    fn retry_maintenance_unregisters(&mut self) {
+        let pending = std::mem::take(&mut self.pending_maintenance_unregisters);
+        for key in pending {
+            self.unregister_maintenance_route(
+                &key,
+                "failed to retry OMP maintenance route cleanup",
+            );
+        }
     }
 }
 
 impl Drop for OmpService {
     fn drop(&mut self) {
-        for (_, (_, _, socket)) in self.hosts.drain() {
+        let hosts = std::mem::take(&mut self.hosts);
+        for ((pane_id, omp_session_id, route_generation), (_, _, socket)) in hosts {
             let _ = socket.shutdown(Shutdown::Both);
+            let key = OmpRouteKey {
+                pane_id,
+                omp_session_id,
+                route_generation,
+            };
+            self.unregister_maintenance_route(
+                &key,
+                "failed to unregister OMP route while stopping service",
+            );
+        }
+        self.retry_maintenance_unregisters();
+        if self.pending_maintenance_unregisters.is_empty() {
+            if let Ok(maintenance) = self.maintenance.as_mut() {
+                maintenance.retire_instance();
+            }
         }
     }
 }
@@ -1017,11 +1249,65 @@ fn host_rejection_message(error: &OmpRouteError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OWNER: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    const OTHER_OWNER: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8";
+
     fn host_socket_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    fn start_host(
+        service: &mut OmpService,
+        pane_id: &str,
+        omp_session_id: &str,
+        route_generation: u64,
+        host_id: u64,
+    ) -> (TcpStream, std::sync::mpsc::Receiver<OmpHostAdmission>) {
+        let (peer, socket) = host_socket_pair();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (admission, admitted) = std::sync::mpsc::sync_channel(1);
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: pane_id.into(),
+                omp_session_id: omp_session_id.into(),
+                route_generation,
+                host_id,
+                outbound,
+                socket,
+                admission,
+            },
+            false,
+            &HashMap::new(),
+        );
+        (peer, admitted)
+    }
+
+    fn stop_host(
+        service: &mut OmpService,
+        pane_id: &str,
+        omp_session_id: &str,
+        route_generation: u64,
+        host_id: u64,
+    ) {
+        service.handle_event(
+            ServerEvent::OmpHostStopped {
+                pane_id: pane_id.into(),
+                omp_session_id: omp_session_id.into(),
+                route_generation,
+                host_id,
+            },
+            false,
+            &HashMap::new(),
+        );
+    }
+
+    fn admission(receiver: std::sync::mpsc::Receiver<OmpHostAdmission>) -> OmpHostAdmission {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("OMP host admission result")
     }
 
     #[test]
@@ -1072,6 +1358,271 @@ mod tests {
         ));
         drop(peer);
         drop(replacement_peer);
+    }
+
+    #[test]
+    fn unavailable_maintenance_keeps_core_service_running_and_rejects_hosts() {
+        let mut service = OmpService::with_maintenance(
+            None,
+            Err(OmpMaintenanceError::StateIo(
+                "untrusted OMP maintenance state directory".into(),
+            )),
+        )
+        .expect("create core service without OMP maintenance");
+
+        assert!(matches!(
+            service.maintenance_status(),
+            Err(OmpMaintenanceError::StateIo(_))
+        ));
+        let (peer, rejected) = start_host(&mut service, "w1:p1", "omp-unavailable", 1, 1);
+        assert!(matches!(
+            admission(rejected),
+            OmpHostAdmission::Rejected { code, .. }
+                if code == "omp_maintenance_state_unavailable"
+        ));
+        assert!(service.live_route_keys().is_empty());
+        drop(peer);
+    }
+
+    #[test]
+    fn state_error_before_duplicate_admission_preserves_existing_live_route() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut service =
+            OmpService::with_test_maintenance(None, "default", store.clone()).expect("service");
+        let key = OmpRouteKey {
+            pane_id: "w1:p1".into(),
+            omp_session_id: "omp-live".into(),
+            route_generation: 1,
+        };
+        let (live_peer, admitted) = start_host(
+            &mut service,
+            &key.pane_id,
+            &key.omp_session_id,
+            key.route_generation,
+            1,
+        );
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+
+        store.fail_next_state_accesses(1);
+        let (retry_peer, rejected) = start_host(
+            &mut service,
+            &key.pane_id,
+            &key.omp_session_id,
+            key.route_generation,
+            2,
+        );
+        assert!(matches!(
+            admission(rejected),
+            OmpHostAdmission::Rejected { code, .. }
+                if code == "omp_maintenance_state_unavailable"
+        ));
+        assert_eq!(service.live_route_keys(), vec![key.clone()]);
+
+        let attachment_epoch = service
+            .routes
+            .attach(91, &key)
+            .expect("existing route remains registered")
+            .into_iter()
+            .find_map(|delivery| match delivery {
+                OmpRouteDelivery::Pane {
+                    client_id: 91,
+                    attachment_epoch,
+                    ..
+                } => Some(attachment_epoch),
+                _ => None,
+            })
+            .expect("existing route attachment");
+        let frame =
+            crate::protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, br#"{"t":"hello"}"#)
+                .expect("guest frame");
+        assert!(service
+            .routes
+            .guest_frame(91, &key, attachment_epoch, frame)
+            .is_ok());
+
+        stop_host(
+            &mut service,
+            &key.pane_id,
+            &key.omp_session_id,
+            key.route_generation,
+            1,
+        );
+        drop((live_peer, retry_peer));
+    }
+
+    #[test]
+    fn ordinary_admission_reports_exact_route_when_no_lease_exists() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut service =
+            OmpService::with_test_maintenance(None, "default", store).expect("create service");
+
+        let (peer, admitted) = start_host(&mut service, "w1:p1", "omp-1", 4, 7);
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        let status = service.maintenance_status().unwrap();
+        assert!(!status.held);
+        assert_eq!(status.route_count, 1);
+        assert_eq!(
+            status.routes,
+            vec![crate::api::schema::ServerOmpMaintenanceRoute {
+                session: "default".into(),
+                pane_id: "w1:p1".into(),
+                omp_session_id: "omp-1".into(),
+                route_generation: 4,
+                proof: false,
+            }]
+        );
+
+        stop_host(&mut service, "w1:p1", "omp-1", 4, 7);
+        assert_eq!(service.maintenance_status().unwrap().route_count, 0);
+        drop(peer);
+    }
+
+    #[test]
+    fn failed_unregister_is_retried_without_removing_other_live_sessions() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut first = OmpService::with_test_maintenance(None, "first", store.clone())
+            .expect("create first service");
+        let mut second = OmpService::with_test_maintenance(None, "second", store.clone())
+            .expect("create second service");
+        let controller = OmpService::with_test_maintenance(None, "controller", store.clone())
+            .expect("create controller service");
+        let (first_peer, first_admitted) = start_host(&mut first, "w1:p1", "omp-1", 1, 1);
+        let (second_peer, second_admitted) = start_host(&mut second, "w2:p1", "omp-2", 1, 2);
+        assert!(matches!(
+            admission(first_admitted),
+            OmpHostAdmission::Accepted
+        ));
+        assert!(matches!(
+            admission(second_admitted),
+            OmpHostAdmission::Accepted
+        ));
+
+        store.fail_next_unregisters(1);
+        stop_host(&mut first, "w1:p1", "omp-1", 1, 1);
+        assert!(first.live_route_keys().is_empty());
+        assert_eq!(controller.maintenance_status().unwrap().route_count, 2);
+
+        assert!(first.enforce_maintenance(&HashMap::new()).is_empty());
+        let status = controller.maintenance_status().unwrap();
+        assert_eq!(status.route_count, 1);
+        assert_eq!(status.routes[0].session, "second");
+        assert_eq!(second.live_route_keys().len(), 1);
+
+        stop_host(&mut second, "w2:p1", "omp-2", 1, 2);
+        drop((first_peer, second_peer));
+    }
+
+    #[test]
+    fn acquire_gates_before_existing_routes_drain_and_covers_new_sessions() {
+        use std::io::Read as _;
+
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut existing = OmpService::with_test_maintenance(None, "existing", store.clone())
+            .expect("create existing service");
+        let controller = OmpService::with_test_maintenance(None, "controller", store.clone())
+            .expect("create controller service");
+        let (mut existing_peer, admitted) =
+            start_host(&mut existing, "w1:p1", "omp-existing", 1, 1);
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+
+        let acquired = controller.acquire_maintenance(OWNER).unwrap();
+        assert!(acquired.held);
+        assert_eq!(acquired.route_count, 1);
+
+        let mut newly_created =
+            OmpService::with_test_maintenance(None, "new", store).expect("create new service");
+        let (_new_peer, denied) = start_host(&mut newly_created, "w2:p1", "omp-new", 1, 2);
+        assert!(matches!(
+            admission(denied),
+            OmpHostAdmission::Rejected { code, .. } if code == "omp_maintenance_active"
+        ));
+
+        existing.enforce_maintenance(&HashMap::new());
+        assert_eq!(controller.maintenance_status().unwrap().route_count, 0);
+        assert_eq!(existing_peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn permit_is_exact_and_consumed_by_one_admission() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let controller = OmpService::with_test_maintenance(None, "controller", store.clone())
+            .expect("create controller service");
+        let mut proof = OmpService::with_test_maintenance(None, "proof", store.clone())
+            .expect("create proof service");
+        let mut wrong_session =
+            OmpService::with_test_maintenance(None, "other", store).expect("create other service");
+        controller.acquire_maintenance(OWNER).unwrap();
+        controller
+            .grant_maintenance_permit(OWNER, "proof", "w1:p1")
+            .unwrap();
+
+        let (_peer, denied) = start_host(&mut wrong_session, "w1:p1", "omp-wrong", 1, 1);
+        assert!(matches!(
+            admission(denied),
+            OmpHostAdmission::Rejected { code, .. } if code == "omp_maintenance_active"
+        ));
+        assert!(controller.maintenance_status().unwrap().permit.is_some());
+
+        let (_peer, denied) = start_host(&mut proof, "w1:p2", "omp-wrong-pane", 1, 2);
+        assert!(matches!(
+            admission(denied),
+            OmpHostAdmission::Rejected { code, .. } if code == "omp_maintenance_active"
+        ));
+        assert!(controller.maintenance_status().unwrap().permit.is_some());
+
+        let (proof_peer, admitted) = start_host(&mut proof, "w1:p1", "omp-proof", 1, 3);
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        let consumed = controller.maintenance_status().unwrap();
+        assert!(consumed.permit.is_none());
+        assert_eq!(consumed.route_count, 1);
+        assert!(consumed.routes[0].proof);
+        assert_eq!(
+            controller
+                .grant_maintenance_permit(OWNER, "proof", "w1:p1")
+                .unwrap(),
+            consumed
+        );
+
+        let (_peer, denied) = start_host(&mut proof, "w1:p1", "omp-second", 2, 4);
+        assert!(matches!(
+            admission(denied),
+            OmpHostAdmission::Rejected { code, .. } if code == "omp_maintenance_active"
+        ));
+        stop_host(&mut proof, "w1:p1", "omp-proof", 1, 3);
+        assert_eq!(controller.maintenance_status().unwrap().route_count, 0);
+        drop(proof_peer);
+    }
+
+    #[test]
+    fn ownership_is_idempotent_and_release_requires_zero_routes() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut service =
+            OmpService::with_test_maintenance(None, "default", store).expect("create service");
+        let (peer, admitted) = start_host(&mut service, "w1:p1", "omp-1", 1, 1);
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+
+        let first = service.acquire_maintenance(OWNER).unwrap();
+        let second = service.acquire_maintenance(OWNER).unwrap();
+        assert_eq!(first, second);
+        assert!(matches!(
+            service.acquire_maintenance(OTHER_OWNER),
+            Err(OmpMaintenanceError::Conflict(_))
+        ));
+        assert!(matches!(
+            service.release_maintenance(OTHER_OWNER),
+            Err(OmpMaintenanceError::NotOwner(_))
+        ));
+        assert!(matches!(
+            service.release_maintenance(OWNER),
+            Err(OmpMaintenanceError::RoutesLive(1))
+        ));
+
+        service.enforce_maintenance(&HashMap::new());
+        assert_eq!(service.maintenance_status().unwrap().route_count, 0);
+        let released = service.release_maintenance(OWNER).unwrap();
+        assert!(!released.held);
+        assert_eq!(service.release_maintenance(OWNER).unwrap(), released);
+        drop(peer);
     }
 
     #[test]

@@ -189,6 +189,7 @@ fn server_command() -> Command {
         .about("Run or control the headless server")
         .subcommand(Command::new("stop").about("Stop the running server"))
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
+        .subcommand(omp_maintenance_command())
         .subcommand(
             Command::new("agent-manifests")
                 .about("Show active agent detection manifests")
@@ -203,6 +204,47 @@ fn server_command() -> Command {
             Command::new("reload-agent-manifests")
                 .about("Reload local agent detection manifest overrides"),
         )
+}
+
+fn omp_maintenance_command() -> Command {
+    Command::new("omp-maintenance")
+        .about("Control the host-wide OMP admission lease")
+        .subcommand(
+            Command::new("acquire")
+                .about("Acquire the lease with a private 32-byte operation capability")
+                .arg(omp_maintenance_capability_stdin_arg())
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("status")
+                .about("Show lease and route status")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("inspect")
+                .about("Read host-wide lease and route state without enforcing maintenance")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("permit")
+                .about("Permit one exact proof-pane admission")
+                .arg(omp_maintenance_capability_stdin_arg())
+                .arg(option("proof-session", "SESSION").required(true))
+                .arg(option("proof-pane", "PANE").required(true))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("release")
+                .about("Release the lease after all routes close")
+                .arg(omp_maintenance_capability_stdin_arg())
+                .arg(json_flag()),
+        )
+}
+
+fn omp_maintenance_capability_stdin_arg() -> Arg {
+    flag("operation-id-stdin")
+        .required(true)
+        .help("Read the private operation capability from stdin")
 }
 
 fn api_command() -> Command {
@@ -1323,6 +1365,32 @@ mod tests {
         assert!(pane
             .get_subcommands()
             .any(|subcommand| subcommand.get_name() == "wait-output"));
+    }
+
+    #[test]
+    fn spec_includes_stdin_only_omp_maintenance_controls() {
+        let cmd = super::command();
+        let maintenance = command_path(&cmd, &["server", "omp-maintenance"]);
+        assert_eq!(maintenance.get_subcommands().count(), 5);
+        for action in ["acquire", "status", "inspect", "permit", "release"] {
+            assert!(maintenance
+                .get_subcommands()
+                .any(|subcommand| subcommand.get_name() == action));
+        }
+        for action in ["acquire", "permit", "release"] {
+            let command = command_path(&cmd, &["server", "omp-maintenance", action]);
+            assert!(has_option(command, "operation-id-stdin"));
+            assert!(!has_option(command, "operation-id"));
+        }
+        for action in ["status", "inspect"] {
+            let command = command_path(&cmd, &["server", "omp-maintenance", action]);
+            assert!(!has_option(command, "operation-id-stdin"));
+            assert!(!has_option(command, "operation-id"));
+        }
+        let permit = command_path(&cmd, &["server", "omp-maintenance", "permit"]);
+        for option in ["operation-id-stdin", "proof-session", "proof-pane", "json"] {
+            assert!(has_option(permit, option));
+        }
     }
 
     #[test]

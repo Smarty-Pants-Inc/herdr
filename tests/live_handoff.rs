@@ -10,11 +10,18 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
     cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_herdr_pid,
     send_input, unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_socket,
 };
+fn fresh_omp_maintenance_owner() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("generate maintenance test capability");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
 
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
@@ -77,6 +84,11 @@ fn spawn_server_with_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(
+        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
+        runtime_dir.join("maintenance-state"),
+    );
     cmd.env("HERDR_SOCKET_PATH", api_socket);
     cmd.env(
         "HERDR_CLIENT_SOCKET_PATH",
@@ -224,6 +236,11 @@ fn spawn_named_session_server(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(
+        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
+        runtime_dir.join("maintenance-state"),
+    );
     cmd.env("HERDR_SESSION", session_name);
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -259,6 +276,10 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(
+        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
+        runtime_dir.join("maintenance-state"),
+    );
     cmd.env_remove("HERDR_SESSION");
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -303,6 +324,11 @@ fn spawn_server_with_args_and_socket_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(
+        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
+        runtime_dir.join("maintenance-state"),
+    );
     cmd.env_remove("HERDR_SESSION");
     if let Some(api_socket_env) = api_socket_env {
         cmd.env("HERDR_SOCKET_PATH", api_socket_env);
@@ -704,6 +730,184 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_server_ptmx_fd_count(replacement_pid, 3, Duration::from_secs(5));
 
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let owner = fresh_omp_maintenance_owner();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let acquired = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:acquire",
+            "method": "server.omp_maintenance.acquire",
+            "params": {"operation_id": owner}
+        }),
+    );
+    assert_ok(acquired.clone());
+    assert_eq!(acquired["result"]["type"], "omp_maintenance");
+    assert_eq!(acquired["result"]["maintenance"]["held"], true);
+
+    let permitted = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:permit",
+            "method": "server.omp_maintenance.permit",
+            "params": {
+                "operation_id": owner,
+                "session": "default",
+                "pane_id": "w1:p1"
+            }
+        }),
+    );
+    assert_ok(permitted.clone());
+    assert_eq!(
+        permitted["result"]["maintenance"]["permit"],
+        serde_json::json!({"session": "default", "pane_id": "w1:p1"})
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let status = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:status",
+            "method": "server.omp_maintenance.status",
+            "params": {}
+        }),
+    );
+    assert_ok(status.clone());
+    let maintenance = &status["result"]["maintenance"];
+    assert!(maintenance.get("operation_id").is_none());
+    assert!(!status.to_string().contains(&owner));
+    assert_eq!(
+        status["result"]["maintenance"]["permit"],
+        serde_json::json!({"session": "default", "pane_id": "w1:p1"})
+    );
+    assert_eq!(status["result"]["maintenance"]["route_count"], 0);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:release",
+            "method": "server.omp_maintenance.release",
+            "params": {"operation_id": owner}
+        }),
+    ));
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let owner = fresh_omp_maintenance_owner();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let legacy_import = base.join("legacy-herdr");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &legacy_import,
+        r#"#!/usr/bin/env python3
+import json
+import socket
+import sys
+
+socket_path, token = sys.argv[-2:]
+stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+stream.connect(socket_path)
+stream.sendall(token.encode() + b"\n")
+line = b""
+while not line.endswith(b"\n"):
+    chunk = stream.recv(4096)
+    if not chunk:
+        sys.exit(20)
+    line += chunk
+manifest = json.loads(line)
+if manifest.get("version") != 1:
+    sys.exit(21)
+stream.sendall(b"validated\n")
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&legacy_import, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:acquire",
+            "method": "server.omp_maintenance.acquire",
+            "params": {"operation_id": owner}
+        }),
+    ));
+
+    let response = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff:downgrade",
+            "method": "server.live_handoff",
+            "params": {"import_exe": legacy_import.to_string_lossy()}
+        }),
+    );
+    assert_eq!(response["error"]["code"], "handoff_failed");
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    ));
+    let status = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:status",
+            "method": "server.omp_maintenance.status",
+            "params": {}
+        }),
+    );
+    assert_ok(status.clone());
+    assert_eq!(status["result"]["maintenance"]["held"], true);
+    assert!(status["result"]["maintenance"]
+        .get("operation_id")
+        .is_none());
+    assert!(!status.to_string().contains(&owner));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:maintenance:release",
+            "method": "server.omp_maintenance.release",
+            "params": {"operation_id": owner}
+        }),
+    ));
     let _ = request(
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
