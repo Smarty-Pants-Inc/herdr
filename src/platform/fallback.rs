@@ -3,6 +3,16 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+#[cfg(unix)]
+pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
+
+#[cfg(not(unix))]
+pub(crate) fn set_default_plugin_pane_pwd(
+    _env: &mut Vec<(String, String)>,
+    _cwd: &std::path::Path,
+) {
+}
+
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
     super::RemoteSshConfigPaths {
         user_config: std::env::var_os("HOME")
@@ -86,6 +96,10 @@ fn shell_quote(value: &str) -> String {
 pub fn raise_server_nofile_limit() {}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
+    false
+}
+
+pub(crate) fn should_query_host_terminal_palette() -> bool {
     false
 }
 
@@ -198,7 +212,7 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 /// Unsupported platform stub.
-pub fn open_url(_url: &str) -> std::io::Result<()> {
+pub fn open_url(_url: &str) -> std::io::Result<Option<std::process::Child>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "opening URLs is not supported on this platform",

@@ -47,7 +47,11 @@ impl Default for UpdateConfig {
 }
 
 fn default_update_channel() -> UpdateChannelConfig {
-    if cfg!(windows) {
+    default_update_channel_for_build(cfg!(windows), crate::build_info::is_preview())
+}
+
+fn default_update_channel_for_build(is_windows: bool, is_preview: bool) -> UpdateChannelConfig {
+    if is_windows && is_preview {
         UpdateChannelConfig::Preview
     } else {
         UpdateChannelConfig::Stable
@@ -326,6 +330,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
+    pub server: ServerConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
@@ -957,6 +962,15 @@ impl ImeCursorShape {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+pub struct ServerConfig {
+    /// Virtual terminal width used when no client is attached. Default: 120.
+    pub headless_cols: u16,
+    /// Virtual terminal height used when no client is attached. Default: 40.
+    pub headless_rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
@@ -1222,6 +1236,15 @@ impl<'de> Deserialize<'de> for ToastConfig {
     }
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
+            headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+        }
+    }
+}
+
 impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
@@ -1254,21 +1277,33 @@ manifest_check = false
         assert!(!config.update.manifest_check);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_update_config_defaults_to_preview() {
+    fn update_channel_default_follows_windows_build_identity() {
+        assert_eq!(
+            default_update_channel_for_build(true, true),
+            UpdateChannelConfig::Preview
+        );
+        assert_eq!(
+            default_update_channel_for_build(true, false),
+            UpdateChannelConfig::Stable
+        );
+        assert_eq!(
+            default_update_channel_for_build(false, true),
+            UpdateChannelConfig::Stable
+        );
+    }
+
+    #[test]
+    fn missing_update_channel_uses_build_default() {
         let empty: Config = toml::from_str("").unwrap();
         let without_update_channel: Config =
             toml::from_str("[update]\nversion_check = false").unwrap();
 
-        assert_eq!(
-            Config::default().update.channel,
-            UpdateChannelConfig::Preview
-        );
-        assert_eq!(empty.update.channel, UpdateChannelConfig::Preview);
+        assert_eq!(Config::default().update.channel, default_update_channel());
+        assert_eq!(empty.update.channel, default_update_channel());
         assert_eq!(
             without_update_channel.update.channel,
-            UpdateChannelConfig::Preview
+            default_update_channel()
         );
     }
 
@@ -1868,6 +1903,45 @@ delay_seconds = {}
     fn onboarding_false_skips_setup() {
         let config: Config = toml::from_str("onboarding = false").unwrap();
         assert!(!config.should_show_onboarding());
+    }
+
+    #[test]
+    fn server_headless_size_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.server.headless_cols,
+            crate::config::DEFAULT_HEADLESS_COLS
+        );
+        assert_eq!(
+            default_config.server.headless_rows,
+            crate::config::DEFAULT_HEADLESS_ROWS
+        );
+
+        let config: Config = toml::from_str(
+            r#"[server]
+headless_cols = 160
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.headless_cols, 160);
+        assert_eq!(config.server.headless_rows, 50);
+
+        let invalid: Config = toml::from_str(
+            r#"[server]
+headless_cols = 0
+headless_rows = 50
+"#,
+        )
+        .unwrap();
+        assert!(invalid.invalid_headless_size_diagnostic().is_some());
+        assert_eq!(
+            invalid.headless_size(),
+            (
+                crate::config::DEFAULT_HEADLESS_COLS,
+                crate::config::DEFAULT_HEADLESS_ROWS
+            )
+        );
     }
 
     #[test]

@@ -173,8 +173,8 @@ impl App {
     }
 
     /// Maps a locally attributed process to the managed agent terminal that owns
-    /// it. Missing runtime state or process inspection intentionally yields no
-    /// match so callers retain normal compatibility behavior.
+    /// its session. Missing runtime state or process inspection intentionally
+    /// yields no match so callers retain normal compatibility behavior.
     pub(crate) fn agent_terminal_target_for_peer_pid(
         &self,
         peer_pid: u32,
@@ -197,7 +197,6 @@ impl App {
             };
 
             child_pid == peer_pid
-                || crate::platform::process_is_descendant_of(peer_pid, child_pid)
                 || crate::platform::session_processes(child_pid)
                     .into_iter()
                     .any(|session_pid| session_pid == peer_pid)

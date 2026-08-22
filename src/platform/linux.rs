@@ -16,7 +16,8 @@ pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
+    StatusCommandGuard,
 };
 
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
@@ -60,6 +61,10 @@ pub fn raise_server_nofile_limit() {}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     running_inside_wsl()
+}
+
+pub(crate) fn should_query_host_terminal_palette() -> bool {
+    !running_inside_wsl()
 }
 
 fn running_inside_wsl() -> bool {
@@ -366,17 +371,6 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
-pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    process_parent_pid_from_stat(&stat)
-}
-
-fn process_parent_pid_from_stat(stat: &str) -> Option<u32> {
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    fields.get(1)?.parse().ok()
-}
-
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_pgrp_and_comm_from_stat(&stat)
@@ -494,14 +488,14 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("xdg-open")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
+        .spawn()
+        .map(Some)
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -1033,14 +1027,6 @@ mod tests {
         assert_eq!(
             process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string()))
-        );
-    }
-
-    #[test]
-    fn proc_stat_parsing_reads_parent_after_a_complex_process_name() {
-        assert_eq!(
-            process_parent_pid_from_stat("123 (name with ) paren) S 42 456 789 0 456"),
-            Some(42)
         );
     }
 

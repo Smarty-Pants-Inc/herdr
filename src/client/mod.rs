@@ -366,11 +366,11 @@ fn setup_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
 
 /// Sets up a direct attach terminal.
 ///
-/// Direct attach forwards stdin to the attached PTY. It enables mouse capture
-/// so wheel events can drive the attached viewport or be forwarded to child
+/// Direct attach forwards stdin to the attached PTY. When configured, mouse
+/// capture lets wheel events drive the attached viewport or reach child
 /// programs that requested mouse input.
-fn setup_direct_attach_terminal() -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(false, true)
+fn setup_direct_attach_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
+    setup_terminal_with_capabilities(false, mouse_capture)
 }
 
 fn setup_terminal_with_capabilities(
@@ -439,6 +439,7 @@ fn setup_terminal_with_capabilities(
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
         reset_host_color_scheme_reports: host_color_scheme_reports,
+        restored: false,
         #[cfg(windows)]
         restore_windows_input_mode: windows_virtual_terminal_input.restore_mode,
     })
@@ -452,6 +453,7 @@ fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> boo
 struct TerminalGuard {
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
+    restored: bool,
     #[cfg(windows)]
     restore_windows_input_mode: Option<u32>,
 }
@@ -600,7 +602,7 @@ fn restore_terminal_state(
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
     #[cfg(windows)] restore_windows_input_mode: Option<u32>,
-) {
+) -> io::Result<()> {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
 
     // Reset modifyOtherKeys if we enabled it.
@@ -624,13 +626,16 @@ fn restore_terminal_state(
         restore_windows_input_mode_value(mode);
     }
 
-    let _ = ratatui::try_restore();
-    let _ = write_terminal_restore_postlude(&mut io::stdout(), reset_host_color_scheme_reports);
+    let restore_result = ratatui::try_restore();
+    let postlude_result =
+        write_terminal_restore_postlude(&mut io::stdout(), reset_host_color_scheme_reports);
 
     #[cfg(windows)]
     if windows_vti_input_backend_enabled() && windows_win32_input_mode_enabled() {
         let _ = disable_windows_win32_input_mode(&mut io::stdout());
     }
+
+    restore_result.and(postlude_result)
 }
 
 #[cfg(not(windows))]
@@ -675,14 +680,28 @@ fn disable_windows_win32_input_mode(writer: &mut impl std::io::Write) -> io::Res
     writer.flush()
 }
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
+impl TerminalGuard {
+    fn restore(mut self) -> io::Result<()> {
+        self.restored = true;
         restore_terminal_state(
             self.reset_modify_other_keys,
             self.reset_host_color_scheme_reports,
             #[cfg(windows)]
             self.restore_windows_input_mode,
-        );
+        )
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = restore_terminal_state(
+                self.reset_modify_other_keys,
+                self.reset_host_color_scheme_reports,
+                #[cfg(windows)]
+                self.restore_windows_input_mode,
+            );
+        }
     }
 }
 
@@ -1439,7 +1458,7 @@ fn run_client_with_mode(
     // so we don't leave the terminal in raw mode if the server rejects us.
     let direct_attach = attach_escape.is_some();
     let terminal_guard = if direct_attach {
-        setup_direct_attach_terminal()
+        setup_direct_attach_terminal(mouse_capture)
     } else {
         setup_terminal(mouse_capture)
     }
@@ -1455,7 +1474,7 @@ fn run_client_with_mode(
     let panic_restore_windows_input_mode = terminal_guard.restore_windows_input_mode;
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal_state(
+        let _ = restore_terminal_state(
             panic_resets_modify_other_keys,
             panic_resets_host_color_scheme_reports,
             #[cfg(windows)]
@@ -1497,7 +1516,7 @@ fn run_client_with_mode(
     });
 
     // Restore the terminal before printing any final status message.
-    drop(terminal_guard);
+    let terminal_restore_failed = terminal_guard.restore().is_err();
 
     if let Err(err) = result {
         rt.shutdown_timeout(Duration::from_millis(100));
@@ -1514,24 +1533,28 @@ fn run_client_with_mode(
         }) {
             info!(path = %executable.path.display(), "relaunching updated client");
             let relaunch_error = executable.exec_replacement();
-            eprintln!("herdr: {err}");
-            eprintln!(
+            let _ = writeln!(io::stderr(), "herdr: {err}");
+            let _ = writeln!(
+                io::stderr(),
                 "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
             );
             std::process::exit(1);
         }
 
-        eprintln!("herdr: {err}");
+        let _ = writeln!(io::stderr(), "herdr: {err}");
         if should_request_remote_reconnect(&err, remote_client) {
             std::process::exit(crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE);
         }
 
-        if matches!(
-            err,
+        let detached = matches!(
+            &err,
             ClientError::ServerShutdown {
                 reason: Some(reason)
             } if reason == "detached"
-        ) {
+        );
+        let connection_lost_during_terminal_hangup =
+            terminal_restore_failed && matches!(&err, ClientError::ConnectionLost(_));
+        if detached || connection_lost_during_terminal_hangup {
             return Ok(());
         }
 
@@ -2929,7 +2952,9 @@ fn should_query_host_terminal_theme() -> bool {
 }
 
 fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
-    let query = crate::terminal_theme::host_terminal_theme_query_sequence();
+    let query = crate::terminal_theme::host_terminal_theme_query_sequence(
+        crate::platform::should_query_host_terminal_palette(),
+    );
     writer.write_all(query.as_bytes())?;
     writer.flush()
 }
@@ -3360,7 +3385,10 @@ mod tests {
         write_host_terminal_theme_query(&mut output).unwrap();
         assert_eq!(
             output,
-            crate::terminal_theme::host_terminal_theme_query_sequence().as_bytes()
+            crate::terminal_theme::host_terminal_theme_query_sequence(
+                crate::platform::should_query_host_terminal_palette(),
+            )
+            .as_bytes()
         );
         assert!(!output
             .windows(crate::terminal_theme::HOST_COLOR_SCHEME_QUERY_SEQUENCE.len())

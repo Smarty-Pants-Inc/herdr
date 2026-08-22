@@ -162,7 +162,7 @@ Use the kind requested by the user. Run `herdr agent --help` to inspect the inst
 herdr agent start reviewer --kind codex --pane <returned-pane-id> --allow-cross-pane -- <agent-args...>
 ```
 
-`agent start` returns only after Herdr detects the expected agent in the same pane and considers it ready for interactive input. It defaults to a 30-second startup timeout.
+A successful `agent start` returns only after Herdr detects the expected agent in the same pane and considers it ready for interactive input. If the agent is blocked during startup, the command returns `agent_not_ready` immediately but keeps the name available for `agent read` and `agent send-keys`. Wait until the agent becomes idle before prompting it. Startup defaults to a 30-second timeout.
 
 ### Resume an existing OMP session
 
@@ -194,9 +194,9 @@ For an explicitly authorized recovery or control step, submit terminal input thr
 herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000 --allow-cross-pane
 ```
 
-`agent prompt` sends text, then encoded Enter after a short delay, while honoring the pane's live bracketed-paste mode. If the agent is already `blocked`, it returns `agent_blocked` without sending input; inspect the dialog and use `agent send-keys` only for a deliberate authorized response. For this control path, `--wait` waits for the first settled `idle`, `done`, or `blocked` state reached after an accepted submission. Do not repeat those defaults with `--until`.
+`agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter after a short delay. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending input. Inspect the blocked UI and ask the user before answering it. For this explicitly authorized control path, `--wait` waits for the first settled `idle`, `done`, or `blocked` state reached after an accepted submission. Do not repeat those defaults with `--until`.
 
-An accepted prompt sent from another non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely; if the caller sets `--timeout` to five seconds or less, Herdr returns the normal `timeout` error instead. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
+A prompt sent from a non-working state must produce an observed lifecycle change within five seconds. Otherwise Herdr returns `agent_prompt_stalled` instead of waiting indefinitely. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
 
 Use `--until` only for a state-specific workflow, such as waiting for an already-running agent to request input:
 

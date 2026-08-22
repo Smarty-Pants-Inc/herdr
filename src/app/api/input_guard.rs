@@ -86,17 +86,6 @@ mod tests {
         target_rx: Receiver<Bytes>,
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    struct ChildGuard(std::process::Child);
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
     fn attributed_agent_fixture() -> Fixture {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -223,50 +212,6 @@ mod tests {
             assert_denied(&response);
         }
 
-        assert!(fixture.source_rx.try_recv().is_err());
-        assert!(fixture.target_rx.try_recv().is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn session_detached_agent_descendant_cannot_prompt_a_different_pane() {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut fixture = attributed_agent_fixture();
-        let mut command = std::process::Command::new("/bin/sleep");
-        command.arg("30");
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = ChildGuard(command.spawn().expect("spawn detached descendant"));
-        let peer_pid = child.0.id();
-        assert!(crate::platform::process_is_descendant_of(
-            peer_pid,
-            std::process::id()
-        ));
-        assert!(!crate::platform::session_processes(std::process::id()).contains(&peer_pid));
-
-        let response = fixture.app.handle_api_request_with_context(
-            Request {
-                id: "detached-cross-pane".into(),
-                method: Method::AgentPrompt(AgentPromptParams {
-                    target: "target-agent".into(),
-                    text: "blocked".into(),
-                    wait: None,
-                    allow_cross_pane: false,
-                }),
-            },
-            ApiRequestContext {
-                local_peer_pid: Some(peer_pid),
-            },
-        );
-
-        assert_denied(&response);
         assert!(fixture.source_rx.try_recv().is_err());
         assert!(fixture.target_rx.try_recv().is_err());
     }

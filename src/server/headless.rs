@@ -269,10 +269,6 @@ fn dirty_patch_intersects_hyperlinks(
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Default shared runtime size (columns, rows) when no clients are attached.
-const MIN_COLS: u16 = 80;
-const MIN_ROWS: u16 = 24;
-
 /// Timeout for in-flight API requests during shutdown.
 #[allow(dead_code)]
 const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -349,8 +345,10 @@ pub struct HeadlessServer {
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
-    /// Shared pane runtime size derived from the foreground client,
-    /// or MIN_COLS × MIN_ROWS when no clients are connected.
+    /// Configured virtual terminal size used when no clients are connected.
+    headless_size: (u16, u16),
+    /// Shared pane runtime size derived from the foreground client, or the
+    /// configured headless size when no clients are connected.
     effective_size: (u16, u16),
     /// Flag set when shutdown is initiated.
     shutting_down: bool,
@@ -382,8 +380,8 @@ fn apply_terminal_attach_scroll(
     };
     if let AttachScrollSource::PageKey { input } = source {
         let host_scroll = runtime
-            .input_state()
-            .is_some_and(crate::pane::InputState::plain_page_keys_use_host_scrollback);
+            .plain_page_keys_use_host_scrollback()
+            .unwrap_or(false);
         if host_scroll {
             match direction {
                 AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
@@ -524,6 +522,7 @@ impl HeadlessServer {
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
 
         let server_keybindings = app_keybindings(&app);
+        let headless_size = app.state.headless_size;
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
@@ -553,7 +552,8 @@ impl HeadlessServer {
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
-            effective_size: (MIN_COLS, MIN_ROWS),
+            headless_size,
+            effective_size: headless_size,
             shutting_down: false,
             handoff_in_progress: false,
             #[cfg(unix)]
@@ -593,7 +593,7 @@ impl HeadlessServer {
         loop {
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
-            self.app.reap_finished_custom_commands();
+            self.app.reap_finished_detached_processes();
 
             // If shutdown has been initiated, complete it and exit.
             if self.shutting_down {
@@ -737,11 +737,22 @@ impl HeadlessServer {
             }
 
             self.drain_client_config_reload_request();
+            self.sync_immediate_pty_sources();
             self.stream_host_mouse_capture_mode();
             self.stream_host_keyboard_enhancement_flags();
 
-            // 7. Render virtually and stream frames.
-            if needs_render && self.app.can_render_now(now) {
+            // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
+            // bounded classification cadence without delaying presentation work
+            // that joins the same coalesced request.
+            let render_cadence_due = self.app.can_render_now(now);
+            if needs_render
+                && (render_cadence_due
+                    || (self.app.can_present_now(now)
+                        && self.has_pending_presentation_work(
+                            needs_full_render,
+                            needs_graphics_render,
+                        )))
+            {
                 crate::render_prof::event("render.attempt");
                 self.sync_canonical_navigation_to_foreground();
                 let render_request = self.app.render_dirty.take();
@@ -799,11 +810,12 @@ impl HeadlessServer {
                     PtyRenderState::Hidden
                 };
                 let mut deferred_graphics = false;
-                let rendered_retained = match retained_render_plan(RetainedRenderInput {
+                let render_plan = retained_render_plan(RetainedRenderInput {
                     needs_full_render,
                     needs_graphics_render,
                     pty,
-                }) {
+                });
+                let rendered_retained = match render_plan {
                     RetainedRenderPlan::Full => false,
                     RetainedRenderPlan::Graphics if self.app_client_count() > 1 => false,
                     RetainedRenderPlan::Graphics => {
@@ -831,7 +843,8 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
-                self.app.mark_rendered(now);
+                self.app
+                    .record_render_attempt(now, render_plan != RetainedRenderPlan::HiddenPty);
                 needs_render = false;
                 needs_full_render = false;
                 needs_graphics_render = false;
@@ -1197,6 +1210,14 @@ impl HeadlessServer {
         }
     }
 
+    fn sync_headless_view_geometry(&mut self) {
+        crate::ui::compute_view_without_resizing_panes(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, self.headless_size.0, self.headless_size.1),
+        );
+    }
+
     fn sync_foreground_client_state(&mut self) {
         self.app.direct_graphics_available = self.direct_graphics_available();
         self.app.pixel_mouse_available = self.foreground_client_id.is_some_and(|id| {
@@ -1208,9 +1229,10 @@ impl HeadlessServer {
             self.retire_all_direct_graphics();
         }
         let Some(client_id) = self.foreground_client_id else {
-            self.effective_size = (MIN_COLS, MIN_ROWS);
+            self.effective_size = self.headless_size;
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            self.sync_headless_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -1218,9 +1240,10 @@ impl HeadlessServer {
         };
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
-            self.effective_size = (MIN_COLS, MIN_ROWS);
+            self.effective_size = self.headless_size;
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
+            self.sync_headless_view_geometry();
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -1580,6 +1603,7 @@ impl HeadlessServer {
         let report = self.app.apply_config_from_disk(notify_success);
         self.app.take_config_reloaded_from_disk();
         self.server_keybindings = app_keybindings(&self.app);
+        self.headless_size = self.app.state.headless_size;
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(&report.diagnostics);
         self.server_config_diagnostic = server_config_diagnostic;
@@ -5609,10 +5633,7 @@ impl HeadlessServer {
                             )
                         })
                 })
-                .and_then(crate::terminal::TerminalRuntime::input_state)
-                .is_some_and(|state| {
-                    state.mouse_protocol_encoding == crate::input::MouseProtocolEncoding::SgrPixels
-                });
+                .is_some_and(crate::terminal::TerminalRuntime::sgr_pixel_mouse_enabled);
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
             if !client.is_full_app_client() {
@@ -5692,10 +5713,41 @@ impl HeadlessServer {
         }
     }
 
-    fn pty_sources_visible_to_any_render_target(
+    fn has_pending_presentation_work(
         &self,
-        sources: &HashSet<crate::layout::PaneId>,
+        needs_full_render: bool,
+        needs_graphics_render: bool,
     ) -> bool {
+        needs_full_render || needs_graphics_render || self.app.render_dirty.has_immediate_work()
+    }
+
+    fn sync_immediate_pty_sources(&self) {
+        let (has_app_target, direct_terminal_targets) = self.pty_render_targets();
+        let mut pane_ids = if has_app_target {
+            self.app.state.app_surface_pane_ids()
+        } else {
+            HashSet::new()
+        };
+        if !direct_terminal_targets.is_empty() {
+            for workspace in &self.app.state.workspaces {
+                for tab in &workspace.tabs {
+                    pane_ids.extend(tab.panes.iter().filter_map(|(&pane_id, pane)| {
+                        direct_terminal_targets
+                            .contains(pane.attached_terminal_id.as_str())
+                            .then_some(pane_id)
+                    }));
+                }
+            }
+            if let Some(popup) = &self.app.state.popup_pane {
+                if direct_terminal_targets.contains(popup.terminal_id.as_str()) {
+                    pane_ids.insert(popup.pane_id);
+                }
+            }
+        }
+        self.app.render_dirty.set_immediate_pty_sources(pane_ids);
+    }
+
+    fn pty_render_targets(&self) -> (bool, HashSet<&str>) {
         let mut has_app_target = false;
         let mut direct_terminal_targets = HashSet::new();
         for client in self
@@ -5714,15 +5766,35 @@ impl HeadlessServer {
                 ClientConnectionMode::App | ClientConnectionMode::OmpPane => {}
             }
         }
+        (has_app_target, direct_terminal_targets)
+    }
+
+    fn pty_source_visible_to_render_targets(
+        &self,
+        pane_id: crate::layout::PaneId,
+        has_app_target: bool,
+        direct_terminal_targets: &HashSet<&str>,
+    ) -> bool {
+        let terminal_id = self.terminal_id_for_pane(pane_id);
+        (has_app_target && (terminal_id.is_none() || self.app_surface_contains_pane(pane_id)))
+            || terminal_id.is_none_or(|source| direct_terminal_targets.contains(source.as_str()))
+    }
+
+    fn pty_sources_visible_to_any_render_target(
+        &self,
+        sources: &HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let (has_app_target, direct_terminal_targets) = self.pty_render_targets();
         if !has_app_target && direct_terminal_targets.is_empty() {
             return false;
         }
 
-        sources.iter().any(|&pane_id| {
-            let terminal_id = self.terminal_id_for_pane(pane_id);
-            (has_app_target && (terminal_id.is_none() || self.app_surface_contains_pane(pane_id)))
-                || terminal_id
-                    .is_none_or(|source| direct_terminal_targets.contains(source.as_str()))
+        sources.iter().copied().any(|pane_id| {
+            self.pty_source_visible_to_render_targets(
+                pane_id,
+                has_app_target,
+                &direct_terminal_targets,
+            )
         })
     }
 
@@ -7172,6 +7244,7 @@ mod tests {
         #[cfg(windows)]
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
         let server_keybindings = app_keybindings(&app);
+        let headless_size = app.state.headless_size;
 
         HeadlessServer {
             app,
@@ -7199,7 +7272,8 @@ mod tests {
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
-            effective_size: (MIN_COLS, MIN_ROWS),
+            headless_size,
+            effective_size: headless_size,
             shutting_down: false,
             handoff_in_progress: false,
             #[cfg(unix)]
@@ -7248,6 +7322,20 @@ mod tests {
             ServerMessage::ServerShutdown { reason } => reason,
             other => panic!("expected shutdown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_headless_size_is_effective_without_clients() {
+        let server = test_headless_server();
+
+        assert_eq!(
+            server.headless_size,
+            (
+                crate::config::DEFAULT_HEADLESS_COLS,
+                crate::config::DEFAULT_HEADLESS_ROWS
+            )
+        );
+        assert_eq!(server.effective_size, server.headless_size);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7683,7 +7771,6 @@ mod tests {
             test_client_writer();
         let mut background = test_identity_client(Some("Bea"), Some(background_writer));
         background.navigation = Some(background_navigation);
-        background.frontend_profile_id = Some("background-profile".into());
         background.renderer_binding_token = Some("background-binding".into());
         background.omp_renderer_capabilities.client_local_native = true;
         server.clients.insert(2, background);
@@ -7892,7 +7979,6 @@ mod tests {
         server.clients.insert(1, foreground);
         let mut background = test_identity_client(Some("Bea"), None);
         background.navigation = Some(background_navigation);
-        background.frontend_profile_id = Some("background-profile".into());
         background.renderer_binding_token = Some("background-binding".into());
         background.omp_renderer_capabilities.client_local_native = true;
         server.clients.insert(2, background);
@@ -8145,7 +8231,6 @@ mod tests {
                 None,
             ),
         );
-        server.clients.get_mut(&1).unwrap().frontend_profile_id = Some("profile".into());
         server.clients.get_mut(&1).unwrap().renderer_binding_token = Some("binding".into());
         server
             .clients
@@ -14049,6 +14134,18 @@ next_tab = ""
     }
 
     #[test]
+    fn visible_source_wakes_pending_hidden_work() {
+        let (server, background_pane) = hidden_pty_visibility_test_server(&[(120, 40)]);
+        let visible_pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        server.sync_immediate_pty_sources();
+
+        assert!(server.app.render_dirty.request_pty(background_pane));
+        assert!(!server.has_pending_presentation_work(false, false));
+        assert!(server.app.render_dirty.request_pty(visible_pane));
+        assert!(server.has_pending_presentation_work(false, false));
+    }
+
+    #[test]
     fn inactive_tab_pty_source_is_hidden_until_tab_focus() {
         let (server, background_pane) = hidden_pty_visibility_test_server(&[]);
         let sources = HashSet::from([background_pane]);
@@ -14133,15 +14230,17 @@ next_tab = ""
     }
 
     #[test]
-    fn direct_terminal_observer_keeps_hidden_pty_source_renderable() {
-        let (mut server, background_pane) = hidden_pty_visibility_test_server(&[]);
+    fn direct_terminal_observer_keeps_hidden_pty_source_renderable_with_app_client() {
+        let (mut server, background_pane) = hidden_pty_visibility_test_server(&[(120, 40)]);
+        assert!(!server.pty_sources_visible_to_any_render_target(&HashSet::from([background_pane])));
+
         let terminal_id = server.app.state.workspaces[0]
             .terminal_id(background_pane)
             .expect("background terminal id")
             .to_string();
         let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
-            1,
+            2,
             ClientConnection::new_with_mode(
                 ClientConnectionMode::TerminalObserve { terminal_id },
                 None,
@@ -14152,7 +14251,7 @@ next_tab = ""
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
                 None,
-                1,
+                2,
                 RenderEncoding::SemanticFrame,
                 false,
                 Some(client_tx),
@@ -14160,6 +14259,12 @@ next_tab = ""
         );
 
         assert!(server.pty_sources_visible_to_any_render_target(&HashSet::from([background_pane])));
+
+        let hidden_pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        server.sync_immediate_pty_sources();
+        assert!(server.app.render_dirty.request_pty(background_pane));
+        assert!(server.has_pending_presentation_work(false, false));
+        assert!(server.app.render_dirty.request_pty(hidden_pane));
     }
 
     #[tokio::test]

@@ -760,8 +760,6 @@ pub(crate) struct ClientConnection {
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
-    /// Opaque client-local correlation identifier; never used for authority.
-    pub(crate) frontend_profile_id: Option<String>,
     /// Client-local high-entropy capability used only for native renderer binding.
     pub(crate) renderer_binding_token: Option<String>,
     /// Presentation-only native renderer capability advertised by this App.
@@ -802,11 +800,13 @@ impl ClientConnection {
         )
     }
 
+    // Connection setup mirrors the validated handshake and transport state.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_mode(
         mode: ClientConnectionMode,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         display_name: Option<String>,
-        frontend_profile_id: Option<String>,
+        _frontend_profile_id: Option<String>,
         renderer_binding_token: Option<String>,
         terminal_size: (u16, u16),
         cell_size: crate::kitty_graphics::HostCellSize,
@@ -824,7 +824,6 @@ impl ClientConnection {
             pending_terminal_attach,
             navigation: None,
             keybindings,
-            frontend_profile_id,
             renderer_binding_token,
             identity,
             omp_renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
@@ -1271,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn app_connections_keep_same_named_identities_and_profiles_independent() {
+    fn app_connections_keep_same_named_identities_and_bindings_independent() {
         let theme = crate::terminal_theme::TerminalTheme::default();
         let first = ClientConnection::new_with_mode(
             ClientConnectionMode::App,
@@ -1316,6 +1315,6 @@ mod tests {
                 .map(|identity| identity.name.as_str()),
             Some("Ada")
         );
-        assert_ne!(first.frontend_profile_id, second.frontend_profile_id);
+        assert_ne!(first.renderer_binding_token, second.renderer_binding_token);
     }
 }

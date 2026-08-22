@@ -16,7 +16,8 @@ pub(crate) use super::unix_common::{
     configure_status_command, create_remote_private_dir, create_remote_ssh_config_dir,
     create_remote_ssh_config_file, hostname, local_datetime, remote_bridge_endpoint_path,
     remote_private_temp_base, remote_reattach_argument, remote_reattach_program,
-    remote_ssh_config_paths, status_commands_supported, StatusCommandGuard,
+    remote_ssh_config_paths, set_default_plugin_pane_pwd, status_commands_supported,
+    StatusCommandGuard,
 };
 
 pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
@@ -43,6 +44,10 @@ const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
+}
+
+pub(crate) fn should_query_host_terminal_palette() -> bool {
+    true
 }
 
 fn raw_command_argv(command: &str, flag: &str) -> Vec<std::ffi::OsString> {
@@ -537,14 +542,14 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("open")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
+        .spawn()
+        .map(Some)
 }
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
@@ -795,11 +800,6 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     drop(stdin);
 
     child.wait().map(|status| status.success()).unwrap_or(false)
-}
-
-pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
-    let parent_pid = process_bsdinfo(pid)?.pbi_ppid;
-    (parent_pid > 0).then_some(parent_pid)
 }
 
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
