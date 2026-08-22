@@ -921,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_mode_transition_keeps_input_emitted_while_mode_is_applied() {
+    fn mouse_mode_transition_marks_input_emitted_while_mode_is_applied_unstable() {
         use std::io::Write as _;
         use std::os::unix::net::UnixStream;
 
@@ -938,8 +938,8 @@ mod tests {
 
         assert_eq!(data, report);
         assert_ne!(current.generation(), old.generation());
-        assert_eq!(snapshot, current);
-        assert!(super::super::mouse_input_is_current(
+        assert!(!snapshot.stable);
+        assert!(!super::super::mouse_input_is_current(
             snapshot,
             input_state.load(),
             current.generation(),

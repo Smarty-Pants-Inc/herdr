@@ -131,9 +131,15 @@ impl HostInputSnapshot {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
+struct HostInputSegment {
+    bytes: usize,
+    snapshot: HostInputSnapshot,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
 struct HostInputBoundary {
-    stale_bytes: usize,
-    stale_snapshot: HostInputSnapshot,
+    segments: VecDeque<HostInputSegment>,
 }
 
 #[cfg(unix)]
@@ -150,10 +156,7 @@ impl HostInputState {
         let snapshot = HostInputSnapshot::from_parts(0, capture_active, sgr_pixels_active);
         Self {
             packed: AtomicU64::new(snapshot.packed),
-            event_order: Mutex::new(HostInputBoundary {
-                stale_bytes: 0,
-                stale_snapshot: snapshot,
-            }),
+            event_order: Mutex::new(HostInputBoundary::default()),
             input_fd: None,
             wake_reader: None,
         }
@@ -178,13 +181,39 @@ impl HostInputState {
         }
     }
 
+    fn assigned_input_bytes(boundary: &HostInputBoundary) -> usize {
+        boundary.segments.iter().map(|segment| segment.bytes).sum()
+    }
+
+    fn push_input_segment(
+        boundary: &mut HostInputBoundary,
+        bytes: usize,
+        snapshot: HostInputSnapshot,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(last) = boundary
+            .segments
+            .back_mut()
+            .filter(|last| last.snapshot == snapshot)
+        {
+            last.bytes = last.bytes.saturating_add(bytes);
+        } else {
+            boundary
+                .segments
+                .push_back(HostInputSegment { bytes, snapshot });
+        }
+    }
+
     fn capture_input_boundary(&self, boundary: &mut HostInputBoundary) -> io::Result<()> {
-        boundary.stale_snapshot = self.load();
-        boundary.stale_bytes = self
+        let pending = self
             .input_fd
             .map(input::pending_input_bytes)
             .transpose()?
             .unwrap_or(0);
+        let unassigned = pending.saturating_sub(Self::assigned_input_bytes(boundary));
+        Self::push_input_segment(boundary, unassigned, self.load());
         Ok(())
     }
 
@@ -201,17 +230,9 @@ impl HostInputState {
         boundary: &mut HostInputBoundary,
         scratch: &mut [u8],
     ) -> io::Result<(usize, HostInputSnapshot)> {
-        let stale = boundary.stale_bytes > 0;
-        let input_state = if stale {
-            boundary.stale_snapshot
-        } else {
-            self.load()
-        };
-        let limit = if stale {
-            boundary.stale_bytes.min(scratch.len())
-        } else {
-            scratch.len()
-        };
+        let segment = boundary.segments.front().copied();
+        let input_state = segment.map_or_else(|| self.load(), |segment| segment.snapshot);
+        let limit = segment.map_or(scratch.len(), |segment| segment.bytes.min(scratch.len()));
         let input_fd = self.input_fd.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "stdin reader is not configured")
         })?;
@@ -220,8 +241,11 @@ impl HostInputState {
             return Err(io::Error::last_os_error());
         }
         let read = read as usize;
-        if stale {
-            boundary.stale_bytes = boundary.stale_bytes.saturating_sub(read);
+        if let Some(segment) = boundary.segments.front_mut() {
+            segment.bytes = segment.bytes.saturating_sub(read);
+            if segment.bytes == 0 {
+                boundary.segments.pop_front();
+            }
         }
         Ok((read, input_state))
     }
@@ -273,6 +297,7 @@ impl HostInputState {
             .event_order
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = self.load();
         self.capture_input_boundary(&mut boundary)?;
         apply()?;
         let mut current = self.packed.load(Ordering::Acquire);
@@ -295,6 +320,17 @@ impl HostInputState {
                 Err(observed) => current = observed,
             }
         };
+        let pending = self
+            .input_fd
+            .map(input::pending_input_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let during_apply = pending.saturating_sub(Self::assigned_input_bytes(&boundary));
+        Self::push_input_segment(
+            &mut boundary,
+            during_apply,
+            previous.continued_with(snapshot),
+        );
         self.wake_input_reader()?;
         Ok(snapshot)
     }
@@ -2438,6 +2474,10 @@ async fn run_client_loop(
                 {
                     continue;
                 }
+                if let Some(cell) = state.mouse_pointer.observe_raw_events(&events) {
+                    state.omp_renderer.observe_pointer_cell(cell);
+                }
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 let (data, parsed_events) = if let Some(attach_escape) = &mut state.attach_escape {
                     let data = match attach_escape.filter_input(
                         data,
@@ -2481,10 +2521,6 @@ async fn run_client_loop(
                     };
                     (data, None)
                 } else {
-                    if let Some(cell) = state.mouse_pointer.observe_raw_events(&events) {
-                        state.omp_renderer.observe_pointer_cell(cell);
-                    }
-                    let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
                         state.redraw_on_focus_gained,
