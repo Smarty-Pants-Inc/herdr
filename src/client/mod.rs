@@ -108,8 +108,6 @@ struct ClientState {
     draw_host_cursor: bool,
     /// Last physical cell size paired with `reported_size`.
     reported_cell_size_px: (u32, u32),
-    /// URL opener children that must be reaped without blocking the client loop.
-    detached_process_children: Vec<std::process::Child>,
     /// App-owned full-surface OMP renderer, when this Unix client advertised support.
     #[cfg(unix)]
     omp_renderer: omp_renderer::ClientOmpRenderer,
@@ -1502,6 +1500,7 @@ fn run_client_with_mode(
         warn!(%err, "failed to install termination handler; terminal restore relies on TerminalGuard::Drop and the panic hook");
     }
 
+    let mut detached_process_children = Vec::new();
     let result = rt.block_on(async {
         run_client_loop(
             stream,
@@ -1513,6 +1512,7 @@ fn run_client_with_mode(
             loop_config,
             negotiated_encoding,
             attach_escape,
+            &mut detached_process_children,
         )
         .await
     });
@@ -1534,7 +1534,16 @@ fn run_client_with_mode(
             )
         }) {
             info!(path = %executable.path.display(), "relaunching updated client");
-            let relaunch_error = executable.exec_replacement();
+            let relaunch_error = match reap_detached_processes_before_exec(
+                &mut detached_process_children,
+                URL_OPENER_REAP_TIMEOUT,
+            ) {
+                Ok(()) => executable.exec_replacement(),
+                Err(error) => io::Error::new(
+                    error.kind(),
+                    format!("failed to clean up URL opener processes before relaunch: {error}"),
+                ),
+            };
             let _ = writeln!(io::stderr(), "herdr: {err}");
             let _ = writeln!(
                 io::stderr(),
@@ -1604,6 +1613,7 @@ fn display_semantic_surface(
 fn display_pending_omp_surface(
     state: &mut ClientState,
     write_stream: &mut LocalStream,
+    detached_process_children: &mut Vec<std::process::Child>,
 ) -> Result<(), ClientError> {
     if let Some(surface) = state
         .omp_renderer
@@ -1625,11 +1635,7 @@ fn display_pending_omp_surface(
                 let _ = io::stdout().flush();
             }
             omp_renderer::LocalEffect::OpenUrl(url) => {
-                open_safe_url(
-                    &url,
-                    &mut state.detached_process_children,
-                    crate::platform::open_url,
-                );
+                open_safe_url(&url, detached_process_children, crate::platform::open_url);
             }
         }
     }
@@ -1637,6 +1643,19 @@ fn display_pending_omp_surface(
         write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
     }
     Ok(())
+}
+
+const CLIENT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+
+async fn next_client_loop_event(
+    maintenance_interval: &mut tokio::time::Interval,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ClientLoopEvent>,
+) -> ClientLoopEvent {
+    tokio::select! {
+        biased;
+        _ = maintenance_interval.tick() => ClientLoopEvent::Timer,
+        event = event_rx.recv() => event.unwrap_or(ClientLoopEvent::Timer),
+    }
 }
 
 /// The main client event loop.
@@ -1656,6 +1675,7 @@ async fn run_client_loop(
     config: ClientLoopConfig,
     negotiated_encoding: RenderEncoding,
     attach_escape: Option<AttachEscapeState>,
+    detached_process_children: &mut Vec<std::process::Child>,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
@@ -1681,7 +1701,6 @@ async fn run_client_loop(
         repaint_pending: false,
         draw_host_cursor,
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
-        detached_process_children: Vec::new(),
         #[cfg(unix)]
         omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_renderer_enabled),
     };
@@ -1784,13 +1803,15 @@ async fn run_client_loop(
     // (implemented on macOS and Windows; a no-op on other platforms).
     use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+    let mut maintenance_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + CLIENT_MAINTENANCE_INTERVAL,
+        CLIENT_MAINTENANCE_INTERVAL,
+    );
+    maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
-        let event = tokio::select! {
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
-        };
+        let event = next_client_loop_event(&mut maintenance_interval, &mut event_rx).await;
 
         match event {
             #[cfg(unix)]
@@ -1858,7 +1879,11 @@ async fn run_client_loop(
                             return Err(ClientError::ConnectionLost(error));
                         }
                     }
-                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        detached_process_children,
+                    )?;
                     continue;
                 }
                 if should_bridge_clipboard_image_paste(
@@ -1901,7 +1926,11 @@ async fn run_client_loop(
                         return Err(ClientError::ConnectionLost(err));
                     }
                 }
-                display_pending_omp_surface(&mut state, &mut write_stream)?;
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    detached_process_children,
+                )?;
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -1950,7 +1979,11 @@ async fn run_client_loop(
                     state
                         .omp_renderer
                         .resize((new_cols, new_rows, cell_width_px, cell_height_px));
-                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        detached_process_children,
+                    )?;
                 }
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
@@ -1995,7 +2028,11 @@ async fn run_client_loop(
                                 state.reported_cell_size_px.1,
                             ),
                         );
-                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            detached_process_children,
+                        )?;
                     }
                     #[cfg(not(unix))]
                     let _ = (
@@ -2220,11 +2257,7 @@ async fn run_client_loop(
                     }
                 }
                 ServerMessage::OpenUrl { url } => {
-                    open_safe_url(
-                        &url,
-                        &mut state.detached_process_children,
-                        crate::platform::open_url,
-                    );
+                    open_safe_url(&url, detached_process_children, crate::platform::open_url);
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
@@ -2240,13 +2273,17 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
-                reap_finished_detached_processes(&mut state.detached_process_children);
+                reap_finished_detached_processes(detached_process_children);
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
                 }
                 #[cfg(unix)]
-                display_pending_omp_surface(&mut state, &mut write_stream)?;
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    detached_process_children,
+                )?;
             }
         }
     }
@@ -2714,9 +2751,62 @@ fn reap_finished_detached_processes(detached_process_children: &mut Vec<std::pro
         Err(err) if err.kind() == io::ErrorKind::Interrupted => true,
         Err(err) => {
             warn!(pid = child.id(), err = %err, "failed to reap detached process");
-            false
+            true
         }
     });
+}
+
+#[cfg(unix)]
+const URL_OPENER_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(unix)]
+fn reap_detached_processes_until(
+    detached_process_children: &mut Vec<std::process::Child>,
+    deadline: Instant,
+) {
+    loop {
+        reap_finished_detached_processes(detached_process_children);
+        if detached_process_children.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(now)));
+    }
+}
+
+#[cfg(unix)]
+fn reap_detached_processes_before_exec(
+    detached_process_children: &mut Vec<std::process::Child>,
+    timeout: Duration,
+) -> io::Result<()> {
+    reap_detached_processes_until(detached_process_children, Instant::now() + timeout);
+    if detached_process_children.is_empty() {
+        return Ok(());
+    }
+
+    for child in detached_process_children.iter_mut() {
+        if let Err(err) = child.kill() {
+            warn!(pid = child.id(), err = %err, "failed to terminate URL opener before relaunch");
+        }
+    }
+
+    reap_detached_processes_until(detached_process_children, Instant::now() + timeout);
+    if detached_process_children.is_empty() {
+        Ok(())
+    } else {
+        let pids = detached_process_children
+            .iter()
+            .map(std::process::Child::id)
+            .collect::<Vec<_>>();
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out reaping URL opener processes {pids:?}"),
+        ))
+    }
 }
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
@@ -3050,6 +3140,52 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn due_client_timer_wins_over_ready_event_stream() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .send(ClientLoopEvent::ServerDisconnected)
+            .await
+            .unwrap();
+        let event_producer = tokio::spawn(async move {
+            while event_tx
+                .send(ClientLoopEvent::ServerDisconnected)
+                .await
+                .is_ok()
+            {}
+        });
+        let mut maintenance_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_millis(10),
+            Duration::from_secs(60),
+        );
+
+        let observed = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut ready_events = 0;
+            loop {
+                match next_client_loop_event(&mut maintenance_interval, &mut event_rx).await {
+                    ClientLoopEvent::Timer => return ready_events,
+                    ClientLoopEvent::ServerDisconnected => {
+                        ready_events += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    _ => unreachable!("test only sends disconnect events"),
+                }
+            }
+        })
+        .await;
+        event_producer.abort();
+
+        let ready_events = observed.expect("ready event stream starved the due client timer");
+        assert!(
+            ready_events > 0,
+            "timer fired before the event stream was ready"
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ClientLoopEvent::ServerDisconnected)
+        ));
     }
 
     #[test]
@@ -4063,6 +4199,46 @@ mod tests {
         assert!(retained, "client dropped URL opener child {pid}");
         assert!(reaped, "client failed to reap URL opener child {pid}");
         assert!(children.is_empty(), "reaped child {pid} remained retained");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_cleanup_terminates_and_reaps_retained_opener_child() {
+        let mut children = Vec::new();
+        let mut opener_pid = None;
+        open_safe_url("https://example.com", &mut children, |_| {
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exec sleep 30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            opener_pid = Some(child.id());
+            Ok(Some(child))
+        });
+
+        let pid = opener_pid.expect("opener child pid");
+        assert_eq!(children.len(), 1, "opener child was not retained");
+        assert!(
+            children[0].try_wait().unwrap().is_none(),
+            "opener child {pid} exited before cleanup"
+        );
+        let started = Instant::now();
+        let cleanup = reap_detached_processes_before_exec(&mut children, Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        let reaped = !crate::platform::process_exists(pid);
+        if !reaped {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+            }
+        }
+
+        assert!(cleanup.is_ok(), "pre-exec cleanup failed: {cleanup:?}");
+        assert!(elapsed < Duration::from_secs(2), "cleanup took {elapsed:?}");
+        assert!(children.is_empty(), "cleaned child {pid} remained retained");
+        assert!(reaped, "pre-exec cleanup failed to reap child {pid}");
     }
 
     #[test]
