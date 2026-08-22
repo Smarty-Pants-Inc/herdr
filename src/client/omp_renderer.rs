@@ -724,9 +724,7 @@ fn forward_local_pixel_event(
 }
 
 fn forward_local_focus_event(runtime: &TerminalRuntime, event: crate::ghostty::FocusEvent) -> bool {
-    runtime
-        .input_state()
-        .is_none_or(|state| !state.focus_reporting)
+    !runtime.focus_reporting_enabled()
         || crate::ghostty::encode_focus(event)
             .is_ok_and(|bytes| runtime.try_send_bytes(Bytes::from(bytes)).is_ok())
 }

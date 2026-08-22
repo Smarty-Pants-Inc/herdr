@@ -1623,7 +1623,7 @@ fn display_pending_omp_surface(
                 let _ = io::stdout().flush();
             }
             omp_renderer::LocalEffect::OpenUrl(url) => {
-                open_safe_url(&url, crate::platform::open_url);
+                open_safe_url(&url, |url| crate::platform::open_url(url).map(|_| ()));
             }
         }
     }
@@ -2213,7 +2213,7 @@ async fn run_client_loop(
                     }
                 }
                 ServerMessage::OpenUrl { url } => {
-                    open_safe_url(&url, crate::platform::open_url);
+                    open_safe_url(&url, |url| crate::platform::open_url(url).map(|_| ()));
                 }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
