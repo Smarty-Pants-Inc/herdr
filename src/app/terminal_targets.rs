@@ -223,6 +223,32 @@ impl App {
         matches.next().is_none().then_some(target)
     }
 
+    /// Maps a locally attributed process to the single managed terminal that
+    /// owns it. Ambiguous or unverifiable process ancestry fails closed.
+    pub(crate) fn terminal_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
+        let mut matches = self.terminal_targets().into_iter().filter(|target| {
+            let Some(child_pid) = self
+                .state
+                .runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    target.ws_idx,
+                    target.pane_id,
+                )
+                .and_then(crate::terminal::TerminalRuntime::child_pid)
+            else {
+                return false;
+            };
+
+            child_pid == peer_pid
+                || crate::platform::process_is_descendant_of(peer_pid, child_pid)
+                || crate::platform::session_processes(child_pid)
+                    .into_iter()
+                    .any(|session_pid| session_pid == peer_pid)
+        });
+        let target = matches.next()?;
+        matches.next().is_none().then_some(target)
+    }
+
     fn terminal_target_candidate(
         &self,
         ws_idx: usize,

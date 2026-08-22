@@ -21,7 +21,6 @@ mod omp_pane;
 mod omp_renderer;
 
 use std::collections::HashSet;
-#[cfg(unix)]
 use std::io::IsTerminal as _;
 use std::io::{self, BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,7 +69,7 @@ struct ClientLoopConfig {
     mouse_capture_active: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     #[cfg(unix)]
-    omp_renderer_enabled: bool,
+    omp_executable: Option<crate::update::OmpExecutable>,
 }
 
 /// State tracking for the thin client.
@@ -709,7 +708,7 @@ impl Drop for TerminalGuard {
 // Handshake
 // ---------------------------------------------------------------------------
 
-fn requested_render_encoding() -> RenderEncoding {
+pub(crate) fn requested_render_encoding() -> RenderEncoding {
     match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
         Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
         _ => RenderEncoding::SemanticFrame,
@@ -835,27 +834,124 @@ fn client_launch_mode(
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn client_omp_renderer_eligible(
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> bool {
+    let _ = launch_mode;
+    omp_renderer::capabilities(requested_encoding, false, stdin_tty, stdout_tty, true)
+        .client_local_native
+}
+
 fn client_omp_renderer_capabilities(
     requested_encoding: RenderEncoding,
     launch_mode: ClientLaunchMode,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    omp_executable: Option<&crate::update::OmpExecutable>,
 ) -> crate::protocol::OmpRendererCapabilities {
     #[cfg(unix)]
     {
+        let _ = launch_mode;
         omp_renderer::capabilities(
             requested_encoding,
-            matches!(
-                launch_mode,
-                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
-            ),
-            io::stdin().is_terminal(),
-            io::stdout().is_terminal(),
+            false,
+            stdin_tty,
+            stdout_tty,
+            omp_executable.is_some(),
         )
     }
     #[cfg(not(unix))]
     {
-        let _ = (requested_encoding, launch_mode);
+        let _ = (
+            requested_encoding,
+            launch_mode,
+            stdin_tty,
+            stdout_tty,
+            omp_executable,
+        );
         crate::protocol::OmpRendererCapabilities::default()
     }
+}
+
+#[cfg(unix)]
+fn resolve_client_omp_executable(eligible: bool) -> Option<crate::update::OmpExecutable> {
+    resolve_client_omp_executable_with(eligible, crate::update::native_omp_executable, |error| {
+        eprintln!("herdr: native OMP renderer unavailable ({error}); using server-side rendering");
+    })
+}
+
+#[cfg(unix)]
+fn client_omp_resolution_is_benign(error: &str) -> bool {
+    matches!(
+        error,
+        "managed OMP companion is disabled for this client attach"
+            | "managed OMP companion is unavailable for this platform"
+            | "this Herdr build has no paired OMP companion"
+    )
+}
+
+#[cfg(unix)]
+fn resolve_client_omp_executable_with(
+    eligible: bool,
+    resolve: impl FnOnce() -> Result<crate::update::OmpExecutable, String>,
+    report_failure: impl FnOnce(&str),
+) -> Option<crate::update::OmpExecutable> {
+    if !eligible {
+        return None;
+    }
+    match resolve().and_then(|executable| executable.verify().map(|()| executable)) {
+        Ok(executable) => Some(executable),
+        Err(error) if client_omp_resolution_is_benign(&error) => None,
+        Err(error) => {
+            report_failure(&error);
+            None
+        }
+    }
+}
+#[cfg(unix)]
+fn probe_connect_then_resolve_client_omp_and_handshake_with<T, H>(
+    eligible: bool,
+    probe_connect: impl FnOnce() -> io::Result<T>,
+    resolve: impl FnOnce(bool) -> Option<crate::update::OmpExecutable>,
+    connect: impl FnOnce() -> io::Result<T>,
+    handshake: impl FnOnce(&mut T, Option<&crate::update::OmpExecutable>) -> Result<H, ClientError>,
+) -> Result<(T, Option<crate::update::OmpExecutable>, H), ClientError> {
+    if eligible {
+        drop(probe_connect().map_err(ClientError::ConnectionFailed)?);
+    }
+    let omp_executable = resolve(eligible);
+    let mut stream = connect().map_err(|error| {
+        if eligible {
+            ClientError::ConnectionLost(error)
+        } else {
+            ClientError::ConnectionFailed(error)
+        }
+    })?;
+    let handshake_result = handshake(&mut stream, omp_executable.as_ref()).map_err(|error| {
+        if !eligible {
+            return error;
+        }
+        match error {
+            ClientError::ConnectionFailed(error) => ClientError::ConnectionLost(error),
+            ClientError::Protocol(protocol::FramingError::UnexpectedEof) => {
+                ClientError::ConnectionLost(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server connection closed during handshake",
+                ))
+            }
+            ClientError::Protocol(protocol::FramingError::Io(error))
+                if error.kind() != io::ErrorKind::InvalidData =>
+            {
+                ClientError::ConnectionLost(error)
+            }
+            error => error,
+        }
+    })?;
+    Ok((stream, omp_executable, handshake_result))
 }
 fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
     match crate::config::load_or_create_identity() {
@@ -881,6 +977,30 @@ fn do_handshake(
     launch_mode: ClientLaunchMode,
     identity: &crate::config::ClientIdentity,
 ) -> Result<RenderEncoding, ClientError> {
+    do_handshake_with_renderer_capabilities(
+        stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        launch_mode,
+        crate::protocol::OmpRendererCapabilities::default(),
+        identity,
+    )
+}
+
+fn do_handshake_with_renderer_capabilities(
+    stream: &mut LocalStream,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+    renderer_capabilities: crate::protocol::OmpRendererCapabilities,
+    identity: &crate::config::ClientIdentity,
+) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
@@ -900,7 +1020,7 @@ fn do_handshake(
             .flatten(),
         frontend_profile_id: Some(identity.frontend_profile_id.clone()),
         renderer_binding_token: Some(identity.renderer_binding_token.clone()),
-        renderer_capabilities: client_omp_renderer_capabilities(requested_encoding, launch_mode),
+        renderer_capabilities,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1005,6 +1125,15 @@ impl ClientExecutableIdentity {
 }
 
 #[cfg(unix)]
+fn should_relaunch_updated_client_during_startup(
+    direct_attach_requested: bool,
+    remote_client: bool,
+    executable_replaced: bool,
+) -> bool {
+    !direct_attach_requested && !remote_client && executable_replaced
+}
+
+#[cfg(unix)]
 fn should_relaunch_updated_client(
     error: &ClientError,
     direct_attach_requested: bool,
@@ -1027,6 +1156,15 @@ fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> 
             error,
             ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. }
         )
+}
+
+#[cfg(unix)]
+fn client_error_exit_code(error: &ClientError, remote_client: bool) -> i32 {
+    if should_request_remote_reconnect(error, remote_client) {
+        crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+    } else {
+        1
+    }
 }
 
 /// Runs the thin client: connects to the server, performs the handshake,
@@ -1381,6 +1519,133 @@ fn run_client_with_mode(
 
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+
+    let socket_path = client_socket_path();
+    crate::logging::startup("client");
+    info!(path = %socket_path.display(), "{log_message}");
+
+    // Get the terminal geometry before handshake (before raw mode).
+    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
+        initial_terminal_geometry(kitty_graphics_enabled);
+    let launch_mode = client_launch_mode(
+        direct_attach_requested,
+        exact_cell_size,
+        cell_width_px,
+        cell_height_px,
+    );
+    let stdin_tty = io::stdin().is_terminal();
+    let stdout_tty = io::stdout().is_terminal();
+    #[cfg(unix)]
+    let omp_eligible =
+        client_omp_renderer_eligible(requested_encoding, launch_mode, stdin_tty, stdout_tty);
+    #[cfg(unix)]
+    let (mut stream, omp_executable, (renderer_capabilities, negotiated_encoding)) =
+        match probe_connect_then_resolve_client_omp_and_handshake_with(
+            omp_eligible,
+            || crate::ipc::connect_local_stream(&socket_path),
+            resolve_client_omp_executable,
+            || crate::ipc::connect_local_stream(&socket_path),
+            |stream, omp_executable| {
+                let renderer_capabilities = client_omp_renderer_capabilities(
+                    requested_encoding,
+                    launch_mode,
+                    stdin_tty,
+                    stdout_tty,
+                    omp_executable,
+                );
+                let negotiated_encoding = do_handshake_with_renderer_capabilities(
+                    stream,
+                    cols,
+                    rows,
+                    cell_width_px,
+                    cell_height_px,
+                    requested_encoding,
+                    launch_mode,
+                    renderer_capabilities,
+                    &identity,
+                )?;
+                Ok((renderer_capabilities, negotiated_encoding))
+            },
+        ) {
+            Ok(values) => values,
+            Err(err) => {
+                #[cfg(unix)]
+                if let Some(executable) = client_executable.as_ref().filter(|executable| {
+                    should_relaunch_updated_client_during_startup(
+                        direct_attach_requested,
+                        remote_client,
+                        executable.was_replaced(),
+                    )
+                }) {
+                    info!(path = %executable.path.display(), "relaunching updated client during startup");
+                    let relaunch_error = executable.exec_replacement();
+                    eprintln!("herdr: {err}");
+                    eprintln!(
+                        "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+                    );
+                    std::process::exit(1);
+                }
+                eprintln!("herdr: {err}");
+                std::process::exit(client_error_exit_code(&err, remote_client));
+            }
+        };
+    #[cfg(unix)]
+    if let Some(executable) = client_executable.as_ref().filter(|executable| {
+        should_relaunch_updated_client_during_startup(
+            direct_attach_requested,
+            remote_client,
+            executable.was_replaced(),
+        )
+    }) {
+        info!(path = %executable.path.display(), "relaunching updated client during startup");
+        let relaunch_error = executable.exec_replacement();
+        eprintln!(
+            "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+        );
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    let omp_executable: Option<crate::update::OmpExecutable> = None;
+    #[cfg(not(unix))]
+    let renderer_capabilities = client_omp_renderer_capabilities(
+        requested_encoding,
+        launch_mode,
+        stdin_tty,
+        stdout_tty,
+        omp_executable.as_ref(),
+    );
+    #[cfg(not(unix))]
+    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("herdr: {}", ClientError::ConnectionFailed(err));
+            std::process::exit(1);
+        }
+    };
+    #[cfg(not(unix))]
+    let negotiated_encoding = match do_handshake_with_renderer_capabilities(
+        &mut stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        launch_mode,
+        renderer_capabilities,
+        &identity,
+    ) {
+        Ok(encoding) => encoding,
+        Err(err) => {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(unix)]
+    let renderer_omp_executable = renderer_capabilities
+        .client_local_native
+        .then_some(omp_executable)
+        .flatten();
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1390,57 +1655,7 @@ fn run_client_with_mode(
         mouse_capture_active: mouse_capture,
         remote_image_paste_key,
         #[cfg(unix)]
-        omp_renderer_enabled: client_omp_renderer_capabilities(
-            requested_encoding,
-            if direct_attach_requested {
-                ClientLaunchMode::TerminalAttach
-            } else {
-                ClientLaunchMode::App
-            },
-        )
-        .client_local_native,
-    };
-
-    let socket_path = client_socket_path();
-    crate::logging::startup("client");
-    info!(path = %socket_path.display(), "{log_message}");
-
-    // Try to connect to the server.
-    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(s) => s,
-        Err(err) => {
-            // Server unreachable — show clear error and exit.
-            let client_err = ClientError::ConnectionFailed(err);
-            eprintln!("herdr: {client_err}");
-            std::process::exit(1);
-        }
-    };
-
-    // Get the terminal geometry before handshake (before raw mode).
-    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(kitty_graphics_enabled);
-
-    // Perform handshake while the stream is still in blocking mode.
-    let negotiated_encoding = match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        client_launch_mode(
-            direct_attach_requested,
-            exact_cell_size,
-            cell_width_px,
-            cell_height_px,
-        ),
-        &identity,
-    ) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
-        }
+        omp_executable: renderer_omp_executable,
     };
 
     if let Some((terminal_id, takeover)) = attach_request {
@@ -1702,7 +1917,7 @@ async fn run_client_loop(
         draw_host_cursor,
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
         #[cfg(unix)]
-        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_renderer_enabled),
+        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -3239,6 +3454,256 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pane_local_omp_skips_native_companion_resolution() {
+        let calls = std::cell::Cell::new(0);
+        let eligible = client_omp_renderer_eligible(
+            RenderEncoding::SemanticFrame,
+            ClientLaunchMode::App,
+            true,
+            true,
+        );
+        assert!(!eligible);
+        let executable = crate::update::OmpExecutable::Explicit(
+            std::env::current_exe().expect("current test executable"),
+        );
+        assert!(
+            !client_omp_renderer_capabilities(
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                true,
+                true,
+                Some(&executable),
+            )
+            .client_local_native
+        );
+        assert!(resolve_client_omp_executable_with(
+            eligible,
+            || {
+                calls.set(calls.get() + 1);
+                panic!("pane-local OMP must not resolve a full-surface companion")
+            },
+            |_| {},
+        )
+        .is_none());
+        assert_eq!(calls.get(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_probes_then_resolves_then_connects_and_handshakes() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let expected = std::env::current_exe().expect("current test executable");
+
+        let (_, resolved, ()) = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || {
+                steps.borrow_mut().push("probe-connect");
+                Ok(())
+            },
+            |eligible| {
+                assert!(eligible);
+                steps.borrow_mut().push("resolve");
+                Some(crate::update::OmpExecutable::Explicit(expected.clone()))
+            },
+            || {
+                steps.borrow_mut().push("connect");
+                Ok(())
+            },
+            |_, executable| {
+                steps.borrow_mut().push("handshake");
+                assert_eq!(
+                    executable.map(|executable| executable.executable()),
+                    Some(expected.as_path())
+                );
+                Ok(())
+            },
+        )
+        .expect("client startup succeeds");
+
+        assert_eq!(resolved.expect("resolved companion").executable(), expected);
+        assert_eq!(
+            steps.into_inner(),
+            vec!["probe-connect", "resolve", "connect", "handshake"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_native_omp_probe_connect_skips_resolution() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
+            true,
+            || Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            |_| panic!("failed probe must prevent native OMP resolution"),
+            || unreachable!("failed probe must prevent the real connection"),
+            |_, _| unreachable!("failed probe must prevent the handshake"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClientError::ConnectionFailed(error))
+                if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_second_connect_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
+            true,
+            || Ok(()),
+            |_| None,
+            || Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            |_, _| unreachable!("failed second connect must prevent the handshake"),
+        );
+
+        let error = result.expect_err("second connection should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source)
+                if source.kind() == io::ErrorKind::ConnectionReset
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+        assert_eq!(client_error_exit_code(&error, false), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_handshake_write_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || Ok(()),
+            |_| None,
+            || Ok(()),
+            |_, _| {
+                Err::<(), _>(ClientError::ConnectionFailed(io::Error::from(
+                    io::ErrorKind::BrokenPipe,
+                )))
+            },
+        );
+
+        let error = result.expect_err("handshake write should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source) if source.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_handshake_read_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || Ok(()),
+            |_| None,
+            || Ok(()),
+            |_, _| Err::<(), _>(ClientError::Protocol(protocol::FramingError::UnexpectedEof)),
+        );
+
+        let error = result.expect_err("handshake read should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source)
+                if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ineligible_native_omp_clients_skip_resolution() {
+        for (encoding, launch_mode, stdin_tty, stdout_tty) in [
+            (
+                RenderEncoding::TerminalAnsi,
+                ClientLaunchMode::App,
+                true,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::TerminalAttach,
+                true,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                false,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                true,
+                false,
+            ),
+        ] {
+            let eligible =
+                client_omp_renderer_eligible(encoding, launch_mode, stdin_tty, stdout_tty);
+            assert!(!eligible);
+            let called = std::cell::Cell::new(false);
+            assert!(resolve_client_omp_executable_with(
+                eligible,
+                || {
+                    called.set(true);
+                    panic!("ineligible client must not resolve a native OMP companion")
+                },
+                |_| {},
+            )
+            .is_none());
+            assert!(!called.get());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_omp_resolution_keeps_expected_unavailability_quiet() {
+        let mut diagnostics = Vec::new();
+
+        for error in [
+            "managed OMP companion is disabled for this client attach",
+            "managed OMP companion is unavailable for this platform",
+            "this Herdr build has no paired OMP companion",
+        ] {
+            assert!(resolve_client_omp_executable_with(
+                true,
+                || Err(error.to_string()),
+                |error| diagnostics.push(error.to_owned()),
+            )
+            .is_none());
+        }
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_omp_resolution_reports_invalid_or_unverified_companions() {
+        for error in [
+            "OMP executable path must be absolute: relative-omp",
+            "OMP companion checksum verification failed: mismatch",
+        ] {
+            let mut diagnostic = None;
+            assert!(resolve_client_omp_executable_with(
+                true,
+                || Err(error.to_string()),
+                |error| diagnostic = Some(error.to_owned()),
+            )
+            .is_none());
+            assert_eq!(diagnostic.as_deref(), Some(error));
+        }
+    }
+
     fn restore_env_var(key: &str, value: Option<OsString>) {
         if let Some(value) = value {
             std::env::set_var(key, value);
@@ -3817,6 +4282,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn replaced_local_app_client_relaunches_during_startup() {
+        assert!(should_relaunch_updated_client_during_startup(
+            false, false, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            true, false, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            false, true, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            false, false, false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn replaced_local_app_client_relaunches_only_after_server_disconnect() {
         let lost = ClientError::ConnectionLost(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -4147,8 +4629,8 @@ mod tests {
 
     #[test]
     fn open_safe_url_accepts_http_and_https() {
-        let mut children = Vec::new();
         let mut opened = Vec::new();
+        let mut children = Vec::new();
         for url in ["http://example.com", "https://example.com"] {
             open_safe_url(url, &mut children, |url| {
                 opened.push(url.to_owned());
@@ -4156,12 +4638,13 @@ mod tests {
             });
         }
         assert_eq!(opened, ["http://example.com", "https://example.com"]);
+        assert!(children.is_empty());
     }
 
     #[test]
     fn open_safe_url_rejects_file_and_custom_schemes() {
-        let mut children = Vec::new();
         let mut calls = 0;
+        let mut children = Vec::new();
         for url in ["file:///tmp/example.rs", "mailto:user@example.com"] {
             open_safe_url(url, &mut children, |_| {
                 calls += 1;
@@ -4169,6 +4652,7 @@ mod tests {
             });
         }
         assert_eq!(calls, 0);
+        assert!(children.is_empty());
     }
 
     #[cfg(unix)]

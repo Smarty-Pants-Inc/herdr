@@ -19,6 +19,15 @@ EXPECTED_ASSET_NAMES = {
     **{target: f"herdr-{target}" for target in ASSET_TARGETS},
     "windows-x86_64": "herdr-windows-x86_64.zip",
 }
+OMP_EXPECTED_ASSET_NAMES = {
+    "linux-x86_64": "omp-linux-x86_64",
+    "linux-aarch64": "omp-linux-aarch64",
+    "macos-x86_64": "omp-macos-x86_64",
+    "macos-aarch64": "omp-macos-aarch64",
+}
+OMP_ASSET_TARGETS = tuple(OMP_EXPECTED_ASSET_NAMES)
+OMP_SOURCE_FIELDS = ("repository", "commit", "tree", "version", "build_id")
+OMP_REPLACEMENT_PREFIX = "REPLACE_WITH_"
 HIDDEN_SUBJECTS = (
     "docs: update website manifest",
     "docs: update preview manifest",
@@ -68,6 +77,34 @@ def read_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_omp_source(data: dict[str, Any]) -> dict[str, str]:
+    if set(data) != set(OMP_SOURCE_FIELDS):
+        raise ValueError(
+            f"OMP source descriptor must contain exactly: {', '.join(OMP_SOURCE_FIELDS)}"
+        )
+    source = {field: str(data[field]).strip() for field in OMP_SOURCE_FIELDS}
+    for field, value in source.items():
+        if not value or OMP_REPLACEMENT_PREFIX in value:
+            raise ValueError(
+                f"OMP source {field} is missing or still a replacement placeholder"
+            )
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"OMP source {field} must be one line")
+    if not re.fullmatch(r"[^/\s]+/[^/\s]+", source["repository"]):
+        raise ValueError("OMP source repository must be owner/name")
+    for field in ("commit", "tree"):
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", source[field]):
+            raise ValueError(f"OMP source {field} must be a 40-character Git object ID")
+    return source
+
+
+def read_omp_source(path: Path) -> dict[str, str]:
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise ValueError("OMP source descriptor must be a JSON object")
+    return validate_omp_source(data)
 
 
 def previous_preview_commit(path: Path) -> str | None:
@@ -131,7 +168,9 @@ def humanize_subject(subject: str) -> tuple[str, str]:
     return heading, body
 
 
-def build_notes(previous: str, commit: str, build_id: str, base_version: str, repo: str) -> str:
+def build_notes(
+    previous: str, commit: str, build_id: str, base_version: str, repo: str
+) -> str:
     short = commit[:12]
     compare = f"https://github.com/{repo}/compare/{previous}...{commit}"
     lines = [
@@ -159,7 +198,9 @@ def build_notes(previous: str, commit: str, build_id: str, base_version: str, re
         lines.append("")
 
     if not wrote:
-        lines.extend(["### Changed", "- Rebuilt preview from the current master branch.", ""])
+        lines.extend(
+            ["### Changed", "- Rebuilt preview from the current master branch.", ""]
+        )
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -168,6 +209,13 @@ def default_asset_urls(repo: str, tag: str) -> dict[str, str]:
     return {
         target: f"https://github.com/{repo}/releases/download/{tag}/{EXPECTED_ASSET_NAMES[target]}"
         for target in ASSET_TARGETS
+    }
+
+
+def default_omp_asset_urls(repo: str, tag: str) -> dict[str, str]:
+    return {
+        target: f"https://github.com/{repo}/releases/download/{tag}/{OMP_EXPECTED_ASSET_NAMES[target]}"
+        for target in OMP_ASSET_TARGETS
     }
 
 
@@ -180,20 +228,97 @@ def read_sha_file(path: Path | None) -> dict[str, str]:
     return {str(key): str(value) for key, value in data.items()}
 
 
-def asset_objects(urls: dict[str, str], shas: dict[str, str]) -> dict[str, dict[str, str]]:
+def asset_objects(
+    urls: dict[str, str], shas: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    if set(shas) != set(ASSET_TARGETS):
+        raise ValueError(
+            f"Herdr SHA targets must be exactly: {', '.join(ASSET_TARGETS)}"
+        )
     assets: dict[str, dict[str, str]] = {}
     for target in ASSET_TARGETS:
-        url = urls[target]
-        entry = {"url": url}
-        sha = shas.get(target)
-        if sha:
-            entry["sha256"] = sha
+        sha = shas[target]
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError(f"{target} requires a SHA-256 digest")
+        entry = {"url": urls[target], "sha256": sha}
         if target.startswith("windows-"):
-            if not sha or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
-                raise ValueError(f"{target} requires a SHA-256 digest")
             entry["format"] = "zip"
         assets[target] = entry
     return assets
+
+
+def omp_asset_objects(
+    urls: dict[str, str], shas: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    if set(shas) != set(OMP_ASSET_TARGETS):
+        raise ValueError(
+            f"OMP SHA targets must be exactly: {', '.join(OMP_ASSET_TARGETS)}"
+        )
+    assets: dict[str, dict[str, str]] = {}
+    for target in OMP_ASSET_TARGETS:
+        sha = shas[target]
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            raise ValueError(f"OMP {target} requires a SHA-256 digest")
+        assets[target] = {"url": urls[target], "sha256": sha}
+    return assets
+
+
+def omp_metadata(
+    source: dict[str, str], repo: str, tag: str, shas: dict[str, str]
+) -> dict[str, Any]:
+    descriptor = validate_omp_source(source)
+    return {
+        "build_id": descriptor["build_id"],
+        "commit": descriptor["commit"],
+        "tree": descriptor["tree"],
+        "version": descriptor["version"],
+        "assets": omp_asset_objects(default_omp_asset_urls(repo, tag), shas),
+    }
+
+
+def valid_retained_asset(asset: Any) -> bool:
+    return (
+        isinstance(asset, dict)
+        and isinstance(asset.get("url"), str)
+        and bool(asset["url"].strip())
+        and isinstance(asset.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", asset["sha256"]) is not None
+    )
+
+
+def retained_build_has_verifiable_assets(build: Any) -> bool:
+    if not isinstance(build, dict):
+        return False
+    assets = build.get("assets")
+    return isinstance(assets, dict) and set(assets) == set(ASSET_TARGETS) and all(
+        valid_retained_asset(assets.get(target)) for target in ASSET_TARGETS
+    )
+
+
+def retained_build_has_verifiable_omp_pair(build: Any) -> bool:
+    if not retained_build_has_verifiable_assets(build):
+        return False
+    omp = build.get("omp")
+    if not isinstance(omp, dict):
+        return False
+    for field in ("build_id", "version"):
+        value = omp.get(field)
+        if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            return False
+    for field in ("commit", "tree"):
+        value = omp.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+            return False
+    omp_assets = omp.get("assets")
+    if not isinstance(omp_assets, dict) or set(omp_assets) != set(OMP_ASSET_TARGETS):
+        return False
+    return all(valid_retained_asset(omp_assets.get(target)) for target in OMP_ASSET_TARGETS)
+
+
+def retained_build_is_verifiable(build: Any) -> bool:
+    return retained_build_has_verifiable_assets(build) and (
+        "omp" not in build or retained_build_has_verifiable_omp_pair(build)
+    )
 
 
 def build_manifest(
@@ -208,13 +333,30 @@ def build_manifest(
     notes: str,
     shas: dict[str, str],
     retain: int,
+    omp_source: dict[str, str] | None = None,
+    omp_shas: dict[str, str] | None = None,
 ) -> str:
+    if (omp_source is None) != (omp_shas is None):
+        raise ValueError(
+            "OMP source descriptor and SHA targets must be provided together"
+        )
     urls = default_asset_urls(repo, tag)
     assets = asset_objects(urls, shas)
+    omp = None
+    if omp_source is not None and omp_shas is not None:
+        omp = omp_metadata(omp_source, repo, tag, omp_shas)
     current = read_json(output) or {}
-    builds = current.get("builds") if isinstance(current.get("builds"), dict) else {}
-    builds = dict(builds)
-    builds[build_id] = {
+    existing_builds = current.get("builds", {})
+    builds = (
+        {
+            key: build
+            for key, build in existing_builds.items()
+            if retained_build_is_verifiable(build)
+        }
+        if isinstance(existing_builds, dict)
+        else {}
+    )
+    build: dict[str, Any] = {
         "base_version": normalize_version(base_version),
         "commit": commit,
         "built_at": built_at,
@@ -222,6 +364,9 @@ def build_manifest(
         "tag": tag,
         "assets": assets,
     }
+    if omp is not None:
+        build["omp"] = omp
+    builds[build_id] = build
     ordered_builds = {
         key: builds[key]
         for key in sorted(
@@ -240,21 +385,33 @@ def build_manifest(
         "protocol": protocol,
         "notes": notes.strip(),
         "assets": assets,
-        "builds": ordered_builds,
     }
+    if omp is not None:
+        manifest["omp"] = omp
+    manifest["builds"] = ordered_builds
     return json.dumps(manifest, indent=2) + "\n"
 
 
 def cmd_notes(args: argparse.Namespace) -> int:
-    previous = args.previous or previous_preview_commit(Path(args.manifest)) or latest_stable_tag()
-    notes = build_notes(previous, args.commit, args.build_id, args.base_version, args.repo)
+    previous = (
+        args.previous
+        or previous_preview_commit(Path(args.manifest))
+        or latest_stable_tag()
+    )
+    notes = build_notes(
+        previous, args.commit, args.build_id, args.base_version, args.repo
+    )
     Path(args.output).write_text(notes, encoding="utf-8")
     return 0
 
 
 def cmd_manifest(args: argparse.Namespace) -> int:
+    if (args.omp_source is None) != (args.omp_sha_file is None):
+        raise SystemExit("--omp-source and --omp-sha-file must be provided together")
     notes = Path(args.notes).read_text(encoding="utf-8")
     shas = read_sha_file(Path(args.sha_file) if args.sha_file else None)
+    omp_source = read_omp_source(Path(args.omp_source)) if args.omp_source else None
+    omp_shas = read_sha_file(Path(args.omp_sha_file)) if args.omp_sha_file else None
     content = build_manifest(
         output=Path(args.output),
         repo=args.repo,
@@ -267,6 +424,8 @@ def cmd_manifest(args: argparse.Namespace) -> int:
         notes=notes,
         shas=shas,
         retain=args.retain,
+        omp_source=omp_source,
+        omp_shas=omp_shas,
     )
     Path(args.output).write_text(content, encoding="utf-8")
     return 0
@@ -314,6 +473,8 @@ def main() -> int:
     manifest.add_argument("--protocol", required=True, type=int)
     manifest.add_argument("--notes", required=True)
     manifest.add_argument("--sha-file")
+    manifest.add_argument("--omp-source")
+    manifest.add_argument("--omp-sha-file")
     manifest.add_argument("--retain", type=int, default=30)
     manifest.set_defaults(func=cmd_manifest)
 
