@@ -2211,7 +2211,7 @@ async fn run_client_loop(
                 {
                     state
                         .omp_renderer
-                        .resize((new_cols, new_rows, cell_width_px, cell_height_px));
+                        .resize((cell_width_px, cell_height_px));
                     display_pending_omp_surface(
                         &mut state,
                         &mut write_stream,
