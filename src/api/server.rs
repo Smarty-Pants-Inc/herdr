@@ -20,7 +20,7 @@ use crate::api::{
     EventHub,
 };
 use crate::ipc::{
-    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
+    bind_private_local_listener, is_connection_closed_error, local_stream_peer_closed,
     local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
     set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
     SocketFileIdentity,
@@ -80,6 +80,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+        omp_maintenance: true,
     })
 }
 
@@ -92,7 +93,7 @@ fn start_server_inner(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
-    let listener = bind_local_listener(&path)?;
+    let listener = bind_private_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
@@ -421,6 +422,11 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
+        Method::ServerOmpMaintenanceAcquire(_) => "server.omp_maintenance.acquire",
+        Method::ServerOmpMaintenanceStatus(_) => "server.omp_maintenance.status",
+        Method::ServerOmpMaintenanceInspect(_) => "server.omp_maintenance.inspect",
+        Method::ServerOmpMaintenancePermit(_) => "server.omp_maintenance.permit",
+        Method::ServerOmpMaintenanceRelease(_) => "server.omp_maintenance.release",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
@@ -1191,6 +1197,7 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                omp_maintenance: true,
             }),
             None,
             None,

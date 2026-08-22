@@ -3708,6 +3708,59 @@
           },
           "type": "object"
         },
+        "ServerOmpMaintenanceAcquireParams": {
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "maxLength": 43,
+              "minLength": 43,
+              "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id"
+          ],
+          "type": "object"
+        },
+        "ServerOmpMaintenancePermitParams": {
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "maxLength": 43,
+              "minLength": 43,
+              "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id",
+            "session",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "ServerOmpMaintenanceReleaseParams": {
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "maxLength": 43,
+              "minLength": 43,
+              "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation_id"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -4517,6 +4570,86 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ServerLiveHandoffParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.omp_maintenance.acquire",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerOmpMaintenanceAcquireParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.omp_maintenance.status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.omp_maintenance.inspect",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.omp_maintenance.permit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerOmpMaintenancePermitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.omp_maintenance.release",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerOmpMaintenanceReleaseParams"
             }
           },
           "required": [
@@ -8766,6 +8899,22 @@
             },
             {
               "properties": {
+                "maintenance": {
+                  "$ref": "#/schemas/success_response/$defs/ServerOmpMaintenanceStatus"
+                },
+                "type": {
+                  "const": "omp_maintenance",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "maintenance"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "snapshot": {
                   "$ref": "#/schemas/success_response/$defs/SessionSnapshot"
                 },
@@ -9987,10 +10136,96 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "omp_maintenance": {
+              "default": false,
+              "type": "boolean"
             }
           },
           "required": [
             "live_handoff"
+          ],
+          "type": "object"
+        },
+        "ServerOmpMaintenancePermit": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "ServerOmpMaintenanceRoute": {
+          "properties": {
+            "omp_session_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "proof": {
+              "type": "boolean"
+            },
+            "route_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session",
+            "pane_id",
+            "omp_session_id",
+            "route_generation",
+            "proof"
+          ],
+          "type": "object"
+        },
+        "ServerOmpMaintenanceStatus": {
+          "properties": {
+            "held": {
+              "type": "boolean"
+            },
+            "permit": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ServerOmpMaintenancePermit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "route_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "routes": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/ServerOmpMaintenanceRoute"
+              },
+              "type": "array"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "held",
+            "route_count",
+            "routes"
           ],
           "type": "object"
         },

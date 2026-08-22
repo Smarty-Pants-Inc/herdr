@@ -39,8 +39,10 @@ use crate::api;
 use crate::app;
 use crate::config;
 use crate::events::AppEvent;
+#[cfg(test)]
+use crate::ipc::bind_local_listener;
 use crate::ipc::{
-    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
+    bind_private_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
     SocketFileIdentity,
 };
 use crate::protocol::{
@@ -535,7 +537,7 @@ impl HeadlessServer {
             workspace.omp_bridge = Some(omp_service.bridge().clone());
         }
 
-        let listener = bind_local_listener(&client_path)?;
+        let listener = bind_private_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
@@ -640,6 +642,7 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        let mut next_omp_maintenance_check = Instant::now();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -711,6 +714,16 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
+            let maintenance_now = Instant::now();
+            if maintenance_now >= next_omp_maintenance_check {
+                next_omp_maintenance_check = maintenance_now + CLIENT_ACCEPT_POLL_INTERVAL;
+                if self.enforce_omp_maintenance() {
+                    needs_render = true;
+                    needs_full_render = true;
+                    needs_graphics_render = false;
+                    crate::render_prof::event("full_render_cause.omp_maintenance");
+                }
+            }
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;
@@ -1335,14 +1348,17 @@ impl HeadlessServer {
     }
 
     #[cfg(unix)]
-    fn authorize_live_handoff(&self) -> io::Result<()> {
-        if self.omp_service.live_route_keys().is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
+    fn authorize_live_handoff(
+        &self,
+    ) -> io::Result<Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>> {
+        if !self.omp_service.live_route_keys().is_empty() {
+            return Err(io::Error::other(
                 "live handoff is unavailable while OMP host routes are live; restart Herdr normally",
-            ))
+            ));
         }
+        self.omp_service
+            .maintenance_handoff_state()
+            .map_err(|error| io::Error::other(error.message()))
     }
 
     #[cfg(unix)]
@@ -1350,7 +1366,7 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
-        self.authorize_live_handoff()?;
+        let omp_maintenance = self.authorize_live_handoff()?;
 
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
@@ -1445,6 +1461,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            omp_maintenance,
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1600,7 +1617,7 @@ impl HeadlessServer {
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
-        let listener = bind_local_listener(&client_path)?;
+        let listener = bind_private_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
@@ -3560,6 +3577,14 @@ impl HeadlessServer {
             render = true;
         }
         render
+    }
+
+    fn enforce_omp_maintenance(&mut self) -> bool {
+        let messages = self.omp_service.enforce_maintenance(&self.clients);
+        if messages.is_empty() {
+            return false;
+        }
+        self.apply_omp_messages(messages) | self.reconcile_omp_renderers()
     }
 
     fn detach_failed_private_omp_guest(&mut self, client_id: u64) {
@@ -5692,6 +5717,32 @@ impl HeadlessServer {
         })
     }
 
+    fn encode_omp_maintenance_response(
+        id: String,
+        result: Result<
+            api::schema::ServerOmpMaintenanceStatus,
+            crate::server::omp_maintenance::OmpMaintenanceError,
+        >,
+    ) -> String {
+        let response = match result {
+            Ok(maintenance) => serde_json::to_string(&api::schema::SuccessResponse {
+                id,
+                result: api::schema::ResponseResult::OmpMaintenance { maintenance },
+            }),
+            Err(error) => serde_json::to_string(&api::schema::ErrorResponse {
+                id,
+                error: api::schema::ErrorBody {
+                    code: error.code().into(),
+                    message: error.message(),
+                },
+            }),
+        };
+        response.unwrap_or_else(|_| {
+            r#"{"id":"","error":{"code":"serialization_error","message":"failed to encode OMP maintenance response"}}"#
+                .to_string()
+        })
+    }
+
     fn handle_pane_omp_bridge_api(
         &self,
         id: String,
@@ -5780,6 +5831,63 @@ impl HeadlessServer {
                 self.handle_pane_omp_bridge_api(msg.request.id.clone(), params, msg.context);
             let _ = msg.respond_to.send(response);
             return false;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenanceAcquire(params) = &msg.request.method {
+            let result = self.omp_service.acquire_maintenance(&params.operation_id);
+            let changed = result.is_ok() && self.enforce_omp_maintenance();
+            let result = result.and_then(|_| self.omp_service.maintenance_status());
+            let response = Self::encode_omp_maintenance_response(msg.request.id.clone(), result);
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::ServerOmpMaintenanceInspect(_)
+        ) {
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.inspect_maintenance(),
+            );
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::ServerOmpMaintenanceStatus(_)
+        ) {
+            let changed = self.enforce_omp_maintenance();
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.maintenance_status(),
+            );
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenancePermit(params) = &msg.request.method {
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.grant_maintenance_permit(
+                    &params.operation_id,
+                    &params.session,
+                    &params.pane_id,
+                ),
+            );
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenanceRelease(params) = &msg.request.method {
+            let changed = self.enforce_omp_maintenance();
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.release_maintenance(&params.operation_id),
+            );
+            let _ = msg.respond_to.send(response);
+            return changed;
         }
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
@@ -7547,6 +7655,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             should_quit,
             None,
         )?;
+        server
+            .omp_service
+            .validate_maintenance_handoff_state(received.manifest.omp_maintenance.as_ref())
+            .map_err(|error| io::Error::other(error.message()))?;
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();

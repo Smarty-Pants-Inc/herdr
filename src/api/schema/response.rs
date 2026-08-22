@@ -15,7 +15,7 @@ use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo, PluginWorkspacePaneInfo,
 };
-use super::server::{ServerBuildIdentity, ServerCapabilities};
+use super::server::{ServerBuildIdentity, ServerCapabilities, ServerOmpMaintenanceStatus};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -49,6 +49,9 @@ pub enum ResponseResult {
         capabilities: Option<ServerCapabilities>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build: Option<ServerBuildIdentity>,
+    },
+    OmpMaintenance {
+        maintenance: ServerOmpMaintenanceStatus,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
