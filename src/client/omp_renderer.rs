@@ -1041,11 +1041,25 @@ fn local_pixel_position(
     let (cols, rows, cell_width_px, cell_height_px) = size;
     let child_width_px = u32::from(cols).checked_mul(cell_width_px)?;
     let child_height_px = u32::from(rows).checked_mul(cell_height_px)?;
-    pointer.pane_position(
+    let crate::input::mouse::Position::Pixels { x, y } = pointer.pane_position(
         Rect::new(0, 0, pointer.geometry.cols, pointer.geometry.rows),
         child_width_px,
         child_height_px,
-    )
+    )?
+    else {
+        return None;
+    };
+    let (column, row) = local_pixel_cell(pointer, size)?;
+    Some(crate::input::mouse::Position::Pixels {
+        x: clamp_pixel_to_cell(x, column, cell_width_px)?,
+        y: clamp_pixel_to_cell(y, row, cell_height_px)?,
+    })
+}
+
+fn clamp_pixel_to_cell(pixel: u32, cell: u16, cell_extent: u32) -> Option<u32> {
+    let start = u32::from(cell).checked_mul(cell_extent)?.checked_add(1)?;
+    let end = u32::from(cell).checked_add(1)?.checked_mul(cell_extent)?;
+    Some(pixel.clamp(start, end))
 }
 
 fn local_pixel_cell(
@@ -1394,6 +1408,23 @@ mod tests {
         assert_ne!(
             frame.cells[1].modifier & ratatui::style::Modifier::UNDERLINED.bits(),
             0
+        );
+    }
+
+    #[test]
+    fn fractional_pixel_mapping_keeps_forwarded_position_in_the_hit_cell() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 1, 801, 20).unwrap();
+        let pointer = crate::input::mouse::HostPixels {
+            x: 11,
+            y: 1,
+            geometry,
+        };
+        let size = (80, 1, 10, 20);
+
+        assert_eq!(local_pixel_cell(pointer, size), Some((1, 0)));
+        assert_eq!(
+            local_pixel_position(pointer, size),
+            Some(crate::input::mouse::Position::Pixels { x: 11, y: 1 })
         );
     }
 
