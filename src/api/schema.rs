@@ -49,6 +49,16 @@ pub enum Method {
     ServerStop(EmptyParams),
     #[serde(rename = "server.live_handoff")]
     ServerLiveHandoff(ServerLiveHandoffParams),
+    #[serde(rename = "server.omp_maintenance.acquire")]
+    ServerOmpMaintenanceAcquire(ServerOmpMaintenanceAcquireParams),
+    #[serde(rename = "server.omp_maintenance.status")]
+    ServerOmpMaintenanceStatus(EmptyParams),
+    #[serde(rename = "server.omp_maintenance.inspect")]
+    ServerOmpMaintenanceInspect(EmptyParams),
+    #[serde(rename = "server.omp_maintenance.permit")]
+    ServerOmpMaintenancePermit(ServerOmpMaintenancePermitParams),
+    #[serde(rename = "server.omp_maintenance.release")]
+    ServerOmpMaintenanceRelease(ServerOmpMaintenanceReleaseParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.agent_manifests")]
