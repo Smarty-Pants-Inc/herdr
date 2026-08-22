@@ -530,6 +530,14 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// The App displayed the first frame for an exact client-local renderer launch.
     OmpRendererReady { client_id: u64, launch_id: u64 },
+    /// The exact native sideband finalized its initial snapshot or a resync.
+    OmpReplicaReady {
+        client_id: u64,
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+    },
     /// A background managed OMP companion resolution completed for the server-private fallback.
     OmpPrivateCompanionResolved {
         result: Result<crate::update::OmpExecutable, String>,
@@ -1016,6 +1024,33 @@ fn send_shutdown_to_unregistered_client(writer: &ClientWriter) {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+fn suppress_client_writer_sigpipe(stream: &LocalStream) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let LocalStream::UdSocket(stream) = stream;
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            stream.inner().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn suppress_client_writer_sigpipe(_stream: &LocalStream) -> io::Result<()> {
+    Ok(())
+}
+
 /// The client writer loop — prioritizes control messages over render frames.
 fn client_writer_loop(
     mut stream: LocalStream,
@@ -1023,6 +1058,12 @@ fn client_writer_loop(
     writer_queue: Arc<ClientWriterQueue>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
+    if let Err(err) = suppress_client_writer_sigpipe(&stream) {
+        debug!(err = %err, "failed to suppress client writer SIGPIPE");
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+        writer_queue.close_writer();
+        return;
+    }
     while let Some(item) = writer_queue.recv() {
         let written = match item {
             ClientWriteItem::Control(data) => {
@@ -1358,6 +1399,18 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
+            ClientMessage::OmpReplicaReady {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+            } => ServerEvent::OmpReplicaReady {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+            },
             ClientMessage::IdentityPersistenceAck {
                 request_id,
                 display_name,
@@ -1482,6 +1535,26 @@ mod tests {
                 client_id: 7,
                 launch_id: 9,
             }
+        ));
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::OmpReplicaReady {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 3,
+                attachment_epoch: 4,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "OMP replica ready event"),
+            ServerEvent::OmpReplicaReady {
+                client_id: 7,
+                pane_id,
+                omp_session_id,
+                route_generation: 3,
+                attachment_epoch: 4,
+            } if pane_id == "pane" && omp_session_id == "session"
         ));
         drop(client_stream);
         handle.join().unwrap().unwrap();

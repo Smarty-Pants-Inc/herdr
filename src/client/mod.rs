@@ -841,9 +841,25 @@ pub(crate) fn client_omp_renderer_eligible(
     stdin_tty: bool,
     stdout_tty: bool,
 ) -> bool {
-    let _ = launch_mode;
-    omp_renderer::capabilities(requested_encoding, false, stdin_tty, stdout_tty, true)
+    #[cfg(unix)]
+    {
+        omp_renderer::capabilities(
+            requested_encoding,
+            matches!(
+                launch_mode,
+                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+            ),
+            stdin_tty,
+            stdout_tty,
+            true,
+        )
         .client_local_native
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (requested_encoding, launch_mode, stdin_tty, stdout_tty);
+        false
+    }
 }
 
 fn client_omp_renderer_capabilities(
@@ -855,10 +871,12 @@ fn client_omp_renderer_capabilities(
 ) -> crate::protocol::OmpRendererCapabilities {
     #[cfg(unix)]
     {
-        let _ = launch_mode;
         omp_renderer::capabilities(
             requested_encoding,
-            false,
+            matches!(
+                launch_mode,
+                ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+            ),
             stdin_tty,
             stdout_tty,
             omp_executable.is_some(),
@@ -2223,6 +2241,7 @@ async fn run_client_loop(
                     launch_id,
                     target_app_client_id,
                     route,
+                    rect,
                     bound,
                     surface_active,
                     prefix,
@@ -2236,12 +2255,8 @@ async fn run_client_loop(
                             bound,
                             surface_active,
                             prefix,
-                            (
-                                state.reported_size.0,
-                                state.reported_size.1,
-                                state.reported_cell_size_px.0,
-                                state.reported_cell_size_px.1,
-                            ),
+                            rect,
+                            (state.reported_cell_size_px.0, state.reported_cell_size_px.1),
                         );
                         display_pending_omp_surface(
                             &mut state,
@@ -2254,6 +2269,7 @@ async fn run_client_loop(
                         launch_id,
                         target_app_client_id,
                         route,
+                        rect,
                         bound,
                         surface_active,
                         prefix,
@@ -3456,38 +3472,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pane_local_omp_skips_native_companion_resolution() {
+    fn native_omp_is_resolved_once_after_renderer_eligibility() {
         let calls = std::cell::Cell::new(0);
+        let expected = std::env::current_exe().expect("current test executable");
         let eligible = client_omp_renderer_eligible(
             RenderEncoding::SemanticFrame,
             ClientLaunchMode::App,
             true,
             true,
         );
-        assert!(!eligible);
-        let executable = crate::update::OmpExecutable::Explicit(
-            std::env::current_exe().expect("current test executable"),
-        );
-        assert!(
-            !client_omp_renderer_capabilities(
-                RenderEncoding::SemanticFrame,
-                ClientLaunchMode::App,
-                true,
-                true,
-                Some(&executable),
-            )
-            .client_local_native
-        );
-        assert!(resolve_client_omp_executable_with(
+        assert!(eligible);
+        let resolved = resolve_client_omp_executable_with(
             eligible,
             || {
                 calls.set(calls.get() + 1);
-                panic!("pane-local OMP must not resolve a full-surface companion")
+                Ok(crate::update::OmpExecutable::Explicit(expected.clone()))
             },
             |_| {},
         )
-        .is_none());
-        assert_eq!(calls.get(), 0);
+        .expect("resolved test executable");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolved.executable(), expected);
     }
     #[cfg(unix)]
     #[test]

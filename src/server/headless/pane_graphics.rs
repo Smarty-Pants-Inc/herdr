@@ -51,7 +51,12 @@ impl HeadlessServer {
             .direct_graphics_available()
             .then_some(self.foreground_client_id)
             .flatten()
-            .filter(|&client_id| !self.native_omp_surface_active(client_id));
+            .filter(|&client_id| {
+                let replaced = self.replaced_omp_pane_info(client_id).map(|info| info.id);
+                direct_key
+                    .as_ref()
+                    .is_none_or(|(pane_id, _)| Some(*pane_id) != replaced)
+            });
         let gate_busy = self
             .app
             .pane_graphics
@@ -515,13 +520,6 @@ impl HeadlessServer {
             .collect()
     }
 
-    pub(super) fn direct_graphics_retirement_messages_for_client(
-        &self,
-        client_id: u64,
-    ) -> Vec<ServerMessage> {
-        self.direct_graphics_retirement_messages_for_client_scope(client_id, None)
-    }
-
     pub(super) fn direct_graphics_retirement_messages_for_client_pane(
         &self,
         client_id: u64,
@@ -575,13 +573,6 @@ impl HeadlessServer {
         }
     }
 
-    pub(super) fn retire_direct_graphics_for_client_without_notifications(
-        &mut self,
-        client_id: u64,
-    ) {
-        self.retire_direct_graphics_for_client_scope_without_notifications(client_id, None);
-    }
-
     pub(super) fn retire_direct_graphics_for_client_pane_without_notifications(
         &mut self,
         client_id: u64,
@@ -624,9 +615,7 @@ impl HeadlessServer {
         let mut prepared = Vec::new();
 
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
-            if !matches!(mode, ClientConnectionMode::App)
-                || self.native_omp_surface_active(client_id)
-            {
+            if !matches!(mode, ClientConnectionMode::App) {
                 continue;
             }
             let excluded_graphics_pane = self.replaced_omp_pane_info(client_id).map(|info| info.id);

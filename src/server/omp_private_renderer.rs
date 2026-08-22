@@ -63,6 +63,7 @@ pub(crate) enum PrivateOmpGuestRecord {
         mutation: bool,
     },
     Control(PrivateOmpGuestControl),
+    ReplicaReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +86,10 @@ pub(crate) struct PrivateOmpGuest {
     guest: Arc<Mutex<Option<TcpStream>>>,
     outbound: mpsc::SyncSender<OutboundRecord>,
     inbound: mpsc::Receiver<PrivateOmpGuestRecord>,
-    bridge_ready: Arc<AtomicBool>,
+    replica_ready: AtomicBool,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    _state_dir: crate::omp_guest_state::OmpGuestStateDir,
 }
 
 impl PrivateOmpGuest {
@@ -101,7 +103,8 @@ impl PrivateOmpGuest {
             listener.local_addr()?.to_string(),
             room_id(&config.route, config.attachment_epoch),
         );
-        let launch_env = omp_guest_launch_env(config.launch_env, token.clone());
+        let state_dir = crate::omp_guest_state::OmpGuestStateDir::new()?;
+        let launch_env = omp_guest_launch_env(config.launch_env, token.clone(), &state_dir);
         let runtime = TerminalRuntime::spawn_argv_command(
             config.pane_id,
             config.rows,
@@ -120,7 +123,6 @@ impl PrivateOmpGuest {
         let (outbound, outbound_rx) = mpsc::sync_channel(OUTBOUND_QUEUE_CAPACITY);
         let (inbound_tx, inbound) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let bridge_ready = Arc::new(AtomicBool::new(false));
         let bridge_failed = Arc::new(AtomicBool::new(false));
         let guest = Arc::new(Mutex::new(None));
         spawn_bridge_thread(
@@ -129,7 +131,6 @@ impl PrivateOmpGuest {
             Arc::clone(&guest),
             outbound_rx,
             inbound_tx,
-            Arc::clone(&bridge_ready),
             Arc::clone(&bridge_failed),
             Arc::clone(&shutting_down),
         );
@@ -143,9 +144,10 @@ impl PrivateOmpGuest {
             guest,
             outbound,
             inbound,
-            bridge_ready,
+            replica_ready: AtomicBool::new(false),
             bridge_failed,
             shutting_down,
+            _state_dir: state_dir,
         })
     }
 
@@ -193,14 +195,17 @@ impl PrivateOmpGuest {
         self.bridge_failed.load(Ordering::Acquire)
     }
 
-    /// True once the guest has authenticated and the private route can receive input.
-    pub(crate) fn bridge_ready(&self) -> bool {
-        self.bridge_ready.load(Ordering::Acquire)
+    pub(crate) fn replica_ready(&self) -> bool {
+        self.replica_ready.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_replica_ready(&self) {
+        self.replica_ready.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
-    pub(crate) fn test_set_bridge_ready(&self) {
-        self.bridge_ready.store(true, Ordering::Release);
+    pub(crate) fn test_set_replica_ready(&self) {
+        self.mark_replica_ready();
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.
@@ -272,6 +277,8 @@ fn bridge_token() -> io::Result<String> {
 }
 
 fn guest_argv(omp_executable: PathBuf, address: String, room: String) -> Vec<String> {
+    // The isolated HOME keeps this ephemeral, while filesystem-backed session
+    // storage is required to load the streamed collaboration replica.
     vec![
         omp_executable.to_string_lossy().into_owned(),
         "__collab-guest-bridge".into(),
@@ -286,16 +293,22 @@ fn guest_argv(omp_executable: PathBuf, address: String, room: String) -> Vec<Str
     ]
 }
 
-fn omp_guest_launch_env(launch_env: PaneLaunchEnv, token: String) -> PaneLaunchEnv {
-    launch_env
-        .without_env("BUN_OPTIONS")
-        .without_env("BUN_INSPECT_PRELOAD")
-        .without_env("BUN_BE_BUN")
-        .without_env("NODE_OPTIONS")
-        .without_env("HERDR_OMP_BRIDGE")
-        .without_env("HERDR_OMP_BRIDGE_TOKEN")
-        .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
-        .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, token)
+fn omp_guest_launch_env(
+    launch_env: PaneLaunchEnv,
+    token: String,
+    state_dir: &crate::omp_guest_state::OmpGuestStateDir,
+) -> PaneLaunchEnv {
+    state_dir.apply_to_pane_env(
+        launch_env
+            .without_env("BUN_OPTIONS")
+            .without_env("BUN_INSPECT_PRELOAD")
+            .without_env("BUN_BE_BUN")
+            .without_env("NODE_OPTIONS")
+            .without_env("HERDR_OMP_BRIDGE")
+            .without_env("HERDR_OMP_BRIDGE_TOKEN")
+            .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+            .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, token),
+    )
 }
 
 fn room_id(route: &OmpRouteKey, attachment_epoch: u64) -> String {
@@ -312,7 +325,6 @@ fn spawn_bridge_thread(
     guest: Arc<Mutex<Option<TcpStream>>>,
     outbound: mpsc::Receiver<OutboundRecord>,
     inbound: mpsc::SyncSender<PrivateOmpGuestRecord>,
-    bridge_ready: Arc<AtomicBool>,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
 ) {
@@ -332,7 +344,6 @@ fn spawn_bridge_thread(
             fail_bridge(&guest, &bridge_failed, &shutting_down);
             return;
         }
-        bridge_ready.store(true, Ordering::Release);
         let reader_failed = Arc::clone(&bridge_failed);
         let reader_shutdown = Arc::clone(&shutting_down);
         let reader_guest = Arc::clone(&guest);
@@ -521,6 +532,13 @@ fn parse_guest_record(line: &str) -> io::Result<PrivateOmpGuestRecord> {
         )
     })?;
     match record.t.as_str() {
+        "replica-ready" if record.action.is_none() && record.frame.is_none() => {
+            Ok(PrivateOmpGuestRecord::ReplicaReady)
+        }
+        "replica-ready" => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid private OMP replica-ready record",
+        )),
         "frame" => record
             .frame
             .map(|frame| PrivateOmpGuestRecord::Frame {
@@ -602,14 +620,16 @@ mod tests {
             "room".into(),
         );
         assert!(argv.iter().any(|arg| arg == "--token-env"));
+        assert!(!argv.iter().any(|arg| arg == "--no-session"));
         assert!(!argv.iter().any(|arg| arg == "bridge-secret"));
     }
 
     #[test]
     fn guest_launch_strips_host_startup_and_identity_env() {
-        let launch_env = omp_guest_launch_env(PaneLaunchEnv::default(), "bridge-secret".into());
-        assert_eq!(
-            launch_env,
+        let state_dir = crate::omp_guest_state::OmpGuestStateDir::new().unwrap();
+        let launch_env =
+            omp_guest_launch_env(PaneLaunchEnv::default(), "bridge-secret".into(), &state_dir);
+        let expected = state_dir.apply_to_pane_env(
             PaneLaunchEnv::default()
                 .without_env("BUN_OPTIONS")
                 .without_env("BUN_INSPECT_PRELOAD")
@@ -618,8 +638,9 @@ mod tests {
                 .without_env("HERDR_OMP_BRIDGE")
                 .without_env("HERDR_OMP_BRIDGE_TOKEN")
                 .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
-                .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, "bridge-secret")
+                .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, "bridge-secret"),
         );
+        assert_eq!(launch_env, expected);
     }
 
     #[test]
@@ -690,6 +711,10 @@ mod tests {
                 PrivateOmpGuestControl::RequestController
             ))
         ));
+        assert!(matches!(
+            parse_guest_record(r#"{"t":"replica-ready"}"#),
+            Ok(PrivateOmpGuestRecord::ReplicaReady)
+        ));
         let Ok(PrivateOmpGuestRecord::Frame { frame, mutation }) =
             parse_guest_record(r#"{"t":"frame","mutation":true,"frame":{"x": 1}}"#)
         else {
@@ -704,6 +729,7 @@ mod tests {
         for record in [
             "not-json",
             r#"{"t":"unknown"}"#,
+            r#"{"t":"replica-ready","frame":{}}"#,
             r#"{"t":"frame"}"#,
             r#"{"t":"control","action":"unknown"}"#,
         ] {

@@ -321,8 +321,6 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
-    #[cfg(test)]
-    independent_omp_renderers_enabled: bool,
     /// Routes whose server-private guest failed; retain the normal pane fallback
     /// instead of immediately respawning a blank replacement for the same route.
     private_omp_failed_routes: HashMap<u64, OmpRouteKey>,
@@ -559,8 +557,6 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
-            #[cfg(test)]
-            independent_omp_renderers_enabled: false,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -593,20 +589,6 @@ impl HeadlessServer {
             server_event_rx,
             server_event_tx,
         })
-    }
-
-    // Independent renderers either replace the full client surface or restart a
-    // focus-scoped guest. Keep the live host PTY pane-local until they can compose
-    // inside a pane and retain one process per route.
-    fn independent_omp_renderers_enabled(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.independent_omp_renderers_enabled
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
     }
 
     /// Runs the headless server event loop until shutdown.
@@ -1329,23 +1311,10 @@ impl HeadlessServer {
     }
 
     #[cfg(unix)]
-    fn authorize_live_handoff(&self) -> io::Result<()> {
-        if self.omp_service.live_route_keys().is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "live handoff is unavailable while OMP host routes are live; restart Herdr normally",
-            ))
-        }
-    }
-
-    #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
-        self.authorize_live_handoff()?;
-
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -1845,6 +1814,34 @@ impl HeadlessServer {
         );
     }
 
+    fn client_omp_renderer_rect(
+        &mut self,
+        client_id: u64,
+        key: &OmpRouteKey,
+    ) -> Option<crate::protocol::OmpRendererRect> {
+        let (workspace_index, pane_id) = self.app.parse_pane_id(&key.pane_id)?;
+        let canonical = self.begin_client_navigation_scope(client_id)?;
+        self.compute_client_navigation_view(client_id);
+        let rect = (self.app.state.active == Some(workspace_index))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .map(|info| info.inner_rect)
+            })
+            .flatten();
+        self.finish_client_navigation_scope(client_id, canonical);
+        rect.map(|rect| crate::protocol::OmpRendererRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        })
+    }
+
     fn compute_foreground_navigation_view(&mut self) {
         if let Some(client_id) = self.foreground_client_id {
             self.compute_client_navigation_view(client_id);
@@ -1995,12 +1992,14 @@ impl HeadlessServer {
     fn queue_native_omp_activation(
         &self,
         client_id: u64,
+        pane_id: crate::layout::PaneId,
         target_message: &ServerMessage,
     ) -> Option<crate::kitty_graphics::HostGraphicsCache> {
-        let direct_cleanup = self.direct_graphics_cleanup_for_client(client_id);
+        let direct_cleanup = self.direct_graphics_cleanup_for_client_pane(client_id, pane_id);
         let (next_graphics_cache, cleanup_bytes) =
-            self.prepare_client_graphics_cleanup(client_id, None, &direct_cleanup)?;
-        let retirement_messages = self.direct_graphics_retirement_messages_for_client(client_id);
+            self.prepare_client_graphics_cleanup(client_id, Some(pane_id), &direct_cleanup)?;
+        let retirement_messages =
+            self.direct_graphics_retirement_messages_for_client_pane(client_id, pane_id);
         let Some(writer) = self
             .clients
             .get(&client_id)
@@ -3683,22 +3682,15 @@ impl HeadlessServer {
         self.clients
             .get(&client_id)
             .and_then(|client| client.omp_renderer_target.as_ref())
-            .is_some_and(|target| target.ready)
+            .is_some_and(|target| target.ready && target.replica_ready)
             && self.omp_service.app_has_native_renderer(client_id)
-    }
-
-    fn native_omp_surface_active(&self, client_id: u64) -> bool {
-        self.clients
-            .get(&client_id)
-            .and_then(|client| client.omp_renderer_target.as_ref())
-            .is_some_and(|target| target.surface_active)
     }
 
     fn private_omp_fallback_ready(&self, client_id: u64, route: &OmpRouteKey) -> bool {
         self.clients
             .get(&client_id)
             .and_then(|client| client.private_omp_guest.as_ref())
-            .is_some_and(|guest| guest.route() == route && guest.bridge_ready())
+            .is_some_and(|guest| guest.route() == route && guest.replica_ready())
     }
 
     fn private_omp_fallback_terminally_failed(&self, client_id: u64, route: &OmpRouteKey) -> bool {
@@ -3743,6 +3735,32 @@ impl HeadlessServer {
         launch_id
     }
 
+    fn omp_renderer_target_message(
+        client_id: u64,
+        target: &OmpRendererTargetState,
+    ) -> ServerMessage {
+        ServerMessage::OmpRendererTarget {
+            launch_id: target.launch_id,
+            target_app_client_id: client_id,
+            route: target.route.clone(),
+            rect: target.rect,
+            bound: target.bound,
+            surface_active: target.surface_active,
+            prefix: target.prefix.clone(),
+        }
+    }
+
+    fn retire_private_omp_after_native_promotion(&mut self, client_id: u64) -> bool {
+        let retired = self
+            .clients
+            .get_mut(&client_id)
+            .is_some_and(|client| client.private_omp_guest.take().is_some());
+        if retired {
+            self.omp_service.retire_private_renderer(client_id);
+        }
+        retired
+    }
+
     fn update_omp_renderer_target(
         &mut self,
         client_id: u64,
@@ -3760,16 +3778,18 @@ impl HeadlessServer {
             && previous
                 .as_ref()
                 .is_none_or(|previous| !previous.surface_active);
-        let message = ServerMessage::OmpRendererTarget {
-            launch_id: target.launch_id,
-            target_app_client_id: client_id,
-            route: target.route.clone(),
-            bound: target.bound,
-            surface_active: target.surface_active,
-            prefix: target.prefix.clone(),
-        };
+        let message = Self::omp_renderer_target_message(client_id, &target);
         if activating {
-            let Some(next_graphics_cache) = self.queue_native_omp_activation(client_id, &message)
+            let Some(pane_id) = target
+                .route
+                .as_ref()
+                .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+                .map(|(_, pane_id)| pane_id)
+            else {
+                return false;
+            };
+            let Some(next_graphics_cache) =
+                self.queue_native_omp_activation(client_id, pane_id, &message)
             else {
                 // RendererReady is one-shot; retain server-only readiness so reconciliation can retry.
                 let Some(current) = self
@@ -3780,11 +3800,13 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                let ready_changed = current.ready != target.ready;
+                let ready_changed =
+                    current.ready != target.ready || current.replica_ready != target.replica_ready;
                 current.ready = target.ready;
+                current.replica_ready = target.replica_ready;
                 return ready_changed;
             };
-            self.retire_direct_graphics_for_client_without_notifications(client_id);
+            self.retire_direct_graphics_for_client_pane_without_notifications(client_id, pane_id);
             self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 return false;
@@ -3838,6 +3860,10 @@ impl HeadlessServer {
                 })
                 .cloned();
             let desired_route = desired_key.as_ref().map(Self::omp_renderer_route);
+            let desired_rect = desired_key
+                .as_ref()
+                .and_then(|key| self.client_omp_renderer_rect(client_id, key))
+                .unwrap_or_default();
             let current = self
                 .clients
                 .get(&client_id)
@@ -3850,8 +3876,10 @@ impl HeadlessServer {
                         OmpRendererTargetState {
                             launch_id: current.launch_id,
                             route: None,
+                            rect: crate::protocol::OmpRendererRect::default(),
                             bound: false,
                             ready: false,
+                            replica_ready: false,
                             prefix: prefix.clone(),
                             surface_active: false,
                         },
@@ -3867,8 +3895,10 @@ impl HeadlessServer {
                         OmpRendererTargetState {
                             launch_id,
                             route: Some(route),
+                            rect: desired_rect,
                             bound: false,
                             ready: false,
+                            replica_ready: false,
                             prefix,
                             surface_active: false,
                         },
@@ -3886,6 +3916,7 @@ impl HeadlessServer {
             if !native_bound
                 && target.bound
                 && target.ready
+                && target.replica_ready
                 && !self.private_omp_fallback_ready(client_id, key)
                 && !self.private_omp_fallback_terminally_failed(client_id, key)
             {
@@ -3893,12 +3924,123 @@ impl HeadlessServer {
             }
             target.bound = native_bound;
             target.ready &= target.bound;
-            target.surface_active =
-                target.bound && target.ready && self.client_omp_surface_active(client_id);
-            target.prefix = prefix;
+            target.replica_ready &= target.bound;
+            target.rect = desired_rect;
+            target.surface_active = target.bound
+                && target.ready
+                && target.replica_ready
+                && !target.rect.is_empty()
+                && self.client_omp_surface_active(client_id);
+            let activation_requested = target.surface_active;
             changed |= self.update_omp_renderer_target(client_id, target);
+            if activation_requested
+                && self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.omp_renderer_target.as_ref())
+                    .is_some_and(|target| target.surface_active)
+            {
+                changed |= self.retire_private_omp_after_native_promotion(client_id);
+            }
         }
         changed
+    }
+
+    fn promote_native_omp_renderer_if_ready(&mut self, client_id: u64) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| target.bound && target.ready && target.replica_ready)
+        else {
+            return false;
+        };
+        let Some(route) = target.route.clone() else {
+            return false;
+        };
+        let key = OmpRouteKey {
+            pane_id: route.pane_id,
+            omp_session_id: route.omp_session_id,
+            route_generation: route.route_generation,
+        };
+        if !self
+            .omp_service
+            .app_has_native_renderer_for_route(client_id, &key)
+        {
+            return false;
+        }
+        self.clear_private_omp_failure_state(client_id, &key);
+        self.clear_private_omp_pending_route(client_id, &key);
+        target.surface_active =
+            !target.rect.is_empty() && self.client_omp_surface_active(client_id);
+        let activation_requested = target.surface_active;
+        let updated = self.update_omp_renderer_target(client_id, target.clone());
+        if !activation_requested && !updated {
+            self.send_to_client(
+                client_id,
+                Self::omp_renderer_target_message(client_id, &target),
+            );
+        }
+        let promotion_complete = !activation_requested
+            || self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.omp_renderer_target.as_ref())
+                .is_some_and(|target| target.surface_active);
+        if promotion_complete {
+            self.retire_private_omp_after_native_promotion(client_id);
+        }
+        self.reconcile_omp_renderers();
+        true
+    }
+
+    fn mark_native_omp_presentation_ready(&mut self, client_id: u64, launch_id: u64) -> bool {
+        let Some(target) = self
+            .clients
+            .get_mut(&client_id)
+            .filter(|client| client.is_full_app_client())
+            .and_then(|client| client.omp_renderer_target.as_mut())
+            .filter(|target| target.launch_id == launch_id && target.bound && !target.ready)
+        else {
+            return false;
+        };
+        target.ready = true;
+        self.promote_native_omp_renderer_if_ready(client_id);
+        true
+    }
+
+    fn mark_native_omp_replica_ready(
+        &mut self,
+        renderer_id: u64,
+        key: OmpRouteKey,
+        attachment_epoch: u64,
+    ) -> bool {
+        let Some(client_id) =
+            self.omp_service
+                .native_renderer_replica_target(renderer_id, &key, attachment_epoch)
+        else {
+            return false;
+        };
+        let Some(target) = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.omp_renderer_target.as_mut())
+            .filter(|target| {
+                target.bound
+                    && !target.replica_ready
+                    && target.route.as_ref().is_some_and(|route| {
+                        route.pane_id == key.pane_id
+                            && route.omp_session_id == key.omp_session_id
+                            && route.route_generation == key.route_generation
+                    })
+            })
+        else {
+            return false;
+        };
+        target.replica_ready = true;
+        self.promote_native_omp_renderer_if_ready(client_id);
+        true
     }
 
     fn private_omp_executable_for_launch(
@@ -4011,9 +4153,6 @@ impl HeadlessServer {
     }
 
     fn reconcile_omp_renderers(&mut self) -> bool {
-        if !self.independent_omp_renderers_enabled() {
-            return false;
-        }
         let mut changed = self.reconcile_native_omp_renderers();
         changed |= self.reconcile_private_omp_guests();
         changed | self.reconcile_native_omp_renderers()
@@ -4230,23 +4369,7 @@ impl HeadlessServer {
             return true;
         }
 
-        let ready_routes = self
-            .clients
-            .iter()
-            .filter_map(|(&client_id, client)| {
-                let guest = client.private_omp_guest.as_ref()?;
-                (guest.bridge_ready()
-                    && self.private_omp_pending_routes.get(&client_id) == Some(guest.route()))
-                .then(|| (client_id, guest.route().clone()))
-            })
-            .collect::<Vec<_>>();
         let mut render = false;
-        for (client_id, route) in &ready_routes {
-            render |= self.clear_private_omp_pending_route(*client_id, route);
-        }
-        if !ready_routes.is_empty() {
-            render |= self.reconcile_omp_renderers();
-        }
 
         let mut events = Vec::new();
         let mut invalid_clients = Vec::new();
@@ -4304,6 +4427,10 @@ impl HeadlessServer {
                             },
                         });
                     }
+                    PrivateOmpGuestRecord::ReplicaReady => {
+                        guest.mark_replica_ready();
+                        render = true;
+                    }
                 }
             }
         }
@@ -4315,6 +4442,22 @@ impl HeadlessServer {
         }
         for event in events {
             render |= self.handle_server_event(event);
+        }
+        let ready_routes = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                let guest = client.private_omp_guest.as_ref()?;
+                (guest.replica_ready()
+                    && self.private_omp_pending_routes.get(&client_id) == Some(guest.route()))
+                .then(|| (client_id, guest.route().clone()))
+            })
+            .collect::<Vec<_>>();
+        for (client_id, route) in &ready_routes {
+            render |= self.clear_private_omp_pending_route(*client_id, route);
+        }
+        if !ready_routes.is_empty() {
+            render |= self.reconcile_omp_renderers();
         }
         render
     }
@@ -4722,7 +4865,7 @@ impl HeadlessServer {
             deferred_requests_changed
                 || foreground_changed
                 || theme_changed
-                || (self.independent_omp_renderers_enabled() && self.reconcile_private_omp_guests())
+                || self.reconcile_private_omp_guests()
                 || (interaction
                     && (hover_changed || (!render_neutral_mouse_motion && !terminal_forward_only)))
         };
@@ -4898,48 +5041,22 @@ impl HeadlessServer {
             ServerEvent::OmpRendererReady {
                 client_id,
                 launch_id,
-            } => {
-                let Some(mut target) = self
-                    .clients
-                    .get(&client_id)
-                    .filter(|client| client.is_full_app_client())
-                    .and_then(|client| client.omp_renderer_target.clone())
-                    .filter(|target| {
-                        target.launch_id == launch_id && target.bound && !target.ready
-                    })
-                else {
-                    return false;
-                };
-                let Some(route) = target.route.clone() else {
-                    return false;
-                };
-                let key = OmpRouteKey {
-                    pane_id: route.pane_id,
-                    omp_session_id: route.omp_session_id,
-                    route_generation: route.route_generation,
-                };
-                if !self
-                    .omp_service
-                    .app_has_native_renderer_for_route(client_id, &key)
-                {
-                    return false;
-                }
-                self.clear_private_omp_failure_state(client_id, &key);
-                self.clear_private_omp_pending_route(client_id, &key);
-                target.ready = true;
-                target.surface_active =
-                    target.bound && target.ready && self.client_omp_surface_active(client_id);
-                self.update_omp_renderer_target(client_id, target);
-                let retired_private = self
-                    .clients
-                    .get_mut(&client_id)
-                    .is_some_and(|client| client.private_omp_guest.take().is_some());
-                if retired_private {
-                    self.omp_service.retire_private_renderer(client_id);
-                }
-                self.reconcile_omp_renderers();
-                true
-            }
+            } => self.mark_native_omp_presentation_ready(client_id, launch_id),
+            ServerEvent::OmpReplicaReady {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch,
+            } => self.mark_native_omp_replica_ready(
+                client_id,
+                OmpRouteKey {
+                    pane_id,
+                    omp_session_id,
+                    route_generation,
+                },
+                attachment_epoch,
+            ),
             ServerEvent::ClientConnected {
                 client_id,
                 cols,
@@ -6833,10 +6950,7 @@ impl HeadlessServer {
             let rendered_findr = (is_app_client && findr_changed)
                 .then(|| crate::server::clients::capture_findr(&self.app.state));
 
-            let native_omp_surface_active = self.native_omp_surface_active(client_id);
-            let excluded_graphics_pane = (!native_omp_surface_active)
-                .then(|| self.replaced_omp_pane_info(client_id).map(|info| info.id))
-                .flatten();
+            let excluded_graphics_pane = self.replaced_omp_pane_info(client_id).map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -6847,12 +6961,9 @@ impl HeadlessServer {
             }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
-            let mut encoded = if native_omp_surface_active {
-                crate::kitty_graphics::EncodedGraphics {
-                    bytes: Vec::new(),
-                    incomplete: false,
-                }
-            } else if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known()
+            let mut encoded = if is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known()
             {
                 if client.graphics_surface_reset_pending {
                     if self.app.pane_graphics.slots.is_empty() {
@@ -7613,7 +7724,6 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     fn test_host_admission_sender(
     ) -> std::sync::mpsc::SyncSender<crate::server::client_transport::OmpHostAdmission> {
@@ -7825,7 +7935,6 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
-            independent_omp_renderers_enabled: true,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
             next_private_omp_retry_id: 1,
@@ -8033,6 +8142,7 @@ mod tests {
         server.clients.get_mut(&7).unwrap().omp_renderer_target = Some(OmpRendererTargetState {
             bound: true,
             ready: true,
+            replica_ready: true,
             surface_active: true,
             ..target
         });
@@ -8933,6 +9043,13 @@ mod tests {
             .slots
             .insert(direct_key.clone(), direct_slot);
         writer.test_fill_control(vec![b'x']);
+        assert!(server.handle_server_event(ServerEvent::OmpReplicaReady {
+            client_id: 2,
+            pane_id: route_key.pane_id.clone(),
+            omp_session_id: route_key.omp_session_id.clone(),
+            route_generation: route_key.route_generation,
+            attachment_epoch: 1,
+        }));
         assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
             client_id: 1,
             launch_id: renderer_launch_id,
@@ -8966,7 +9083,7 @@ mod tests {
             .omp_renderer_target
             .as_ref()
             .is_some_and(|target| target.surface_active));
-        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert!(!server.clients[&1].graphics_cache.is_empty());
         assert!(!server.app.pane_graphics.slots.contains_key(&direct_key));
         assert!(matches!(
             direct_response_rx.try_recv(),
@@ -9121,7 +9238,7 @@ mod tests {
             .private_omp_guest
             .as_ref()
             .expect("private guest")
-            .test_set_bridge_ready();
+            .test_set_replica_ready();
         assert!(server.drain_private_omp_guest_records());
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
         let canonical = server.begin_client_navigation_scope(2).unwrap();
@@ -9158,6 +9275,20 @@ mod tests {
             .and_then(|client| client.navigation.as_mut())
             .expect("background projection")
             .non_findr_mode = Some(crate::app::Mode::Prefix);
+        assert!(server.handle_server_event(ServerEvent::OmpReplicaReady {
+            client_id: 3,
+            pane_id: renderer_route.pane_id.clone(),
+            omp_session_id: renderer_route.omp_session_id.clone(),
+            route_generation: renderer_route.route_generation,
+            attachment_epoch: 1,
+        }));
+        let target = server.clients[&2]
+            .omp_renderer_target
+            .as_ref()
+            .expect("native target");
+        assert!(target.replica_ready);
+        assert!(!target.ready);
+        assert!(server.clients[&2].private_omp_guest.is_some());
         assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
             client_id: 2,
             launch_id: renderer_launch_id,
@@ -9330,128 +9461,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pane_local_omp_keeps_host_runtime_chrome_input_and_scrollback() {
-        let mut server = test_headless_server();
-        server.independent_omp_renderers_enabled = false;
-        let mut workspace = crate::workspace::Workspace::test_new("pane-local-omp");
-        let omp_pane = workspace.tabs[0].root_pane;
-        workspace.test_split(ratatui::layout::Direction::Horizontal);
-        let other_pane = workspace.tabs[0]
-            .layout
-            .pane_ids()
-            .into_iter()
-            .find(|pane_id| *pane_id != omp_pane)
-            .expect("split pane");
-        workspace.tabs[0].layout.focus_pane(omp_pane);
-        let terminal_id = workspace.terminal_id(omp_pane).unwrap().clone();
-        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
-        let mut output = Vec::new();
-        for line in 0..80 {
-            output.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
-        }
-        output.extend_from_slice(b"LIVE OMP\r\n");
-        let (runtime, mut host_input) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80, 24, 4096, &output, 8,
-            );
-        runtime.test_set_child_pid(4242);
-        server.app.state.workspaces = vec![workspace];
-        server.app.state.active = Some(0);
-        server.app.state.selected = 0;
-        server.app.state.mode = crate::app::Mode::Terminal;
-        server
-            .app
-            .terminal_runtimes
-            .insert(terminal_id.clone(), runtime);
-        let (writer, control_rx, render_rx) = test_client_writer();
-        let mut client = test_identity_client(Some("Ada"), Some(writer));
-        client.omp_renderer_capabilities.client_local_native = true;
-        server.clients.insert(1, client);
-        server.foreground_client_id = Some(1);
-        let (_host, _host_messages) = start_test_omp_host(&mut server, route, "session", 1);
-
-        assert!(server.clients[&1].omp_renderer_target.is_none());
-        assert!(server.clients[&1].private_omp_guest.is_none());
-        assert!(server.private_omp_pending_routes.is_empty());
-        assert!(control_rx.try_recv().is_err());
-        server.render_and_stream();
-        let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
-        let text = frame_text(&frame);
-        assert!(text.contains("LIVE OMP"));
-        assert!(!text.contains("native renderer"));
-
-        let inner = server
-            .app
-            .state
-            .view
-            .pane_infos
-            .iter()
-            .find(|info| info.id == omp_pane)
-            .expect("OMP pane info")
-            .inner_rect;
-        assert!(server.handle_client_input_events(
-            1,
-            vec![crate::raw_input::RawInputEvent::Mouse(
-                crossterm::event::MouseEvent {
-                    kind: MouseEventKind::ScrollUp,
-                    column: inner.x,
-                    row: inner.y,
-                    modifiers: KeyModifiers::empty(),
-                },
-            )],
-        ));
-        assert_eq!(
-            server
-                .app
-                .terminal_runtimes
-                .get(&terminal_id)
-                .unwrap()
-                .scroll_metrics()
-                .unwrap()
-                .offset_from_bottom,
-            server.app.state.mouse_scroll_lines
-        );
-        assert!(host_input.try_recv().is_err());
-
-        let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
-            KeyCode::Char('x'),
-            KeyModifiers::empty(),
-        ));
-        assert!(server.handle_client_input_events(1, vec![ordinary_key]));
-        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"x");
-        let prefix = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
-            server.app.state.prefix_code,
-            server.app.state.prefix_mods,
-        ));
-        assert!(server.handle_client_input_events(1, vec![prefix]));
-        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
-        server.render_and_stream();
-        let prefix_frame =
-            read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
-        assert!(frame_text(&prefix_frame).contains("LIVE OMP"));
-
-        server.app.state.workspaces[0].tabs[0]
-            .layout
-            .focus_pane(other_pane);
-        assert!(!server.reconcile_omp_renderers());
-        server.app.state.workspaces[0].tabs[0]
-            .layout
-            .focus_pane(omp_pane);
-        assert!(!server.reconcile_omp_renderers());
-        assert_eq!(
-            server
-                .app
-                .terminal_runtimes
-                .get(&terminal_id)
-                .unwrap()
-                .child_pid(),
-            Some(4242)
-        );
-        assert!(server.clients[&1].private_omp_guest.is_none());
-        shutdown_test_runtimes(&mut server);
-    }
-
-    #[tokio::test]
     async fn native_bound_app_masks_host_pane_and_consumes_terminal_input() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("native-omp");
@@ -9558,6 +9567,14 @@ mod tests {
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
         }));
         assert!(server.clients[&1].private_omp_guest.is_some());
+        assert!(server.handle_server_event(ServerEvent::OmpReplicaReady {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 1,
+        }));
+        assert!(server.clients[&1].private_omp_guest.is_some());
         while app_control.try_recv().is_ok() {}
         server
             .clients
@@ -9570,7 +9587,7 @@ mod tests {
             launch_id: renderer_launch_id,
         }));
         assert!(server.clients[&1].private_omp_guest.is_none());
-        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert!(!server.clients[&1].graphics_cache.is_empty());
         server
             .clients
             .get_mut(&1)
@@ -9585,7 +9602,7 @@ mod tests {
         assert!(!text.contains("HOST PTY"));
         assert!(!frame.hyperlinks.iter().any(|link| link == host_uri));
         assert_eq!(frame.cursor, None);
-        assert!(frame.graphics.is_empty());
+        assert!(!frame.graphics.is_empty());
 
         let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
             KeyCode::Char('x'),
@@ -9692,6 +9709,13 @@ mod tests {
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
         }));
         assert!(server.omp_service.app_has_native_renderer(1));
+        assert!(server.handle_server_event(ServerEvent::OmpReplicaReady {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 1,
+        }));
         assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
             client_id: 1,
             launch_id: renderer_launch_id,
@@ -9732,7 +9756,7 @@ mod tests {
             .private_omp_guest
             .as_ref()
             .expect("private guest")
-            .test_set_bridge_ready();
+            .test_set_replica_ready();
         assert!(server.drain_private_omp_guest_records());
         let fallback_target = server.clients[&1]
             .omp_renderer_target
@@ -9762,65 +9786,6 @@ mod tests {
             private_guest_pane
         );
         shutdown_test_runtimes(&mut server);
-    }
-
-    #[cfg(unix)]
-    fn live_omp_route(server: &mut HeadlessServer) -> std::net::TcpStream {
-        let pane_id = "w1:p1".to_owned();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
-        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
-            .expect("connect OMP host peer");
-        let (socket, _) = listener.accept().expect("accept OMP host peer");
-        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
-        assert!(!server.handle_server_event(ServerEvent::OmpHostStarted {
-            pane_id,
-            omp_session_id: "session".into(),
-            route_generation: 1,
-            host_id: 1,
-            outbound,
-            socket,
-            admission: test_host_admission_sender(),
-        }));
-        peer
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_handoff_rejects_live_omp_routes_without_side_effects() {
-        let mut server = test_headless_server();
-        let (writer, control_rx, _render_rx) = test_client_writer();
-        server
-            .clients
-            .insert(1, test_identity_client(Some("Ada"), Some(writer)));
-        server.foreground_client_id = Some(1);
-        let mut host = live_omp_route(&mut server);
-
-        let error = server
-            .perform_live_handoff(api::schema::ServerLiveHandoffParams::default())
-            .expect_err("live OMP route must block handoff");
-        assert_eq!(
-            error.to_string(),
-            "live handoff is unavailable while OMP host routes are live; restart Herdr normally"
-        );
-        assert!(!server.handoff_in_progress);
-        assert!(server.clients.contains_key(&1));
-        assert_eq!(server.foreground_client_id, Some(1));
-        assert!(
-            control_rx.try_recv().is_err(),
-            "client must not be disconnected"
-        );
-        host.set_read_timeout(Some(Duration::from_millis(10)))
-            .unwrap();
-        assert!(
-            matches!(host.read(&mut [0]), Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_handoff_authorization_allows_no_omp_routes() {
-        let server = test_headless_server();
-        assert!(server.authorize_live_handoff().is_ok());
     }
 
     #[test]

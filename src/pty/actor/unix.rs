@@ -1457,7 +1457,8 @@ mod tests {
             .try_write_user_input(Bytes::from_static(b"blocked"))
             .is_err());
 
-        let _ = peer.write_all(b"ignored");
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).expect("released actor closes PTY"), 0);
         assert!(read_rx.recv_timeout(Duration::from_millis(150)).is_err());
     }
 }
