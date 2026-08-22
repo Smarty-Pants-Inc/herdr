@@ -1,0 +1,15 @@
+merge_queue:
+  max_parallel_checks: 2
+
+queue_rules:
+  - name: default
+    checks_timeout: 30 min
+    merge_method: squash
+    queue_conditions:
+      - base ~= ^(master|landing/execution-locality-base-cd0e0235)$
+      - -draft
+      - check-success = smarty-review
+      - check-success = smarty-land-ready
+      - check-success = smarty-ci
+    merge_conditions:
+      - check-success = smarty-ci
