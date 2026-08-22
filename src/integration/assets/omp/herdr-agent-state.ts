@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
@@ -301,6 +301,18 @@ function retryableErrorMessage(event: any): string | undefined {
   return errorMessage || "retryable provider error";
 }
 
+function closureRejectedMessage(event: unknown): string | undefined {
+  if (!event || typeof event !== "object" || !("closureRejected" in event)) {
+    return undefined;
+  }
+  const closureRejected = event.closureRejected;
+  if (!closureRejected || typeof closureRejected !== "object" || !("todos" in closureRejected)) {
+    return undefined;
+  }
+  const todos = Array.isArray(closureRejected.todos) ? closureRejected.todos : [];
+  return `completion rejected: ${todos.length} incomplete todo item(s) remain`;
+}
+
 function askBlockedMessage(args: any): string {
   const questions = Array.isArray(args?.questions) ? args.questions : [];
   const firstQuestion = questions.find((question: any) => typeof question?.question === "string");
@@ -524,6 +536,17 @@ export default function (pi) {
       // OMP can emit duplicate/late end events while auto-retry is already
       // holding the pane in Working. Do not let an unqualified duplicate end
       // cancel the retry hold and publish a false Idle.
+      return;
+    }
+
+    const closureMessage = closureRejectedMessage(event);
+    if (closureMessage) {
+      clearPendingTimers();
+      clearFailureState();
+      agentActive = false;
+      failureBlocked = true;
+      failureMessage = closureMessage;
+      publishState();
       return;
     }
 

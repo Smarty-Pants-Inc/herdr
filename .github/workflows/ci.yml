@@ -35,7 +35,11 @@ jobs:
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
       - name: Validate PR title
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request' &&
+          !(github.event.pull_request.draft &&
+            github.event.pull_request.user.login == 'mergify[bot]' &&
+            startsWith(github.event.pull_request.title, 'merge queue: checking '))
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
@@ -252,3 +256,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows PowerShell installer test failed with exit code $LASTEXITCODE"
           }
+
+  smarty-ci:
+    name: smarty-ci
+    if: always()
+    needs:
+      - conventional-commits
+      - check
+      - windows-conpty-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful prerequisite jobs
+        env:
+          CONVENTIONAL_COMMITS_RESULT: ${{ needs.conventional-commits.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          WINDOWS_CONPTY_PACKAGE_RESULT: ${{ needs.windows-conpty-package.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CHECK_RESULT" = success
+          test "$WINDOWS_CONPTY_PACKAGE_RESULT" = success
+          test "$CONVENTIONAL_COMMITS_RESULT" = success || test "$CONVENTIONAL_COMMITS_RESULT" = skipped

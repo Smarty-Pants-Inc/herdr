@@ -87,7 +87,7 @@ impl App {
             self.sync_prefix_input_source(previous_mode);
             return changed | deferred_changed;
         }
-        let response = self.handle_api_request(msg.request);
+        let response = self.handle_api_request_with_context(msg.request, msg.context);
         if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
             self.attach_pane_graphics_stream_active(params, active, &response);
         }
@@ -556,6 +556,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_rendered(&mut self, now: Instant) {
         self.record_render_attempt(now, true);
     }

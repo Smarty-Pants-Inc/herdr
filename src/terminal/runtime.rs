@@ -343,6 +343,11 @@ impl TerminalRuntime {
         self.0.keyboard_report_all_requested()
     }
 
+    #[cfg(unix)]
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.0.focus_reporting_enabled()
+    }
+
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.0.bracketed_paste_enabled()
     }
@@ -612,6 +617,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_set_child_pid(&self, pid: u32) {
+        self.0.test_set_child_pid(pid);
+    }
+
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)

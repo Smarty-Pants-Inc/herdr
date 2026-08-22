@@ -272,72 +272,62 @@ fn matched_rule_region_preview<'a>(
         .filter(|preview| !preview.is_empty())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AgentStartArgs {
+    name: String,
+    kind: String,
+    pane_id: String,
+    timeout_ms: Option<u64>,
+    allow_cross_pane: bool,
+    agent_args: Vec<String>,
+}
+
+fn parse_agent_start_args(args: &[String]) -> Result<AgentStartArgs, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["agent", "start"], args)?;
+    Ok(AgentStartArgs {
+        name: matches
+            .get_one::<String>("name")
+            .expect("Clap requires the agent name")
+            .clone(),
+        kind: matches
+            .get_one::<String>("kind")
+            .expect("Clap requires the agent kind")
+            .clone(),
+        pane_id: super::normalize_pane_id(
+            matches
+                .get_one::<String>("pane")
+                .expect("Clap requires the pane target"),
+        ),
+        timeout_ms: matches.get_one::<u64>("timeout").copied(),
+        allow_cross_pane: matches.get_flag("allow-cross-pane"),
+        agent_args: matches
+            .get_many::<String>("agent_args")
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
+    })
+}
+
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
-    let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
-        return Ok(2);
-    };
-    let separator = args
-        .iter()
-        .position(|arg| arg == "--")
-        .unwrap_or(args.len());
-    let mut kind = None;
-    let mut pane_id = None;
-    let mut timeout_ms = None;
-    let mut index = 1;
-    while index < separator {
-        match args[index].as_str() {
-            "--kind" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --kind");
-                    return Ok(2);
-                };
-                kind = Some(value.clone());
-                index += 2;
-            }
-            "--pane" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --pane");
-                    return Ok(2);
-                };
-                pane_id = Some(super::normalize_pane_id(value));
-                index += 2;
-            }
-            "--timeout" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --timeout");
-                    return Ok(2);
-                };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
-                index += 2;
-            }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
+    let AgentStartArgs {
+        name,
+        kind,
+        pane_id,
+        timeout_ms,
+        allow_cross_pane,
+        agent_args,
+    } = match parse_agent_start_args(args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            return Ok(exit_code);
         }
-    }
-    let Some(kind) = kind else {
-        eprintln!("missing required --kind");
-        return Ok(2);
-    };
-    let Some(pane_id) = pane_id else {
-        eprintln!("missing required --pane");
-        return Ok(2);
     };
     let Some(expected_kind) = crate::detect::parse_agent_label(&kind) else {
         eprintln!("unsupported interactive agent kind: {kind}");
         return Ok(2);
     };
     let expected_kind = crate::detect::agent_label(expected_kind).to_string();
-    let agent_args = if separator < args.len() {
-        args[separator + 1..].to_vec()
-    } else {
-        Vec::new()
-    };
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
@@ -363,6 +353,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                allow_cross_pane,
             }),
         })?;
         if response.get("error").is_none() {
@@ -400,10 +391,10 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         .as_deref()
         .is_some_and(|pinned| pinned != expected_terminal_id)
     {
-        return super::print_response(&agent_name_lost_error("cli:agent:start", name));
+        return super::print_response(&agent_name_lost_error("cli:agent:start", &name));
     }
     let waited = wait_for_named_agent(
-        name,
+        &name,
         &pane_id,
         timeout,
         &expected_kind,
@@ -757,7 +748,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]"
         );
         return Ok(2);
     };
@@ -768,6 +759,7 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
+    let mut allow_cross_pane = false;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -801,6 +793,11 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
+            "--allow-cross-pane" => {
+                allow_cross_pane = true;
+                index += 1;
+            }
+
             option => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -821,23 +818,40 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
             target: target.clone(),
             text: text.clone(),
             wait: wait.then_some(AgentPromptWaitOptions { until, timeout_ms }),
+            allow_cross_pane,
         }),
     })?;
     super::print_response(&response)
 }
+fn parse_agent_send_keys_args(args: &[String]) -> Result<AgentSendKeysParams, clap::Error> {
+    let matches = super::spec::parse_leaf_args(&["agent", "send-keys"], args)?;
+    Ok(AgentSendKeysParams {
+        target: matches
+            .get_one::<String>("target")
+            .expect("Clap requires the agent target")
+            .clone(),
+        keys: matches
+            .get_many::<String>("key")
+            .expect("Clap requires at least one key")
+            .cloned()
+            .collect(),
+        allow_cross_pane: matches.get_flag("allow-cross-pane"),
+    })
+}
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
-        return Ok(2);
-    }
+    let params = match parse_agent_send_keys_args(args) {
+        Ok(params) => params,
+        Err(err) => {
+            let exit_code = err.exit_code();
+            err.print()?;
+            return Ok(exit_code);
+        }
+    };
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send-keys".into(),
-        method: Method::AgentSendKeys(AgentSendKeysParams {
-            target: args[0].clone(),
-            keys: args[1..].to_vec(),
-        }),
+        method: Method::AgentSendKeys(params),
     })?)
 }
 
@@ -910,14 +924,14 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent send-keys <target> [--allow-cross-pane] <key> [key ...]");
+    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS] [--allow-cross-pane]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [--allow-cross-pane] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
@@ -932,4 +946,77 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn send_keys_accepts_option_first_and_trailing_override() {
+        for values in [
+            &["--allow-cross-pane", "reviewer", "enter"][..],
+            &["reviewer", "enter", "--allow-cross-pane"][..],
+        ] {
+            let params = parse_agent_send_keys_args(&args(values)).unwrap();
+            assert_eq!(params.target, "reviewer");
+            assert_eq!(params.keys, ["enter"]);
+            assert!(params.allow_cross_pane);
+        }
+    }
+
+    #[test]
+    fn send_keys_double_dash_keeps_override_name_as_payload() {
+        let params =
+            parse_agent_send_keys_args(&args(&["reviewer", "--", "--allow-cross-pane"])).unwrap();
+        assert_eq!(params.keys, ["--allow-cross-pane"]);
+        assert!(!params.allow_cross_pane);
+    }
+
+    #[test]
+    fn start_accepts_option_first_and_preserves_trailing_agent_args() {
+        let parsed = parse_agent_start_args(&args(&[
+            "--allow-cross-pane",
+            "reviewer",
+            "--kind",
+            "omp",
+            "--pane",
+            "w1:p1",
+            "--timeout",
+            "45000",
+            "--",
+            "--resume",
+            "/tmp/session.jsonl",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.name, "reviewer");
+        assert_eq!(parsed.kind, "omp");
+        assert_eq!(parsed.pane_id, "w1:p1");
+        assert_eq!(parsed.timeout_ms, Some(45_000));
+        assert!(parsed.allow_cross_pane);
+        assert_eq!(parsed.agent_args, ["--resume", "/tmp/session.jsonl"]);
+    }
+
+    #[test]
+    fn start_accepts_established_agent_kind_aliases() {
+        for (kind, expected) in [
+            ("cursor-agent", crate::detect::Agent::Cursor),
+            ("devin-cli", crate::detect::Agent::Devin),
+            ("kiro-cli", crate::detect::Agent::Kiro),
+        ] {
+            let parsed =
+                parse_agent_start_args(&args(&["reviewer", "--kind", kind, "--pane", "w1:p1"]))
+                    .unwrap();
+            assert_eq!(parsed.kind, kind);
+            assert_eq!(
+                crate::detect::parse_agent_label(&parsed.kind),
+                Some(expected)
+            );
+        }
+    }
 }
