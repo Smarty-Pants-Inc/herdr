@@ -1167,6 +1167,13 @@ impl App {
             Method::PaneProcessInfo(params) => {
                 return self.handle_pane_process_info(request.id, params);
             }
+            Method::PaneOmpBridge(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "omp_bridge_discovery_denied",
+                    "OMP bridge discovery is unavailable for this caller",
+                );
+            }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
             Method::LayoutSetSplitRatio(params) => {
