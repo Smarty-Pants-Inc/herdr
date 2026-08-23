@@ -137,7 +137,9 @@ impl OmpRouteRegistry {
             .routes
             .iter()
             .any(|((pane_id, omp_session_id), route)| {
-                route.live && pane_id == &key.pane_id && omp_session_id != &key.omp_session_id
+                pane_id == &key.pane_id
+                    && omp_session_id != &key.omp_session_id
+                    && (route.live || !route.attachments.is_empty())
             })
         {
             return Err(OmpRouteError::RouteBusy);
@@ -817,8 +819,16 @@ mod tests {
         routes.host_stopped(&key()).unwrap();
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
+        let other_session = OmpRouteKey {
+            omp_session_id: "other-session".into(),
+            ..key()
+        };
+        assert_eq!(
+            routes.host_started(other_session.clone()),
+            Err(OmpRouteError::RouteBusy)
+        );
         routes.detach(1, &key(), epoch).unwrap();
-        assert_eq!(routes.host_started(key()), Ok(Vec::new()));
+        assert_eq!(routes.host_started(other_session), Ok(Vec::new()));
     }
 
     #[test]
