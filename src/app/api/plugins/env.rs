@@ -28,3 +28,18 @@ pub(crate) fn plugin_path_env(plugin: &InstalledPluginInfo) -> Vec<(String, Stri
         ),
     ]
 }
+
+pub(crate) fn local_plugin_runtime_env(plugin: &InstalledPluginInfo) -> Vec<(String, String)> {
+    let mut env = plugin_path_env(plugin);
+    env.push((
+        crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+        crate::api::socket_path().display().to_string(),
+    ));
+    if let Ok(current_exe) = std::env::current_exe() {
+        env.push((
+            "HERDR_BIN_PATH".to_string(),
+            current_exe.display().to_string(),
+        ));
+    }
+    env
+}

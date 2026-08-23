@@ -33,18 +33,23 @@ impl std::fmt::Debug for RemoteExecReadyNonce {
     }
 }
 
+#[cfg(any(unix, test))]
+fn random_hex_string(byte_len: usize) -> std::io::Result<String> {
+    let mut bytes = vec![0_u8; byte_len];
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(byte_len * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(value)
+}
+
 impl RemoteExecReadyNonce {
     #[cfg(any(unix, test))]
     pub(crate) fn generate() -> std::io::Result<Self> {
-        let mut bytes = [0_u8; REMOTE_EXEC_READY_NONCE_BYTES];
-        getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut value = String::with_capacity(REMOTE_EXEC_READY_NONCE_BYTES * 2);
-        for byte in bytes {
-            value.push(HEX[(byte >> 4) as usize] as char);
-            value.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        Ok(Self(value))
+        Ok(Self(random_hex_string(REMOTE_EXEC_READY_NONCE_BYTES)?))
     }
 
     #[cfg(any(unix, test))]
@@ -541,15 +546,7 @@ fn read_remote_exec_request(stream: &mut UnixStream) -> std::io::Result<RemoteEx
 
 #[cfg(unix)]
 fn random_socket_path(prefix: &str) -> std::io::Result<PathBuf> {
-    let mut bytes = [0_u8; REMOTE_SOCKET_NONCE_BYTES];
-    getrandom::fill(&mut bytes).map_err(|err| std::io::Error::other(err.to_string()))?;
-
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut nonce = String::with_capacity(REMOTE_SOCKET_NONCE_BYTES * 2);
-    for byte in bytes {
-        nonce.push(HEX[(byte >> 4) as usize] as char);
-        nonce.push(HEX[(byte & 0x0f) as usize] as char);
-    }
+    let nonce = random_hex_string(REMOTE_SOCKET_NONCE_BYTES)?;
     Ok(Path::new("/tmp").join(format!("{prefix}{nonce}.sock")))
 }
 

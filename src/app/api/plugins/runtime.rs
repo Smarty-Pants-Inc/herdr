@@ -44,17 +44,7 @@ impl App {
         let started_unix_ms = current_unix_ms();
         let mut env = Vec::new();
         if execution_target.is_local() {
-            env.extend(super::env::plugin_path_env(plugin));
-            env.push((
-                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
-                crate::api::socket_path().display().to_string(),
-            ));
-            if let Ok(current_exe) = std::env::current_exe() {
-                env.push((
-                    "HERDR_BIN_PATH".to_string(),
-                    current_exe.display().to_string(),
-                ));
-            }
+            env.extend(super::env::local_plugin_runtime_env(plugin));
         }
         env.extend([
             ("HERDR_ENV".to_string(), "1".to_string()),

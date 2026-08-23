@@ -645,17 +645,7 @@ impl App {
         env.retain(|(key, _)| !plugin_pane_protected_env_key(key));
         env.extend(plugin_theme_env(&self.state.palette));
         if execution_target.is_local() {
-            env.extend(super::env::plugin_path_env(plugin));
-            env.push((
-                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
-                crate::api::socket_path().display().to_string(),
-            ));
-            if let Ok(current_exe) = std::env::current_exe() {
-                env.push((
-                    "HERDR_BIN_PATH".to_string(),
-                    current_exe.display().to_string(),
-                ));
-            }
+            env.extend(super::env::local_plugin_runtime_env(plugin));
         }
         env.push(("HERDR_ENV".to_string(), "1".to_string()));
         env.push(("HERDR_PLUGIN_ID".to_string(), plugin.plugin_id.clone()));
