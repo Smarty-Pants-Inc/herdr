@@ -9,7 +9,7 @@ use crate::api::schema::{
     InstalledPluginInfo, PluginActionInfo, PluginActionInvokeParams, PluginActionListParams,
     PluginInvocationContext, PluginLinkParams, PluginListParams, PluginLogListParams,
     PluginManifestAction, PluginManifestLinkHandler, PluginPaneCloseParams, PluginPaneFocusParams,
-    PluginPaneInfo, PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope,
+    PluginPaneInfo, PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope, PluginPlatform,
     PluginSetEnabledParams, PluginUnlinkParams, ResponseResult, ViewId,
 };
 use crate::app::App;
@@ -37,7 +37,7 @@ impl App {
             .collect();
     }
 
-    fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
+    pub(crate) fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
         if self.no_session {
             return Ok(());
         }
@@ -195,11 +195,12 @@ impl App {
                 format!("plugin {} is disabled", plugin.plugin_id),
             );
         }
-        let context = match self.merge_plugin_action_context(params.context, &id) {
-            Ok(context) => context,
-            Err((code, message)) => return encode_error(id, code, message),
-        };
-        if self.plugin_command_execution_target(&context).is_local() {
+        let (context, execution_target) =
+            match self.merge_plugin_action_context(params.context, &id) {
+                Ok(context) => context,
+                Err((code, message)) => return encode_error(id, code, message),
+            };
+        if execution_target.is_local() {
             if let Err((code, message)) = ensure_platform_supported(
                 effective_platforms(&action.platforms, &plugin.platforms),
                 &format!("action '{}'", action.qualified_id()),
@@ -213,6 +214,7 @@ impl App {
             None,
             action.command.clone(),
             &context,
+            execution_target,
             None,
         ) {
             Ok(log) => log,
@@ -227,18 +229,32 @@ impl App {
             },
         )
     }
+
     fn merge_plugin_action_context(
         &self,
         provided: Option<PluginInvocationContext>,
         correlation_id: &str,
-    ) -> Result<PluginInvocationContext, (&'static str, String)> {
+    ) -> Result<(PluginInvocationContext, crate::execution::ExecutionTarget), (&'static str, String)>
+    {
         let Some(source_pane_id) = provided
             .as_ref()
             .and_then(|context| context.focused_pane_id.as_deref())
         else {
-            return Ok(self.merge_plugin_context(provided, correlation_id));
+            let context = self.merge_plugin_context(provided, correlation_id);
+            let execution_target = match context.focused_pane_id.as_deref() {
+                Some(source_pane_id) => {
+                    self.plugin_context_and_execution_target_for_source_pane(
+                        source_pane_id,
+                        correlation_id,
+                    )
+                    .map(|(_, execution_target)| execution_target)
+                    .ok_or_else(|| ("pane_not_found", format!("pane {source_pane_id} not found")))?
+                }
+                None => crate::execution::ExecutionTarget::Local,
+            };
+            return Ok((context, execution_target));
         };
-        let Some((mut context, _)) = self
+        let Some((mut context, execution_target)) = self
             .plugin_context_and_execution_target_for_source_pane(source_pane_id, correlation_id)
         else {
             return Err(("pane_not_found", format!("pane {source_pane_id} not found")));
@@ -251,7 +267,7 @@ impl App {
             context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
             context.view_id = provided.view_id.or(context.view_id);
         }
-        Ok(context)
+        Ok((context, execution_target))
     }
 
     #[cfg(test)]
@@ -275,10 +291,12 @@ impl App {
         if !plugin.enabled {
             return Err(format!("plugin {} is disabled", plugin.plugin_id));
         }
-        let mut context = self.current_plugin_context("keybinding");
+        let (mut context, execution_target) = self
+            .merge_plugin_action_context(None, "keybinding")
+            .map_err(|(_, message)| message)?;
         context.invocation_source = Some("keybinding".to_string());
         context.view_id = view_id.cloned();
-        if self.plugin_command_execution_target(&context).is_local() {
+        if execution_target.is_local() {
             ensure_platform_supported(
                 effective_platforms(&action.platforms, &plugin.platforms),
                 &action.qualified_id(),
@@ -291,6 +309,7 @@ impl App {
             None,
             action.command,
             &context,
+            execution_target,
             None,
         )
         .map(|_| ())
@@ -355,7 +374,6 @@ impl App {
             view_id,
         )
     }
-
     fn invoke_plugin_link_handler_for_url_with_context(
         &mut self,
         url: &str,
@@ -396,6 +414,7 @@ impl App {
             None,
             action.command,
             &context,
+            execution_target,
             None,
         )
         .map(|_| true)
@@ -429,7 +448,7 @@ impl App {
         encode_success(id, ResponseResult::PluginLogList { logs })
     }
 
-    pub(super) fn handle_plugin_pane_open(
+    pub(crate) fn handle_plugin_pane_open(
         &mut self,
         id: String,
         params: PluginPaneOpenParams,
@@ -437,6 +456,14 @@ impl App {
         if let Err(err) = self.refresh_installed_plugins() {
             return encode_error(id, "plugin_registry_load_failed", err.to_string());
         }
+        self.handle_plugin_pane_open_with_refreshed_registry(id, params)
+    }
+
+    pub(crate) fn handle_plugin_pane_open_with_refreshed_registry(
+        &mut self,
+        id: String,
+        params: PluginPaneOpenParams,
+    ) -> String {
         let Some(plugin_id) = normalize_plugin_id(&params.plugin_id) else {
             return invalid_plugin_id(id);
         };
@@ -684,6 +711,21 @@ impl App {
         }
     }
 
+    fn link_handler_platform_supported_on_target(
+        platforms: &Option<Vec<PluginPlatform>>,
+        execution_target: &crate::execution::ExecutionTarget,
+        subject: &str,
+    ) -> bool {
+        if execution_target.is_local() {
+            return ensure_platform_supported(platforms, subject).is_ok();
+        }
+        // An SSH pane may run on either supported remote OS, so partial declarations
+        // cannot safely claim a link before remote command resolution.
+        platforms.as_ref().is_none_or(|platforms| {
+            platforms.contains(&PluginPlatform::Linux) && platforms.contains(&PluginPlatform::Macos)
+        })
+    }
+
     fn find_plugin_link_handler(
         &self,
         url: &str,
@@ -699,13 +741,11 @@ impl App {
         plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
         for plugin in plugins {
             for handler in &plugin.link_handlers {
-                if execution_target.is_local()
-                    && ensure_platform_supported(
-                        &effective_platforms(&handler.platforms, &plugin.platforms).clone(),
-                        &handler.id,
-                    )
-                    .is_err()
-                {
+                if !Self::link_handler_platform_supported_on_target(
+                    effective_platforms(&handler.platforms, &plugin.platforms),
+                    execution_target,
+                    &handler.id,
+                ) {
                     continue;
                 }
                 let Some(action) = plugin
@@ -715,13 +755,11 @@ impl App {
                 else {
                     continue;
                 };
-                if execution_target.is_local()
-                    && ensure_platform_supported(
-                        &effective_platforms(&action.platforms, &plugin.platforms).clone(),
-                        &action.id,
-                    )
-                    .is_err()
-                {
+                if !Self::link_handler_platform_supported_on_target(
+                    effective_platforms(&action.platforms, &plugin.platforms),
+                    execution_target,
+                    &action.id,
+                ) {
                     continue;
                 }
                 let Ok(regex) = regex::Regex::new(&handler.pattern) else {
@@ -850,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_command_inherits_focused_pane_execution_target() {
+    fn plugin_action_context_inherits_focused_pane_execution_target() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-plugin-target");
         let pane_id = workspace.tabs[0].root_pane;
@@ -865,9 +903,17 @@ mod tests {
             .unwrap()
             .execution_target = crate::execution::ExecutionTarget::ssh("primary").unwrap();
 
-        let context = app.current_plugin_context("target-test");
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (context, execution_target) = app
+            .merge_plugin_action_context(None, "target-test")
+            .unwrap();
+
         assert_eq!(
-            app.plugin_command_execution_target(&context),
+            context.focused_pane_id.as_deref(),
+            Some(public_pane_id.as_str())
+        );
+        assert_eq!(
+            execution_target,
             crate::execution::ExecutionTarget::ssh("primary").unwrap()
         );
     }
@@ -949,7 +995,7 @@ mod tests {
             Some(active_pane_id.as_str())
         );
 
-        let context = app
+        let (context, execution_target) = app
             .merge_plugin_action_context(
                 Some(PluginInvocationContext {
                     workspace_id: Some("wrong-workspace".into()),
@@ -989,9 +1035,77 @@ mod tests {
         assert_ne!(context.focused_pane_agent.as_deref(), Some("wrong agent"));
         assert_eq!(context.invocation_source.as_deref(), Some("cli"));
         assert_eq!(
-            app.plugin_command_execution_target(&context),
+            execution_target,
             crate::execution::ExecutionTarget::ssh("caller").unwrap()
         );
+    }
+
+    #[test]
+    fn plugin_action_context_rejects_missing_caller_pane() {
+        let app = test_app();
+        let mut provided = app.current_plugin_context("missing-caller");
+        provided.focused_pane_id = Some("missing-pane".into());
+
+        let Err((code, message)) =
+            app.merge_plugin_action_context(Some(provided), "missing-caller")
+        else {
+            panic!("missing caller pane must not fall back to local execution");
+        };
+
+        assert_eq!(code, "pane_not_found");
+        assert_eq!(message, "pane missing-pane not found");
+    }
+
+    #[test]
+    fn remote_plugin_action_uses_caller_target_for_validation_and_startup() {
+        let (mut app, caller_pane_id, _) = app_with_background_plugin_source();
+        let root = unique_temp_path("remote-plugin-action-target");
+        let local_unsupported_platform = if cfg!(target_os = "linux") {
+            "macos"
+        } else if cfg!(target_os = "macos") {
+            "windows"
+        } else {
+            "linux"
+        };
+        write_manifest_content(
+            &root,
+            &format!(
+                r#"
+id = "example.remote-action"
+name = "Remote Action"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["{local_unsupported_platform}"]
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["remote-only"]
+"#
+            ),
+        );
+        link_manifest(&mut app, &root);
+        app.state.plugin_commands_in_flight = MAX_PLUGIN_COMMANDS_IN_FLIGHT;
+        let mut context = app.current_plugin_context("remote-action");
+        context.focused_pane_id = Some(caller_pane_id);
+
+        let response = app.handle_api_request(Request {
+            id: "remote-action".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.remote-action".into()),
+                action_id: "run".into(),
+                context: Some(context),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "plugin_command_limit_reached");
+        assert_eq!(
+            app.state.plugin_command_logs.last().map(|log| log.status),
+            Some(PluginCommandStatus::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1052,7 +1166,7 @@ mod tests {
 
         let mut provided = app.current_plugin_context("cli");
         provided.focused_pane_id = Some(caller.clone());
-        let action_context = app
+        let (action_context, action_target) = app
             .merge_plugin_action_context(Some(provided), "action")
             .unwrap();
         let (pane_context, pane_target) = app
@@ -1062,8 +1176,8 @@ mod tests {
         for context in [action_context, pane_context] {
             assert_eq!(context.focused_pane_id.as_deref(), Some(caller.as_str()));
             assert_eq!(context.focused_pane_cwd.as_deref(), cwd.to_str());
-            assert_eq!(app.plugin_command_execution_target(&context), target);
         }
+        assert_eq!(action_target, target);
         assert_eq!(pane_target, target);
     }
 
@@ -1104,7 +1218,7 @@ id = "example.remote-links"
 name = "Remote Links"
 version = "0.1.0"
 min_herdr_version = "0.6.10"
-platforms = ["windows"]
+platforms = ["linux", "macos"]
 
 [[actions]]
 id = "open"
@@ -2464,6 +2578,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id: opened_pane_id,
+            child_pid: None,
         });
         assert!(app.state.popup_pane.is_none());
         assert!(event_hub.events_after(0).is_empty());
@@ -2996,6 +3111,7 @@ command = ["sh", "-c", "printf '%s' \"${HERDR_VIEW_ID-unset}\""]
                 None,
                 action.command.clone(),
                 &ownerless,
+                crate::execution::ExecutionTarget::Local,
                 None,
             )
             .unwrap();
@@ -3004,7 +3120,15 @@ command = ["sh", "-c", "printf '%s' \"${HERDR_VIEW_ID-unset}\""]
         let mut owned = ownerless;
         owned.view_id = ViewId::from_opaque("view-private");
         let log = app
-            .start_plugin_command(&plugin, Some(action.id), None, action.command, &owned, None)
+            .start_plugin_command(
+                &plugin,
+                Some(action.id),
+                None,
+                action.command,
+                &owned,
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
             .unwrap();
         assert_eq!(wait_for_stdout(&mut app, &log.log_id), "view-private");
 
@@ -3509,6 +3633,147 @@ action = "generic"
     }
 
     #[test]
+    fn ssh_link_handlers_skip_partial_platform_matches_in_manifest_order() {
+        let mut app = test_app();
+        let root = unique_temp_path("ssh-link-handler-platform-order");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.ssh-link-platforms"
+name = "SSH Link Platforms"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open link"
+command = ["true"]
+
+[[actions]]
+id = "macos-action"
+title = "Open on macOS"
+platforms = ["macos"]
+command = ["true"]
+
+[[link_handlers]]
+id = "first-linux-only"
+title = "First matching handler"
+pattern = "^https://example\\.com/"
+platforms = ["linux"]
+action = "open"
+
+[[link_handlers]]
+id = "second-macos-action"
+title = "Second matching handler"
+pattern = "^https://example\\.com/"
+action = "macos-action"
+
+[[link_handlers]]
+id = "third-windows-only"
+title = "Third matching handler"
+pattern = "^https://example\\.com/"
+platforms = ["windows"]
+action = "open"
+
+[[link_handlers]]
+id = "fourth-compatible"
+title = "Compatible handler"
+pattern = "^https://example\\.com/"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        let (_plugin, handler) = app
+            .find_plugin_link_handler(
+                "https://example.com/issue/398",
+                &crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target"),
+            )
+            .expect("compatible handler should match");
+        assert_eq!(handler.id, "fourth-compatible");
+        assert_eq!(handler.action, "open");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ssh_link_handler_platform_policy_allows_unrestricted_or_dual_supported_sets() {
+        let target = crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target");
+        assert!(App::link_handler_platform_supported_on_target(
+            &None,
+            &target,
+            "unrestricted"
+        ));
+        assert!(App::link_handler_platform_supported_on_target(
+            &Some(vec![PluginPlatform::Linux, PluginPlatform::Macos]),
+            &target,
+            "linux-and-macos",
+        ));
+        assert!(App::link_handler_platform_supported_on_target(
+            &Some(vec![
+                PluginPlatform::Linux,
+                PluginPlatform::Macos,
+                PluginPlatform::Windows,
+            ]),
+            &target,
+            "linux-macos-and-windows",
+        ));
+        for platforms in [
+            vec![PluginPlatform::Linux],
+            vec![PluginPlatform::Macos],
+            vec![PluginPlatform::Windows],
+            vec![PluginPlatform::Linux, PluginPlatform::Windows],
+            vec![PluginPlatform::Macos, PluginPlatform::Windows],
+        ] {
+            assert!(!App::link_handler_platform_supported_on_target(
+                &Some(platforms),
+                &target,
+                "partial",
+            ));
+        }
+    }
+
+    #[test]
+    fn ssh_link_handlers_do_not_claim_partial_platform_matches() {
+        let mut app = test_app();
+        let root = unique_temp_path("ssh-link-handler-platform-reject");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.ssh-link-platform-reject"
+name = "SSH Link Platform Reject"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux"]
+
+[[actions]]
+id = "open"
+title = "Open link"
+command = ["true"]
+
+[[link_handlers]]
+id = "linux-only"
+title = "Linux-only handler"
+pattern = "^https://example\\.com/"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        assert!(
+            app.find_plugin_link_handler(
+                "https://example.com/issue/398",
+                &crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target"),
+            )
+            .is_none(),
+            "an SSH link handler without both supported remote platforms must not claim the URL"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn plugin_link_rejects_invalid_link_handler_pattern() {
         let mut app = test_app();
         let root = unique_temp_path("plugin-bad-link-handler-pattern");
@@ -3938,7 +4203,10 @@ command = ["sh", "-c", "echo ok"]
             },
         );
 
-        app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id,
+            child_pid: None,
+        });
 
         assert!(!app.state.plugin_panes.contains_key(&pane_id));
     }

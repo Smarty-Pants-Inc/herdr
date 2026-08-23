@@ -2411,27 +2411,7 @@ impl AppState {
 }
 
 pub(crate) fn safe_osc8_url(url: &str) -> Option<&str> {
-    crate::web_url::safe_web_url(url).or_else(|| {
-        if url.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
-            return None;
-        }
-        let remainder = url.strip_prefix("file://")?;
-        let path_after_root = if let Some(path) = remainder.strip_prefix('/') {
-            path
-        } else {
-            let (authority, path) = remainder.split_once('/')?;
-            if !authority.eq_ignore_ascii_case("localhost") {
-                return None;
-            }
-            path
-        };
-        let folded = path_after_root.to_ascii_lowercase();
-        (!path_after_root.starts_with('/')
-            && !path_after_root.starts_with('\\')
-            && !folded.starts_with("%2f")
-            && !folded.starts_with("%5c"))
-        .then_some(url)
-    })
+    (!url.is_empty() && !url.bytes().any(|byte| byte < b' ' || byte == 0x7f)).then_some(url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2798,7 +2778,7 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, .. } => {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
@@ -3740,27 +3720,24 @@ mod tests {
     }
 
     #[test]
-    fn osc8_file_urls_require_local_absolute_paths() {
-        assert_eq!(
-            safe_osc8_url("file:///tmp/report.md?line=7"),
-            Some("file:///tmp/report.md?line=7")
-        );
-        assert_eq!(
-            safe_osc8_url("file://localhost/tmp/report.md?line=7"),
-            Some("file://localhost/tmp/report.md?line=7")
-        );
-        assert_eq!(safe_osc8_url("file://attacker/share/report.md"), None);
-        assert_eq!(safe_osc8_url("file://localhost-relative"), None);
-        for unsafe_url in [
-            "file:////attacker/share/report.md",
-            "file://localhost//attacker/share/report.md",
-            "file:///%2Fattacker/share/report.md",
-            "file:///%5C%5Cattacker/share/report.md",
-            "file:///\\\\attacker\\share\\report.md",
-            "file:///tmp/report.md\nHERDR_PLUGIN_CLICKED_URL=forged",
+    fn osc8_urls_are_safe_for_handlers_without_becoming_platform_openers() {
+        for url in [
+            "https://example.com/report",
+            "file:///tmp/report.md?line=7",
+            "file://build.example/tmp/report.md?line=7",
+            "artifact://5776",
         ] {
-            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url}");
+            assert_eq!(safe_osc8_url(url), Some(url));
         }
+        for unsafe_url in [
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
+        ] {
+            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url:?}");
+        }
+        assert!(crate::web_url::safe_web_url("artifact://5776").is_none());
+        assert!(crate::web_url::safe_web_url("file://build.example/tmp/report.md").is_none());
     }
 
     #[test]
@@ -5446,6 +5423,7 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
             pane_id: bg_pane_id,
+            child_pid: None,
         });
 
         assert!(state.pending_agent_notifications.is_empty());

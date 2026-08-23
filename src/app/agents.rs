@@ -182,6 +182,9 @@ impl App {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        if !terminal.execution_target.is_local() {
+            return Err(AgentStartError::UnsupportedExecutionTarget(params.pane_id));
+        }
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
@@ -251,6 +254,12 @@ impl App {
                 code: "agent_pane_not_found".into(),
                 message: format!("agent target pane {target} not found"),
             },
+            AgentStartError::UnsupportedExecutionTarget(target) => {
+                crate::api::schema::ErrorBody {
+                    code: "agent_start_unsupported_execution_target".into(),
+                    message: format!("agent start only supports local panes; {target} is remote"),
+                }
+            }
             AgentStartError::TargetBusy(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_busy".into(),
                 message: format!("agent target pane {target} is not an available shell"),
@@ -446,6 +455,7 @@ pub(super) enum AgentStartError {
     InvalidArgument,
     InvalidTimeout,
     TargetNotFound(String),
+    UnsupportedExecutionTarget(String),
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),

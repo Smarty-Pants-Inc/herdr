@@ -17,41 +17,37 @@ struct PendingAgentResumeCandidate {
 
 impl App {
     fn retry_timed_out_remote_agent_resumes(&mut self, now: Instant) -> bool {
-        let pane_ids = self
+        let pane_exits = self
             .state
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.tabs.iter())
             .flat_map(|tab| tab.layout.pane_ids())
-            .filter(|pane_id| {
-                let Some(terminal_id) = self.state.terminal_id_for_runtime_pane(*pane_id) else {
-                    return false;
-                };
-                let Some(terminal) = self.state.terminals.get(&terminal_id) else {
-                    return false;
-                };
-                !terminal.execution_target.is_local()
+            .filter_map(|pane_id| {
+                let terminal_id = self.state.terminal_id_for_runtime_pane(pane_id)?;
+                let terminal = self.state.terminals.get(&terminal_id)?;
+                let child_pid = self.terminal_runtimes.get(&terminal_id)?.child_pid()?;
+                (!terminal.execution_target.is_local()
                     && terminal.pending_agent_resume_plan.is_some()
                     && terminal.pending_agent_resume_confirmation_due(now)
-                    && self
-                        .terminal_runtimes
-                        .get(&terminal_id)
-                        .is_some_and(|runtime| {
-                            terminal.pending_agent_resume_attempt_matches_peer(runtime.child_pid())
-                        })
+                    && terminal.pending_agent_resume_attempt_matches_peer(Some(child_pid)))
+                .then_some((pane_id, child_pid))
             })
             .collect::<Vec<_>>();
 
-        if pane_ids.is_empty() {
+        if pane_exits.is_empty() {
             return false;
         }
 
-        for pane_id in pane_ids {
+        for (pane_id, child_pid) in pane_exits {
             tracing::warn!(
                 pane = pane_id.raw(),
                 "remote agent resume confirmation timed out; retrying"
             );
-            self.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id });
+            self.handle_internal_event(crate::events::AppEvent::PaneDied {
+                pane_id,
+                child_pid: Some(child_pid),
+            });
         }
         true
     }

@@ -47,6 +47,15 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
+    pub fn remote_execution_ready(&self) -> bool {
+        self.0.remote_execution_ready()
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_remote_execution_ready_for_test(&self, ready: bool) {
+        self.0.set_remote_execution_ready_for_test(ready);
+    }
+
+    #[cfg(unix)]
     pub fn handoff_runtime_state(
         &self,
         pane_id: u32,
@@ -83,6 +92,7 @@ impl TerminalRuntime {
         .map(Self)
     }
 
+    #[cfg(test)]
     // Wrapper mirrors pane runtime construction arguments.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -179,40 +189,6 @@ impl TerminalRuntime {
             shell_config,
             launch_env,
             initial_history_ansi,
-            events,
-            render_notify,
-            render_dirty,
-        )
-        .map(Self)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_shell_command(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        command: &str,
-        launch_env: &crate::pane::PaneLaunchEnv,
-        agent_detection: crate::pane::AgentDetection,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<Self> {
-        crate::pane::PaneRuntime::spawn_shell_command(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            command,
-            launch_env,
-            agent_detection,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
             events,
             render_notify,
             render_dirty,

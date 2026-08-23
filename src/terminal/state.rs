@@ -151,7 +151,6 @@ pub struct TerminalState {
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
-    pending_agent_resume_attempt_live: bool,
     pending_agent_resume_attempt_pid: Option<u32>,
     pending_agent_resume_retired_pids: Vec<u32>,
     pending_agent_resume_confirmation_deadline: Option<Instant>,
@@ -190,7 +189,6 @@ impl TerminalState {
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
-            pending_agent_resume_attempt_live: false,
             pending_agent_resume_attempt_pid: None,
             pending_agent_resume_confirmation_deadline: None,
             pending_agent_resume_retired_pids: Vec::new(),
@@ -320,7 +318,6 @@ impl TerminalState {
         let valid = self.pending_agent_resume_plan.is_some()
             && child_pid > 0
             && !self.pending_agent_resume_retired_pids.contains(&child_pid);
-        self.pending_agent_resume_attempt_live = valid;
         self.pending_agent_resume_attempt_pid = valid.then_some(child_pid);
         self.pending_agent_resume_confirmation_deadline =
             valid.then_some(now + PENDING_AGENT_RESUME_CONFIRMATION_TIMEOUT);
@@ -328,7 +325,6 @@ impl TerminalState {
     }
 
     pub(crate) fn clear_pending_agent_resume_attempt_live(&mut self) {
-        self.pending_agent_resume_attempt_live = false;
         self.pending_agent_resume_attempt_pid = None;
         self.pending_agent_resume_confirmation_deadline = None;
     }
@@ -348,9 +344,8 @@ impl TerminalState {
     }
 
     pub(crate) fn pending_agent_resume_attempt_matches_peer(&self, peer_pid: Option<u32>) -> bool {
-        self.pending_agent_resume_attempt_live
-            && peer_pid.is_some()
-            && self.pending_agent_resume_attempt_pid == peer_pid
+        self.pending_agent_resume_attempt_pid
+            .is_some_and(|attempt_pid| peer_pid == Some(attempt_pid))
     }
 
     pub(crate) fn pending_agent_resume_confirmation_deadline(&self) -> Option<Instant> {
@@ -358,15 +353,10 @@ impl TerminalState {
     }
 
     pub(crate) fn pending_agent_resume_confirmation_due(&self, now: Instant) -> bool {
-        self.pending_agent_resume_attempt_live
+        self.pending_agent_resume_attempt_pid.is_some()
             && self
                 .pending_agent_resume_confirmation_deadline
                 .is_some_and(|deadline| now >= deadline)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn pending_agent_resume_attempt_live(&self) -> bool {
-        self.pending_agent_resume_attempt_live
     }
 
     #[cfg(unix)]
@@ -383,7 +373,6 @@ impl TerminalState {
     pub(crate) fn restore_pending_agent_resume_handoff(
         &mut self,
         plan: Option<crate::agent_resume::AgentResumePlan>,
-        attempt_live: bool,
         attempt_pid: Option<u32>,
         mut retired_pids: Vec<u32>,
         now: Instant,
@@ -397,11 +386,9 @@ impl TerminalState {
             .saturating_sub(PENDING_AGENT_RESUME_RETIRED_PID_LIMIT);
         self.pending_agent_resume_retired_pids = retired_pids.split_off(keep_from);
         let valid = self.pending_agent_resume_plan.is_some()
-            && attempt_live
             && attempt_pid.is_some_and(|pid| {
                 pid > 0 && !self.pending_agent_resume_retired_pids.contains(&pid)
             });
-        self.pending_agent_resume_attempt_live = valid;
         self.pending_agent_resume_attempt_pid = valid.then_some(attempt_pid).flatten();
         self.pending_agent_resume_confirmation_deadline =
             valid.then_some(now + PENDING_AGENT_RESUME_CONFIRMATION_TIMEOUT);
@@ -1532,7 +1519,7 @@ impl TerminalState {
         agent_label: &str,
         session_ref: &crate::agent_resume::AgentSessionRef,
     ) -> bool {
-        let matches = self.pending_agent_resume_attempt_live
+        let matches = self.pending_agent_resume_attempt_pid.is_some()
             && self.pending_agent_resume_plan.as_ref().is_some_and(|plan| {
                 plan.agent == agent_label
                     && plan.dedupe_key
@@ -3702,6 +3689,30 @@ mod tests {
             .expect("matching report should otherwise be accepted");
 
         assert!(terminal.pending_agent_resume_plan.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_resume_attempt_liveness_is_derived_from_pid() {
+        let mut terminal = test_terminal();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("codex-session").unwrap();
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:codex", "codex", &session_ref);
+        let now = Instant::now();
+
+        assert!(terminal.mark_pending_agent_resume_attempt_live(42, now));
+        let deadline = terminal
+            .pending_agent_resume_confirmation_deadline()
+            .unwrap();
+        assert_eq!(terminal.pending_agent_resume_attempt_pid(), Some(42));
+        assert!(terminal.pending_agent_resume_attempt_matches_peer(Some(42)));
+        assert!(terminal.pending_agent_resume_confirmation_due(deadline));
+
+        terminal.clear_pending_agent_resume_attempt_live();
+        assert_eq!(terminal.pending_agent_resume_attempt_pid(), None);
+        assert!(!terminal.pending_agent_resume_attempt_matches_peer(Some(42)));
+        assert!(!terminal.pending_agent_resume_confirmation_due(deadline));
+        assert_eq!(terminal.pending_agent_resume_confirmation_deadline(), None);
     }
 
     #[test]

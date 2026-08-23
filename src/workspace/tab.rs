@@ -58,115 +58,8 @@ pub struct Tab {
 }
 
 impl Tab {
-    // Tab construction threads pane runtime geometry, host context, and render hooks.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        number: usize,
-        initial_cwd: PathBuf,
-        rows: u16,
-        cols: u16,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        shell_config: crate::pane::PaneShellConfig<'_>,
-        launch_env: &PaneLaunchEnv,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        Self::new_with_runtime(
-            number,
-            initial_cwd,
-            rows,
-            cols,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            launch_env,
-            events,
-            render_notify,
-            render_dirty,
-            &crate::execution::ExecutionTarget::Local,
-            None,
-            None,
-        )
-    }
-
-    // Command tab construction mirrors the shell tab runtime arguments.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_argv_command(
-        number: usize,
-        initial_cwd: PathBuf,
-        rows: u16,
-        cols: u16,
-        argv: &[String],
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        launch_env: &PaneLaunchEnv,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        Self::new_with_runtime(
-            number,
-            initial_cwd,
-            rows,
-            cols,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
-            launch_env,
-            events,
-            render_notify,
-            render_dirty,
-            &crate::execution::ExecutionTarget::Local,
-            Some(argv),
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_plugin_command_on(
-        number: usize,
-        initial_cwd: PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
-        rows: u16,
-        cols: u16,
-        plugin_id: &str,
-        entrypoint: &str,
-        local_argv: &[String],
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        launch_env: &PaneLaunchEnv,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        Self::new_with_runtime(
-            number,
-            initial_cwd,
-            rows,
-            cols,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
-            launch_env,
-            events,
-            render_notify,
-            render_dirty,
-            execution_target,
-            Some(local_argv),
-            Some((plugin_id, entrypoint)),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_runtime(
+    pub(super) fn new_with_runtime(
         number: usize,
         initial_cwd: PathBuf,
         rows: u16,
@@ -204,51 +97,18 @@ impl Tab {
                 render_dirty.clone(),
             )?
         } else if let Some(argv) = argv {
-            if execution_target.is_local() {
-                TerminalRuntime::spawn_argv_command(
-                    root_id,
-                    rows,
-                    cols,
-                    initial_cwd.clone(),
-                    argv,
-                    launch_env,
-                    crate::pane::AgentDetection::Enabled,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    host_terminal_appearance,
-                    events.clone(),
-                    render_notify.clone(),
-                    render_dirty.clone(),
-                )?
-            } else {
-                TerminalRuntime::spawn_argv_command_on(
-                    root_id,
-                    rows,
-                    cols,
-                    initial_cwd.clone(),
-                    execution_target,
-                    argv,
-                    launch_env,
-                    crate::pane::AgentDetection::Enabled,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    host_terminal_appearance,
-                    events.clone(),
-                    render_notify.clone(),
-                    render_dirty.clone(),
-                )?
-            }
-        } else if execution_target.is_local() {
-            TerminalRuntime::spawn(
+            TerminalRuntime::spawn_argv_command_on(
                 root_id,
                 rows,
                 cols,
                 initial_cwd.clone(),
+                execution_target,
+                argv,
+                launch_env,
+                crate::pane::AgentDetection::Enabled,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
-                shell_config,
-                launch_env,
                 events.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -346,6 +206,7 @@ impl Tab {
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         command: &str,
         launch_env: &PaneLaunchEnv,
         scrollback_limit_bytes: usize,
@@ -360,7 +221,7 @@ impl Tab {
             rows,
             cols,
             cwd,
-            &crate::execution::ExecutionTarget::Local,
+            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,

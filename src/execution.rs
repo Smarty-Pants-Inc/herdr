@@ -1,7 +1,6 @@
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::str::FromStr;
 
 #[cfg(unix)]
@@ -11,7 +10,7 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc as std_mpsc, Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -22,6 +21,63 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const REMOTE_EXEC_PROTOCOL: u32 = 3;
 pub(crate) const REMOTE_EXEC_READY_OSC_PREFIX: &[u8] = b"\x1b]6973;herdr-remote-exec-ready=";
+pub(crate) const REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES: usize = 32 * 1024;
+const REMOTE_EXEC_READY_NONCE_BYTES: usize = 16;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RemoteExecReadyNonce(String);
+
+impl std::fmt::Debug for RemoteExecReadyNonce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteExecReadyNonce([redacted])")
+    }
+}
+
+impl RemoteExecReadyNonce {
+    #[cfg(any(unix, test))]
+    pub(crate) fn generate() -> std::io::Result<Self> {
+        let mut bytes = [0_u8; REMOTE_EXEC_READY_NONCE_BYTES];
+        getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut value = String::with_capacity(REMOTE_EXEC_READY_NONCE_BYTES * 2);
+        for byte in bytes {
+            value.push(HEX[(byte >> 4) as usize] as char);
+            value.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Ok(Self(value))
+    }
+
+    #[cfg(any(unix, test))]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub(crate) fn matches(&self, candidate: &str) -> bool {
+        self.0 == candidate
+    }
+}
+
+impl Serialize for RemoteExecReadyNonce {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteExecReadyNonce {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let valid = value.len() == REMOTE_EXEC_READY_NONCE_BYTES * 2
+            && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        valid
+            .then_some(Self(value))
+            .ok_or_else(|| serde::de::Error::custom("invalid remote execution readiness nonce"))
+    }
+}
 
 #[cfg(unix)]
 const REMOTE_API_SOCKET_PREFIX: &str = "herdr-remote-api-";
@@ -36,7 +92,7 @@ const REMOTE_SOCKET_BIND_ATTEMPTS: usize = 4;
 #[cfg(unix)]
 const REMOTE_EXEC_REQUEST_MAX_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
-const REMOTE_REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_REQUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(unix)]
 const REMOTE_REQUEST_IO_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(unix)]
@@ -85,13 +141,7 @@ impl ExecutionTarget {
     }
 
     pub(crate) fn osc7_authority(&self) -> Osc7Authority {
-        self.osc7_authority_with(
-            crate::platform::hostname(),
-            match self {
-                Self::Local => None,
-                Self::Ssh { host } => query_ssh_hostname(host),
-            },
-        )
+        self.osc7_authority_with(crate::platform::hostname(), None)
     }
 
     pub(crate) fn osc7_authority_with(
@@ -158,6 +208,7 @@ struct RemoteExecRequest {
     command: RemoteCommand,
     env: Vec<(String, String)>,
     api_socket: PathBuf,
+    ready_nonce: RemoteExecReadyNonce,
 }
 
 #[cfg(unix)]
@@ -172,6 +223,12 @@ impl RemoteExecSsh {
     fn ssh_args(&self, host: &str, pty: bool) -> Vec<String> {
         vec![
             if pty { "-tt" } else { "-T" }.to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            "-o".to_string(),
+            "ConnectionAttempts=1".to_string(),
             "-o".to_string(),
             "ExitOnForwardFailure=yes".to_string(),
             "-o".to_string(),
@@ -191,10 +248,20 @@ impl RemoteExecSsh {
 pub(crate) struct RemoteRequestChannel {
     path: PathBuf,
     cancelled: Arc<AtomicBool>,
+    delivery: std_mpsc::Receiver<std::io::Result<()>>,
 }
 
 #[cfg(not(unix))]
 pub(crate) struct RemoteRequestChannel;
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteRequestDelivery {
+    Pending,
+    Delivered,
+    Failed(String),
+}
+
 #[cfg(not(unix))]
 impl RemoteRequestChannel {
     pub(crate) fn cancel(self) {}
@@ -204,6 +271,17 @@ impl RemoteRequestChannel {
 impl RemoteRequestChannel {
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn delivery_status(&self) -> RemoteRequestDelivery {
+        match self.delivery.try_recv() {
+            Ok(Ok(())) => RemoteRequestDelivery::Delivered,
+            Ok(Err(err)) => RemoteRequestDelivery::Failed(err.to_string()),
+            Err(std_mpsc::TryRecvError::Empty) => RemoteRequestDelivery::Pending,
+            Err(std_mpsc::TryRecvError::Disconnected) => RemoteRequestDelivery::Failed(
+                "remote execution request channel disconnected".into(),
+            ),
+        }
     }
 
     pub(crate) fn cancel(self) {
@@ -221,6 +299,7 @@ impl Drop for RemoteRequestChannel {
 pub(crate) struct PreparedSshPtyCommand {
     pub(crate) command: CommandBuilder,
     pub(crate) request_channel: RemoteRequestChannel,
+    pub(crate) ready_nonce: RemoteExecReadyNonce,
 }
 
 pub(crate) struct PreparedSshProcessCommand {
@@ -234,16 +313,18 @@ fn prepare_remote_exec_ssh(
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
-) -> std::io::Result<(RemoteExecSsh, RemoteRequestChannel)> {
+) -> std::io::Result<(RemoteExecSsh, RemoteRequestChannel, RemoteExecReadyNonce)> {
     let api_socket = random_socket_path(REMOTE_API_SOCKET_PREFIX)?;
     let request_socket = random_socket_path(REMOTE_REQUEST_SOCKET_PREFIX)?;
     let api_forward = socket_forward(&api_socket, &crate::api::socket_path())?;
+    let ready_nonce = RemoteExecReadyNonce::generate()?;
     let shell_path = crate::remote::resolve_prepared_remote_shell_path(host)?;
     let request = RemoteExecRequest {
         cwd: cwd.to_path_buf(),
         command,
         env,
         api_socket: api_socket.clone(),
+        ready_nonce: ready_nonce.clone(),
     };
     let request_channel = start_remote_request_channel(request)?;
     let request_forward = socket_forward(&request_socket, request_channel.path())?;
@@ -255,9 +336,9 @@ fn prepare_remote_exec_ssh(
             remote_command: remote_exec_command(&shell_path, &request_socket),
         },
         request_channel,
+        ready_nonce,
     ))
 }
-
 #[cfg(unix)]
 fn socket_forward(remote_socket: &Path, local_socket: &Path) -> std::io::Result<String> {
     Ok(format!(
@@ -288,10 +369,8 @@ fn ssh_streamlocal_socket_path(path: &Path) -> std::io::Result<&str> {
 
 #[cfg(unix)]
 fn remote_exec_command(shell_path: &str, request_socket: &Path) -> String {
-    format!(
-        "exec {shell_path} remote-exec {}",
-        crate::remote::shell_quote(&request_socket.display().to_string())
-    )
+    let socket = crate::remote::shell_quote(&request_socket.display().to_string());
+    format!("exec {shell_path} remote-exec {socket}")
 }
 
 #[cfg(unix)]
@@ -319,16 +398,19 @@ fn start_remote_request_channel(
         let thread_socket = local_socket.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let thread_cancelled = Arc::clone(&cancelled);
+        let (delivery_tx, delivery) = std_mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("herdr-remote-exec-request".to_string())
             .spawn(move || {
-                serve_remote_exec_request(
+                let result = serve_remote_exec_request(
                     listener,
                     payload,
                     thread_socket,
                     socket_identity,
                     thread_cancelled,
+                    REMOTE_REQUEST_CONNECT_TIMEOUT,
                 );
+                let _ = delivery_tx.send(result);
             });
         if let Err(err) = thread {
             let _ = crate::ipc::remove_socket_file_if_owned(&local_socket, &cleanup_identity);
@@ -338,6 +420,7 @@ fn start_remote_request_channel(
         return Ok(RemoteRequestChannel {
             path: local_socket,
             cancelled,
+            delivery,
         });
     }
 
@@ -375,8 +458,9 @@ fn serve_remote_exec_request(
     socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
     cancelled: Arc<AtomicBool>,
-) {
-    let deadline = Instant::now() + REMOTE_REQUEST_CONNECT_TIMEOUT;
+    connect_timeout: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + connect_timeout;
     let result = loop {
         if cancelled.load(Ordering::Acquire) {
             break Ok(());
@@ -395,13 +479,14 @@ fn serve_remote_exec_request(
             Err(err) => break Err(err),
         }
     };
-    if let Err(err) = result {
+    if let Err(err) = &result {
         tracing::debug!(%err, "remote execution request channel closed without a request");
     }
     drop(listener);
     if let Err(err) = crate::ipc::remove_socket_file_if_owned(&socket, &socket_identity) {
         tracing::debug!(socket = %socket.display(), %err, "failed to remove remote execution request socket");
     }
+    result
 }
 
 #[cfg(unix)]
@@ -493,7 +578,8 @@ pub(crate) fn ssh_pty_command(
 
     #[cfg(unix)]
     {
-        let (remote_exec, request_channel) = prepare_remote_exec_ssh(host, cwd, command, env)?;
+        let (remote_exec, request_channel, ready_nonce) =
+            prepare_remote_exec_ssh(host, cwd, command, env)?;
         let mut ssh = CommandBuilder::new("ssh");
         ssh.args(remote_exec.ssh_args(host, true));
         ssh.env("TERM", crate::pane::PANE_TERM);
@@ -501,6 +587,7 @@ pub(crate) fn ssh_pty_command(
         Ok(PreparedSshPtyCommand {
             command: ssh,
             request_channel,
+            ready_nonce,
         })
     }
 }
@@ -527,10 +614,10 @@ pub(crate) fn ssh_process_command(
             "per-terminal SSH execution is only supported on Unix",
         ))
     }
-
     #[cfg(unix)]
     {
-        let (remote_exec, request_channel) = prepare_remote_exec_ssh(host, cwd, command, env)?;
+        let (remote_exec, request_channel, _ready_nonce) =
+            prepare_remote_exec_ssh(host, cwd, command, env)?;
         let mut ssh = crate::noninteractive_process::command("ssh");
         ssh.args(remote_exec.ssh_args(host, false));
         Ok(PreparedSshProcessCommand {
@@ -565,28 +652,35 @@ pub(crate) fn run_remote_exec(request_socket: &str) -> std::io::Result<i32> {
         })?;
         let request = read_remote_exec_request(&mut stream)?;
         validate_remote_api_socket_path(&request.api_socket)?;
+        let RemoteExecRequest {
+            cwd: requested_cwd,
+            command: requested_command,
+            env: mut requested_env,
+            api_socket,
+            ready_nonce,
+        } = request;
 
-        let resolved = remote_process_command(&request.command)?;
+        let resolved = remote_process_command(&requested_command)?;
         let mut command = resolved.command;
-        let cwd = if request.cwd.as_os_str().is_empty() {
+        let cwd = if requested_cwd.as_os_str().is_empty() {
             resolved.cwd
         } else {
-            Some(request.cwd)
+            Some(requested_cwd)
         };
-        let mut env = request.env;
-        env.extend(resolved.env);
-        let cwd = apply_remote_cwd(&mut command, cwd.as_deref(), &mut env)?;
-        apply_remote_exec_env(&mut command, env);
+        requested_env.extend(resolved.env);
+        let cwd = apply_remote_cwd(&mut command, cwd.as_deref(), &mut requested_env)?;
+        apply_remote_exec_env(&mut command, requested_env);
         command.env("TERM", crate::pane::PANE_TERM);
         command.env("COLORTERM", crate::pane::PANE_COLORTERM);
         command.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
-        command.env(crate::api::SOCKET_PATH_ENV_VAR, &request.api_socket);
+        command.env(crate::api::SOCKET_PATH_ENV_VAR, &api_socket);
         if let Ok(executable) = std::env::current_exe() {
             command.env("HERDR_BIN_PATH", executable);
         }
 
         let ready_marker = remote_exec_ready_marker_for_terminal(
             std::io::stdout().is_terminal(),
+            &ready_nonce,
             crate::platform::hostname().as_deref(),
             &cwd,
         )?;
@@ -610,18 +704,36 @@ fn apply_remote_exec_env(command: &mut std::process::Command, env: Vec<(String, 
     command.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
     command.env_remove("HERDR_VIEW_ID");
     command.envs(env);
+    command.env_remove("HERDR_BUILD_BIN_PATH");
 }
 #[cfg(unix)]
 #[derive(Serialize)]
 struct RemoteExecReadyPayload<'a> {
+    nonce: &'a str,
     hostname: Option<&'a str>,
     cwd: &'a Path,
 }
 
 #[cfg(unix)]
-fn remote_exec_ready_marker(hostname: Option<&str>, cwd: &Path) -> std::io::Result<Vec<u8>> {
-    let payload = serde_json::to_vec(&RemoteExecReadyPayload { hostname, cwd })
-        .map_err(std::io::Error::other)?;
+fn remote_exec_ready_marker(
+    nonce: &RemoteExecReadyNonce,
+    hostname: Option<&str>,
+    cwd: &Path,
+) -> std::io::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(&RemoteExecReadyPayload {
+        nonce: nonce.as_str(),
+        hostname,
+        cwd,
+    })
+    .map_err(std::io::Error::other)?;
+    if payload.len() > REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "remote execution ready payload exceeds {REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES} bytes"
+            ),
+        ));
+    }
     let mut marker =
         Vec::with_capacity(REMOTE_EXEC_READY_OSC_PREFIX.len() + payload.len() + b"\x1b\\".len());
     marker.extend_from_slice(REMOTE_EXEC_READY_OSC_PREFIX);
@@ -632,11 +744,12 @@ fn remote_exec_ready_marker(hostname: Option<&str>, cwd: &Path) -> std::io::Resu
 #[cfg(unix)]
 fn remote_exec_ready_marker_for_terminal(
     stdout_is_terminal: bool,
+    nonce: &RemoteExecReadyNonce,
     hostname: Option<&str>,
     cwd: &Path,
 ) -> std::io::Result<Option<Vec<u8>>> {
     stdout_is_terminal
-        .then(|| remote_exec_ready_marker(hostname, cwd))
+        .then(|| remote_exec_ready_marker(nonce, hostname, cwd))
         .transpose()
 }
 
@@ -764,29 +877,6 @@ fn ssh_destination_host(destination: &str) -> &str {
     destination
         .rsplit_once('@')
         .map_or(destination, |(_, host)| host)
-}
-
-fn query_ssh_hostname(destination: &str) -> Option<String> {
-    validate_ssh_host(destination).ok()?;
-    let output = crate::noninteractive_process::command("ssh")
-        .args(["-G", destination])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let output = std::str::from_utf8(&output.stdout).ok()?;
-    parse_ssh_config_hostname(output).map(str::to_owned)
-}
-
-fn parse_ssh_config_hostname(output: &str) -> Option<&str> {
-    output.lines().find_map(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        let key = fields.next()?;
-        let hostname = fields.next()?;
-        (key.eq_ignore_ascii_case("hostname") && fields.next().is_none()).then_some(hostname)
-    })
 }
 
 fn validate_ssh_host(host: &str) -> std::io::Result<()> {
@@ -937,12 +1027,17 @@ mod tests {
     #[test]
     fn remote_exec_ready_marker_json_encodes_hostname_and_resolved_cwd() {
         let cwd = Path::new("/remote/plugin-root");
-        assert_eq!(
-            remote_exec_ready_marker(Some("build-\"node"), cwd).unwrap(),
-            b"\x1b]6973;herdr-remote-exec-ready={\"hostname\":\"build-\\\"node\",\"cwd\":\"/remote/plugin-root\"}\x1b\\"
+        let nonce = RemoteExecReadyNonce::generate().unwrap();
+        let expected = format!(
+            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"build-\\\"node\",\"cwd\":\"/remote/plugin-root\"}}\x1b\\",
+            nonce.as_str()
         );
         assert_eq!(
-            remote_exec_ready_marker_for_terminal(false, Some("build-node"), cwd).unwrap(),
+            remote_exec_ready_marker(&nonce, Some("build-\"node"), cwd).unwrap(),
+            expected.as_bytes()
+        );
+        assert_eq!(
+            remote_exec_ready_marker_for_terminal(false, &nonce, Some("build-node"), cwd).unwrap(),
             None
         );
     }
@@ -973,18 +1068,6 @@ mod tests {
         assert_eq!(local, ExecutionTarget::Local);
         assert_eq!(ssh.to_string(), "ssh:primary");
         assert!("ssh:-bad".parse::<ExecutionTarget>().is_err());
-    }
-
-    #[test]
-    fn ssh_config_hostname_parser_requires_one_hostname_value() {
-        let output = "host build-alias\nuser deploy\nhostname Real.Example.COM\nport 22\n";
-        assert_eq!(parse_ssh_config_hostname(output), Some("Real.Example.COM"));
-        assert_eq!(parse_ssh_config_hostname("user deploy\nport 22\n"), None);
-        assert_eq!(parse_ssh_config_hostname("hostname\n"), None);
-        assert_eq!(
-            parse_ssh_config_hostname("hostname real.example.com extra\n"),
-            None
-        );
     }
 
     #[cfg(unix)]
@@ -1031,6 +1114,7 @@ mod tests {
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
+            ready_nonce: RemoteExecReadyNonce::generate().unwrap(),
         };
         let channel = start_remote_request_channel(request).unwrap();
         let socket = channel.path().to_path_buf();
@@ -1050,6 +1134,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn request_delivery_timeout_is_reported_and_reclaims_socket() {
+        let request = RemoteExecRequest {
+            cwd: PathBuf::new(),
+            command: RemoteCommand::Shell,
+            env: Vec::new(),
+            api_socket: PathBuf::from(
+                "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
+            ),
+            ready_nonce: RemoteExecReadyNonce::generate().unwrap(),
+        };
+        let payload = encode_remote_exec_request(&request).unwrap();
+        let socket = random_socket_path(LOCAL_REQUEST_SOCKET_PREFIX).unwrap();
+        let listener = bind_private_request_listener(&socket).unwrap();
+        let identity = crate::ipc::socket_file_identity(&socket).unwrap();
+
+        let result = serve_remote_exec_request(
+            listener,
+            payload,
+            socket.clone(),
+            identity,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(1),
+        );
+
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_exec_request_round_trips_over_a_framed_socket() {
         let request = RemoteExecRequest {
             cwd: PathBuf::from("/tmp/work"),
@@ -1060,6 +1174,7 @@ mod tests {
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
+            ready_nonce: RemoteExecReadyNonce::generate().unwrap(),
         };
         let payload = encode_remote_exec_request(&request).unwrap();
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
@@ -1071,6 +1186,7 @@ mod tests {
         assert_eq!(received.command, request.command);
         assert_eq!(received.env, request.env);
         assert_eq!(received.api_socket, request.api_socket);
+        assert_eq!(received.ready_nonce, request.ready_nonce);
     }
 
     #[cfg(unix)]
@@ -1085,6 +1201,7 @@ mod tests {
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
+            ready_nonce: RemoteExecReadyNonce::generate().unwrap(),
         };
         assert_eq!(
             encode_remote_exec_request(&request).unwrap_err().kind(),
@@ -1154,13 +1271,16 @@ mod tests {
 
         assert_eq!(pty_args.first().map(String::as_str), Some("-tt"));
         assert_eq!(process_args.first().map(String::as_str), Some("-T"));
-        assert!(pty_args
-            .windows(2)
-            .any(|args| args == ["-o", "StreamLocalBindMask=0177"]));
-        for args in [&pty_args, &process_args] {
-            assert!(args
-                .windows(2)
-                .any(|args| args == ["-o", "ControlPath=none"]));
+        for option in [
+            "BatchMode=yes",
+            "ConnectTimeout=10",
+            "ConnectionAttempts=1",
+            "StreamLocalBindMask=0177",
+            "ControlPath=none",
+        ] {
+            for args in [&pty_args, &process_args] {
+                assert!(args.windows(2).any(|args| args == ["-o", option]));
+            }
         }
         assert!(!pty_args
             .iter()
@@ -1171,15 +1291,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remote_exec_command_keeps_a_resolved_shell_path_quoted() {
+    fn remote_exec_command_uses_only_the_verified_helper() {
         let request_socket =
             Path::new("/tmp/herdr-remote-request-0123456789abcdef0123456789abcdef.sock");
+
         assert_eq!(
             remote_exec_command("'/opt/herdr bin/herdr'", request_socket),
             format!(
                 "exec '/opt/herdr bin/herdr' remote-exec {}",
                 request_socket.display()
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_exec_ready_marker_enforces_shared_payload_bound() {
+        let nonce = RemoteExecReadyNonce::generate().unwrap();
+        let accepted = PathBuf::from(format!("/{}", "x".repeat(4096)));
+        assert!(remote_exec_ready_marker(&nonce, Some("build-node"), &accepted).is_ok());
+
+        let oversized = PathBuf::from(format!(
+            "/{}",
+            "x".repeat(REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES)
+        ));
+        assert_eq!(
+            remote_exec_ready_marker(&nonce, Some("build-node"), &oversized)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
         );
     }
 }

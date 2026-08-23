@@ -52,6 +52,15 @@ pub(crate) fn resolve_installed_plugin_command(
         })?;
     let plugin = crate::app::load_plugin_manifest(&stored.manifest_path, stored.enabled)
         .map_err(|(_, message)| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+    if plugin.plugin_id != plugin_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "reloaded plugin manifest id {} does not match requested registry id {plugin_id}",
+                plugin.plugin_id
+            ),
+        ));
+    }
     if !plugin.enabled {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -304,6 +313,69 @@ mod tests {
         assert!(is_windows_batch_file_name(OsStr::new("script.BAT")));
         assert!(!is_windows_batch_file_name(OsStr::new("node.exe")));
         assert!(!is_windows_batch_file_name(OsStr::new("node")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_reloaded_manifest_with_mismatched_plugin_id() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-plugin-command-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create plugin fixture");
+        let manifest_path = root.join("herdr-plugin.toml");
+        let manifest = |id: &str| {
+            format!(
+                r#"
+id = "{id}"
+name = "Test Plugin"
+version = "0.1.0"
+min_herdr_version = "{}"
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["true"]
+"#,
+                crate::build_info::BASE_VERSION
+            )
+        };
+        std::fs::write(&manifest_path, manifest("example.requested"))
+            .expect("write requested manifest");
+        let stored = crate::app::load_plugin_manifest(&manifest_path.display().to_string(), true)
+            .expect("load requested manifest");
+        let registry_path = root.join("plugins.json");
+        crate::persist::plugin_registry::save_to_path(&registry_path, &[stored])
+            .expect("save plugin registry");
+        std::fs::write(&manifest_path, manifest("example.reloaded"))
+            .expect("replace manifest with mismatched id");
+
+        let result =
+            crate::persist::plugin_registry::with_test_registry_path(registry_path, || {
+                resolve_installed_plugin_command(
+                    "example.requested",
+                    &PluginCommandTarget::Action {
+                        action_id: "run".into(),
+                        link_handler_id: None,
+                    },
+                )
+            });
+        let _ = std::fs::remove_dir_all(&root);
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched plugin manifest was resolved"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("example.reloaded")
+                && error.to_string().contains("example.requested"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(windows)]

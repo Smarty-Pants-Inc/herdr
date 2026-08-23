@@ -692,11 +692,13 @@ impl App {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
-        if crate::web_url::safe_web_url(&url).is_some()
-            && self
-                .event_tx
-                .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
-                .is_err()
+        let Some(url) = crate::web_url::safe_web_url(&url).map(str::to_owned) else {
+            return false;
+        };
+        if self
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
+            .is_err()
         {
             tracing::warn!("failed to queue pane URL opening");
         }
@@ -1142,6 +1144,35 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn full_open_url_queue_still_consumes_safe_link() {
+        let mut app = test_app();
+        for _ in 0..crate::app::APP_EVENT_CHANNEL_CAPACITY {
+            app.event_tx
+                .try_send(crate::events::AppEvent::OpenUrl {
+                    url: "https://example.com/fill".into(),
+                    source_id: 0,
+                })
+                .expect("fill OpenUrl queue");
+        }
+        assert!(app
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl {
+                url: "https://example.com/overflow".into(),
+                source_id: 0,
+            })
+            .is_err());
+
+        let source_id = 41;
+        assert!(app.activate_link_click(
+            source_id,
+            crate::layout::PaneId::alloc(),
+            "https://example.com/click".into(),
+            None,
+        ));
+        assert!(app.pending_url_click_sources.contains(&source_id));
     }
 
     #[tokio::test]

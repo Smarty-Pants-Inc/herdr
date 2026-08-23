@@ -203,7 +203,7 @@ impl LocalTarget {
         }
         while let Ok(event) = self.events.try_recv() {
             match event {
-                AppEvent::PaneDied { pane_id } if pane_id == self.pane_id => {
+                AppEvent::PaneDied { pane_id, .. } if pane_id == self.pane_id => {
                     self.fail();
                     return true;
                 }
@@ -1610,7 +1610,10 @@ mod tests {
         assert!(renderer.cache_server_frame(ignored_server_frame).is_none());
         assert!(renderer.handoff_frame.is_some());
         events
-            .try_send(AppEvent::PaneDied { pane_id })
+            .try_send(AppEvent::PaneDied {
+                pane_id,
+                child_pid: None,
+            })
             .expect("queue local pane death");
 
         let cleanup = renderer
@@ -1891,7 +1894,12 @@ mod tests {
         let (mut renderer, events, pane_id) = active_renderer(runtime, prefix.clone());
         let route = renderer.target.as_ref().unwrap().route.clone();
 
-        events.try_send(AppEvent::PaneDied { pane_id }).unwrap();
+        events
+            .try_send(AppEvent::PaneDied {
+                pane_id,
+                child_pid: None,
+            })
+            .unwrap();
         assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
         assert!(renderer.target.as_ref().unwrap().failed);
         assert!(!renderer.local_selected);

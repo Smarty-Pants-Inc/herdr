@@ -133,6 +133,26 @@ impl App {
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        if let AppEvent::PaneDied {
+            pane_id,
+            child_pid: Some(child_pid),
+        } = &ev
+        {
+            let current_child_pid = self
+                .state
+                .terminal_id_for_runtime_pane(*pane_id)
+                .and_then(|terminal_id| self.terminal_runtimes.get(&terminal_id))
+                .and_then(crate::terminal::TerminalRuntime::child_pid);
+            if current_child_pid != Some(*child_pid) {
+                tracing::debug!(
+                    pane = pane_id.raw(),
+                    event_child_pid = child_pid,
+                    current_child_pid,
+                    "ignoring stale PaneDied event"
+                );
+                return Vec::new();
+            }
+        }
         if let AppEvent::TerminalBell { count, .. } = ev {
             if let Err(err) =
                 crate::terminal_effects::write_terminal_bells(&mut std::io::stdout(), count)
@@ -252,7 +272,7 @@ impl App {
             return Vec::new();
         }
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self.close_workspace_plugin_pane_by_internal_id(*pane_id) {
                 return Vec::new();
             }
@@ -285,7 +305,7 @@ impl App {
             }
         }
 
-        let overlay_state = if let AppEvent::PaneDied { pane_id } = &ev {
+        let overlay_state = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.overlay_panes.remove(pane_id).map(|overlay| {
                 let was_overlay_active =
                     self.state
@@ -309,7 +329,7 @@ impl App {
             None
         };
 
-        if let AppEvent::PaneDied { pane_id } = &ev {
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
                 if let Some(public_pane_id) = self.public_pane_id(ws_idx, *pane_id) {
                     self.emit_event(crate::api::schema::EventEnvelope {
@@ -322,7 +342,7 @@ impl App {
                 }
             }
         }
-        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id } = &ev {
+        let pane_exit_layout_target = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.find_pane(*pane_id).and_then(|(ws_idx, _)| {
                 self.layout_update_target_after_pane_removal(ws_idx, *pane_id)
             })
@@ -2128,6 +2148,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            child_pid: None,
         });
 
         let overlay_tab = &app.state.workspaces[0].tabs[0];
@@ -2154,7 +2175,10 @@ mod tests {
         app.state.ensure_test_terminals();
         let tab_id = app.public_tab_id(0, 0).unwrap();
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id: dead_pane });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: dead_pane,
+            child_pid: None,
+        });
 
         let events = event_hub.events_after(0);
         let pane_exited = events
@@ -2303,6 +2327,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            child_pid: None,
         });
 
         let events = event_hub.events_after(0);
@@ -2328,6 +2353,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            child_pid: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2347,6 +2373,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: overlay_pane,
+            child_pid: None,
         });
 
         let tab = &app.state.workspaces[0].tabs[0];
@@ -2386,7 +2413,10 @@ mod tests {
         assert!(terminal.mark_pending_agent_resume_attempt_live(17, Instant::now()));
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            child_pid: Some(17),
+        });
 
         assert!(app.find_pane(pane_id).is_some());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -2422,6 +2452,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_pane_died_does_not_retire_replacement_runtime() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("remote-resume");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::ssh("dev1").expect("valid SSH host");
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "codex-session".into()],
+            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+        });
+        assert!(terminal.mark_pending_agent_resume_attempt_live(101, Instant::now()));
+        terminal.retire_pending_agent_resume_attempt();
+        assert!(terminal.mark_pending_agent_resume_attempt_live(202, Instant::now()));
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(202);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            child_pid: Some(101),
+        });
+
+        assert!(app.find_pane(pane_id).is_some());
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .and_then(crate::terminal::TerminalRuntime::child_pid),
+            Some(202)
+        );
+        assert!(
+            app.state.terminals[&terminal_id].pending_agent_resume_attempt_matches_peer(Some(202))
+        );
+
+        app.terminal_runtimes
+            .remove(&terminal_id)
+            .unwrap()
+            .shutdown();
+    }
+
+    #[tokio::test]
     async fn pane_died_retries_unconfirmed_remote_shell_until_ready_event() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -2445,7 +2528,10 @@ mod tests {
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         let before = Instant::now();
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            child_pid: Some(11),
+        });
 
         assert!(app.find_pane(pane_id).is_some());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -2520,7 +2606,10 @@ mod tests {
         });
         assert!(!app.state.terminals[&terminal_id].respawn_shell_on_exit);
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            child_pid: Some(31),
+        });
 
         assert!(app.find_pane(pane_id).is_none());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -2702,7 +2791,10 @@ mod tests {
                 .expect("test session id should be valid"),
         });
 
-        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            child_pid: None,
+        });
 
         assert!(
             app.find_pane(pane_id).is_some(),

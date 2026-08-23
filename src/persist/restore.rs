@@ -521,12 +521,7 @@ fn restore_tab(
                 state.remote_execution_ready,
                 state.respawn_shell_on_exit,
                 state.pending_agent_resume_plan.clone(),
-                state.pending_agent_resume_attempt_live,
-                state.pending_agent_resume_attempt_pid.or_else(|| {
-                    state
-                        .pending_agent_resume_attempt_live
-                        .then_some(state.child_pid)
-                }),
+                state.pending_agent_resume_attempt_pid,
                 state.pending_agent_resume_retired_pids.clone(),
             )
         });
@@ -645,7 +640,6 @@ fn restore_tab(
                     remote_execution_ready,
                     respawn_shell_on_exit,
                     pending_plan,
-                    pending_attempt_live,
                     pending_attempt_pid,
                     retired_attempt_pids,
                 )) = imported_remote_resume_state
@@ -653,7 +647,6 @@ fn restore_tab(
                     let has_pending_plan = pending_plan.is_some();
                     terminal.restore_pending_agent_resume_handoff(
                         pending_plan,
-                        pending_attempt_live,
                         pending_attempt_pid,
                         retired_attempt_pids,
                         std::time::Instant::now(),
@@ -1065,7 +1058,6 @@ mod tests {
             remote_hostname: None,
             remote_exec_ready_filter: crate::pane::RemoteExecReadyFilter::default(),
             pending_agent_resume_plan: None,
-            pending_agent_resume_attempt_live: false,
             pending_agent_resume_attempt_pid: None,
             pending_agent_resume_retired_pids: Vec::new(),
             respawn_shell_on_exit: None,
@@ -1102,7 +1094,7 @@ mod tests {
         let child = pair.slave.spawn_command(command).unwrap();
         let child_pid = child.process_id().expect("child pid");
         state.child_pid = child_pid;
-        if state.pending_agent_resume_attempt_live {
+        if state.pending_agent_resume_attempt_pid.is_some() {
             state.pending_agent_resume_attempt_pid = Some(child_pid);
         }
         drop(pair);
@@ -1790,7 +1782,7 @@ mod tests {
         let plan = crate::agent_resume::plan("herdr:codex", "codex", &session_ref).unwrap();
         let mut state = handoff_runtime_state();
         state.pending_agent_resume_plan = Some(plan.clone());
-        state.pending_agent_resume_attempt_live = true;
+        state.pending_agent_resume_attempt_pid = Some(1);
         state.pending_agent_resume_retired_pids = vec![41, 42];
         state.respawn_shell_on_exit = Some(false);
         let (mut imports, mut child, child_pid) = imported_handoff_runtime(state);
@@ -1810,7 +1802,7 @@ mod tests {
 
         let terminal = terminals.values().next().expect("terminal should restore");
         assert_eq!(terminal.pending_agent_resume_plan.as_ref(), Some(&plan));
-        assert!(terminal.pending_agent_resume_attempt_live());
+        assert!(terminal.pending_agent_resume_attempt_pid().is_some());
         assert!(terminal.pending_agent_resume_attempt_matches_peer(Some(child_pid)));
         assert_eq!(terminal.pending_agent_resume_retired_pids(), &[41, 42]);
         assert!(!terminal.respawn_shell_on_exit);
@@ -1845,7 +1837,7 @@ mod tests {
 
         let terminal = terminals.values().next().expect("terminal should restore");
         assert!(terminal.pending_agent_resume_plan.is_none());
-        assert!(!terminal.pending_agent_resume_attempt_live());
+        assert!(terminal.pending_agent_resume_attempt_pid().is_none());
         assert!(
             !terminal.respawn_shell_on_exit,
             "an imported runtime that already saw the ready marker must not retry its SSH shell"

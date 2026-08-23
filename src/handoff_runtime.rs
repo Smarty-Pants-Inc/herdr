@@ -152,8 +152,6 @@ pub(crate) struct HandoffRuntimeState {
     pub remote_exec_ready_filter: crate::pane::RemoteExecReadyFilter,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
-    #[serde(default)]
-    pub pending_agent_resume_attempt_live: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_agent_resume_attempt_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -208,7 +206,6 @@ mod tests {
         assert!(!older.remote_execution_ready);
         assert_eq!(older.remote_hostname, None);
         assert!(older.pending_agent_resume_plan.is_none());
-        assert!(!older.pending_agent_resume_attempt_live);
         assert!(older.pending_agent_resume_attempt_pid.is_none());
         assert!(older.pending_agent_resume_retired_pids.is_empty());
         assert!(older.respawn_shell_on_exit.is_none());
@@ -227,7 +224,6 @@ mod tests {
                 "argv": ["codex", "resume", "session-1"],
                 "dedupe_key": "codex:id:session-1"
             },
-            "pending_agent_resume_attempt_live": true,
             "pending_agent_resume_attempt_pid": 42,
             "pending_agent_resume_retired_pids": [40, 41],
             "respawn_shell_on_exit": false
@@ -237,7 +233,6 @@ mod tests {
         assert_eq!(encoded["remote_execution_ready"], true);
         assert_eq!(encoded["remote_hostname"], "actual-node");
         assert_eq!(encoded["pending_agent_resume_plan"]["agent"], "codex");
-        assert_eq!(encoded["pending_agent_resume_attempt_live"], true);
         assert_eq!(encoded["pending_agent_resume_attempt_pid"], 42);
         assert_eq!(
             encoded["pending_agent_resume_retired_pids"],

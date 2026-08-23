@@ -27,7 +27,7 @@ use super::super::api_helpers::{
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
-fn split_cwd_for_target(
+pub(super) fn split_cwd_for_target(
     explicit_cwd: Option<String>,
     execution_target: &crate::execution::ExecutionTarget,
     source_target: &crate::execution::ExecutionTarget,
@@ -98,13 +98,14 @@ fn requested_pane_split_source(
     app: &App,
     caller_pane_id: Option<&str>,
     target_is_explicit: bool,
+    workspace_is_explicit: bool,
     ws_idx: usize,
     target_pane_id: PaneId,
 ) -> (
     crate::execution::ExecutionTarget,
     Option<std::path::PathBuf>,
 ) {
-    if target_is_explicit {
+    if target_is_explicit || !workspace_is_explicit {
         return pane_split_source(app, ws_idx, target_pane_id);
     }
     workspace_plugin_pane_split_source(app, caller_pane_id)
@@ -114,6 +115,7 @@ fn requested_pane_split_source(
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target_is_explicit = params.target_pane_id.is_some();
+        let workspace_is_explicit = params.workspace_id.is_some();
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
@@ -138,6 +140,7 @@ impl App {
             self,
             params.caller_pane_id.as_deref(),
             target_is_explicit,
+            workspace_is_explicit,
             ws_idx,
             target_pane_id,
         );
@@ -2133,11 +2136,15 @@ mod tests {
             crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
 
         assert_eq!(
-            requested_pane_split_source(&app, Some(&caller), false, 1, target_pane_id),
+            requested_pane_split_source(&app, Some(&caller), false, true, 1, target_pane_id),
             (plugin_target, Some(plugin_cwd))
         );
         assert_eq!(
-            requested_pane_split_source(&app, Some(&caller), true, 1, target_pane_id),
+            requested_pane_split_source(&app, Some(&caller), false, false, 1, target_pane_id,),
+            (selected_target.clone(), Some(selected_cwd.clone()))
+        );
+        assert_eq!(
+            requested_pane_split_source(&app, Some(&caller), true, true, 1, target_pane_id),
             (selected_target, Some(selected_cwd))
         );
     }

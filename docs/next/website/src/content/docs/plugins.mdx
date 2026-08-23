@@ -225,10 +225,13 @@ but changing `herdr-plugin.toml` after the install preview aborts install. Build
 failures show the plugin id, build index, working directory, command, exit
 status or spawn error, and capped stdout/stderr without interpreting tool output.
 
-Build commands are plain argv commands too, but they do not receive runtime
-plugin context or Herdr socket env. Plugin authors should document required
-system tools such as `cargo`, `npm`, `bun`, or `lua`; Herdr reports build
-failures but does not install missing toolchains.
+Build commands are plain argv commands too. Herdr scrubs runtime context such as
+`HERDR_BIN_PATH`, socket and session variables, pane/workspace/view identity,
+and all `HERDR_PLUGIN_*` variables, then injects only `HERDR_BUILD_BIN_PATH` as
+the validated absolute path to the Herdr executable running the install.
+Runtime plugin commands never receive `HERDR_BUILD_BIN_PATH`. Plugin authors
+should document required system tools such as `cargo`, `npm`, `bun`, or `lua`;
+Herdr reports build failures but does not install missing toolchains.
 
 ## Startup hooks
 

@@ -269,13 +269,14 @@ export the tab containing that pane.
 
 The response includes `workspace_id`, `tab_id`, `zoomed`, `focused_pane_id`, and
 `root`. `root` is a BSP tree of `pane` and `split` nodes. Pane nodes can include
-`pane_id`, `label`, `cwd`, and argv `command`. Split nodes use
-`direction` (`right` or `down`), `ratio`, `first`, and `second`.
+`pane_id`, `label`, `cwd`, argv `command`, and `execution_target`. The target is
+`{"kind":"local"}` by default or, on Unix, `{"kind":"ssh","host":"HOST"}`.
+Split nodes use `direction` (`right` or `down`), `ratio`, `first`, and `second`.
 
 `layout.apply` creates a fresh tab from a declarative tree. If `tab_id` is
 provided, Herdr creates the replacement tab first and then closes the old tab.
-This restores structure, labels, cwd, env, and optional argv commands; it does
-not preserve live PTYs, scrollback, or running processes.
+This restores structure, labels, cwd, execution targets, env, and optional argv
+commands; it does not preserve live PTYs, scrollback, or running processes.
 
 ```json
 {
@@ -299,6 +300,7 @@ not preserve live PTYs, scrollback, or running processes.
         "label": "tests",
         "cwd": "/repo",
         "command": ["sh", "-c", "just test"],
+        "execution_target": { "kind": "ssh", "host": "build.example" },
         "env": { "HERDR_ROLE": "tests" }
       }
     }

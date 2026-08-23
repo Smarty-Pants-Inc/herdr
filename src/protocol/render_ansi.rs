@@ -1396,12 +1396,16 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_hit_testing_matches_activation_allowlist() {
+    fn hyperlink_hit_testing_accepts_clean_osc8_handler_urls() {
         for uri in [
             "https://example.com/docs",
             "http://example.com/docs",
             "file:///tmp/report.md?line=7",
             "file://localhost/tmp/report.md?line=7",
+            "file://attacker/share/report.md",
+            "local://repo/src/main.rs",
+            "memory://artifact/report.md",
+            "mailto:hello@example.com",
         ] {
             let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
             frame.hyperlinks.push(uri.to_owned());
@@ -1409,14 +1413,13 @@ mod tests {
         }
 
         for uri in [
-            "local://repo/src/main.rs",
-            "memory://artifact/report.md",
-            "mailto:hello@example.com",
-            "file://attacker/share/report.md",
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
         ] {
             let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
             frame.hyperlinks.push(uri.to_owned());
-            assert!(!frame_has_hyperlink_at(&frame, 0, 0), "accepted {uri}");
+            assert!(!frame_has_hyperlink_at(&frame, 0, 0), "accepted {uri:?}");
         }
     }
 

@@ -2293,6 +2293,9 @@
                   },
                   "type": "object"
                 },
+                "execution_target": {
+                  "$ref": "#/schemas/request/$defs/ExecutionTarget"
+                },
                 "label": {
                   "type": [
                     "string",
@@ -7445,6 +7448,9 @@
                     "type": "string"
                   },
                   "type": "object"
+                },
+                "execution_target": {
+                  "$ref": "#/schemas/success_response/$defs/ExecutionTarget"
                 },
                 "label": {
                   "type": [

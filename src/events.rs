@@ -54,8 +54,12 @@ pub struct WorktreeRemoveResult {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
-    /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    /// A pane's child process exited. Runtime-owned events carry the child PID so
+    /// a delayed exit cannot retire a replacement runtime for the same pane.
+    PaneDied {
+        pane_id: PaneId,
+        child_pid: Option<u32>,
+    },
     /// The remote helper successfully spawned this pane's requested process.
     /// Internal-only handshake; it is not part of the public socket event schema.
     RemoteExecutionReady {

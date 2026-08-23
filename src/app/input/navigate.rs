@@ -843,7 +843,9 @@ impl App {
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
-            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(&binding),
+            crate::config::CustomCommandAction::Popup => {
+                self.spawn_custom_popup_command(&binding, view_id)
+            }
             crate::config::CustomCommandAction::PluginAction => self
                 .invoke_plugin_action_from_keybind_for_view(binding.command.clone(), view_id)
                 .map_err(std::io::Error::other),
@@ -867,11 +869,12 @@ impl App {
     fn spawn_custom_popup_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> io::Result<()> {
         self.spawn_popup_shell_command(
             &binding.command,
             None,
-            self.custom_command_env().0,
+            self.custom_command_env_for_view(view_id).0,
             crate::app::popup::PopupGeometry {
                 width: binding.width,
                 height: binding.height,
@@ -1036,6 +1039,10 @@ impl App {
         };
         let previous_focus_target = self.state.current_pane_focus_target();
         let (rows, cols) = self.state.estimate_pane_size();
+        let cwd = Some(
+            self.focused_pane_cwd_in_workspace(ws_idx)
+                .unwrap_or_else(|| self.resolve_new_terminal_cwd(None)),
+        );
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
         let (env, _) = self.custom_command_env();
@@ -1050,18 +1057,12 @@ impl App {
             .focused_pane_id()
             .ok_or_else(|| std::io::Error::other("no focused pane"))?;
         let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
-        let cwd = ws.active_tab().and_then(|tab| {
-            tab.cwd_for_pane(
-                previous_focus,
-                &self.state.terminals,
-                &self.terminal_runtimes,
-            )
-        });
         let new_pane = ws.split_focused_command(
             Direction::Horizontal,
             new_rows,
             new_cols,
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             command,
             env,
             self.state.pane_scrollback_limit_bytes,
@@ -1167,15 +1168,15 @@ impl App {
         let previous_focus = ws
             .focused_pane_id()
             .ok_or_else(|| std::io::Error::other("no focused pane"))?;
-        let cwd = cwd.or_else(|| {
-            ws.active_tab().and_then(|tab| {
-                tab.cwd_for_pane(
-                    previous_focus,
-                    &self.state.terminals,
-                    &self.terminal_runtimes,
-                )
+        let cwd = cwd
+            .or_else(|| {
+                self.launch_cwd_for_pane_in_workspace_on(ws_idx, previous_focus, execution_target)
             })
-        });
+            .or_else(|| {
+                execution_target
+                    .is_local()
+                    .then(|| self.resolve_new_terminal_cwd(None))
+            });
 
         let (tab_idx, new_pane, workspace_id) = {
             let ws = self
@@ -3764,6 +3765,34 @@ navigate_pane_down = "ctrl+j"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn popup_custom_command_uses_invoking_view_environment() {
+        let mut app = app_with_test_workspaces(&["popup-view"]);
+        app.state.mode = Mode::Terminal;
+        let output_path = unique_temp_path("popup-custom-command-view");
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::direct("ctrl+alt+g"),
+            label: "ctrl+alt+g".into(),
+            command: format!(
+                "printf '%s' \"$HERDR_VIEW_ID\" > '{}'",
+                output_path.display()
+            ),
+            action: crate::config::CustomCommandAction::Popup,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let view_id = crate::api::schema::ViewId::from_opaque("popup-view").unwrap();
+
+        app.launch_custom_command_for_view(binding, ActionContext::Direct, Some(&view_id));
+
+        assert!(app.state.popup_pane.is_some());
+        assert_eq!(wait_for_file(&output_path), "popup-view");
+        assert!(app.close_popup_pane());
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn custom_command_runs_from_prefix_key_in_navigate_mode() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -3838,6 +3867,44 @@ navigate_pane_down = "ctrl+j"
 
         let _ = std::fs::remove_file(output_path);
         let _ = std::fs::remove_file(release_path);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_argv_overlay_from_ssh_uses_local_fallback_cwd() {
+        let mut app = app_with_test_workspaces(&["remote-overlay"]);
+        app.state.mode = Mode::Terminal;
+        let fallback_cwd = unique_temp_path("local-overlay-fallback");
+        std::fs::create_dir_all(&fallback_cwd).expect("create local fallback cwd");
+        app.state.new_terminal_cwd =
+            crate::config::NewTerminalCwdConfig::Path(fallback_cwd.display().to_string());
+        let source_pane = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused source pane");
+        let source_terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(source_pane)
+            .expect("source terminal")
+            .clone();
+        let source_terminal = app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source terminal state");
+        source_terminal.cwd = "/remote/worktree".into();
+        source_terminal.execution_target =
+            crate::execution::ExecutionTarget::ssh("build.example").expect("SSH target");
+        let argv = vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()];
+
+        let (_, overlay) = app
+            .spawn_overlay_argv_command(&argv, None, Vec::new(), Vec::new())
+            .expect("open local argv overlay");
+
+        assert_eq!(
+            overlay.terminal.execution_target,
+            crate::execution::ExecutionTarget::Local
+        );
+        assert_eq!(overlay.terminal.cwd, fallback_cwd);
+        overlay.runtime.shutdown();
+        let _ = std::fs::remove_dir_all(fallback_cwd);
     }
 
     #[cfg(unix)]

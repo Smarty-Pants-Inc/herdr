@@ -1331,7 +1331,12 @@ fn run_plugin_build_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_herdr_runtime_env(&mut child);
-
+    if let Err(error) = inject_plugin_build_bin_path(&mut child) {
+        return Err(Box::new(PluginBuildFailure {
+            context,
+            kind: PluginBuildFailureKind::Start { error },
+        }));
+    }
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -1515,6 +1520,7 @@ fn scrub_herdr_runtime_env(command: &mut Command) {
         crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
         crate::session::SESSION_ENV_VAR,
         "HERDR_BIN_PATH",
+        "HERDR_BUILD_BIN_PATH",
         "HERDR_ENV",
         "HERDR_WORKSPACE_ID",
         "HERDR_TAB_ID",
@@ -1523,11 +1529,34 @@ fn scrub_herdr_runtime_env(command: &mut Command) {
     ] {
         command.env_remove(key);
     }
+    let configured_plugin_keys = command
+        .get_envs()
+        .filter(|(key, _)| key.to_string_lossy().starts_with("HERDR_PLUGIN_"))
+        .map(|(key, _)| key.to_os_string())
+        .collect::<Vec<_>>();
+    for key in configured_plugin_keys {
+        command.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("HERDR_PLUGIN_") {
             command.env_remove(key);
         }
     }
+}
+
+fn inject_plugin_build_bin_path(command: &mut Command) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "current Herdr executable is not a validated file: {}",
+                executable.display()
+            ),
+        ));
+    }
+    command.env("HERDR_BUILD_BIN_PATH", executable);
+    Ok(())
 }
 
 fn build_platform_supported(
@@ -1692,17 +1721,34 @@ mod tests {
     }
 
     #[test]
-    fn plugin_build_env_scrubs_view_identity() {
+    fn plugin_build_env_scrubs_runtime_identity_and_sets_manager_path() {
         let mut command = Command::new("true");
-        command.env("HERDR_VIEW_ID", "stale");
+        command
+            .env("HERDR_BIN_PATH", "spoofed-runtime-path")
+            .env("HERDR_BUILD_BIN_PATH", "spoofed-build-path")
+            .env("HERDR_PLUGIN_CONTEXT_JSON", "spoofed-context")
+            .env("HERDR_VIEW_ID", "stale");
 
         scrub_herdr_runtime_env(&mut command);
+        inject_plugin_build_bin_path(&mut command).unwrap();
 
-        let view_id = command
+        for key in [
+            "HERDR_BIN_PATH",
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            "HERDR_VIEW_ID",
+        ] {
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value);
+            assert_eq!(value, Some(None), "runtime variable {key} was not scrubbed");
+        }
+        let build_path = command
             .get_envs()
-            .find(|(name, _)| *name == std::ffi::OsStr::new("HERDR_VIEW_ID"))
-            .map(|(_, value)| value);
-        assert_eq!(view_id, Some(None));
+            .find(|(name, _)| *name == std::ffi::OsStr::new("HERDR_BUILD_BIN_PATH"))
+            .and_then(|(_, value)| value)
+            .expect("build path should be injected");
+        assert_eq!(build_path, std::env::current_exe().unwrap().as_os_str());
     }
     #[test]
     fn plugin_action_context_uses_caller_pane() {

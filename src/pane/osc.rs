@@ -342,6 +342,8 @@ pub(crate) struct RemoteExecReadyFilter {
     state: RemoteExecReadyFilterState,
     prefix: Vec<u8>,
     payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_nonce: Option<crate::execution::RemoteExecReadyNonce>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -356,6 +358,14 @@ enum RemoteExecReadyFilterState {
 }
 
 impl RemoteExecReadyFilter {
+    #[cfg(any(unix, test))]
+    pub(crate) fn set_expected_nonce(
+        &mut self,
+        expected_nonce: Option<crate::execution::RemoteExecReadyNonce>,
+    ) {
+        self.expected_nonce = expected_nonce;
+    }
+
     #[cfg(unix)]
     pub(crate) fn validated_handoff_state(mut self) -> Self {
         let valid = match self.state {
@@ -371,7 +381,8 @@ impl RemoteExecReadyFilter {
                     && crate::execution::REMOTE_EXEC_READY_OSC_PREFIX.starts_with(&self.prefix)
             }
             RemoteExecReadyFilterState::Payload | RemoteExecReadyFilterState::PayloadEscape => {
-                self.prefix.is_empty() && self.payload.len() <= Self::MAX_PAYLOAD_BYTES
+                self.prefix.is_empty()
+                    && self.payload.len() <= crate::execution::REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES
             }
             RemoteExecReadyFilterState::Discarding
             | RemoteExecReadyFilterState::DiscardingEscape => {
@@ -384,8 +395,6 @@ impl RemoteExecReadyFilter {
             Self::default()
         }
     }
-
-    const MAX_PAYLOAD_BYTES: usize = 1024;
 
     pub(super) fn filter<'a>(&mut self, bytes: &'a [u8]) -> FilteredPtyBytes<'a> {
         if self.state == RemoteExecReadyFilterState::Ground
@@ -445,7 +454,11 @@ impl RemoteExecReadyFilter {
                 RemoteExecReadyFilterState::Payload => match byte {
                     0x07 => self.finish(ready),
                     0x1b => self.state = RemoteExecReadyFilterState::PayloadEscape,
-                    _ if self.payload.len() < Self::MAX_PAYLOAD_BYTES => self.payload.push(byte),
+                    _ if self.payload.len()
+                        < crate::execution::REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES =>
+                    {
+                        self.payload.push(byte)
+                    }
                     _ => {
                         self.payload.clear();
                         self.state = RemoteExecReadyFilterState::Discarding;
@@ -484,30 +497,39 @@ impl RemoteExecReadyFilter {
 
     fn finish(&mut self, ready: &mut Option<RemoteExecReady>) {
         if ready.is_none() {
-            *ready = parse_remote_exec_ready(&self.payload);
+            if let Some(parsed) =
+                parse_remote_exec_ready(&self.payload, self.expected_nonce.as_ref())
+            {
+                self.expected_nonce = None;
+                *ready = Some(parsed);
+            }
         }
         self.payload.clear();
         self.state = RemoteExecReadyFilterState::Ground;
     }
 }
 
-fn parse_remote_exec_ready(payload: &[u8]) -> Option<RemoteExecReady> {
+fn parse_remote_exec_ready(
+    payload: &[u8],
+    expected_nonce: Option<&crate::execution::RemoteExecReadyNonce>,
+) -> Option<RemoteExecReady> {
     #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum WirePayload {
-        Current {
-            #[serde(default)]
-            hostname: Option<String>,
-            #[serde(default)]
-            cwd: Option<PathBuf>,
-        },
-        Legacy(String),
+    struct WirePayload {
+        nonce: String,
+        #[serde(default)]
+        hostname: Option<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
     }
 
-    let (hostname, cwd) = match serde_json::from_slice(payload).ok()? {
-        WirePayload::Current { hostname, cwd } => (hostname, cwd),
-        WirePayload::Legacy(hostname) => (Some(hostname), None),
-    };
+    let WirePayload {
+        nonce,
+        hostname,
+        cwd,
+    } = serde_json::from_slice(payload).ok()?;
+    if !expected_nonce.is_some_and(|expected| expected.matches(&nonce)) {
+        return None;
+    }
     let hostname =
         hostname.filter(|hostname| !hostname.is_empty() && !hostname.chars().any(char::is_control));
     let cwd = cwd.filter(|cwd| cwd.is_absolute());
@@ -1177,14 +1199,29 @@ mod tests {
     }
 
     #[test]
-    fn remote_exec_ready_filter_suppresses_split_marker_without_losing_output() {
+    fn remote_exec_ready_filter_requires_exact_nonce_without_losing_output() {
+        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
+        let wrong_nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
         let mut filter = RemoteExecReadyFilter::default();
+        filter.set_expected_nonce(Some(nonce.clone()));
+
+        let spoof = format!(
+            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"spoof\"}}\x1b\\",
+            wrong_nonce.as_str()
+        );
+        let spoofed = filter.filter(spoof.as_bytes());
+        assert!(spoofed.bytes.is_empty());
+        assert_eq!(spoofed.ready, None);
 
         let first = filter.filter(b"before\x1b]6973;herdr-remote-");
         assert_eq!(first.bytes.as_ref(), b"before");
         assert_eq!(first.ready, None);
 
-        let second = filter.filter(b"exec-ready={\"hostname\":\"actual-");
+        let second_payload = format!(
+            "exec-ready={{\"nonce\":\"{}\",\"hostname\":\"actual-",
+            nonce.as_str()
+        );
+        let second = filter.filter(second_payload.as_bytes());
         assert!(second.bytes.is_empty());
         assert_eq!(second.ready, None);
 
@@ -1195,6 +1232,36 @@ mod tests {
             Some(RemoteExecReady {
                 hostname: Some("actual-node".into()),
                 cwd: Some("/remote/plugin-root".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn remote_exec_ready_filter_accepts_payloads_beyond_the_old_cwd_limit() {
+        let cwd = format!("/{}", "x".repeat(4096));
+        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "nonce": nonce.as_str(),
+            "hostname": "actual-node",
+            "cwd": cwd,
+        }))
+        .unwrap();
+        assert!(payload.len() > 1024);
+        assert!(payload.len() <= crate::execution::REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES);
+        let mut marker = crate::execution::REMOTE_EXEC_READY_OSC_PREFIX.to_vec();
+        marker.extend_from_slice(&payload);
+        marker.extend_from_slice(b"\x1b\\");
+
+        let mut filter = RemoteExecReadyFilter::default();
+        filter.set_expected_nonce(Some(nonce));
+        let filtered = filter.filter(&marker);
+
+        assert!(filtered.bytes.is_empty());
+        assert_eq!(
+            filtered.ready,
+            Some(RemoteExecReady {
+                hostname: Some("actual-node".into()),
+                cwd: Some(std::path::PathBuf::from(format!("/{}", "x".repeat(4096)))),
             })
         );
     }
@@ -1212,9 +1279,14 @@ mod tests {
 
     #[test]
     fn remote_exec_ready_filter_discards_control_hostname_but_keeps_ready() {
+        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
         let mut filter = RemoteExecReadyFilter::default();
-        let filtered =
-            filter.filter(b"\x1b]6973;herdr-remote-exec-ready=\"build\\u0007node\"\x1b\\");
+        filter.set_expected_nonce(Some(nonce.clone()));
+        let payload = format!(
+            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"build\\u0007node\"}}\x1b\\",
+            nonce.as_str()
+        );
+        let filtered = filter.filter(payload.as_bytes());
 
         assert!(filtered.bytes.is_empty());
         assert_eq!(

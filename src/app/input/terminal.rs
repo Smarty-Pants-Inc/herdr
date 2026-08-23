@@ -1607,64 +1607,81 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn single_click_osc8_file_url_invokes_plugin_handler_and_suppresses_release() {
-        let uri = "file:///tmp/odd%20file.rs?line=12&col=4";
-        let screen =
-            format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\");
-        let (mut app, info) = app_with_screen_bytes(b"");
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
-        let (runtime, mut input_rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                info.inner_rect.width,
-                info.inner_rect.height,
-                0,
-                screen.as_bytes(),
-                4,
+    async fn single_click_handler_only_osc8_urls_invoke_plugins_and_suppress_release() {
+        for (uri, pattern) in [
+            (
+                "file://build.example/tmp/odd%20file.rs?line=12&col=4",
+                "^file://",
+            ),
+            ("artifact://5776", "^artifact://"),
+        ] {
+            let screen =
+                format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\");
+            let (mut app, info) = app_with_screen_bytes(b"");
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    info.inner_rect.width,
+                    info.inner_rect.height,
+                    0,
+                    screen.as_bytes(),
+                    4,
+                );
+            app.state.insert_test_runtime(pane_id, runtime);
+            install_test_link_handler(&mut app, "handler-only", pattern);
+
+            assert_eq!(
+                app.state
+                    .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, 1)
+                    .as_deref(),
+                Some(uri)
             );
-        app.state.insert_test_runtime(pane_id, runtime);
-        install_test_link_handler(&mut app, "local-file", "^file://");
 
-        assert_eq!(
-            app.state
-                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, 1)
-                .as_deref(),
-            Some(uri)
-        );
+            let x = info.inner_rect.x + 1;
+            app.handle_mouse_from_input_source(
+                41,
+                modified_mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    x,
+                    info.inner_rect.y,
+                    KeyModifiers::empty(),
+                ),
+            );
+            app.handle_mouse_from_input_source(
+                41,
+                modified_mouse(
+                    MouseEventKind::Up(MouseButton::Left),
+                    x,
+                    info.inner_rect.y,
+                    KeyModifiers::empty(),
+                ),
+            );
 
-        let x = info.inner_rect.x + 1;
-        app.handle_mouse_from_input_source(
-            41,
-            modified_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                x,
-                info.inner_rect.y,
-                KeyModifiers::empty(),
-            ),
-        );
-        app.handle_mouse_from_input_source(
-            41,
-            modified_mouse(
-                MouseEventKind::Up(MouseButton::Left),
-                x,
-                info.inner_rect.y,
-                KeyModifiers::empty(),
-            ),
-        );
+            let log = app
+                .state
+                .plugin_command_logs
+                .last()
+                .expect("handler-only link should start plugin handler");
+            assert_eq!(log.action_id.as_deref(), Some("open"));
+            assert!(
+                input_rx.try_recv().is_err(),
+                "handled link must not reach pane"
+            );
+            assert!(
+                app.event_rx.try_recv().is_err(),
+                "plugin-handled link must not queue an OpenUrl event"
+            );
+        }
+    }
 
-        let log = app
-            .state
-            .plugin_command_logs
-            .last()
-            .expect("file link should start plugin handler");
-        assert_eq!(log.action_id.as_deref(), Some("open"));
-        assert!(
-            input_rx.try_recv().is_err(),
-            "handled file link must not reach pane"
-        );
-        assert!(
-            app.event_rx.try_recv().is_err(),
-            "plugin-handled file link must not queue an OpenUrl event"
-        );
+    #[tokio::test]
+    async fn unmatched_custom_osc8_url_is_not_consumed() {
+        let (mut app, _info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        assert!(!app.activate_link_click(41, pane_id, "artifact://5776".into(), None));
+        assert!(!app.pending_url_click_sources.contains(&41));
+        assert!(app.event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use crate::layout::PaneId;
 use crate::pane::PaneLaunchEnv;
 use crate::popup_size::{resolve_popup_geometry, PopupResolvedGeometry, PopupSize};
 use crate::protocol::CursorState;
-use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
+use crate::terminal::TerminalRuntime;
 
 pub(crate) struct PrivateLinkClick {
     pub(crate) url: String,
@@ -16,7 +16,7 @@ pub(crate) struct PrivateLinkClick {
 
 pub(crate) struct PrivateSurface {
     pane_id: PaneId,
-    terminal: TerminalState,
+    manual_title: String,
     runtime: Option<TerminalRuntime>,
     width: Option<PopupSize>,
     height: Option<PopupSize>,
@@ -42,13 +42,12 @@ impl PrivateSurface {
         }
 
         let pane_id = PaneId::alloc();
-        let terminal_id = TerminalId::alloc();
         let launch_env = PaneLaunchEnv::from_extra(spec.env).without_pane_identity();
         let runtime = TerminalRuntime::spawn_plugin_command_on(
             pane_id,
             geometry.inner.height,
             geometry.inner.width,
-            spec.cwd.clone(),
+            spec.cwd,
             &spec.execution_target,
             &spec.plugin.plugin_id,
             &spec.entrypoint,
@@ -69,14 +68,9 @@ impl PrivateSurface {
             cell_size.height_px,
         );
 
-        let mut terminal = TerminalState::new(terminal_id.clone(), spec.cwd)
-            .with_execution_target(spec.execution_target)
-            .with_launch_argv(spec.command);
-        terminal.set_manual_label(spec.title);
-
         Ok(Self {
             pane_id,
-            terminal,
+            manual_title: spec.title,
             runtime: Some(runtime),
             width: spec.width,
             height: spec.height,
@@ -94,10 +88,9 @@ impl PrivateSurface {
     ) -> Self {
         let geometry = resolve_popup_geometry(None, None, area).expect("test popup geometry");
         let pane_id = PaneId::alloc();
-        let terminal = TerminalState::new(TerminalId::alloc(), std::path::PathBuf::from("/tmp"));
         Self {
             pane_id,
-            terminal,
+            manual_title: "popup".to_string(),
             runtime: Some(TerminalRuntime::test_with_screen_bytes(
                 geometry.inner.width,
                 geometry.inner.height,
@@ -137,7 +130,7 @@ impl PrivateSurface {
         }
         self.render_area = area;
         self.cell_size = cell_size;
-        let Some(geometry) = self.geometry() else {
+        let Some(geometry) = self.geometry_for(self.render_area) else {
             return;
         };
         if let Some(runtime) = self.runtime.as_ref() {
@@ -161,10 +154,6 @@ impl PrivateSurface {
         }
     }
 
-    pub(crate) fn update_cwd(&mut self, cwd: std::path::PathBuf) {
-        self.terminal.cwd = cwd;
-    }
-
     pub(crate) fn render(
         &self,
         frame: &mut ratatui::Frame,
@@ -175,13 +164,12 @@ impl PrivateSurface {
         else {
             return;
         };
-        let title = self.terminal.manual_label.as_deref().unwrap_or("popup");
         crate::ui::render_popup_runtime(
             frame,
             geometry.outer,
             geometry.inner,
             runtime,
-            title,
+            &self.manual_title,
             palette,
         );
     }
@@ -276,7 +264,7 @@ impl PrivateSurface {
             _ => {}
         }
 
-        let geometry = self.geometry()?;
+        let geometry = self.geometry_for(self.render_area)?;
         if !geometry
             .inner
             .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
@@ -342,10 +330,6 @@ impl PrivateSurface {
             let _ = runtime.try_send_bytes(Bytes::from(bytes));
         }
         None
-    }
-
-    fn geometry(&self) -> Option<PopupResolvedGeometry> {
-        self.geometry_for(self.render_area)
     }
 
     fn geometry_for(&self, area: Rect) -> Option<PopupResolvedGeometry> {

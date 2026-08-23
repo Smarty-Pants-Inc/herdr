@@ -6,6 +6,7 @@ use crate::api::schema::{
     PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope, ResponseResult,
 };
 use crate::app::App;
+type PreparedPluginPaneLaunch = (std::path::PathBuf, Vec<(String, String)>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientPrivatePluginPopupOrigin {
@@ -203,6 +204,23 @@ impl App {
         }
     }
 
+    fn prepare_plugin_pane_launch(
+        &self,
+        plugin: &InstalledPluginInfo,
+        pane: &PluginManifestPane,
+        cwd: Option<String>,
+        env: std::collections::HashMap<String, String>,
+        context: &PluginInvocationContext,
+        execution_target: &crate::execution::ExecutionTarget,
+    ) -> Result<PreparedPluginPaneLaunch, (String, String)> {
+        validate_plugin_pane_platform(plugin, pane, execution_target)
+            .map_err(|(code, message)| (code.to_string(), message))?;
+        let cwd = self.plugin_pane_cwd(plugin, cwd, execution_target);
+        let env =
+            self.plugin_pane_launch_env(plugin, &pane.id, &cwd, execution_target, env, context)?;
+        Ok((cwd, env))
+    }
+
     pub(super) fn open_plugin_popup_pane(
         &mut self,
         id: String,
@@ -217,21 +235,15 @@ impl App {
             Ok(source) => source,
             Err((code, message)) => return encode_error(id, code, message),
         };
-        if let Err((code, message)) =
-            validate_plugin_pane_platform(plugin, &pane, &execution_target)
-        {
-            return encode_error(id, code, message);
-        }
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
-        let extra_env = match self.plugin_pane_launch_env(
+        let (cwd, extra_env) = match self.prepare_plugin_pane_launch(
             plugin,
-            &pane.id,
-            &cwd,
-            &execution_target,
+            &pane,
+            params.cwd,
             params.env,
             &context,
+            &execution_target,
         ) {
-            Ok(env) => env,
+            Ok(prepared) => prepared,
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let width = params.width.or(pane.width);
@@ -300,21 +312,15 @@ impl App {
             Ok(source) => source,
             Err((code, message)) => return encode_error(id, code, message),
         };
-        if let Err((code, message)) =
-            validate_plugin_pane_platform(plugin, &pane, &execution_target)
-        {
-            return encode_error(id, code, message);
-        }
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
-        let extra_env = match self.plugin_pane_launch_env(
+        let (cwd, extra_env) = match self.prepare_plugin_pane_launch(
             plugin,
-            &pane.id,
-            &cwd,
-            &execution_target,
-            params.env.clone(),
+            &pane,
+            params.cwd,
+            params.env,
             &context,
+            &execution_target,
         ) {
-            Ok(env) => env,
+            Ok(prepared) => prepared,
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let width = params.width.or(pane.width);
@@ -368,21 +374,15 @@ impl App {
             Ok(source) => source,
             Err((code, message)) => return encode_error(id, code, message),
         };
-        if let Err((code, message)) =
-            validate_plugin_pane_platform(plugin, &pane, &execution_target)
-        {
-            return encode_error(id, code, message);
-        }
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
-        let extra_env = match self.plugin_pane_launch_env(
+        let (cwd, extra_env) = match self.prepare_plugin_pane_launch(
             plugin,
-            &pane.id,
-            &cwd,
-            &execution_target,
+            &pane,
+            params.cwd,
             params.env,
             &context,
+            &execution_target,
         ) {
-            Ok(env) => env,
+            Ok(prepared) => prepared,
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let (ws_idx, new_pane) = match self.spawn_overlay_plugin_command(
@@ -437,22 +437,16 @@ impl App {
         let execution_target = self
             .execution_target_for_pane_in_workspace(ws_idx, target_pane)
             .unwrap_or_default();
-        if let Err((code, message)) =
-            validate_plugin_pane_platform(plugin, &pane, &execution_target)
-        {
-            return encode_error(id, code, message);
-        }
         let context = self.plugin_context_for_pane(ws_idx, target_pane, "plugin-pane");
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
-        let extra_env = match self.plugin_pane_launch_env(
+        let (cwd, extra_env) = match self.prepare_plugin_pane_launch(
             plugin,
-            &pane.id,
-            &cwd,
-            &execution_target,
+            &pane,
+            params.cwd,
             params.env,
             &context,
+            &execution_target,
         ) {
-            Ok(env) => env,
+            Ok(prepared) => prepared,
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let direction = match params
@@ -545,21 +539,15 @@ impl App {
             Ok(source) => source,
             Err((code, message)) => return encode_error(id, code, message),
         };
-        if let Err((code, message)) =
-            validate_plugin_pane_platform(plugin, &pane, &execution_target)
-        {
-            return encode_error(id, code, message);
-        }
-        let cwd = self.plugin_pane_cwd(plugin, params.cwd, &execution_target);
-        let extra_env = match self.plugin_pane_launch_env(
+        let (cwd, extra_env) = match self.prepare_plugin_pane_launch(
             plugin,
-            &pane.id,
-            &cwd,
-            &execution_target,
+            &pane,
+            params.cwd,
             params.env,
             &context,
+            &execution_target,
         ) {
-            Ok(env) => env,
+            Ok(prepared) => prepared,
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let (rows, cols) = self.state.estimate_pane_size();
@@ -794,6 +782,7 @@ fn plugin_pane_protected_env_key(key: &str) -> bool {
                 | "HERDR_PLUGIN_ENTRYPOINT_ID"
                 | "HERDR_PLUGIN_CONTEXT_JSON"
                 | "HERDR_BIN_PATH"
+                | "HERDR_BUILD_BIN_PATH"
                 | "HERDR_VIEW_ID"
         )
 }

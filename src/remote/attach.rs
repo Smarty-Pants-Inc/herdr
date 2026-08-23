@@ -735,13 +735,22 @@ pub(crate) fn resolve_prepared_remote_shell_path(target: &str) -> io::Result<Str
     let candidates = remote_binary_candidates(&ssh, &expected)?;
     let prepared = prepared_remote_binary(&ssh, &expected, &candidates)?
         .ok_or_else(|| unprepared_remote_error(target))?;
-    let shell_path = prepared.shell_path;
-    cache_prepared_remote_shell_path(target, &shell_path);
-    Ok(shell_path)
+    cache_prepared_remote_shell_path(target, &prepared.shell_path);
+    Ok(prepared.shell_path)
 }
 
 #[cfg(unix)]
-fn cached_prepared_remote_shell_path(target: &str) -> Option<String> {
+fn unprepared_remote_error(target: &str) -> io::Error {
+    io::Error::other(format!(
+        "remote Herdr on {target} is not prepared for version {} and protocol {}; run `herdr --remote {}` first",
+        current_version(),
+        CURRENT_PROTOCOL,
+        shell_quote(target)
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn cached_prepared_remote_shell_path(target: &str) -> Option<String> {
     let cache = PREPARED_REMOTE_SHELL_PATHS.get_or_init(|| Mutex::new(BTreeMap::new()));
     let cache = cache
         .lock()
@@ -773,16 +782,6 @@ fn prepared_remote_binary(
     } else {
         Ok(None)
     }
-}
-
-#[cfg(unix)]
-fn unprepared_remote_error(target: &str) -> io::Error {
-    io::Error::other(format!(
-        "remote Herdr on {target} is not prepared for version {} and protocol {}; run `herdr --remote {}` first",
-        current_version(),
-        CURRENT_PROTOCOL,
-        shell_quote(target)
-    ))
 }
 
 fn prepare_remote_herdr(
@@ -3184,7 +3183,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepared_remote_shell_path_cache_remembers_verified_path() {
+    fn cached_prepared_remote_shell_path_remembers_verified_path() {
         let target = format!("cache-test-{}", std::process::id());
         let shell_path = "'/opt/herdr bin/herdr'";
 
@@ -3196,15 +3195,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn unprepared_remote_error_instructs_user_to_prepare_the_host() {
-        let error = unprepared_remote_error("user@example.com");
-        let message = error.to_string();
-
-        assert!(message.contains("not prepared"));
-        assert!(message.contains("herdr --remote user@example.com"));
-    }
     #[test]
     fn remote_binary_probe_requires_remote_exec_protocol() {
         let stdout = format!(

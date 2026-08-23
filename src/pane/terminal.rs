@@ -258,6 +258,14 @@ impl PaneTerminal {
         self.ghostty.seed_remote_exec_ready_filter(state);
     }
 
+    #[cfg(unix)]
+    pub(crate) fn set_remote_exec_ready_nonce(
+        &self,
+        nonce: Option<crate::execution::RemoteExecReadyNonce>,
+    ) {
+        self.ghostty.set_remote_exec_ready_nonce(nonce);
+    }
+
     pub fn resize(
         &self,
         rows: u16,
@@ -1552,6 +1560,13 @@ impl GhosttyPaneTerminal {
     fn seed_remote_exec_ready_filter(&self, state: RemoteExecReadyFilter) {
         if let Ok(mut core) = self.core.lock() {
             core.remote_exec_ready_filter = state.validated_handoff_state();
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_remote_exec_ready_nonce(&self, nonce: Option<crate::execution::RemoteExecReadyNonce>) {
+        if let Ok(mut core) = self.core.lock() {
+            core.remote_exec_ready_filter.set_expected_nonce(nonce);
         }
     }
 
@@ -4564,28 +4579,39 @@ mod tests {
         );
     }
     #[test]
-    fn process_pty_bytes_consumes_split_remote_ready_marker_without_rendering_it() {
+    fn process_pty_bytes_requires_exact_remote_ready_nonce() {
         let (tx, _rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
+        let expected = crate::execution::RemoteExecReadyNonce::generate().unwrap();
+        let wrong = crate::execution::RemoteExecReadyNonce::generate().unwrap();
 
+        let spoof = format!(
+            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"spoof\"}}\x1b\\",
+            wrong.as_str()
+        );
+        let spoof_result = pane.process_pty_bytes(pane_id, 0, spoof.as_bytes(), &tx);
+        assert_eq!(spoof_result.remote_exec_ready, None);
+
+        pane.set_remote_exec_ready_nonce(Some(expected.clone()));
         let first = pane.process_pty_bytes(
             pane_id,
             0,
-            b"\x1b]6973;herdr-remote-exec-ready={\"hostname\":\"build",
+            format!(
+                "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"build",
+                expected.as_str()
+            )
+            .as_bytes(),
             &tx,
         );
-        assert!(!first.request_render);
         assert_eq!(first.remote_exec_ready, None);
-
         let second = pane.process_pty_bytes(
             pane_id,
             0,
             b"-node\",\"cwd\":\"/remote/plugin-root\"}\x1b\\",
             &tx,
         );
-        assert!(!second.request_render);
         assert_eq!(
             second.remote_exec_ready,
             Some(RemoteExecReady {
