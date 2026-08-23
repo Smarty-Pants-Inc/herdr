@@ -17,6 +17,14 @@ export function resolveCommit(git, ref) {
   return git(['rev-parse', `${ref}^{commit}`]).trim();
 }
 
+export function resolveCommitIfPresent(git, ref) {
+  try {
+    return resolveCommit(git, ref);
+  } catch {
+    return null;
+  }
+}
+
 export function gitPathExists(git, ref, path) {
   try {
     git(['cat-file', '-e', `${ref}:${path}`]);

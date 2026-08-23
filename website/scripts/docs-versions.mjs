@@ -8,6 +8,7 @@ import {
   gitTreesEqual,
   listDocumentationPaths,
   resolveCommit,
+  resolveCommitIfPresent,
 } from './docs-snapshot.mjs';
 
 const websiteDir = dirname(fileURLToPath(import.meta.url));
@@ -157,8 +158,20 @@ export async function checkVersions() {
       if (!/^[0-9a-f]{40}$/.test(entry.commit)) {
         throw new Error(`docs version ${entry.version} has invalid commit ${entry.commit}`);
       }
-      const taggedCommit = resolveCommit(git, entry.tag);
-      if (taggedCommit !== entry.commit) {
+      const taggedCommit = resolveCommitIfPresent(git, entry.tag);
+      if (taggedCommit === null) {
+        try {
+          git(['cat-file', '-e', `${entry.commit}^{commit}`]);
+        } catch {
+          throw new Error(
+            `docs version ${entry.version} is missing both tag ${entry.tag} and commit ${entry.commit}`,
+          );
+        }
+        console.warn(
+          `docs version ${entry.version} tag ${entry.tag} is unavailable; ` +
+            `using recorded commit ${entry.commit}`,
+        );
+      } else if (taggedCommit !== entry.commit) {
         throw new Error(
           `docs version ${entry.version} tag ${entry.tag} moved from ${entry.commit} to ${taggedCommit}`,
         );

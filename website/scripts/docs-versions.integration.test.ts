@@ -123,6 +123,8 @@ describe('documentation release publishing', () => {
     expect(archivedManifest.versions.map(({ version }) => version)).toEqual(['1.0.0', '0.9.0']);
     expect(await read(root, 'README.md')).toBe('post-release correction\n');
     runScript(root, ['check']);
+    git(root, ['tag', '-d', 'v1.0.0']);
+    runScript(root, ['check']);
 
     const correctedArchivedDocs = '---\ntitle: Documentation\n---\n\ncorrected archived docs\n';
     await write(
