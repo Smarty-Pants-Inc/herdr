@@ -4588,6 +4588,15 @@ impl HeadlessServer {
             .flatten()
     }
 
+    fn private_omp_guest_ready_to_render(&self, client_id: u64) -> bool {
+        self.private_omp_pending_routes.get(&client_id).is_none()
+            && self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.private_omp_guest.as_ref())
+                .is_some_and(crate::server::omp_private_renderer::PrivateOmpGuest::replica_ready)
+    }
+
     fn replaced_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
         self.private_omp_pane_info(client_id)
             .or_else(|| self.independent_omp_pane_info(client_id))
@@ -6852,11 +6861,12 @@ impl HeadlessServer {
                         hyperlinks
                             .retain(|((x, y), _, _)| !info.inner_rect.contains((*x, *y).into()));
                     }
-                    if let (Some(info), Some(guest)) = (
+                    if let (Some(info), Some(guest), true) = (
                         self.private_omp_pane_info(client_id),
                         self.clients
                             .get(&client_id)
                             .and_then(|client| client.private_omp_guest.as_ref()),
+                        self.private_omp_guest_ready_to_render(client_id),
                     ) {
                         let inner = info.inner_rect;
                         if inner.width > 0 && inner.height > 0 {
@@ -8031,6 +8041,7 @@ mod tests {
             start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
 
         assert_eq!(server.private_omp_pending_routes.get(&1), Some(&route));
+        assert!(!server.private_omp_guest_ready_to_render(1));
         server.render_and_stream();
         let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
         let text = frame_text(&frame);

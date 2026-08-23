@@ -14,6 +14,13 @@ pub(crate) fn test_reset_peer_pid_session_process_checks() {
 pub(crate) fn test_peer_pid_session_process_checks() -> usize {
     PEER_PID_SESSION_PROCESS_CHECKS.with(std::cell::Cell::get)
 }
+fn peer_pid_owns_terminal_bridge(
+    child_pid: u32,
+    peer_pid: u32,
+    foreground_process_group_id: Option<u32>,
+) -> bool {
+    child_pid == peer_pid || foreground_process_group_id == Some(peer_pid)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalTarget {
@@ -223,8 +230,8 @@ impl App {
         matches.next().is_none().then_some(target)
     }
 
-    /// Maps the exact managed terminal root process to its terminal. Ambiguous
-    /// or unverifiable attribution fails closed.
+    /// Maps the exact managed terminal root or verified foreground process-group
+    /// leader to its terminal. Ambiguous or unverifiable attribution fails closed.
     pub(crate) fn terminal_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
         let mut matches = self.terminal_targets().into_iter().filter(|target| {
             let Some(child_pid) = self
@@ -239,7 +246,11 @@ impl App {
                 return false;
             };
 
-            child_pid == peer_pid
+            peer_pid_owns_terminal_bridge(
+                child_pid,
+                peer_pid,
+                crate::detect::foreground_process_group_id(child_pid),
+            )
         });
         let target = matches.next()?;
         matches.next().is_none().then_some(target)
@@ -264,5 +275,18 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_pid_owns_terminal_bridge;
+
+    #[test]
+    fn omp_bridge_owner_accepts_root_or_foreground_leader_only() {
+        assert!(peer_pid_owns_terminal_bridge(10, 10, Some(20)));
+        assert!(peer_pid_owns_terminal_bridge(10, 20, Some(20)));
+        assert!(!peer_pid_owns_terminal_bridge(10, 30, Some(20)));
+        assert!(!peer_pid_owns_terminal_bridge(10, 20, None));
     }
 }
