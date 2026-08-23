@@ -2021,7 +2021,7 @@ impl HeadlessServer {
         }
         serialized.extend(Self::frame_server_message(target_message).ok()?);
         let queued = if has_cleanup {
-            writer.replace_with_cleanup(serialized)
+            writer.replace_with_pane_cleanup(pane_id, serialized)
         } else {
             writer.control.send(serialized).is_ok()
         };
@@ -8349,6 +8349,12 @@ mod tests {
         assert!(server.reconcile_omp_renderers());
         assert_eq!(server.private_omp_pending_routes.get(&1), Some(&old_route));
 
+        assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
+            pane_id: pane_id.clone(),
+            omp_session_id: "old".into(),
+            route_generation: 1,
+            host_id: 1,
+        }));
         let (_new_host, _new_messages) = start_test_omp_host(&mut server, pane_id, "a", 2);
         assert_eq!(
             server.private_omp_pending_routes.get(&1),
@@ -8517,9 +8523,18 @@ mod tests {
         assert_eq!(address, server.omp_service.bridge().address());
         assert!(server.omp_service.bridge().validates(&pane_id, &token));
 
+        let mut descendant = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn descendant peer");
         for (id, requested_pane, peer_pid) in [
             ("missing-peer", source_pane_id.as_str(), None),
             ("unknown-peer", source_pane_id.as_str(), Some(2_000_000_000)),
+            (
+                "descendant-peer",
+                source_pane_id.as_str(),
+                Some(descendant.id()),
+            ),
         ] {
             let response: api::schema::ErrorResponse = serde_json::from_str(
                 &request_pane_omp_bridge(&mut server, id, requested_pane, peer_pid),
@@ -8532,6 +8547,9 @@ mod tests {
                 "OMP bridge discovery is unavailable for this caller"
             );
         }
+
+        let _ = descendant.kill();
+        let _ = descendant.wait();
 
         server
             .app
@@ -9042,6 +9060,24 @@ mod tests {
             .pane_graphics
             .slots
             .insert(direct_key.clone(), direct_slot);
+        let stale_render = HeadlessServer::frame_server_message(&ServerMessage::WindowTitle {
+            title: Some("stale render".into()),
+        })
+        .expect("frame stale render");
+        writer.test_fill_render(stale_render);
+        let unrelated_graphics = HeadlessServer::frame_server_message(&ServerMessage::Graphics {
+            bytes: b"unrelated graphics".to_vec(),
+        })
+        .expect("frame unrelated graphics");
+        writer
+            .render
+            .send_ordered(crate::layout::PaneId::alloc(), unrelated_graphics)
+            .expect("queue unrelated graphics");
+        let latest_render = HeadlessServer::frame_server_message(&ServerMessage::WindowTitle {
+            title: Some("latest render".into()),
+        })
+        .expect("frame latest render");
+        writer.test_fill_render(latest_render);
         writer.test_fill_control(vec![b'x']);
         assert!(server.handle_server_event(ServerEvent::OmpReplicaReady {
             client_id: 2,
@@ -9095,6 +9131,21 @@ mod tests {
         assert!(queued[..63].iter().all(|message| message == b"x"));
         let combined = queued.last().expect("combined activation record");
         let mut cursor = std::io::Cursor::new(combined.as_slice());
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+                .expect("preserved stale render frame"),
+            ServerMessage::WindowTitle { title } if title.as_deref() == Some("stale render")
+        ));
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+                .expect("preserved unrelated graphics frame"),
+            ServerMessage::Graphics { bytes } if bytes == b"unrelated graphics"
+        ));
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+                .expect("preserved latest render frame"),
+            ServerMessage::WindowTitle { title } if title.as_deref() == Some("latest render")
+        ));
         match protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
             .expect("graphics cleanup frame")
         {
@@ -9799,7 +9850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_stop_reconciles_private_guest_to_started_replacement() {
+    async fn host_stop_allows_replacement_only_after_old_host_stops() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-replacement");
         let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
@@ -9850,15 +9901,16 @@ mod tests {
                 .route()
                 .omp_session_id,
             "old",
-            "deterministic ordering keeps the selected route while both are live"
+            "a second live session cannot replace the selected route"
         );
 
         assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
-            pane_id: route,
+            pane_id: route.clone(),
             omp_session_id: "old".into(),
             route_generation: 1,
             host_id: 1,
         }));
+        assert!(server.handle_server_event(host_started(2, "replacement")));
         assert_eq!(
             server.clients[&1]
                 .private_omp_guest
@@ -9867,7 +9919,7 @@ mod tests {
                 .route()
                 .omp_session_id,
             "replacement",
-            "stopping the selected live route immediately attaches its replacement"
+            "replacement attaches only after the prior host has stopped"
         );
     }
     fn pane_updated_events(event_hub: &api::EventHub) -> usize {

@@ -223,8 +223,8 @@ impl App {
         matches.next().is_none().then_some(target)
     }
 
-    /// Maps a locally attributed process to the single managed terminal that
-    /// owns it. Ambiguous or unverifiable process ancestry fails closed.
+    /// Maps the exact managed terminal root process to its terminal. Ambiguous
+    /// or unverifiable attribution fails closed.
     pub(crate) fn terminal_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
         let mut matches = self.terminal_targets().into_iter().filter(|target| {
             let Some(child_pid) = self
@@ -240,10 +240,6 @@ impl App {
             };
 
             child_pid == peer_pid
-                || crate::platform::process_is_descendant_of(peer_pid, child_pid)
-                || crate::platform::session_processes(child_pid)
-                    .into_iter()
-                    .any(|session_pid| session_pid == peer_pid)
         });
         let target = matches.next()?;
         matches.next().is_none().then_some(target)

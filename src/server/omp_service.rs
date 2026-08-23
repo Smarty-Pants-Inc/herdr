@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn host_route_admission_reports_acceptance_and_route_busy_rejection() {
+    fn host_route_admission_rejects_second_live_session_for_same_pane() {
         let mut service = OmpService::new(None).unwrap();
         let clients = HashMap::new();
         let (peer, socket) = host_socket_pair();
@@ -1077,7 +1077,7 @@ mod tests {
         service.handle_event(
             ServerEvent::OmpHostStarted {
                 pane_id: "pane".into(),
-                omp_session_id: "session".into(),
+                omp_session_id: "replacement-session".into(),
                 route_generation: 1,
                 host_id: 2,
                 outbound: replacement_outbound,

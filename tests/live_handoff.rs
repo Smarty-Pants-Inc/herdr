@@ -863,6 +863,7 @@ try:
     initial = announce(inherited_address, os.environ["HERDR_OMP_BRIDGE_TOKEN"], inherited_pane_id)
     write_marker({
         "phase": "initial",
+        "pid": os.getpid(),
         "inherited_pane_id": inherited_pane_id,
         "inherited_address": inherited_address,
     })
@@ -873,6 +874,7 @@ try:
     replacement = announce(address, token, pane_id)
     write_marker({
         "phase": "reconnected",
+        "pid": os.getpid(),
         "inherited_pane_id": inherited_pane_id,
         "stale_pane_id": stale_pane_id,
         "pane_id": pane_id,
@@ -924,7 +926,7 @@ except Exception as error:
         serde_json::json!({
             "id": "test:pane:start-omp",
             "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": "omp", "keys": ["Enter"]}
+            "params": {"pane_id": pane_id, "text": "exec omp", "keys": ["Enter"]}
         }),
     ));
 
@@ -932,6 +934,8 @@ except Exception as error:
     let initial: serde_json::Value = serde_json::from_str(&initial_text).unwrap();
     assert!(initial.get("error").is_none(), "fake OMP failed: {initial}");
     assert_eq!(initial["inherited_pane_id"], pane_id);
+    let initial_pid = initial["pid"].as_u64().expect("fake OMP process PID");
+    assert!(initial_pid > 0);
 
     assert_ok(request(
         &api_socket,
@@ -943,6 +947,11 @@ except Exception as error:
     let marker_text = wait_for_file_contains(&marker, "reconnected", Duration::from_secs(10));
     let payload: serde_json::Value = serde_json::from_str(&marker_text).unwrap();
     assert!(payload.get("error").is_none(), "fake OMP failed: {payload}");
+    assert_eq!(
+        payload["pid"].as_u64(),
+        Some(initial_pid),
+        "replacement bridge must reconnect the original fake OMP process"
+    );
     assert_eq!(payload["inherited_pane_id"], pane_id);
     assert_ne!(
         payload["pane_id"], payload["stale_pane_id"],

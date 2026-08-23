@@ -133,6 +133,16 @@ impl OmpRouteRegistry {
         &mut self,
         key: OmpRouteKey,
     ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        if self
+            .routes
+            .iter()
+            .any(|((pane_id, omp_session_id), route)| {
+                route.live && pane_id == &key.pane_id && omp_session_id != &key.omp_session_id
+            })
+        {
+            return Err(OmpRouteError::RouteBusy);
+        }
+
         use std::collections::hash_map::Entry;
 
         let route = match self
@@ -150,8 +160,8 @@ impl OmpRouteRegistry {
             Entry::Occupied(entry) => {
                 let route = entry.into_mut();
                 // The first authenticated host pins this route's incarnation for
-                // the server lifetime. Pane descendants may choose a session name,
-                // but cannot replace that session with a caller-chosen generation.
+                // the server lifetime and cannot replace it with a caller-chosen
+                // generation.
                 if key.route_generation != route.key.route_generation {
                     return Err(OmpRouteError::StaleGeneration);
                 }
@@ -762,13 +772,21 @@ mod tests {
     }
 
     #[test]
-    fn host_admission_rejects_duplicate_and_caller_chosen_generation() {
+    fn host_admission_rejects_duplicate_sessions_and_caller_chosen_generation() {
         let mut routes = OmpRouteRegistry::default();
         routes.host_started(key()).unwrap();
         let attached = routes.attach(1, &key()).unwrap();
         let epoch = epoch(&attached, 1);
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
+        let other_session = OmpRouteKey {
+            omp_session_id: "other-session".into(),
+            ..key()
+        };
+        assert_eq!(
+            routes.host_started(other_session),
+            Err(OmpRouteError::RouteBusy)
+        );
         let newer = OmpRouteKey {
             route_generation: key().route_generation + 1,
             ..key()
