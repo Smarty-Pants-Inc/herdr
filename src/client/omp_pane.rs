@@ -1,5 +1,7 @@
+use std::ffi::OsStr;
 use std::io::{self, BufRead, Read as _, Write as _};
 use std::net::{Shutdown, TcpListener};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -20,6 +22,8 @@ use interprocess::TryClone as _;
 
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const SERVER_TO_GUEST_QUEUE_CAPACITY: usize = 64;
+const OMP_GUEST_BRIDGE_TOKEN_ENV: &str = "HERDR_OMP_GUEST_BRIDGE_TOKEN";
+
 #[derive(Deserialize)]
 struct GuestRecord {
     t: String,
@@ -30,26 +34,89 @@ struct GuestRecord {
     #[serde(default)]
     mutation: bool,
 }
-struct OmpGuestChild(std::process::Child);
+struct OmpGuestChild {
+    child: std::process::Child,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    dedicated_parent_session: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn guest_session_pid_is_owned(
+    pid: u32,
+    parent_pid: u32,
+    child_pid: u32,
+    dedicated_parent_session: bool,
+    child_running: bool,
+) -> bool {
+    pid != parent_pid
+        && (dedicated_parent_session
+            || (child_running
+                && (pid == child_pid || crate::platform::process_is_descendant_of(pid, child_pid))))
+}
+
+impl OmpGuestChild {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        // Stay in the renderer's foreground process group. A nested process
+        // group is stopped by SIGTTIN on its first PTY read.
+        let child = command.spawn()?;
+        Ok(Self {
+            child,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            dedicated_parent_session: unsafe { libc::getsid(0) == libc::getpid() },
+        })
+    }
+
+    fn terminate(&mut self) {
+        let child_running = self.child.try_wait().ok().flatten().is_none();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let parent_pid = std::process::id();
+            let child_pid = self.child.id();
+            let mut pids = crate::platform::session_processes(parent_pid)
+                .into_iter()
+                .filter(|pid| {
+                    guest_session_pid_is_owned(
+                        *pid,
+                        parent_pid,
+                        child_pid,
+                        self.dedicated_parent_session,
+                        child_running,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if child_running && !pids.contains(&child_pid) {
+                pids.push(child_pid);
+            }
+            crate::platform::signal_processes(&pids, crate::platform::Signal::Kill);
+            if child_running {
+                let _ = self.child.wait();
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if child_running {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
 
 impl std::ops::Deref for OmpGuestChild {
     type Target = std::process::Child;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.child
     }
 }
 
 impl std::ops::DerefMut for OmpGuestChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.child
     }
 }
 
 impl Drop for OmpGuestChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.terminate();
     }
 }
 
@@ -87,6 +154,11 @@ fn validate_guest_record(record: &GuestRecord) -> io::Result<()> {
         {
             Ok(())
         }
+        "replica-ready" if record.action.is_none() && record.frame.is_none() => Ok(()),
+        "replica-ready" => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid OMP guest replica-ready record",
+        )),
         "control" => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid OMP guest bridge control",
@@ -236,6 +308,57 @@ fn accept_omp_guest(
 
 /// Runs the hidden OMP logical-pane client inside its App-owned local PTY.
 /// Its inherited stdio belongs to that PTY, never to the App's real terminal.
+fn configure_omp_guest_command(command: &mut Command, address: &str, room: &str, token: &str) {
+    // The isolated HOME keeps this ephemeral, while filesystem-backed session
+    // storage is required to load the streamed collaboration replica.
+    command
+        .args([
+            "__collab-guest-bridge",
+            address,
+            room,
+            "--token-env",
+            "--no-tools",
+            "--no-lsp",
+            "--no-skills",
+            "--no-rules",
+            "--no-extensions",
+        ])
+        .env(OMP_GUEST_BRIDGE_TOKEN_ENV, token)
+        .env_remove("BUN_OPTIONS")
+        .env_remove("BUN_INSPECT_PRELOAD")
+        .env_remove("BUN_BE_BUN")
+        .env_remove("NODE_OPTIONS")
+        .env_remove("HERDR_OMP_BRIDGE")
+        .env_remove("HERDR_OMP_BRIDGE_TOKEN")
+        .env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+}
+
+fn select_omp_pane_socket_path(
+    remote_client: bool,
+    client_socket_override: Option<&OsStr>,
+    default_path: PathBuf,
+) -> PathBuf {
+    if remote_client {
+        if let Some(path) = client_socket_override.filter(|path| !path.is_empty()) {
+            return PathBuf::from(path);
+        }
+    }
+    default_path
+}
+
+fn omp_pane_socket_path() -> PathBuf {
+    let client_socket_override =
+        std::env::var_os(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR);
+    select_omp_pane_socket_path(
+        super::is_remote_client_process(),
+        client_socket_override.as_deref(),
+        client_socket_path(),
+    )
+}
+
 pub(super) fn run(
     pane_id: String,
     omp_session_id: String,
@@ -243,7 +366,8 @@ pub(super) fn run(
     target_app_client_id: Option<u64>,
 ) -> io::Result<()> {
     init_logging();
-    let mut stream = crate::ipc::connect_local_stream(&client_socket_path())?;
+    let socket_path = omp_pane_socket_path();
+    let mut stream = crate::ipc::connect_local_stream(&socket_path)?;
     let (cols, rows, _, _, _) = initial_terminal_geometry(false);
     do_handshake(
         &mut stream,
@@ -303,7 +427,7 @@ pub(super) fn run(
     let address = listener.local_addr()?.to_string();
     let room_identity = format!(
         "{}\0{pane_id}\0{omp_session_id}\0{route_generation}\0{initial_attachment_epoch}",
-        client_socket_path().display()
+        socket_path.display()
     );
     let room_id = format!(
         "herdr-{}",
@@ -316,25 +440,13 @@ pub(super) fn run(
     getrandom::fill(&mut bridge_token_bytes)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let bridge_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bridge_token_bytes);
-    let omp_bin = std::env::var("OMP_BIN").unwrap_or_else(|_| "omp".to_owned());
-    let mut child = OmpGuestChild(
-        Command::new(omp_bin)
-            .args([
-                "__collab-guest-bridge",
-                &address,
-                &room_id,
-                &bridge_token,
-                "--no-tools",
-                "--no-lsp",
-                "--no-skills",
-                "--no-rules",
-                "--no-extensions",
-            ])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?,
-    );
+    let omp = crate::update::native_omp_executable().map_err(io::Error::other)?;
+    omp.verify().map_err(io::Error::other)?;
+    let guest_state = crate::omp_guest_state::OmpGuestStateDir::new()?;
+    let mut command = Command::new(omp.executable());
+    configure_omp_guest_command(&mut command, &address, &room_id, &bridge_token);
+    guest_state.apply_to_command(&mut command);
+    let mut child = OmpGuestChild::spawn(command)?;
     listener.set_nonblocking(true)?;
     let accept_deadline = Instant::now() + Duration::from_secs(30);
     let (guest, mut guest_reader) = accept_omp_guest(
@@ -375,39 +487,49 @@ pub(super) fn run(
                 )
             })?;
             validate_guest_record(&record)?;
-            let message = if record.t == "control" {
-                let action = match record.action.as_deref() {
-                    Some("request-controller") => OmpControlAction::RequestController,
-                    Some("release-controller") => OmpControlAction::ReleaseController,
-                    _ => unreachable!("guest record validated above"),
-                };
-                ClientMessage::OmpControl {
-                    pane_id: write_pane.clone(),
-                    omp_session_id: write_session.clone(),
-                    route_generation,
-                    attachment_epoch: write_epoch.load(Ordering::Acquire),
-                    action,
-                }
-            } else {
-                let frame = record.frame.expect("guest record validated above");
-                let envelope = encode_guest_payload(frame.get().as_bytes())?;
-                if record.mutation {
+            let message = match record.t.as_str() {
+                "control" => {
+                    let action = match record.action.as_deref() {
+                        Some("request-controller") => OmpControlAction::RequestController,
+                        Some("release-controller") => OmpControlAction::ReleaseController,
+                        _ => unreachable!("guest record validated above"),
+                    };
                     ClientMessage::OmpControl {
                         pane_id: write_pane.clone(),
                         omp_session_id: write_session.clone(),
                         route_generation,
                         attachment_epoch: write_epoch.load(Ordering::Acquire),
-                        action: OmpControlAction::Mutation { frame: envelope },
-                    }
-                } else {
-                    ClientMessage::OmpFrame {
-                        pane_id: write_pane.clone(),
-                        omp_session_id: write_session.clone(),
-                        route_generation,
-                        attachment_epoch: write_epoch.load(Ordering::Acquire),
-                        frame: envelope,
+                        action,
                     }
                 }
+                "replica-ready" => ClientMessage::OmpReplicaReady {
+                    pane_id: write_pane.clone(),
+                    omp_session_id: write_session.clone(),
+                    route_generation,
+                    attachment_epoch: write_epoch.load(Ordering::Acquire),
+                },
+                "frame" => {
+                    let frame = record.frame.expect("guest record validated above");
+                    let envelope = encode_guest_payload(frame.get().as_bytes())?;
+                    if record.mutation {
+                        ClientMessage::OmpControl {
+                            pane_id: write_pane.clone(),
+                            omp_session_id: write_session.clone(),
+                            route_generation,
+                            attachment_epoch: write_epoch.load(Ordering::Acquire),
+                            action: OmpControlAction::Mutation { frame: envelope },
+                        }
+                    } else {
+                        ClientMessage::OmpFrame {
+                            pane_id: write_pane.clone(),
+                            omp_session_id: write_session.clone(),
+                            route_generation,
+                            attachment_epoch: write_epoch.load(Ordering::Acquire),
+                            frame: envelope,
+                        }
+                    }
+                }
+                _ => unreachable!("guest record validated above"),
             };
             write_to_server(&mut server_writer, &message)?;
         }
@@ -526,7 +648,7 @@ pub(super) fn run(
     let _ = crate::ipc::shutdown_local_stream_write(&stream);
     shutdown_herdr_socket(&stream);
     drop(guest_writer);
-    let _ = child.kill();
+    child.terminate();
     let _ = server_to_guest.join();
     match loop_result {
         Err(error) => Err(error),
@@ -540,6 +662,129 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_omp_pane_uses_forwarded_socket_while_local_keeps_api_precedence() {
+        let forwarded = OsStr::new("/tmp/herdr-remote.sock");
+        let local = crate::server::socket_paths::client_socket_path_from_overrides(
+            Some("/tmp/local-session/herdr.sock"),
+            Some("/tmp/herdr-remote.sock"),
+        );
+        assert_eq!(local, PathBuf::from("/tmp/local-session/herdr-client.sock"));
+        assert_eq!(
+            select_omp_pane_socket_path(true, Some(forwarded), local.clone()),
+            PathBuf::from(forwarded)
+        );
+        assert_eq!(
+            select_omp_pane_socket_path(false, Some(forwarded), local.clone()),
+            local
+        );
+    }
+
+    #[test]
+    fn guest_bridge_token_is_environment_only() {
+        let mut command = Command::new("/tmp/omp");
+        configure_omp_guest_command(&mut command, "127.0.0.1:1234", "room", "bridge-secret");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--token-env"));
+        assert!(!args.iter().any(|arg| arg == "--no-session"));
+        assert!(!args.iter().any(|arg| arg == "bridge-secret"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(OMP_GUEST_BRIDGE_TOKEN_ENV)
+                && value == Some(std::ffi::OsStr::new("bridge-secret"))
+        }));
+        for name in [
+            "BUN_OPTIONS",
+            "BUN_INSPECT_PRELOAD",
+            "BUN_BE_BUN",
+            "NODE_OPTIONS",
+            "HERDR_OMP_BRIDGE",
+            "HERDR_OMP_BRIDGE_TOKEN",
+            crate::integration::HERDR_PANE_ID_ENV_VAR,
+        ] {
+            assert!(command
+                .get_envs()
+                .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() }));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn guest_child_teardown_kills_descendants() {
+        let state = crate::omp_guest_state::OmpGuestStateDir::new().unwrap();
+        let leaked = state.root().join("leaked");
+        let ready = state.root().join("ready");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("(sleep 0.2; : > \"$1\") & : > \"$2\"; wait")
+            .arg("sh")
+            .arg(&leaked)
+            .arg(&ready);
+        let mut child = OmpGuestChild::spawn(command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            assert!(child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists());
+
+        child.terminate();
+        child.terminate();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!leaked.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn guest_child_teardown_kills_descendants_after_root_exit() {
+        const HELPER_ENV: &str = "HERDR_TEST_OMP_GUEST_EXIT_HELPER";
+        if let Some(leaked) = std::env::var_os(HELPER_ENV) {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("(sleep 0.2; : > \"$1\") & exit 0")
+                .arg("sh")
+                .arg(&leaked);
+            let mut child = OmpGuestChild::spawn(command).unwrap();
+            while child.try_wait().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.terminate();
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!PathBuf::from(leaked).exists());
+            return;
+        }
+
+        let state = crate::omp_guest_state::OmpGuestStateDir::new().unwrap();
+        let leaked = state.root().join("leaked-after-root-exit");
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([
+                "--exact",
+                "client::omp_pane::tests::guest_child_teardown_kills_descendants_after_root_exit",
+                "--nocapture",
+            ])
+            .env(HELPER_ENV, &leaked);
+        crate::platform::detach_server_daemon_command(&mut helper);
+        assert!(helper.status().unwrap().success());
+        assert!(!leaked.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guest_child_stays_in_the_foreground_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 10"]);
+        let mut child = OmpGuestChild::spawn(command).unwrap();
+        let child_pid = i32::try_from(child.id()).unwrap();
+
+        assert_eq!(unsafe { libc::getpgid(child_pid) }, unsafe {
+            libc::getpgrp()
+        });
+        child.terminate();
+    }
 
     #[test]
     fn trickling_candidate_expires_before_authenticated_guest() {
@@ -605,6 +850,7 @@ mod tests {
         for record in [
             "not-json",
             r#"{"t":"unknown","frame":{}}"#,
+            r#"{"t":"replica-ready","frame":{}}"#,
             r#"{"t":"frame"}"#,
             r#"{"t":"control","action":"unknown"}"#,
         ] {

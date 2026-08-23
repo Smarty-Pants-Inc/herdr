@@ -556,11 +556,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn mark_rendered(&mut self, now: Instant) {
-        self.record_render_attempt(now, true);
-    }
-
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
             Some(last_render_at) => now.duration_since(last_render_at) >= self.render_interval(),
@@ -1041,7 +1036,7 @@ mod tests {
             Some(rendered_at + Duration::from_millis(8))
         );
 
-        app.mark_rendered(rendered_at + Duration::from_millis(8));
+        app.record_render_attempt(rendered_at + Duration::from_millis(8), true);
         assert!(!app.can_render_now(rendered_at + MIN_RENDER_INTERVAL));
         assert!(app.can_render_now(rendered_at + Duration::from_millis(8) + MIN_RENDER_INTERVAL));
     }

@@ -202,6 +202,11 @@ pub fn process_exists(_pid: u32) -> bool {
 }
 
 /// Unsupported platform stub.
+pub(crate) fn process_start_identity(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn write_clipboard(_bytes: &[u8]) -> bool {
     false
 }

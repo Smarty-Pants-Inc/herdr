@@ -133,6 +133,18 @@ impl OmpRouteRegistry {
         &mut self,
         key: OmpRouteKey,
     ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        if self
+            .routes
+            .iter()
+            .any(|((pane_id, omp_session_id), route)| {
+                pane_id == &key.pane_id
+                    && omp_session_id != &key.omp_session_id
+                    && (route.live || !route.attachments.is_empty())
+            })
+        {
+            return Err(OmpRouteError::RouteBusy);
+        }
+
         use std::collections::hash_map::Entry;
 
         let route = match self
@@ -150,8 +162,8 @@ impl OmpRouteRegistry {
             Entry::Occupied(entry) => {
                 let route = entry.into_mut();
                 // The first authenticated host pins this route's incarnation for
-                // the server lifetime. Pane descendants may choose a session name,
-                // but cannot replace that session with a caller-chosen generation.
+                // the server lifetime and cannot replace it with a caller-chosen
+                // generation.
                 if key.route_generation != route.key.route_generation {
                     return Err(OmpRouteError::StaleGeneration);
                 }
@@ -204,6 +216,20 @@ impl OmpRouteRegistry {
             return Err(OmpRouteError::StaleGeneration);
         }
         Ok(route)
+    }
+
+    pub(crate) fn is_current_attachment(
+        &self,
+        client_id: u64,
+        key: &OmpRouteKey,
+        attachment_epoch: u64,
+    ) -> bool {
+        self.routes
+            .get(&(key.pane_id.clone(), key.omp_session_id.clone()))
+            .is_some_and(|route| {
+                route.key.route_generation == key.route_generation
+                    && route.attachment(client_id, attachment_epoch).is_ok()
+            })
     }
 
     pub(crate) fn attach(
@@ -748,13 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn host_admission_rejects_duplicate_and_caller_chosen_generation() {
+    fn host_admission_rejects_duplicate_sessions_and_caller_chosen_generation() {
         let mut routes = OmpRouteRegistry::default();
         routes.host_started(key()).unwrap();
         let attached = routes.attach(1, &key()).unwrap();
         let epoch = epoch(&attached, 1);
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
+        let other_session = OmpRouteKey {
+            omp_session_id: "other-session".into(),
+            ..key()
+        };
+        assert_eq!(
+            routes.host_started(other_session),
+            Err(OmpRouteError::RouteBusy)
+        );
         let newer = OmpRouteKey {
             route_generation: key().route_generation + 1,
             ..key()
@@ -785,8 +819,16 @@ mod tests {
         routes.host_stopped(&key()).unwrap();
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
+        let other_session = OmpRouteKey {
+            omp_session_id: "other-session".into(),
+            ..key()
+        };
+        assert_eq!(
+            routes.host_started(other_session.clone()),
+            Err(OmpRouteError::RouteBusy)
+        );
         routes.detach(1, &key(), epoch).unwrap();
-        assert_eq!(routes.host_started(key()), Ok(Vec::new()));
+        assert_eq!(routes.host_started(other_session), Ok(Vec::new()));
     }
 
     #[test]

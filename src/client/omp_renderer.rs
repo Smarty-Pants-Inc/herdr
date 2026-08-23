@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use crossterm::event::{KeyEventKind, MouseEventKind};
+use crossterm::event::{KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::sync::{mpsc, Notify};
 
@@ -11,8 +11,8 @@ use crate::events::AppEvent;
 use crate::layout::PaneId;
 use crate::protocol::{
     ClientInputEvent, ClientKeyCode, ClientKeyKind, ClientKeySource, ClientMessage,
-    ClientMouseKind, FrameData, OmpRendererCapabilities, OmpRendererPrefix, OmpRendererRoute,
-    RenderEncoding,
+    ClientMouseKind, FrameData, OmpRendererCapabilities, OmpRendererPrefix, OmpRendererRect,
+    OmpRendererRoute, RenderEncoding,
 };
 use crate::render_signal::RenderSignal;
 use crate::terminal::TerminalRuntime;
@@ -27,13 +27,15 @@ pub(super) fn capabilities(
     app_surface: bool,
     stdin_tty: bool,
     stdout_tty: bool,
+    omp_executable: bool,
 ) -> OmpRendererCapabilities {
     OmpRendererCapabilities {
         client_local_native: cfg!(unix)
             && app_surface
             && encoding == RenderEncoding::SemanticFrame
             && stdin_tty
-            && stdout_tty,
+            && stdout_tty
+            && omp_executable,
     }
 }
 
@@ -57,6 +59,7 @@ struct LocalTarget {
     pane_id: PaneId,
     events: mpsc::Receiver<AppEvent>,
     render_dirty: Arc<RenderSignal>,
+    rect: OmpRendererRect,
     size: (u16, u16, u32, u32),
     started_at: Instant,
     bound_at: Option<Instant>,
@@ -71,12 +74,18 @@ struct LocalTarget {
 
 impl LocalTarget {
     fn spawn(
+        omp_executable: &crate::update::OmpExecutable,
         launch_id: u64,
         target_app_client_id: u64,
         route: OmpRendererRoute,
         prefix: OmpRendererPrefix,
-        size: (u16, u16, u32, u32),
+        rect: OmpRendererRect,
+        cell_size: (u32, u32),
     ) -> std::io::Result<Self> {
+        let (cell_width_px, cell_height_px) = cell_size;
+        let cols = rect.width;
+        let rows = rect.height;
+        let size = (cols, rows, cell_width_px, cell_height_px);
         let pane_id = PaneId::alloc();
         let (events_tx, events) = mpsc::channel(16);
         let render_notify = Arc::new(Notify::new());
@@ -91,12 +100,9 @@ impl LocalTarget {
             "--app-client-id".into(),
             target_app_client_id.to_string(),
         ];
-        let launch_env = crate::pane::PaneLaunchEnv::from_extra(vec![(
-            OMP_RENDERER_LAUNCH_ID_ENV.into(),
-            launch_id.to_string(),
-        )])
-        .without_pane_identity();
-        let (cols, rows, cell_width_px, cell_height_px) = size;
+        let mut extra_env = vec![(OMP_RENDERER_LAUNCH_ID_ENV.into(), launch_id.to_string())];
+        omp_executable.append_launch_env(&mut extra_env);
+        let launch_env = crate::pane::PaneLaunchEnv::from_extra(extra_env).without_pane_identity();
         let runtime = TerminalRuntime::spawn_argv_command(
             pane_id,
             rows.max(1),
@@ -123,6 +129,7 @@ impl LocalTarget {
             events,
             render_dirty,
             size,
+            rect,
             started_at: Instant::now(),
             bound_at: None,
             bound: false,
@@ -148,13 +155,19 @@ impl LocalTarget {
         self.stop();
     }
 
-    fn resize(&mut self, size: (u16, u16, u32, u32)) {
-        self.size = size;
+    fn resize(&mut self, rect: OmpRendererRect, cell_size: (u32, u32)) {
+        self.rect = rect;
+        let (cell_width_px, cell_height_px) = cell_size;
+        self.size = (rect.width, rect.height, cell_width_px, cell_height_px);
         let Some(runtime) = self.runtime.as_ref() else {
             return;
         };
-        let (cols, rows, cell_width_px, cell_height_px) = size;
-        runtime.resize(rows.max(1), cols.max(1), cell_width_px, cell_height_px);
+        runtime.resize(
+            rect.height.max(1),
+            rect.width.max(1),
+            cell_width_px,
+            cell_height_px,
+        );
     }
 
     fn poll(&mut self, now: Instant, effects: &mut Vec<LocalEffect>) -> bool {
@@ -197,9 +210,12 @@ impl LocalTarget {
         damaged
     }
 
-    fn frame(&self, size: (u16, u16)) -> Option<FrameData> {
+    fn frame(&self) -> Option<FrameData> {
+        if self.rect.is_empty() {
+            return None;
+        }
         let runtime = self.runtime.as_ref()?;
-        let area = Rect::new(0, 0, size.0.max(1), size.1.max(1));
+        let area = Rect::new(0, 0, self.rect.width, self.rect.height);
         let (buffer, cursor) = crate::server::render_stream::render_terminal_virtual(runtime, area);
         let hyperlinks = runtime.visible_hyperlinks(area);
         Some(FrameData::from_ratatui_buffer_with_hyperlinks(
@@ -210,15 +226,22 @@ impl LocalTarget {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseDestination {
+    Local,
+    Server,
+}
+
 #[derive(Default)]
 pub(super) struct ClientOmpRenderer {
-    enabled: bool,
+    omp_executable: Option<crate::update::OmpExecutable>,
     latest_launch_id: u64,
     attempted_launches: HashSet<u64>,
     target: Option<LocalTarget>,
     cached_server_frame: Option<FrameData>,
     local_selected: bool,
     server_owned_input: bool,
+    mouse_captures: HashMap<MouseButton, MouseDestination>,
     awaiting_fallback: bool,
     awaiting_promotion: bool,
     deferred_messages: Vec<ClientMessage>,
@@ -229,15 +252,16 @@ pub(super) struct ClientOmpRenderer {
 }
 
 impl ClientOmpRenderer {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(omp_executable: Option<crate::update::OmpExecutable>) -> Self {
         Self {
-            enabled,
+            omp_executable,
             latest_launch_id: 0,
             attempted_launches: HashSet::new(),
             target: None,
             cached_server_frame: None,
             local_selected: false,
             server_owned_input: false,
+            mouse_captures: HashMap::new(),
             awaiting_fallback: false,
             awaiting_promotion: false,
             deferred_messages: Vec::new(),
@@ -257,16 +281,16 @@ impl ClientOmpRenderer {
         bound: bool,
         surface_active: bool,
         prefix: OmpRendererPrefix,
-        size: (u16, u16, u32, u32),
+        rect: OmpRendererRect,
+        cell_size: (u32, u32),
     ) {
-        if !self.enabled || launch_id < self.latest_launch_id {
+        if self.omp_executable.is_none() || launch_id < self.latest_launch_id {
             return;
         }
         if route.is_none() {
             self.latest_launch_id = launch_id;
             self.stop_target();
             self.discard_deferred_messages();
-            self.cached_server_frame = None;
             return;
         }
         let route = route.expect("route checked above");
@@ -279,20 +303,36 @@ impl ClientOmpRenderer {
         if replace {
             self.stop_target();
             self.discard_deferred_messages();
-            self.cached_server_frame = None;
             self.latest_launch_id = launch_id;
             if !self.attempted_launches.insert(launch_id) {
                 return;
             }
-            self.target =
-                LocalTarget::spawn(launch_id, target_app_client_id, route, prefix.clone(), size)
-                    .ok();
+            let target = self.omp_executable.as_ref().and_then(|omp_executable| {
+                LocalTarget::spawn(
+                    omp_executable,
+                    launch_id,
+                    target_app_client_id,
+                    route,
+                    prefix.clone(),
+                    rect,
+                    cell_size,
+                )
+                .ok()
+            });
+            self.target = target;
             self.needs_render = true;
         }
         if !bound {
-            self.cached_server_frame = None;
             self.release_deferred_messages();
         }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.launch_id == launch_id && target.bound && !bound)
+        {
+            self.mouse_captures.clear();
+        }
+
         let mut confirm_promotion = None;
         let Some(target) = self
             .target
@@ -316,7 +356,7 @@ impl ClientOmpRenderer {
         target.promoted = target.ready_reported && target.bound;
         target.prefix = prefix;
         if was_surface_active && !target.surface_active {
-            self.cached_server_frame = None;
+            self.needs_render = true;
         }
         if target.bound && target.surface_active {
             self.server_owned_input = false;
@@ -330,12 +370,11 @@ impl ClientOmpRenderer {
                     && !self.server_owned_input,
             );
         }
-        target.resize(size);
+        target.resize(rect, cell_size);
         self.needs_render = true;
         if let Some(local_active) = confirm_promotion {
             if local_active {
                 self.local_selected = true;
-                self.cached_server_frame = None;
                 self.needs_render = true;
                 self.force_repaint = true;
             }
@@ -344,19 +383,21 @@ impl ClientOmpRenderer {
     }
 
     pub(super) fn cache_server_frame(&mut self, frame: FrameData) -> Option<SurfaceFrame> {
-        if self.local_selected {
-            return None;
-        }
         self.cached_server_frame = Some(frame.clone());
+        let frame = if self.local_selected {
+            self.composed_frame()?
+        } else {
+            frame
+        };
         Some(SurfaceFrame {
             frame,
             force_repaint: false,
         })
     }
 
-    pub(super) fn resize(&mut self, size: (u16, u16, u32, u32)) {
+    pub(super) fn resize(&mut self, cell_size: (u32, u32)) {
         if let Some(target) = self.target.as_mut() {
-            target.resize(size);
+            target.resize(target.rect, cell_size);
         }
         self.force_repaint = true;
         self.needs_render = true;
@@ -369,6 +410,53 @@ impl ClientOmpRenderer {
             || self.awaiting_promotion
     }
 
+    fn mouse_destination(&mut self, mouse: &MouseEvent) -> MouseDestination {
+        match &mouse.kind {
+            MouseEventKind::Down(button) => {
+                let destination = self.mouse_destination_at(mouse);
+                self.mouse_captures.insert(*button, destination);
+                destination
+            }
+            MouseEventKind::Drag(button) => self
+                .mouse_captures
+                .get(button)
+                .copied()
+                .unwrap_or_else(|| self.mouse_destination_at(mouse)),
+            MouseEventKind::Up(button) => {
+                let destination = self
+                    .mouse_captures
+                    .get(button)
+                    .copied()
+                    .unwrap_or_else(|| self.mouse_destination_at(mouse));
+                self.mouse_captures.remove(button);
+                destination
+            }
+            _ => self.mouse_destination_at(mouse),
+        }
+    }
+
+    fn mouse_destination_at(&self, mouse: &MouseEvent) -> MouseDestination {
+        let local = !self.awaiting_fallback
+            && !self.server_owned_input
+            && (self.local_selected || self.awaiting_promotion)
+            && self.target.as_ref().is_some_and(|target| {
+                !target.failed
+                    && !target.rect.is_empty()
+                    && Rect::new(
+                        target.rect.x,
+                        target.rect.y,
+                        target.rect.width,
+                        target.rect.height,
+                    )
+                    .contains((mouse.column, mouse.row).into())
+            });
+        if local {
+            MouseDestination::Local
+        } else {
+            MouseDestination::Server
+        }
+    }
+
     pub(super) fn route_input(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
@@ -378,6 +466,22 @@ impl ClientOmpRenderer {
         let mut deferred_events = Vec::new();
         for event in events {
             let protocol_event = client_event_from_raw(&event);
+            let mouse_destination = match &event {
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    Some(self.mouse_destination(mouse))
+                }
+                _ => None,
+            };
+            if matches!(mouse_destination, Some(MouseDestination::Server)) {
+                if self.awaiting_fallback {
+                    if let Some(event) = protocol_event {
+                        deferred_events.push(event);
+                    }
+                } else if let Some(event) = protocol_event {
+                    server_batch.push(event);
+                }
+                continue;
+            }
             if self.awaiting_fallback || self.awaiting_promotion {
                 if let Some(event) = protocol_event {
                     deferred_events.push(event);
@@ -402,7 +506,6 @@ impl ClientOmpRenderer {
                     });
                 }
                 self.server_owned_input = true;
-                self.cached_server_frame = None;
                 self.needs_render = true;
                 self.force_repaint = true;
                 continue;
@@ -413,17 +516,23 @@ impl ClientOmpRenderer {
                 }
                 continue;
             }
+            let rect = self
+                .target
+                .as_ref()
+                .map(|target| target.rect)
+                .unwrap_or_default();
+            let local_event = translate_local_event(event, rect);
             let sent = self
                 .target
                 .as_ref()
                 .and_then(|target| target.runtime.as_ref())
-                .is_some_and(|runtime| forward_local_event(runtime, event));
+                .is_some_and(|runtime| forward_local_event(runtime, local_event));
             if !sent {
                 if let Some(target) = self.target.as_mut() {
                     target.fail();
                 }
+                self.mouse_captures.clear();
                 self.awaiting_fallback = true;
-                self.cached_server_frame = None;
                 self.needs_render = true;
                 self.force_repaint = true;
                 if let Some(event) = protocol_event {
@@ -456,6 +565,15 @@ impl ClientOmpRenderer {
             width_px: geometry.width_px,
             height_px: geometry.height_px,
         };
+        let mouse_destination =
+            pixel_mouse_event(&data, geometry).map(|(_, _, mouse)| self.mouse_destination(&mouse));
+        if matches!(mouse_destination, Some(MouseDestination::Server)) {
+            if self.awaiting_fallback {
+                self.deferred_messages.push(message);
+                return None;
+            }
+            return Some(message);
+        }
         if self.awaiting_fallback || self.awaiting_promotion {
             self.deferred_messages.push(message);
             return None;
@@ -465,7 +583,7 @@ impl ClientOmpRenderer {
         }
         let sent = self.target.as_ref().and_then(|target| {
             target.runtime.as_ref().and_then(|runtime| {
-                forward_local_pixel_event(runtime, &data, geometry, target.size)
+                forward_local_pixel_event(runtime, &data, geometry, target.rect, target.size)
             })
         });
         match sent {
@@ -475,8 +593,8 @@ impl ClientOmpRenderer {
                 if let Some(target) = self.target.as_mut() {
                     target.fail();
                 }
+                self.mouse_captures.clear();
                 self.awaiting_fallback = true;
-                self.cached_server_frame = None;
                 self.deferred_messages.push(message);
                 self.needs_render = true;
                 self.force_repaint = true;
@@ -485,7 +603,7 @@ impl ClientOmpRenderer {
         }
     }
 
-    pub(super) fn next_frame(&mut self, now: Instant, size: (u16, u16)) -> Option<SurfaceFrame> {
+    pub(super) fn next_frame(&mut self, now: Instant, _size: (u16, u16)) -> Option<SurfaceFrame> {
         let damaged = self
             .target
             .as_mut()
@@ -494,6 +612,8 @@ impl ClientOmpRenderer {
             if target.bound
                 && target.first_damage
                 && target.runtime.is_some()
+                && !target.rect.is_empty()
+                && self.cached_server_frame.is_some()
                 && !target.failed
                 && !target.ready_reported
             {
@@ -505,9 +625,9 @@ impl ClientOmpRenderer {
                 self.awaiting_promotion = true;
             }
             if target.failed && target.ready_reported && !target.fallback_confirmed {
+                self.mouse_captures.clear();
                 self.awaiting_promotion = false;
                 self.awaiting_fallback = true;
-                self.cached_server_frame = None;
             }
         }
         let should_select = self.target.as_ref().is_some_and(|target| {
@@ -515,19 +635,17 @@ impl ClientOmpRenderer {
                 && target.runtime.is_some()
                 && target.bound
                 && target.surface_active
+                && !target.rect.is_empty()
                 && target.first_damage
                 && !self.server_owned_input
         });
         if should_select != self.local_selected {
             self.local_selected = should_select;
-            if should_select {
-                self.cached_server_frame = None;
-            }
             self.needs_render = true;
             self.force_repaint = true;
         }
         if self.local_selected && (damaged || self.needs_render) {
-            let frame = self.target.as_ref()?.frame(size)?;
+            let frame = self.composed_frame()?;
             let force_repaint = std::mem::take(&mut self.force_repaint);
             self.needs_render = false;
             return Some(SurfaceFrame {
@@ -546,6 +664,12 @@ impl ClientOmpRenderer {
         None
     }
 
+    fn composed_frame(&self) -> Option<FrameData> {
+        let base = self.cached_server_frame.as_ref()?;
+        let target = self.target.as_ref()?;
+        compose_frame(base, target.frame()?, target.rect)
+    }
+
     pub(super) fn take_outbound_messages(&mut self) -> Vec<ClientMessage> {
         std::mem::take(&mut self.outbound_messages)
     }
@@ -557,6 +681,7 @@ impl ClientOmpRenderer {
     fn resolve_promotion(&mut self, local_active: bool) {
         self.awaiting_promotion = false;
         if !local_active {
+            self.mouse_captures.clear();
             self.outbound_messages.append(&mut self.deferred_messages);
             return;
         }
@@ -605,6 +730,7 @@ impl ClientOmpRenderer {
 
     fn release_deferred_messages(&mut self) {
         if self.awaiting_fallback || self.awaiting_promotion {
+            self.mouse_captures.clear();
             self.awaiting_fallback = false;
             self.awaiting_promotion = false;
             self.outbound_messages.append(&mut self.deferred_messages);
@@ -617,6 +743,7 @@ impl ClientOmpRenderer {
         self.deferred_messages.clear();
         self.outbound_messages.clear();
         self.effects.clear();
+        self.mouse_captures.clear();
     }
 
     fn stop_target(&mut self) {
@@ -628,6 +755,7 @@ impl ClientOmpRenderer {
         }
         self.local_selected = false;
         self.server_owned_input = false;
+        self.mouse_captures.clear();
         self.needs_render = true;
     }
 }
@@ -674,6 +802,58 @@ fn client_event_from_raw(event: &crate::raw_input::RawInputEvent) -> Option<Clie
     }
 }
 
+fn translate_local_event(
+    event: crate::raw_input::RawInputEvent,
+    rect: OmpRendererRect,
+) -> crate::raw_input::RawInputEvent {
+    match event {
+        crate::raw_input::RawInputEvent::Mouse(mut mouse) => {
+            mouse.column = mouse.column.saturating_sub(rect.x);
+            mouse.row = mouse.row.saturating_sub(rect.y);
+            crate::raw_input::RawInputEvent::Mouse(mouse)
+        }
+        event => event,
+    }
+}
+
+fn compose_frame(base: &FrameData, local: FrameData, rect: OmpRendererRect) -> Option<FrameData> {
+    let base_cells = usize::from(base.width).checked_mul(usize::from(base.height))?;
+    let local_cells = usize::from(local.width).checked_mul(usize::from(local.height))?;
+    if base.cells.len() != base_cells || local.cells.len() != local_cells {
+        return None;
+    }
+    let mut composed = base.clone();
+    let hyperlink_offset = u32::try_from(composed.hyperlinks.len()).ok()?;
+    composed.hyperlinks.extend(local.hyperlinks);
+    let width = rect
+        .width
+        .min(local.width)
+        .min(base.width.saturating_sub(rect.x));
+    let height = rect
+        .height
+        .min(local.height)
+        .min(base.height.saturating_sub(rect.y));
+    for y in 0..height {
+        for x in 0..width {
+            let local_index = usize::from(y) * usize::from(local.width) + usize::from(x);
+            let base_index =
+                usize::from(rect.y + y) * usize::from(base.width) + usize::from(rect.x + x);
+            let mut cell = local.cells[local_index].clone();
+            if let Some(index) = cell.hyperlink.as_mut() {
+                *index = index.checked_add(hyperlink_offset)?;
+            }
+            composed.cells[base_index] = cell;
+        }
+    }
+    composed.cursor = local.cursor.map(|cursor| crate::protocol::CursorState {
+        x: rect.x.saturating_add(cursor.x),
+        y: rect.y.saturating_add(cursor.y),
+        visible: cursor.visible,
+        shape: cursor.shape,
+    });
+    Some(composed)
+}
+
 fn encode_local_mouse(
     runtime: &TerminalRuntime,
     kind: MouseEventKind,
@@ -692,12 +872,10 @@ fn encode_local_mouse(
     }
 }
 
-fn forward_local_pixel_event(
-    runtime: &TerminalRuntime,
+fn pixel_mouse_event(
     data: &[u8],
     geometry: crate::input::mouse::HostGeometry,
-    size: (u16, u16, u32, u32),
-) -> Option<bool> {
+) -> Option<(u32, u32, MouseEvent)> {
     let (x, y) = crate::input::mouse::parse_report(data)?;
     let (column, row) = geometry.cell(x, y)?;
     let cell_report = crate::input::mouse::report_at_cell(data, column, row)?;
@@ -707,14 +885,30 @@ fn forward_local_pixel_event(
             crate::raw_input::RawInputEvent::Mouse(mouse) => Some(mouse),
             _ => None,
         })?;
+    Some((x, y, mouse))
+}
+
+fn forward_local_pixel_event(
+    runtime: &TerminalRuntime,
+    data: &[u8],
+    geometry: crate::input::mouse::HostGeometry,
+    rect: OmpRendererRect,
+    size: (u16, u16, u32, u32),
+) -> Option<bool> {
+    let (x, y, mouse) = pixel_mouse_event(data, geometry)?;
     let (cols, rows, cell_width_px, cell_height_px) = size;
     let child_width_px = u32::from(cols).checked_mul(cell_width_px)?;
     let child_height_px = u32::from(rows).checked_mul(cell_height_px)?;
-    let position = crate::input::mouse::HostPixels { x, y, geometry }.pane_position(
-        Rect::new(0, 0, geometry.cols, geometry.rows),
-        child_width_px,
-        child_height_px,
-    )?;
+    let position = crate::input::mouse::HostPixels { x, y, geometry }
+        .pane_position(
+            Rect::new(rect.x, rect.y, rect.width, rect.height),
+            child_width_px,
+            child_height_px,
+        )
+        .unwrap_or(crate::input::mouse::Position::Cell {
+            column: mouse.column.saturating_sub(rect.x),
+            row: mouse.row.saturating_sub(rect.y),
+        });
     let bytes = encode_local_mouse(runtime, mouse.kind, position, mouse.modifiers);
     Some(
         bytes.is_none_or(|bytes| {
@@ -763,7 +957,7 @@ fn forward_local_event(runtime: &TerminalRuntime, event: crate::raw_input::RawIn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     fn test_prefix() -> OmpRendererPrefix {
         OmpRendererPrefix {
@@ -772,13 +966,56 @@ mod tests {
         }
     }
 
+    fn test_rect() -> OmpRendererRect {
+        OmpRendererRect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> crate::raw_input::RawInputEvent {
+        crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    fn test_server_frame() -> FrameData {
+        FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: " ".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                };
+                80 * 24
+            ],
+            width: 80,
+            height: 24,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    fn test_omp_executable() -> crate::update::OmpExecutable {
+        crate::update::OmpExecutable::Explicit("/tmp/pre-resolved-omp".into())
+    }
+
     fn active_renderer(
         runtime: TerminalRuntime,
         prefix: OmpRendererPrefix,
     ) -> (ClientOmpRenderer, mpsc::Sender<AppEvent>, PaneId) {
         let pane_id = PaneId::alloc();
         let (events_tx, events) = mpsc::channel(8);
-        let mut renderer = ClientOmpRenderer::new(true);
+        let mut renderer = ClientOmpRenderer::new(Some(test_omp_executable()));
         renderer.latest_launch_id = 1;
         renderer.attempted_launches.insert(1);
         renderer.local_selected = true;
@@ -795,6 +1032,7 @@ mod tests {
             pane_id,
             events,
             render_dirty: Arc::new(RenderSignal::new()),
+            rect: test_rect(),
             size: (80, 24, 10, 20),
             started_at: Instant::now(),
             bound_at: Some(Instant::now()),
@@ -811,14 +1049,73 @@ mod tests {
 
     #[test]
     fn capability_requires_semantic_app_tty() {
-        assert!(capabilities(RenderEncoding::SemanticFrame, true, true, true).client_local_native);
-        assert!(!capabilities(RenderEncoding::TerminalAnsi, true, true, true).client_local_native);
         assert!(
-            !capabilities(RenderEncoding::SemanticFrame, false, true, true).client_local_native
+            capabilities(RenderEncoding::SemanticFrame, true, true, true, true).client_local_native
         );
         assert!(
-            !capabilities(RenderEncoding::SemanticFrame, true, false, true).client_local_native
+            !capabilities(RenderEncoding::TerminalAnsi, true, true, true, true).client_local_native
         );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, true, true, true, false)
+                .client_local_native
+        );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, false, true, true, true)
+                .client_local_native
+        );
+        assert!(
+            !capabilities(RenderEncoding::SemanticFrame, true, false, true, true)
+                .client_local_native
+        );
+    }
+
+    #[test]
+    fn target_handling_reuses_pre_resolved_omp_without_resolving() {
+        let calls = std::cell::Cell::new(0);
+        let expected = std::env::current_exe().expect("current test executable");
+        let executable = super::super::resolve_client_omp_executable_with(
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(crate::update::OmpExecutable::Explicit(expected.clone()))
+            },
+            |_| {},
+        )
+        .expect("resolved test executable");
+        let mut renderer = ClientOmpRenderer::new(Some(executable));
+
+        renderer.apply_target(1, 2, None, false, false, test_prefix(), test_rect(), (0, 0));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            renderer
+                .omp_executable
+                .as_ref()
+                .map(|executable| executable.executable()),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn target_handling_ignores_native_target_without_pre_resolved_executable() {
+        let mut renderer = ClientOmpRenderer::new(None);
+        renderer.apply_target(
+            1,
+            2,
+            Some(OmpRendererRoute {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            false,
+            false,
+            test_prefix(),
+            test_rect(),
+            (0, 0),
+        );
+
+        assert!(renderer.target.is_none());
+        assert_eq!(renderer.latest_launch_id, 0);
     }
 
     #[test]
@@ -900,11 +1197,164 @@ mod tests {
         runtime.resize(12, 40, 10, 20);
         runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
-        renderer.target.as_mut().unwrap().size = (40, 12, 10, 20);
-        let data = b"\x1b[<35;321;241M".to_vec();
+        let target = renderer.target.as_mut().unwrap();
+        target.rect = OmpRendererRect {
+            x: 20,
+            y: 6,
+            width: 40,
+            height: 12,
+        };
+        target.size = (40, 12, 10, 20);
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        assert!(renderer.route_pixel_input(data, geometry).is_none());
-        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<35;161;121M");
+        let outside = b"\x1b[<35;101;21M".to_vec();
+        assert!(matches!(
+            renderer.route_pixel_input(outside, geometry),
+            Some(ClientMessage::InputPixels { .. })
+        ));
+        let inside = b"\x1b[<35;321;241M".to_vec();
+        assert!(renderer.route_pixel_input(inside, geometry).is_none());
+        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<35;121;121M");
+    }
+
+    #[tokio::test]
+    async fn structured_mouse_gestures_follow_the_down_destination() {
+        {
+            let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
+            runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            let target = renderer.target.as_mut().expect("native target");
+            target.rect = OmpRendererRect {
+                x: 20,
+                y: 6,
+                width: 40,
+                height: 12,
+            };
+            let messages = renderer.route_input(vec![
+                mouse(MouseEventKind::Down(MouseButton::Left), 21, 7),
+                mouse(MouseEventKind::Drag(MouseButton::Left), 2, 2),
+                mouse(MouseEventKind::Up(MouseButton::Left), 2, 2),
+            ]);
+
+            assert!(messages.is_empty());
+            for _ in 0..3 {
+                assert!(input.try_recv().is_ok());
+            }
+            assert!(input.try_recv().is_err());
+            assert!(renderer.mouse_captures.is_empty());
+        }
+
+        {
+            let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
+            runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            let target = renderer.target.as_mut().expect("native target");
+            target.rect = OmpRendererRect {
+                x: 20,
+                y: 6,
+                width: 40,
+                height: 12,
+            };
+            let messages = renderer.route_input(vec![
+                mouse(MouseEventKind::Down(MouseButton::Left), 2, 2),
+                mouse(MouseEventKind::Drag(MouseButton::Left), 21, 7),
+                mouse(MouseEventKind::Up(MouseButton::Left), 21, 7),
+            ]);
+
+            assert!(matches!(
+                messages.as_slice(),
+                [ClientMessage::InputEvents { events }] if events.len() == 3
+            ));
+            assert!(input.try_recv().is_err());
+            assert!(renderer.mouse_captures.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn pixel_mouse_gestures_follow_the_down_destination() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        {
+            let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
+            runtime.resize(12, 40, 10, 20);
+            runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            let target = renderer.target.as_mut().expect("native target");
+            target.rect = OmpRendererRect {
+                x: 20,
+                y: 6,
+                width: 40,
+                height: 12,
+            };
+            target.size = (40, 12, 10, 20);
+
+            assert!(renderer
+                .route_pixel_input(b"\x1b[<0;321;241M".to_vec(), geometry)
+                .is_none());
+            assert!(renderer
+                .route_pixel_input(b"\x1b[<32;101;21M".to_vec(), geometry)
+                .is_none());
+            assert!(renderer
+                .route_pixel_input(b"\x1b[<0;101;21m".to_vec(), geometry)
+                .is_none());
+            for _ in 0..3 {
+                assert!(input.try_recv().is_ok());
+            }
+            assert!(input.try_recv().is_err());
+            assert!(renderer.mouse_captures.is_empty());
+        }
+
+        {
+            let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
+            runtime.resize(12, 40, 10, 20);
+            runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            let target = renderer.target.as_mut().expect("native target");
+            target.rect = OmpRendererRect {
+                x: 20,
+                y: 6,
+                width: 40,
+                height: 12,
+            };
+            target.size = (40, 12, 10, 20);
+
+            for data in [
+                b"\x1b[<0;101;21M".to_vec(),
+                b"\x1b[<32;321;241M".to_vec(),
+                b"\x1b[<0;321;241m".to_vec(),
+            ] {
+                assert!(matches!(
+                    renderer.route_pixel_input(data.clone(), geometry),
+                    Some(ClientMessage::InputPixels { data: forwarded, .. }) if forwarded == data
+                ));
+            }
+            assert!(input.try_recv().is_err());
+            assert!(renderer.mouse_captures.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn mouse_capture_clears_when_target_stops_or_falls_back() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert!(renderer
+            .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)])
+            .is_empty());
+        assert_eq!(
+            renderer.mouse_captures.get(&MouseButton::Left),
+            Some(&MouseDestination::Local)
+        );
+        renderer.apply_target(2, 2, None, false, false, test_prefix(), test_rect(), (0, 0));
+        assert!(renderer.mouse_captures.is_empty());
+
+        let (runtime, input) = TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
+        drop(input);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert!(renderer
+            .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)])
+            .is_empty());
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.mouse_captures.is_empty());
     }
 
     #[tokio::test]
@@ -925,12 +1375,31 @@ mod tests {
             .is_empty());
         assert!(renderer.awaiting_fallback);
         assert!(renderer.take_outbound_messages().is_empty());
-        renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 0, 0));
+        renderer.apply_target(1, 2, Some(route), false, false, prefix, test_rect(), (0, 0));
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
             [ClientMessage::InputEvents { events }] if events.len() == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn native_child_death_releases_surface_after_server_fallback_confirmation() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let prefix = test_prefix();
+        let (mut renderer, events, pane_id) = active_renderer(runtime, prefix.clone());
+        let route = renderer.target.as_ref().unwrap().route.clone();
+
+        events.try_send(AppEvent::PaneDied { pane_id }).unwrap();
+        assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
+        assert!(renderer.target.as_ref().unwrap().failed);
+        assert!(!renderer.local_selected);
+        assert!(renderer.awaiting_fallback);
+
+        renderer.apply_target(1, 2, Some(route), false, false, prefix, test_rect(), (0, 0));
+
+        assert!(!renderer.awaiting_fallback);
+        assert!(renderer.target.as_ref().unwrap().fallback_confirmed);
     }
 
     #[tokio::test]
@@ -947,7 +1416,7 @@ mod tests {
             )])
             .is_empty());
         assert!(renderer.awaiting_fallback);
-        renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 0, 0));
+        renderer.apply_target(1, 2, Some(route), false, false, prefix, test_rect(), (0, 0));
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
             [ClientMessage::InputEvents { events }] if events.len() == 1
@@ -992,7 +1461,7 @@ mod tests {
             .is_empty());
         assert!(renderer.target.as_ref().unwrap().failed);
         assert!(renderer.awaiting_fallback);
-        renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 0, 0));
+        renderer.apply_target(1, 2, Some(route), false, false, prefix, test_rect(), (0, 0));
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
             [ClientMessage::InputEvents { events }]
@@ -1013,6 +1482,7 @@ mod tests {
         target.ready_reported = false;
         target.promoted = false;
         renderer.local_selected = false;
+        renderer.cached_server_frame = Some(test_server_frame());
 
         renderer.next_frame(Instant::now(), (80, 24));
         assert!(matches!(
@@ -1028,7 +1498,7 @@ mod tests {
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
         assert!(renderer.route_pixel_input(data, geometry).is_none());
 
-        renderer.apply_target(1, 2, Some(route), true, true, prefix, (80, 24, 10, 20));
+        renderer.apply_target(1, 2, Some(route), true, true, prefix, test_rect(), (10, 20));
 
         assert!(!renderer.awaiting_promotion);
         assert!(renderer.target.as_ref().unwrap().promoted);
@@ -1047,7 +1517,15 @@ mod tests {
         target.surface_active = false;
         target.ready_reported = false;
         target.promoted = false;
+        target.rect = OmpRendererRect {
+            x: 20,
+            y: 6,
+            width: 40,
+            height: 12,
+        };
+        target.size = (40, 12, 10, 20);
         renderer.local_selected = false;
+        renderer.cached_server_frame = Some(test_server_frame());
 
         renderer.next_frame(Instant::now(), (80, 24));
         renderer.take_outbound_messages();
@@ -1058,9 +1536,23 @@ mod tests {
             .is_empty());
         let data = b"\x1b[<35;321;241M".to_vec();
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let outside = b"\x1b[<35;11;21M".to_vec();
+        assert!(matches!(
+            renderer.route_pixel_input(outside.clone(), geometry),
+            Some(ClientMessage::InputPixels { data, .. }) if data == outside
+        ));
         assert!(renderer.route_pixel_input(data, geometry).is_none());
 
-        renderer.apply_target(1, 2, Some(route), true, false, prefix, (80, 24, 10, 20));
+        renderer.apply_target(
+            1,
+            2,
+            Some(route),
+            true,
+            false,
+            prefix,
+            test_rect(),
+            (10, 20),
+        );
 
         assert!(renderer.target.as_ref().unwrap().promoted);
         assert!(matches!(
@@ -1080,26 +1572,69 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn native_authority_discards_server_frames_and_stale_fallback_cache() {
-        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
-        let prefix = test_prefix();
-        let (mut renderer, _events, _) = active_renderer(runtime, prefix.clone());
-        let route = renderer.target.as_ref().unwrap().route.clone();
-        let frame = FrameData {
-            cells: Vec::new(),
-            width: 0,
-            height: 0,
-            cursor: None,
-            hyperlinks: Vec::new(),
-            graphics: vec![1],
+    #[test]
+    fn native_surface_composes_inside_server_frame_and_preserves_outer_state() {
+        let cell = |symbol: &str, hyperlink| crate::protocol::CellData {
+            symbol: symbol.into(),
+            fg: 1,
+            bg: 2,
+            modifier: 0,
+            skip: false,
+            hyperlink,
+        };
+        let base = FrameData {
+            cells: vec![cell("S", None); 12],
+            width: 4,
+            height: 3,
+            cursor: Some(crate::protocol::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+                shape: 0,
+            }),
+            hyperlinks: vec!["server".into()],
+            graphics: vec![7, 8],
+        };
+        let local = FrameData {
+            cells: vec![cell("L", Some(0)); 4],
+            width: 2,
+            height: 2,
+            cursor: Some(crate::protocol::CursorState {
+                x: 1,
+                y: 0,
+                visible: true,
+                shape: 2,
+            }),
+            hyperlinks: vec!["local".into()],
+            graphics: Vec::new(),
         };
 
-        assert!(renderer.cache_server_frame(frame.clone()).is_none());
-        assert!(renderer.cached_server_frame.is_none());
-        renderer.cached_server_frame = Some(frame);
-        renderer.apply_target(1, 2, Some(route), true, false, prefix, (80, 24, 10, 20));
-        assert!(renderer.cached_server_frame.is_none());
+        let composed = compose_frame(
+            &base,
+            local,
+            OmpRendererRect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(composed.cells[0].symbol, "S");
+        assert_eq!(composed.cells[5].symbol, "L");
+        assert_eq!(composed.cells[5].hyperlink, Some(1));
+        assert_eq!(composed.hyperlinks, ["server", "local"]);
+        assert_eq!(composed.graphics, [7, 8]);
+        assert_eq!(
+            composed.cursor,
+            Some(crate::protocol::CursorState {
+                x: 2,
+                y: 1,
+                visible: true,
+                shape: 2,
+            })
+        );
     }
 
     #[tokio::test]
@@ -1120,7 +1655,16 @@ mod tests {
         assert!(renderer.route_pixel_input(data.clone(), geometry).is_none());
         assert!(renderer.awaiting_fallback);
         assert!(renderer.take_outbound_messages().is_empty());
-        renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 10, 20));
+        renderer.apply_target(
+            1,
+            2,
+            Some(route),
+            false,
+            false,
+            prefix,
+            test_rect(),
+            (10, 20),
+        );
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
@@ -1145,7 +1689,7 @@ mod tests {
             )])
             .is_empty());
         assert!(renderer.awaiting_fallback);
-        renderer.apply_target(2, 2, None, false, false, test_prefix(), (80, 24, 0, 0));
+        renderer.apply_target(2, 2, None, false, false, test_prefix(), test_rect(), (0, 0));
         assert!(!renderer.awaiting_fallback);
         assert!(renderer.deferred_messages.is_empty());
         assert!(renderer.take_outbound_messages().is_empty());
@@ -1160,6 +1704,10 @@ mod tests {
         target.ready_reported = false;
         target.promoted = false;
         renderer.local_selected = false;
+        assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert!(!renderer.awaiting_promotion);
+        renderer.cached_server_frame = Some(test_server_frame());
 
         assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
         assert!(matches!(

@@ -762,6 +762,217 @@ fn remote_client_reconnects_after_live_handoff() {
     cleanup_test_base(&base);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_reconnects_active_omp_host_via_replacement_bridge() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let fake_bin = base.join("fake-bin");
+    let marker = base.join("omp-bridge.json");
+    let fake_omp = fake_bin.join("omp");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let test_config = base.join("config.toml");
+    fs::write(
+        &test_config,
+        "onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\nshell_mode = \"non_login\"\n",
+    )
+    .unwrap();
+
+    let marker_literal = serde_json::to_string(marker.to_string_lossy().as_ref()).unwrap();
+    let omp_build_id_literal =
+        serde_json::to_string(option_env!("HERDR_BUILD_OMP_BUILD_ID").unwrap_or("")).unwrap();
+    let script = r#"#!/usr/bin/env python3
+import json
+import os
+import socket
+import time
+
+marker = __MARKER__
+omp_build_id = __OMP_BUILD_ID__
+
+def write_marker(payload):
+    with open(marker, "w", encoding="utf-8") as output:
+        json.dump(payload, output)
+
+def announce(address, token, pane_id):
+    host, port = address.rsplit(":", 1)
+    bridge = socket.create_connection((host, int(port)), timeout=5)
+    bridge.settimeout(None)
+    announcement = {
+        "t": "host",
+        "paneId": pane_id,
+        "ompSessionId": "handoff-discovery",
+        "routeGeneration": 1,
+        "token": token,
+        "ompBuildId": omp_build_id,
+    }
+    bridge.sendall((json.dumps(announcement, separators=(",", ":")) + "\n").encode())
+    ready_line = bridge.makefile("r", encoding="utf-8").readline()
+    if not ready_line or json.loads(ready_line).get("t") != "ready":
+        raise RuntimeError("OMP bridge did not accept host")
+    return bridge
+
+def discover(stale_pane_id):
+    deadline = time.monotonic() + 10
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            request_id = "handoff-omp-bridge"
+            api = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            api.settimeout(1)
+            api.connect(os.environ["HERDR_SOCKET_PATH"])
+            request = {
+                "id": request_id,
+                "method": "pane.omp_bridge",
+                "params": {"pane_id": stale_pane_id},
+            }
+            api.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            response_line = api.makefile("r", encoding="utf-8").readline()
+            if not response_line:
+                raise RuntimeError("bridge discovery returned no response")
+            response = json.loads(response_line)
+            if response.get("id") != request_id:
+                raise RuntimeError("bridge discovery response id mismatch")
+            result = response.get("result")
+            if not isinstance(result, dict) or result.get("type") != "pane_omp_bridge":
+                raise RuntimeError("bridge discovery response type mismatch")
+            pane_id = result.get("pane_id")
+            address = result.get("address")
+            token = result.get("token")
+            if not isinstance(pane_id, str) or not pane_id:
+                raise RuntimeError("bridge discovery pane missing")
+            if not isinstance(address, str) or not address:
+                raise RuntimeError("bridge discovery address missing")
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("bridge discovery credential missing")
+            return pane_id, address, token
+        except Exception as error:
+            last_error = error
+            time.sleep(0.05)
+    raise RuntimeError("replacement bridge discovery failed: " + str(last_error))
+
+try:
+    inherited_pane_id = os.environ["HERDR_PANE_ID"]
+    stale_pane_id = inherited_pane_id + "-retired"
+    inherited_address = os.environ["HERDR_OMP_BRIDGE"]
+    initial = announce(inherited_address, os.environ["HERDR_OMP_BRIDGE_TOKEN"], inherited_pane_id)
+    write_marker({
+        "phase": "initial",
+        "pid": os.getpid(),
+        "inherited_pane_id": inherited_pane_id,
+        "inherited_address": inherited_address,
+    })
+    while initial.recv(8192):
+        pass
+
+    pane_id, address, token = discover(stale_pane_id)
+    replacement = announce(address, token, pane_id)
+    write_marker({
+        "phase": "reconnected",
+        "pid": os.getpid(),
+        "inherited_pane_id": inherited_pane_id,
+        "stale_pane_id": stale_pane_id,
+        "pane_id": pane_id,
+        "inherited_address": inherited_address,
+        "address": address,
+    })
+    while replacement.recv(8192):
+        pass
+except Exception as error:
+    write_marker({"error": type(error).__name__ + ": " + str(error)})
+    raise
+"#
+    .replace("__MARKER__", &marker_literal)
+    .replace("__OMP_BUILD_ID__", &omp_build_id_literal);
+    fs::write(&fake_omp, script).unwrap();
+    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let test_config = test_config.to_string_lossy().into_owned();
+
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[
+            ("PATH", path.as_str()),
+            ("HERDR_CONFIG_PATH", test_config.as_str()),
+        ],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-omp",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": "exec omp", "keys": ["Enter"]}
+        }),
+    ));
+
+    let initial_text = wait_for_file_contains(&marker, "initial", Duration::from_secs(10));
+    let initial: serde_json::Value = serde_json::from_str(&initial_text).unwrap();
+    assert!(initial.get("error").is_none(), "fake OMP failed: {initial}");
+    assert_eq!(initial["inherited_pane_id"], pane_id);
+    let initial_pid = initial["pid"].as_u64().expect("fake OMP process PID");
+    assert!(initial_pid > 0);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let marker_text = wait_for_file_contains(&marker, "reconnected", Duration::from_secs(10));
+    let payload: serde_json::Value = serde_json::from_str(&marker_text).unwrap();
+    assert!(payload.get("error").is_none(), "fake OMP failed: {payload}");
+    assert_eq!(
+        payload["pid"].as_u64(),
+        Some(initial_pid),
+        "replacement bridge must reconnect the original fake OMP process"
+    );
+    assert_eq!(payload["inherited_pane_id"], pane_id);
+    assert_ne!(
+        payload["pane_id"], payload["stale_pane_id"],
+        "bridge discovery trusted the stale public pane ID"
+    );
+    let inherited_address = payload["inherited_address"].as_str().unwrap();
+    let replacement_address = payload["address"].as_str().unwrap();
+    assert!(!inherited_address.is_empty());
+    assert!(!replacement_address.is_empty());
+    assert_ne!(
+        inherited_address, replacement_address,
+        "preserved OMP host reused the retired bridge"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn live_handoff_preserves_named_session_socket_paths() {
     let _lock = test_lock();

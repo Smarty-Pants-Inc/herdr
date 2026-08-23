@@ -140,6 +140,11 @@ pub enum ResponseResult {
     PaneProcessInfo {
         process_info: PaneProcessInfo,
     },
+    PaneOmpBridge {
+        pane_id: String,
+        address: String,
+        token: String,
+    },
     LayoutExport {
         layout: LayoutDescription,
     },

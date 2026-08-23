@@ -91,6 +91,14 @@ enum HostSourceKey {
     PaneLayer { pane_id: PaneId, layer_id: String },
 }
 
+impl HostSourceKey {
+    fn pane_id(&self) -> PaneId {
+        match self {
+            Self::Terminal { pane_id, .. } | Self::PaneLayer { pane_id, .. } => *pane_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct ImageSignature {
     image_width: u32,
@@ -172,6 +180,7 @@ pub(crate) fn paint_local_pane_graphics(
             app.view.tab_surface(),
             cell_size,
             None,
+            None,
             &mut cache,
         );
         drop(cache);
@@ -193,6 +202,7 @@ pub(crate) fn paint_local_pane_graphics(
             terminal_runtimes,
             app.view.tab_surface(),
             cell_size,
+            None,
             None,
             &mut cache,
         );
@@ -219,6 +229,7 @@ pub(crate) fn encode_local_pane_graphics(
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
+    excluded_pane: Option<PaneId>,
     transaction_budget: Option<usize>,
     cache: &mut HostGraphicsCache,
 ) -> EncodedGraphics {
@@ -241,6 +252,7 @@ pub(crate) fn encode_local_pane_graphics(
             terminal_runtimes,
             surface,
             cell_size,
+            excluded_pane,
             &cache.images,
             &cache.oversized,
         );
@@ -270,6 +282,7 @@ pub(crate) fn encode_local_pane_graphics(
             terminal_runtimes,
             surface,
             cell_size,
+            excluded_pane,
             &cache.images,
             &cache.oversized,
         )
@@ -860,6 +873,43 @@ impl HostGraphicsCache {
         bytes
     }
 
+    pub(crate) fn clear_pane_bytes(&mut self, pane_id: PaneId) -> Vec<u8> {
+        let pane_sources = self
+            .sources
+            .keys()
+            .filter(|source| source.pane_id() == pane_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_images = HashSet::new();
+        for source in pane_sources {
+            if let Some(image_id) = self.sources.remove(&source) {
+                removed_images.insert(image_id);
+            }
+            self.oversized.remove(&source);
+        }
+        self.oversized
+            .retain(|source, _| source.pane_id() != pane_id);
+
+        let mut bytes = Vec::new();
+        for image_id in removed_images {
+            if self.sources.values().any(|id| *id == image_id) {
+                continue;
+            }
+            encode_delete_image(&mut bytes, image_id);
+            self.images.remove(&image_id);
+            self.placements.retain(|(id, _), _| *id != image_id);
+            self.replayed_placements.retain(|(id, _)| *id != image_id);
+        }
+        if self
+            .continuation
+            .as_ref()
+            .is_some_and(|(source, _, _)| source.pane_id() == pane_id)
+        {
+            self.continuation = None;
+        }
+        bytes
+    }
+
     fn has_pane_sources(&self) -> bool {
         self.sources
             .keys()
@@ -933,6 +983,13 @@ impl HostGraphicsCache {
     #[cfg(test)]
     pub(crate) fn test_image_count(&self) -> usize {
         self.images.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_pane_source(&self, pane_id: PaneId) -> bool {
+        self.sources
+            .keys()
+            .any(|source| source.pane_id() == pane_id)
     }
 
     #[cfg(test)]
@@ -1013,6 +1070,7 @@ fn collect_visible_placements(
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
+    excluded_pane: Option<PaneId>,
     uploaded_images: &HashMap<u32, ImageSignature>,
     oversized_images: &HashMap<HostSourceKey, ImageSignature>,
 ) -> Vec<HostPlacement> {
@@ -1041,6 +1099,9 @@ fn collect_visible_placements(
     );
     let mut placements = Vec::new();
     for info in surface.pane_infos {
+        if excluded_pane == Some(info.id) {
+            continue;
+        }
         let mut pane_layers = graphics
             .slots
             .iter()
@@ -1338,7 +1399,7 @@ pub(crate) fn encode_kitty_regular_file(
     out.extend_from_slice(b"\x1b8");
 }
 
-fn encode_delete_image(out: &mut Vec<u8>, id: u32) {
+pub(crate) fn encode_delete_image(out: &mut Vec<u8>, id: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\");
 }
 
@@ -2714,6 +2775,7 @@ mod tests {
                 width_px: 10,
                 height_px: 20,
             },
+            None,
             Some(HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
             &mut cache,
         );

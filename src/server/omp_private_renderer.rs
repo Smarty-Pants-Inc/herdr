@@ -31,11 +31,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+const OMP_GUEST_BRIDGE_TOKEN_ENV: &str = "HERDR_OMP_GUEST_BRIDGE_TOKEN";
+
 const INBOUND_QUEUE_CAPACITY: usize = 256;
 
 /// Static inputs for a server-private OMP guest and its private PTY.
 pub(crate) struct PrivateOmpGuestConfig {
     pub(crate) route: OmpRouteKey,
+    /// Retained through launch so managed identity can be reverified at the spawn boundary.
+    pub(crate) omp_executable: crate::update::OmpExecutable,
     pub(crate) attachment_epoch: u64,
     pub(crate) controller: bool,
     pub(crate) pane_id: PaneId,
@@ -59,6 +63,7 @@ pub(crate) enum PrivateOmpGuestRecord {
         mutation: bool,
     },
     Control(PrivateOmpGuestControl),
+    ReplicaReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,27 +86,32 @@ pub(crate) struct PrivateOmpGuest {
     guest: Arc<Mutex<Option<TcpStream>>>,
     outbound: mpsc::SyncSender<OutboundRecord>,
     inbound: mpsc::Receiver<PrivateOmpGuestRecord>,
+    replica_ready: AtomicBool,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    _state_dir: crate::omp_guest_state::OmpGuestStateDir,
 }
 
 impl PrivateOmpGuest {
     pub(crate) fn spawn(config: PrivateOmpGuestConfig) -> io::Result<Self> {
+        config.omp_executable.verify().map_err(io::Error::other)?;
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0")?);
         listener.set_nonblocking(true)?;
         let token = bridge_token()?;
         let argv = guest_argv(
+            config.omp_executable.executable().to_path_buf(),
             listener.local_addr()?.to_string(),
             room_id(&config.route, config.attachment_epoch),
-            token.clone(),
         );
+        let state_dir = crate::omp_guest_state::OmpGuestStateDir::new()?;
+        let launch_env = omp_guest_launch_env(config.launch_env, token.clone(), &state_dir);
         let runtime = TerminalRuntime::spawn_argv_command(
             config.pane_id,
             config.rows,
             config.cols,
             config.cwd,
             &argv,
-            &config.launch_env,
+            &launch_env,
             AgentDetection::Disabled,
             config.scrollback_limit_bytes,
             config.terminal_theme,
@@ -134,8 +144,10 @@ impl PrivateOmpGuest {
             guest,
             outbound,
             inbound,
+            replica_ready: AtomicBool::new(false),
             bridge_failed,
             shutting_down,
+            _state_dir: state_dir,
         })
     }
 
@@ -181,6 +193,19 @@ impl PrivateOmpGuest {
     /// does not set this, so callers can distinguish an expected shutdown.
     pub(crate) fn bridge_failed(&self) -> bool {
         self.bridge_failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn replica_ready(&self) -> bool {
+        self.replica_ready.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_replica_ready(&self) {
+        self.replica_ready.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_replica_ready(&self) {
+        self.mark_replica_ready();
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.
@@ -251,30 +276,39 @@ fn bridge_token() -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn omp_bin() -> String {
-    std::env::var("OMP_BIN").unwrap_or_else(|_| {
-        #[cfg(test)]
-        if let Ok(executable) = std::env::current_exe() {
-            // Routing tests need a spawnable command, not an installed OMP bridge.
-            return executable.to_string_lossy().into_owned();
-        }
-        "omp".to_owned()
-    })
-}
-
-fn guest_argv(address: String, room: String, token: String) -> Vec<String> {
+fn guest_argv(omp_executable: PathBuf, address: String, room: String) -> Vec<String> {
+    // The isolated HOME keeps this ephemeral, while filesystem-backed session
+    // storage is required to load the streamed collaboration replica.
     vec![
-        omp_bin(),
+        omp_executable.to_string_lossy().into_owned(),
         "__collab-guest-bridge".into(),
         address,
         room,
-        token,
+        "--token-env".into(),
         "--no-tools".into(),
         "--no-lsp".into(),
         "--no-skills".into(),
         "--no-rules".into(),
         "--no-extensions".into(),
     ]
+}
+
+fn omp_guest_launch_env(
+    launch_env: PaneLaunchEnv,
+    token: String,
+    state_dir: &crate::omp_guest_state::OmpGuestStateDir,
+) -> PaneLaunchEnv {
+    state_dir.apply_to_pane_env(
+        launch_env
+            .without_env("BUN_OPTIONS")
+            .without_env("BUN_INSPECT_PRELOAD")
+            .without_env("BUN_BE_BUN")
+            .without_env("NODE_OPTIONS")
+            .without_env("HERDR_OMP_BRIDGE")
+            .without_env("HERDR_OMP_BRIDGE_TOKEN")
+            .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+            .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, token),
+    )
 }
 
 fn room_id(route: &OmpRouteKey, attachment_epoch: u64) -> String {
@@ -498,6 +532,13 @@ fn parse_guest_record(line: &str) -> io::Result<PrivateOmpGuestRecord> {
         )
     })?;
     match record.t.as_str() {
+        "replica-ready" if record.action.is_none() && record.frame.is_none() => {
+            Ok(PrivateOmpGuestRecord::ReplicaReady)
+        }
+        "replica-ready" => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid private OMP replica-ready record",
+        )),
         "frame" => record
             .frame
             .map(|frame| PrivateOmpGuestRecord::Frame {
@@ -572,6 +613,37 @@ fn write_guest_records(
 mod tests {
     use super::*;
     #[test]
+    fn guest_bridge_token_is_not_exposed_in_argv() {
+        let argv = guest_argv(
+            PathBuf::from("/tmp/omp"),
+            "127.0.0.1:1234".into(),
+            "room".into(),
+        );
+        assert!(argv.iter().any(|arg| arg == "--token-env"));
+        assert!(!argv.iter().any(|arg| arg == "--no-session"));
+        assert!(!argv.iter().any(|arg| arg == "bridge-secret"));
+    }
+
+    #[test]
+    fn guest_launch_strips_host_startup_and_identity_env() {
+        let state_dir = crate::omp_guest_state::OmpGuestStateDir::new().unwrap();
+        let launch_env =
+            omp_guest_launch_env(PaneLaunchEnv::default(), "bridge-secret".into(), &state_dir);
+        let expected = state_dir.apply_to_pane_env(
+            PaneLaunchEnv::default()
+                .without_env("BUN_OPTIONS")
+                .without_env("BUN_INSPECT_PRELOAD")
+                .without_env("BUN_BE_BUN")
+                .without_env("NODE_OPTIONS")
+                .without_env("HERDR_OMP_BRIDGE")
+                .without_env("HERDR_OMP_BRIDGE_TOKEN")
+                .without_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+                .with_extra(OMP_GUEST_BRIDGE_TOKEN_ENV, "bridge-secret"),
+        );
+        assert_eq!(launch_env, expected);
+    }
+
+    #[test]
     fn trickling_candidate_expires_before_authenticated_guest() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -639,6 +711,10 @@ mod tests {
                 PrivateOmpGuestControl::RequestController
             ))
         ));
+        assert!(matches!(
+            parse_guest_record(r#"{"t":"replica-ready"}"#),
+            Ok(PrivateOmpGuestRecord::ReplicaReady)
+        ));
         let Ok(PrivateOmpGuestRecord::Frame { frame, mutation }) =
             parse_guest_record(r#"{"t":"frame","mutation":true,"frame":{"x": 1}}"#)
         else {
@@ -653,6 +729,7 @@ mod tests {
         for record in [
             "not-json",
             r#"{"t":"unknown"}"#,
+            r#"{"t":"replica-ready","frame":{}}"#,
             r#"{"t":"frame"}"#,
             r#"{"t":"control","action":"unknown"}"#,
         ] {

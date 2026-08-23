@@ -802,6 +802,11 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let parent_pid = process_bsdinfo(pid)?.pbi_ppid;
+    (parent_pid > 0).then_some(parent_pid)
+}
+
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -817,6 +822,13 @@ fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     };
 
     (ret == size).then_some(info)
+}
+
+pub(crate) fn process_start_identity(pid: u32) -> Option<u64> {
+    let info = process_bsdinfo(pid)?;
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
 }
 
 fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {

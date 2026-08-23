@@ -1167,6 +1167,13 @@ impl App {
             Method::PaneProcessInfo(params) => {
                 return self.handle_pane_process_info(request.id, params);
             }
+            Method::PaneOmpBridge(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "omp_bridge_discovery_denied",
+                    "OMP bridge discovery is unavailable for this caller",
+                );
+            }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
             Method::LayoutSetSplitRatio(params) => {
@@ -1571,12 +1578,15 @@ mod tests {
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
         app.terminal_runtimes.insert(terminal_id, runtime);
 
-        let response = app.handle_api_request(crate::api::schema::Request {
-            id: "reload_manifests".into(),
-            method: crate::api::schema::Method::ServerReloadAgentManifests(
-                crate::api::schema::EmptyParams::default(),
-            ),
-        });
+        let response = {
+            let _guard = crate::config::test_config_env_lock().lock();
+            app.handle_api_request(crate::api::schema::Request {
+                id: "reload_manifests".into(),
+                method: crate::api::schema::Method::ServerReloadAgentManifests(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            })
+        };
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["type"], "agent_manifest_reload");
         assert!(!response["result"]["manifests"]

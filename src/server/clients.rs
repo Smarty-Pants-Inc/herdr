@@ -37,8 +37,10 @@ pub(crate) enum DeferredRender {
 pub(crate) struct OmpRendererTargetState {
     pub(crate) launch_id: u64,
     pub(crate) route: Option<crate::protocol::OmpRendererRoute>,
+    pub(crate) rect: crate::protocol::OmpRendererRect,
     pub(crate) bound: bool,
     pub(crate) ready: bool,
+    pub(crate) replica_ready: bool,
     pub(crate) prefix: crate::protocol::OmpRendererPrefix,
     pub(crate) surface_active: bool,
 }

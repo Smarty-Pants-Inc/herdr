@@ -371,6 +371,17 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_parent_pid_from_stat(&stat)
+}
+
+fn process_parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(1)?.parse().ok()
+}
+
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_pgrp_and_comm_from_stat(&stat)
@@ -456,6 +467,15 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
             libc::kill(pid as i32, sig);
         }
     }
+}
+pub(crate) fn process_start_identity(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_start_identity_from_stat(&stat)
+}
+
+fn process_start_identity_from_stat(stat: &str) -> Option<u64> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 pub fn process_exists(pid: u32) -> bool {
@@ -1027,6 +1047,16 @@ mod tests {
         assert_eq!(
             process_pgrp_and_comm_from_stat("123 (name with ) paren) S 1 456 789 0 456"),
             Some((456, "name with ) paren".to_string()))
+        );
+    }
+
+    #[test]
+    fn proc_stat_parsing_reads_process_start_identity_after_complex_name() {
+        assert_eq!(
+            process_start_identity_from_stat(
+                "123 (name with ) paren) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19"
+            ),
+            Some(19)
         );
     }
 

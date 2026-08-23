@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 25,
+  "protocol": 26,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -2725,6 +2725,17 @@
           ],
           "type": "object"
         },
+        "PaneOmpBridgeParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneProcessInfoParams": {
           "properties": {
             "pane_id": {
@@ -5212,6 +5223,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneProcessInfoParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.omp_bridge",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneOmpBridgeParams"
             }
           },
           "required": [
@@ -9190,6 +9217,30 @@
               "required": [
                 "type",
                 "process_info"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "token": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_omp_bridge",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "address",
+                "token"
               ],
               "type": "object"
             },

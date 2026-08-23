@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -74,6 +74,21 @@ pub struct OmpRendererRoute {
     pub route_generation: u64,
 }
 
+/// Client-projected inner pane rectangle for a native OMP surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl OmpRendererRect {
+    pub const fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
 /// Normalized Herdr prefix metadata retained by the App while native rendering is active.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OmpRendererPrefix {
@@ -83,6 +98,7 @@ pub struct OmpRendererPrefix {
 
 #[cfg(unix)]
 impl OmpRendererPrefix {
+    #[cfg(unix)]
     pub(crate) fn key_combo(&self) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
         (
             self.code.to_crossterm(),
@@ -729,8 +745,15 @@ pub enum ClientMessage {
         attachment_epoch: u64,
         frame: Vec<u8>,
     },
-    /// The App displayed the first frame for this exact client-local renderer launch.
+    /// The App produced the first renderable frame for this exact client-local launch.
     OmpRendererReady { launch_id: u64 },
+    /// The exact native sideband finished applying its initial snapshot or a resync.
+    OmpReplicaReady {
+        pane_id: String,
+        omp_session_id: String,
+        route_generation: u64,
+        attachment_epoch: u64,
+    },
 }
 
 /// Herdr-owned controller operations; payload bytes remain owned by OMP.
@@ -1098,9 +1121,11 @@ pub enum ServerMessage {
         target_app_client_id: u64,
         /// `None` stops the current launch without offering a replacement.
         route: Option<OmpRendererRoute>,
+        /// Exact client-projected inner rectangle occupied by this renderer.
+        rect: OmpRendererRect,
         /// True only after the exact launch sideband has attached.
         bound: bool,
-        /// True only while the bound route owns the App's full surface.
+        /// True only while the bound route owns its projected App pane surface.
         surface_active: bool,
         prefix: OmpRendererPrefix,
     },
@@ -1448,6 +1473,15 @@ mod tests {
         );
         assert_eq!(tag(&ClientMessage::OmpRendererReady { launch_id: 9 }), 19);
         assert_eq!(
+            tag(&ClientMessage::OmpReplicaReady {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                attachment_epoch: 2,
+            }),
+            20
+        );
+        assert_eq!(
             tag(&ServerMessage::OmpPane {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
@@ -1484,6 +1518,7 @@ mod tests {
                 launch_id: 9,
                 target_app_client_id: 42,
                 route: None,
+                rect: OmpRendererRect::default(),
                 bound: false,
                 surface_active: false,
                 prefix: OmpRendererPrefix {
@@ -1644,6 +1679,12 @@ mod tests {
                 omp_session_id: "session".into(),
                 route_generation: 3,
             }),
+            rect: OmpRendererRect {
+                x: 3,
+                y: 4,
+                width: 70,
+                height: 20,
+            },
             bound: true,
             surface_active: true,
             prefix: OmpRendererPrefix {
@@ -1667,6 +1708,20 @@ mod tests {
     }
 
     #[test]
+    fn omp_replica_ready_roundtrip() {
+        let ready = ClientMessage::OmpReplicaReady {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 3,
+            attachment_epoch: 4,
+        };
+        let encoded = bincode::serde::encode_to_vec(&ready, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(ready, decoded);
+    }
+
+    #[test]
     fn client_notification_activation_roundtrip() {
         let msg = ClientMessage::ActivateNotification {
             activation: NotificationActivation {
@@ -1682,8 +1737,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_25_hello_carries_app_renderer_capability() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_26_hello_carries_app_renderer_capability() {
+        assert_eq!(PROTOCOL_VERSION, 26);
         let profile = "a".repeat(43);
         let app = ClientMessage::Hello {
             version: PROTOCOL_VERSION,

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::protocol::{
     select_omp_renderer, OmpControlAction, OmpFrameDirection, OmpRendererMode, ServerMessage,
 };
-use crate::server::client_transport::ServerEvent;
+use crate::server::client_transport::{OmpHostAdmission, ServerEvent};
 use crate::server::clients::ClientConnection;
 use crate::server::omp_bridge;
 use crate::server::omp_route::{OmpRouteDelivery, OmpRouteError, OmpRouteKey, OmpRouteRegistry};
@@ -189,9 +189,20 @@ impl OmpService {
         if !self.client_is_private_renderer(client_id) {
             return Vec::new();
         }
+        let private_route = self.route_bindings.get(&client_id).cloned();
+        let preserve_peer = private_route.as_ref().is_some_and(|route| {
+            self.bound_apps.iter().any(|(&renderer_id, &app_id)| {
+                renderer_id != client_id
+                    && app_id == client_id
+                    && self.route_bindings.get(&renderer_id) == Some(route)
+            })
+        });
         let peer_id = self.bound_apps.remove(&client_id).unwrap_or(client_id);
         self.renderer_modes.remove(&client_id);
         self.route_bindings.remove(&client_id);
+        if preserve_peer {
+            return Vec::new();
+        }
         let mut messages = Vec::new();
         for (key, deliveries) in self.routes.disconnect(peer_id) {
             if self.send_peer_left(&key, peer_id, &mut messages, clients)
@@ -442,11 +453,6 @@ impl OmpService {
                     );
                     return messages;
                 }
-                if self.renderer_modes.get(&client_id) == Some(&OmpRendererMode::ClientLocalNative)
-                    && !self.native_renderer_is_ready(client_id, clients)
-                {
-                    return messages;
-                }
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     self.send_error(
                         &mut messages,
@@ -485,10 +491,14 @@ impl OmpService {
                 host_id,
                 outbound,
                 socket,
+                admission,
             } => {
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     tracing::warn!("rejected oversized OMP host route identifier");
-                    let _ = socket.shutdown(Shutdown::Both);
+                    let _ = admission.send(OmpHostAdmission::Rejected {
+                        code: OmpRouteError::UnknownRoute.code().to_owned(),
+                        message: "OMP host route identifier is invalid".into(),
+                    });
                     return messages;
                 }
                 let key = OmpRouteKey {
@@ -504,6 +514,14 @@ impl OmpService {
                 match self.routes.host_started(key.clone()) {
                     Ok(deliveries) => {
                         self.replace_host(route_key, host_id, outbound, socket);
+                        if admission.send(OmpHostAdmission::Accepted).is_err() {
+                            self.remove_host(&key);
+                            if let Ok(deliveries) = self.routes.host_stopped(&key) {
+                                self.deliver(&key, deliveries, &mut messages, clients);
+                                self.routes.remove_if_inactive_and_empty(&key);
+                            }
+                            return messages;
+                        }
                         if self.sync_authority(&key, &deliveries, &mut messages, clients) {
                             self.deliver(&key, deliveries, &mut messages, clients);
                         }
@@ -516,7 +534,10 @@ impl OmpService {
                             code = error.code(),
                             "rejected OMP bridge host"
                         );
-                        let _ = socket.shutdown(Shutdown::Both);
+                        let _ = admission.send(OmpHostAdmission::Rejected {
+                            code: error.code().to_owned(),
+                            message: host_rejection_message(&error).into(),
+                        });
                     }
                 }
             }
@@ -644,6 +665,22 @@ impl OmpService {
                 && self.route_bindings.get(renderer_id) == Some(key)
         })
     }
+
+    pub(crate) fn native_renderer_replica_target(
+        &self,
+        renderer_id: u64,
+        key: &OmpRouteKey,
+        attachment_epoch: u64,
+    ) -> Option<u64> {
+        (self.renderer_modes.get(&renderer_id) == Some(&OmpRendererMode::ClientLocalNative)
+            && self.route_bindings.get(&renderer_id) == Some(key))
+        .then(|| self.bound_apps.get(&renderer_id).copied())
+        .flatten()
+        .filter(|app_client_id| {
+            self.routes
+                .is_current_attachment(*app_client_id, key, attachment_epoch)
+        })
+    }
     pub(crate) fn app_client_for_renderer(
         &self,
         client_id: u64,
@@ -671,7 +708,7 @@ impl OmpService {
                 .get(&renderer_id)
                 .and_then(|app_id| clients.get(app_id))
                 .and_then(|client| client.omp_renderer_target.as_ref())
-                .is_some_and(|target| target.ready)
+                .is_some_and(|target| target.ready && target.replica_ready)
     }
 
     fn renderers_for_peer(
@@ -987,6 +1024,18 @@ fn valid_route_id(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn host_rejection_message(error: &OmpRouteError) -> &'static str {
+    match error {
+        OmpRouteError::UnknownRoute => "OMP host route is unknown",
+        OmpRouteError::StaleGeneration => "OMP host route generation is stale",
+        OmpRouteError::StaleAttachment => "OMP host attachment is stale",
+        OmpRouteError::HostUnavailable => "OMP host is unavailable",
+        OmpRouteError::RouteBusy => "OMP host route is already active",
+        OmpRouteError::ControllerRequired => "OMP host controller is required",
+        OmpRouteError::InvalidFrame(_) => "OMP host frame is invalid",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1044,56 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    #[test]
+    fn host_route_admission_rejects_second_live_session_for_same_pane() {
+        let mut service = OmpService::new(None).unwrap();
+        let clients = HashMap::new();
+        let (peer, socket) = host_socket_pair();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (admission, admitted) = std::sync::mpsc::sync_channel(1);
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                host_id: 1,
+                outbound,
+                socket,
+                admission,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(
+            admitted.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(OmpHostAdmission::Accepted)
+        ));
+
+        let (replacement_peer, replacement_socket) = host_socket_pair();
+        let (replacement_outbound, _replacement_outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (replacement_admission, replacement_admitted) = std::sync::mpsc::sync_channel(1);
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: "pane".into(),
+                omp_session_id: "replacement-session".into(),
+                route_generation: 1,
+                host_id: 2,
+                outbound: replacement_outbound,
+                socket: replacement_socket,
+                admission: replacement_admission,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(
+            replacement_admitted.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(OmpHostAdmission::Rejected { code, message })
+                if code == "route_busy" && message == "OMP host route is already active"
+        ));
+        drop(peer);
+        drop(replacement_peer);
     }
 
     #[test]
@@ -1297,8 +1396,10 @@ mod tests {
                 omp_session_id: key.omp_session_id.clone(),
                 route_generation: key.route_generation,
             }),
+            rect: crate::protocol::OmpRendererRect::default(),
             bound: false,
             ready: false,
+            replica_ready: false,
             prefix: crate::protocol::OmpRendererPrefix {
                 code: crate::protocol::ClientKeyCode::Char('a'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
@@ -1402,8 +1503,10 @@ mod tests {
                 omp_session_id: key.omp_session_id.clone(),
                 route_generation: key.route_generation,
             }),
+            rect: crate::protocol::OmpRendererRect::default(),
             bound: true,
             ready: false,
+            replica_ready: false,
             prefix: crate::protocol::OmpRendererPrefix {
                 code: crate::protocol::ClientKeyCode::Char('a'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
@@ -1425,29 +1528,41 @@ mod tests {
             crate::protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, br#"{"t":"hello"}"#)
                 .unwrap();
 
-        for event in [
-            ServerEvent::OmpControl {
-                client_id: 11,
-                pane_id: key.pane_id.clone(),
-                omp_session_id: key.omp_session_id.clone(),
-                route_generation: key.route_generation,
-                attachment_epoch,
-                action: OmpControlAction::Mutation {
+        assert!(service
+            .handle_event(
+                ServerEvent::OmpControl {
+                    client_id: 11,
+                    pane_id: key.pane_id.clone(),
+                    omp_session_id: key.omp_session_id.clone(),
+                    route_generation: key.route_generation,
+                    attachment_epoch,
+                    action: OmpControlAction::Mutation {
+                        frame: frame.clone(),
+                    },
+                },
+                true,
+                &clients,
+            )
+            .is_empty());
+        assert!(outbound_rx.try_recv().is_err());
+        assert!(service
+            .handle_event(
+                ServerEvent::OmpFrame {
+                    client_id: 11,
+                    pane_id: key.pane_id.clone(),
+                    omp_session_id: key.omp_session_id.clone(),
+                    route_generation: key.route_generation,
+                    attachment_epoch,
                     frame: frame.clone(),
                 },
-            },
-            ServerEvent::OmpFrame {
-                client_id: 11,
-                pane_id: key.pane_id.clone(),
-                omp_session_id: key.omp_session_id.clone(),
-                route_generation: key.route_generation,
-                attachment_epoch,
-                frame: frame.clone(),
-            },
-        ] {
-            assert!(service.handle_event(event, true, &clients).is_empty());
-        }
-        assert!(outbound_rx.try_recv().is_err());
+                true,
+                &clients,
+            )
+            .is_empty());
+        assert!(outbound_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap()
+            .contains("\"fromPeer\":33"));
         let mut warming = service.renderers_for_peer(33, &key, &clients);
         warming.sort_unstable();
         assert_eq!(warming, vec![11, 33]);
@@ -1459,6 +1574,13 @@ mod tests {
             .as_mut()
             .unwrap()
             .ready = true;
+        clients
+            .get_mut(&33)
+            .unwrap()
+            .omp_renderer_target
+            .as_mut()
+            .unwrap()
+            .replica_ready = true;
         assert_eq!(service.renderers_for_peer(33, &key, &clients), vec![11]);
         assert!(service
             .handle_event(
@@ -1539,6 +1661,73 @@ mod tests {
         assert!(!service.route_bindings.contains_key(&11));
         assert_eq!(service.bound_apps.get(&33), Some(&33));
         assert_eq!(service.renderers_for_peer(33, &key, &clients), vec![33]);
+        let frame =
+            crate::protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, br#"{"t":"hello"}"#)
+                .unwrap();
+        assert!(service
+            .routes
+            .guest_frame(33, &key, attachment_epoch, frame)
+            .is_ok());
+    }
+
+    #[test]
+    fn private_failure_preserves_warming_native_route() {
+        let mut service = OmpService::new(None).unwrap();
+        let key = OmpRouteKey {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        service.routes.host_started(key.clone()).unwrap();
+        let attachment_epoch = service
+            .routes
+            .attach(33, &key)
+            .unwrap()
+            .into_iter()
+            .find_map(|delivery| match delivery {
+                OmpRouteDelivery::Pane {
+                    client_id: 33,
+                    attachment_epoch,
+                    ..
+                } => Some(attachment_epoch),
+                _ => None,
+            })
+            .unwrap();
+        service
+            .renderer_modes
+            .insert(11, OmpRendererMode::ClientLocalNative);
+        service
+            .renderer_modes
+            .insert(33, OmpRendererMode::ServerPrivateGuestPty);
+        service.bound_apps.insert(11, 33);
+        service.bound_apps.insert(33, 33);
+        service.route_bindings.insert(11, key.clone());
+        service.route_bindings.insert(33, key.clone());
+        let clients = HashMap::from([
+            (
+                11,
+                client(
+                    crate::server::clients::ClientConnectionMode::OmpPane,
+                    None,
+                    Some("profile-a"),
+                ),
+            ),
+            (
+                33,
+                client(
+                    crate::server::clients::ClientConnectionMode::App,
+                    Some("Ada"),
+                    Some("profile-a"),
+                ),
+            ),
+        ]);
+
+        assert!(service.detach_private_app(33, &clients).is_empty());
+        assert!(!service.bound_apps.contains_key(&33));
+        assert!(!service.renderer_modes.contains_key(&33));
+        assert!(!service.route_bindings.contains_key(&33));
+        assert_eq!(service.bound_apps.get(&11), Some(&33));
+        assert_eq!(service.renderers_for_peer(33, &key, &clients), vec![11]);
         let frame =
             crate::protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, br#"{"t":"hello"}"#)
                 .unwrap();
@@ -1747,8 +1936,10 @@ mod tests {
                     omp_session_id: key.omp_session_id.clone(),
                     route_generation: key.route_generation,
                 }),
+                rect: crate::protocol::OmpRendererRect::default(),
                 bound: false,
                 ready: false,
+                replica_ready: false,
                 prefix: crate::protocol::OmpRendererPrefix {
                     code: crate::protocol::ClientKeyCode::Char('a'),
                     modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
