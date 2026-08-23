@@ -6,6 +6,12 @@ use crate::api::schema::{
     PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope, ResponseResult,
 };
 use crate::app::App;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientPrivatePluginPopupOrigin {
+    Pane(crate::layout::PaneId),
+    WorkspacePlugin(crate::layout::PaneId),
+}
 #[derive(Debug, Clone)]
 pub(crate) struct ClientPrivatePluginPopupSpec {
     pub(crate) plugin: InstalledPluginInfo,
@@ -17,9 +23,27 @@ pub(crate) struct ClientPrivatePluginPopupSpec {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) width: Option<crate::popup_size::PopupSize>,
     pub(crate) height: Option<crate::popup_size::PopupSize>,
-    pub(crate) source_pane_id: String,
+    pub(crate) origin: ClientPrivatePluginPopupOrigin,
 }
 
+fn private_popup_origin_for_source(
+    app: &App,
+    source_pane_id: &str,
+) -> Option<ClientPrivatePluginPopupOrigin> {
+    if let Some((_, pane_id)) = app.parse_pane_id(source_pane_id) {
+        return Some(ClientPrivatePluginPopupOrigin::Pane(pane_id));
+    }
+    app.state
+        .workspace_plugin_panes
+        .iter()
+        .find_map(|(workspace_id, pane)| {
+            (crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(workspace_id)
+                == source_pane_id)
+                .then_some(ClientPrivatePluginPopupOrigin::WorkspacePlugin(
+                    pane.pane_id,
+                ))
+        })
+}
 impl App {
     pub(crate) fn plugin_pane_effective_scope(
         &self,
@@ -116,6 +140,12 @@ impl App {
                 "client-private plugin popup requires a source pane".to_string(),
             )
         })?;
+        let origin = private_popup_origin_for_source(self, &source_pane_id).ok_or_else(|| {
+            (
+                "pane_not_found",
+                format!("pane {source_pane_id} is no longer available"),
+            )
+        })?;
         context.view_id = params.view_id.clone();
         validate_plugin_pane_platform(&plugin, &pane, &execution_target)?;
         let cwd = self.plugin_pane_cwd(&plugin, params.cwd.clone(), &execution_target);
@@ -146,8 +176,31 @@ impl App {
             env,
             width: params.width.or(pane.width),
             height: params.height.or(pane.height),
-            source_pane_id,
+            origin,
         })
+    }
+
+    pub(crate) fn private_popup_source_pane_id(
+        &self,
+        origin: ClientPrivatePluginPopupOrigin,
+    ) -> Option<String> {
+        match origin {
+            ClientPrivatePluginPopupOrigin::Pane(pane_id) => {
+                let (ws_idx, _) = self.find_pane(pane_id)?;
+                self.public_pane_id(ws_idx, pane_id)
+            }
+            ClientPrivatePluginPopupOrigin::WorkspacePlugin(pane_id) => self
+                .state
+                .workspace_plugin_panes
+                .iter()
+                .find_map(|(workspace_id, pane)| {
+                    (pane.pane_id == pane_id).then(|| {
+                        crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(
+                            workspace_id,
+                        )
+                    })
+                }),
+        }
     }
 
     pub(super) fn open_plugin_popup_pane(
@@ -885,5 +938,46 @@ mod tests {
         let serialized_context: PluginInvocationContext =
             serde_json::from_str(&env["HERDR_PLUGIN_CONTEXT_JSON"]).unwrap();
         assert_eq!(serialized_context, context);
+    }
+
+    #[test]
+    fn private_popup_origin_does_not_follow_reused_workspace_plugin_public_id() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("source");
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let original_pane_id = crate::layout::PaneId::alloc();
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: original_pane_id,
+                terminal_id: terminal_id.clone(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: false,
+                collapsed: false,
+            },
+        );
+        let source =
+            crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
+        let origin = private_popup_origin_for_source(&app, &source).unwrap();
+        assert_eq!(app.private_popup_source_pane_id(origin), Some(source));
+
+        app.state
+            .workspace_plugin_panes
+            .get_mut(&workspace_id)
+            .unwrap()
+            .pane_id = crate::layout::PaneId::alloc();
+
+        assert_eq!(app.private_popup_source_pane_id(origin), None);
     }
 }

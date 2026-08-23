@@ -1,17 +1,18 @@
-use std::collections::HashMap;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::str::FromStr;
-use std::sync::{LazyLock, Mutex};
 
 #[cfg(unix)]
 use std::{
-    fs::File,
     io::{IsTerminal as _, Read as _, Write as _},
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -53,6 +54,25 @@ pub enum ExecutionTarget {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Osc7Authority {
+    accepted: Vec<String>,
+}
+
+impl Osc7Authority {
+    pub(crate) fn accepts(&self, authority: Option<&str>, remote_hostname: Option<&str>) -> bool {
+        let Some(authority) = authority else {
+            return true;
+        };
+        authority.eq_ignore_ascii_case("localhost")
+            || remote_hostname.is_some_and(|host| authority.eq_ignore_ascii_case(host))
+            || self
+                .accepted
+                .iter()
+                .any(|host| authority.eq_ignore_ascii_case(host))
+    }
+}
+
 impl ExecutionTarget {
     pub fn ssh(host: impl Into<String>) -> std::io::Result<Self> {
         let host = host.into();
@@ -64,36 +84,32 @@ impl ExecutionTarget {
         matches!(self, Self::Local)
     }
 
-    pub(crate) fn accepts_osc7_authority(
-        &self,
-        authority: Option<&str>,
-        remote_hostname: Option<&str>,
-    ) -> bool {
-        let local_hostname = crate::platform::hostname();
-        self.accepts_osc7_authority_with_local_hostname(
-            authority,
-            remote_hostname,
-            local_hostname.as_deref(),
+    pub(crate) fn osc7_authority(&self) -> Osc7Authority {
+        self.osc7_authority_with(
+            crate::platform::hostname(),
+            match self {
+                Self::Local => None,
+                Self::Ssh { host } => query_ssh_hostname(host),
+            },
         )
     }
 
-    fn accepts_osc7_authority_with_local_hostname(
+    pub(crate) fn osc7_authority_with(
         &self,
-        authority: Option<&str>,
-        remote_hostname: Option<&str>,
-        local_hostname: Option<&str>,
-    ) -> bool {
-        let Some(authority) = authority else {
-            return true;
-        };
-        if authority.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
+        local_hostname: Option<String>,
+        effective_ssh_hostname: Option<String>,
+    ) -> Osc7Authority {
+        let mut accepted = Vec::with_capacity(2);
         match self {
-            Self::Local => local_hostname.is_some_and(|host| authority.eq_ignore_ascii_case(host)),
-            Self::Ssh { host } if ssh_authority_matches(authority, host, remote_hostname) => true,
-            Self::Ssh { host } => effective_ssh_hostname_matches(authority, host),
+            Self::Local => accepted.extend(local_hostname),
+            Self::Ssh { host } => {
+                accepted.push(ssh_destination_host(host).to_string());
+                if let Some(hostname) = effective_ssh_hostname {
+                    accepted.push(hostname);
+                }
+            }
         }
+        Osc7Authority { accepted }
     }
 }
 
@@ -171,6 +187,46 @@ impl RemoteExecSsh {
         ]
     }
 }
+#[cfg(unix)]
+pub(crate) struct RemoteRequestChannel {
+    path: PathBuf,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(not(unix))]
+pub(crate) struct RemoteRequestChannel;
+#[cfg(not(unix))]
+impl RemoteRequestChannel {
+    pub(crate) fn cancel(self) {}
+}
+
+#[cfg(unix)]
+impl RemoteRequestChannel {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn cancel(self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RemoteRequestChannel {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+pub(crate) struct PreparedSshPtyCommand {
+    pub(crate) command: CommandBuilder,
+    pub(crate) request_channel: RemoteRequestChannel,
+}
+
+pub(crate) struct PreparedSshProcessCommand {
+    pub(crate) command: std::process::Command,
+    pub(crate) request_channel: RemoteRequestChannel,
+}
 
 #[cfg(unix)]
 fn prepare_remote_exec_ssh(
@@ -178,7 +234,7 @@ fn prepare_remote_exec_ssh(
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
-) -> std::io::Result<RemoteExecSsh> {
+) -> std::io::Result<(RemoteExecSsh, RemoteRequestChannel)> {
     let api_socket = random_socket_path(REMOTE_API_SOCKET_PREFIX)?;
     let request_socket = random_socket_path(REMOTE_REQUEST_SOCKET_PREFIX)?;
     let api_forward = socket_forward(&api_socket, &crate::api::socket_path())?;
@@ -189,13 +245,17 @@ fn prepare_remote_exec_ssh(
         env,
         api_socket: api_socket.clone(),
     };
-    let local_request_socket = start_remote_request_channel(request)?;
+    let request_channel = start_remote_request_channel(request)?;
+    let request_forward = socket_forward(&request_socket, request_channel.path())?;
 
-    Ok(RemoteExecSsh {
-        api_forward,
-        request_forward: socket_forward(&request_socket, &local_request_socket)?,
-        remote_command: remote_exec_command(&shell_path, &request_socket),
-    })
+    Ok((
+        RemoteExecSsh {
+            api_forward,
+            request_forward,
+            remote_command: remote_exec_command(&shell_path, &request_socket),
+        },
+        request_channel,
+    ))
 }
 
 #[cfg(unix)]
@@ -235,7 +295,9 @@ fn remote_exec_command(shell_path: &str, request_socket: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn start_remote_request_channel(request: RemoteExecRequest) -> std::io::Result<PathBuf> {
+fn start_remote_request_channel(
+    request: RemoteExecRequest,
+) -> std::io::Result<RemoteRequestChannel> {
     let payload = encode_remote_exec_request(&request)?;
 
     for _ in 0..REMOTE_SOCKET_BIND_ATTEMPTS {
@@ -255,17 +317,28 @@ fn start_remote_request_channel(request: RemoteExecRequest) -> std::io::Result<P
 
         let cleanup_identity = socket_identity.clone();
         let thread_socket = local_socket.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
         let thread = thread::Builder::new()
             .name("herdr-remote-exec-request".to_string())
             .spawn(move || {
-                serve_remote_exec_request(listener, payload, thread_socket, socket_identity);
+                serve_remote_exec_request(
+                    listener,
+                    payload,
+                    thread_socket,
+                    socket_identity,
+                    thread_cancelled,
+                );
             });
         if let Err(err) = thread {
             let _ = crate::ipc::remove_socket_file_if_owned(&local_socket, &cleanup_identity);
             return Err(err);
         }
 
-        return Ok(local_socket);
+        return Ok(RemoteRequestChannel {
+            path: local_socket,
+            cancelled,
+        });
     }
 
     Err(std::io::Error::new(
@@ -301,9 +374,13 @@ fn serve_remote_exec_request(
     payload: Vec<u8>,
     socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
+    cancelled: Arc<AtomicBool>,
 ) {
     let deadline = Instant::now() + REMOTE_REQUEST_CONNECT_TIMEOUT;
     let result = loop {
+        if cancelled.load(Ordering::Acquire) {
+            break Ok(());
+        }
         match listener.accept() {
             Ok((mut stream, _)) => break write_remote_exec_request(&mut stream, &payload),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -380,7 +457,7 @@ fn read_remote_exec_request(stream: &mut UnixStream) -> std::io::Result<RemoteEx
 #[cfg(unix)]
 fn random_socket_path(prefix: &str) -> std::io::Result<PathBuf> {
     let mut bytes = [0_u8; REMOTE_SOCKET_NONCE_BYTES];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(|err| std::io::Error::other(err.to_string()))?;
 
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut nonce = String::with_capacity(REMOTE_SOCKET_NONCE_BYTES * 2);
@@ -396,7 +473,7 @@ pub(crate) fn ssh_pty_command(
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
-) -> std::io::Result<CommandBuilder> {
+) -> std::io::Result<PreparedSshPtyCommand> {
     let ExecutionTarget::Ssh { host } = target else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -416,12 +493,15 @@ pub(crate) fn ssh_pty_command(
 
     #[cfg(unix)]
     {
-        let remote_exec = prepare_remote_exec_ssh(host, cwd, command, env)?;
+        let (remote_exec, request_channel) = prepare_remote_exec_ssh(host, cwd, command, env)?;
         let mut ssh = CommandBuilder::new("ssh");
         ssh.args(remote_exec.ssh_args(host, true));
         ssh.env("TERM", crate::pane::PANE_TERM);
         ssh.env("COLORTERM", crate::pane::PANE_COLORTERM);
-        Ok(ssh)
+        Ok(PreparedSshPtyCommand {
+            command: ssh,
+            request_channel,
+        })
     }
 }
 
@@ -430,7 +510,7 @@ pub(crate) fn ssh_process_command(
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
-) -> std::io::Result<std::process::Command> {
+) -> std::io::Result<PreparedSshProcessCommand> {
     let ExecutionTarget::Ssh { host } = target else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -450,10 +530,13 @@ pub(crate) fn ssh_process_command(
 
     #[cfg(unix)]
     {
-        let remote_exec = prepare_remote_exec_ssh(host, cwd, command, env)?;
+        let (remote_exec, request_channel) = prepare_remote_exec_ssh(host, cwd, command, env)?;
         let mut ssh = crate::noninteractive_process::command("ssh");
         ssh.args(remote_exec.ssh_args(host, false));
-        Ok(ssh)
+        Ok(PreparedSshProcessCommand {
+            command: ssh,
+            request_channel,
+        })
     }
 }
 
@@ -571,14 +654,23 @@ fn apply_remote_cwd(
     env: &mut Vec<(String, String)>,
 ) -> std::io::Result<PathBuf> {
     let process_cwd = std::env::current_dir()?;
-    let cwd = match cwd {
-        Some(cwd) if cwd.is_absolute() => cwd.to_path_buf(),
-        Some(cwd) => process_cwd.join(cwd),
-        None => process_cwd,
-    };
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    let cwd = resolve_remote_cwd(cwd, &process_cwd, home.as_deref());
     command.current_dir(&cwd);
     crate::platform::set_default_plugin_pane_pwd(env, &cwd);
     Ok(cwd)
+}
+
+#[cfg(unix)]
+fn resolve_remote_cwd(cwd: Option<&Path>, process_cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let requested = cwd.or(home).unwrap_or(process_cwd);
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        process_cwd.join(requested)
+    }
 }
 
 #[cfg(unix)]
@@ -668,52 +760,14 @@ fn remote_shell_is_login(mode: crate::config::ShellModeConfig) -> bool {
     }
 }
 
-static SSH_HOSTNAME_CACHE: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn ssh_authority_matches(
-    authority: &str,
-    destination: &str,
-    effective_hostname: Option<&str>,
-) -> bool {
-    let destination_host = destination
+fn ssh_destination_host(destination: &str) -> &str {
+    destination
         .rsplit_once('@')
-        .map_or(destination, |(_, host)| host);
-    authority.eq_ignore_ascii_case(destination_host)
-        || effective_hostname.is_some_and(|host| authority.eq_ignore_ascii_case(host))
-}
-
-fn effective_ssh_hostname_matches(authority: &str, destination: &str) -> bool {
-    if validate_ssh_host(destination).is_err() {
-        return false;
-    }
-    cached_ssh_hostname_matches_with(
-        &SSH_HOSTNAME_CACHE,
-        authority,
-        destination,
-        query_ssh_hostname,
-    )
-}
-
-fn cached_ssh_hostname_matches_with(
-    cache: &Mutex<HashMap<String, Option<String>>>,
-    authority: &str,
-    destination: &str,
-    resolve: impl FnOnce(&str) -> Option<String>,
-) -> bool {
-    let Ok(mut cache) = cache.lock() else {
-        return false;
-    };
-    if let Some(hostname) = cache.get(destination) {
-        return ssh_authority_matches(authority, destination, hostname.as_deref());
-    }
-    let hostname = resolve(destination);
-    let matches = ssh_authority_matches(authority, destination, hostname.as_deref());
-    cache.insert(destination.to_string(), hostname);
-    matches
+        .map_or(destination, |(_, host)| host)
 }
 
 fn query_ssh_hostname(destination: &str) -> Option<String> {
+    validate_ssh_host(destination).ok()?;
     let output = crate::noninteractive_process::command("ssh")
         .args(["-G", destination])
         .stdin(Stdio::null())
@@ -821,6 +875,15 @@ mod tests {
         let resolved = apply_remote_cwd(&mut command, Some(relative), &mut env).unwrap();
         assert_eq!(resolved, std::env::current_dir().unwrap().join(relative));
         assert!(resolved.is_absolute());
+
+        assert_eq!(
+            resolve_remote_cwd(
+                None,
+                Path::new("/remote/process-cwd"),
+                Some(Path::new("/home/remote"))
+            ),
+            Path::new("/home/remote")
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -885,38 +948,22 @@ mod tests {
     }
 
     #[test]
-    fn osc7_authority_accepts_actual_local_and_remote_hostnames() {
-        assert!(
-            ExecutionTarget::Local.accepts_osc7_authority_with_local_hostname(
-                Some("LOCAL-NODE"),
-                None,
-                Some("local-node"),
-            )
-        );
-        assert!(
-            !ExecutionTarget::Local.accepts_osc7_authority_with_local_hostname(
-                Some("other-node"),
-                None,
-                Some("local-node"),
-            )
-        );
+    fn osc7_authority_uses_only_precomputed_and_runtime_hostnames() {
+        let local =
+            ExecutionTarget::Local.osc7_authority_with(Some("local-node".to_string()), None);
+        assert!(local.accepts(Some("LOCAL-NODE"), None));
+        assert!(!local.accepts(Some("other-node"), None));
 
-        let remote = ExecutionTarget::ssh("build-alias").unwrap();
-        assert!(remote.accepts_osc7_authority_with_local_hostname(
-            Some("ACTUAL-NODE"),
-            Some("actual-node"),
-            Some("local-node"),
-        ));
-        assert!(remote.accepts_osc7_authority_with_local_hostname(
-            None,
-            Some("actual-node"),
-            Some("local-node"),
-        ));
-        assert!(remote.accepts_osc7_authority_with_local_hostname(
-            Some("localhost"),
-            Some("actual-node"),
-            Some("local-node"),
-        ));
+        let remote = ExecutionTarget::ssh("deploy@build-alias")
+            .unwrap()
+            .osc7_authority_with(None, Some("real.example.com".to_string()));
+        assert!(remote.accepts(Some("BUILD-ALIAS"), None));
+        assert!(remote.accepts(Some("REAL.EXAMPLE.COM"), None));
+        assert!(remote.accepts(Some("ACTUAL-NODE"), Some("actual-node")));
+        assert!(remote.accepts(None, Some("actual-node")));
+        assert!(remote.accepts(Some("localhost"), Some("actual-node")));
+        assert!(!remote.accepts(Some("deploy@build-alias"), None));
+        assert!(!remote.accepts(Some("other-node"), None));
     }
 
     #[test]
@@ -929,35 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_authority_matching_uses_destination_host_without_user_prefix() {
-        assert!(ssh_authority_matches(
-            "BUILD-HOST",
-            "deploy@build-host",
-            None
-        ));
-        assert!(!ssh_authority_matches(
-            "deploy@build-host",
-            "deploy@build-host",
-            None
-        ));
-        assert!(!ssh_authority_matches(
-            "other-host",
-            "deploy@build-host",
-            None
-        ));
-        assert!(ssh_authority_matches(
-            "REAL.EXAMPLE.COM",
-            "build-alias",
-            Some("real.example.com")
-        ));
-        assert!(!ssh_authority_matches(
-            "real.example.com",
-            "build-alias",
-            None
-        ));
-    }
-
-    #[test]
     fn ssh_config_hostname_parser_requires_one_hostname_value() {
         let output = "host build-alias\nuser deploy\nhostname Real.Example.COM\nport 22\n";
         assert_eq!(parse_ssh_config_hostname(output), Some("Real.Example.COM"));
@@ -967,37 +985,6 @@ mod tests {
             parse_ssh_config_hostname("hostname real.example.com extra\n"),
             None
         );
-    }
-
-    #[test]
-    fn ssh_hostname_cache_caches_successes_and_failures_per_destination() {
-        let cache = Mutex::new(HashMap::new());
-        let calls = std::cell::Cell::new(0);
-
-        for _ in 0..2 {
-            assert!(cached_ssh_hostname_matches_with(
-                &cache,
-                "real.example.com",
-                "build-alias",
-                |destination| {
-                    calls.set(calls.get() + 1);
-                    (destination == "build-alias").then(|| "real.example.com".to_string())
-                }
-            ));
-        }
-        for _ in 0..2 {
-            assert!(!cached_ssh_hostname_matches_with(
-                &cache,
-                "missing.example.com",
-                "missing-alias",
-                |_| {
-                    calls.set(calls.get() + 1);
-                    None
-                }
-            ));
-        }
-
-        assert_eq!(calls.get(), 2);
     }
 
     #[cfg(unix)]
@@ -1032,6 +1019,33 @@ mod tests {
 
         drop(listener);
         crate::ipc::remove_socket_file_if_owned(&socket, &identity).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_request_channel_cancels_listener_and_removes_socket() {
+        let request = RemoteExecRequest {
+            cwd: PathBuf::new(),
+            command: RemoteCommand::Shell,
+            env: Vec::new(),
+            api_socket: PathBuf::from(
+                "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
+            ),
+        };
+        let channel = start_remote_request_channel(request).unwrap();
+        let socket = channel.path().to_path_buf();
+        assert!(socket.exists());
+
+        drop(channel);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while socket.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !socket.exists(),
+            "cancelled listener socket was not reclaimed"
+        );
     }
 
     #[cfg(unix)]

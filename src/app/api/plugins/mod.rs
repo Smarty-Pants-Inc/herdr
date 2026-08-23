@@ -21,7 +21,7 @@ use crate::api::schema::PluginCommandStatus;
 pub(crate) use env::{ensure_plugin_user_dirs, plugin_path_env};
 pub(crate) use manifest::load_plugin_manifest;
 pub(crate) use manifest::{effective_platforms, ensure_platform_supported};
-pub(crate) use panes::ClientPrivatePluginPopupSpec;
+pub(crate) use panes::{ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec};
 #[cfg(test)]
 use runtime::{read_capped_plugin_output, MAX_PLUGIN_COMMANDS_IN_FLIGHT};
 

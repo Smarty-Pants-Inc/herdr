@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
 
+pub(crate) const PENDING_AGENT_RESUME_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(60);
+const PENDING_AGENT_RESUME_RETIRED_PID_LIMIT: usize = 32;
+
 #[path = "metadata.rs"]
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
@@ -151,6 +154,7 @@ pub struct TerminalState {
     pending_agent_resume_attempt_live: bool,
     pending_agent_resume_attempt_pid: Option<u32>,
     pending_agent_resume_retired_pids: Vec<u32>,
+    pending_agent_resume_confirmation_deadline: Option<Instant>,
 }
 
 impl TerminalState {
@@ -188,6 +192,7 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             pending_agent_resume_attempt_live: false,
             pending_agent_resume_attempt_pid: None,
+            pending_agent_resume_confirmation_deadline: None,
             pending_agent_resume_retired_pids: Vec::new(),
         }
     }
@@ -301,40 +306,62 @@ impl TerminalState {
         plan: crate::agent_resume::AgentResumePlan,
     ) -> Self {
         self.pending_agent_resume_plan = Some(plan);
-        self.pending_agent_resume_attempt_live = false;
-        self.pending_agent_resume_attempt_pid = None;
+        self.clear_pending_agent_resume_attempt_live();
         self.pending_agent_resume_retired_pids.clear();
         self.respawn_shell_on_exit = false;
         self
     }
 
-    pub(crate) fn mark_pending_agent_resume_attempt_live(&mut self, child_pid: u32) -> bool {
+    pub(crate) fn mark_pending_agent_resume_attempt_live(
+        &mut self,
+        child_pid: u32,
+        now: Instant,
+    ) -> bool {
         let valid = self.pending_agent_resume_plan.is_some()
             && child_pid > 0
             && !self.pending_agent_resume_retired_pids.contains(&child_pid);
         self.pending_agent_resume_attempt_live = valid;
         self.pending_agent_resume_attempt_pid = valid.then_some(child_pid);
+        self.pending_agent_resume_confirmation_deadline =
+            valid.then_some(now + PENDING_AGENT_RESUME_CONFIRMATION_TIMEOUT);
         valid
     }
 
     pub(crate) fn clear_pending_agent_resume_attempt_live(&mut self) {
         self.pending_agent_resume_attempt_live = false;
         self.pending_agent_resume_attempt_pid = None;
+        self.pending_agent_resume_confirmation_deadline = None;
     }
 
     pub(crate) fn retire_pending_agent_resume_attempt(&mut self) {
-        if let Some(pid) = self.pending_agent_resume_attempt_pid.take() {
+        if let Some(pid) = self.pending_agent_resume_attempt_pid {
             if !self.pending_agent_resume_retired_pids.contains(&pid) {
+                if self.pending_agent_resume_retired_pids.len()
+                    == PENDING_AGENT_RESUME_RETIRED_PID_LIMIT
+                {
+                    self.pending_agent_resume_retired_pids.remove(0);
+                }
                 self.pending_agent_resume_retired_pids.push(pid);
             }
         }
-        self.pending_agent_resume_attempt_live = false;
+        self.clear_pending_agent_resume_attempt_live();
     }
 
     pub(crate) fn pending_agent_resume_attempt_matches_peer(&self, peer_pid: Option<u32>) -> bool {
         self.pending_agent_resume_attempt_live
             && peer_pid.is_some()
             && self.pending_agent_resume_attempt_pid == peer_pid
+    }
+
+    pub(crate) fn pending_agent_resume_confirmation_deadline(&self) -> Option<Instant> {
+        self.pending_agent_resume_confirmation_deadline
+    }
+
+    pub(crate) fn pending_agent_resume_confirmation_due(&self, now: Instant) -> bool {
+        self.pending_agent_resume_attempt_live
+            && self
+                .pending_agent_resume_confirmation_deadline
+                .is_some_and(|deadline| now >= deadline)
     }
 
     #[cfg(unix)]
@@ -358,13 +385,17 @@ impl TerminalState {
         plan: Option<crate::agent_resume::AgentResumePlan>,
         attempt_live: bool,
         attempt_pid: Option<u32>,
-        retired_pids: Vec<u32>,
+        mut retired_pids: Vec<u32>,
+        now: Instant,
     ) {
         self.pending_agent_resume_plan = plan;
         if self.pending_agent_resume_plan.is_some() {
             self.respawn_shell_on_exit = false;
         }
-        self.pending_agent_resume_retired_pids = retired_pids;
+        let keep_from = retired_pids
+            .len()
+            .saturating_sub(PENDING_AGENT_RESUME_RETIRED_PID_LIMIT);
+        self.pending_agent_resume_retired_pids = retired_pids.split_off(keep_from);
         let valid = self.pending_agent_resume_plan.is_some()
             && attempt_live
             && attempt_pid.is_some_and(|pid| {
@@ -372,6 +403,8 @@ impl TerminalState {
             });
         self.pending_agent_resume_attempt_live = valid;
         self.pending_agent_resume_attempt_pid = valid.then_some(attempt_pid).flatten();
+        self.pending_agent_resume_confirmation_deadline =
+            valid.then_some(now + PENDING_AGENT_RESUME_CONFIRMATION_TIMEOUT);
     }
 
     pub(crate) fn confirm_remote_execution_ready(&mut self) -> bool {
@@ -1507,8 +1540,7 @@ impl TerminalState {
             });
         if matches {
             self.pending_agent_resume_plan = None;
-            self.pending_agent_resume_attempt_live = false;
-            self.pending_agent_resume_attempt_pid = None;
+            self.clear_pending_agent_resume_attempt_live();
             self.pending_agent_resume_retired_pids.clear();
         }
         matches
@@ -2233,8 +2265,7 @@ impl TerminalState {
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
-        self.pending_agent_resume_attempt_live = false;
-        self.pending_agent_resume_attempt_pid = None;
+        self.clear_pending_agent_resume_attempt_live();
         self.pending_agent_resume_retired_pids.clear();
         self.clear_agent_name();
     }
@@ -3687,7 +3718,7 @@ mod tests {
         });
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &expected);
-        assert!(terminal.mark_pending_agent_resume_attempt_live(41));
+        assert!(terminal.mark_pending_agent_resume_attempt_live(41, Instant::now()));
 
         terminal
             .set_agent_session_ref_for_session_start(
@@ -3727,7 +3758,7 @@ mod tests {
         });
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &session_ref);
-        assert!(terminal.mark_pending_agent_resume_attempt_live(42));
+        assert!(terminal.mark_pending_agent_resume_attempt_live(42, Instant::now()));
 
         let confirmed = terminal
             .set_agent_session_ref_for_session_start(
@@ -3741,6 +3772,30 @@ mod tests {
 
         assert!(confirmed.session_ref_changed);
         assert!(terminal.pending_agent_resume_plan.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_resume_attempt_pids_are_bounded_and_oldest_reclaimed() {
+        let mut terminal = test_terminal().with_execution_target(
+            crate::execution::ExecutionTarget::ssh("dev1").expect("valid SSH host"),
+        );
+        let session_ref = crate::agent_resume::AgentSessionRef::id("codex-session").unwrap();
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:codex", "codex", &session_ref);
+        let now = Instant::now();
+
+        for pid in 1..=(PENDING_AGENT_RESUME_RETIRED_PID_LIMIT as u32 + 2) {
+            assert!(terminal.mark_pending_agent_resume_attempt_live(pid, now));
+            terminal.retire_pending_agent_resume_attempt();
+        }
+
+        assert_eq!(
+            terminal.pending_agent_resume_retired_pids().len(),
+            PENDING_AGENT_RESUME_RETIRED_PID_LIMIT
+        );
+        assert_eq!(terminal.pending_agent_resume_retired_pids()[0], 3);
+        assert!(terminal.mark_pending_agent_resume_attempt_live(1, now));
     }
 
     #[test]

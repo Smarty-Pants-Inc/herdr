@@ -592,22 +592,6 @@ fn restore_tab(
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
                 )
-            } else if execution_target.is_local() {
-                TerminalRuntime::spawn_with_initial_history(
-                    *id,
-                    rows,
-                    cols,
-                    cwd.clone(),
-                    runtime_context.scrollback_limit_bytes,
-                    crate::terminal_theme::TerminalTheme::default(),
-                    None,
-                    runtime_context.shell_config,
-                    &launch_env,
-                    startup.initial_history_ansi,
-                    runtime_context.events.clone(),
-                    runtime_context.render_notify.clone(),
-                    runtime_context.render_dirty.clone(),
-                )
             } else {
                 TerminalRuntime::spawn_with_initial_history_on(
                     *id,
@@ -628,42 +612,22 @@ fn restore_tab(
             }
 
             #[cfg(not(unix))]
-            {
-                if execution_target.is_local() {
-                    TerminalRuntime::spawn_with_initial_history(
-                        *id,
-                        rows,
-                        cols,
-                        cwd.clone(),
-                        runtime_context.scrollback_limit_bytes,
-                        crate::terminal_theme::TerminalTheme::default(),
-                        None,
-                        runtime_context.shell_config,
-                        &launch_env,
-                        startup.initial_history_ansi,
-                        runtime_context.events.clone(),
-                        runtime_context.render_notify.clone(),
-                        runtime_context.render_dirty.clone(),
-                    )
-                } else {
-                    TerminalRuntime::spawn_with_initial_history_on(
-                        *id,
-                        rows,
-                        cols,
-                        cwd.clone(),
-                        &execution_target,
-                        runtime_context.scrollback_limit_bytes,
-                        crate::terminal_theme::TerminalTheme::default(),
-                        None,
-                        runtime_context.shell_config,
-                        &launch_env,
-                        startup.initial_history_ansi,
-                        runtime_context.events.clone(),
-                        runtime_context.render_notify.clone(),
-                        runtime_context.render_dirty.clone(),
-                    )
-                }
-            }
+            TerminalRuntime::spawn_with_initial_history_on(
+                *id,
+                rows,
+                cols,
+                cwd.clone(),
+                &execution_target,
+                runtime_context.scrollback_limit_bytes,
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                runtime_context.shell_config,
+                &launch_env,
+                startup.initial_history_ansi,
+                runtime_context.events.clone(),
+                runtime_context.render_notify.clone(),
+                runtime_context.render_dirty.clone(),
+            )
         };
 
         match runtime_result {
@@ -692,6 +656,7 @@ fn restore_tab(
                         pending_attempt_live,
                         pending_attempt_pid,
                         retired_attempt_pids,
+                        std::time::Instant::now(),
                     );
                     if !has_pending_plan {
                         if let Some(respawn_shell_on_exit) = respawn_shell_on_exit {

@@ -1,11 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use ratatui::layout::Rect;
 
 use super::App;
-
-const PENDING_REMOTE_AGENT_RESUME_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct PendingAgentResumeCandidate {
     pane_id: crate::layout::PaneId,
@@ -18,32 +16,7 @@ struct PendingAgentResumeCandidate {
 }
 
 impl App {
-    pub(crate) fn has_pending_agent_resumes(&self) -> bool {
-        self.state.terminals.values().any(|terminal| {
-            terminal.pending_agent_resume_plan.is_some()
-                || (terminal.respawn_shell_on_exit
-                    && self.terminal_runtimes.get(&terminal.id).is_none())
-        })
-    }
-
-    fn has_unconfirmed_remote_agent_resumes(&self) -> bool {
-        self.state.terminals.values().any(|terminal| {
-            !terminal.execution_target.is_local()
-                && terminal.pending_agent_resume_plan.is_some()
-                && self
-                    .terminal_runtimes
-                    .get(&terminal.id)
-                    .is_some_and(|runtime| {
-                        terminal.pending_agent_resume_attempt_matches_peer(runtime.child_pid())
-                    })
-        })
-    }
-
     fn retry_timed_out_remote_agent_resumes(&mut self, now: Instant) -> bool {
-        if !self.pending_agent_resume_due(now) {
-            return false;
-        }
-
         let pane_ids = self
             .state
             .workspaces
@@ -59,6 +32,7 @@ impl App {
                 };
                 !terminal.execution_target.is_local()
                     && terminal.pending_agent_resume_plan.is_some()
+                    && terminal.pending_agent_resume_confirmation_due(now)
                     && self
                         .terminal_runtimes
                         .get(&terminal_id)
@@ -82,31 +56,38 @@ impl App {
         true
     }
 
-    pub(crate) fn sync_pending_agent_resume_deadline(&mut self, now: Instant) {
-        if !self.has_pending_agent_resumes() {
-            self.pending_agent_resume_deadline = None;
-            return;
-        }
-        if self.has_unconfirmed_remote_agent_resumes() {
-            self.pending_agent_resume_deadline
-                .get_or_insert(now + PENDING_REMOTE_AGENT_RESUME_CONFIRMATION_TIMEOUT);
-            return;
-        }
+    pub(crate) fn sync_pending_agent_resume_retry_at(&mut self, now: Instant) {
         if self.pending_agent_resume_candidates().is_empty() {
-            self.pending_agent_resume_deadline = None;
-            return;
+            self.pending_agent_resume_retry_at = None;
+        } else {
+            self.pending_agent_resume_retry_at
+                .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
         }
-        self.pending_agent_resume_deadline
-            .get_or_insert(now + super::PENDING_AGENT_RESUME_THEME_WAIT);
     }
 
-    pub(crate) fn pending_agent_resume_due(&self, now: Instant) -> bool {
-        self.pending_agent_resume_deadline
+    pub(crate) fn pending_agent_resume_retry_due(&self, now: Instant) -> bool {
+        self.pending_agent_resume_retry_at
             .is_some_and(|deadline| now >= deadline)
     }
 
-    pub(crate) fn start_pending_agent_resumes(&mut self, allow_empty_theme: bool) -> bool {
-        if self.retry_timed_out_remote_agent_resumes(Instant::now()) {
+    pub(crate) fn next_pending_agent_resume_deadline(&self) -> Option<Instant> {
+        std::iter::once(self.pending_agent_resume_retry_at)
+            .chain(
+                self.state
+                    .terminals
+                    .values()
+                    .map(|terminal| terminal.pending_agent_resume_confirmation_deadline()),
+            )
+            .flatten()
+            .min()
+    }
+
+    pub(crate) fn start_pending_agent_resumes(
+        &mut self,
+        now: Instant,
+        allow_empty_theme: bool,
+    ) -> bool {
+        if self.retry_timed_out_remote_agent_resumes(now) {
             self.schedule_session_save();
             return true;
         }
@@ -134,6 +115,7 @@ impl App {
                 plan,
                 rows,
                 cols,
+                now,
                 allow_empty_theme,
             );
         }
@@ -141,11 +123,8 @@ impl App {
         if changed {
             self.schedule_session_save();
         }
-        if !self.has_pending_agent_resumes()
-            || (!self.has_unconfirmed_remote_agent_resumes()
-                && self.pending_agent_resume_candidates().is_empty())
-        {
-            self.pending_agent_resume_deadline = None;
+        if self.pending_agent_resume_candidates().is_empty() {
+            self.pending_agent_resume_retry_at = None;
         }
         changed
     }
@@ -276,16 +255,14 @@ impl App {
             plan,
             rows,
             cols,
+            Instant::now(),
             allow_empty_theme,
         );
         if changed {
             self.schedule_session_save();
         }
-        if !self.has_pending_agent_resumes()
-            || (!self.has_unconfirmed_remote_agent_resumes()
-                && self.pending_agent_resume_candidates().is_empty())
-        {
-            self.pending_agent_resume_deadline = None;
+        if self.pending_agent_resume_candidates().is_empty() {
+            self.pending_agent_resume_retry_at = None;
         }
         changed
     }
@@ -299,13 +276,13 @@ impl App {
         plan: Option<crate::agent_resume::AgentResumePlan>,
         rows: u16,
         cols: u16,
+        now: Instant,
         allow_empty_theme: bool,
     ) -> bool {
         let host_terminal_theme = self.state.host_terminal_theme;
         if host_terminal_theme.is_empty() && !allow_empty_theme {
             return false;
         }
-        let awaiting_remote_resume_confirmation = self.has_unconfirmed_remote_agent_resumes();
 
         let resume_command = if let Some(plan) = plan.as_ref() {
             let Some(command) = shell_command_from_argv(&plan.argv) else {
@@ -382,7 +359,7 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             if plan.is_some() && !execution_target.is_local() {
                 rejected_attempt_identity = !attempt_pid
-                    .is_some_and(|pid| terminal.mark_pending_agent_resume_attempt_live(pid));
+                    .is_some_and(|pid| terminal.mark_pending_agent_resume_attempt_live(pid, now));
             } else {
                 terminal.clear_pending_agent_resume_attempt_live();
             }
@@ -405,23 +382,11 @@ impl App {
             return false;
         }
         self.terminal_runtimes.insert(terminal_id, runtime);
-        if plan.is_some() && !execution_target.is_local() {
-            if awaiting_remote_resume_confirmation {
-                self.pending_agent_resume_deadline.get_or_insert(
-                    Instant::now() + PENDING_REMOTE_AGENT_RESUME_CONFIRMATION_TIMEOUT,
-                );
-            } else {
-                self.pending_agent_resume_deadline =
-                    Some(Instant::now() + PENDING_REMOTE_AGENT_RESUME_CONFIRMATION_TIMEOUT);
-            }
-        }
         true
     }
     fn reschedule_pending_agent_resume_retry(&mut self) {
-        if !self.has_unconfirmed_remote_agent_resumes() {
-            self.pending_agent_resume_deadline =
-                Some(Instant::now() + super::PENDING_AGENT_RESUME_THEME_WAIT);
-        }
+        self.pending_agent_resume_retry_at =
+            Some(Instant::now() + super::PENDING_AGENT_RESUME_THEME_WAIT);
     }
 }
 
@@ -552,63 +517,67 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unconfirmed_remote_agent_resume_times_out_and_requeues() {
+    async fn remote_agent_resume_confirmation_deadlines_are_per_terminal() {
         let mut app = test_app();
-        let workspace = crate::workspace::Workspace::test_new("remote-resume");
-        let pane_id = workspace.tabs[0].root_pane;
-        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
-        app.state.workspaces = vec![workspace];
+        let first_workspace = crate::workspace::Workspace::test_new("remote-resume-1");
+        let first_pane = first_workspace.tabs[0].root_pane;
+        let first_terminal = first_workspace.terminal_id(first_pane).cloned().unwrap();
+        let second_workspace = crate::workspace::Workspace::test_new("remote-resume-2");
+        let second_pane = second_workspace.tabs[0].root_pane;
+        let second_terminal = second_workspace.terminal_id(second_pane).cloned().unwrap();
+        app.state.workspaces = vec![first_workspace, second_workspace];
         app.state.ensure_test_terminals();
 
-        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-        runtime.test_set_child_pid(101);
-        {
-            let terminal = app
-                .state
-                .terminals
-                .get_mut(&terminal_id)
-                .expect("test terminal should exist");
+        let now = Instant::now();
+        for (terminal_id, pid, started_at) in [
+            (&first_terminal, 101, now),
+            (
+                &second_terminal,
+                202,
+                now + std::time::Duration::from_secs(10),
+            ),
+        ] {
+            let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
             terminal.execution_target = crate::execution::ExecutionTarget::ssh("dev1").unwrap();
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
-                dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+                dedupe_key: format!("herdr:codex\0codex\0Id\0{pid}"),
             });
-            assert!(terminal.mark_pending_agent_resume_attempt_live(101));
+            assert!(terminal.mark_pending_agent_resume_attempt_live(pid, started_at));
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            runtime.test_set_child_pid(pid);
+            app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         }
-        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
-        let now = Instant::now();
-        app.sync_pending_agent_resume_deadline(now);
-        let confirmation_deadline = app
-            .pending_agent_resume_deadline
-            .expect("unconfirmed remote resume should have a deadline");
+        let first_deadline = app.state.terminals[&first_terminal]
+            .pending_agent_resume_confirmation_deadline()
+            .unwrap();
+        let second_deadline = app.state.terminals[&second_terminal]
+            .pending_agent_resume_confirmation_deadline()
+            .unwrap();
+        assert!(first_deadline < second_deadline);
+        app.pending_agent_resume_retry_at =
+            Some(second_deadline + std::time::Duration::from_secs(1));
         assert_eq!(
-            confirmation_deadline,
-            now + PENDING_REMOTE_AGENT_RESUME_CONFIRMATION_TIMEOUT
-        );
-        assert!(!app.start_pending_agent_resumes(false));
-        assert_eq!(
-            app.pending_agent_resume_deadline,
-            Some(confirmation_deadline),
-            "an injected remote resume must keep waiting for confirmation"
+            app.next_pending_agent_resume_deadline(),
+            Some(first_deadline)
         );
 
-        app.pending_agent_resume_deadline =
-            Some(Instant::now() - std::time::Duration::from_millis(1));
-        assert!(app.start_pending_agent_resumes(false));
-        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
-        let terminal = app
-            .state
-            .terminals
-            .get(&terminal_id)
-            .expect("terminal should survive a timed out retry");
-        assert!(terminal.pending_agent_resume_plan.is_some());
-        assert!(!terminal.pending_agent_resume_attempt_matches_peer(Some(101)));
-        assert_eq!(terminal.pending_agent_resume_retired_pids(), &[101]);
-        assert!(app
-            .pending_agent_resume_deadline
-            .is_some_and(|deadline| deadline > Instant::now()));
+        assert!(app.start_pending_agent_resumes(first_deadline, false));
+        assert!(app.terminal_runtimes.get(&first_terminal).is_none());
+        assert!(app.terminal_runtimes.get(&second_terminal).is_some());
+        let first = &app.state.terminals[&first_terminal];
+        assert!(first.pending_agent_resume_plan.is_some());
+        assert!(!first.pending_agent_resume_attempt_matches_peer(Some(101)));
+        assert_eq!(first.pending_agent_resume_retired_pids(), &[101]);
+        assert!(app.state.terminals[&second_terminal]
+            .pending_agent_resume_attempt_matches_peer(Some(202)));
+
+        app.terminal_runtimes
+            .remove(&second_terminal)
+            .unwrap()
+            .shutdown();
     }
 
     #[cfg(unix)]
@@ -637,7 +606,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        assert!(!app.start_pending_agent_resumes(false));
+        assert!(!app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
 
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
@@ -654,7 +623,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&terminal_id).is_some());
         let terminal = app
             .state
@@ -711,7 +680,7 @@ mod tests {
             .expect("test terminal should exist")
             .respawn_shell_on_exit = true;
 
-        assert!(app.start_pending_agent_resumes(true));
+        assert!(app.start_pending_agent_resumes(Instant::now(), true));
         assert!(app.terminal_runtimes.get(&terminal_id).is_some());
         let terminal = &app.state.terminals[&terminal_id];
         assert!(!terminal.respawn_shell_on_exit);
@@ -746,9 +715,10 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        app.sync_pending_agent_resume_deadline(std::time::Instant::now());
-        assert!(!app.start_pending_agent_resumes(false));
-        assert!(app.start_pending_agent_resumes(true));
+        let now = Instant::now();
+        app.sync_pending_agent_resume_retry_at(now);
+        assert!(!app.start_pending_agent_resumes(now, false));
+        assert!(app.start_pending_agent_resumes(now, true));
         assert!(app.terminal_runtimes.get(&terminal_id).is_some());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
@@ -797,14 +767,14 @@ mod tests {
                 dedupe_key: format!("herdr:codex\0codex\0Id\0{terminal_id}"),
             });
         }
-        app.pending_agent_resume_deadline =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        app.pending_agent_resume_retry_at =
+            Some(Instant::now() - std::time::Duration::from_millis(1));
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&active_terminal).is_some());
         assert!(app.terminal_runtimes.get(&hidden_terminal).is_some());
         assert!(
-            app.pending_agent_resume_deadline.is_none(),
+            app.pending_agent_resume_retry_at.is_none(),
             "launched pending resumes should clear the wakeup deadline"
         );
 
@@ -861,7 +831,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&inactive_terminal).is_some());
         assert!(
             app.state
@@ -922,7 +892,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert!(app.terminal_runtimes.get(&hidden_terminal).is_some());
         assert!(
             app.state
@@ -980,9 +950,10 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        app.sync_pending_agent_resume_deadline(std::time::Instant::now());
-        assert!(app.pending_agent_resume_deadline.is_some());
-        assert!(app.start_pending_agent_resumes(false));
+        let now = Instant::now();
+        app.sync_pending_agent_resume_retry_at(now);
+        assert!(app.pending_agent_resume_retry_at.is_some());
+        assert!(app.start_pending_agent_resumes(now, false));
         assert!(app.terminal_runtimes.get(&previous_terminal).is_some());
         assert!(
             app.state
@@ -1041,7 +1012,7 @@ mod tests {
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         assert_eq!(
             app.terminal_runtimes
                 .get(&terminal_id)

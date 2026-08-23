@@ -138,16 +138,19 @@ impl App {
         let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let child = if let Some((program, args)) = local_command {
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .env_remove("HERDR_VIEW_ID")
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+            let (child, remote_request_channel) = if let Some((program, args)) = local_command {
+                (
+                    crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
+                        .env_remove("HERDR_VIEW_ID")
+                        .envs(env)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn(),
+                    None,
+                )
             } else {
                 let action_id = action_id_for_launch.expect("remote plugin action requires id");
-                crate::execution::ssh_process_command(
+                match crate::execution::ssh_process_command(
                     &execution_target,
                     std::path::Path::new(""),
                     crate::execution::RemoteCommand::Plugin {
@@ -158,13 +161,17 @@ impl App {
                         },
                     },
                     env,
-                )
-                .and_then(|mut command| {
-                    command
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                })
+                ) {
+                    Ok(mut prepared) => (
+                        prepared
+                            .command
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn(),
+                        Some(prepared.request_channel),
+                    ),
+                    Err(err) => (Err(err), None),
+                }
             };
             let finished = match child {
                 Ok(mut child) => {
@@ -180,7 +187,11 @@ impl App {
                             read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
                         })
                     });
-                    match child.wait() {
+                    let status = child.wait();
+                    if let Some(channel) = remote_request_channel {
+                        channel.cancel();
+                    }
+                    match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
@@ -207,14 +218,19 @@ impl App {
                         },
                     }
                 }
-                Err(err) => crate::events::AppEvent::PluginCommandFinished {
-                    log_id,
-                    finished_unix_ms: current_unix_ms(),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(err.to_string()),
-                },
+                Err(err) => {
+                    if let Some(channel) = remote_request_channel {
+                        channel.cancel();
+                    }
+                    crate::events::AppEvent::PluginCommandFinished {
+                        log_id,
+                        finished_unix_ms: current_unix_ms(),
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(err.to_string()),
+                    }
+                }
             };
             let _ = event_tx.blocking_send(finished);
         });

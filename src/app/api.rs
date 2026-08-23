@@ -601,7 +601,7 @@ impl App {
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
             runtime.shutdown();
         }
-        self.pending_agent_resume_deadline =
+        self.pending_agent_resume_retry_at =
             Some(Instant::now() + super::PENDING_AGENT_RESUME_THEME_WAIT);
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
@@ -2383,7 +2383,7 @@ mod tests {
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_set_child_pid(17);
-        assert!(terminal.mark_pending_agent_resume_attempt_live(17));
+        assert!(terminal.mark_pending_agent_resume_attempt_live(17, Instant::now()));
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
 
         app.handle_internal_event(AppEvent::PaneDied { pane_id });
@@ -2397,7 +2397,7 @@ mod tests {
             app.state.terminals[&terminal_id].detected_agent,
             Some(Agent::Codex)
         );
-        assert!(app.pending_agent_resume_deadline.is_some());
+        assert!(app.pending_agent_resume_retry_at.is_some());
 
         let stale = app
             .state
@@ -2450,7 +2450,7 @@ mod tests {
         assert!(app.find_pane(pane_id).is_some());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
         assert!(app.state.terminals[&terminal_id].respawn_shell_on_exit);
-        assert!(app.pending_agent_resume_deadline.is_some_and(|deadline| {
+        assert!(app.pending_agent_resume_retry_at.is_some_and(|deadline| {
             deadline >= before + crate::app::PENDING_AGENT_RESUME_THEME_WAIT
         }));
 
@@ -2524,7 +2524,7 @@ mod tests {
 
         assert!(app.find_pane(pane_id).is_none());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
-        assert!(app.pending_agent_resume_deadline.is_none());
+        assert!(app.pending_agent_resume_retry_at.is_none());
     }
 
     #[tokio::test]
@@ -2606,10 +2606,10 @@ mod tests {
         terminal.execution_target = crate::execution::ExecutionTarget::ssh("dev1").unwrap();
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &session_ref);
-        assert!(terminal.mark_pending_agent_resume_attempt_live(101));
+        assert!(terminal.mark_pending_agent_resume_attempt_live(101, Instant::now()));
         terminal.retire_pending_agent_resume_attempt();
         assert!(
-            !terminal.mark_pending_agent_resume_attempt_live(101),
+            !terminal.mark_pending_agent_resume_attempt_live(101, Instant::now()),
             "a retired SSH PID must not be reused as an attempt identity"
         );
         let params = crate::api::schema::PaneReportAgentSessionParams {
@@ -2640,7 +2640,7 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .mark_pending_agent_resume_attempt_live(202));
+            .mark_pending_agent_resume_attempt_live(202, Instant::now()));
         let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_set_child_pid(202);
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);

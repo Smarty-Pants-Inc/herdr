@@ -163,11 +163,13 @@ pane.
 
 `pane.split` also accepts an optional `execution_target`: `{"kind":"local"}`
 or, on Unix, `{"kind":"ssh","host":"HOST"}`. When it is omitted, the new
-pane inherits the source pane's target. A same-target split follows the source
-working directory; a cross-target split uses the destination's default home
-unless `cwd` is explicit. Managed workspace-right plugin callers set
-`caller_pane_id` so a workspace-selected split keeps the plugin's locality
-while using the workspace's focused tiled pane as the insertion point.
+pane inherits the source pane's target. An explicit `target_pane_id` supplies
+both the insertion point and the source target/cwd. Managed workspace-right
+plugin `caller_pane_id` locality applies only to a workspace-selected split
+without an explicit target pane. A same-target split follows the source cwd; a
+cross-target local split uses the configured `terminal.new_cwd`, while a
+cross-target SSH split starts in the remote user's home. Explicit `cwd`
+overrides either default.
 
 Per-pane SSH execution targets are Unix-only. This does not affect whole-server
 `herdr --remote`, which remains available on Windows clients connecting to

@@ -73,7 +73,7 @@ pub(crate) fn load_plugin_manifest(
 }
 pub(crate) use api::plugins::{
     effective_platforms, ensure_platform_supported, ensure_plugin_user_dirs, plugin_path_env,
-    ClientPrivatePluginPopupSpec,
+    ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec,
 };
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
@@ -183,7 +183,7 @@ pub struct App {
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
-    pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    pub(crate) pending_agent_resume_retry_at: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) findr_scan_deadline: Option<Instant>,
@@ -851,7 +851,7 @@ impl App {
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
-            pending_agent_resume_deadline: None,
+            pending_agent_resume_retry_at: None,
             session_save_deadline: None,
             session_save_thread: None,
             detached_process_children: Vec::new(),
@@ -1217,8 +1217,8 @@ impl App {
                         cell_size,
                     )?;
                 }
-                self.sync_pending_agent_resume_deadline(now);
-                if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
+                self.sync_pending_agent_resume_retry_at(now);
+                if self.start_pending_agent_resumes(now, self.pending_agent_resume_retry_due(now)) {
                     self.render_dirty.request_generic();
                     self.render_notify.notify_one();
                 }

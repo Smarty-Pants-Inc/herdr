@@ -267,11 +267,6 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         cmd.env_remove(key);
     }
     cmd.env_remove("HERDR_VIEW_ID");
-    if matches!(&launch_env.identity, PaneLaunchIdentity::NoIdentity) {
-        cmd.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
-        cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-        cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
-    }
     for key in &launch_env.remove {
         cmd.env_remove(key);
     }
@@ -281,11 +276,16 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     if !matches!(&launch_env.identity, PaneLaunchIdentity::NoIdentity) {
         cmd.env_remove("HERDR_VIEW_ID");
     }
+    if matches!(&launch_env.identity, PaneLaunchIdentity::NoIdentity) {
+        cmd.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
+        cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
+        cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
+    }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
     let pane_id = match &launch_env.identity {
-        PaneLaunchIdentity::Inherit => None,
+        PaneLaunchIdentity::Inherit | PaneLaunchIdentity::NoIdentity => None,
         PaneLaunchIdentity::Managed {
             workspace_id,
             tab_id,
@@ -305,17 +305,30 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
             Some(pane_id.as_str())
         }
-        PaneLaunchIdentity::NoIdentity => {
-            cmd.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
-            cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-            cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
-            None
-        }
     };
     if let (Some(bridge), Some(pane_id)) = (&launch_env.omp_bridge, pane_id) {
         cmd.env("HERDR_OMP_BRIDGE", bridge.address());
         cmd.env("HERDR_OMP_BRIDGE_TOKEN", bridge.token(pane_id));
     }
+}
+
+fn pane_argv_command_builder(
+    cwd: &std::path::Path,
+    argv: &[String],
+    launch_env: &PaneLaunchEnv,
+) -> std::io::Result<CommandBuilder> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "argv must not be empty",
+        ));
+    };
+    let mut cmd = CommandBuilder::new(program);
+    cmd.args(args);
+    cmd.cwd(cwd);
+    apply_pane_terminal_env(&mut cmd);
+    apply_pane_launch_env(&mut cmd, launch_env);
+    Ok(cmd)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1784,9 +1797,10 @@ pub(crate) fn usable_reported_cwd(
 fn usable_terminal_reported_cwd(
     (cwd, authority): ReportedCwd,
     execution_target: &crate::execution::ExecutionTarget,
+    osc7_authority: &crate::execution::Osc7Authority,
     remote_hostname: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    if !execution_target.accepts_osc7_authority(authority.as_deref(), remote_hostname) {
+    if !osc7_authority.accepts(authority.as_deref(), remote_hostname) {
         return None;
     }
     usable_reported_cwd(cwd, execution_target)
@@ -1833,11 +1847,13 @@ fn publish_reported_cwd(
     pane_id: PaneId,
     reported: ReportedCwd,
     execution_target: &crate::execution::ExecutionTarget,
+    osc7_authority: &crate::execution::Osc7Authority,
     remote_hostname: Option<&str>,
     reported_cwd: &Arc<Mutex<Option<std::path::PathBuf>>>,
     events: &mpsc::Sender<AppEvent>,
 ) {
-    let Some(cwd) = usable_terminal_reported_cwd(reported, execution_target, remote_hostname)
+    let Some(cwd) =
+        usable_terminal_reported_cwd(reported, execution_target, osc7_authority, remote_hostname)
     else {
         return;
     };
@@ -2044,40 +2060,6 @@ impl PaneRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_with_initial_history(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        shell_config: PaneShellConfig<'_>,
-        launch_env: &PaneLaunchEnv,
-        initial_history_ansi: Option<&str>,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<Self> {
-        Self::spawn_with_initial_history_on(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            &crate::execution::ExecutionTarget::Local,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            launch_env,
-            initial_history_ansi,
-            events,
-            render_notify,
-            render_dirty,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_with_initial_history_on(
         pane_id: PaneId,
         rows: u16,
@@ -2094,25 +2076,24 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (cmd, windows_powershell_prompt_cwd_reporting) = if execution_target.is_local() {
-            let windows_powershell_prompt_cwd_reporting =
-                uses_windows_powershell_pane_shell(shell_config);
-            let mut cmd = pane_shell_command_builder(shell_config)?;
-            cmd.cwd(&cwd);
-            apply_pane_terminal_env(&mut cmd);
-            apply_pane_launch_env(&mut cmd, launch_env);
-            (cmd, windows_powershell_prompt_cwd_reporting)
-        } else {
-            (
-                crate::execution::ssh_pty_command(
+        let (cmd, remote_request_channel, windows_powershell_prompt_cwd_reporting) =
+            if execution_target.is_local() {
+                let windows_powershell_prompt_cwd_reporting =
+                    uses_windows_powershell_pane_shell(shell_config);
+                let mut cmd = pane_shell_command_builder(shell_config)?;
+                cmd.cwd(&cwd);
+                apply_pane_terminal_env(&mut cmd);
+                apply_pane_launch_env(&mut cmd, launch_env);
+                (cmd, None, windows_powershell_prompt_cwd_reporting)
+            } else {
+                let prepared = crate::execution::ssh_pty_command(
                     execution_target,
                     &cwd,
                     crate::execution::RemoteCommand::Shell,
                     launch_env.remote_env(),
-                )?,
-                false,
-            )
-        };
+                )?;
+                (prepared.command, Some(prepared.request_channel), false)
+            };
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2125,6 +2106,7 @@ impl PaneRuntime {
             render_dirty,
             execution_target,
             cmd,
+            remote_request_channel,
             "failed to spawn shell",
             SpawnInitialState {
                 detected_agent: None,
@@ -2186,21 +2168,22 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let cmd = if execution_target.is_local() {
+        let (cmd, remote_request_channel) = if execution_target.is_local() {
             let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
             cmd.cwd(&cwd);
             apply_pane_terminal_env(&mut cmd);
             apply_pane_launch_env(&mut cmd, launch_env);
-            cmd
+            (cmd, None)
         } else {
-            crate::execution::ssh_pty_command(
+            let prepared = crate::execution::ssh_pty_command(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::ShellCommand {
                     command: command.to_string(),
                 },
                 launch_env.remote_env(),
-            )?
+            )?;
+            (prepared.command, Some(prepared.request_channel))
         };
         Self::spawn_command_builder(
             pane_id,
@@ -2214,6 +2197,7 @@ impl PaneRuntime {
             render_dirty,
             execution_target,
             cmd,
+            remote_request_channel,
             "failed to spawn command pane",
             SpawnInitialState::default(),
             agent_detection,
@@ -2271,31 +2255,18 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        if argv.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "argv must not be empty",
-            ));
-        }
-        let cmd = if execution_target.is_local() {
-            let (program, args) = argv.split_first().expect("argv checked above");
-            let mut cmd = CommandBuilder::new(program);
-            for arg in args {
-                cmd.arg(arg);
-            }
-            cmd.cwd(&cwd);
-            apply_pane_terminal_env(&mut cmd);
-            apply_pane_launch_env(&mut cmd, launch_env);
-            cmd
+        let (cmd, remote_request_channel) = if execution_target.is_local() {
+            (pane_argv_command_builder(&cwd, argv, launch_env)?, None)
         } else {
-            crate::execution::ssh_pty_command(
+            let prepared = crate::execution::ssh_pty_command(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::Argv {
                     argv: argv.to_vec(),
                 },
                 launch_env.remote_env(),
-            )?
+            )?;
+            (prepared.command, Some(prepared.request_channel))
         };
         Self::spawn_command_builder(
             pane_id,
@@ -2309,6 +2280,7 @@ impl PaneRuntime {
             render_dirty,
             execution_target,
             cmd,
+            remote_request_channel,
             "failed to spawn argv command pane",
             SpawnInitialState::default(),
             agent_detection,
@@ -2333,35 +2305,25 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        if execution_target.is_local() {
-            return Self::spawn_argv_command_on(
-                pane_id,
-                rows,
-                cols,
-                cwd,
+        let (cmd, remote_request_channel) = if execution_target.is_local() {
+            (
+                pane_argv_command_builder(&cwd, local_argv, launch_env)?,
+                None,
+            )
+        } else {
+            let prepared = crate::execution::ssh_pty_command(
                 execution_target,
-                local_argv,
-                launch_env,
-                agent_detection,
-                scrollback_limit_bytes,
-                host_terminal_theme,
-                host_terminal_appearance,
-                events,
-                render_notify,
-                render_dirty,
-            );
-        }
-        let cmd = crate::execution::ssh_pty_command(
-            execution_target,
-            &cwd,
-            crate::execution::RemoteCommand::Plugin {
-                plugin_id: plugin_id.to_string(),
-                target: crate::plugin_command::PluginCommandTarget::Pane {
-                    entrypoint: entrypoint.to_string(),
+                &cwd,
+                crate::execution::RemoteCommand::Plugin {
+                    plugin_id: plugin_id.to_string(),
+                    target: crate::plugin_command::PluginCommandTarget::Pane {
+                        entrypoint: entrypoint.to_string(),
+                    },
                 },
-            },
-            launch_env.remote_env(),
-        )?;
+                launch_env.remote_env(),
+            )?;
+            (prepared.command, Some(prepared.request_channel))
+        };
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2374,6 +2336,7 @@ impl PaneRuntime {
             render_dirty,
             execution_target,
             cmd,
+            remote_request_channel,
             "failed to spawn plugin command pane",
             SpawnInitialState::default(),
             agent_detection,
@@ -2457,6 +2420,7 @@ impl PaneRuntime {
         ));
         let remote_hostname = Arc::new(Mutex::new(handoff_remote_hostname));
         let emit_pane_died_on_reader_exit = Arc::new(AtomicBool::new(true));
+        let osc7_authority = execution_target.osc7_authority();
 
         let io = {
             let terminal = terminal.clone();
@@ -2469,6 +2433,7 @@ impl PaneRuntime {
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
             let execution_target = execution_target.clone();
+            let osc7_authority = osc7_authority.clone();
             let remote_execution_ready = remote_execution_ready.clone();
             let remote_hostname_state = remote_hostname.clone();
             let emit_pane_died_on_reader_exit = emit_pane_died_on_reader_exit.clone();
@@ -2531,6 +2496,7 @@ impl PaneRuntime {
                                 pane_id,
                                 cwd,
                                 &execution_target,
+                                &osc7_authority,
                                 remote_hostname.as_deref(),
                                 &reported_cwd,
                                 &read_events,
@@ -2543,6 +2509,7 @@ impl PaneRuntime {
                         pane_id,
                         cwd,
                         &execution_target,
+                        &osc7_authority,
                         remote_hostname.as_deref(),
                         &reported_cwd,
                         &read_events,
@@ -2630,6 +2597,7 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
         execution_target: &crate::execution::ExecutionTarget,
         cmd: CommandBuilder,
+        remote_request_channel: Option<crate::execution::RemoteRequestChannel>,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
@@ -2656,10 +2624,10 @@ impl PaneRuntime {
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+        let osc7_authority = execution_target.osc7_authority();
+        let mut spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
-        // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
@@ -2671,45 +2639,9 @@ impl PaneRuntime {
         let emit_pane_died_on_reader_exit = Arc::new(AtomicBool::new(true));
         #[cfg(unix)]
         let exit_latch = Arc::new(SpawnExitLatch::default());
-        {
-            let child_wait_completed = child_wait_completed.clone();
-            let emit_pane_died = emit_pane_died_on_reader_exit.clone();
-            let child_wait_events = events.clone();
-            let child_wait_rt = tokio::runtime::Handle::current();
-            #[cfg(unix)]
-            let child_wait_exit_latch = exit_latch.clone();
-            let mut child = spawned.child;
-            if let Some(pid) = child.process_id() {
-                child_pid.store(pid, Ordering::Release);
-                crate::logging::pane_spawned(pane_id.raw(), pid);
-            }
-            tokio::task::spawn_blocking(move || {
-                match child.wait() {
-                    Ok(status) => {
-                        let status_text = format!("{status:?}");
-                        crate::logging::pane_exited(pane_id.raw(), &status_text);
-                    }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
-                }
-                child_wait_completed.store(true, Ordering::Release);
-                #[cfg(unix)]
-                publish_spawned_pane_died_if_complete(
-                    &child_wait_exit_latch,
-                    SpawnExitLatch::CHILD_REAPED,
-                    &emit_pane_died,
-                    &child_wait_events,
-                    &child_wait_rt,
-                    pane_id,
-                );
-                #[cfg(not(unix))]
-                if emit_pane_died.load(Ordering::Acquire) {
-                    if let Err(err) = child_wait_rt
-                        .block_on(child_wait_events.send(AppEvent::PaneDied { pane_id }))
-                    {
-                        error!(pane = pane_id.raw(), err = %err, "failed to send PaneDied event");
-                    }
-                }
-            });
+        if let Some(pid) = spawned.child.process_id() {
+            child_pid.store(pid, Ordering::Release);
+            crate::logging::pane_spawned(pane_id.raw(), pid);
         }
 
         let io = {
@@ -2723,6 +2655,7 @@ impl PaneRuntime {
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
             let execution_target = execution_target.clone();
+            let osc7_authority = osc7_authority.clone();
             let remote_execution_ready = remote_execution_ready.clone();
             let remote_hostname_state = remote_hostname.clone();
             #[cfg(unix)]
@@ -2790,6 +2723,7 @@ impl PaneRuntime {
                                 pane_id,
                                 cwd,
                                 &execution_target,
+                                &osc7_authority,
                                 remote_hostname.as_deref(),
                                 &reported_cwd,
                                 &events,
@@ -2802,6 +2736,7 @@ impl PaneRuntime {
                         pane_id,
                         cwd,
                         &execution_target,
+                        &osc7_authority,
                         remote_hostname.as_deref(),
                         &reported_cwd,
                         &events,
@@ -2833,7 +2768,7 @@ impl PaneRuntime {
                     pane_id,
                 );
             });
-            PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
+            let actor = match PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
                 #[cfg(unix)]
                 master_fd: spawned.master_fd,
@@ -2842,8 +2777,66 @@ impl PaneRuntime {
                 initially_quiesced: false,
                 on_read,
                 on_reader_exit: Some(on_reader_exit),
-            })?)
+            }) {
+                Ok(actor) => actor,
+                Err(err) => {
+                    let _ = spawned.child.kill();
+                    let _ = spawned.child.wait();
+                    return Err(err);
+                }
+            };
+            PaneRuntimeIo::Actor(actor)
         };
+        #[cfg(unix)]
+        let child_exit_actor = match &io {
+            PaneRuntimeIo::Actor(actor) => Some(actor.clone()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => None,
+        };
+        {
+            let child_wait_completed = child_wait_completed.clone();
+            let emit_pane_died = emit_pane_died_on_reader_exit.clone();
+            let child_wait_events = events.clone();
+            let child_wait_rt = tokio::runtime::Handle::current();
+            #[cfg(unix)]
+            let child_wait_exit_latch = exit_latch.clone();
+            let mut child = spawned.child;
+            tokio::task::spawn_blocking(move || {
+                let status = child.wait();
+                if let Some(channel) = remote_request_channel {
+                    channel.cancel();
+                }
+                match status {
+                    Ok(status) => {
+                        let status_text = format!("{status:?}");
+                        crate::logging::pane_exited(pane_id.raw(), &status_text);
+                    }
+                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
+                }
+                #[cfg(unix)]
+                if let Some(actor) = child_exit_actor {
+                    actor.finish_after_child_exit();
+                }
+                child_wait_completed.store(true, Ordering::Release);
+                #[cfg(unix)]
+                publish_spawned_pane_died_if_complete(
+                    &child_wait_exit_latch,
+                    SpawnExitLatch::CHILD_REAPED,
+                    &emit_pane_died,
+                    &child_wait_events,
+                    &child_wait_rt,
+                    pane_id,
+                );
+                #[cfg(not(unix))]
+                if emit_pane_died.load(Ordering::Acquire) {
+                    if let Err(err) = child_wait_rt
+                        .block_on(child_wait_events.send(AppEvent::PaneDied { pane_id }))
+                    {
+                        error!(pane = pane_id.raw(), err = %err, "failed to send PaneDied event");
+                    }
+                }
+            });
+        }
 
         // --- Detection task ---
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
@@ -4159,10 +4152,13 @@ mod tests {
 
         let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
         let (events, _event_rx) = mpsc::channel(1);
+        let authority = crate::execution::ExecutionTarget::Local
+            .osc7_authority_with(Some("local-node".into()), None);
         publish_reported_cwd(
             runtime.pane_id,
             (cwd.clone(), None),
             &crate::execution::ExecutionTarget::Local,
+            &authority,
             None,
             &runtime.reported_cwd,
             &events,
@@ -4207,11 +4203,13 @@ mod tests {
     fn reported_cwd_accepts_ready_hostname_for_ssh_alias() {
         let cwd = std::path::PathBuf::from("/remote/repo");
         let target = crate::execution::ExecutionTarget::ssh("build-alias").unwrap();
+        let authority = target.osc7_authority_with(None, None);
 
         assert_eq!(
             usable_terminal_reported_cwd(
                 (cwd.clone(), Some("actual-node".into())),
                 &target,
+                &authority,
                 Some("ACTUAL-NODE"),
             ),
             Some(cwd)
@@ -4222,30 +4220,39 @@ mod tests {
     fn reported_cwd_validation_accepts_local_and_direct_remote_authorities() {
         let local_cwd = std::env::current_dir().unwrap();
         let local = crate::execution::ExecutionTarget::Local;
+        let local_authority = local.osc7_authority_with(Some("local-node".into()), None);
         assert_eq!(
-            usable_terminal_reported_cwd((local_cwd.clone(), None), &local, None),
+            usable_terminal_reported_cwd((local_cwd.clone(), None), &local, &local_authority, None,),
             Some(local_cwd.clone())
         );
         assert_eq!(
             usable_terminal_reported_cwd(
                 (local_cwd.clone(), Some("LOCALHOST".into())),
                 &local,
+                &local_authority,
                 None,
             ),
             Some(local_cwd.clone())
         );
         assert_eq!(
-            usable_terminal_reported_cwd((local_cwd, Some("build-host".into())), &local, None,),
+            usable_terminal_reported_cwd(
+                (local_cwd, Some("build-host".into())),
+                &local,
+                &local_authority,
+                None,
+            ),
             None
         );
 
         let remote_cwd = std::env::temp_dir().join("herdr-missing-remote-reported-cwd");
         let ssh = crate::execution::ExecutionTarget::ssh("deploy@Build-Host").unwrap();
+        let ssh_authority = ssh.osc7_authority_with(None, None);
         for authority in [None, Some("localhost"), Some("build-host")] {
             assert_eq!(
                 usable_terminal_reported_cwd(
                     (remote_cwd.clone(), authority.map(str::to_owned)),
                     &ssh,
+                    &ssh_authority,
                     None,
                 ),
                 Some(remote_cwd.clone())
@@ -4764,6 +4771,7 @@ mod tests {
             Arc::new(RenderSignal::new()),
             &crate::execution::ExecutionTarget::ssh("build-alias").unwrap(),
             command,
+            None,
             "test command failed",
             SpawnInitialState::default(),
             AgentDetection::Disabled,
@@ -4827,6 +4835,49 @@ mod tests {
         );
         assert!(!visible.contains("6973"));
         assert!(!visible.contains("actual-node"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_exit_finishes_after_bounded_drain_when_descendant_holds_slave() {
+        let pane_id = PaneId::from_raw(30);
+        let mut command = CommandBuilder::new("python3");
+        command.args([
+            "-c",
+            "import os,time\nif os.fork() == 0:\n    time.sleep(2)\n    os._exit(0)\nos.write(1, b'final-before-exit')\nos._exit(0)\n",
+        ]);
+        let (events, mut event_rx) = mpsc::channel(8);
+        let runtime = PaneRuntime::spawn_command_builder(
+            pane_id,
+            24,
+            80,
+            4096,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+            &crate::execution::ExecutionTarget::Local,
+            command,
+            None,
+            "test command failed",
+            SpawnInitialState::default(),
+            AgentDetection::Disabled,
+        )
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("PaneDied should not wait for a descendant-held slave")
+            .expect("event channel should remain open");
+        assert!(matches!(event, AppEvent::PaneDied { pane_id: died } if died == pane_id));
+        assert!(runtime.visible_text().contains("final-before-exit"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[cfg(unix)]

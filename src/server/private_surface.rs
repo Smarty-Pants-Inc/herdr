@@ -2,7 +2,7 @@ use bytes::Bytes;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::app::ClientPrivatePluginPopupSpec;
+use crate::app::{ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec};
 use crate::layout::PaneId;
 use crate::pane::PaneLaunchEnv;
 use crate::popup_size::{resolve_popup_geometry, PopupResolvedGeometry, PopupSize};
@@ -11,7 +11,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalState};
 
 pub(crate) struct PrivateLinkClick {
     pub(crate) url: String,
-    pub(crate) source_pane_id: String,
+    pub(crate) origin: ClientPrivatePluginPopupOrigin,
 }
 
 pub(crate) struct PrivateSurface {
@@ -20,7 +20,7 @@ pub(crate) struct PrivateSurface {
     runtime: Option<TerminalRuntime>,
     width: Option<PopupSize>,
     height: Option<PopupSize>,
-    source_pane_id: String,
+    origin: ClientPrivatePluginPopupOrigin,
     render_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
     pending_url_click: bool,
@@ -80,7 +80,7 @@ impl PrivateSurface {
             runtime: Some(runtime),
             width: spec.width,
             height: spec.height,
-            source_pane_id: spec.source_pane_id,
+            origin: spec.origin,
             render_area: area,
             cell_size,
             pending_url_click: false,
@@ -89,7 +89,7 @@ impl PrivateSurface {
     #[cfg(test)]
     pub(crate) fn test_with_screen_bytes(
         area: Rect,
-        source_pane_id: impl Into<String>,
+        origin: ClientPrivatePluginPopupOrigin,
         bytes: &[u8],
     ) -> Self {
         let geometry = resolve_popup_geometry(None, None, area).expect("test popup geometry");
@@ -105,7 +105,7 @@ impl PrivateSurface {
             )),
             width: None,
             height: None,
-            source_pane_id: source_pane_id.into(),
+            origin,
             render_area: area,
             cell_size: crate::kitty_graphics::HostCellSize::default(),
             pending_url_click: false,
@@ -287,17 +287,17 @@ impl PrivateSurface {
         let col = mouse.column.saturating_sub(geometry.inner.x);
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(runtime) = self.runtime.as_ref() {
-                if let Some(url) = crate::app::actions::raw_url_at_terminal_cell(
+                if let Some(link) = crate::app::actions::resolved_terminal_link_at_cell(
                     runtime,
-                    self.pane_id,
-                    geometry.inner,
                     viewport_row,
                     col,
+                    geometry.inner.width,
+                    geometry.inner.height,
                 ) {
                     self.pending_url_click = true;
                     return Some(PrivateLinkClick {
-                        url,
-                        source_pane_id: self.source_pane_id.clone(),
+                        url: link.url,
+                        origin: self.origin,
                     });
                 }
             }
@@ -373,9 +373,10 @@ mod tests {
     #[tokio::test]
     async fn plain_click_uses_translated_private_coordinates_and_preserves_raw_url() {
         let area = Rect::new(0, 0, 80, 24);
+        let origin = ClientPrivatePluginPopupOrigin::Pane(PaneId::from_raw(7));
         let mut surface = PrivateSurface::test_with_screen_bytes(
             area,
-            "w1:p1",
+            origin,
             b"\x1b]8;;file:///tmp/private.txt\x1b\\open\x1b]8;;\x1b\\",
         );
         let ((column, row), _, uri) = surface
@@ -398,13 +399,16 @@ mod tests {
             .expect("plain private link click");
 
         assert_eq!(click.url, "file:///tmp/private.txt");
-        assert_eq!(click.source_pane_id, "w1:p1");
+        assert_eq!(click.origin, origin);
     }
 
     #[tokio::test]
     async fn resize_updates_only_private_runtime_geometry() {
-        let mut surface =
-            PrivateSurface::test_with_screen_bytes(Rect::new(0, 0, 80, 24), "w1:p1", b"private");
+        let mut surface = PrivateSurface::test_with_screen_bytes(
+            Rect::new(0, 0, 80, 24),
+            ClientPrivatePluginPopupOrigin::Pane(PaneId::from_raw(8)),
+            b"private",
+        );
         surface.resize(
             Rect::new(0, 0, 100, 30),
             crate::kitty_graphics::HostCellSize::default(),

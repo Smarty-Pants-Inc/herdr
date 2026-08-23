@@ -94,10 +94,26 @@ fn pane_split_source(
     )
 }
 
+fn requested_pane_split_source(
+    app: &App,
+    caller_pane_id: Option<&str>,
+    target_is_explicit: bool,
+    ws_idx: usize,
+    target_pane_id: PaneId,
+) -> (
+    crate::execution::ExecutionTarget,
+    Option<std::path::PathBuf>,
+) {
+    if target_is_explicit {
+        return pane_split_source(app, ws_idx, target_pane_id);
+    }
+    workspace_plugin_pane_split_source(app, caller_pane_id)
+        .unwrap_or_else(|| pane_split_source(app, ws_idx, target_pane_id))
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
-        let caller_source =
-            workspace_plugin_pane_split_source(self, params.caller_pane_id.as_deref());
+        let target_is_explicit = params.target_pane_id.is_some();
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
@@ -118,8 +134,13 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        let (source_target, source_cwd) =
-            caller_source.unwrap_or_else(|| pane_split_source(self, ws_idx, target_pane_id));
+        let (source_target, source_cwd) = requested_pane_split_source(
+            self,
+            params.caller_pane_id.as_deref(),
+            target_is_explicit,
+            ws_idx,
+            target_pane_id,
+        );
         let execution_target = params
             .execution_target
             .clone()
@@ -2068,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_split_uses_cross_workspace_plugin_caller_locality() {
+    fn pane_split_source_uses_plugin_only_for_workspace_selected_target() {
         let (mut app, _) = app_with_test_workspace();
         let workspace_id = app.public_workspace_id(0);
         app.state
@@ -2076,10 +2097,20 @@ mod tests {
             .push(Workspace::test_new("destination"));
         app.state.ensure_test_terminals();
         let target_pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal_id = app.state.workspaces[1]
+            .terminal_id(target_pane_id)
+            .cloned()
+            .unwrap();
+        let selected_target = crate::execution::ExecutionTarget::ssh("selected.example").unwrap();
+        let selected_cwd = std::path::PathBuf::from("/selected/worktree");
+        let selected_terminal = app.state.terminals.get_mut(&target_terminal_id).unwrap();
+        selected_terminal.execution_target = selected_target.clone();
+        selected_terminal.cwd = selected_cwd.clone();
+
         let plugin_pane_id = crate::layout::PaneId::alloc();
         let plugin_terminal_id = crate::terminal::TerminalId::alloc();
-        let plugin_target = crate::execution::ExecutionTarget::ssh("remote.example").unwrap();
-        let plugin_cwd = std::path::PathBuf::from("/remote/worktree");
+        let plugin_target = crate::execution::ExecutionTarget::ssh("plugin.example").unwrap();
+        let plugin_cwd = std::path::PathBuf::from("/plugin/worktree");
         let mut terminal =
             crate::terminal::TerminalState::new(plugin_terminal_id.clone(), plugin_cwd.clone());
         terminal.execution_target = plugin_target.clone();
@@ -2101,11 +2132,14 @@ mod tests {
         let caller =
             crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
 
-        let (source_target, source_cwd) = workspace_plugin_pane_split_source(&app, Some(&caller))
-            .unwrap_or_else(|| pane_split_source(&app, 1, target_pane_id));
-
-        assert_eq!(source_target, plugin_target);
-        assert_eq!(source_cwd, Some(plugin_cwd));
+        assert_eq!(
+            requested_pane_split_source(&app, Some(&caller), false, 1, target_pane_id),
+            (plugin_target, Some(plugin_cwd))
+        );
+        assert_eq!(
+            requested_pane_split_source(&app, Some(&caller), true, 1, target_pane_id),
+            (selected_target, Some(selected_cwd))
+        );
     }
 
     #[test]

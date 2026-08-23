@@ -186,14 +186,15 @@ herdr pane close <pane_id>
 
 For pane commands that accept `--current`, Herdr uses the calling pane's
 `HERDR_PANE_ID` when the command runs inside a Herdr pane. For `pane split`,
-an explicit pane id or `--pane ID` splits that pane, `--current` splits the
-calling pane, and an omitted target keeps using the UI-focused pane.
-The split response exposes the new pane ID as `.result.pane.pane_id`.
+an explicit pane id, `--pane ID`, or `--current` uses that selected pane for
+both insertion and inherited execution target/cwd. With no pane selector,
+Herdr uses the UI-focused pane. The split response exposes the new pane ID as
+`.result.pane.pane_id`.
 
 `--workspace` selects that workspace's focused tiled pane as the insertion point.
-When a managed workspace-right plugin invokes the command, Herdr carries its
-pane identity internally so the new pane inherits the plugin's execution target
-and cwd instead of an unrelated tiled pane's locality.
+When a managed workspace-right plugin invokes a workspace-selected split without
+an explicit pane selector, the new pane may inherit the plugin caller's execution
+target and cwd while still splitting the workspace's focused tiled pane.
 
 Per-pane SSH execution targets are Unix-only. This is separate from whole-server
 `herdr --remote`, which remains available on Windows clients connecting to
@@ -202,8 +203,9 @@ supported Linux and macOS hosts.
 Without `--target`, a split inherits the source pane's execution target. Use
 `--target local` to force local execution or `--target ssh:HOST` to run the new
 terminal on a trusted SSH host while keeping it in the current Herdr UI. A
-same-target split follows the source cwd. A cross-target split starts in the
-destination's default home unless `--cwd` is explicit. Prepare a matching
+same-target split follows the source cwd. A cross-target local split uses the
+configured `terminal.new_cwd`; a cross-target SSH split starts in the remote
+user's home. An explicit `--cwd` overrides either default. Prepare a matching
 remote Herdr first by running `herdr --remote HOST`; per-pane launches never
 install or replace remote software. See [Persistence and remote access](/docs/persistence-remote/).
 

@@ -2409,33 +2409,6 @@ impl AppState {
         self.clear_selection();
     }
 }
-pub(crate) fn raw_url_at_terminal_cell(
-    runtime: &crate::terminal::TerminalRuntime,
-    _pane_id: crate::layout::PaneId,
-    inner: ratatui::layout::Rect,
-    viewport_row: u16,
-    col: u16,
-) -> Option<String> {
-    if viewport_row >= inner.height || col >= inner.width {
-        return None;
-    }
-
-    if let Some(link) =
-        runtime.hyperlink_at_viewport_cell(col, viewport_row, inner.width, inner.height)
-    {
-        return safe_osc8_url(&link.uri).map(str::to_owned);
-    }
-
-    let line = runtime.logical_line_at_viewport_row(viewport_row, inner.width, inner.height)?;
-    let byte_index = line.cells.iter().find_map(|cell| {
-        (cell.viewport_row == viewport_row
-            && col >= cell.viewport_col
-            && col < cell.viewport_col.saturating_add(cell.width))
-        .then_some(cell.byte_index)
-    })?;
-    let (start, end) = url_byte_span_at_byte_index(&line.text, byte_index)?;
-    crate::web_url::safe_web_url(line.text.get(start..end)?).map(str::to_owned)
-}
 
 pub(crate) fn safe_osc8_url(url: &str) -> Option<&str> {
     crate::web_url::safe_web_url(url).or_else(|| {
