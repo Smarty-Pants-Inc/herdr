@@ -335,6 +335,16 @@ fn compiled_omp_identity() -> Result<Option<OmpBuildIdentity<'static>>, String> 
     Ok(Some(identity))
 }
 
+#[cfg(unix)]
+pub(crate) fn paired_omp_build() -> Result<bool, String> {
+    Ok(compiled_omp_identity()?.is_some())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn paired_omp_build() -> Result<bool, String> {
+    Ok(false)
+}
+
 #[derive(Deserialize)]
 struct HomebrewFormula {
     versions: HomebrewFormulaVersions,
@@ -551,6 +561,7 @@ impl ManagedOmpCompanion {
 
     pub(crate) fn apply_to_command(&self, command: &mut Command) {
         command
+            .env_remove(OMP_BIN_ENV_VAR)
             .env(MANAGED_OMP_BIN_ENV_VAR, &self.executable)
             .env(MANAGED_OMP_BUILD_ID_ENV_VAR, &self.build_id)
             .env(MANAGED_OMP_COMMIT_ENV_VAR, &self.commit)
@@ -1833,44 +1844,59 @@ fn managed_omp_companion_from_env() -> Result<Option<ManagedOmpCompanion>, Strin
 }
 
 #[cfg(unix)]
+fn resolve_omp_executable_for_build(
+    paired: bool,
+    explicit: impl FnOnce() -> Result<Option<PathBuf>, String>,
+    fallback: impl FnOnce() -> Result<OmpExecutable, String>,
+) -> Result<OmpExecutable, String> {
+    if !paired {
+        if let Some(path) = explicit()? {
+            return Ok(OmpExecutable::Explicit(path));
+        }
+    }
+    fallback()
+}
+
+#[cfg(unix)]
 pub(crate) fn native_omp_executable() -> Result<OmpExecutable, String> {
-    if let Some(path) = explicit_omp_executable()? {
-        return Ok(OmpExecutable::Explicit(path));
-    }
-    if env::var_os(MANAGED_OMP_DISABLED_ENV_VAR).is_some() {
-        return Err("managed OMP companion is disabled for this client attach".into());
-    }
-    if omp_platform_target().is_none() {
-        return Err("managed OMP companion is unavailable for this platform".into());
-    }
-    if let Some(companion) = managed_omp_companion_from_env()? {
-        return Ok(OmpExecutable::Managed(companion));
-    }
-    managed_omp_companion_for_current_build()?
-        .map(OmpExecutable::Managed)
-        .ok_or_else(|| "this Herdr build has no paired OMP companion".into())
+    let paired = paired_omp_build()?;
+    resolve_omp_executable_for_build(paired, explicit_omp_executable, || {
+        if env::var_os(MANAGED_OMP_DISABLED_ENV_VAR).is_some() {
+            return Err("managed OMP companion is disabled for this client attach".into());
+        }
+        if omp_platform_target().is_none() {
+            return Err("managed OMP companion is unavailable for this platform".into());
+        }
+        if let Some(companion) = managed_omp_companion_from_env()? {
+            return Ok(OmpExecutable::Managed(companion));
+        }
+        managed_omp_companion_for_current_build()?
+            .map(OmpExecutable::Managed)
+            .ok_or_else(|| "this Herdr build has no paired OMP companion".into())
+    })
 }
 
 #[cfg(unix)]
 pub(crate) fn server_private_omp_executable() -> Result<OmpExecutable, String> {
-    if let Some(path) = explicit_omp_executable()? {
-        return Ok(OmpExecutable::Explicit(path));
-    }
-    if compiled_omp_identity()?.is_some() {
-        if omp_platform_target().is_none() {
-            return Err(
-                "paired Herdr build has no managed OMP companion for this server platform".into(),
-            );
+    let paired = paired_omp_build()?;
+    resolve_omp_executable_for_build(paired, explicit_omp_executable, || {
+        if paired {
+            if omp_platform_target().is_none() {
+                return Err(
+                    "paired Herdr build has no managed OMP companion for this server platform"
+                        .into(),
+                );
+            }
+            return managed_omp_companion_for_current_build()?
+                .map(OmpExecutable::Managed)
+                .ok_or_else(|| "paired Herdr build has no managed OMP companion".into());
         }
-        return managed_omp_companion_for_current_build()?
-            .map(OmpExecutable::Managed)
-            .ok_or_else(|| "paired Herdr build has no managed OMP companion".into());
-    }
-    #[cfg(test)]
-    if let Ok(executable) = env::current_exe() {
-        return Ok(OmpExecutable::Explicit(executable));
-    }
-    server_private_omp_fallback_executable()
+        #[cfg(test)]
+        if let Ok(executable) = env::current_exe() {
+            return Ok(OmpExecutable::Explicit(executable));
+        }
+        server_private_omp_fallback_executable()
+    })
 }
 
 #[cfg(not(unix))]
@@ -3880,12 +3906,10 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static parking_lot::Mutex<()> {
+        crate::config::test_config_env_lock()
     }
 
     struct UmaskGuard(libc::mode_t);
@@ -3949,6 +3973,25 @@ mod tests {
             commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             version: "17.3.7",
+        }
+    }
+
+    fn write_test_omp_executable(path: &Path, contents: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn test_managed_omp_companion(path: &Path) -> ManagedOmpCompanion {
+        let identity = test_omp_identity();
+        ManagedOmpCompanion {
+            executable: path.to_path_buf(),
+            build_id: identity.build_id.into(),
+            sha256: format!("{:x}", Sha256::digest(fs::read(path).unwrap())),
+            commit: identity.commit.into(),
+            tree: identity.tree.into(),
+            version: identity.version.into(),
         }
     }
 
@@ -4200,7 +4243,7 @@ mod tests {
 
     #[test]
     fn mise_configured_installs_dir_path_is_detected() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let previous = std::env::var_os(MISE_INSTALLS_DIR_ENV);
         std::env::set_var(MISE_INSTALLS_DIR_ENV, "/opt/mise-tools");
         let path = Path::new("/opt/mise-tools/herdr/0.6.6/bin/herdr");
@@ -4381,7 +4424,7 @@ mod tests {
 
     #[test]
     fn fake_release_notes_default_to_real_large_changelog_section() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         std::env::remove_var(FAKE_UPDATE_NOTES_VERSION_ENV);
 
         let body = fake_release_notes_body("9.4.9");
@@ -4391,7 +4434,7 @@ mod tests {
 
     #[test]
     fn fake_release_notes_fallback_include_version_and_context() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         std::env::set_var(FAKE_UPDATE_NOTES_VERSION_ENV, "does-not-exist");
 
         let body = fake_release_notes_body("9.4.9");
@@ -4625,6 +4668,82 @@ mod tests {
             fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paired_native_selection_ignores_mismatched_raw_omp_override() {
+        let _guard = env_lock().lock();
+        let dir = unique_test_dir("paired-native-override");
+        fs::create_dir(&dir).unwrap();
+        let raw_override = dir.join("raw-omp");
+        let managed_path = dir.join("managed-omp");
+        write_test_omp_executable(&raw_override, b"#!/bin/sh\necho raw\n");
+        write_test_omp_executable(&managed_path, b"#!/bin/sh\necho managed\n");
+        let companion = test_managed_omp_companion(&managed_path);
+        let previous = env::var_os(OMP_BIN_ENV_VAR);
+        env::set_var(OMP_BIN_ENV_VAR, &raw_override);
+
+        let selected = resolve_omp_executable_for_build(true, explicit_omp_executable, || {
+            Ok(OmpExecutable::Managed(companion))
+        });
+
+        match previous {
+            Some(value) => env::set_var(OMP_BIN_ENV_VAR, value),
+            None => env::remove_var(OMP_BIN_ENV_VAR),
+        }
+        let selected = selected.unwrap();
+        assert_eq!(selected.executable(), managed_path);
+        selected.verify().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paired_private_renderer_selection_ignores_mismatched_raw_omp_override() {
+        let _guard = env_lock().lock();
+        let dir = unique_test_dir("paired-private-override");
+        fs::create_dir(&dir).unwrap();
+        let raw_override = dir.join("raw-omp");
+        let managed_path = dir.join("managed-omp");
+        write_test_omp_executable(&raw_override, b"#!/bin/sh\necho raw\n");
+        write_test_omp_executable(&managed_path, b"#!/bin/sh\necho managed\n");
+        let companion = test_managed_omp_companion(&managed_path);
+        let previous = env::var_os(OMP_BIN_ENV_VAR);
+        env::set_var(OMP_BIN_ENV_VAR, &raw_override);
+
+        let selected = resolve_omp_executable_for_build(true, explicit_omp_executable, || {
+            Ok(OmpExecutable::Managed(companion))
+        });
+
+        match previous {
+            Some(value) => env::set_var(OMP_BIN_ENV_VAR, value),
+            None => env::remove_var(OMP_BIN_ENV_VAR),
+        }
+        let selected = selected.unwrap();
+        assert_eq!(selected.executable(), managed_path);
+        selected.verify().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unpaired_selection_retains_raw_omp_override() {
+        let _guard = env_lock().lock();
+        let dir = unique_test_dir("unpaired-override");
+        fs::create_dir(&dir).unwrap();
+        let raw_override = dir.join("raw-omp");
+        write_test_omp_executable(&raw_override, b"#!/bin/sh\necho raw\n");
+        let previous = env::var_os(OMP_BIN_ENV_VAR);
+        env::set_var(OMP_BIN_ENV_VAR, &raw_override);
+
+        let selected = resolve_omp_executable_for_build(false, explicit_omp_executable, || {
+            panic!("unpaired explicit override must short-circuit managed resolution")
+        });
+
+        match previous {
+            Some(value) => env::set_var(OMP_BIN_ENV_VAR, value),
+            None => env::remove_var(OMP_BIN_ENV_VAR),
+        }
+        assert_eq!(selected.unwrap().executable(), raw_override);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5293,7 +5412,7 @@ mod tests {
 
     #[test]
     fn plain_update_targets_all_running_sessions() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = set_test_config_home("all-sessions");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
@@ -5323,7 +5442,7 @@ mod tests {
 
     #[test]
     fn explicit_session_update_targets_only_that_session() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = set_test_config_home("explicit-session");
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/ignored-herdr.sock");
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
@@ -5353,7 +5472,7 @@ mod tests {
 
     #[test]
     fn socket_override_update_targets_socket_not_env_session() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/custom-herdr.sock");
         std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
         crate::session::clear_explicit_session_for_test();
@@ -5377,7 +5496,7 @@ mod tests {
 
     #[test]
     fn plain_update_errors_when_named_session_has_client_socket_without_status_api() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         let config_home = set_test_config_home("client-only-session");
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
@@ -5448,7 +5567,7 @@ mod tests {
 
     #[test]
     fn noninteractive_plain_update_does_not_complete_with_running_server() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock();
         assert!(
             !io::stdin().is_terminal(),
             "this test relies on noninteractive test stdin"

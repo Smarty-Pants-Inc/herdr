@@ -195,6 +195,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         };
     let native_omp_renderer_eligible =
         remote_client_omp_renderer_eligible(io::stdin().is_terminal(), io::stdout().is_terminal());
+    let paired_omp_build = crate::update::paired_omp_build().map_err(io::Error::other)?;
     let managed_omp = prepare_remote_omp_companion(native_omp_renderer_eligible);
 
     loop {
@@ -210,6 +211,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
             &reattach_command,
             remote.keybindings,
             native_omp_renderer_eligible,
+            paired_omp_build,
             managed_omp.as_ref(),
         );
         drop(bridge);
@@ -249,7 +251,7 @@ fn prepare_remote_omp_companion_with(
     eligible: bool,
     resolve: impl FnOnce() -> Result<Option<crate::update::ManagedOmpCompanion>, String>,
 ) -> Option<crate::update::ManagedOmpCompanion> {
-    if !eligible || std::env::var_os("OMP_BIN").is_some() {
+    if !eligible {
         return None;
     }
     match resolve() {
@@ -2431,6 +2433,7 @@ fn remote_client_command(
     reattach_command: &str,
     keybindings: RemoteKeybindings,
     native_omp_renderer_eligible: bool,
+    paired_omp_build: bool,
     managed_omp: Option<&crate::update::ManagedOmpCompanion>,
 ) -> Command {
     let mut command = Command::new(exe);
@@ -2446,15 +2449,16 @@ fn remote_client_command(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    if paired_omp_build {
+        command.env_remove("OMP_BIN");
+    }
     if let Some(encoding) = remote_client_default_encoding(native_omp_renderer_eligible) {
         command.env("HERDR_RENDER_ENCODING", encoding);
     }
     if native_omp_renderer_eligible {
         if let Some(companion) = managed_omp {
             companion.apply_to_command(&mut command);
-        } else if crate::build_info::omp_build_id().is_some()
-            && std::env::var_os("OMP_BIN").is_none()
-        {
+        } else if paired_omp_build {
             command.env(crate::update::MANAGED_OMP_DISABLED_ENV_VAR, "1");
         }
     }
@@ -2466,6 +2470,7 @@ fn run_client_process(
     reattach_command: &str,
     keybindings: RemoteKeybindings,
     native_omp_renderer_eligible: bool,
+    paired_omp_build: bool,
     managed_omp: Option<&crate::update::ManagedOmpCompanion>,
 ) -> io::Result<RemoteClientProcessExit> {
     let status = remote_client_command(
@@ -2474,6 +2479,7 @@ fn run_client_process(
         reattach_command,
         keybindings,
         native_omp_renderer_eligible,
+        paired_omp_build,
         managed_omp,
     )
     .status()?;
@@ -3843,8 +3849,7 @@ mod tests {
 
     #[cfg(unix)]
     fn remote_env_lock() -> &'static parking_lot::Mutex<()> {
-        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     #[cfg(unix)]
@@ -3865,6 +3870,7 @@ mod tests {
             "herdr --remote host",
             RemoteKeybindings::Local,
             false,
+            false,
             None,
         );
         assert!(command.get_envs().any(|(key, value)| {
@@ -3874,6 +3880,9 @@ mod tests {
         assert!(!command.get_envs().any(|(key, _)| {
             key == std::ffi::OsStr::new(crate::update::MANAGED_OMP_DISABLED_ENV_VAR)
         }));
+        assert!(!command
+            .get_envs()
+            .any(|(key, _)| key == std::ffi::OsStr::new("OMP_BIN")));
         assert_eq!(remote_client_default_encoding(false), Some("terminal-ansi"));
         assert_eq!(remote_client_default_encoding(true), None);
 
@@ -3884,6 +3893,7 @@ mod tests {
                 Path::new("/tmp/herdr.sock"),
                 "herdr --remote host",
                 RemoteKeybindings::Local,
+                false,
                 false,
                 None,
             );
@@ -3905,6 +3915,36 @@ mod tests {
             Some(value) => std::env::set_var(crate::update::MANAGED_OMP_BIN_ENV_VAR, value),
             None => std::env::remove_var(crate::update::MANAGED_OMP_BIN_ENV_VAR),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paired_remote_client_clears_raw_omp_override() {
+        let _guard = remote_env_lock().lock();
+        let prior_omp_bin = std::env::var_os("OMP_BIN");
+        std::env::set_var("OMP_BIN", std::env::current_exe().unwrap());
+
+        let command = remote_client_command(
+            Path::new("/tmp/herdr"),
+            Path::new("/tmp/herdr.sock"),
+            "herdr --remote host",
+            RemoteKeybindings::Local,
+            true,
+            true,
+            None,
+        );
+
+        match prior_omp_bin {
+            Some(value) => std::env::set_var("OMP_BIN", value),
+            None => std::env::remove_var("OMP_BIN"),
+        }
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| { key == std::ffi::OsStr::new("OMP_BIN") && value.is_none() }));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(crate::update::MANAGED_OMP_DISABLED_ENV_VAR)
+                && value == Some(std::ffi::OsStr::new("1"))
+        }));
     }
 
     #[cfg(unix)]
@@ -3945,7 +3985,7 @@ mod tests {
             Ok(None)
         })
         .is_none());
-        assert!(!called.get());
+        assert!(called.get());
 
         match prior_encoding {
             Some(value) => std::env::set_var("HERDR_RENDER_ENCODING", value),

@@ -824,6 +824,13 @@ fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     (ret == size).then_some(info)
 }
 
+pub(crate) fn process_start_identity(pid: u32) -> Option<u64> {
+    let info = process_bsdinfo(pid)?;
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
 fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
     let end = info
         .pbi_comm
