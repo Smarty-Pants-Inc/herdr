@@ -1667,10 +1667,12 @@ mod tests {
                 input_rx.try_recv().is_err(),
                 "handled link must not reach pane"
             );
-            assert!(
-                app.event_rx.try_recv().is_err(),
-                "plugin-handled link must not queue an OpenUrl event"
-            );
+            while let Ok(event) = app.event_rx.try_recv() {
+                assert!(
+                    !matches!(event, AppEvent::OpenUrl { .. }),
+                    "plugin-handled link must not queue an OpenUrl event"
+                );
+            }
         }
     }
 

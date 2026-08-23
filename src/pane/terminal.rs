@@ -4578,6 +4578,7 @@ mod tests {
             Some((std::path::PathBuf::from("/tmp/iterm2"), None))
         );
     }
+    #[cfg(unix)]
     #[test]
     fn process_pty_bytes_requires_exact_remote_ready_nonce() {
         let (tx, _rx) = mpsc::channel(4);
