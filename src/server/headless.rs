@@ -308,6 +308,10 @@ enum PrivateOmpRetryState {
     Pending(u64),
     Consumed,
 }
+struct PendingPrivateSurfaceResponse {
+    id: String,
+    respond_to: std::sync::mpsc::Sender<String>,
+}
 
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
@@ -324,6 +328,8 @@ pub struct HeadlessServer {
     clients: HashMap<u64, ClientConnection>,
     /// Remote client-private popup launches staged until their helper confirms execution.
     private_surface_candidates: HashMap<u64, crate::server::private_surface::PrivateSurface>,
+    /// Responses held until a remote client-private popup confirms execution.
+    private_surface_candidate_responses: HashMap<u64, PendingPrivateSurfaceResponse>,
     #[cfg(test)]
     independent_omp_renderers_enabled: bool,
     /// Routes whose server-private guest failed; retain the normal pane fallback
@@ -571,6 +577,7 @@ impl HeadlessServer {
             client_socket_identity,
             clients: HashMap::new(),
             private_surface_candidates: HashMap::new(),
+            private_surface_candidate_responses: HashMap::new(),
             #[cfg(test)]
             independent_omp_renderers_enabled: false,
             private_omp_failed_routes: HashMap::new(),
@@ -1939,6 +1946,32 @@ impl HeadlessServer {
         self.retire_private_pane_id(surface.pane_id());
         surface.shutdown();
     }
+    fn private_surface_error_response(
+        id: impl Into<String>,
+        code: &str,
+        message: impl Into<String>,
+    ) -> String {
+        serde_json::to_string(&api::schema::ErrorResponse {
+            id: id.into(),
+            error: api::schema::ErrorBody {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        })
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn private_surface_ok_response(id: impl Into<String>) -> String {
+        serde_json::to_string(&api::schema::SuccessResponse {
+            id: id.into(),
+            result: api::schema::ResponseResult::Ok {},
+        })
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn respond_pending_private_surface(pending: PendingPrivateSurfaceResponse, response: String) {
+        let _ = pending.respond_to.send(response);
+    }
 
     fn activate_private_surface(
         &mut self,
@@ -1968,24 +2001,65 @@ impl HeadlessServer {
         true
     }
 
+    #[cfg(test)]
     fn install_private_surface(
         &mut self,
         client_id: u64,
         surface: crate::server::private_surface::PrivateSurface,
         wait_for_remote_ready: bool,
     ) -> bool {
+        self.install_private_surface_with_response(client_id, surface, wait_for_remote_ready, None)
+    }
+
+    fn install_private_surface_with_response(
+        &mut self,
+        client_id: u64,
+        surface: crate::server::private_surface::PrivateSurface,
+        wait_for_remote_ready: bool,
+        pending_response: Option<PendingPrivateSurfaceResponse>,
+    ) -> bool {
         if !self.clients.contains_key(&client_id) {
             self.retire_private_surface(surface);
+            if let Some(pending) = pending_response {
+                let response = Self::private_surface_error_response(
+                    pending.id.clone(),
+                    "view_not_found",
+                    "view disconnected during request",
+                );
+                Self::respond_pending_private_surface(pending, response);
+            }
             return false;
         }
         if wait_for_remote_ready {
+            let previous_pending = self.private_surface_candidate_responses.remove(&client_id);
             if let Some(previous) = self.private_surface_candidates.insert(client_id, surface) {
                 self.retire_private_surface(previous);
+            }
+            if let Some(previous_pending) = previous_pending {
+                let response = Self::private_surface_error_response(
+                    previous_pending.id.clone(),
+                    "plugin_pane_open_failed",
+                    "private popup launch replaced before execution became ready",
+                );
+                Self::respond_pending_private_surface(previous_pending, response);
+            }
+            if let Some(pending) = pending_response {
+                self.private_surface_candidate_responses
+                    .insert(client_id, pending);
             }
             return true;
         }
         if let Some(candidate) = self.private_surface_candidates.remove(&client_id) {
             self.retire_private_surface(candidate);
+        }
+        if let Some(previous_pending) = self.private_surface_candidate_responses.remove(&client_id)
+        {
+            let response = Self::private_surface_error_response(
+                previous_pending.id.clone(),
+                "plugin_pane_open_failed",
+                "private popup launch replaced before execution became ready",
+            );
+            Self::respond_pending_private_surface(previous_pending, response);
         }
         self.activate_private_surface(client_id, surface)
     }
@@ -2016,6 +2090,14 @@ impl HeadlessServer {
         let removed = self.clients.remove(&client_id);
         if let Some(candidate) = self.private_surface_candidates.remove(&client_id) {
             self.retire_private_surface(candidate);
+        }
+        if let Some(pending) = self.private_surface_candidate_responses.remove(&client_id) {
+            let response = Self::private_surface_error_response(
+                pending.id.clone(),
+                "view_not_found",
+                "view disconnected during request",
+            );
+            Self::respond_pending_private_surface(pending, response);
         }
         self.private_omp_failed_routes.remove(&client_id);
         self.private_omp_retry_attempted_routes.remove(&client_id);
@@ -3054,7 +3136,22 @@ impl HeadlessServer {
                     let Some(surface) = self.private_surface_candidates.remove(&owner_id) else {
                         return false;
                     };
-                    return self.activate_private_surface(owner_id, surface);
+                    let activated = self.activate_private_surface(owner_id, surface);
+                    if let Some(pending) =
+                        self.private_surface_candidate_responses.remove(&owner_id)
+                    {
+                        let response = if activated {
+                            Self::private_surface_ok_response(pending.id.clone())
+                        } else {
+                            Self::private_surface_error_response(
+                                pending.id.clone(),
+                                "view_not_found",
+                                "view disconnected before remote popup became ready",
+                            )
+                        };
+                        Self::respond_pending_private_surface(pending, response);
+                    }
+                    return activated;
                 }
                 AppEvent::PaneDied { pane_id, .. } => {
                     if let Some(surface) = self.private_surface_candidates.remove(&owner_id) {
@@ -3064,6 +3161,16 @@ impl HeadlessServer {
                             "remote private popup exited before execution became ready; keeping existing surface"
                         );
                         self.retire_private_surface(surface);
+                        if let Some(pending) =
+                            self.private_surface_candidate_responses.remove(&owner_id)
+                        {
+                            let response = Self::private_surface_error_response(
+                                pending.id.clone(),
+                                "plugin_pane_open_failed",
+                                "remote private popup exited before execution became ready",
+                            );
+                            Self::respond_pending_private_surface(pending, response);
+                        }
                     }
                     return false;
                 }
@@ -6303,27 +6410,32 @@ impl HeadlessServer {
         spec
     }
 
+    #[cfg(test)]
     fn handle_client_private_plugin_pane_open(
         &mut self,
         id: String,
         params: api::schema::PluginPaneOpenParams,
     ) -> (String, bool) {
+        let (response, changed) =
+            self.handle_client_private_plugin_pane_open_with_response(id, params, None);
+        (response.unwrap_or_default(), changed)
+    }
+
+    fn handle_client_private_plugin_pane_open_with_response(
+        &mut self,
+        id: String,
+        params: api::schema::PluginPaneOpenParams,
+        respond_to: Option<std::sync::mpsc::Sender<String>>,
+    ) -> (Option<String>, bool) {
         let error = |code: &str, message: String| {
-            serde_json::to_string(&api::schema::ErrorResponse {
-                id: id.clone(),
-                error: api::schema::ErrorBody {
-                    code: code.to_string(),
-                    message,
-                },
-            })
-            .unwrap_or_else(|_| "{}".to_string())
+            Self::private_surface_error_response(id.clone(), code, message)
         };
         let Some(requested_view_id) = params.view_id.as_ref() else {
             return (
-                error(
+                Some(error(
                     "view_id_required",
                     "client-private plugin panes require view_id".to_string(),
-                ),
+                )),
                 false,
             );
         };
@@ -6335,25 +6447,26 @@ impl HeadlessServer {
         });
         let Some(owner_id) = owner_id else {
             return (
-                error(
+                Some(error(
                     "view_not_found",
                     format!("view {requested_view_id} is not connected"),
-                ),
+                )),
                 false,
             );
         };
 
         let spec = match self.client_private_plugin_popup_spec_for_owner(owner_id, &params) {
             Ok(spec) => spec,
-            Err((code, message)) => return (error(code, message), false),
+            Err((code, message)) => return (Some(error(code, message)), false),
         };
         let wait_for_remote_ready = !spec.execution_target.is_local();
+        let deferred = wait_for_remote_ready && respond_to.is_some();
         let Some(area) = self.private_popup_terminal_area_for_owner(owner_id) else {
             return (
-                error(
+                Some(error(
                     "view_not_found",
                     "view disconnected during request".to_string(),
-                ),
+                )),
                 false,
             );
         };
@@ -6365,10 +6478,10 @@ impl HeadlessServer {
             )
         }) else {
             return (
-                error(
+                Some(error(
                     "view_not_found",
                     "view disconnected during request".to_string(),
-                ),
+                )),
                 false,
             );
         };
@@ -6377,23 +6490,42 @@ impl HeadlessServer {
             spec, area, cell_size, theme, appearance, &self.app,
         ) {
             Ok(surface) => {
-                if !self.install_private_surface(owner_id, surface, wait_for_remote_ready) {
-                    return (
-                        error(
-                            "view_not_found",
-                            "view disconnected during request".to_string(),
-                        ),
-                        false,
-                    );
+                let pending_response = if deferred {
+                    respond_to.map(|respond_to| PendingPrivateSurfaceResponse {
+                        id: id.clone(),
+                        respond_to,
+                    })
+                } else {
+                    None
+                };
+                if !self.install_private_surface_with_response(
+                    owner_id,
+                    surface,
+                    wait_for_remote_ready,
+                    pending_response,
+                ) {
+                    return if deferred {
+                        (None, false)
+                    } else {
+                        (
+                            Some(error(
+                                "view_not_found",
+                                "view disconnected during request".to_string(),
+                            )),
+                            false,
+                        )
+                    };
                 }
-                let response = serde_json::to_string(&api::schema::SuccessResponse {
-                    id,
-                    result: api::schema::ResponseResult::Ok {},
-                })
-                .unwrap_or_else(|_| "{}".to_string());
-                (response, true)
+                if deferred {
+                    (None, true)
+                } else {
+                    (Some(Self::private_surface_ok_response(id)), true)
+                }
             }
-            Err(err) => (error("plugin_pane_open_failed", err.to_string()), false),
+            Err(err) => (
+                Some(error("plugin_pane_open_failed", err.to_string())),
+                false,
+            ),
         }
     }
 
@@ -6419,33 +6551,39 @@ impl HeadlessServer {
             return false;
         }
         let mut changed = self.drain_all_internal_events_with_forwarding();
-        let refreshed_shared_plugin_pane = if let api::schema::Method::PluginPaneOpen(params) =
-            &msg.request.method
-        {
-            if let Err(err) = self.app.refresh_installed_plugins() {
-                let response = serde_json::to_string(&api::schema::ErrorResponse {
-                    id: msg.request.id.clone(),
-                    error: api::schema::ErrorBody {
-                        code: "plugin_registry_load_failed".to_string(),
-                        message: err.to_string(),
-                    },
-                })
-                .unwrap_or_else(|_| "{}".to_string());
-                let _ = msg.respond_to.send(response);
-                return changed;
-            }
-            if self.app.plugin_pane_effective_scope(params)
-                == api::schema::PluginPaneScope::ClientPrivate
-            {
-                let (response, plugin_changed) = self
-                    .handle_client_private_plugin_pane_open(msg.request.id.clone(), params.clone());
-                let _ = msg.respond_to.send(response);
-                return changed | plugin_changed;
-            }
-            Some((msg.request.id.clone(), params.clone()))
-        } else {
-            None
-        };
+        let refreshed_shared_plugin_pane =
+            if let api::schema::Method::PluginPaneOpen(params) = &msg.request.method {
+                if let Err(err) = self.app.refresh_installed_plugins() {
+                    let response = serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id.clone(),
+                        error: api::schema::ErrorBody {
+                            code: "plugin_registry_load_failed".to_string(),
+                            message: err.to_string(),
+                        },
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    let _ = msg.respond_to.send(response);
+                    return changed;
+                }
+                if self.app.plugin_pane_effective_scope(params)
+                    == api::schema::PluginPaneScope::ClientPrivate
+                {
+                    let respond_to = msg.respond_to.clone();
+                    let (response, plugin_changed) = self
+                        .handle_client_private_plugin_pane_open_with_response(
+                            msg.request.id.clone(),
+                            params.clone(),
+                            Some(respond_to),
+                        );
+                    if let Some(response) = response {
+                        let _ = msg.respond_to.send(response);
+                    }
+                    return changed | plugin_changed;
+                }
+                Some((msg.request.id.clone(), params.clone()))
+            } else {
+                None
+            };
 
         if let api::schema::Method::PaneOmpBridge(params) = &msg.request.method {
             let response =
@@ -8029,6 +8167,14 @@ impl Drop for HeadlessServer {
         for (_, surface) in self.private_surface_candidates.drain() {
             surface.shutdown();
         }
+        for (_, pending) in self.private_surface_candidate_responses.drain() {
+            let response = Self::private_surface_error_response(
+                pending.id.clone(),
+                "server_unavailable",
+                "server is shutting down",
+            );
+            Self::respond_pending_private_surface(pending, response);
+        }
         crate::server::clipboard_image::remove_files(staged_files);
         let _ = self.cleanup_sockets();
     }
@@ -8585,6 +8731,7 @@ mod tests {
             client_socket_identity,
             clients: HashMap::new(),
             private_surface_candidates: HashMap::new(),
+            private_surface_candidate_responses: HashMap::new(),
             independent_omp_renderers_enabled: true,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
@@ -19520,8 +19667,17 @@ next_tab = ""
             b"candidate",
         );
         let candidate_pane_id = candidate.pane_id();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let pending = PendingPrivateSurfaceResponse {
+            id: "remote-open".into(),
+            respond_to,
+        };
 
-        assert!(server.install_private_surface(1, candidate, true));
+        assert!(server.install_private_surface_with_response(1, candidate, true, Some(pending)));
+        assert!(
+            response_rx.try_recv().is_err(),
+            "remote open must wait for readiness"
+        );
         assert_eq!(
             server.clients[&1]
                 .private_surface
@@ -19545,6 +19701,12 @@ next_tab = ""
                 cwd: Some("/remote".into()),
             })
         );
+        let response = response_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("remote readiness response");
+        let response = serde_json::from_str::<crate::api::schema::SuccessResponse>(&response)
+            .expect("remote readiness success");
+        assert_eq!(response.id, "remote-open");
         assert!(server.private_surface_candidates.is_empty());
         assert_eq!(
             server.clients[&1]
@@ -19633,14 +19795,30 @@ next_tab = ""
             b"candidate",
         );
         let candidate_pane_id = candidate.pane_id();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let pending = PendingPrivateSurfaceResponse {
+            id: "remote-open".into(),
+            respond_to,
+        };
 
-        assert!(server.install_private_surface(1, candidate, true));
+        assert!(server.install_private_surface_with_response(1, candidate, true, Some(pending)));
+        assert!(
+            response_rx.try_recv().is_err(),
+            "remote open must wait for readiness"
+        );
         assert!(
             !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
                 pane_id: candidate_pane_id,
                 child_pid: None,
             })
         );
+        let response = response_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pre-ready remote failure response");
+        let response = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("pre-ready remote failure error");
+        assert_eq!(response.id, "remote-open");
+        assert_eq!(response.error.code, "plugin_pane_open_failed");
         assert!(server.private_surface_candidates.is_empty());
         assert_eq!(
             server.clients[&1]

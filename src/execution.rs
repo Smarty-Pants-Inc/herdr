@@ -212,6 +212,8 @@ struct RemoteExecRequest {
     cwd: PathBuf,
     command: RemoteCommand,
     env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remove_env: Vec<String>,
     api_socket: PathBuf,
     ready_nonce: RemoteExecReadyNonce,
 }
@@ -318,6 +320,7 @@ fn prepare_remote_exec_ssh(
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
+    remove_env: Vec<String>,
 ) -> std::io::Result<(RemoteExecSsh, RemoteRequestChannel, RemoteExecReadyNonce)> {
     let api_socket = random_socket_path(REMOTE_API_SOCKET_PREFIX)?;
     let request_socket = random_socket_path(REMOTE_REQUEST_SOCKET_PREFIX)?;
@@ -328,6 +331,7 @@ fn prepare_remote_exec_ssh(
         cwd: cwd.to_path_buf(),
         command,
         env,
+        remove_env,
         api_socket: api_socket.clone(),
         ready_nonce: ready_nonce.clone(),
     };
@@ -550,11 +554,12 @@ fn random_socket_path(prefix: &str) -> std::io::Result<PathBuf> {
     Ok(Path::new("/tmp").join(format!("{prefix}{nonce}.sock")))
 }
 
-pub(crate) fn ssh_pty_command(
+pub(crate) fn ssh_pty_command_with_removals(
     target: &ExecutionTarget,
     cwd: &Path,
     command: RemoteCommand,
     env: Vec<(String, String)>,
+    remove_env: Vec<String>,
 ) -> std::io::Result<PreparedSshPtyCommand> {
     let ExecutionTarget::Ssh { host } = target else {
         return Err(std::io::Error::new(
@@ -566,7 +571,7 @@ pub(crate) fn ssh_pty_command(
 
     #[cfg(not(unix))]
     {
-        let _ = (cwd, command, env);
+        let _ = (cwd, command, env, remove_env);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "per-terminal SSH execution is only supported on Unix",
@@ -576,7 +581,7 @@ pub(crate) fn ssh_pty_command(
     #[cfg(unix)]
     {
         let (remote_exec, request_channel, ready_nonce) =
-            prepare_remote_exec_ssh(host, cwd, command, env)?;
+            prepare_remote_exec_ssh(host, cwd, command, env, remove_env)?;
         let mut ssh = CommandBuilder::new("ssh");
         ssh.args(remote_exec.ssh_args(host, true));
         ssh.env("TERM", crate::pane::PANE_TERM);
@@ -595,6 +600,16 @@ pub(crate) fn ssh_process_command(
     command: RemoteCommand,
     env: Vec<(String, String)>,
 ) -> std::io::Result<PreparedSshProcessCommand> {
+    ssh_process_command_with_removals(target, cwd, command, env, Vec::new())
+}
+
+pub(crate) fn ssh_process_command_with_removals(
+    target: &ExecutionTarget,
+    cwd: &Path,
+    command: RemoteCommand,
+    env: Vec<(String, String)>,
+    remove_env: Vec<String>,
+) -> std::io::Result<PreparedSshProcessCommand> {
     let ExecutionTarget::Ssh { host } = target else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -605,7 +620,7 @@ pub(crate) fn ssh_process_command(
 
     #[cfg(not(unix))]
     {
-        let _ = (cwd, command, env);
+        let _ = (cwd, command, env, remove_env);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "per-terminal SSH execution is only supported on Unix",
@@ -614,7 +629,7 @@ pub(crate) fn ssh_process_command(
     #[cfg(unix)]
     {
         let (remote_exec, request_channel, _ready_nonce) =
-            prepare_remote_exec_ssh(host, cwd, command, env)?;
+            prepare_remote_exec_ssh(host, cwd, command, env, remove_env)?;
         let mut ssh = crate::noninteractive_process::command("ssh");
         ssh.args(remote_exec.ssh_args(host, false));
         Ok(PreparedSshProcessCommand {
@@ -653,6 +668,7 @@ pub(crate) fn run_remote_exec(request_socket: &str) -> std::io::Result<i32> {
             cwd: requested_cwd,
             command: requested_command,
             env: mut requested_env,
+            remove_env,
             api_socket,
             ready_nonce,
         } = request;
@@ -666,7 +682,7 @@ pub(crate) fn run_remote_exec(request_socket: &str) -> std::io::Result<i32> {
         };
         requested_env.extend(resolved.env);
         let cwd = apply_remote_cwd(&mut command, cwd.as_deref(), &mut requested_env)?;
-        apply_remote_exec_env(&mut command, requested_env);
+        apply_remote_exec_env(&mut command, requested_env, remove_env);
         command.env("TERM", crate::pane::PANE_TERM);
         command.env("COLORTERM", crate::pane::PANE_COLORTERM);
         command.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
@@ -694,12 +710,23 @@ pub(crate) fn run_remote_exec(request_socket: &str) -> std::io::Result<i32> {
     }
 }
 #[cfg(unix)]
-fn apply_remote_exec_env(command: &mut std::process::Command, env: Vec<(String, String)>) {
+fn apply_remote_exec_env(
+    command: &mut std::process::Command,
+    env: Vec<(String, String)>,
+    remove_env: Vec<String>,
+) {
     command.env_remove("CODEX_THREAD_ID");
+    // Outer mux markers no longer describe the process launched inside Herdr.
+    for key in ["TMUX", "STY", "ZELLIJ"] {
+        command.env_remove(key);
+    }
     command.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
     command.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
     command.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
     command.env_remove("HERDR_VIEW_ID");
+    for key in remove_env {
+        command.env_remove(key);
+    }
     command.envs(env);
     command.env_remove("HERDR_BUILD_BIN_PATH");
 }
@@ -995,6 +1022,7 @@ mod tests {
                     "request-workspace".to_string(),
                 ),
             ],
+            Vec::new(),
         );
 
         let env_value = |key: &str| {
@@ -1018,6 +1046,38 @@ mod tests {
         ] {
             assert_eq!(env_value(key), Some(None), "{key} should remain scrubbed");
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn remote_exec_scrubs_inherited_mux_markers() {
+        let mut command = std::process::Command::new("true");
+        for key in ["TMUX", "STY", "ZELLIJ"] {
+            command.env(key, "outer");
+        }
+
+        apply_remote_exec_env(&mut command, Vec::new(), Vec::new());
+
+        for key in ["TMUX", "STY", "ZELLIJ"] {
+            assert_eq!(
+                command.get_envs().find(|(name, _)| *name == key),
+                Some((std::ffi::OsStr::new(key), None)),
+                "inherited {key} marker survived"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_exec_applies_explicit_environment_removals() {
+        let mut command = std::process::Command::new("true");
+        command.env("BUN_OPTIONS", "outer");
+
+        apply_remote_exec_env(&mut command, Vec::new(), vec!["BUN_OPTIONS".to_string()]);
+
+        assert_eq!(
+            command.get_envs().find(|(name, _)| *name == "BUN_OPTIONS"),
+            Some((std::ffi::OsStr::new("BUN_OPTIONS"), None))
+        );
     }
 
     #[cfg(unix)]
@@ -1108,6 +1168,7 @@ mod tests {
             cwd: PathBuf::new(),
             command: RemoteCommand::Shell,
             env: Vec::new(),
+            remove_env: Vec::new(),
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
@@ -1136,6 +1197,7 @@ mod tests {
             cwd: PathBuf::new(),
             command: RemoteCommand::Shell,
             env: Vec::new(),
+            remove_env: Vec::new(),
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
@@ -1158,7 +1220,6 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(!socket.exists());
     }
-
     #[cfg(unix)]
     #[test]
     fn remote_exec_request_round_trips_over_a_framed_socket() {
@@ -1168,6 +1229,7 @@ mod tests {
                 command: "printf '%s' structured".to_string(),
             },
             env: vec![("EXAMPLE".to_string(), "value".to_string())],
+            remove_env: vec!["BUN_OPTIONS".to_string()],
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),
@@ -1182,6 +1244,7 @@ mod tests {
         assert_eq!(received.cwd, request.cwd);
         assert_eq!(received.command, request.command);
         assert_eq!(received.env, request.env);
+        assert_eq!(received.remove_env, request.remove_env);
         assert_eq!(received.api_socket, request.api_socket);
         assert_eq!(received.ready_nonce, request.ready_nonce);
     }
@@ -1195,6 +1258,7 @@ mod tests {
                 command: "x".repeat(REMOTE_EXEC_REQUEST_MAX_BYTES),
             },
             env: Vec::new(),
+            remove_env: Vec::new(),
             api_socket: PathBuf::from(
                 "/tmp/herdr-remote-api-0123456789abcdef0123456789abcdef.sock",
             ),

@@ -204,6 +204,9 @@ impl PaneLaunchEnv {
         self.identity = PaneLaunchIdentity::NoIdentity;
         self
     }
+    pub(crate) fn remote_env_with_removals(&self) -> (Vec<(String, String)>, Vec<String>) {
+        (self.remote_env(), self.remove.clone())
+    }
     pub(crate) fn remote_env(&self) -> Vec<(String, String)> {
         let mut env = self.extra.clone();
         env.retain(|(key, _)| key != "HERDR_BUILD_BIN_PATH");
@@ -2199,11 +2202,13 @@ impl PaneRuntime {
             apply_pane_launch_env(&mut cmd, launch_env);
             (cmd, None, None, windows_powershell_prompt_cwd_reporting)
         } else {
-            let prepared = crate::execution::ssh_pty_command(
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::ssh_pty_command_with_removals(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::Shell,
-                launch_env.remote_env(),
+                env,
+                remove_env,
             )?;
             (
                 prepared.command,
@@ -2260,13 +2265,15 @@ impl PaneRuntime {
             apply_pane_launch_env(&mut cmd, launch_env);
             (cmd, None, None)
         } else {
-            let prepared = crate::execution::ssh_pty_command(
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::ssh_pty_command_with_removals(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::ShellCommand {
                     command: command.to_string(),
                 },
-                launch_env.remote_env(),
+                env,
+                remove_env,
             )?;
             (
                 prepared.command,
@@ -2352,13 +2359,15 @@ impl PaneRuntime {
                 None,
             )
         } else {
-            let prepared = crate::execution::ssh_pty_command(
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::ssh_pty_command_with_removals(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::Argv {
                     argv: argv.to_vec(),
                 },
-                launch_env.remote_env(),
+                env,
+                remove_env,
             )?;
             (
                 prepared.command,
@@ -2411,7 +2420,8 @@ impl PaneRuntime {
                 None,
             )
         } else {
-            let prepared = crate::execution::ssh_pty_command(
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::ssh_pty_command_with_removals(
                 execution_target,
                 &cwd,
                 crate::execution::RemoteCommand::Plugin {
@@ -2420,7 +2430,8 @@ impl PaneRuntime {
                         entrypoint: entrypoint.to_string(),
                     },
                 },
-                launch_env.remote_env(),
+                env,
+                remove_env,
             )?;
             (
                 prepared.command,
@@ -4091,6 +4102,15 @@ mod tests {
         );
 
         assert!(cmd.get_env("BUN_OPTIONS").is_none());
+    }
+
+    #[test]
+    fn pane_launch_env_remote_removals_preserve_without_env() {
+        let (_, remove_env) = PaneLaunchEnv::default()
+            .without_env("BUN_OPTIONS")
+            .remote_env_with_removals();
+
+        assert_eq!(remove_env, vec!["BUN_OPTIONS"]);
     }
 
     #[test]
