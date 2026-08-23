@@ -1,0 +1,880 @@
+name: Smarty Preview Promote Windows Bootstrap
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Exact immutable smarty-preview P/R/O tag to promote
+        required: true
+        type: string
+      bridge_commit:
+        description: Exact reviewed smarty-channel Windows bootstrap bridge commit
+        required: true
+        type: string
+permissions:
+  contents: read
+
+concurrency:
+  group: smarty-preview-bootstrap-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment: smarty-preview-promotion
+    permissions:
+      contents: read
+    steps:
+      - name: Require exact reviewed promotion identity
+        id: identity
+        shell: /bin/bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref }}
+          TAG_INPUT: ${{ inputs.tag }}
+          BRIDGE_INPUT: ${{ inputs.bridge_commit }}
+          SMARTY_RELEASE_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${SMARTY_RELEASE_TOKEN:-}" || {
+            echo "::error::SMARTY_RELEASE_TOKEN is required in the smarty-preview-promotion environment"
+            exit 1
+          }
+          unset SMARTY_RELEASE_TOKEN
+          /usr/bin/python3 -I -S - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          if os.environ["EVENT_NAME"] != "push":
+              raise SystemExit("promotion must remain attached to the exact tag-push transaction")
+          if os.environ["EVENT_REPOSITORY"] != "Smarty-Pants-Inc/herdr":
+              raise SystemExit("promotion must run in the canonical Smarty repository")
+          tag = os.environ["TAG_INPUT"]
+          match = re.fullmatch(
+              r"smarty-preview-(?P<build>\d{4}-\d{2}-\d{2}-p(?P<parent>[0-9a-f]{40})-"
+              r"r(?P<source>[0-9a-f]{40})-o(?P<omp>[0-9a-f]{40}))",
+              tag,
+          )
+          if match is None:
+              raise SystemExit("promotion tag must be one exact lowercase P/R/O preview tag")
+          if os.environ["EVENT_REF"] != f"refs/tags/{tag}":
+              raise SystemExit("promotion must run on the exact immutable preview tag")
+          if os.environ["EVENT_SHA"] != match.group("source"):
+              raise SystemExit("promotion workflow source must be exact R")
+          bridge = os.environ["BRIDGE_INPUT"]
+          if re.fullmatch(r"[0-9a-f]{40}", bridge) is None:
+              raise SystemExit("promotion bridge commit must be lowercase 40-hex")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for key, value in {
+                  "tag": tag,
+                  "build_id": match.group("build"),
+                  "parent": match.group("parent"),
+                  "source": match.group("source"),
+                  "omp": match.group("omp"),
+                  "bridge_commit": bridge,
+              }.items():
+                  output.write(f"{key}={value}\n")
+          PY
+
+      - name: Validate exact promotion authorization and bridge
+        id: bridge
+        shell: /bin/bash
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILD_ID: ${{ steps.identity.outputs.build_id }}
+          EXPECTED_PARENT: ${{ steps.identity.outputs.parent }}
+          EXPECTED_SOURCE: ${{ steps.identity.outputs.source }}
+          EXPECTED_OMP: ${{ steps.identity.outputs.omp }}
+          BRIDGE_COMMIT: ${{ steps.identity.outputs.bridge_commit }}
+        run: |
+          set -euo pipefail
+          askpass="$RUNNER_TEMP/smarty-promotion-askpass-$$"
+          umask 077
+          cat > "$askpass" <<'SH'
+          #!/bin/bash
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          /bin/chmod 0700 "$askpass"
+          trap '/bin/rm -f "$askpass"' EXIT
+          git_auth() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.askPass="$askpass" "$@"
+          }
+          remote=https://github.com/Smarty-Pants-Inc/herdr.git
+          channel_ref=refs/heads/smarty-channel
+          primary_authorization_ref=refs/heads/smarty-preview-authorization
+          promotion_authorization_ref=refs/heads/smarty-preview-promotion-authorization
+          observe_ref() {
+            local ref="$1" line value
+            line="$(git_auth ls-remote "$remote" "$ref")"
+            test -n "$line"
+            value="${line%%$'\t'*}"
+            if [ "$line" != "$value"$'\t'"$ref" ] || [[ ! "$value" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Remote ref $ref is not one exact lowercase commit"
+              exit 1
+            fi
+            /usr/bin/printf '%s' "$value"
+          }
+          channel_commit="$(observe_ref "$channel_ref")"
+          primary_authorization_commit="$(observe_ref "$primary_authorization_ref")"
+          authorization_commit="$(observe_ref "$promotion_authorization_ref")"
+          /usr/bin/git init -q promotion-repo
+          git_auth -C promotion-repo fetch --no-tags "$remote" \
+            "+$channel_ref:refs/remotes/smarty/channel" \
+            "+$primary_authorization_ref:refs/remotes/smarty/primary-authorization" \
+            "+$promotion_authorization_ref:refs/remotes/smarty/promotion-authorization"
+          test "$(/usr/bin/git -C promotion-repo rev-parse refs/remotes/smarty/channel)" = "$channel_commit"
+          test "$(/usr/bin/git -C promotion-repo rev-parse refs/remotes/smarty/primary-authorization)" = "$primary_authorization_commit"
+          test "$(/usr/bin/git -C promotion-repo rev-parse refs/remotes/smarty/promotion-authorization)" = "$authorization_commit"
+          create_promotion_lease() {
+            local blob tree
+            blob="$(/usr/bin/printf '{"schema":1,"action":"promote-windows-bootstrap-to-canonical","parent":"%s","source":"%s","omp":"%s","tag":"%s","build_id":"%s","bridge_commit":"%s","workflow":".github/workflows/smarty-preview-promote.yml"}\n' \
+              "$EXPECTED_PARENT" "$EXPECTED_SOURCE" "$EXPECTED_OMP" "$TAG" "$BUILD_ID" "$BRIDGE_COMMIT" \
+              | /usr/bin/git -C promotion-repo hash-object -w --stdin)"
+            tree="$(/usr/bin/printf '100644 blob %s\t.smarty-preview-promotion-authorization.json\n' "$blob" \
+              | /usr/bin/git -C promotion-repo mktree)"
+            GIT_AUTHOR_NAME='smarty-preview' \
+              GIT_AUTHOR_EMAIL='smarty-preview@users.noreply.github.com' \
+              GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' \
+              GIT_COMMITTER_NAME='smarty-preview' \
+              GIT_COMMITTER_EMAIL='smarty-preview@users.noreply.github.com' \
+              GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
+              /usr/bin/git -C promotion-repo commit-tree "$tree" \
+              -m 'Authorize Smarty Preview canonical promotion'
+          }
+          /usr/bin/git -C promotion-repo cat-file -e "$BRIDGE_COMMIT^{commit}"
+          auth_paths="$(/usr/bin/git -C promotion-repo ls-tree -r --name-only "$authorization_commit")"
+          if [ "$auth_paths" = .smarty-preview-promotion-authorization.json ]; then
+            test -z "$(/usr/bin/git -C promotion-repo show -s --format=%P "$authorization_commit")"
+            /usr/bin/git -C promotion-repo show \
+              "$authorization_commit:.smarty-preview-promotion-authorization.json" > promotion-authorization.json
+            authorization_state=lease
+            expected_authorization_commit="$(create_promotion_lease)"
+            test "$authorization_commit" = "$expected_authorization_commit" || {
+              echo "::error::Promotion authorization is not the exact deterministic lease"
+              exit 1
+            }
+            test "$channel_commit" = "$BRIDGE_COMMIT"
+            test "$primary_authorization_commit" = "$BRIDGE_COMMIT"
+          else
+            test "$authorization_commit" = "$channel_commit"
+            test "$primary_authorization_commit" = "$channel_commit"
+            test "$(/usr/bin/git -C promotion-repo show -s --format=%P "$channel_commit")" = "$BRIDGE_COMMIT"
+            authorization_state=consumed
+          fi
+          /bin/mkdir bridge
+          bridge_tree="$(/usr/bin/git -C promotion-repo ls-tree -r "$BRIDGE_COMMIT")"
+          if [ "$(/usr/bin/printf '%s\n' "$bridge_tree" | /usr/bin/cut -f2 | /usr/bin/sort)" != $'install.sh\npreview.json' ]; then
+            echo "::error::Reviewed bridge commit has unexpected files"
+            exit 1
+          fi
+          while IFS=$'\t' read -r metadata name; do
+            mode="${metadata%% *}"
+            kind="${metadata#* }"
+            kind="${kind%% *}"
+            test "$kind" = blob
+            case "$name:$mode" in
+              install.sh:100755|preview.json:100644) ;;
+              *) echo "::error::Reviewed bridge commit has an unexpected file mode"; exit 1 ;;
+            esac
+          done <<< "$bridge_tree"
+          /usr/bin/git -C promotion-repo show "$BRIDGE_COMMIT:preview.json" > bridge/preview.json
+          /usr/bin/git -C promotion-repo show "$BRIDGE_COMMIT:install.sh" > bridge/install.sh
+          /bin/chmod 0755 bridge/install.sh
+          env -i \
+            PATH=/usr/bin:/bin \
+            HOME="$RUNNER_TEMP/trusted-home" \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            AUTHORIZATION_STATE="$authorization_state" \
+            AUTHORIZATION_COMMIT="$authorization_commit" \
+            PRIMARY_AUTHORIZATION_COMMIT="$primary_authorization_commit" \
+            CHANNEL_COMMIT="$channel_commit" \
+            TAG="$TAG" \
+            BUILD_ID="$BUILD_ID" \
+            EXPECTED_PARENT="$EXPECTED_PARENT" \
+            EXPECTED_SOURCE="$EXPECTED_SOURCE" \
+            EXPECTED_OMP="$EXPECTED_OMP" \
+            BRIDGE_COMMIT="$BRIDGE_COMMIT" \
+            /usr/bin/python3 -I -S - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from datetime import datetime
+          from pathlib import Path
+
+          HERDR = {
+              "linux-x86_64": "herdr-linux-x86_64",
+              "linux-aarch64": "herdr-linux-aarch64",
+              "macos-x86_64": "herdr-macos-x86_64",
+              "macos-aarch64": "herdr-macos-aarch64",
+              "windows-x86_64": "herdr-windows-x86_64.zip",
+          }
+          OMP = {
+              "linux-x86_64": "omp-linux-x86_64",
+              "linux-aarch64": "omp-linux-aarch64",
+              "macos-x86_64": "omp-macos-x86_64",
+              "macos-aarch64": "omp-macos-aarch64",
+          }
+          TOP = {
+              "assets", "base_version", "build_id", "builds", "built_at", "channel",
+              "commit", "notes", "omp", "protocol", "schema_version",
+          }
+          BUILD = {"assets", "base_version", "built_at", "commit", "omp", "protocol", "tag"}
+          PAIRED = re.compile(
+              r"^(?P<day>\d{4}-\d{2}-\d{2})-p(?P<parent>[0-9a-f]{40})-"
+              r"r(?P<source>[0-9a-f]{40})-o(?P<omp>[0-9a-f]{40})$"
+          )
+          LEGACY = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})-(?P<source>[0-9a-f]{12})$")
+
+          def fail(message):
+              raise SystemExit(message)
+
+          def obj(value, label):
+              if not isinstance(value, dict):
+                  fail(f"{label} must be an object")
+              return value
+
+          def scalar(value, label):
+              if not isinstance(value, str) or not value or value != value.strip() or "\n" in value or "\r" in value:
+                  fail(f"{label} must be one nonempty line")
+              return value
+
+          def sha(value, label):
+              if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                  fail(f"{label} must be lowercase SHA-256")
+              return value
+
+          def timestamp(value, label):
+              value = scalar(value, label)
+              try:
+                  parsed = datetime.fromisoformat(f"{value[:-1]}+00:00" if value.endswith("Z") else value)
+              except ValueError as error:
+                  raise SystemExit(f"{label} must be ISO-8601") from error
+              if parsed.tzinfo is None:
+                  fail(f"{label} must include a timezone")
+              return value
+
+          def asset(value, tag, name, label):
+              value = obj(value, label)
+              expected = {"sha256", "url"} | ({"format"} if name.endswith(".zip") else set())
+              if set(value) != expected:
+                  fail(f"{label} has unexpected fields")
+              sha(value.get("sha256"), f"{label} sha256")
+              if value.get("url") != f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{tag}/{name}":
+                  fail(f"{label} URL mismatch")
+              if name.endswith(".zip") and value.get("format") != "zip":
+                  fail(f"{label} format mismatch")
+              return value
+
+          def assets(value, tag, names, label):
+              value = obj(value, label)
+              if set(value) != set(names):
+                  fail(f"{label} allow-list mismatch")
+              for platform, name in names.items():
+                  asset(value[platform], tag, name, f"{label} {platform}")
+              return value
+
+          def omp(value, tag, expected_commit=None):
+              value = obj(value, "retained OMP identity")
+              if set(value) != {"assets", "build_id", "commit", "tree", "version"}:
+                  fail("retained OMP identity has unexpected fields")
+              scalar(value.get("build_id"), "retained OMP build_id")
+              scalar(value.get("version"), "retained OMP version")
+              for field in ("commit", "tree"):
+                  if re.fullmatch(r"[0-9a-f]{40}", str(value.get(field))) is None:
+                      fail(f"retained OMP {field} is invalid")
+              if expected_commit is not None and value["commit"] != expected_commit:
+                  fail("retained OMP commit does not match paired build ID")
+              assets(value.get("assets"), tag, OMP, "retained OMP assets")
+              return value
+
+          def build(build_id, value):
+              value = obj(value, f"retained build {build_id}")
+              if set(value) not in (BUILD, BUILD - {"omp"}):
+                  fail(f"retained build {build_id} has unexpected fields")
+              paired = PAIRED.fullmatch(build_id)
+              legacy = LEGACY.fullmatch(build_id)
+              if paired is None and legacy is None:
+                  fail(f"retained build {build_id} has an invalid identity")
+              datetime.strptime((paired or legacy).group("day"), "%Y-%m-%d")
+              tag = f"smarty-preview-{build_id}"
+              if value.get("tag") != tag:
+                  fail(f"retained build {build_id} tag mismatch")
+              commit = str(value.get("commit"))
+              if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                  fail(f"retained build {build_id} commit is invalid")
+              if paired is not None:
+                  if commit != paired.group("source") or "omp" not in value:
+                      fail(f"retained build {build_id} paired identity mismatch")
+              elif commit[:12] != legacy.group("source"):
+                  fail(f"retained build {build_id} legacy identity mismatch")
+              scalar(value.get("base_version"), f"retained build {build_id} base_version")
+              timestamp(value.get("built_at"), f"retained build {build_id} built_at")
+              if isinstance(value.get("protocol"), bool) or not isinstance(value.get("protocol"), int) or value["protocol"] < 1:
+                  fail(f"retained build {build_id} protocol is invalid")
+              assets(value.get("assets"), tag, HERDR, f"retained build {build_id} assets")
+              if "omp" in value:
+                  omp(value["omp"], tag, paired.group("omp") if paired is not None else None)
+              return value
+
+          bridge = obj(json.loads(Path("bridge/preview.json").read_text(encoding="utf-8")), "bridge")
+          if set(bridge) != TOP | {"bootstrap", "canonical_build_id"}:
+              fail("bridge has unexpected fields")
+          build_id = os.environ["BUILD_ID"]
+          if bridge.get("schema_version") != 2 or bridge.get("channel") != "preview":
+              fail("bridge schema or channel mismatch")
+          if bridge.get("canonical_build_id") != build_id:
+              fail("bridge canonical build ID mismatch")
+          match = PAIRED.fullmatch(build_id)
+          if (
+              match is None
+              or match.group("parent") != os.environ["EXPECTED_PARENT"]
+              or match.group("source") != os.environ["EXPECTED_SOURCE"]
+              or match.group("omp") != os.environ["EXPECTED_OMP"]
+              or os.environ["TAG"] != f"smarty-preview-{build_id}"
+          ):
+              fail("bridge P/R/O/tag identity mismatch")
+          builds = obj(bridge.get("builds"), "bridge builds")
+          if not builds:
+              fail("bridge builds must not be empty")
+          for retained_id, retained in builds.items():
+              build(retained_id, retained)
+          current = obj(builds.get(build_id), "bridge current build")
+          alias = "bootstrap-" + hashlib.sha256(build_id.encode("ascii")).hexdigest()
+          windows = current["assets"]["windows-x86_64"]
+          canonical = {
+              "assets": current["assets"],
+              "base_version": current["base_version"],
+              "build_id": build_id,
+              "builds": builds,
+              "built_at": current["built_at"],
+              "channel": "preview",
+              "commit": current["commit"],
+              "notes": bridge.get("notes"),
+              "omp": current["omp"],
+              "protocol": current["protocol"],
+              "schema_version": 1,
+          }
+          if (
+              bridge.get("build_id") != alias
+              or bridge.get("assets") != {"windows-x86_64": windows}
+              or bridge.get("bootstrap") != {
+                  "schema": "smarty.windows-bootstrap.v1",
+                  "paired_build_id": build_id,
+                  "paired_tag": os.environ["TAG"],
+                  "paired_manifest": "preview.json",
+                  "windows_asset_sha256": windows["sha256"],
+              }
+              or any(
+                  bridge.get(key) != canonical.get(key)
+                  for key in TOP - {"assets", "build_id", "schema_version"}
+              )
+          ):
+              fail("bridge does not bind the exact canonical paired manifest")
+          if os.environ["AUTHORIZATION_STATE"] == "lease":
+              authorization = json.loads(Path("promotion-authorization.json").read_text(encoding="utf-8"))
+              if authorization != {
+                  "schema": 1,
+                  "action": "promote-windows-bootstrap-to-canonical",
+                  "parent": os.environ["EXPECTED_PARENT"],
+                  "source": os.environ["EXPECTED_SOURCE"],
+                  "omp": os.environ["EXPECTED_OMP"],
+                  "tag": os.environ["TAG"],
+                  "build_id": build_id,
+                  "bridge_commit": os.environ["BRIDGE_COMMIT"],
+                  "workflow": ".github/workflows/smarty-preview-promote.yml",
+              }:
+                  fail("promotion lease does not explicitly authorize this exact bridge and P/R/O")
+          Path("bridge/canonical-preview.json").write_text(
+              json.dumps(canonical, indent=2) + "\n", encoding="utf-8"
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"authorization_state={os.environ['AUTHORIZATION_STATE']}\n")
+              output.write(f"authorization_commit={os.environ['AUTHORIZATION_COMMIT']}\n")
+              output.write(f"primary_authorization_commit={os.environ['PRIMARY_AUTHORIZATION_COMMIT']}\n")
+              output.write(f"channel_commit={os.environ['CHANNEL_COMMIT']}\n")
+              output.write(f"built_at={current['built_at']}\n")
+          PY
+          /bin/rm -f "$askpass"
+          trap - EXIT
+
+      - name: Fetch and verify exact immutable paired release
+        shell: /bin/bash
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILD_ID: ${{ steps.identity.outputs.build_id }}
+          EXPECTED_PARENT: ${{ steps.identity.outputs.parent }}
+          EXPECTED_SOURCE: ${{ steps.identity.outputs.source }}
+          EXPECTED_OMP: ${{ steps.identity.outputs.omp }}
+        run: |
+          set -euo pipefail
+          /usr/bin/gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/Smarty-Pants-Inc/herdr/releases/tags/$TAG" > release.json
+          /bin/mkdir release-assets
+          /usr/bin/gh release download "$TAG" \
+            --repo Smarty-Pants-Inc/herdr \
+            --dir release-assets
+          /usr/bin/python3 -I -S - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          payload_metadata = {
+              "herdr-linux-x86_64": ("herdr", "linux-x86_64", "binary", "musl"),
+              "herdr-linux-aarch64": ("herdr", "linux-aarch64", "binary", "musl"),
+              "herdr-macos-x86_64": ("herdr", "macos-x86_64", "binary", "darwin"),
+              "herdr-macos-aarch64": ("herdr", "macos-aarch64", "binary", "darwin"),
+              "herdr-windows-x86_64.zip": ("herdr", "windows-x86_64", "zip", "msvc"),
+              "omp-linux-x86_64": ("omp", "linux-x86_64", "binary", "glibc"),
+              "omp-linux-aarch64": ("omp", "linux-aarch64", "binary", "glibc"),
+              "omp-macos-x86_64": ("omp", "macos-x86_64", "binary", "darwin"),
+              "omp-macos-aarch64": ("omp", "macos-aarch64", "binary", "darwin"),
+              "pi_natives.linux-x64-baseline.node": ("omp-native", "linux-x86_64", "binary", "glibc"),
+              "pi_natives.linux-x64-modern.node": ("omp-native", "linux-x86_64", "binary", "glibc"),
+              "pi_natives.linux-arm64.node": ("omp-native", "linux-aarch64", "binary", "glibc"),
+              "pi_natives.darwin-x64-baseline.node": ("omp-native", "macos-x86_64", "binary", "darwin"),
+              "pi_natives.darwin-arm64.node": ("omp-native", "macos-aarch64", "binary", "darwin"),
+          }
+          payloads = tuple(payload_metadata)
+          sidecars = tuple(f"{name}.sha256" for name in payloads)
+          platform_payloads = {
+              "linux-x86_64": (
+                  "herdr-linux-x86_64", "omp-linux-x86_64",
+                  "pi_natives.linux-x64-baseline.node", "pi_natives.linux-x64-modern.node",
+              ),
+              "linux-aarch64": ("herdr-linux-aarch64", "omp-linux-aarch64", "pi_natives.linux-arm64.node"),
+              "macos-x86_64": (
+                  "herdr-macos-x86_64", "omp-macos-x86_64", "pi_natives.darwin-x64-baseline.node",
+              ),
+              "macos-aarch64": ("herdr-macos-aarch64", "omp-macos-aarch64", "pi_natives.darwin-arm64.node"),
+              "windows-x86_64": ("herdr-windows-x86_64.zip",),
+          }
+          provenance = tuple(f"smarty-provenance-{platform}.sigstore.json" for platform in platform_payloads)
+          evidence = ("smarty-pair.spdx.json", *provenance, "smarty-pair.spdx.sigstore.json")
+          metadata = ("smarty-pair.json", "smarty-pair.provenance.sigstore.json", *evidence)
+          expected = set(payloads + sidecars + metadata)
+          root = Path("release-assets")
+          paths = list(root.iterdir())
+          if len(expected) != 37 or {path.name for path in paths} != expected or any(
+              not path.is_file() or path.is_symlink() for path in paths
+          ):
+              raise SystemExit("promotion release is not the exact 37-file immutable release")
+
+          def record(name):
+              data = (root / name).read_bytes()
+              return {"length": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+          records = {name: record(name) for name in expected}
+          release = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          prefix = f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{os.environ['TAG']}/"
+          assets = release.get("assets")
+          if (
+              release.get("tag_name") != os.environ["TAG"]
+              or release.get("target_commitish") != os.environ["EXPECTED_SOURCE"]
+              or release.get("draft") is not False
+              or release.get("prerelease") is not True
+              or release.get("immutable") is not True
+              or not isinstance(assets, list)
+              or len(assets) != 37
+              or {value.get("name") for value in assets} != expected
+              or any(
+                  value.get("state") != "uploaded"
+                  or value.get("browser_download_url") != prefix + value.get("name", "")
+                  for value in assets
+              )
+          ):
+              raise SystemExit("promotion release is not the exact immutable preview")
+          for name in payloads:
+              if (root / f"{name}.sha256").read_text(encoding="ascii").split() != [records[name]["sha256"], name]:
+                  raise SystemExit(f"promotion checksum sidecar mismatch: {name}")
+          pair = json.loads((root / "smarty-pair.json").read_text(encoding="utf-8"))
+          if set(pair) != {
+              "schema", "pair_id", "release", "sources", "toolchains", "lock_inputs",
+              "platforms", "artifacts", "evidence", "verification",
+          } or pair.get("schema") != "smarty.paired-release.v1":
+              raise SystemExit("promotion pair manifest schema mismatch")
+          material = b"smarty.paired-release.v1\0" + b"\0".join(
+              os.environ[name].encode("ascii")
+              for name in ("EXPECTED_PARENT", "EXPECTED_SOURCE", "EXPECTED_OMP")
+          )
+          canonical = json.loads(Path("bridge/canonical-preview.json").read_text(encoding="utf-8"))
+          def validate_pair_bridge_sources(
+              pair, canonical, expected_parent, expected_source, expected_omp, expected_build_id
+          ):
+              sources = pair.get("sources", {})
+              herdr_source = sources.get("herdr", {}) if isinstance(sources, dict) else {}
+              omp_source = sources.get("omp", {}) if isinstance(sources, dict) else {}
+              if (
+                  pair.get("sources", {}).get("parent", {}).get("commit") != expected_parent
+                  or herdr_source.get("commit") != expected_source
+                  or herdr_source.get("build_id") != expected_build_id
+                  or herdr_source.get("version") != canonical["base_version"]
+                  or herdr_source.get("protocol") != canonical["protocol"]
+                  or omp_source.get("commit") != expected_omp
+                  or omp_source.get("tree") != canonical["omp"]["tree"]
+                  or omp_source.get("version") != canonical["omp"]["version"]
+                  or omp_source.get("build_id") != canonical["omp"]["build_id"]
+              ):
+                  raise SystemExit("promotion pair sources do not match the exact bridge scalars")
+
+          if (
+              pair.get("pair_id") != hashlib.sha256(material).hexdigest()
+              or pair.get("release") != {
+                  "repository": "Smarty-Pants-Inc/herdr",
+                  "tag": os.environ["TAG"],
+                  "build_id": os.environ["BUILD_ID"],
+                  "built_at": canonical["built_at"],
+                  "immutable": True,
+              }
+          ):
+              raise SystemExit("promotion pair manifest identity mismatch")
+          validate_pair_bridge_sources(
+              pair,
+              canonical,
+              os.environ["EXPECTED_PARENT"],
+              os.environ["EXPECTED_SOURCE"],
+              os.environ["EXPECTED_OMP"],
+              os.environ["BUILD_ID"],
+          )
+          artifacts = pair.get("artifacts")
+          if not isinstance(artifacts, dict) or set(artifacts) != set(payloads + sidecars):
+              raise SystemExit("promotion pair artifact allow-list mismatch")
+          for name in payloads:
+              component, platform, format_name, abi = payload_metadata[name]
+              if artifacts[name] != {
+                  "component": component,
+                  "platform": platform,
+                  "format": format_name,
+                  "abi": abi,
+                  **records[name],
+                  "url": prefix + name,
+              }:
+                  raise SystemExit(f"promotion pair payload record mismatch: {name}")
+          for name in sidecars:
+              payload = name.removesuffix(".sha256")
+              if artifacts[name] != {
+                  "kind": "sha256",
+                  "payload": payload,
+                  **records[name],
+                  "url": prefix + name,
+              }:
+                  raise SystemExit(f"promotion pair sidecar record mismatch: {name}")
+          evidence_records = pair.get("evidence")
+          if not isinstance(evidence_records, dict) or set(evidence_records) != set(evidence):
+              raise SystemExit("promotion pair evidence allow-list mismatch")
+          for name in evidence:
+              if evidence_records[name] != {**records[name], "url": prefix + name}:
+                  raise SystemExit(f"promotion pair evidence record mismatch: {name}")
+          verification = pair.get("verification")
+          verifier = verification.get("verifier") if isinstance(verification, dict) else None
+          if (
+              not isinstance(verifier, dict)
+              or set(verifier) != {"length", "sha256"}
+              or isinstance(verifier.get("length"), bool)
+              or not isinstance(verifier.get("length"), int)
+              or verifier["length"] <= 0
+              or re.fullmatch(r"[0-9a-f]{64}", str(verifier.get("sha256"))) is None
+          ):
+              raise SystemExit("promotion trusted verifier record is invalid")
+
+          def subjects(path):
+              text = path.read_text(encoding="utf-8")
+              try:
+                  values = [json.loads(text)]
+              except json.JSONDecodeError:
+                  values = [json.loads(line) for line in text.splitlines() if line.strip()]
+              found = {}
+              pending = list(values)
+              while pending:
+                  value = pending.pop()
+                  if isinstance(value, list):
+                      pending.extend(value)
+                  elif isinstance(value, dict):
+                      envelope = value.get("dsseEnvelope")
+                      if isinstance(envelope, dict):
+                          pending.append(envelope)
+                      if isinstance(value.get("payload"), str) and ("payloadType" in value or "signatures" in value):
+                          statement = json.loads(base64.b64decode(value["payload"], validate=True))
+                          for subject in statement.get("subject", []):
+                              name = subject.get("name")
+                              digest = subject.get("digest", {}).get("sha256")
+                              if name in found and found[name] != digest:
+                                  raise SystemExit(f"conflicting promotion attestation subject: {path.name}")
+                              found[name] = digest
+                      pending.extend(child for key, child in value.items() if key != "dsseEnvelope")
+              if any(
+                  not isinstance(name, str)
+                  or not isinstance(digest, str)
+                  or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                  for name, digest in found.items()
+              ):
+                  raise SystemExit(f"invalid promotion attestation subject: {path.name}")
+              return found
+
+          for platform, names in platform_payloads.items():
+              if subjects(root / f"smarty-provenance-{platform}.sigstore.json") != {
+                  name: records[name]["sha256"] for name in names
+              }:
+                  raise SystemExit(f"promotion platform provenance subject mismatch: {platform}")
+          if subjects(root / "smarty-pair.spdx.sigstore.json") != {
+              name: records[name]["sha256"] for name in payloads + ("smarty-pair.spdx.json",)
+          }:
+              raise SystemExit("promotion SPDX provenance subject mismatch")
+          if subjects(root / "smarty-pair.provenance.sigstore.json") != {
+              "smarty-pair.json": records["smarty-pair.json"]["sha256"]
+          }:
+              raise SystemExit("promotion pair provenance subject mismatch")
+          current = canonical["builds"][os.environ["BUILD_ID"]]
+          for platform, name in {
+              "linux-x86_64": "herdr-linux-x86_64",
+              "linux-aarch64": "herdr-linux-aarch64",
+              "macos-x86_64": "herdr-macos-x86_64",
+              "macos-aarch64": "herdr-macos-aarch64",
+              "windows-x86_64": "herdr-windows-x86_64.zip",
+          }.items():
+              if current["assets"][platform]["sha256"] != records[name]["sha256"]:
+                  raise SystemExit(f"promotion bridge Herdr asset mismatch: {platform}")
+          for platform, name in {
+              "linux-x86_64": "omp-linux-x86_64",
+              "linux-aarch64": "omp-linux-aarch64",
+              "macos-x86_64": "omp-macos-x86_64",
+              "macos-aarch64": "omp-macos-aarch64",
+          }.items():
+              if current["omp"]["assets"][platform]["sha256"] != records[name]["sha256"]:
+                  raise SystemExit(f"promotion bridge OMP asset mismatch: {platform}")
+          PY
+
+      - name: Cryptographically verify immutable release evidence
+        shell: /bin/bash
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          EXPECTED_SOURCE: ${{ steps.identity.outputs.source }}
+        run: |
+          set -euo pipefail
+          verify() {
+            local bundle="$1" predicate="$2"
+            shift 2
+            local subject
+            for subject in "$@"; do
+              /usr/bin/gh attestation verify "release-assets/$subject" \
+                --repo Smarty-Pants-Inc/herdr \
+                --bundle "release-assets/$bundle" \
+                --signer-workflow Smarty-Pants-Inc/herdr/.github/workflows/smarty-preview.yml \
+                --signer-digest "$EXPECTED_SOURCE" \
+                --source-ref "refs/tags/$TAG" \
+                --source-digest "$EXPECTED_SOURCE" \
+                --deny-self-hosted-runners \
+                --predicate-type "$predicate"
+            done
+          }
+          verify smarty-provenance-linux-x86_64.sigstore.json https://slsa.dev/provenance/v1 herdr-linux-x86_64 omp-linux-x86_64 pi_natives.linux-x64-baseline.node pi_natives.linux-x64-modern.node
+          verify smarty-provenance-linux-aarch64.sigstore.json https://slsa.dev/provenance/v1 herdr-linux-aarch64 omp-linux-aarch64 pi_natives.linux-arm64.node
+          verify smarty-provenance-macos-x86_64.sigstore.json https://slsa.dev/provenance/v1 herdr-macos-x86_64 omp-macos-x86_64 pi_natives.darwin-x64-baseline.node
+          verify smarty-provenance-macos-aarch64.sigstore.json https://slsa.dev/provenance/v1 herdr-macos-aarch64 omp-macos-aarch64 pi_natives.darwin-arm64.node
+          verify smarty-provenance-windows-x86_64.sigstore.json https://slsa.dev/provenance/v1 herdr-windows-x86_64.zip
+          verify smarty-pair.spdx.sigstore.json https://spdx.dev/Document/v2.3 herdr-linux-x86_64 herdr-linux-aarch64 herdr-macos-x86_64 herdr-macos-aarch64 herdr-windows-x86_64.zip omp-linux-x86_64 omp-linux-aarch64 omp-macos-x86_64 omp-macos-aarch64 pi_natives.linux-x64-baseline.node pi_natives.linux-x64-modern.node pi_natives.linux-arm64.node pi_natives.darwin-x64-baseline.node pi_natives.darwin-arm64.node smarty-pair.spdx.json
+          verify smarty-pair.provenance.sigstore.json https://slsa.dev/provenance/v1 smarty-pair.json
+
+      - name: Render exact canonical channel from authenticated verifier
+        shell: /bin/bash
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          BUILD_ID: ${{ steps.identity.outputs.build_id }}
+          EXPECTED_SOURCE: ${{ steps.identity.outputs.source }}
+          EXPECTED_BUILT_AT: ${{ steps.bridge.outputs.built_at }}
+        run: |
+          set -euo pipefail
+          askpass="$RUNNER_TEMP/smarty-promotion-source-askpass-$$"
+          umask 077
+          cat > "$askpass" <<'SH'
+          #!/bin/bash
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          /bin/chmod 0700 "$askpass"
+          trap '/bin/rm -f "$askpass"' EXIT
+          git_auth() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.askPass="$askpass" "$@"
+          }
+          remote=https://github.com/Smarty-Pants-Inc/herdr.git
+          tag_ref="refs/tags/$TAG"
+          git_auth -C promotion-repo fetch --no-tags "$remote" "+$tag_ref:refs/smarty/promotion-source"
+          /bin/rm -f "$askpass"
+          trap - EXIT
+          unset GH_TOKEN
+          git_public() {
+            /usr/bin/env -i GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              /usr/bin/git -C promotion-repo "$@"
+          }
+          source_ref=refs/smarty/promotion-source
+          test "$(git_public rev-parse "$source_ref")" = "$EXPECTED_SOURCE"
+          test "$(git_public cat-file -t "$source_ref")" = commit
+          source_built_at_raw="$(git_public show -s --format=%cI "$source_ref")"
+          source_built_at="$(
+            /usr/bin/env -i SOURCE_BUILT_AT_RAW="$source_built_at_raw" \
+              /usr/bin/python3 -I -S - <<'PY'
+          import os
+          from datetime import datetime, timezone
+
+          source_time = datetime.fromisoformat(os.environ["SOURCE_BUILT_AT_RAW"])
+          if source_time.tzinfo is None:
+              raise SystemExit("promotion source commit time has no timezone")
+          print(source_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+          PY
+          )"
+          test "$source_built_at" = "$EXPECTED_BUILT_AT" || {
+            echo "::error::Promotion bridge built_at does not match source commit time"
+            exit 1
+          }
+          if [ "$TAG" != "smarty-preview-$BUILD_ID" ] || [ "${BUILD_ID:0:10}" != "${source_built_at:0:10}" ]; then
+            echo "::error::Promotion tag day does not match canonical source commit date"
+            exit 1
+          fi
+          /usr/bin/git -C promotion-repo show refs/smarty/promotion-source:scripts/preview.py > trusted-preview.py
+          /usr/bin/git -C promotion-repo show refs/smarty/promotion-source:scripts/install-smarty.sh > expected-install.sh
+          /usr/bin/cmp -s expected-install.sh bridge/install.sh
+          /usr/bin/python3 -I -S - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          pair = json.loads(Path("release-assets/smarty-pair.json").read_text(encoding="utf-8"))
+          expected = pair["verification"]["verifier"]
+          data = Path("trusted-preview.py").read_bytes()
+          if expected != {"length": len(data), "sha256": hashlib.sha256(data).hexdigest()}:
+              raise SystemExit("promotion source verifier does not match the attested pair")
+          PY
+          /bin/mkdir candidate
+          /usr/bin/env -i /usr/bin/python3 -I -S trusted-preview.py promote-bootstrap-manifest \
+            --bridge bridge/preview.json \
+            --output candidate/preview.json
+          /usr/bin/cmp -s candidate/preview.json bridge/canonical-preview.json
+          /bin/cp bridge/install.sh candidate/install.sh
+          /bin/chmod 0755 candidate/install.sh
+          /usr/bin/python3 -I -S - <<'PY'
+          from pathlib import Path
+
+          root = Path("candidate")
+          paths = list(root.iterdir())
+          if {path.name for path in paths} != {"install.sh", "preview.json"} or any(
+              not path.is_file() or path.is_symlink() for path in paths
+          ):
+              raise SystemExit("promotion candidate has unexpected files")
+          PY
+
+      - name: Promote bridge to canonical channel with compare-and-swap
+        shell: /bin/bash
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          BUILD_ID: ${{ steps.identity.outputs.build_id }}
+          BRIDGE_COMMIT: ${{ steps.identity.outputs.bridge_commit }}
+          BUILT_AT: ${{ steps.bridge.outputs.built_at }}
+          EXPECTED_AUTHORIZATION_STATE: ${{ steps.bridge.outputs.authorization_state }}
+          EXPECTED_PRIMARY_AUTHORIZATION_COMMIT: ${{ steps.bridge.outputs.primary_authorization_commit }}
+          EXPECTED_AUTHORIZATION_COMMIT: ${{ steps.bridge.outputs.authorization_commit }}
+          EXPECTED_CHANNEL_COMMIT: ${{ steps.bridge.outputs.channel_commit }}
+        run: |
+          set -euo pipefail
+          askpass="$RUNNER_TEMP/smarty-promotion-publish-askpass-$$"
+          umask 077
+          cat > "$askpass" <<'SH'
+          #!/bin/bash
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$GH_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          /bin/chmod 0700 "$askpass"
+          trap '/bin/rm -f "$askpass"' EXIT
+          git_auth() {
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/git -c credential.helper= -c core.askPass="$askpass" "$@"
+          }
+          remote=https://github.com/Smarty-Pants-Inc/herdr.git
+          channel_ref=refs/heads/smarty-channel
+          primary_authorization_ref=refs/heads/smarty-preview-authorization
+          promotion_authorization_ref=refs/heads/smarty-preview-promotion-authorization
+          fetched_ref() {
+            local name="$1" value
+            value="$(/usr/bin/git -C channel-repo rev-parse --verify "refs/remotes/smarty/$name^{commit}")"
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]]
+            /usr/bin/printf '%s' "$value"
+          }
+          /usr/bin/git init -q channel-repo
+          git_auth -C channel-repo fetch --no-tags "$remote" \
+            "+$channel_ref:refs/remotes/smarty/channel" \
+            "+$primary_authorization_ref:refs/remotes/smarty/primary-authorization" \
+            "+$promotion_authorization_ref:refs/remotes/smarty/promotion-authorization"
+          fetched_channel="$(fetched_ref channel)"
+          fetched_primary_authorization="$(fetched_ref primary-authorization)"
+          fetched_authorization="$(fetched_ref promotion-authorization)"
+          /bin/cp candidate/preview.json candidate/install.sh channel-repo/
+          /usr/bin/git -C channel-repo add preview.json install.sh
+          tree="$(/usr/bin/git -C channel-repo write-tree)"
+          candidate_commit="$(GIT_AUTHOR_NAME='github-actions[bot]' \
+            GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_AUTHOR_DATE="$BUILT_AT" \
+            GIT_COMMITTER_NAME='github-actions[bot]' \
+            GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' \
+            GIT_COMMITTER_DATE="$BUILT_AT" \
+            /usr/bin/git -C channel-repo commit-tree "$tree" -p "$BRIDGE_COMMIT" \
+            -m "Promote Smarty preview $BUILD_ID to canonical channel")"
+          if [ "$fetched_channel" = "$candidate_commit" ] \
+            && [ "$fetched_primary_authorization" = "$candidate_commit" ] \
+            && [ "$fetched_authorization" = "$candidate_commit" ]; then
+            echo "Smarty channel already promoted to canonical $BUILD_ID"
+            /bin/rm -f "$askpass"
+            trap - EXIT
+            exit 0
+          fi
+          if [ "$EXPECTED_AUTHORIZATION_STATE" = consumed ]; then
+            echo "::error::Consumed promotion authorization does not point at the deterministic candidate"
+            exit 1
+          fi
+          test "$EXPECTED_AUTHORIZATION_STATE" = lease
+          if [ "$fetched_channel" != "$BRIDGE_COMMIT" ] || [ "$fetched_channel" != "$EXPECTED_CHANNEL_COMMIT" ]; then
+            echo "::error::Smarty channel moved from reviewed bridge $BRIDGE_COMMIT to $fetched_channel"
+            exit 1
+          fi
+          if [ "$fetched_primary_authorization" != "$BRIDGE_COMMIT" ] \
+            || [ "$fetched_primary_authorization" != "$EXPECTED_PRIMARY_AUTHORIZATION_COMMIT" ]; then
+            echo "::error::Primary Smarty authorization moved from reviewed bridge $BRIDGE_COMMIT to $fetched_primary_authorization"
+            exit 1
+          fi
+          if [ "$fetched_authorization" != "$EXPECTED_AUTHORIZATION_COMMIT" ]; then
+            echo "::error::Smarty promotion authorization moved from $EXPECTED_AUTHORIZATION_COMMIT to $fetched_authorization"
+            exit 1
+          fi
+          /usr/bin/git -C channel-repo cat-file blob "$BRIDGE_COMMIT:preview.json" \
+            | /usr/bin/cmp -s - bridge/preview.json
+          /usr/bin/git -C channel-repo cat-file blob "$BRIDGE_COMMIT:install.sh" \
+            | /usr/bin/cmp -s - bridge/install.sh
+          git_auth -C channel-repo push --atomic \
+            "--force-with-lease=$channel_ref:$BRIDGE_COMMIT" \
+            "--force-with-lease=$primary_authorization_ref:$BRIDGE_COMMIT" \
+            "--force-with-lease=$promotion_authorization_ref:$EXPECTED_AUTHORIZATION_COMMIT" \
+            "$remote" "$candidate_commit:$channel_ref" \
+            "$candidate_commit:$primary_authorization_ref" \
+            "$candidate_commit:$promotion_authorization_ref"
+          /bin/rm -f "$askpass"
+          trap - EXIT
