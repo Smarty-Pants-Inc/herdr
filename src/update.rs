@@ -30,12 +30,26 @@ use std::time::{Duration, Instant};
 #[cfg(not(windows))]
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
-#[cfg(unix)]
 use sha2::{Digest, Sha256};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+const PREVIEW_RELEASE_DOWNLOAD_URL: &str =
+    "https://github.com/Smarty-Pants-Inc/herdr/releases/download";
+const CANONICAL_PREVIEW_HERDR_ASSETS: &[(&str, &str)] = &[
+    ("linux-x86_64", "herdr-linux-x86_64"),
+    ("linux-aarch64", "herdr-linux-aarch64"),
+    ("macos-x86_64", "herdr-macos-x86_64"),
+    ("macos-aarch64", "herdr-macos-aarch64"),
+    ("windows-x86_64", "herdr-windows-x86_64.zip"),
+];
+const CANONICAL_PREVIEW_OMP_ASSETS: &[(&str, &str)] = &[
+    ("linux-x86_64", "omp-linux-x86_64"),
+    ("linux-aarch64", "omp-linux-aarch64"),
+    ("macos-x86_64", "omp-macos-x86_64"),
+    ("macos-aarch64", "omp-macos-aarch64"),
+];
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
@@ -155,11 +169,10 @@ fn preview_manifest_url(build_manifest_url: Option<&str>) -> &str {
     build_manifest_url.unwrap_or(PREVIEW_UPDATE_MANIFEST_URL)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AssetRef {
     url: String,
     sha256: Option<String>,
-    #[cfg(windows)]
     format: Option<String>,
 }
 
@@ -173,7 +186,6 @@ impl<'de> Deserialize<'de> for AssetRef {
             serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
                 url: url.trim().to_string(),
                 sha256: None,
-                #[cfg(windows)]
                 format: None,
             }),
             serde_json::Value::Object(mut object) => {
@@ -184,7 +196,6 @@ impl<'de> Deserialize<'de> for AssetRef {
                 let sha256 = object
                     .remove("sha256")
                     .and_then(|value| value.as_str().map(str::to_string));
-                #[cfg(windows)]
                 let format = object
                     .remove("format")
                     .and_then(|value| value.as_str().map(str::to_string));
@@ -194,7 +205,6 @@ impl<'de> Deserialize<'de> for AssetRef {
                 Ok(Self {
                     url: url.trim().to_string(),
                     sha256: sha256.filter(|value| !value.trim().is_empty()),
-                    #[cfg(windows)]
                     format: format.filter(|value| !value.trim().is_empty()),
                 })
             }
@@ -205,7 +215,7 @@ impl<'de> Deserialize<'de> for AssetRef {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl AssetRef {
     fn package_format(&self) -> Result<String, String> {
         let format = self
@@ -263,21 +273,144 @@ struct ManifestReleaseMetadata {
     announcement: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Default)]
+enum CanonicalBuildId {
+    #[default]
+    Absent,
+    Present(Option<String>),
+}
+
+impl CanonicalBuildId {
+    #[cfg(windows)]
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+fn deserialize_canonical_build_id<'de, D>(deserializer: D) -> Result<CanonicalBuildId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(CanonicalBuildId::Present(Option::<String>::deserialize(
+        deserializer,
+    )?))
+}
+
 #[derive(Deserialize)]
 struct PreviewManifest {
     channel: String,
     base_version: String,
     build_id: String,
+    #[serde(default, deserialize_with = "deserialize_canonical_build_id")]
+    canonical_build_id: CanonicalBuildId,
     commit: String,
     built_at: String,
     protocol: u32,
     notes: String,
     assets: BTreeMap<String, AssetRef>,
-    #[cfg(unix)]
     #[serde(default)]
     omp: Option<OmpCompanionMetadata>,
     #[serde(default)]
     builds: BTreeMap<String, PreviewBuildMetadata>,
+}
+
+impl PreviewManifest {
+    fn bridge_build(&self) -> Result<Option<(&str, &PreviewBuildMetadata)>, String> {
+        let CanonicalBuildId::Present(canonical_build_id) = &self.canonical_build_id else {
+            return Ok(None);
+        };
+        let canonical_build_id = canonical_build_id
+            .as_deref()
+            .ok_or("preview manifest canonical_build_id must not be null")?;
+        let canonical_identity = parse_canonical_paired_build_id(canonical_build_id).ok_or(
+            "preview manifest canonical_build_id must be a full lowercase P/R/O build identity",
+        )?;
+        if self.build_id != windows_bootstrap_build_alias(canonical_build_id) {
+            return Err(
+                "preview manifest build_id does not match canonical bootstrap alias".into(),
+            );
+        }
+        let archived = self.builds.get(canonical_build_id).ok_or_else(|| {
+            format!("preview manifest has no retained canonical build {canonical_build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+        {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} metadata differs from top-level metadata"
+            ));
+        }
+        if canonical_identity.herdr_commit != archived.commit {
+            return Err(format!(
+                "preview manifest canonical build {canonical_build_id} Herdr commit does not match retained metadata"
+            ));
+        }
+        let top_omp = self.omp.as_ref().ok_or_else(|| {
+            format!(
+                "preview manifest canonical build {canonical_build_id} has no top-level OMP metadata"
+            )
+        })?;
+        let archived_omp = archived.omp.as_ref().ok_or_else(|| {
+            format!(
+                "preview manifest retained canonical build {canonical_build_id} has no OMP metadata"
+            )
+        })?;
+        if archived_omp != top_omp {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} OMP metadata differs from top-level metadata"
+            ));
+        }
+        if canonical_identity.omp_commit != archived_omp.commit {
+            return Err(format!(
+                "preview manifest canonical build {canonical_build_id} OMP commit does not match retained metadata"
+            ));
+        }
+        if self.assets.len() != 1 || !self.assets.contains_key("windows-x86_64") {
+            return Err(
+                "preview bridge manifest top-level assets must contain only windows-x86_64".into(),
+            );
+        }
+        let canonical_windows_asset = archived.assets.get("windows-x86_64").ok_or_else(|| {
+            format!(
+                "preview manifest retained canonical build {canonical_build_id} has no Windows asset"
+            )
+        })?;
+        if self.assets.get("windows-x86_64") != Some(canonical_windows_asset) {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} Windows asset differs from top-level metadata"
+            ));
+        }
+        self.validate_current_and_retained_builds(canonical_build_id)?;
+        Ok(Some((canonical_build_id, archived)))
+    }
+
+    fn effective_build_id(&self) -> Result<&str, String> {
+        if let Some((canonical_build_id, _)) = self.bridge_build()? {
+            return Ok(canonical_build_id);
+        }
+        let build_id = self.build_id.trim();
+        if parse_canonical_paired_build_id(build_id).is_none() {
+            return Err(
+                "preview manifest build_id must be a full lowercase P/R/O build identity".into(),
+            );
+        }
+        Ok(build_id)
+    }
+
+    fn validate_current_and_retained_builds(&self, build_id: &str) -> Result<(), String> {
+        validate_canonical_preview_build(build_id, &self.commit, &self.assets, self.omp.as_ref())?;
+        for (retained_build_id, retained) in &self.builds {
+            validate_canonical_preview_build(
+                retained_build_id,
+                &retained.commit,
+                &retained.assets,
+                retained.omp.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -287,19 +420,76 @@ struct PreviewBuildMetadata {
     built_at: String,
     protocol: u32,
     assets: BTreeMap<String, AssetRef>,
-    #[cfg(unix)]
     #[serde(default)]
     omp: Option<OmpCompanionMetadata>,
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct OmpCompanionMetadata {
     build_id: String,
     commit: String,
     tree: String,
     version: String,
     assets: BTreeMap<String, AssetRef>,
+}
+
+fn canonical_preview_asset_url(build_id: &str, asset_name: &str) -> String {
+    format!("{PREVIEW_RELEASE_DOWNLOAD_URL}/smarty-preview-{build_id}/{asset_name}")
+}
+
+fn validate_canonical_preview_asset_urls(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    expected_assets: &[(&str, &str)],
+    component: &str,
+) -> Result<(), String> {
+    for &(target, asset_name) in expected_assets {
+        let Some(asset) = assets.get(target) else {
+            continue;
+        };
+        if asset.url != canonical_preview_asset_url(build_id, asset_name) {
+            return Err(format!(
+                "preview manifest {component} asset {target} URL does not bind the canonical release tag"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_canonical_preview_build(
+    build_id: &str,
+    commit: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    omp: Option<&OmpCompanionMetadata>,
+) -> Result<(), String> {
+    let identity = parse_canonical_paired_build_id(build_id).ok_or_else(|| {
+        format!("preview manifest build {build_id} must use a full lowercase P/R/O build identity")
+    })?;
+    if commit != identity.herdr_commit {
+        return Err(format!(
+            "preview manifest build {build_id} Herdr commit does not match its P/R/O identity"
+        ));
+    }
+    let omp =
+        omp.ok_or_else(|| format!("preview manifest build {build_id} has no paired OMP metadata"))?;
+    if omp.commit != identity.omp_commit {
+        return Err(format!(
+            "preview manifest build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_canonical_preview_asset_urls(
+        build_id,
+        assets,
+        CANONICAL_PREVIEW_HERDR_ASSETS,
+        "Herdr",
+    )?;
+    validate_canonical_preview_asset_urls(
+        build_id,
+        &omp.assets,
+        CANONICAL_PREVIEW_OMP_ASSETS,
+        "OMP",
+    )?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -444,20 +634,31 @@ fn preview_omp_metadata_for_build<'a>(
     manifest: &'a PreviewManifest,
     herdr_build_id: &str,
 ) -> Result<&'a OmpCompanionMetadata, String> {
-    if manifest.build_id == herdr_build_id {
-        return manifest.omp.as_ref().ok_or_else(|| {
+    let canonical_build_id = manifest.effective_build_id()?;
+    if canonical_build_id == herdr_build_id {
+        manifest.validate_current_and_retained_builds(canonical_build_id)?;
+        let omp = if let Some((_, archived)) = manifest.bridge_build()? {
+            archived.omp.as_ref()
+        } else {
+            manifest.omp.as_ref()
+        };
+        return omp.ok_or_else(|| {
             format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
         });
     }
-    manifest
+    let retained = manifest
         .builds
         .get(herdr_build_id)
-        .ok_or_else(|| format!("preview manifest has no retained build {herdr_build_id}"))?
-        .omp
-        .as_ref()
-        .ok_or_else(|| {
-            format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
-        })
+        .ok_or_else(|| format!("preview manifest has no retained build {herdr_build_id}"))?;
+    validate_canonical_preview_build(
+        herdr_build_id,
+        &retained.commit,
+        &retained.assets,
+        retained.omp.as_ref(),
+    )?;
+    retained.omp.as_ref().ok_or_else(|| {
+        format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+    })
 }
 
 #[cfg(unix)]
@@ -707,6 +908,50 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
+pub(crate) fn windows_bootstrap_build_alias(canonical_build_id: &str) -> String {
+    format!(
+        "bootstrap-{:x}",
+        Sha256::digest(canonical_build_id.as_bytes())
+    )
+}
+
+struct CanonicalPairedBuildId<'a> {
+    herdr_commit: &'a str,
+    omp_commit: &'a str,
+}
+
+fn parse_canonical_paired_build_id(value: &str) -> Option<CanonicalPairedBuildId<'_>> {
+    fn is_lowercase_oid(value: &str) -> bool {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    let (date, identities) = value.split_once("-p")?;
+    let date = date.as_bytes();
+    if date.len() != 10
+        || date[4] != b'-'
+        || date[7] != b'-'
+        || !date
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (parent, identities) = identities.split_once("-r")?;
+    let (herdr_commit, omp_commit) = identities.split_once("-o")?;
+    if !is_lowercase_oid(parent) || !is_lowercase_oid(herdr_commit) || !is_lowercase_oid(omp_commit)
+    {
+        return None;
+    }
+    Some(CanonicalPairedBuildId {
+        herdr_commit,
+        omp_commit,
+    })
+}
+
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
@@ -730,13 +975,11 @@ fn release_info_from_preview_manifest_for_build(
             manifest.channel
         ));
     }
-    let build_id = manifest.build_id.trim();
-    if build_id.is_empty() {
-        return Err("preview manifest build_id is empty".into());
-    }
-    if installed_is_preview && current_build_id.is_some_and(|current| current == build_id) {
-        return Ok(None);
-    }
+    let (canonical_build_id, retained_build) = match manifest.bridge_build()? {
+        Some((canonical_build_id, retained_build)) => (canonical_build_id, Some(retained_build)),
+        None => (manifest.effective_build_id()?, None),
+    };
+    manifest.validate_current_and_retained_builds(canonical_build_id)?;
 
     let version = Version::parse(&manifest.base_version).ok_or_else(|| {
         format!(
@@ -750,28 +993,17 @@ fn release_info_from_preview_manifest_for_build(
     }
     let (os, arch) = platform_target();
     let asset_key = format!("{os}-{arch}");
-    if let Some(archived) = manifest.builds.get(build_id) {
-        if archived.base_version != manifest.base_version
-            || archived.commit != manifest.commit
-            || archived.built_at != manifest.built_at
-            || archived.protocol != manifest.protocol
-        {
-            tracing::warn!(
-                build_id,
-                "preview manifest archived build metadata differs from top-level metadata"
-            );
-        }
-    }
-    let asset = manifest
-        .assets
-        .get(&asset_key)
-        .or_else(|| {
+    let asset = if let Some(retained_build) = retained_build {
+        retained_build.assets.get(&asset_key)
+    } else {
+        manifest.assets.get(&asset_key).or_else(|| {
             manifest
                 .builds
-                .get(build_id)
+                .get(canonical_build_id)
                 .and_then(|build| build.assets.get(&asset_key))
         })
-        .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
+    }
+    .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
     let sha256 = asset.sha256.clone();
     if require_checksum {
         let checksum = sha256
@@ -791,19 +1023,35 @@ fn release_info_from_preview_manifest_for_build(
             ));
         }
     }
+    #[cfg(windows)]
+    let package_format = asset.package_format()?;
+    #[cfg(windows)]
+    let needs_windows_storage_canonicalization = manifest.canonical_build_id.is_absent()
+        && windows_same_build_storage_needs_canonicalization(
+            &preview_display_version(&manifest.base_version, canonical_build_id),
+            &package_format,
+        );
+    #[cfg(not(windows))]
+    let needs_windows_storage_canonicalization = false;
+    if installed_is_preview
+        && current_build_id.is_some_and(|current| current == canonical_build_id)
+        && !needs_windows_storage_canonicalization
+    {
+        return Ok(None);
+    }
 
     Ok(Some(ReleaseInfo {
-        identity: preview_display_version(&manifest.base_version, build_id),
+        identity: preview_display_version(&manifest.base_version, canonical_build_id),
         version,
         channel: UpdateChannel::Preview,
-        build_id: Some(build_id.to_string()),
+        build_id: Some(canonical_build_id.to_string()),
         commit: Some(manifest.commit.clone()),
         #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
         download_url: asset.url.clone(),
         sha256,
         #[cfg(windows)]
-        package_format: asset.package_format()?,
+        package_format,
         notes_body,
     }))
 }
@@ -1923,9 +2171,125 @@ pub(crate) fn install_exact_asset_and_reexec(
     Err("automatic remote server build alignment is not yet supported on Windows".into())
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_RELEASE_METADATA_FILE: &str = ".herdr-release.json";
+#[cfg(any(windows, test))]
+const WINDOWS_RELEASE_TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+
+#[cfg(any(windows, test))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsReleaseIdentityMetadata {
+    schema_version: u32,
+    version_identity: String,
+    target_triple: String,
+    format: String,
+}
+
+#[cfg(any(windows, test))]
+fn windows_release_metadata_matches(
+    path: &Path,
+    version_identity: &str,
+    package_format: &str,
+) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            serde_json::from_str::<WindowsReleaseIdentityMetadata>(
+                contents.strip_prefix('\u{feff}').unwrap_or(&contents),
+            )
+            .ok()
+        })
+        .is_some_and(|metadata| {
+            matches!(package_format, "zip" | "exe")
+                && metadata.schema_version == 1
+                && metadata.version_identity == version_identity
+                && metadata.target_triple == WINDOWS_RELEASE_TARGET_TRIPLE
+                && metadata.format == package_format
+        })
+}
+
+#[cfg(any(windows, test))]
+fn windows_same_build_storage_needs_canonicalization_at(
+    current_exe: &Path,
+    standalone_root: &Path,
+    version_identity: &str,
+    package_format: &str,
+) -> bool {
+    let current_link = standalone_root.join("current").join("herdr.exe");
+    let releases_dir = standalone_root.join("releases");
+    let (Ok(current_exe), Ok(releases_dir)) = (
+        fs::canonicalize(current_exe),
+        fs::canonicalize(releases_dir),
+    ) else {
+        return false;
+    };
+    if !current_exe.starts_with(&releases_dir) {
+        return false;
+    }
+    let Ok(current_link) = fs::canonicalize(current_link) else {
+        return true;
+    };
+    if current_exe != current_link {
+        return true;
+    }
+    let Some(release_dir) = current_exe.parent() else {
+        return false;
+    };
+    !windows_release_metadata_matches(
+        &release_dir.join(WINDOWS_RELEASE_METADATA_FILE),
+        version_identity,
+        package_format,
+    )
+}
+
+#[cfg(windows)]
+fn windows_same_build_storage_needs_canonicalization(
+    version_identity: &str,
+    package_format: &str,
+) -> bool {
+    let herdr_home = env::var_os("HERDR_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".herdr")));
+    let (Some(herdr_home), Ok(current_exe)) = (herdr_home, env::current_exe()) else {
+        return false;
+    };
+    windows_same_build_storage_needs_canonicalization_at(
+        &current_exe,
+        &herdr_home.join("packages").join("standalone"),
+        version_identity,
+        package_format,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn windows_installed_herdr_exe_path_from_env(
+    install_dir: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let install_dir = match install_dir.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        Some(install_dir) => PathBuf::from(install_dir),
+        None => PathBuf::from(
+            local_app_data.ok_or("LOCALAPPDATA is not set; cannot locate Herdr install")?,
+        )
+        .join("Programs")
+        .join("Herdr")
+        .join("bin"),
+    };
+    Ok(install_dir.join("herdr.exe"))
+}
+
+#[cfg(windows)]
+fn windows_installed_herdr_exe_path() -> Result<PathBuf, String> {
+    windows_installed_herdr_exe_path_from_env(
+        env::var_os("HERDR_INSTALL_DIR").as_deref(),
+        env::var_os("LOCALAPPDATA").as_deref(),
+    )
+}
+
 #[cfg(windows)]
 const WINDOWS_INSTALLER: &str = include_str!("../website/install.ps1");
-
 #[cfg(windows)]
 struct DownloadedWindowsUpdate {
     package_path: PathBuf,
@@ -1970,6 +2334,38 @@ fn download_windows_update(release: &ReleaseInfo) -> Result<DownloadedWindowsUpd
     Ok(update)
 }
 
+#[cfg(any(windows, test))]
+fn windows_installer_command(
+    installer_path: &Path,
+    channel: &str,
+    package_path: &Path,
+    package_format: &str,
+    package_identity: &str,
+    package_sha256: &str,
+) -> Command {
+    let mut command = Command::new("powershell");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(installer_path)
+        .args(["-Channel", channel, "-LocalPackagePath"])
+        .arg(package_path)
+        .args([
+            "-LocalPackageFormat",
+            package_format,
+            "-LocalPackageIdentity",
+            package_identity,
+            "-LocalPackageSha256",
+            package_sha256,
+        ])
+        // Drop any inherited PSModulePath. When herdr is launched from
+        // PowerShell 7, its Core module paths come first and Windows
+        // PowerShell 5.1 (this `powershell`) fails to autoload cmdlets like
+        // Get-FileHash. Removing it lets 5.1 compute its own default path.
+        // See PowerShell/PowerShell#8635.
+        .env_remove("PSModulePath");
+    command
+}
+
 #[cfg(windows)]
 fn install_windows_update_with_installer(
     release: &ReleaseInfo,
@@ -1979,51 +2375,22 @@ fn install_windows_update_with_installer(
         .sha256
         .as_deref()
         .ok_or("Windows update asset is missing a SHA-256 checksum")?;
-    let mut command = Command::new("powershell");
-    command
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&update.installer_path)
-        .args(["-Channel", release.channel.as_str(), "-LocalPackagePath"])
-        .arg(&update.package_path)
-        .args([
-            "-LocalPackageFormat",
-            &release.package_format,
-            "-LocalPackageIdentity",
-            release.label(),
-            "-LocalPackageSha256",
-            expected_sha256,
-        ])
-        // Drop any inherited PSModulePath. When herdr is launched from
-        // PowerShell 7, its Core module paths come first and Windows
-        // PowerShell 5.1 (this `powershell`) fails to autoload cmdlets like
-        // Get-FileHash. Removing it lets 5.1 compute its own default path.
-        // See PowerShell/PowerShell#8635.
-        .env_remove("PSModulePath");
-
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to run Windows installer: {err}"))?;
+    let status = windows_installer_command(
+        &update.installer_path,
+        release.channel.as_str(),
+        &update.package_path,
+        &release.package_format,
+        release.label(),
+        expected_sha256,
+    )
+    .status()
+    .map_err(|err| format!("failed to run Windows installer: {err}"))?;
 
     if !status.success() {
         return Err(format!("Windows installer failed with status {status}"));
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_installed_herdr_exe_path() -> Result<PathBuf, String> {
-    if let Some(install_dir) = env::var_os("HERDR_INSTALL_DIR").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(install_dir).join("herdr.exe"));
-    }
-
-    let local_app_data = env::var_os("LOCALAPPDATA")
-        .ok_or("LOCALAPPDATA is not set; cannot locate Herdr install")?;
-    Ok(PathBuf::from(local_app_data)
-        .join("Programs")
-        .join("Herdr")
-        .join("bin")
-        .join("herdr.exe"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3918,12 +4285,18 @@ mod tests {
         unique_test_socket_path(name).with_extension("dir")
     }
 
-    fn paired_omp_manifest_value(url: &str, checksum: Option<&str>) -> serde_json::Value {
+    const TEST_PAIRED_OMP_HERDR_BUILD_ID: &str = concat!(
+        "2026-08-19-pdddddddddddddddddddddddddddddddddddddddd-",
+        "rcccccccccccccccccccccccccccccccccccccccc-",
+        "oaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+
+    fn paired_omp_manifest_value(checksum: Option<&str>) -> serde_json::Value {
         serde_json::json!({
             "channel": "preview",
             "base_version": "0.8.0",
-            "build_id": "herdr-build",
-            "commit": "herdr-commit",
+            "build_id": TEST_PAIRED_OMP_HERDR_BUILD_ID,
+            "commit": "c".repeat(40),
             "built_at": "2026-08-19T00:00:00Z",
             "protocol": 77,
             "notes": "paired build",
@@ -3935,12 +4308,131 @@ mod tests {
                 "version": "17.3.7",
                 "assets": {
                     "macos-aarch64": {
-                        "url": url,
+                        "url": canonical_preview_asset_url(
+                            TEST_PAIRED_OMP_HERDR_BUILD_ID,
+                            "omp-macos-aarch64",
+                        ),
                         "sha256": checksum,
                     }
                 }
             }
         })
+    }
+
+    fn bridge_manifest_value() -> (String, serde_json::Value) {
+        let canonical_build_id = concat!(
+            "2026-08-22-paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-",
+            "rbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-",
+            "occcccccccccccccccccccccccccccccccccccccc"
+        )
+        .to_string();
+        let mut retained_assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_HERDR_ASSETS {
+            let sha256 = if target == "windows-x86_64" {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            };
+            let mut asset = serde_json::json!({
+                "url": canonical_preview_asset_url(&canonical_build_id, asset_name),
+                "sha256": sha256,
+            });
+            if target == "windows-x86_64" {
+                asset["format"] = serde_json::json!("zip");
+            }
+            retained_assets.insert(target.into(), asset);
+        }
+        let windows_asset = retained_assets
+            .get("windows-x86_64")
+            .expect("Windows asset")
+            .clone();
+        let mut omp_assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_OMP_ASSETS {
+            omp_assets.insert(
+                target.into(),
+                serde_json::json!({
+                    "url": canonical_preview_asset_url(&canonical_build_id, asset_name),
+                    "sha256": "c".repeat(64),
+                }),
+            );
+        }
+        let omp = serde_json::json!({
+            "build_id": "omp-build",
+            "commit": "c".repeat(40),
+            "tree": "b".repeat(40),
+            "version": "17.3.7",
+            "assets": omp_assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(
+            canonical_build_id.clone(),
+            serde_json::json!({
+                "base_version": "9.9.9",
+                "commit": "b".repeat(40),
+                "built_at": "2026-08-22T03:00:00Z",
+                "protocol": 77,
+                "assets": retained_assets,
+                "omp": omp.clone(),
+            }),
+        );
+        (
+            canonical_build_id.clone(),
+            serde_json::json!({
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": windows_bootstrap_build_alias(&canonical_build_id),
+                "canonical_build_id": canonical_build_id,
+                "commit": "b".repeat(40),
+                "built_at": "2026-08-22T03:00:00Z",
+                "protocol": 77,
+                "notes": "### Fixed\n- One",
+                "assets": { "windows-x86_64": windows_asset },
+                "omp": omp,
+                "builds": builds,
+            }),
+        )
+    }
+
+    fn canonical_manifest_value() -> (String, serde_json::Value) {
+        let (canonical_build_id, mut manifest) = bridge_manifest_value();
+        let retained = manifest["builds"][canonical_build_id.as_str()].clone();
+        manifest
+            .as_object_mut()
+            .expect("preview manifest")
+            .remove("canonical_build_id");
+        manifest["build_id"] = serde_json::json!(canonical_build_id);
+        manifest["assets"] = retained["assets"].clone();
+        manifest["omp"] = retained["omp"].clone();
+        (canonical_build_id, manifest)
+    }
+
+    fn bridge_release_error(value: serde_json::Value, canonical_build_id: &str) -> String {
+        let manifest: PreviewManifest = serde_json::from_value(value).expect("bridge manifest");
+        release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some(canonical_build_id),
+        )
+        .expect_err("tampered bridge must fail before same-build return")
+    }
+
+    fn bridge_omp_asset_error(value: serde_json::Value, canonical_build_id: &str) -> String {
+        let manifest: PreviewManifest = serde_json::from_value(value).expect("bridge manifest");
+        let commit = "c".repeat(40);
+        let tree = "b".repeat(40);
+        preview_omp_asset_for_build(
+            &manifest,
+            canonical_build_id,
+            OmpBuildIdentity {
+                build_id: "omp-build",
+                commit: &commit,
+                tree: &tree,
+                version: "17.3.7",
+            },
+            "macos-aarch64",
+        )
+        .expect_err("tampered bridge must fail before OMP download")
     }
 
     fn test_omp_identity() -> OmpBuildIdentity<'static> {
@@ -4630,11 +5122,11 @@ mod tests {
 
     #[test]
     fn paired_omp_manifest_requires_build_identity_and_asset_checksum() {
-        let value = paired_omp_manifest_value("file:///tmp/omp", Some(&"c".repeat(64)));
+        let value = paired_omp_manifest_value(Some(&"c".repeat(64)));
         let manifest: PreviewManifest = serde_json::from_value(value.clone()).unwrap();
         let (omp, _, checksum) = preview_omp_asset_for_build(
             &manifest,
-            "herdr-build",
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
             test_omp_identity(),
             "macos-aarch64",
         )
@@ -4650,15 +5142,24 @@ mod tests {
         assert!(serde_json::from_value::<PreviewManifest>(missing_build_id).is_err());
 
         let missing_checksum: PreviewManifest =
-            serde_json::from_value(paired_omp_manifest_value("file:///tmp/omp", None)).unwrap();
+            serde_json::from_value(paired_omp_manifest_value(None)).unwrap();
         let error = preview_omp_asset_for_build(
             &missing_checksum,
-            "herdr-build",
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
             test_omp_identity(),
             "macos-aarch64",
         )
         .unwrap_err();
         assert!(error.contains("missing a SHA-256 checksum"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_uses_canonical_build_for_current_omp_lookup() {
+        let (canonical_build_id, value) = bridge_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let omp = preview_omp_metadata_for_build(&manifest, &canonical_build_id).unwrap();
+        assert_eq!(omp.build_id, "omp-build");
     }
 
     #[test]
@@ -4773,7 +5274,7 @@ mod tests {
 
         let dir = unique_test_dir("unsealed-cached-omp");
         let state_dir = dir.join("state");
-        let cache_dir = remote_client_build_dir(&state_dir, "herdr-build");
+        let cache_dir = remote_client_build_dir(&state_dir, TEST_PAIRED_OMP_HERDR_BUILD_ID);
         let herdr = cache_dir.join("herdr");
         let omp = cache_dir.join("omp");
         let asset = b"#!/bin/sh\nexit 0\n";
@@ -4790,15 +5291,12 @@ mod tests {
         );
 
         let checksum = format!("{:x}", Sha256::digest(asset));
-        let manifest: PreviewManifest = serde_json::from_value(paired_omp_manifest_value(
-            "file:///missing-omp-asset",
-            Some(&checksum),
-        ))
-        .unwrap();
+        let manifest: PreviewManifest =
+            serde_json::from_value(paired_omp_manifest_value(Some(&checksum))).unwrap();
         let companion = install_omp_companion_from_manifest_at(
             &state_dir,
             &manifest,
-            "herdr-build",
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
             test_omp_identity(),
             "macos-aarch64",
         )
@@ -4820,21 +5318,14 @@ mod tests {
         let asset = b"#!/bin/sh\nexit 0\n";
         fs::write(&source, asset).unwrap();
         let checksum = format!("{:x}", Sha256::digest(asset));
-        let manifest: PreviewManifest = serde_json::from_value(paired_omp_manifest_value(
-            &format!("file://{}", source.display()),
-            Some(&checksum),
-        ))
-        .unwrap();
-
-        let companion = install_omp_companion_from_manifest_at(
+        let asset_url = format!("file://{}", source.display());
+        let executable = install_exact_omp_asset_for_remote_build_at(
             &state_dir,
-            &manifest,
             "herdr-build",
-            test_omp_identity(),
-            "macos-aarch64",
+            &asset_url,
+            &checksum,
         )
         .unwrap();
-        let executable = companion.executable().to_path_buf();
         assert_eq!(
             executable,
             remote_omp_executable_path(&state_dir.canonicalize().unwrap(), "herdr-build")
@@ -4842,23 +5333,21 @@ mod tests {
         assert_eq!(fs::read(&executable).unwrap(), asset);
 
         fs::write(&executable, b"corrupt").unwrap();
-        install_omp_companion_from_manifest_at(
+        install_exact_omp_asset_for_remote_build_at(
             &state_dir,
-            &manifest,
             "herdr-build",
-            test_omp_identity(),
-            "macos-aarch64",
+            &asset_url,
+            &checksum,
         )
         .unwrap();
         assert_eq!(fs::read(&executable).unwrap(), asset);
 
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
-        install_omp_companion_from_manifest_at(
+        install_exact_omp_asset_for_remote_build_at(
             &state_dir,
-            &manifest,
             "herdr-build",
-            test_omp_identity(),
-            "macos-aarch64",
+            &asset_url,
+            &checksum,
         )
         .unwrap();
         assert_ne!(
@@ -4909,6 +5398,263 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             args.iter().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn managed_windows_same_build_storage_binds_identity_and_selected_package_format() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-same-build");
+        let standalone_root = dir.join("packages").join("standalone");
+        let release_dir = standalone_root.join("releases").join("legacy-bootstrap");
+        let current_link = standalone_root.join("current");
+        let current_exe = release_dir.join("herdr.exe");
+        let version_identity = "0.8.2-preview.canonical-build";
+        let metadata_json = |format: &str| {
+            serde_json::json!({
+                "schema_version": 1,
+                "version_identity": version_identity,
+                "target_triple": WINDOWS_RELEASE_TARGET_TRIPLE,
+                "format": format,
+            })
+            .to_string()
+        };
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&current_exe, b"herdr").unwrap();
+        symlink(&release_dir, &current_link).unwrap();
+
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let metadata = release_dir.join(WINDOWS_RELEASE_METADATA_FILE);
+        fs::write(&metadata, format!("\u{feff}{}", metadata_json("zip"))).unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(
+            &metadata,
+            format!("\u{feff}\u{feff}{}", metadata_json("zip")),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(&metadata, metadata_json("exe")).unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "exe",
+        ));
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "msi",
+        ));
+
+        fs::write(
+            &metadata,
+            serde_json::json!({
+                "schema_version": 1,
+                "version_identity": version_identity,
+                "target_triple": WINDOWS_RELEASE_TARGET_TRIPLE,
+                "format": "zip",
+                "unexpected": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let custom_exe = dir.join("custom").join("herdr.exe");
+        fs::create_dir_all(custom_exe.parent().unwrap()).unwrap();
+        fs::write(&custom_exe, b"herdr").unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &custom_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_windows_same_build_storage_retries_after_partial_junction_switch() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-same-build-retry");
+        let standalone_root = dir.join("packages").join("standalone");
+        let releases_dir = standalone_root.join("releases");
+        let release_dir = releases_dir.join("active-release");
+        let current_link = standalone_root.join("current");
+        let current_exe = release_dir.join("herdr.exe");
+        let version_identity = "0.8.2-preview.canonical-build";
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&current_exe, b"herdr").unwrap();
+
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let divergent_release = releases_dir.join("divergent-release");
+        fs::create_dir(&divergent_release).unwrap();
+        fs::write(divergent_release.join("herdr.exe"), b"herdr").unwrap();
+        symlink(&divergent_release, &current_link).unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let unmanaged_exe = dir.join("outside").join("herdr.exe");
+        fs::create_dir_all(unmanaged_exe.parent().unwrap()).unwrap();
+        fs::write(&unmanaged_exe, b"herdr").unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &unmanaged_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_update_uses_default_visible_junction_not_internal_storage() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-default-install-dir");
+        let standalone_root = dir.join("home/packages/standalone");
+        let release_dir = standalone_root.join("releases/release");
+        let current_dir = standalone_root.join("current");
+        let local_app_data = dir.join("local-app-data");
+        let visible_bin_dir = local_app_data.join("Programs/Herdr/bin");
+        let release_exe = release_dir.join("herdr.exe");
+        let current_exe = current_dir.join("herdr.exe");
+
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&release_exe, b"herdr").unwrap();
+        symlink(&release_dir, &current_dir).unwrap();
+        fs::create_dir_all(visible_bin_dir.parent().unwrap()).unwrap();
+        symlink(&release_dir, &visible_bin_dir).unwrap();
+
+        let visible_exe =
+            windows_installed_herdr_exe_path_from_env(None, Some(local_app_data.as_os_str()))
+                .unwrap();
+        assert_eq!(visible_exe, visible_bin_dir.join("herdr.exe"));
+        assert_eq!(
+            fs::canonicalize(&visible_exe).unwrap(),
+            fs::canonicalize(&release_exe).unwrap(),
+        );
+        for internal_exe in [&current_exe, &release_exe] {
+            assert!(internal_exe.exists());
+            assert_ne!(visible_exe, *internal_exe);
+            assert_ne!(visible_exe.parent(), internal_exe.parent());
+        }
+
+        let command = windows_installer_command(
+            &dir.join("install.ps1"),
+            "preview",
+            &dir.join("update.zip"),
+            "zip",
+            "0.8.2-preview.build",
+            &"a".repeat(64),
+        );
+        assert!(!command
+            .get_args()
+            .any(|argument| argument == std::ffi::OsStr::new("-InstallDir")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_update_preserves_explicit_herdr_install_dir_contract() {
+        let dir = unique_test_dir("windows-explicit-install-dir");
+        let custom_install_dir = dir.join("custom-herdr");
+        let local_app_data = dir.join("local-app-data");
+        fs::create_dir(&dir).unwrap();
+
+        assert_eq!(
+            windows_installed_herdr_exe_path_from_env(
+                Some(custom_install_dir.as_os_str()),
+                Some(local_app_data.as_os_str()),
+            )
+            .unwrap(),
+            custom_install_dir.join("herdr.exe")
+        );
+        assert_eq!(
+            windows_installed_herdr_exe_path_from_env(
+                Some(std::ffi::OsStr::new("   ")),
+                Some(local_app_data.as_os_str()),
+            )
+            .unwrap(),
+            local_app_data.join("Programs/Herdr/bin/herdr.exe")
+        );
+        let command = windows_installer_command(
+            &dir.join("install.ps1"),
+            "preview",
+            &dir.join("update.zip"),
+            "zip",
+            "0.8.2-preview.build",
+            &"a".repeat(64),
+        );
+        assert!(!command
+            .get_envs()
+            .any(|(name, _)| name == std::ffi::OsStr::new("HERDR_INSTALL_DIR")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_selected_package_format_supports_legacy_exe_and_zip() {
+        let legacy_exe = AssetRef {
+            url: "https://example.com/herdr.exe".into(),
+            sha256: None,
+            format: None,
+        };
+        let zip = AssetRef {
+            url: "https://example.com/herdr.zip".into(),
+            sha256: None,
+            format: None,
+        };
+        let declared_exe = AssetRef {
+            url: "https://example.com/herdr.zip".into(),
+            sha256: None,
+            format: Some("exe".into()),
+        };
+
+        assert_eq!(legacy_exe.package_format().as_deref(), Ok("exe"));
+        assert_eq!(zip.package_format().as_deref(), Ok("zip"));
+        assert_eq!(declared_exe.package_format().as_deref(), Ok("exe"));
     }
 
     #[test]
@@ -5835,30 +6581,23 @@ mod tests {
     fn build_scoped_preview_manifest_rejects_missing_or_invalid_asset_checksum() {
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
+        let (_, value) = canonical_manifest_value();
 
-        for (asset, expected_error) in [
-            (
-                r#"{"url": "https://example.com/herdr"}"#,
-                "missing a SHA-256 checksum",
-            ),
-            (
-                r#"{"url": "https://example.com/herdr", "sha256": "deadbeef"}"#,
-                "invalid SHA-256 checksum",
-            ),
+        for (checksum, expected_error) in [
+            (None, "missing a SHA-256 checksum"),
+            (Some("deadbeef"), "invalid SHA-256 checksum"),
         ] {
-            let manifest: PreviewManifest = serde_json::from_str(&format!(
-                r####"{{
-                    "channel": "preview",
-                    "base_version": "9.9.9",
-                    "build_id": "2026-06-02-abcdef123456",
-                    "commit": "abcdef1234567890",
-                    "built_at": "2026-06-02T03:00:00Z",
-                    "protocol": 77,
-                    "notes": "### Fixed\n- One",
-                    "assets": {{ "{asset_key}": {asset} }}
-                }}"####
-            ))
-            .unwrap();
+            let mut candidate = value.clone();
+            let asset = candidate["assets"][&asset_key]
+                .as_object_mut()
+                .expect("platform asset");
+            match checksum {
+                Some(checksum) => asset["sha256"] = serde_json::json!(checksum),
+                None => {
+                    asset.remove("sha256");
+                }
+            }
+            let manifest: PreviewManifest = serde_json::from_value(candidate).unwrap();
 
             let error = release_info_from_preview_manifest_for_build(&manifest, true, false, None)
                 .unwrap_err();
@@ -5867,50 +6606,396 @@ mod tests {
     }
 
     #[test]
-    fn preview_manifest_reports_update_when_build_id_differs() {
+    fn canonical_preview_manifest_reports_update_when_build_id_differs() {
+        let (canonical_build_id, value) = canonical_manifest_value();
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "channel": "preview",
-                "base_version": "9.9.9",
-                "build_id": "2026-06-02-abcdef123456",
-                "commit": "abcdef1234567890",
-                "built_at": "2026-06-02T03:00:00Z",
-                "protocol": 77,
-                "notes": "### Fixed\n- One",
-                "assets": {{
-                    "{asset_key}": {{
-                        "url": "https://example.com/herdr-linux-x86_64",
-                        "sha256": "deadbeef"
-                    }}
-                }},
-                "builds": {{
-                    "2026-06-02-abcdef123456": {{
-                        "base_version": "9.9.9",
-                        "commit": "abcdef1234567890",
-                        "built_at": "2026-06-02T03:00:00Z",
-                        "protocol": 77,
-                        "assets": {{
-                            "{asset_key}": {{
-                                "url": "https://example.com/herdr-linux_x86_64",
-                                "sha256": "deadbeef"
-                            }}
-                        }}
-                    }}
-                }}
-            }}"####
-        );
-        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
 
-        let release = release_info_from_preview_manifest(&manifest)
-            .unwrap()
-            .expect("preview update");
+        let release = release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            false,
+            Some("previous-build"),
+        )
+        .unwrap()
+        .expect("preview update");
 
+        let expected_asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset name");
+        let expected_sha256 = if asset_key == "windows-x86_64" {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
         assert_eq!(release.channel, UpdateChannel::Preview);
-        assert_eq!(release.identity, "9.9.9-preview.2026-06-02-abcdef123456");
+        assert_eq!(
+            release.identity,
+            format!("9.9.9-preview.{canonical_build_id}")
+        );
         assert_eq!(release.target_protocol, Some(77));
-        assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            release.download_url,
+            canonical_preview_asset_url(&canonical_build_id, expected_asset_name)
+        );
+        assert_eq!(release.sha256.as_deref(), Some(expected_sha256.as_str()));
+    }
+
+    #[test]
+    fn bridge_manifest_uses_canonical_identity_without_update_loop() {
+        let (canonical_build_id, value) = bridge_manifest_value();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some("previous-build"),
+        )
+        .unwrap()
+        .expect("bridge update");
+        assert_eq!(
+            release.identity,
+            format!("9.9.9-preview.{canonical_build_id}")
+        );
+        assert_eq!(
+            release.build_id.as_deref(),
+            Some(canonical_build_id.as_str())
+        );
+        let expected_asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset name");
+        let expected_download_url =
+            canonical_preview_asset_url(&canonical_build_id, expected_asset_name);
+        let expected_sha256 = if asset_key == "windows-x86_64" {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
+        assert_eq!(release.download_url, expected_download_url);
+        assert_eq!(release.sha256.as_deref(), Some(expected_sha256.as_str()));
+        assert!(release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some(&canonical_build_id),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            windows_bootstrap_build_alias("abc"),
+            "bootstrap-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_coordinated_attacker_asset_aliases() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+        let attacker_url = "https://attacker.invalid/herdr-windows-x86_64.zip";
+        let attacker_sha256 = "d".repeat(64);
+        let mut herdr = bridge.clone();
+        herdr["assets"]["windows-x86_64"]["url"] = serde_json::json!(attacker_url);
+        herdr["assets"]["windows-x86_64"]["sha256"] = serde_json::json!(attacker_sha256);
+        let retained = herdr["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&canonical_build_id)
+            .expect("canonical retained build");
+        retained["assets"]["windows-x86_64"]["url"] = serde_json::json!(attacker_url);
+        retained["assets"]["windows-x86_64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let error = bridge_release_error(herdr, &canonical_build_id);
+        assert!(error.contains("canonical release tag"), "{error}");
+
+        let mut omp = bridge;
+        omp["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        omp["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let retained = omp["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&canonical_build_id)
+            .expect("canonical retained build");
+        retained["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        retained["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let error = bridge_omp_asset_error(omp, &canonical_build_id);
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn retained_paired_omp_asset_rejects_attacker_url_before_download() {
+        let (_current_build_id, mut bridge) = bridge_manifest_value();
+        let retained_build_id = format!(
+            "2026-08-21-p{}-r{}-o{}",
+            "d".repeat(40),
+            "e".repeat(40),
+            "a".repeat(40),
+        );
+        assert!(parse_canonical_paired_build_id(&retained_build_id).is_some());
+        bridge["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(
+                retained_build_id.clone(),
+                serde_json::json!({
+                    "base_version": "9.9.9",
+                    "commit": "e".repeat(40),
+                    "built_at": "2026-08-21T03:00:00Z",
+                    "protocol": 77,
+                    "assets": {},
+                    "omp": {
+                        "build_id": "omp-build",
+                        "commit": "a".repeat(40),
+                        "tree": "b".repeat(40),
+                        "version": "17.3.7",
+                        "assets": {
+                            "macos-aarch64": {
+                                "url": canonical_preview_asset_url(&retained_build_id, "omp-macos-aarch64"),
+                                "sha256": "c".repeat(64),
+                            },
+                        },
+                    },
+                }),
+            );
+        let retained = bridge["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&retained_build_id)
+            .expect("retained build");
+        retained["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        retained["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+
+        let manifest: PreviewManifest = serde_json::from_value(bridge).expect("preview manifest");
+        let error = preview_omp_asset_for_build(
+            &manifest,
+            &retained_build_id,
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .expect_err("attacker-hosted retained OMP asset must fail before download");
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_unbound_or_invalid_canonical_identity_before_same_build_return() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut wrong_alias = bridge.clone();
+        wrong_alias["build_id"] = serde_json::json!(windows_bootstrap_build_alias("other-build"));
+        assert!(bridge_release_error(wrong_alias, &canonical_build_id).contains("bootstrap alias"));
+
+        let invalid_identity = "not-a-paired-build";
+        let mut malformed_identity = bridge.clone();
+        malformed_identity["canonical_build_id"] = serde_json::json!(invalid_identity);
+        malformed_identity["build_id"] =
+            serde_json::json!(windows_bootstrap_build_alias(invalid_identity));
+        assert!(
+            bridge_release_error(malformed_identity, &canonical_build_id)
+                .contains("full lowercase P/R/O")
+        );
+
+        let uppercase_identity = format!(
+            "2026-08-22-p{}-r{}-o{}",
+            "A".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+        );
+        let mut uppercase_identity_value = bridge.clone();
+        uppercase_identity_value["canonical_build_id"] = serde_json::json!(uppercase_identity);
+        uppercase_identity_value["build_id"] =
+            serde_json::json!(windows_bootstrap_build_alias(&uppercase_identity));
+        assert!(
+            bridge_release_error(uppercase_identity_value, &canonical_build_id)
+                .contains("full lowercase P/R/O")
+        );
+
+        let mut null_identity = bridge;
+        null_identity["canonical_build_id"] = serde_json::Value::Null;
+        assert!(
+            bridge_release_error(null_identity, &canonical_build_id).contains("must not be null")
+        );
+    }
+
+    #[test]
+    fn bridge_manifest_binds_canonical_retained_commits_before_same_build_return() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut different_herdr_commit = bridge.clone();
+        let replacement_herdr_commit = "d".repeat(40);
+        different_herdr_commit["commit"] =
+            serde_json::Value::String(replacement_herdr_commit.clone());
+        different_herdr_commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["commit"] = serde_json::Value::String(replacement_herdr_commit);
+        assert!(
+            bridge_release_error(different_herdr_commit, &canonical_build_id)
+                .contains("Herdr commit does not match retained metadata")
+        );
+
+        let mut different_omp_commit = bridge;
+        let replacement_omp_commit = "d".repeat(40);
+        different_omp_commit["omp"]["commit"] =
+            serde_json::Value::String(replacement_omp_commit.clone());
+        different_omp_commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["omp"]["commit"] = serde_json::Value::String(replacement_omp_commit);
+        assert!(
+            bridge_release_error(different_omp_commit, &canonical_build_id)
+                .contains("OMP commit does not match retained metadata")
+        );
+    }
+
+    #[test]
+    fn preview_manifest_rejects_downgrade_to_generic_asset_parser() {
+        let (canonical_build_id, mut stripped_bridge) = bridge_manifest_value();
+        let attacker_url = "https://attacker.invalid/herdr-preview";
+        let attacker_sha256 = "d".repeat(64);
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+
+        stripped_bridge["assets"] =
+            stripped_bridge["builds"][canonical_build_id.as_str()]["assets"].clone();
+        stripped_bridge["build_id"] = serde_json::json!("legacy-preview-build");
+        stripped_bridge
+            .as_object_mut()
+            .expect("bridge manifest")
+            .remove("canonical_build_id");
+        stripped_bridge["assets"][&asset_key]["url"] = serde_json::json!(attacker_url);
+        stripped_bridge["assets"][&asset_key]["sha256"] =
+            serde_json::json!(attacker_sha256.clone());
+        let stripped_manifest: PreviewManifest =
+            serde_json::from_value(stripped_bridge).expect("stripped preview manifest");
+        let error =
+            release_info_from_preview_manifest_for_build(&stripped_manifest, false, false, None)
+                .expect_err("stripped bridge must not reach generic preview asset parsing");
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+
+        let (_, mut noncanonical) = canonical_manifest_value();
+        noncanonical["build_id"] = serde_json::json!("2026-08-22-abcdef123456");
+        noncanonical["assets"][&asset_key]["url"] = serde_json::json!(attacker_url);
+        noncanonical["assets"][&asset_key]["sha256"] = serde_json::json!(attacker_sha256);
+        let noncanonical_manifest: PreviewManifest =
+            serde_json::from_value(noncanonical).expect("noncanonical preview manifest");
+        let error = release_info_from_preview_manifest_for_build(
+            &noncanonical_manifest,
+            false,
+            false,
+            None,
+        )
+        .expect_err("noncanonical preview build ID must be rejected");
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_tampered_retained_metadata_and_assets() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut missing_retained_build = bridge.clone();
+        missing_retained_build["builds"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&canonical_build_id);
+        assert!(
+            bridge_release_error(missing_retained_build, &canonical_build_id)
+                .contains("no retained canonical build")
+        );
+
+        let mut base_version = bridge.clone();
+        base_version["base_version"] = serde_json::json!("9.9.8");
+        assert!(
+            bridge_release_error(base_version, &canonical_build_id).contains("metadata differs")
+        );
+
+        let mut commit = bridge.clone();
+        commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["commit"] = serde_json::json!("other-commit");
+        assert!(bridge_release_error(commit, &canonical_build_id).contains("metadata differs"));
+
+        let mut built_at = bridge.clone();
+        built_at["built_at"] = serde_json::json!("2026-08-23T03:00:00Z");
+        assert!(bridge_release_error(built_at, &canonical_build_id).contains("metadata differs"));
+
+        let mut protocol = bridge.clone();
+        protocol["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["protocol"] = serde_json::json!(78);
+        assert!(bridge_release_error(protocol, &canonical_build_id).contains("metadata differs"));
+
+        let mut missing_top_omp = bridge.clone();
+        missing_top_omp.as_object_mut().unwrap().remove("omp");
+        assert!(bridge_release_error(missing_top_omp, &canonical_build_id)
+            .contains("no top-level OMP metadata"));
+
+        let mut missing_retained_omp = bridge.clone();
+        missing_retained_omp["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("omp");
+        assert!(
+            bridge_release_error(missing_retained_omp, &canonical_build_id)
+                .contains("has no OMP metadata")
+        );
+
+        let mut omp = bridge.clone();
+        omp["omp"]["version"] = serde_json::json!("different-omp");
+        assert!(bridge_release_error(omp, &canonical_build_id).contains("OMP metadata differs"));
+
+        let mut extra_top_level_asset = bridge.clone();
+        extra_top_level_asset["assets"]["linux-x86_64"] = serde_json::json!({
+            "url": "https://example.com/unbound-linux",
+            "sha256": "d".repeat(64),
+        });
+        assert!(
+            bridge_release_error(extra_top_level_asset, &canonical_build_id)
+                .contains("only windows-x86_64")
+        );
+
+        let mut windows_url = bridge.clone();
+        windows_url["assets"]["windows-x86_64"]["url"] =
+            serde_json::json!("https://example.com/other-windows.zip");
+        assert!(bridge_release_error(windows_url, &canonical_build_id)
+            .contains("Windows asset differs"));
+
+        let mut windows_sha = bridge.clone();
+        windows_sha["assets"]["windows-x86_64"]["sha256"] = serde_json::json!("d".repeat(64));
+        assert!(bridge_release_error(windows_sha, &canonical_build_id)
+            .contains("Windows asset differs"));
+
+        let mut windows_format = bridge.clone();
+        windows_format["assets"]["windows-x86_64"]["format"] = serde_json::json!("exe");
+        assert!(bridge_release_error(windows_format, &canonical_build_id)
+            .contains("Windows asset differs"));
+
+        let mut missing_windows = bridge;
+        missing_windows["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["assets"]
+            .as_object_mut()
+            .unwrap()
+            .remove("windows-x86_64");
+        assert!(bridge_release_error(missing_windows, &canonical_build_id)
+            .contains("has no Windows asset"));
     }
 
     #[test]
