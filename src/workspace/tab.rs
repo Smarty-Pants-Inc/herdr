@@ -18,6 +18,18 @@ pub(crate) struct MovedPane {
     pub pane_state: PaneState,
 }
 
+pub(crate) struct PaneMoveTabSnapshot {
+    pub(crate) custom_name: Option<String>,
+    pub(crate) number: usize,
+    pub(crate) root_pane: PaneId,
+    pub(crate) layout: TileLayout,
+    pub(crate) zoomed: bool,
+    pub(crate) pane_count: usize,
+    pub(crate) events: mpsc::Sender<AppEvent>,
+    pub(crate) render_notify: Arc<Notify>,
+    pub(crate) render_dirty: Arc<RenderSignal>,
+}
+
 pub struct NewPane {
     pub pane_id: PaneId,
     pub terminal: TerminalState,
@@ -522,6 +534,51 @@ impl Tab {
             render_notify,
             render_dirty,
         }
+    }
+    pub(crate) fn pane_move_snapshot(&self) -> PaneMoveTabSnapshot {
+        PaneMoveTabSnapshot {
+            custom_name: self.custom_name.clone(),
+            number: self.number,
+            root_pane: self.root_pane,
+            layout: self.layout.clone(),
+            zoomed: self.zoomed,
+            pane_count: self.layout.pane_count(),
+            events: self.events.clone(),
+            render_notify: self.render_notify.clone(),
+            render_dirty: self.render_dirty.clone(),
+        }
+    }
+
+    pub(crate) fn from_existing_pane_for_recovery(
+        snapshot: &PaneMoveTabSnapshot,
+        moved: MovedPane,
+    ) -> Self {
+        let mut tab = Self::from_existing_pane(
+            snapshot.number,
+            snapshot.custom_name.clone(),
+            moved,
+            snapshot.events.clone(),
+            snapshot.render_notify.clone(),
+            snapshot.render_dirty.clone(),
+        );
+        tab.root_pane = snapshot.root_pane;
+        tab.layout = snapshot.layout.clone();
+        tab.zoomed = snapshot.zoomed;
+        tab
+    }
+    pub(crate) fn restore_moved_pane(
+        &mut self,
+        snapshot: &PaneMoveTabSnapshot,
+        moved: MovedPane,
+    ) -> Result<(), MovedPane> {
+        if self.panes.contains_key(&moved.pane_id) {
+            return Err(moved);
+        }
+        self.panes.insert(moved.pane_id, moved.pane_state);
+        self.root_pane = snapshot.root_pane;
+        self.layout = snapshot.layout.clone();
+        self.zoomed = snapshot.zoomed;
+        Ok(())
     }
 
     pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<MovedPane> {

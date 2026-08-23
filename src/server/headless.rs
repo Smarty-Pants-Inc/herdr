@@ -284,6 +284,7 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise idle. Keep this much slower than the old resize-poll cadence to
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PRIVATE_SURFACE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Headless server
@@ -313,6 +314,12 @@ struct PendingPrivateSurfaceResponse {
     respond_to: std::sync::mpsc::Sender<String>,
 }
 
+struct PrivateSurfaceCandidate {
+    surface: crate::server::private_surface::PrivateSurface,
+    pending_response: Option<PendingPrivateSurfaceResponse>,
+    deadline: Instant,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -327,9 +334,7 @@ pub struct HeadlessServer {
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
     /// Remote client-private popup launches staged until their helper confirms execution.
-    private_surface_candidates: HashMap<u64, crate::server::private_surface::PrivateSurface>,
-    /// Responses held until a remote client-private popup confirms execution.
-    private_surface_candidate_responses: HashMap<u64, PendingPrivateSurfaceResponse>,
+    private_surface_candidates: HashMap<u64, PrivateSurfaceCandidate>,
     #[cfg(test)]
     independent_omp_renderers_enabled: bool,
     /// Routes whose server-private guest failed; retain the normal pane fallback
@@ -577,7 +582,6 @@ impl HeadlessServer {
             client_socket_identity,
             clients: HashMap::new(),
             private_surface_candidates: HashMap::new(),
-            private_surface_candidate_responses: HashMap::new(),
             #[cfg(test)]
             independent_omp_renderers_enabled: false,
             private_omp_failed_routes: HashMap::new(),
@@ -932,6 +936,13 @@ impl HeadlessServer {
                 .map(|pending| pending.next_deadline())
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
+                });
+            let next_deadline = self
+                .private_surface_candidates
+                .values()
+                .map(|candidate| candidate.deadline)
+                .fold(next_deadline, |deadline, candidate| {
+                    Some(deadline.map_or(candidate, |current| current.min(candidate)))
                 });
             let event = {
                 tokio::select! {
@@ -1972,6 +1983,18 @@ impl HeadlessServer {
     fn respond_pending_private_surface(pending: PendingPrivateSurfaceResponse, response: String) {
         let _ = pending.respond_to.send(response);
     }
+    fn retire_private_surface_candidate(
+        &mut self,
+        candidate: PrivateSurfaceCandidate,
+        code: &str,
+        message: &str,
+    ) {
+        self.retire_private_surface(candidate.surface);
+        if let Some(pending) = candidate.pending_response {
+            let response = Self::private_surface_error_response(pending.id.clone(), code, message);
+            Self::respond_pending_private_surface(pending, response);
+        }
+    }
 
     fn activate_private_surface(
         &mut self,
@@ -2031,35 +2054,28 @@ impl HeadlessServer {
             return false;
         }
         if wait_for_remote_ready {
-            let previous_pending = self.private_surface_candidate_responses.remove(&client_id);
-            if let Some(previous) = self.private_surface_candidates.insert(client_id, surface) {
-                self.retire_private_surface(previous);
-            }
-            if let Some(previous_pending) = previous_pending {
-                let response = Self::private_surface_error_response(
-                    previous_pending.id.clone(),
+            if let Some(previous) = self.private_surface_candidates.insert(
+                client_id,
+                PrivateSurfaceCandidate {
+                    surface,
+                    pending_response,
+                    deadline: Instant::now() + PRIVATE_SURFACE_READY_TIMEOUT,
+                },
+            ) {
+                self.retire_private_surface_candidate(
+                    previous,
                     "plugin_pane_open_failed",
                     "private popup launch replaced before execution became ready",
                 );
-                Self::respond_pending_private_surface(previous_pending, response);
-            }
-            if let Some(pending) = pending_response {
-                self.private_surface_candidate_responses
-                    .insert(client_id, pending);
             }
             return true;
         }
-        if let Some(candidate) = self.private_surface_candidates.remove(&client_id) {
-            self.retire_private_surface(candidate);
-        }
-        if let Some(previous_pending) = self.private_surface_candidate_responses.remove(&client_id)
-        {
-            let response = Self::private_surface_error_response(
-                previous_pending.id.clone(),
+        if let Some(previous) = self.private_surface_candidates.remove(&client_id) {
+            self.retire_private_surface_candidate(
+                previous,
                 "plugin_pane_open_failed",
                 "private popup launch replaced before execution became ready",
             );
-            Self::respond_pending_private_surface(previous_pending, response);
         }
         self.activate_private_surface(client_id, surface)
     }
@@ -2089,15 +2105,11 @@ impl HeadlessServer {
         self.retire_direct_graphics_for_client(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(candidate) = self.private_surface_candidates.remove(&client_id) {
-            self.retire_private_surface(candidate);
-        }
-        if let Some(pending) = self.private_surface_candidate_responses.remove(&client_id) {
-            let response = Self::private_surface_error_response(
-                pending.id.clone(),
+            self.retire_private_surface_candidate(
+                candidate,
                 "view_not_found",
                 "view disconnected during request",
             );
-            Self::respond_pending_private_surface(pending, response);
         }
         self.private_omp_failed_routes.remove(&client_id);
         self.private_omp_retry_attempted_routes.remove(&client_id);
@@ -2487,12 +2499,15 @@ impl HeadlessServer {
         Ok(())
     }
 
-    /// Drains server events from the dedicated channel.
+    /// Drains a bounded server-event batch so scheduled deadlines remain serviceable under load.
     ///
     /// Uses the original full-render semantics when pane graphics are dormant.
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) && !self.app.scroll_render_pending {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) || self.app.scroll_render_pending {
+                break;
+            }
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -2501,10 +2516,13 @@ impl HeadlessServer {
         changed
     }
 
-    /// Returns the strongest render impact from the drained event batch.
+    /// Returns the strongest render impact from one bounded server-event batch.
     fn drain_server_events_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) && !self.app.scroll_render_pending {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) || self.app.scroll_render_pending {
+                break;
+            }
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -3127,19 +3145,25 @@ impl HeadlessServer {
         if let Some(owner_id) = private_pane_id.and_then(|pane_id| {
             self.private_surface_candidates
                 .iter()
-                .find_map(|(&client_id, surface)| {
-                    (surface.pane_id() == pane_id).then_some(client_id)
+                .find_map(|(&client_id, candidate)| {
+                    (candidate.surface.pane_id() == pane_id).then_some(client_id)
                 })
         }) {
             match &ev {
                 AppEvent::RemoteExecutionReady { .. } => {
-                    let Some(surface) = self.private_surface_candidates.remove(&owner_id) else {
+                    let Some(candidate) = self.private_surface_candidates.remove(&owner_id) else {
                         return false;
                     };
-                    let activated = self.activate_private_surface(owner_id, surface);
-                    if let Some(pending) =
-                        self.private_surface_candidate_responses.remove(&owner_id)
-                    {
+                    if Instant::now() >= candidate.deadline {
+                        self.retire_private_surface_candidate(
+                            candidate,
+                            "plugin_pane_open_failed",
+                            "remote private popup did not become ready before timeout",
+                        );
+                        return false;
+                    }
+                    let activated = self.activate_private_surface(owner_id, candidate.surface);
+                    if let Some(pending) = candidate.pending_response {
                         let response = if activated {
                             Self::private_surface_ok_response(pending.id.clone())
                         } else {
@@ -3154,23 +3178,17 @@ impl HeadlessServer {
                     return activated;
                 }
                 AppEvent::PaneDied { pane_id, .. } => {
-                    if let Some(surface) = self.private_surface_candidates.remove(&owner_id) {
+                    if let Some(candidate) = self.private_surface_candidates.remove(&owner_id) {
                         warn!(
                             client_id = owner_id,
                             pane = pane_id.raw(),
                             "remote private popup exited before execution became ready; keeping existing surface"
                         );
-                        self.retire_private_surface(surface);
-                        if let Some(pending) =
-                            self.private_surface_candidate_responses.remove(&owner_id)
-                        {
-                            let response = Self::private_surface_error_response(
-                                pending.id.clone(),
-                                "plugin_pane_open_failed",
-                                "remote private popup exited before execution became ready",
-                            );
-                            Self::respond_pending_private_surface(pending, response);
-                        }
+                        self.retire_private_surface_candidate(
+                            candidate,
+                            "plugin_pane_open_failed",
+                            "remote private popup exited before execution became ready",
+                        );
                     }
                     return false;
                 }
@@ -3894,7 +3912,6 @@ impl HeadlessServer {
             self.app.state.redraw_on_focus_gained,
         );
         let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
-        let mut link_clicks = Vec::new();
         let Some(view_id) = self
             .clients
             .get(&client_id)
@@ -3915,41 +3932,66 @@ impl HeadlessServer {
         }
         let theme = client.host_terminal_theme;
         let appearance = client.host_terminal_appearance;
-        let Some(surface) = client.private_surface.as_mut() else {
-            return false;
-        };
         if theme_changed {
-            surface.apply_host_theme(theme, appearance);
-        }
-        for event in events {
-            if let Some(click) = surface.route_event(event, mouse_scroll_lines) {
-                link_clicks.push(click);
+            if let Some(surface) = client.private_surface.as_ref() {
+                surface.apply_host_theme(theme, appearance);
             }
         }
 
-        for click in link_clicks {
+        for event in events {
+            let click = {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return false;
+                };
+                let Some(surface) = client.private_surface.as_mut() else {
+                    return false;
+                };
+                surface.route_event(event, mouse_scroll_lines)
+            };
+            let Some(click) = click else {
+                continue;
+            };
+
+            let mouse = click.mouse;
             let Some(source_pane_id) = self.app.private_popup_source_pane_id(click.origin) else {
                 self.close_private_surface(client_id);
                 return true;
             };
-            let handled = match self.app.invoke_plugin_link_handler_for_url_from_source(
-                &click.url,
-                &source_pane_id,
-                &view_id,
-            ) {
-                Ok(handled) => handled,
-                Err(err) => {
-                    warn!(err = %err, url = %click.url, "failed to invoke private popup link handler");
-                    false
+            let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
+                if let Some(surface) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .and_then(|client| client.private_surface.as_mut())
+                {
+                    surface.replay_rejected_link_click(mouse, mouse_scroll_lines);
                 }
+                continue;
             };
-            if !handled && crate::web_url::safe_web_url(&click.url).is_some() {
-                self.send_to_client(
-                    client_id,
-                    ServerMessage::OpenUrl {
-                        url: click.url.clone(),
-                    },
-                );
+            let mut open_url = None;
+            let activated = self.app.activate_link_once_from_source_with_fallback(
+                client_id,
+                &source_pane_id,
+                click.url,
+                &view_id,
+                |url| {
+                    open_url = Some(url);
+                    true
+                },
+            );
+            self.finish_client_navigation_scope(client_id, canonical);
+            if let Some(url) = open_url {
+                self.send_to_client(client_id, ServerMessage::OpenUrl { url });
+            }
+            if let Some(surface) = self
+                .clients
+                .get_mut(&client_id)
+                .and_then(|client| client.private_surface.as_mut())
+            {
+                if activated {
+                    surface.mark_link_click_activated();
+                } else {
+                    surface.replay_rejected_link_click(mouse, mouse_scroll_lines);
+                }
             }
         }
         true
@@ -5507,8 +5549,20 @@ impl HeadlessServer {
             ServerEvent::ActivateOmpLink {
                 client_id,
                 launch_id,
+                request_id,
                 url,
-            } => self.activate_native_omp_link(client_id, launch_id, url),
+            } => {
+                let activated = self.activate_native_omp_link(client_id, launch_id, url);
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::OmpLinkActivationResult {
+                        launch_id,
+                        request_id,
+                        activated,
+                    },
+                );
+                activated
+            }
             ServerEvent::OmpRendererReady {
                 client_id,
                 launch_id,
@@ -6280,7 +6334,10 @@ impl HeadlessServer {
     /// During shutdown, remaining requests get a `server_unavailable` error.
     fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
@@ -6300,7 +6357,10 @@ impl HeadlessServer {
 
     fn drain_api_requests_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
@@ -7910,8 +7970,26 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
-        // No resize polling needed — server has no terminal.
-        // Client resize messages drive size changes instead.
+        let expired_clients = self
+            .private_surface_candidates
+            .iter()
+            .filter_map(|(&client_id, candidate)| (now >= candidate.deadline).then_some(client_id))
+            .collect::<Vec<_>>();
+        for client_id in expired_clients {
+            let Some(candidate) = self.private_surface_candidates.remove(&client_id) else {
+                continue;
+            };
+            warn!(
+                client_id,
+                "remote private popup did not become ready before timeout"
+            );
+            self.retire_private_surface_candidate(
+                candidate,
+                "plugin_pane_open_failed",
+                "remote private popup did not become ready before timeout",
+            );
+            changed = true;
+        }
 
         if self
             .app
@@ -8164,16 +8242,17 @@ impl Drop for HeadlessServer {
                 client.staged_clipboard_files
             })
             .collect::<Vec<_>>();
-        for (_, surface) in self.private_surface_candidates.drain() {
-            surface.shutdown();
-        }
-        for (_, pending) in self.private_surface_candidate_responses.drain() {
-            let response = Self::private_surface_error_response(
-                pending.id.clone(),
+        let candidates = self
+            .private_surface_candidates
+            .drain()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            self.retire_private_surface_candidate(
+                candidate,
                 "server_unavailable",
                 "server is shutting down",
             );
-            Self::respond_pending_private_surface(pending, response);
         }
         crate::server::clipboard_image::remove_files(staged_files);
         let _ = self.cleanup_sockets();
@@ -8731,7 +8810,6 @@ mod tests {
             client_socket_identity,
             clients: HashMap::new(),
             private_surface_candidates: HashMap::new(),
-            private_surface_candidate_responses: HashMap::new(),
             independent_omp_renderers_enabled: true,
             private_omp_failed_routes: HashMap::new(),
             private_omp_retry_attempted_routes: HashMap::new(),
@@ -10806,6 +10884,7 @@ mod tests {
         assert!(server.handle_server_event(ServerEvent::ActivateOmpLink {
             client_id: 1,
             launch_id: renderer_launch_id,
+            request_id: 1,
             url: native_url.into(),
         }));
         assert!(server.app.last_pane_click.is_none());
@@ -10824,6 +10903,7 @@ mod tests {
         assert!(server.handle_server_event(ServerEvent::ActivateOmpLink {
             client_id: 1,
             launch_id: renderer_launch_id,
+            request_id: 2,
             url: native_url.into(),
         }));
         assert!(!server.app.pending_url_click_sources.contains(&1));
@@ -10831,6 +10911,7 @@ mod tests {
         assert!(!server.handle_server_event(ServerEvent::ActivateOmpLink {
             client_id: 1,
             launch_id: renderer_launch_id + 1,
+            request_id: 3,
             url: native_url.into(),
         }));
 
@@ -19689,7 +19770,7 @@ next_tab = ""
             server
                 .private_surface_candidates
                 .get(&1)
-                .map(|surface| surface.pane_id()),
+                .map(|candidate| candidate.surface.pane_id()),
             Some(candidate_pane_id)
         );
 
@@ -19751,7 +19832,7 @@ next_tab = ""
             server
                 .private_surface_candidates
                 .get(&1)
-                .map(|surface| surface.pane_id()),
+                .map(|candidate| candidate.surface.pane_id()),
             Some(candidate_pane_id)
         );
         assert!(server.retired_private_pane_ids.contains(&existing_pane_id));

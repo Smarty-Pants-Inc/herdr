@@ -51,6 +51,9 @@ pub(super) fn launch_cwd_for_terminal(
 impl App {
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         let workspace = self.state.workspaces.get(ws_idx)?;
+        if !workspace.identity_execution_target.is_local() {
+            return None;
+        }
         if let Some(root_pane) = workspace.tabs.first().map(|tab| tab.root_pane) {
             if let Some(terminal_id) = workspace.terminal_id(root_pane) {
                 if self

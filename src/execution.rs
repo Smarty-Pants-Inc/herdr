@@ -600,16 +600,6 @@ pub(crate) fn ssh_process_command(
     command: RemoteCommand,
     env: Vec<(String, String)>,
 ) -> std::io::Result<PreparedSshProcessCommand> {
-    ssh_process_command_with_removals(target, cwd, command, env, Vec::new())
-}
-
-pub(crate) fn ssh_process_command_with_removals(
-    target: &ExecutionTarget,
-    cwd: &Path,
-    command: RemoteCommand,
-    env: Vec<(String, String)>,
-    remove_env: Vec<String>,
-) -> std::io::Result<PreparedSshProcessCommand> {
     let ExecutionTarget::Ssh { host } = target else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -620,7 +610,7 @@ pub(crate) fn ssh_process_command_with_removals(
 
     #[cfg(not(unix))]
     {
-        let _ = (cwd, command, env, remove_env);
+        let _ = (cwd, command, env);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "per-terminal SSH execution is only supported on Unix",
@@ -629,7 +619,7 @@ pub(crate) fn ssh_process_command_with_removals(
     #[cfg(unix)]
     {
         let (remote_exec, request_channel, _ready_nonce) =
-            prepare_remote_exec_ssh(host, cwd, command, env, remove_env)?;
+            prepare_remote_exec_ssh(host, cwd, command, env, Vec::new())?;
         let mut ssh = crate::noninteractive_process::command("ssh");
         ssh.args(remote_exec.ssh_args(host, false));
         Ok(PreparedSshProcessCommand {

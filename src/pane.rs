@@ -317,11 +317,7 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     }
 }
 
-fn pane_argv_command_builder(
-    cwd: &std::path::Path,
-    argv: &[String],
-    launch_env: &PaneLaunchEnv,
-) -> std::io::Result<CommandBuilder> {
+fn pane_argv_command_builder(argv: &[String]) -> std::io::Result<CommandBuilder> {
     let Some((program, args)) = argv.split_first() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -330,10 +326,47 @@ fn pane_argv_command_builder(
     };
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
-    cmd.cwd(cwd);
-    apply_pane_terminal_env(&mut cmd);
-    apply_pane_launch_env(&mut cmd, launch_env);
     Ok(cmd)
+}
+
+type PreparedPanePty = (
+    CommandBuilder,
+    Option<crate::execution::RemoteRequestChannel>,
+    Option<crate::execution::RemoteExecReadyNonce>,
+);
+
+fn prepare_pane_pty_command<Local, Remote>(
+    cwd: &Path,
+    execution_target: &crate::execution::ExecutionTarget,
+    launch_env: &PaneLaunchEnv,
+    local: Local,
+    remote: Remote,
+) -> std::io::Result<PreparedPanePty>
+where
+    Local: FnOnce() -> std::io::Result<CommandBuilder>,
+    Remote: FnOnce() -> crate::execution::RemoteCommand,
+{
+    if execution_target.is_local() {
+        let mut cmd = local()?;
+        cmd.cwd(cwd);
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, launch_env);
+        Ok((cmd, None, None))
+    } else {
+        let (env, remove_env) = launch_env.remote_env_with_removals();
+        let prepared = crate::execution::ssh_pty_command_with_removals(
+            execution_target,
+            cwd,
+            remote(),
+            env,
+            remove_env,
+        )?;
+        Ok((
+            prepared.command,
+            Some(prepared.request_channel),
+            Some(prepared.ready_nonce),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2188,35 +2221,15 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (
-            cmd,
-            remote_request_channel,
-            remote_ready_nonce,
-            windows_powershell_prompt_cwd_reporting,
-        ) = if execution_target.is_local() {
-            let windows_powershell_prompt_cwd_reporting =
-                uses_windows_powershell_pane_shell(shell_config);
-            let mut cmd = pane_shell_command_builder(shell_config)?;
-            cmd.cwd(&cwd);
-            apply_pane_terminal_env(&mut cmd);
-            apply_pane_launch_env(&mut cmd, launch_env);
-            (cmd, None, None, windows_powershell_prompt_cwd_reporting)
-        } else {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::ssh_pty_command_with_removals(
-                execution_target,
-                &cwd,
-                crate::execution::RemoteCommand::Shell,
-                env,
-                remove_env,
-            )?;
-            (
-                prepared.command,
-                Some(prepared.request_channel),
-                Some(prepared.ready_nonce),
-                false,
-            )
-        };
+        let windows_powershell_prompt_cwd_reporting =
+            execution_target.is_local() && uses_windows_powershell_pane_shell(shell_config);
+        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
+            &cwd,
+            execution_target,
+            launch_env,
+            || pane_shell_command_builder(shell_config),
+            || crate::execution::RemoteCommand::Shell,
+        )?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2258,29 +2271,15 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = if execution_target.is_local() {
-            let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
-            cmd.cwd(&cwd);
-            apply_pane_terminal_env(&mut cmd);
-            apply_pane_launch_env(&mut cmd, launch_env);
-            (cmd, None, None)
-        } else {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::ssh_pty_command_with_removals(
-                execution_target,
-                &cwd,
-                crate::execution::RemoteCommand::ShellCommand {
-                    command: command.to_string(),
-                },
-                env,
-                remove_env,
-            )?;
-            (
-                prepared.command,
-                Some(prepared.request_channel),
-                Some(prepared.ready_nonce),
-            )
-        };
+        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
+            &cwd,
+            execution_target,
+            launch_env,
+            || Ok(crate::platform::pane_custom_command_pty_builder(command)),
+            || crate::execution::RemoteCommand::ShellCommand {
+                command: command.to_string(),
+            },
+        )?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2352,29 +2351,15 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = if execution_target.is_local() {
-            (
-                pane_argv_command_builder(&cwd, argv, launch_env)?,
-                None,
-                None,
-            )
-        } else {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::ssh_pty_command_with_removals(
-                execution_target,
-                &cwd,
-                crate::execution::RemoteCommand::Argv {
-                    argv: argv.to_vec(),
-                },
-                env,
-                remove_env,
-            )?;
-            (
-                prepared.command,
-                Some(prepared.request_channel),
-                Some(prepared.ready_nonce),
-            )
-        };
+        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
+            &cwd,
+            execution_target,
+            launch_env,
+            || pane_argv_command_builder(argv),
+            || crate::execution::RemoteCommand::Argv {
+                argv: argv.to_vec(),
+            },
+        )?;
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2413,32 +2398,18 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = if execution_target.is_local() {
-            (
-                pane_argv_command_builder(&cwd, local_argv, launch_env)?,
-                None,
-                None,
-            )
-        } else {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::ssh_pty_command_with_removals(
-                execution_target,
-                &cwd,
-                crate::execution::RemoteCommand::Plugin {
-                    plugin_id: plugin_id.to_string(),
-                    target: crate::plugin_command::PluginCommandTarget::Pane {
-                        entrypoint: entrypoint.to_string(),
-                    },
+        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
+            &cwd,
+            execution_target,
+            launch_env,
+            || pane_argv_command_builder(local_argv),
+            || crate::execution::RemoteCommand::Plugin {
+                plugin_id: plugin_id.to_string(),
+                target: crate::plugin_command::PluginCommandTarget::Pane {
+                    entrypoint: entrypoint.to_string(),
                 },
-                env,
-                remove_env,
-            )?;
-            (
-                prepared.command,
-                Some(prepared.request_channel),
-                Some(prepared.ready_nonce),
-            )
-        };
+            },
+        )?;
         Self::spawn_command_builder(
             pane_id,
             rows,

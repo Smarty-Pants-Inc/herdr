@@ -2736,6 +2736,24 @@ async fn run_client_loop(
                         prefix,
                     );
                 }
+                ServerMessage::OmpLinkActivationResult {
+                    launch_id,
+                    request_id,
+                    activated,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        state.omp_renderer.resolve_link_activation(
+                            launch_id,
+                            request_id,
+                            activated,
+                            applied_host_input_generation,
+                        );
+                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (launch_id, request_id, activated);
+                }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
                         record_received_kitty_graphics(&frame.bytes);

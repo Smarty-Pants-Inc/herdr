@@ -649,11 +649,42 @@ impl App {
         url: String,
         view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
+        self.activate_link_once_with_key(source_id, pane_id.raw().to_string(), url, |app, url| {
+            app.activate_resolved_link(source_id, pane_id, url, view_id)
+        })
+    }
+
+    pub(crate) fn activate_link_once_from_source_with_fallback(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_pane_id: &str,
+        url: String,
+        view_id: &crate::api::schema::ViewId,
+        fallback: impl FnOnce(String) -> bool,
+    ) -> bool {
+        self.activate_link_once_with_key(source_id, source_pane_id.to_owned(), url, |app, url| {
+            app.activate_resolved_link_with(
+                url,
+                move |app, url| {
+                    app.invoke_plugin_link_handler_for_url_from_source(url, source_pane_id, view_id)
+                },
+                move |_, url| fallback(url),
+            )
+        })
+    }
+
+    fn activate_link_once_with_key(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_key: String,
+        url: String,
+        activate: impl FnOnce(&mut Self, String) -> bool,
+    ) -> bool {
         let at = std::time::Instant::now();
         if self
             .last_link_click
             .as_ref()
-            .is_some_and(|last| last.is_duplicate_for(source_id, pane_id, &url, at))
+            .is_some_and(|last| last.is_duplicate_for(source_id, &source_key, &url, at))
         {
             if let Some(last) = self.last_link_click.as_mut() {
                 last.at = at;
@@ -661,10 +692,10 @@ impl App {
             return true;
         }
         self.last_link_click = None;
-        if self.activate_resolved_link(source_id, pane_id, url.clone(), view_id) {
+        if activate(self, url.clone()) {
             self.last_link_click = Some(LinkClickState {
                 source_id,
-                pane_id,
+                source_key,
                 url,
                 at,
             });
@@ -681,11 +712,24 @@ impl App {
         url: String,
         view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
+        self.activate_resolved_link_with(
+            url,
+            move |app, url| app.invoke_plugin_link_handler_for_url_for_view(url, pane_id, view_id),
+            move |app, url| app.queue_open_url(source_id, url),
+        )
+    }
+
+    fn activate_resolved_link_with(
+        &mut self,
+        url: String,
+        invoke_plugin_handler: impl FnOnce(&mut Self, &str) -> Result<bool, String>,
+        fallback: impl FnOnce(&mut Self, String) -> bool,
+    ) -> bool {
         self.last_pane_click = None;
         let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
             return false;
         };
-        match self.invoke_plugin_link_handler_for_url_for_view(&url, pane_id, view_id) {
+        match invoke_plugin_handler(self, &url) {
             Ok(true) => return true,
             Ok(false) => {}
             Err(err) => {
@@ -695,14 +739,17 @@ impl App {
         let Some(url) = crate::web_url::safe_web_url(&url).map(str::to_owned) else {
             return false;
         };
-        if self
+        fallback(self, url)
+    }
+
+    fn queue_open_url(&mut self, source_id: super::InputSourceId, url: String) -> bool {
+        let result = self
             .event_tx
-            .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
-            .is_err()
-        {
+            .try_send(crate::events::AppEvent::OpenUrl { url, source_id });
+        if result.is_err() {
             tracing::warn!("failed to queue pane URL opening");
         }
-        true
+        result.is_ok()
     }
 
     fn handle_url_click_for_view(
@@ -1147,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn full_open_url_queue_still_consumes_safe_link() {
+    fn full_open_url_queue_rejects_safe_link_without_consuming_it() {
         let mut app = test_app();
         for _ in 0..crate::app::APP_EVENT_CHANNEL_CAPACITY {
             app.event_tx
@@ -1166,13 +1213,13 @@ mod tests {
             .is_err());
 
         let source_id = 41;
-        assert!(app.activate_link_click(
+        assert!(!app.activate_link_click(
             source_id,
             crate::layout::PaneId::alloc(),
             "https://example.com/click".into(),
             None,
         ));
-        assert!(app.pending_url_click_sources.contains(&source_id));
+        assert!(!app.pending_url_click_sources.contains(&source_id));
     }
 
     #[tokio::test]

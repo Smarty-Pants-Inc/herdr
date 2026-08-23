@@ -106,7 +106,7 @@ impl PaneClickState {
 #[derive(Debug, Clone)]
 pub(crate) struct LinkClickState {
     source_id: InputSourceId,
-    pane_id: crate::layout::PaneId,
+    source_key: String,
     url: String,
     at: Instant,
 }
@@ -115,12 +115,12 @@ impl LinkClickState {
     fn is_duplicate_for(
         &self,
         source_id: InputSourceId,
-        pane_id: crate::layout::PaneId,
+        source_key: &str,
         url: &str,
         at: Instant,
     ) -> bool {
         self.source_id == source_id
-            && self.pane_id == pane_id
+            && self.source_key == source_key
             && self.url == url
             && at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
     }
@@ -780,10 +780,9 @@ impl App {
         };
 
         state.terminals = restored_terminals;
-
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
-                .resolved_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
+                .local_git_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
             state.workspaces[ws_idx].cached_git_branch =
                 cwd.as_deref().and_then(crate::workspace::git_branch);
         }

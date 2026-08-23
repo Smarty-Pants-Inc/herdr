@@ -12,6 +12,7 @@ use crate::terminal::TerminalRuntime;
 pub(crate) struct PrivateLinkClick {
     pub(crate) url: String,
     pub(crate) origin: ClientPrivatePluginPopupOrigin,
+    pub(crate) mouse: MouseEvent,
 }
 
 pub(crate) struct PrivateSurface {
@@ -24,6 +25,8 @@ pub(crate) struct PrivateSurface {
     render_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
     pending_url_click: bool,
+    replay_mouse_gesture: bool,
+    last_mouse_cell: Option<(u16, u16)>,
 }
 
 impl PrivateSurface {
@@ -78,6 +81,8 @@ impl PrivateSurface {
             render_area: area,
             cell_size,
             pending_url_click: false,
+            replay_mouse_gesture: false,
+            last_mouse_cell: None,
         })
     }
     #[cfg(test)]
@@ -102,6 +107,8 @@ impl PrivateSurface {
             render_area: area,
             cell_size: crate::kitty_graphics::HostCellSize::default(),
             pending_url_click: false,
+            replay_mouse_gesture: false,
+            last_mouse_cell: None,
         }
     }
 
@@ -116,6 +123,10 @@ impl PrivateSurface {
 
     pub(crate) fn pane_id(&self) -> PaneId {
         self.pane_id
+    }
+
+    pub(crate) fn shutdown(mut self) {
+        self.shutdown_runtime();
     }
 
     pub(crate) fn keyboard_report_all_requested(&self) -> bool {
@@ -245,34 +256,46 @@ impl PrivateSurface {
         None
     }
 
-    pub(crate) fn shutdown(mut self) {
-        self.shutdown_runtime();
-    }
-
     fn route_mouse(
         &mut self,
         mouse: MouseEvent,
         mouse_scroll_lines: usize,
     ) -> Option<PrivateLinkClick> {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.pending_url_click = false,
-            MouseEventKind::Drag(MouseButton::Left) if self.pending_url_click => return None,
-            MouseEventKind::Up(MouseButton::Left) if self.pending_url_click => {
-                self.pending_url_click = false;
-                return None;
-            }
-            _ => {}
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.pending_url_click = false;
+            self.replay_mouse_gesture = false;
+        }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) && self.pending_url_click {
+            return None;
+        }
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) && self.pending_url_click {
+            self.pending_url_click = false;
+            return None;
         }
 
         let geometry = self.geometry_for(self.render_area)?;
-        if !geometry
-            .inner
-            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
-        {
-            return None;
-        }
-        let viewport_row = mouse.row.saturating_sub(geometry.inner.y);
-        let col = mouse.column.saturating_sub(geometry.inner.x);
+        let (col, viewport_row) =
+            if let Some((col, viewport_row)) = Self::mouse_cell(&geometry, mouse) {
+                self.last_mouse_cell = Some((col, viewport_row));
+                (col, viewport_row)
+            } else if self.replay_mouse_gesture
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                )
+            {
+                let Some((col, viewport_row)) = self.last_mouse_cell else {
+                    self.replay_mouse_gesture = false;
+                    return None;
+                };
+                (col, viewport_row)
+            } else {
+                if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                    self.replay_mouse_gesture = false;
+                }
+                return None;
+            };
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(runtime) = self.runtime.as_ref() {
                 if let Some(link) = crate::app::actions::resolved_terminal_link_at_cell(
@@ -286,12 +309,63 @@ impl PrivateSurface {
                     return Some(PrivateLinkClick {
                         url: link.url,
                         origin: self.origin,
+                        mouse,
                     });
                 }
             }
         }
 
-        let runtime = self.runtime.as_ref()?;
+        self.forward_mouse(mouse, mouse_scroll_lines, col, viewport_row);
+        if self.replay_mouse_gesture && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+        {
+            self.replay_mouse_gesture = false;
+        }
+        None
+    }
+
+    pub(crate) fn replay_rejected_link_click(
+        &mut self,
+        mouse: MouseEvent,
+        mouse_scroll_lines: usize,
+    ) {
+        self.pending_url_click = false;
+        self.replay_mouse_gesture = false;
+        if let Some(geometry) = self.geometry_for(self.render_area) {
+            if let Some((col, viewport_row)) = Self::mouse_cell(&geometry, mouse) {
+                self.last_mouse_cell = Some((col, viewport_row));
+                self.replay_mouse_gesture = true;
+                self.forward_mouse(mouse, mouse_scroll_lines, col, viewport_row);
+            }
+        }
+    }
+
+    pub(crate) fn mark_link_click_activated(&mut self) {
+        self.pending_url_click = true;
+        self.replay_mouse_gesture = false;
+    }
+
+    fn mouse_cell(geometry: &PopupResolvedGeometry, mouse: MouseEvent) -> Option<(u16, u16)> {
+        if !geometry
+            .inner
+            .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+        {
+            return None;
+        }
+        Some((
+            mouse.column.saturating_sub(geometry.inner.x),
+            mouse.row.saturating_sub(geometry.inner.y),
+        ))
+    }
+    fn forward_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        mouse_scroll_lines: usize,
+        col: u16,
+        viewport_row: u16,
+    ) {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
         let position = crate::input::mouse::Position::Cell {
             column: col,
             row: viewport_row,
@@ -313,7 +387,7 @@ impl PrivateSurface {
                         MouseEventKind::ScrollDown => runtime.scroll_down(mouse_scroll_lines),
                         _ => {}
                     }
-                    return None;
+                    return;
                 }
             },
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
@@ -329,7 +403,6 @@ impl PrivateSurface {
             }
             let _ = runtime.try_send_bytes(Bytes::from(bytes));
         }
-        None
     }
 
     fn geometry_for(&self, area: Rect) -> Option<PopupResolvedGeometry> {
@@ -404,5 +477,52 @@ mod tests {
             surface.runtime_size_for_test(),
             Some((expected.height, expected.width))
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_link_replays_release_after_pointer_leaves_popup() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut surface = PrivateSurface::test_with_screen_bytes(
+            area,
+            ClientPrivatePluginPopupOrigin::Pane(PaneId::from_raw(9)),
+            b"\x1b]8;;file:///tmp/private.txt\x1b\\open\x1b]8;;\x1b\\",
+        );
+        let ((column, row), _, _) = surface
+            .visible_hyperlinks(area)
+            .into_iter()
+            .next()
+            .expect("private hyperlink");
+        let click = surface
+            .route_event(
+                crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                3,
+            )
+            .expect("private link click");
+        surface.replay_rejected_link_click(click.mouse, 3);
+        assert!(surface.replay_mouse_gesture);
+        surface.route_event(
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            3,
+        );
+        surface.route_event(
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            3,
+        );
+        assert!(!surface.replay_mouse_gesture);
     }
 }

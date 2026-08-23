@@ -2000,7 +2000,7 @@ fn workspace_can_start_worktree_action(
         return false;
     }
     let git_space = ws.git_space().cloned().or_else(|| {
-        ws.resolved_identity_cwd_from(&state.terminals, terminal_runtimes)
+        ws.local_git_identity_cwd_from(&state.terminals, terminal_runtimes)
             .as_deref()
             .and_then(crate::workspace::git_space_metadata)
     });

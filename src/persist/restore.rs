@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratatui::layout::Direction;
@@ -42,6 +42,12 @@ struct RestoreRuntimeContext<'a> {
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
+}
+
+struct WorkspaceRestoreIdentity<'a> {
+    id: &'a str,
+    cwd: &'a Path,
+    execution_target: &'a crate::execution::ExecutionTarget,
 }
 
 type RestoredSession = (
@@ -323,6 +329,11 @@ fn restore_workspace(
         .and_then(|max| max.checked_add(1))
         .unwrap_or(1)
         .max(snap.next_public_tab_number);
+    let workspace_identity = WorkspaceRestoreIdentity {
+        id: &workspace_id,
+        cwd: &snap.identity_cwd,
+        execution_target: &snap.identity_execution_target,
+    };
     let mut failed_imports = 0;
 
     for (idx, tab_snap) in snap.tabs.iter().enumerate() {
@@ -331,7 +342,7 @@ fn restore_workspace(
             tab_snap,
             history.and_then(|history| history.tabs.get(idx)),
             tab_number,
-            &workspace_id,
+            &workspace_identity,
             rows,
             cols,
             runtime_context,
@@ -374,19 +385,26 @@ fn restore_workspace(
         return (None, failed_imports);
     }
 
-    let worktree_space = restored_worktree_space_membership(snap.worktree_space.clone());
-    let (cached_git_space, cached_auto_label, cached_git_status_key) =
-        crate::workspace::discover_workspace_git_identity(&snap.identity_cwd);
+    let worktree_space = restored_worktree_space_membership(
+        snap.worktree_space.clone(),
+        &snap.identity_execution_target,
+    );
+    let (cached_git_space, cached_auto_label, cached_git_status_key, cached_git_branch) =
+        crate::workspace::cached_git_identity_for_target(
+            &snap.identity_cwd,
+            &snap.identity_execution_target,
+        );
 
     (
         Some(Workspace {
             id: workspace_id,
             custom_name: snap.custom_name.clone(),
+            identity_execution_target: snap.identity_execution_target.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
             cached_auto_label,
             cached_git_status_key,
-            cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
+            cached_git_branch,
             cached_git_ahead_behind: None,
             cached_git_space,
             worktree_space,
@@ -408,7 +426,11 @@ fn restore_workspace(
 
 fn restored_worktree_space_membership(
     space: Option<crate::workspace::WorktreeSpaceMembership>,
+    identity_execution_target: &crate::execution::ExecutionTarget,
 ) -> Option<crate::workspace::WorktreeSpaceMembership> {
+    if !identity_execution_target.is_local() {
+        return None;
+    }
     space.filter(|space| {
         space.checkout_path.exists()
             && crate::workspace::git_space_metadata(&space.checkout_path)
@@ -420,7 +442,7 @@ fn restore_tab(
     snap: &TabSnapshot,
     history: Option<&TabHistorySnapshot>,
     number: usize,
-    workspace_id: &str,
+    workspace_identity: &WorkspaceRestoreIdentity<'_>,
     rows: u16,
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
@@ -443,11 +465,11 @@ fn restore_tab(
         let old_id = reverse_id_map.get(id);
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
         let saved_cwd = saved_pane
-            .map(|p| p.cwd.clone())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+            .map(|pane| pane.cwd.clone())
+            .unwrap_or_else(|| workspace_identity.cwd.to_path_buf());
         let execution_target = saved_pane
             .map(|pane| pane.execution_target.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|| workspace_identity.execution_target.clone());
 
         let cwd = if !execution_target.is_local() || saved_cwd.exists() {
             saved_cwd
@@ -503,8 +525,8 @@ fn restore_tab(
                 PaneLaunchEnv::from_extra(Vec::new())
                     .with_omp_bridge(runtime_context.omp_bridge.clone())
                     .with_identity(
-                        workspace_id.to_string(),
-                        crate::workspace::public_tab_id_for_number(workspace_id, number),
+                        workspace_identity.id.to_string(),
+                        crate::workspace::public_tab_id_for_number(workspace_identity.id, number),
                         pane_id.to_string(),
                     )
             })
@@ -1010,6 +1032,8 @@ mod tests {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                identity_execution_target: crate::execution::ExecutionTarget::ssh("build-alias")
+                    .unwrap(),
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -1179,7 +1203,35 @@ mod tests {
             is_linked_worktree: true,
         };
 
-        assert_eq!(restored_worktree_space_membership(Some(membership)), None);
+        assert_eq!(
+            restored_worktree_space_membership(
+                Some(membership),
+                &crate::execution::ExecutionTarget::Local,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn restored_worktree_space_membership_drops_remote_identity_without_host_probe() {
+        let checkout_path = std::env::current_dir().unwrap();
+        let membership = crate::workspace::WorktreeSpaceMembership {
+            key: crate::workspace::git_space_metadata(&checkout_path)
+                .expect("test checkout should be a Git worktree")
+                .key,
+            label: "herdr".into(),
+            repo_root: checkout_path.clone(),
+            checkout_path,
+            is_linked_worktree: true,
+        };
+
+        assert_eq!(
+            restored_worktree_space_membership(
+                Some(membership),
+                &crate::execution::ExecutionTarget::ssh("build.example").unwrap(),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1403,6 +1455,7 @@ mod tests {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -1485,6 +1538,7 @@ mod tests {
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (20, 3)]),
                 next_public_pane_number: 4,
@@ -1599,6 +1653,7 @@ mod tests {
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (11, 2), (12, 3), (13, 4)]),
                 next_public_pane_number: 5,
@@ -1683,6 +1738,7 @@ mod tests {
             id: Some("w1".into()),
             custom_name: None,
             identity_cwd: cwd,
+            identity_execution_target: crate::execution::ExecutionTarget::Local,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
@@ -1752,11 +1808,19 @@ mod tests {
         let mut resumed_sessions = HashSet::new();
         let mut imported_panes = HashMap::new();
 
+        let execution_target = crate::execution::ExecutionTarget::Ssh {
+            host: "-invalid".into(),
+        };
+        let workspace_identity = WorkspaceRestoreIdentity {
+            id: "workspace",
+            cwd: Path::new("/remote/worktree"),
+            execution_target: &execution_target,
+        };
         let (restored, failed_imports) = restore_tab(
             &snapshot,
             None,
             1,
-            "workspace",
+            &workspace_identity,
             24,
             80,
             &runtime_context,
@@ -1858,6 +1922,7 @@ mod tests {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
+                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -2129,6 +2194,7 @@ mod tests {
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,
+                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
