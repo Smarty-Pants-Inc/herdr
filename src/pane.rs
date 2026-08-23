@@ -44,7 +44,7 @@ use self::agent_detection::{
 };
 #[cfg(unix)]
 pub(crate) use self::osc::RemoteExecReadyFilter;
-use self::osc::{RemoteExecReady, ReportedCwd};
+use self::osc::ReportedCwd;
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -1874,69 +1874,100 @@ fn publish_reported_cwd(
         );
     }
 }
-fn publish_pty_remote_metadata(
-    pane_id: PaneId,
-    shell_pid: u32,
-    reported_cwd_result: &mut Option<ReportedCwd>,
-    remote_exec_ready: Option<&RemoteExecReady>,
-    execution_target: &crate::execution::ExecutionTarget,
-    osc7_authority: &crate::execution::Osc7Authority,
-    remote_ready_seen: &mut bool,
-    remote_hostname: &mut Option<String>,
-    pending_remote_cwd: &mut Option<ReportedCwd>,
-    remote_execution_ready: &AtomicBool,
-    remote_hostname_state: &Mutex<Option<String>>,
-    reported_cwd: &Mutex<Option<std::path::PathBuf>>,
-    events: &mpsc::Sender<AppEvent>,
-) {
-    let mut buffered_reported_cwd = false;
-    if !execution_target.is_local() && !*remote_ready_seen {
-        if let Some(cwd) = reported_cwd_result.clone() {
-            *pending_remote_cwd = Some(cwd);
-            buffered_reported_cwd = true;
+struct PtyRemoteMetadataState {
+    execution_target: crate::execution::ExecutionTarget,
+    osc7_authority: crate::execution::Osc7Authority,
+    remote_ready_seen: bool,
+    remote_hostname: Option<String>,
+    pending_remote_cwd: Option<ReportedCwd>,
+    remote_execution_ready: Arc<AtomicBool>,
+    remote_hostname_state: Arc<Mutex<Option<String>>>,
+    reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+    events: mpsc::Sender<AppEvent>,
+}
+
+impl PtyRemoteMetadataState {
+    fn new(
+        execution_target: crate::execution::ExecutionTarget,
+        osc7_authority: crate::execution::Osc7Authority,
+        remote_execution_ready: Arc<AtomicBool>,
+        remote_hostname_state: Arc<Mutex<Option<String>>>,
+        reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+        events: mpsc::Sender<AppEvent>,
+    ) -> Self {
+        let remote_ready_seen = remote_execution_ready.load(Ordering::Acquire);
+        let remote_hostname = remote_hostname_state
+            .lock()
+            .ok()
+            .and_then(|hostname| hostname.clone());
+        Self {
+            execution_target,
+            osc7_authority,
+            remote_ready_seen,
+            remote_hostname,
+            pending_remote_cwd: None,
+            remote_execution_ready,
+            remote_hostname_state,
+            reported_cwd,
+            events,
         }
     }
-    if !*remote_ready_seen {
-        if let Some(ready) = remote_exec_ready {
-            *remote_ready_seen = true;
-            *remote_hostname = ready.hostname.clone();
-            if let Ok(mut captured_hostname) = remote_hostname_state.lock() {
-                *captured_hostname = remote_hostname.clone();
+
+    fn publish(
+        &mut self,
+        pane_id: PaneId,
+        shell_pid: u32,
+        result: &mut self::terminal::ProcessBytesResult,
+    ) {
+        let mut buffered_reported_cwd = false;
+        if !self.execution_target.is_local() && !self.remote_ready_seen {
+            if let Some(cwd) = result.reported_cwd.clone() {
+                self.pending_remote_cwd = Some(cwd);
+                buffered_reported_cwd = true;
             }
-            remote_execution_ready.store(true, Ordering::Release);
-            if !execution_target.is_local() {
-                publish_remote_exec_ready(
-                    pane_id,
-                    shell_pid,
-                    ready.hostname.clone(),
-                    ready.cwd.clone(),
-                    events,
-                );
+        }
+        if !self.remote_ready_seen {
+            if let Some(ready) = result.remote_exec_ready.as_ref() {
+                self.remote_ready_seen = true;
+                self.remote_hostname = ready.hostname.clone();
+                if let Ok(mut captured_hostname) = self.remote_hostname_state.lock() {
+                    *captured_hostname = self.remote_hostname.clone();
+                }
+                self.remote_execution_ready.store(true, Ordering::Release);
+                if !self.execution_target.is_local() {
+                    publish_remote_exec_ready(
+                        pane_id,
+                        shell_pid,
+                        ready.hostname.clone(),
+                        ready.cwd.clone(),
+                        &self.events,
+                    );
+                }
+                if let Some(cwd) = self.pending_remote_cwd.take() {
+                    publish_reported_cwd(
+                        pane_id,
+                        cwd,
+                        &self.execution_target,
+                        &self.osc7_authority,
+                        self.remote_hostname.as_deref(),
+                        &self.reported_cwd,
+                        &self.events,
+                    );
+                }
             }
-            if let Some(cwd) = pending_remote_cwd.take() {
+        }
+        if !buffered_reported_cwd && (self.execution_target.is_local() || self.remote_ready_seen) {
+            if let Some(cwd) = result.reported_cwd.take() {
                 publish_reported_cwd(
                     pane_id,
                     cwd,
-                    execution_target,
-                    osc7_authority,
-                    remote_hostname.as_deref(),
-                    reported_cwd,
-                    events,
+                    &self.execution_target,
+                    &self.osc7_authority,
+                    self.remote_hostname.as_deref(),
+                    &self.reported_cwd,
+                    &self.events,
                 );
             }
-        }
-    }
-    if !buffered_reported_cwd && (execution_target.is_local() || *remote_ready_seen) {
-        if let Some(cwd) = reported_cwd_result.take() {
-            publish_reported_cwd(
-                pane_id,
-                cwd,
-                execution_target,
-                osc7_authority,
-                remote_hostname.as_deref(),
-                reported_cwd,
-                events,
-            );
         }
     }
 }
@@ -2505,21 +2536,18 @@ impl PaneRuntime {
             let detection_content_seq = detection_content_seq.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
-            let reported_cwd = reported_cwd.clone();
-            let execution_target = execution_target.clone();
-            let osc7_authority = osc7_authority.clone();
-            let remote_execution_ready = remote_execution_ready.clone();
-            let remote_hostname_state = remote_hostname.clone();
+            let mut remote_metadata = PtyRemoteMetadataState::new(
+                execution_target.clone(),
+                osc7_authority.clone(),
+                remote_execution_ready.clone(),
+                remote_hostname.clone(),
+                reported_cwd.clone(),
+                read_events.clone(),
+            );
             let exit_child_pid = child_pid.clone();
             let emit_pane_died_on_reader_exit = emit_pane_died_on_reader_exit.clone();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
-            let mut remote_ready_seen = remote_execution_ready.load(Ordering::Acquire);
-            let mut remote_hostname = remote_hostname_state
-                .lock()
-                .ok()
-                .and_then(|hostname| hostname.clone());
-            let mut pending_remote_cwd = None;
             let on_read = Box::new(move |bytes: &[u8]| {
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
@@ -2544,21 +2572,7 @@ impl PaneRuntime {
                         }
                     });
                 }
-                publish_pty_remote_metadata(
-                    pane_id,
-                    shell_pid,
-                    &mut result.reported_cwd,
-                    result.remote_exec_ready.as_ref(),
-                    &execution_target,
-                    &osc7_authority,
-                    &mut remote_ready_seen,
-                    &mut remote_hostname,
-                    &mut pending_remote_cwd,
-                    &remote_execution_ready,
-                    &remote_hostname_state,
-                    &reported_cwd,
-                    &read_events,
-                );
+                remote_metadata.publish(pane_id, shell_pid, &mut result);
                 for content in result.clipboard_writes {
                     if let Err(err) =
                         read_events.try_send(AppEvent::PaneClipboardWrite { pane_id, content })
@@ -2706,11 +2720,14 @@ impl PaneRuntime {
             let detection_content_seq = detection_content_seq.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
-            let reported_cwd = reported_cwd.clone();
-            let execution_target = execution_target.clone();
-            let osc7_authority = osc7_authority.clone();
-            let remote_execution_ready = remote_execution_ready.clone();
-            let remote_hostname_state = remote_hostname.clone();
+            let mut remote_metadata = PtyRemoteMetadataState::new(
+                execution_target.clone(),
+                osc7_authority.clone(),
+                remote_execution_ready.clone(),
+                remote_hostname.clone(),
+                reported_cwd.clone(),
+                events.clone(),
+            );
             #[cfg(unix)]
             let exit_events = events.clone();
             #[cfg(unix)]
@@ -2722,9 +2739,6 @@ impl PaneRuntime {
             let delay_rt = tokio::runtime::Handle::current();
             #[cfg(unix)]
             let exit_rt = delay_rt.clone();
-            let mut remote_ready_seen = false;
-            let mut remote_hostname = None;
-            let mut pending_remote_cwd = None;
             let on_read = Box::new(move |bytes: &[u8]| {
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
@@ -2751,21 +2765,7 @@ impl PaneRuntime {
                         }
                     });
                 }
-                publish_pty_remote_metadata(
-                    pane_id,
-                    shell_pid,
-                    &mut result.reported_cwd,
-                    result.remote_exec_ready.as_ref(),
-                    &execution_target,
-                    &osc7_authority,
-                    &mut remote_ready_seen,
-                    &mut remote_hostname,
-                    &mut pending_remote_cwd,
-                    &remote_execution_ready,
-                    &remote_hostname_state,
-                    &reported_cwd,
-                    &events,
-                );
+                remote_metadata.publish(pane_id, shell_pid, &mut result);
                 for content in result.clipboard_writes {
                     if let Err(err) =
                         events.try_send(AppEvent::PaneClipboardWrite { pane_id, content })
