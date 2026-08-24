@@ -8,11 +8,11 @@ pub(super) fn plugin_state_dir(plugin_id: &str) -> std::path::PathBuf {
     crate::plugin_paths::plugin_state_dir(plugin_id)
 }
 
-pub(super) fn ensure_plugin_user_dirs(plugin: &InstalledPluginInfo) -> std::io::Result<()> {
+pub(crate) fn ensure_plugin_user_dirs(plugin: &InstalledPluginInfo) -> std::io::Result<()> {
     crate::plugin_paths::ensure_plugin_user_dirs(&plugin.plugin_id)
 }
 
-pub(super) fn plugin_path_env(plugin: &InstalledPluginInfo) -> Vec<(String, String)> {
+pub(crate) fn plugin_path_env(plugin: &InstalledPluginInfo) -> Vec<(String, String)> {
     let config_dir = plugin_config_dir(&plugin.plugin_id);
     let state_dir = plugin_state_dir(&plugin.plugin_id);
 
@@ -27,4 +27,19 @@ pub(super) fn plugin_path_env(plugin: &InstalledPluginInfo) -> Vec<(String, Stri
             state_dir.display().to_string(),
         ),
     ]
+}
+
+pub(crate) fn local_plugin_runtime_env(plugin: &InstalledPluginInfo) -> Vec<(String, String)> {
+    let mut env = plugin_path_env(plugin);
+    env.push((
+        crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+        crate::api::socket_path().display().to_string(),
+    ));
+    if let Ok(current_exe) = std::env::current_exe() {
+        env.push((
+            "HERDR_BIN_PATH".to_string(),
+            current_exe.display().to_string(),
+        ));
+    }
+    env
 }

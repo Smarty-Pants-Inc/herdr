@@ -720,6 +720,10 @@ pub(crate) struct ClientConnection {
     pub(crate) pending_terminal_attach: bool,
     /// Client-local stable-ID navigation projection for full-app connections.
     pub(crate) navigation: Option<ClientNavigationState>,
+    /// Opaque identity for this full app presentation view.
+    pub(crate) view_id: Option<crate::api::schema::ViewId>,
+    /// Client-private popup terminal, never projected into shared AppState.
+    pub(crate) private_surface: Option<crate::server::private_surface::PrivateSurface>,
     /// Client-local app keybindings. None means use the server's keybindings.
     pub(crate) keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
     /// The client's terminal size after clamping.
@@ -819,10 +823,14 @@ impl ClientConnection {
     ) -> Self {
         let identity =
             matches!(mode, ClientConnectionMode::App).then(|| AppIdentity::new(display_name));
+        let view_id = (matches!(&mode, ClientConnectionMode::App) && !pending_terminal_attach)
+            .then(crate::api::schema::ViewId::alloc);
         Self {
             mode,
             pending_terminal_attach,
             navigation: None,
+            view_id,
+            private_surface: None,
             keybindings,
             renderer_binding_token,
             identity,
