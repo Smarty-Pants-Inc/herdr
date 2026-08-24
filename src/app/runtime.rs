@@ -405,10 +405,11 @@ impl App {
         changed |= self.handle_tab_bar_status_tasks(now);
 
         if geometry_dirty || resized {
-            self.pending_agent_resume_deadline = None;
+            self.pending_agent_resume_retry_at = None;
         } else {
-            self.sync_pending_agent_resume_deadline(now);
-            changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
+            self.sync_pending_agent_resume_retry_at(now);
+            changed |=
+                self.start_pending_agent_resumes(now, self.pending_agent_resume_retry_due(now));
         }
         changed
     }
@@ -653,7 +654,7 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
-            self.pending_agent_resume_deadline,
+            self.next_pending_agent_resume_deadline(),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.findr_scan_deadline,
@@ -994,7 +995,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
-        app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
+        app.pending_agent_resume_retry_at = Some(Instant::now() - Duration::from_millis(1));
 
         assert!(!app.handle_scheduled_tasks(Instant::now(), true));
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -1005,7 +1006,7 @@ mod tests {
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
             .is_some());
-        assert!(app.pending_agent_resume_deadline.is_none());
+        assert!(app.pending_agent_resume_retry_at.is_none());
     }
     #[test]
     fn wheel_input_uses_fast_render_cadence_once() {

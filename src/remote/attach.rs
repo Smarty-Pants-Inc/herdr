@@ -16,6 +16,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,8 @@ const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_RECONNECT_EXIT_CODE: i32 = 75;
+#[cfg(unix)]
+static PREPARED_REMOTE_SHELL_PATHS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -719,6 +723,67 @@ impl InstallSource {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn resolve_prepared_remote_shell_path(target: &str) -> io::Result<String> {
+    if let Some(shell_path) = cached_prepared_remote_shell_path(target) {
+        return Ok(shell_path);
+    }
+
+    let ssh = RemoteSsh::new(target.to_string(), false);
+    let platform = detect_remote_platform(&ssh)?;
+    let expected = RemoteHerdr::for_platform(platform);
+    let candidates = remote_binary_candidates(&ssh, &expected)?;
+    let prepared = prepared_remote_binary(&ssh, &expected, &candidates)?
+        .ok_or_else(|| unprepared_remote_error(target))?;
+    cache_prepared_remote_shell_path(target, &prepared.shell_path);
+    Ok(prepared.shell_path)
+}
+
+#[cfg(unix)]
+fn unprepared_remote_error(target: &str) -> io::Error {
+    io::Error::other(format!(
+        "remote Herdr on {target} is not prepared for version {} and protocol {}; run `herdr --remote {}` first",
+        current_version(),
+        CURRENT_PROTOCOL,
+        shell_quote(target)
+    ))
+}
+
+#[cfg(unix)]
+pub(crate) fn cached_prepared_remote_shell_path(target: &str) -> Option<String> {
+    let cache = PREPARED_REMOTE_SHELL_PATHS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.get(target).cloned()
+}
+
+#[cfg(unix)]
+fn cache_prepared_remote_shell_path(target: &str, shell_path: &str) {
+    let cache = PREPARED_REMOTE_SHELL_PATHS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(target.to_string(), shell_path.to_string());
+}
+
+fn prepared_remote_binary(
+    ssh: &RemoteSsh,
+    expected: &RemoteHerdr,
+    candidates: &[RemoteHerdr],
+) -> io::Result<Option<RemoteHerdr>> {
+    for candidate in candidates {
+        if remote_binary_matches(ssh, candidate)? {
+            return Ok(Some(candidate.clone()));
+        }
+    }
+    if remote_binary_matches(ssh, expected)? {
+        Ok(Some(expected.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
 fn prepare_remote_herdr(
     ssh: &RemoteSsh,
     live_handoff_enabled: bool,
@@ -729,18 +794,13 @@ fn prepare_remote_herdr(
     let remote_binary_candidates = remote_binary_candidates(ssh, &remote_herdr)?;
 
     if override_binary.is_none() {
-        for candidate in &remote_binary_candidates {
-            if remote_binary_matches(ssh, candidate).unwrap_or(false) {
-                return Ok(PreparedRemoteHerdr {
-                    remote_herdr: candidate.clone(),
-                    installed_or_replaced: false,
-                    stop_after_install_approved: false,
-                });
-            }
-        }
-        if remote_binary_matches(ssh, &remote_herdr)? {
+        if let Some(prepared) =
+            prepared_remote_binary(ssh, &remote_herdr, &remote_binary_candidates)?
+        {
+            #[cfg(unix)]
+            cache_prepared_remote_shell_path(ssh.target(), &prepared.shell_path);
             return Ok(PreparedRemoteHerdr {
-                remote_herdr,
+                remote_herdr: prepared,
                 installed_or_replaced: false,
                 stop_after_install_approved: false,
             });
@@ -776,6 +836,8 @@ fn prepare_remote_herdr(
         )));
     }
     warn_if_remote_bin_not_on_path(ssh)?;
+    #[cfg(unix)]
+    cache_prepared_remote_shell_path(ssh.target(), &remote_herdr.shell_path);
 
     Ok(PreparedRemoteHerdr {
         remote_herdr,
@@ -1045,7 +1107,7 @@ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<Remo
 
 fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
     let command = format!(
-        "test -x {0} && {0} status client --json",
+        "test -x {0} && {0} status client --json && {0} remote-exec --protocol",
         remote_herdr.shell_path
     );
     let output = ssh.sh_output(&command)?;
@@ -1053,9 +1115,17 @@ fn remote_binary_matches(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Res
         return Ok(false);
     }
 
-    Ok(remote_client_status_is_compatible(
-        &String::from_utf8_lossy(&output.stdout),
-    ))
+    Ok(remote_binary_probe_matches(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn remote_binary_probe_matches(stdout: &str) -> bool {
+    let mut lines = stdout.lines();
+    let status = lines.next().unwrap_or_default();
+    let remote_exec_protocol = lines.next().unwrap_or_default().trim();
+    remote_client_status_is_compatible(status)
+        && remote_exec_protocol == crate::execution::REMOTE_EXEC_PROTOCOL.to_string()
 }
 
 fn remote_client_status_is_compatible(status: &str) -> bool {
@@ -2533,10 +2603,8 @@ mod tests {
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
 
-        let socket = std::env::temp_dir().join(format!(
-            "herdr-bridge-permissions-test-{}.sock",
-            std::process::id()
-        ));
+        let _guard = remote_env_lock().lock();
+        let socket = local_forward_socket_path("permissions-test", "default");
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
@@ -2550,7 +2618,13 @@ mod tests {
         )
         .expect("start bridge listener");
 
+        let parent_mode = std::fs::metadata(socket.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o700);
         assert_eq!(mode, BRIDGE_SOCKET_PERMISSION_MODE);
 
         drop(bridge);
@@ -2572,11 +2646,10 @@ mod tests {
             flags & libc::O_NONBLOCK != 0
         }
 
-        let socket = std::env::temp_dir().join(format!(
-            "herdr-bridge-blocking-test-{}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&socket);
+        let _guard = remote_env_lock().lock();
+        let socket = local_forward_socket_path("blocking-test", "default");
+        crate::ipc::prepare_socket_path(&socket, |_| "blocking test socket busy".to_string())
+            .expect("prepare listener");
         let listener = crate::ipc::bind_private_local_listener(&socket).expect("bind listener");
         let client = crate::ipc::connect_local_stream(&socket).expect("connect client");
         let mut server = listener.accept().expect("accept client");
@@ -3109,6 +3182,38 @@ mod tests {
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_prepared_remote_shell_path_remembers_verified_path() {
+        let target = format!("cache-test-{}", std::process::id());
+        let shell_path = "'/opt/herdr bin/herdr'";
+
+        cache_prepared_remote_shell_path(&target, shell_path);
+
+        assert_eq!(
+            cached_prepared_remote_shell_path(&target).as_deref(),
+            Some(shell_path)
+        );
+    }
+
+    #[test]
+    fn remote_binary_probe_requires_remote_exec_protocol() {
+        let stdout = format!(
+            "{{\"protocol\":{CURRENT_PROTOCOL}}}\n{}\n",
+            crate::execution::REMOTE_EXEC_PROTOCOL
+        );
+        assert!(remote_binary_probe_matches(&stdout));
+
+        let without_remote_exec = format!("{{\"protocol\":{CURRENT_PROTOCOL}}}\n");
+        assert!(!remote_binary_probe_matches(&without_remote_exec));
+
+        let wrong_remote_exec = format!(
+            "{{\"protocol\":{CURRENT_PROTOCOL}}}\n{}\n",
+            crate::execution::REMOTE_EXEC_PROTOCOL + 1
+        );
+        assert!(!remote_binary_probe_matches(&wrong_remote_exec));
     }
 
     #[test]
@@ -4014,7 +4119,7 @@ mod tests {
     fn local_forward_socket_path_falls_back_to_tmp_when_dir_is_long() {
         let _guard = remote_env_lock().lock();
         // Force a TMPDIR long enough that even the hashed short name cannot
-        // fit inside it. The fallback should drop to /tmp.
+        // fit inside it. The fallback should use a short private directory under /tmp.
         let prior = std::env::var_os("TMPDIR");
         let long_dir = std::env::temp_dir().join("a".repeat(80));
         let _ = fs::create_dir_all(&long_dir);
@@ -4036,11 +4141,16 @@ mod tests {
         let _ = fs::remove_dir_all(&long_dir);
 
         assert!(fits, "fallback path still overflows: {}", path.display());
-        assert_eq!(parent.as_deref(), Some(Path::new("/tmp")));
+        assert_eq!(parent.as_deref(), Some(private_tmp_dir().as_path()));
         assert!(
             filename.starts_with("herdr-r-"),
             "expected hashed fallback, got {filename}"
         );
+    }
+
+    #[cfg(unix)]
+    fn private_tmp_dir() -> PathBuf {
+        PathBuf::from("/tmp").join(format!("herdr-{}", unsafe { libc::geteuid() }))
     }
 
     #[test]

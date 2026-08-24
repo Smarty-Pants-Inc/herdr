@@ -772,6 +772,28 @@ fn omp_osc_title_braille_spinner_is_working() {
 }
 
 #[test]
+fn omp_osc_title_windows_separator_is_working() {
+    let result = osc_explain(Agent::Omp, "", "π : Merge main and rebuild Herdr", "");
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("osc_title_working")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn omp_osc_title_attention_is_blocked() {
+    let result = osc_explain(Agent::Omp, "", "π ! Review required", "");
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("osc_title_blocked")
+    );
+    assert!(result.visible_blocker);
+}
+
+#[test]
 fn omp_osc_title_plain_is_idle() {
     let result = osc_explain(Agent::Omp, "", "π > Merge main and rebuild Herdr", "");
     assert_eq!(result.state, AgentState::Idle);

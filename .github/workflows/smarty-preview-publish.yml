@@ -1,0 +1,1631 @@
+name: Smarty Preview Trusted Publisher
+
+on:
+  workflow_run:
+    workflows: ["Smarty Preview"]
+    types: [completed]
+
+# This file is defined on the protected default branch. It is the only workflow
+# allowed to use release credentials, attestations, or channel mutation.
+permissions:
+  actions: read
+  contents: read
+
+env:
+  REPOSITORY: Smarty-Pants-Inc/herdr
+  PRODUCER_WORKFLOW: .github/workflows/smarty-preview.yml
+  TRUSTED_WORKFLOW: .github/workflows/smarty-preview-publish.yml
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHON_VERSION: "3.12"
+  ZIG_VERSION: 0.15.2
+
+concurrency:
+  # A tag is the release identity; retries for one tag reconcile together.
+  group: smarty-preview-trusted-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  validate-seal:
+    name: Validate producer run and seal inputs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      publisher_commit: ${{ steps.identity.outputs.publisher_commit }}
+      run_id: ${{ steps.identity.outputs.run_id }}
+      run_attempt: ${{ steps.identity.outputs.run_attempt }}
+      tag: ${{ steps.identity.outputs.tag }}
+      built_at: ${{ steps.identity.outputs.built_at }}
+      parent: ${{ steps.identity.outputs.parent }}
+      source: ${{ steps.identity.outputs.source }}
+      omp: ${{ steps.identity.outputs.omp }}
+      omp_build_id: ${{ steps.producer.outputs.omp_build_id }}
+      omp_commit: ${{ steps.producer.outputs.omp_commit }}
+      omp_tree: ${{ steps.producer.outputs.omp_tree }}
+      omp_version: ${{ steps.producer.outputs.omp_version }}
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout executing trusted publisher revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Fetch immutable GitHub identity records
+        id: api
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - "$EVENT_RUN_ID" "$EVENT_RUN_ATTEMPT" "$REPOSITORY" <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          run_id, event_attempt, repository = sys.argv[1:]
+          if not run_id.isdigit() or int(run_id) < 1:
+              raise SystemExit("workflow_run.id must be a positive integer")
+          if not event_attempt.isdigit() or int(event_attempt) < 1:
+              raise SystemExit("workflow_run.run_attempt must be a positive integer")
+          def api(path, output):
+              data = subprocess.check_output(["gh", "api", path], text=True)
+              Path(output).write_text(data, encoding="utf-8")
+              return json.loads(data)
+          run = api(f"repos/{repository}/actions/runs/{run_id}", "run.json")
+          if run.get("run_attempt") != int(event_attempt):
+              raise SystemExit("workflow_run.run_attempt does not match API run")
+          api(f"repos/{repository}/actions/workflows/smarty-preview.yml", "producer-workflow.json")
+          pages = []
+          for page in range(1, 33):
+              response = api(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100&page={page}", f"artifacts-{page}.json")
+              if not isinstance(response.get("artifacts"), list):
+                  raise SystemExit("artifact API page is invalid")
+              pages.extend(response["artifacts"])
+              total_count = response.get("total_count")
+              if not isinstance(total_count, int) or total_count < len(pages):
+                  raise SystemExit("artifact API total count is invalid")
+              if len(pages) >= total_count or len(response["artifacts"]) == 0:
+                  break
+          else:
+              raise SystemExit("artifact API pagination exceeds the bounded page limit")
+          Path("artifacts.json").write_text(json.dumps({"total_count": len(pages), "artifacts": pages}), encoding="utf-8")
+          repo = api(f"repos/{repository}", "repository.json")
+          default_branch = repo.get("default_branch")
+          if not isinstance(default_branch, str) or not default_branch:
+              raise SystemExit("repository default branch is missing")
+          api(f"repos/{repository}/actions/workflows/smarty-preview-publish.yml", "publisher-workflow.json")
+          publisher_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          workflow_sha = os.environ["WORKFLOW_SHA"]
+          if publisher_sha != workflow_sha:
+              raise SystemExit("checked-out publisher revision differs from executing workflow revision")
+          publisher_blob = subprocess.check_output(["git", "rev-parse", "HEAD:.github/workflows/smarty-preview-publish.yml"], text=True).strip()
+          api(f"repos/{repository}/contents/.github/workflows/smarty-preview-publish.yml?ref={publisher_sha}", "publisher-content.json")
+          api(f"repos/{repository}/branches/{default_branch}", "publisher-branch.json")
+          Path("publisher-revision.json").write_text(json.dumps({"sha": publisher_sha, "path": ".github/workflows/smarty-preview-publish.yml", "blob_sha": publisher_blob}) + "\n", encoding="utf-8")
+          Path("publisher-meta.json").write_text(json.dumps({"default_branch": default_branch, "checked_out_commit": publisher_sha, "checked_out_blob": publisher_blob}) + "\n", encoding="utf-8")
+          PY
+      - name: Validate exact run, publisher revision, and artifact inventory
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBLISHER_SHA="$(python -I -S -c 'import json; print(json.load(open("publisher-meta.json"))["checked_out_commit"])')"
+          PUBLISHER_BLOB="$(python -I -S -c 'import json; print(json.load(open("publisher-meta.json"))["checked_out_blob"])')"
+          DEFAULT_BRANCH="$(python -I -S -c 'import json; print(json.load(open("publisher-meta.json"))["default_branch"])')"
+          python scripts/smarty_preview_trusted.py validate-run \
+            --run-json run.json \
+            --workflow-json producer-workflow.json \
+            --artifacts-json artifacts.json \
+            --publisher-workflow-json publisher-workflow.json \
+            --publisher-content-json publisher-content.json \
+            --publisher-branch-json publisher-branch.json \
+            --publisher-revision-json publisher-revision.json \
+            --default-branch "$DEFAULT_BRANCH" \
+            --checked-out-commit "$PUBLISHER_SHA" \
+            --checked-out-blob "$PUBLISHER_BLOB" \
+            --run-id "$RUN_ID" \
+            --event-run-attempt "$EVENT_RUN_ATTEMPT" \
+            --output identity.json
+          TAG="$(python -I -S -c 'import json; print(json.load(open("identity.json"))["tag"])')"
+          SOURCE="$(python -I -S -c 'import json; print(json.load(open("identity.json"))["source"])')"
+          gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag.json
+          python scripts/smarty_preview_trusted.py validate-tag --tag-json tag.json --tag "$TAG" --source-sha "$SOURCE" --output tag-identity.json
+          python -I -S - "$RUN_ID" <<'PY'
+          import json, os
+          identity = json.load(open("identity.json"))
+          if identity["run_id"] != int(os.environ["RUN_ID"]):
+              raise SystemExit("run output ID mismatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"publisher_commit={json.load(open('publisher-meta.json'))['checked_out_commit']}\n")
+              for key in ("run_id", "run_attempt", "tag", "built_at", "parent", "source", "omp"):
+                  out.write(f"{key}={identity[key]}\n")
+          PY
+      - name: Upload trusted publisher anchor
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-publisher-anchor-${{ steps.identity.outputs.tag }}-${{ steps.identity.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: |
+            identity.json
+            publisher-meta.json
+            publisher-revision.json
+          if-no-files-found: error
+          compression-level: 0
+      - name: Download validated artifacts by API identity
+        id: producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact-zips producer
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          identity=json.load(open("identity.json"))
+          token=os.environ["GH_TOKEN"]
+          root=Path("artifact-zips")
+          max_bytes=4 * 1024 * 1024 * 1024
+          max_total_bytes=16 * 1024 * 1024 * 1024
+          declared_total=sum(record.get("size_in_bytes", 0) for record in identity["artifacts"].values())
+          if declared_total < 1 or declared_total > max_total_bytes:
+              raise SystemExit("producer artifact aggregate exceeds download limit")
+          for name, record in identity["artifacts"].items():
+              expected_size=record["size_in_bytes"]
+              if not isinstance(expected_size, int) or expected_size < 1 or expected_size > max_bytes:
+                  raise SystemExit(f"artifact size exceeds download limit: {name}")
+              request=Request(record["archive_download_url"], headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+              path=root / f"{name}.zip"
+              total=0
+              with urlopen(request, timeout=120) as response, path.open("wb") as output:
+                  while True:
+                      chunk=response.read(min(1024 * 1024, expected_size - total + 1))
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      if total > expected_size:
+                          raise SystemExit(f"artifact download exceeds declared size: {name}")
+                      output.write(chunk)
+              if total != expected_size:
+                  raise SystemExit(f"artifact download is truncated: {name}")
+          PY
+          python -I -S - <<'PY'
+          import subprocess
+          from pathlib import Path
+          for archive in sorted(Path("artifact-zips").glob("*.zip")):
+              subprocess.run(["python", "scripts/smarty_preview_trusted.py", "extract-zip", "--archive", str(archive), "--output", "producer"], check=True)
+          PY
+          python scripts/smarty_preview_trusted.py verify-downloads --root artifact-zips --identity identity.json --output download-record.json
+          python scripts/smarty_preview_trusted.py validate-producer --root producer --identity identity.json --output producer-record.json
+          python -I -S - <<'PY'
+          import json, os
+          descriptor = json.load(open("producer-record.json"))["descriptor"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for key in ("build_id", "commit", "tree", "version"):
+                  out.write(f"omp_{key}={descriptor[key]}\n")
+          PY
+      - name: Upload trusted validation handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-validation-${{ steps.identity.outputs.run_id }}-${{ steps.identity.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: |
+            identity.json
+            tag-identity.json
+            download-record.json
+            producer-record.json
+            producer
+          if-no-files-found: error
+          compression-level: 0
+
+  trusted-source:
+    name: Validate and hand off exact private sources
+    needs: [validate-seal]
+    outputs:
+      omp_build_id: ${{ steps.source_identity.outputs.omp_build_id }}
+      omp_commit: ${{ steps.source_identity.outputs.omp_commit }}
+      omp_tree: ${{ steps.source_identity.outputs.omp_tree }}
+      omp_version: ${{ steps.source_identity.outputs.omp_version }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.validate-seal.outputs.publisher_commit }}
+          fetch-depth: 1
+          path: publisher-source
+          persist-credentials: false
+      - name: Checkout exact Herdr source for archive validation
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: Smarty-Pants-Inc/herdr
+          ref: ${{ needs.validate-seal.outputs.source }}
+          token: ${{ github.token }}
+          path: herdr-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download trusted validation handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-validation-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: validation
+      - name: Validate candidate Herdr archive against exact source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
+            --archive validation/producer/source-archives/herdr-source.tar \
+            --repository herdr-source
+      - name: Checkout exact private parent
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: Smarty-Pants-Inc/smarty-dev
+          ref: ${{ needs.validate-seal.outputs.parent }}
+          token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
+          path: parent-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout exact private OMP source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: Smarty-Pants-Inc/oh-my-pi
+          ref: ${{ needs.validate-seal.outputs.omp }}
+          token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
+          path: omp-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact private parent is landed on origin/main
+        env:
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SMARTY_SOURCE_READ_TOKEN: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          askpass="$(mktemp)"
+          trap 'rm -f "$askpass"' EXIT
+          cat >"$askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            Username*) printf '%s\n' x-access-token ;;
+            Password*) printf '%s\n' "$SMARTY_SOURCE_READ_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          SH
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git -C parent-source -c credential.helper= -c core.askPass="$askpass" \
+              fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git -C parent-source merge-base --is-ancestor "$PARENT" refs/remotes/origin/main
+      - name: Validate exact parent and OMP source closure
+        id: source_identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python publisher-source/scripts/smarty_preview_trusted.py validate-sources \
+            --identity validation/identity.json \
+            --plan validation/producer/producer-plan.json \
+            --parent-root parent-source \
+            --omp-root omp-source \
+            --descriptor validation/producer/source-archives/omp-descriptor.json \
+            --output trusted-source-record.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          omp = json.loads(Path("trusted-source-record.json").read_text(encoding="utf-8"))["omp"]
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for key in ("build_id", "commit", "tree", "version"):
+                  output.write(f"omp_{key}={omp[key]}\n")
+          PY
+      - name: Archive validated OMP source handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p trusted-source-handoff
+          cp trusted-source-record.json trusted-source-handoff/trusted-source-record.json
+          python -I -S - <<'PY'
+          import io, json, subprocess, tarfile
+          from pathlib import Path
+          record = json.loads(Path("trusted-source-record.json").read_text(encoding="utf-8"))
+          Path("trusted-source-handoff/omp-descriptor.json").write_text(
+              json.dumps(record["omp"], sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          records = subprocess.check_output(["git", "-C", "omp-source", "ls-tree", "-r", "--full-tree", "-z", "HEAD"])
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          total = 0
+          with tarfile.open("trusted-source-handoff/omp-source.tar", "w") as archive:
+              for tree_record in records.split(b"\0"):
+                  if not tree_record:
+                      continue
+                  header, raw_name = tree_record.split(b"\t", 1)
+                  mode, kind, object_id = header.split()
+                  if kind != b"blob":
+                      raise SystemExit(f"unsupported non-blob OMP source tree entry: {raw_name!r}")
+                  object_name = object_id.decode("ascii")
+                  git_mode = int(mode, 8)
+                  size = int(subprocess.check_output(["git", "-C", "omp-source", "cat-file", "-s", object_name], text=True).strip())
+                  if size > max_file_bytes or total > max_total_bytes - size:
+                      raise SystemExit(f"OMP source exceeds the bounded archive size limit: {raw_name!r}")
+                  total += size
+                  info = tarfile.TarInfo(raw_name.decode("utf-8"))
+                  info.mtime = 0
+                  if git_mode & 0o170000 == 0o120000:
+                      if size < 1 or size > 4096:
+                          raise SystemExit(f"OMP symlink target exceeds the bounded size limit: {raw_name!r}")
+                      target_bytes = subprocess.check_output(["git", "-C", "omp-source", "cat-file", "blob", object_name])
+                      if len(target_bytes) != size:
+                          raise SystemExit(f"OMP symlink target size changed: {raw_name!r}")
+                      target = target_bytes.decode("utf-8")
+                      if (not target or "\x00" in target or "\\" in target or target.startswith("/")
+                              or any(part in ("", ".") for part in target.split("/"))):
+                          raise SystemExit(f"unsafe OMP symlink target: {raw_name!r}")
+                      info.type = tarfile.SYMTYPE
+                      info.linkname = target
+                      info.mode = 0
+                      info.size = 0
+                      archive.addfile(info)
+                      continue
+                  info.mode = git_mode & 0o7777
+                  info.size = size
+                  process = subprocess.Popen(["git", "-C", "omp-source", "cat-file", "blob", object_name], stdout=subprocess.PIPE)
+                  if process.stdout is None:
+                      process.kill()
+                      process.wait()
+                      raise SystemExit("OMP Git blob stream is unavailable")
+                  try:
+                      archive.addfile(info, process.stdout)
+                      if process.stdout.read(1):
+                          raise SystemExit(f"OMP Git blob exceeds declared size: {raw_name!r}")
+                  except BaseException:
+                      if process.poll() is None:
+                          process.kill()
+                      process.wait()
+                      raise
+                  if process.wait() != 0:
+                      raise SystemExit(f"OMP Git blob could not be read: {raw_name!r}")
+          PY
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
+            --archive trusted-source-handoff/omp-source.tar \
+            --repository omp-source
+      - name: Upload trusted source handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-source-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: trusted-source-handoff
+          if-no-files-found: error
+          compression-level: 0
+
+  trusted-build:
+    name: Independently build trusted Herdr ${{ matrix.platform }}
+    needs: [validate-seal]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: smarty-linux-16-core
+            target: x86_64-unknown-linux-musl
+            omp_target: ''
+            native_targets: ''
+          - platform: linux-aarch64
+            os: smarty-linux-arm-16-core
+            target: aarch64-unknown-linux-musl
+            omp_target: ''
+            native_targets: ''
+          - platform: macos-x86_64
+            os: smarty-macos-intel-12-core
+            target: x86_64-apple-darwin
+            omp_target: ''
+            native_targets: ''
+          - platform: macos-aarch64
+            os: smarty-macos-arm-5-core
+            target: aarch64-apple-darwin
+            omp_target: ''
+            native_targets: ''
+          - platform: windows-x86_64
+            os: smarty-windows-16-core
+            target: x86_64-pc-windows-msvc
+            omp_target: ''
+            native_targets: ''
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout exact Herdr source with workflow token
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: Smarty-Pants-Inc/herdr
+          ref: ${{ needs.validate-seal.outputs.source }}
+          token: ${{ github.token }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Cache trusted Herdr Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          workspaces: source
+          key: trusted-preview-${{ matrix.target }}
+      - name: Build trusted Herdr source
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_ID: ${{ needs.validate-seal.outputs.tag }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP_BUILD_ID: ${{ needs.validate-seal.outputs.omp_build_id }}
+          OMP_COMMIT: ${{ needs.validate-seal.outputs.omp_commit }}
+          OMP_TREE: ${{ needs.validate-seal.outputs.omp_tree }}
+          OMP_VERSION: ${{ needs.validate-seal.outputs.omp_version }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE"
+          SOURCE_TREE="$(git -C source rev-parse HEAD^{tree})"
+          python -I -S - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path("source/rust-toolchain.toml").read_text(encoding="utf-8")
+          channels = re.findall(r'(?m)^\s*channel\s*=\s*"([^"]+)"\s*$', text)
+          if channels != ["1.96.1"]:
+              raise SystemExit("Herdr rust-toolchain.toml does not declare exactly Rust 1.96.1")
+          PY
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup target add "$TARGET" --toolchain 1.96.1
+          export HERDR_BUILD_CHANNEL=preview
+          export HERDR_BUILD_ID="${BUILD_ID#smarty-preview-}"
+          export HERDR_BUILD_COMMIT="$SOURCE"
+          export HERDR_BUILD_OMP_BUILD_ID="$OMP_BUILD_ID"
+          export HERDR_BUILD_OMP_COMMIT="$OMP_COMMIT"
+          export HERDR_BUILD_OMP_TREE="$OMP_TREE"
+          export HERDR_BUILD_OMP_VERSION="$OMP_VERSION"
+          export HERDR_BUILD_UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"
+          export HERDR_BUILD_AUTO_UPDATE=true
+          cargo +1.96.1 build --release --locked --target "$TARGET" --manifest-path source/Cargo.toml
+          mkdir -p release-assets
+          env -u RUSTUP_TOOLCHAIN cargo +1.96.1 metadata --locked --format-version=1 --filter-platform "$TARGET" --manifest-path source/Cargo.toml > "release-assets/herdr-$PLATFORM.json"
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE"
+          test "$(git -C source rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test -z "$(git -C source diff --name-only)"
+          test -z "$(git -C source diff --cached --name-only)"
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            cp "source/target/$TARGET/release/herdr" "release-assets/herdr-$PLATFORM"
+          fi
+      - name: Package trusted Windows Herdr artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = Get-Content -Raw -LiteralPath "source/packaging/windows/conpty.json" | ConvertFrom-Json
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          Invoke-WebRequest -Uri $metadata.package.url -OutFile $package -TimeoutSec 120
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $package).Hash.ToLowerInvariant()
+          if ($actual -cne [string]$metadata.package.sha256) { throw "ConPTY package digest mismatch" }
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+          & (Resolve-Path "source\scripts\package_windows_conpty.ps1").Path `
+            -HerdrExe (Resolve-Path "source\target\x86_64-pc-windows-msvc\release\herdr.exe").Path `
+            -PackagePath $package `
+            -StageDir (Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64") `
+            -OutputPath (Join-Path (Get-Location) "release-assets\herdr-windows-x86_64.zip")
+      - name: Write trusted Herdr checksum
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE"
+          test -z "$(git -C source diff --name-only)"
+          test -z "$(git -C source diff --cached --name-only)"
+          python -I -S - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          root = Path("release-assets")
+          platform = os.environ["PLATFORM"]
+          payload = "herdr-windows-x86_64.zip" if platform == "windows-x86_64" else f"herdr-{platform}"
+          metadata = f"herdr-{platform}.json"
+          paths = list(root.iterdir()) if root.is_dir() else []
+          if {path.name for path in paths} != {payload, metadata} or any(path.is_symlink() or not path.is_file() for path in paths):
+              raise SystemExit("trusted Herdr artifact inventory mismatch")
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          total = 0
+          for name in (payload, metadata):
+              path = root / name
+              size = path.stat().st_size
+              if size > max_file_bytes or total > max_total_bytes - size:
+                  raise SystemExit(f"trusted Herdr outputs exceed the bounded upload limit: {name}")
+              total += size
+              digest = hashlib.sha256()
+              with path.open("rb") as content:
+                  while chunk := content.read(1024 * 1024):
+                      digest.update(chunk)
+              (root / f"{name}.sha256").write_text(f"{digest.hexdigest()}  {name}\n", encoding="ascii")
+          PY
+      - name: Upload trusted Herdr platform bytes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-herdr-${{ matrix.platform }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: release-assets
+          if-no-files-found: error
+          compression-level: 0
+
+  trusted-omp-build:
+    name: Independently build trusted OMP ${{ matrix.platform }}
+    needs: [validate-seal, trusted-source]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: smarty-linux-16-core
+            omp_target: linux-x64
+            native_targets: "linux-x64-baseline linux-x64-modern"
+          - platform: linux-aarch64
+            os: smarty-linux-arm-16-core
+            omp_target: linux-arm64
+            native_targets: "linux-arm64"
+          - platform: macos-x86_64
+            os: smarty-macos-intel-12-core
+            omp_target: darwin-x64
+            native_targets: "darwin-x64-baseline"
+          - platform: macos-aarch64
+            os: smarty-macos-arm-5-core
+            omp_target: darwin-arm64
+            native_targets: "darwin-arm64"
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Bun 1.4.0
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.0
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.validate-seal.outputs.publisher_commit }}
+          fetch-depth: 1
+          path: publisher-source
+          persist-credentials: false
+      - name: Stage trusted OMP tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p trusted-tools
+          cp publisher-source/scripts/smarty_preview_trusted.py trusted-tools/smarty_preview_trusted.py
+          cp publisher-source/scripts/preview.py trusted-tools/preview.py
+          rm -rf publisher-source
+      - name: Download validated OMP source handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-source-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: trusted-source
+      - name: Extract validated OMP source handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python trusted-tools/smarty_preview_trusted.py extract-tar \
+            --archive trusted-source/omp-source.tar --output omp-source
+      - name: Cache trusted OMP Bun dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: trusted-omp-bun-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('omp-source/bun.lock') }}
+          restore-keys: |
+            trusted-omp-bun-${{ runner.os }}-${{ runner.arch }}-
+      - name: Setup pinned Bazelisk for OMP natives
+        uses: bazel-contrib/setup-bazel@5bab119910beb57b5848d5090ee6d35c031fb26e # main 2026-07-30
+        with:
+          module-root: omp-source
+          bazelisk-cache: false
+          cache-save: false
+      - name: Build trusted OMP and native assets
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          OMP_TARGET: ${{ matrix.omp_target }}
+          NATIVE_TARGETS: ${{ matrix.native_targets }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          export OMP_BUILD_ID="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["build_id"])')"
+          export OMP_COMMIT="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["commit"])')"
+          export OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["tree"])')"
+          export OMP_VERSION="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["version"])')"
+          test -n "$OMP_BUILD_ID" -a -n "$OMP_COMMIT" -a -n "$OMP_TREE" -a -n "$OMP_VERSION"
+          (cd omp-source && bun install --frozen-lockfile && bun run gen:bundle)
+          read -r -a native_targets <<< "$NATIVE_TARGETS"
+          toolchain_log="$RUNNER_TEMP/rules-rust-toolchain.log"
+          (cd omp-source && bun scripts/bazel-natives.ts "${native_targets[@]}" --dest packages/natives/native -- --toolchain_resolution_debug='.*rules_rust.*' 2> >(tee "$toolchain_log" >&2))
+          test -s "$toolchain_log"
+          python trusted-tools/preview.py rules-rust-report --log "$toolchain_log" --platform "$PLATFORM" --output "release-assets/omp-rules-rust-$PLATFORM.json"
+          test -s "release-assets/omp-rules-rust-$PLATFORM.json"
+          (cd omp-source && bun scripts/ci-release-build-binaries.ts --targets "$OMP_TARGET")
+          cp "omp-source/packages/coding-agent/binaries/omp-$OMP_TARGET" "release-assets/omp-$PLATFORM"
+          test -x "release-assets/omp-$PLATFORM"
+          test "$(release-assets/omp-$PLATFORM __build-id)" = "$OMP_BUILD_ID"
+          case "$PLATFORM" in
+            linux-x86_64) cp omp-source/packages/natives/native/pi_natives.linux-x64-baseline.node release-assets/pi_natives.linux-x64-baseline.node; cp omp-source/packages/natives/native/pi_natives.linux-x64-modern.node release-assets/pi_natives.linux-x64-modern.node ;;
+            linux-aarch64) cp omp-source/packages/natives/native/pi_natives.linux-arm64.node release-assets/pi_natives.linux-arm64.node ;;
+            macos-x86_64) cp omp-source/packages/natives/native/pi_natives.darwin-x64-baseline.node release-assets/pi_natives.darwin-x64-baseline.node ;;
+            macos-aarch64) cp omp-source/packages/natives/native/pi_natives.darwin-arm64.node release-assets/pi_natives.darwin-arm64.node ;;
+            *) echo "unsupported OMP platform: $PLATFORM" >&2; exit 1 ;;
+          esac
+      - name: Write trusted OMP checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib
+          from pathlib import Path
+          root = Path("release-assets")
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          total = 0
+          for path in sorted(root.iterdir()):
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"trusted OMP output is not a regular file: {path.name}")
+              size = path.stat().st_size
+              if size > max_file_bytes or total > max_total_bytes - size:
+                  raise SystemExit(f"trusted OMP outputs exceed the bounded upload limit: {path.name}")
+              total += size
+              digest = hashlib.sha256()
+              with path.open("rb") as payload:
+                  while chunk := payload.read(1024 * 1024):
+                      digest.update(chunk)
+              (root / f"{path.name}.sha256").write_text(f"{digest.hexdigest()}  {path.name}\n", encoding="ascii")
+          PY
+      - name: Upload trusted OMP platform bytes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-omp-${{ matrix.platform }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: release-assets
+          if-no-files-found: error
+          compression-level: 0
+
+
+  trusted-assemble:
+    name: Assemble and seal exact release inputs
+    needs: [validate-seal, trusted-source, trusted-build, trusted-omp-build]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.96.1
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.validate-seal.outputs.publisher_commit }}
+          fetch-depth: 1
+          path: publisher-source
+          persist-credentials: false
+      - name: Checkout exact Herdr source with workflow token
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: Smarty-Pants-Inc/herdr
+          ref: ${{ needs.validate-seal.outputs.source }}
+          token: ${{ github.token }}
+          path: herdr-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact Herdr source checkout
+        shell: bash
+        env:
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+        run: |
+          set -euo pipefail
+          test "$(git -C herdr-source rev-parse HEAD)" = "$SOURCE"
+          test -n "$(git -C herdr-source rev-parse HEAD^{tree})"
+      - name: Download trusted source handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-source-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: trusted-source
+      - name: Download trusted validation handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-validation-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: validation
+      - name: Validate candidate Herdr archive against exact source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
+            --archive validation/producer/source-archives/herdr-source.tar \
+            --repository herdr-source
+      - name: Extract validated OMP source handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python publisher-source/scripts/smarty_preview_trusted.py extract-tar \
+            --archive trusted-source/omp-source.tar --output omp-source
+      - name: Setup pinned Bazelisk for OMP metadata
+        uses: bazel-contrib/setup-bazel@5bab119910beb57b5848d5090ee6d35c031fb26e # main 2026-07-30
+        with:
+          module-root: omp-source
+          bazelisk-cache: false
+          cache-save: false
+      - name: Download trusted Linux x86_64 Herdr bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-herdr-linux-x86_64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/linux-x86_64
+      - name: Download trusted Linux x86_64 OMP bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-omp-linux-x86_64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/linux-x86_64
+      - name: Download trusted Linux aarch64 Herdr bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-herdr-linux-aarch64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/linux-aarch64
+      - name: Download trusted Linux aarch64 OMP bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-omp-linux-aarch64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/linux-aarch64
+      - name: Download trusted macOS x86_64 Herdr bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-herdr-macos-x86_64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/macos-x86_64
+      - name: Download trusted macOS x86_64 OMP bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-omp-macos-x86_64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/macos-x86_64
+      - name: Download trusted macOS aarch64 Herdr bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-herdr-macos-aarch64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/macos-aarch64
+      - name: Download trusted macOS aarch64 OMP bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-omp-macos-aarch64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/macos-aarch64
+      - name: Download trusted Windows x86_64 Herdr bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-herdr-windows-x86_64-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: inputs/windows-x86_64
+      - name: Validate and stage exact trusted platform bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib
+          from pathlib import Path
+          from shutil import copyfile
+          payloads = {
+              "linux-x86_64": {"herdr-linux-x86_64", "herdr-linux-x86_64.json", "omp-linux-x86_64", "pi_natives.linux-x64-baseline.node", "pi_natives.linux-x64-modern.node", "omp-rules-rust-linux-x86_64.json"},
+              "linux-aarch64": {"herdr-linux-aarch64", "herdr-linux-aarch64.json", "omp-linux-aarch64", "pi_natives.linux-arm64.node", "omp-rules-rust-linux-aarch64.json"},
+              "macos-x86_64": {"herdr-macos-x86_64", "herdr-macos-x86_64.json", "omp-macos-x86_64", "pi_natives.darwin-x64-baseline.node", "omp-rules-rust-macos-x86_64.json"},
+              "macos-aarch64": {"herdr-macos-aarch64", "herdr-macos-aarch64.json", "omp-macos-aarch64", "pi_natives.darwin-arm64.node", "omp-rules-rust-macos-aarch64.json"},
+              "windows-x86_64": {"herdr-windows-x86_64.zip", "herdr-windows-x86_64.json"},
+          }
+          output = Path("release-assets")
+          output.mkdir(parents=True, exist_ok=True)
+          metadata = Path("metadata/cargo-metadata")
+          metadata.mkdir(parents=True, exist_ok=True)
+          for platform, names in payloads.items():
+              root = Path("inputs") / platform
+              expected = names | {f"{name}.sha256" for name in names}
+              actual = {path.name for path in root.iterdir()}
+              if actual != expected or any(path.is_symlink() or not path.is_file() for path in root.iterdir()):
+                  raise SystemExit(f"trusted platform artifact inventory mismatch: {platform}")
+              for name in names:
+                  digest = hashlib.sha256()
+                  with (root / name).open("rb") as payload:
+                      while chunk := payload.read(1024 * 1024):
+                          digest.update(chunk)
+                  if (root / f"{name}.sha256").read_text(encoding="ascii").split() != [digest.hexdigest(), name]:
+                      raise SystemExit(f"trusted platform checksum mismatch: {name}")
+                  if name.startswith("omp-rules-rust-"):
+                      copyfile(root / name, Path("inputs") / name)
+                  elif name.startswith("herdr-") and name.endswith(".json"):
+                      copyfile(root / name, metadata / name)
+                  else:
+                      copyfile(root / name, output / name)
+                      copyfile(root / f"{name}.sha256", output / f"{name}.sha256")
+          PY
+      - name: Assemble exact payloads and semantic inputs
+        shell: bash
+        env:
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+          BUILT_AT: ${{ needs.validate-seal.outputs.built_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets metadata/cargo-metadata source-archives
+          cp trusted-source/trusted-source-record.json metadata/source-validation.json
+          cp trusted-source/omp-source.tar source-archives/omp-source.tar
+          cp validation/producer/producer-plan.json metadata/producer-plan.json
+          cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar
+          python -I -S - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          source_record = json.loads(Path("trusted-source/trusted-source-record.json").read_text(encoding="utf-8"))
+          validation_record = json.loads(Path("validation/producer/producer-record.json").read_text(encoding="utf-8"))
+          Path("metadata/omp-descriptor.json").write_text(json.dumps(source_record["omp"], sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          identity = source_record.get("identity", {})
+          expected = {"tag": os.environ["TAG"], "build_id": os.environ["TAG"].removeprefix("smarty-preview-"), "parent": os.environ["PARENT"], "source": os.environ["SOURCE"], "omp": os.environ["OMP"]}
+          if any(identity.get(key) != value for key, value in expected.items()):
+              raise SystemExit("trusted source handoff identity mismatch")
+          if validation_record.get("descriptor") != source_record["omp"]:
+              raise SystemExit("producer OMP descriptor differs from trusted source identity")
+          source_tree = subprocess.check_output(["git", "-C", "herdr-source", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          if subprocess.check_output(["git", "-C", "herdr-source", "rev-parse", "HEAD"], text=True).strip() != expected["source"]:
+              raise SystemExit("trusted Herdr checkout commit mismatch")
+          Path("metadata/source-trees.json").write_text(json.dumps({"parent":source_record["parent"]["tree"],"source":source_tree,"omp":source_record["omp"]["tree"]}, sort_keys=True)+"\n", encoding="utf-8")
+          PY
+          while read -r platform target; do
+            (cd omp-source && env -u RUSTUP_TOOLCHAIN cargo metadata --locked --format-version=1 --filter-platform "$target") > "metadata/cargo-metadata/omp-$platform.json"
+          done <<'EOF'
+          linux-x86_64 x86_64-unknown-linux-gnu
+          linux-aarch64 aarch64-unknown-linux-gnu
+          macos-x86_64 x86_64-apple-darwin
+          macos-aarch64 aarch64-apple-darwin
+          EOF
+          bazel_tool="$(command -v bazelisk || command -v bazel || true)"
+          test -n "$bazel_tool"
+          (cd omp-source && "$bazel_tool" --ignore_all_rc_files mod --lockfile_mode=error graph --output=json) > metadata/omp-bazel-graph.json
+          python -I -S - <<'PY'
+          import json
+          from pathlib import Path
+          platforms=("linux-x86_64","linux-aarch64","macos-x86_64","macos-aarch64")
+          reports={p:json.loads((Path("inputs")/f"omp-rules-rust-{p}.json").read_text()) for p in platforms}
+          toolchains={p:{"resolved":r["resolved"],"toolchain_type":r["toolchain_type"]} for p,r in reports.items()}
+          Path("metadata/omp-rules-rust-toolchains.json").write_text(json.dumps({"schema":1,"toolchains":toolchains}, sort_keys=True)+"\n", encoding="utf-8")
+          PY
+          base_version="$(python -I -S -c 'import json; print(json.load(open("validation/producer/producer-plan.json"))["base_version"])')"
+          plan_protocol="$(python -I -S -c 'import json; print(json.load(open("validation/producer/producer-plan.json"))["protocol"])')"
+          protocol="$(python -I -S - <<'PY'
+          import re
+          from pathlib import Path
+          matches = re.findall(r"(?m)^pub const PROTOCOL_VERSION: u32 = ([0-9]+);$", Path("herdr-source/src/protocol/wire.rs").read_text(encoding="utf-8"))
+          if len(matches) != 1:
+              raise SystemExit("Herdr protocol declaration is not exact")
+          print(matches[0])
+          PY
+          )"
+          test "$plan_protocol" = "$protocol"
+          omp_version="$(python -I -S -c 'import json; print(json.load(open("metadata/omp-descriptor.json"))["version"])')"
+          python publisher-source/scripts/preview.py spdx --output release-assets/smarty-pair.spdx.json --asset-dir release-assets --built-at "$BUILT_AT" --parent-commit "$PARENT" --herdr-commit "$SOURCE" --omp-commit "$OMP" --herdr-version "${base_version}-preview.${TAG#smarty-preview-}" --omp-version "$omp_version" --herdr-root herdr-source --omp-root omp-source --omp-bazel-graph metadata/omp-bazel-graph.json --cargo-metadata-dir metadata/cargo-metadata
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          identity={"tag":os.environ["TAG"],"build_id":os.environ["TAG"].removeprefix("smarty-preview-"),"built_at":os.environ["BUILT_AT"],"parent":os.environ["PARENT"],"source":os.environ["SOURCE"],"omp":os.environ["OMP"]}
+          Path("seal-input-identity.json").write_text(json.dumps(identity, sort_keys=True, separators=(",", ":"))+"\n", encoding="utf-8")
+          PY
+          python publisher-source/scripts/smarty_preview_trusted.py seal-inputs --asset-dir release-assets --identity seal-input-identity.json --output-dir sealed
+      - name: Upload sealed release inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-sealed-inputs-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: |
+            release-assets
+            sealed
+            metadata
+            source-archives
+          if-no-files-found: error
+          compression-level: 0
+
+  attest-and-seal:
+    name: Attest exact release bytes and seal final release
+    needs: [validate-seal, trusted-assemble]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.validate-seal.outputs.publisher_commit }}
+          fetch-depth: 1
+          path: publisher-source
+          persist-credentials: false
+      - name: Download sealed inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-sealed-inputs-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: .
+      - name: Extract trusted source archives with bounded verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python publisher-source/scripts/smarty_preview_trusted.py extract-tar --archive source-archives/herdr-source.tar --output herdr-source
+          python publisher-source/scripts/smarty_preview_trusted.py extract-tar --archive source-archives/omp-source.tar --output omp-source
+      - name: Write platform and SBOM subject lists
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib
+          from pathlib import Path
+          root = Path("release-assets")
+          subjects = {
+              "linux-x86_64": ("herdr-linux-x86_64", "omp-linux-x86_64", "pi_natives.linux-x64-baseline.node", "pi_natives.linux-x64-modern.node"),
+              "linux-aarch64": ("herdr-linux-aarch64", "omp-linux-aarch64", "pi_natives.linux-arm64.node"),
+              "macos-x86_64": ("herdr-macos-x86_64", "omp-macos-x86_64", "pi_natives.darwin-x64-baseline.node"),
+              "macos-aarch64": ("herdr-macos-aarch64", "omp-macos-aarch64", "pi_natives.darwin-arm64.node"),
+              "windows-x86_64": ("herdr-windows-x86_64.zip",),
+          }
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          def digest(name):
+              path = root / name
+              size = path.stat().st_size
+              if size > max_file_bytes:
+                  raise SystemExit(f"attestation subject exceeds the bounded size limit: {name}")
+              digest = hashlib.sha256()
+              total = 0
+              with path.open("rb") as source:
+                  while chunk := source.read(1024 * 1024):
+                      total += len(chunk)
+                      if total > max_file_bytes:
+                          raise SystemExit(f"attestation subject changed beyond the bounded size limit: {name}")
+                      digest.update(chunk)
+              if total != size:
+                  raise SystemExit(f"attestation subject changed while hashing: {name}")
+              return digest.hexdigest()
+          subject_dir = Path("attest-subjects")
+          subject_dir.mkdir()
+          for platform, names in subjects.items():
+              (subject_dir / f"{platform}.sha256").write_text(
+                  "".join(f"{digest(name)}  {name}\n" for name in names), encoding="ascii"
+              )
+          all_names = tuple(name for names in subjects.values() for name in names) + ("smarty-pair.spdx.json",)
+          total = sum((root / name).stat().st_size for name in all_names)
+          if total > max_total_bytes:
+              raise SystemExit("attestation subjects exceed the aggregate size limit")
+          (subject_dir / "spdx.sha256").write_text(
+              "".join(f"{digest(name)}  {name}\n" for name in all_names), encoding="ascii"
+          )
+          PY
+      - name: Attest Linux x86_64 release subjects
+        id: attest_linux_x86_64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/linux-x86_64.sha256
+          show-summary: false
+      - name: Save Linux x86_64 provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_linux_x86_64.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-linux-x86_64.sigstore.json
+      - name: Attest Linux aarch64 release subjects
+        id: attest_linux_aarch64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/linux-aarch64.sha256
+          show-summary: false
+      - name: Save Linux aarch64 provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_linux_aarch64.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-linux-aarch64.sigstore.json
+      - name: Attest macOS x86_64 release subjects
+        id: attest_macos_x86_64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/macos-x86_64.sha256
+          show-summary: false
+      - name: Save macOS x86_64 provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_macos_x86_64.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-macos-x86_64.sigstore.json
+      - name: Attest macOS aarch64 release subjects
+        id: attest_macos_aarch64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/macos-aarch64.sha256
+          show-summary: false
+      - name: Save macOS aarch64 provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_macos_aarch64.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-macos-aarch64.sigstore.json
+      - name: Attest Windows x86_64 release subject
+        id: attest_windows_x86_64
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/windows-x86_64.sha256
+          show-summary: false
+      - name: Save Windows x86_64 provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_windows_x86_64.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-windows-x86_64.sigstore.json
+      - name: Attest SPDX release subjects
+        id: attest_spdx
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: attest-subjects/spdx.sha256
+          show-summary: false
+      - name: Save SPDX provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest_spdx.outputs.bundle-path }}
+        run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-pair.spdx.sigstore.json
+      - name: Build and verify canonical paired manifest
+        shell: bash
+        env:
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          BUILT_AT: ${{ needs.validate-seal.outputs.built_at }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+        run: |
+          set -euo pipefail
+          BUILD_ID="${TAG#smarty-preview-}"
+          PARENT_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["parent"])')"
+          SOURCE_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["source"])')"
+          OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["omp"])')"
+          BASE_VERSION="$(python -I -S -c 'import json; print(json.load(open("metadata/producer-plan.json"))["base_version"])')"
+          PLAN_PROTOCOL="$(python -I -S -c 'import json; print(json.load(open("metadata/producer-plan.json"))["protocol"])')"
+          PROTOCOL="$(python -I -S - <<'PY'
+          import re
+          from pathlib import Path
+          matches = re.findall(r"(?m)^pub const PROTOCOL_VERSION: u32 = ([0-9]+);$", Path("herdr-source/src/protocol/wire.rs").read_text(encoding="utf-8"))
+          if len(matches) != 1:
+              raise SystemExit("Herdr protocol declaration is not exact")
+          print(matches[0])
+          PY
+          )"
+          test "$PLAN_PROTOCOL" = "$PROTOCOL"
+          python publisher-source/scripts/preview.py pair-manifest \
+            --output release-assets/smarty-pair.json --asset-dir release-assets \
+            --tag "$TAG" --build-id "$BUILD_ID" --built-at "$BUILT_AT" \
+            --parent-commit "$PARENT" --parent-tree "$PARENT_TREE" \
+            --herdr-commit "$SOURCE" --herdr-tree "$SOURCE_TREE" \
+            --base-version "$BASE_VERSION" --protocol "$PROTOCOL" \
+            --omp-source metadata/omp-descriptor.json --herdr-root herdr-source --omp-root omp-source \
+            --omp-rules-rust-toolchains metadata/omp-rules-rust-toolchains.json \
+            --trusted-verifier publisher-source/scripts/smarty_preview_trusted.py \
+            --source-archive-dir source-archives --omp-bazel-graph metadata/omp-bazel-graph.json \
+            --cargo-metadata-dir metadata/cargo-metadata --bun-version 1.4.0 --zig-version 0.15.2
+      - name: Attest paired manifest
+        id: attest_pair
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/smarty-pair.json
+          show-summary: false
+      - name: Save paired provenance bundle and seal release
+        env:
+          BUNDLE_PATH: ${{ steps.attest_pair.outputs.bundle-path }}
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          BUILT_AT: ${{ needs.validate-seal.outputs.built_at }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$BUNDLE_PATH"
+          cp "$BUNDLE_PATH" release-assets/smarty-pair.provenance.sigstore.json
+          BUILD_ID="${TAG#smarty-preview-}"
+          PARENT_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["parent"])')"
+          SOURCE_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["source"])')"
+          OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["omp"])')"
+          python publisher-source/scripts/preview.py verify-pair \
+            --asset-dir release-assets --expected-parent "$PARENT" --expected-source "$SOURCE" --expected-omp "$OMP" \
+            --expected-parent-tree "$PARENT_TREE" --expected-source-tree "$SOURCE_TREE" --expected-omp-tree "$OMP_TREE" \
+            --expected-tag "$TAG" --expected-build-id "$BUILD_ID" --herdr-root herdr-source --omp-root omp-source \
+            --trusted-verifier publisher-source/scripts/smarty_preview_trusted.py --source-archive-dir source-archives \
+            --omp-bazel-graph metadata/omp-bazel-graph.json --cargo-metadata-dir metadata/cargo-metadata \
+            --omp-rules-rust-toolchains metadata/omp-rules-rust-toolchains.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          identity={"tag":os.environ["TAG"],"build_id":os.environ["TAG"].removeprefix("smarty-preview-"),"built_at":os.environ["BUILT_AT"],"parent":os.environ["PARENT"],"source":os.environ["SOURCE"],"omp":os.environ["OMP"]}
+          Path("seal-identity.json").write_bytes(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()+b"\n")
+          PY
+          python publisher-source/scripts/smarty_preview_trusted.py seal --asset-dir release-assets --identity seal-identity.json --output-dir final-seal
+      - name: Upload final immutable release bytes and seal
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-final-release-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: |
+            release-assets
+            final-seal
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-release:
+    name: Publish or reconcile immutable paired release
+    needs: [validate-seal, attest-and-seal]
+    runs-on: ubuntu-latest
+    environment: smarty-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download final sealed bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-final-release-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: .
+      - name: Verify and reconcile immutable release
+        env:
+          GH_TOKEN: ${{ secrets.SMARTY_RELEASE_TOKEN }}
+          REPOSITORY: Smarty-Pants-Inc/herdr
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+        shell: bash
+        run: |
+          fetch_assets() {
+            python -I -S - "$1" "$2" <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          release = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          release_id = release.get("id")
+          if not isinstance(release_id, int) or release_id < 1:
+              raise SystemExit("release ID is invalid")
+          values = []
+          for page in range(1, 17):
+              raw = subprocess.check_output([
+                  "gh", "api", f"repos/{os.environ['REPOSITORY']}/releases/{release_id}/assets?per_page=100&page={page}"
+              ], text=True)
+              page_values = json.loads(raw)
+              if not isinstance(page_values, list):
+                  raise SystemExit("release asset page is invalid")
+              values.extend(page_values)
+              if len(page_values) < 100:
+                  break
+          else:
+              raise SystemExit("release asset pagination exceeds the bounded page limit")
+          Path(sys.argv[2]).write_text(json.dumps(values, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          }
+          merge_assets() {
+            python -I -S - "$1" "$2" <<'PY'
+          import json, sys
+          from pathlib import Path
+          release_path, assets_path = map(Path, sys.argv[1:])
+          release = json.loads(release_path.read_text(encoding="utf-8"))
+          assets = json.loads(assets_path.read_text(encoding="utf-8"))
+          if not isinstance(assets, list):
+              raise SystemExit("release asset list is invalid")
+          release["assets"] = assets
+          release_path.write_text(json.dumps(release, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          }
+          refresh_release() {
+            gh api "repos/$REPOSITORY/releases/tags/$TAG" > "$1"
+            fetch_assets "$1" "$1.assets"
+            merge_assets "$1" "$1.assets"
+          }
+          test -s final-seal/sealed-handoff.json
+          python -I -S - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
+          root = Path("release-assets")
+          paths = list(root.iterdir()) if root.is_dir() else []
+          if {path.name for path in paths} != set(expected) or any(path.is_symlink() or not path.is_file() for path in paths):
+              raise SystemExit("local sealed release asset inventory is not exact")
+          total = 0
+          for name, record in expected.items():
+              path = root / name
+              size = path.stat().st_size
+              if size != record["length"] or size > max_file_bytes or total > max_total_bytes - size:
+                  raise SystemExit(f"local sealed release size limit mismatch: {name}")
+              total += size
+              digest = hashlib.sha256()
+              with path.open("rb") as payload:
+                  while chunk := payload.read(1024 * 1024):
+                      digest.update(chunk)
+              if digest.hexdigest() != record["sha256"]:
+                  raise SystemExit(f"local sealed release digest mismatch: {name}")
+          PY
+          rm -rf remote-assets
+          gh api "repos/$REPOSITORY/immutable-releases" > immutable-releases.json
+          python -I -S - <<'PY'
+          import json
+          from pathlib import Path
+          state = json.loads(Path("immutable-releases.json").read_text(encoding="utf-8"))
+          if state.get("enabled") is not True:
+              raise SystemExit("immutable releases are not enabled")
+          PY
+          gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref-before.json
+          python -I -S - "$SOURCE" "$TAG" <<'PY'
+          import json, sys
+          from pathlib import Path
+          source, tag = sys.argv[1:]
+          tag_ref = json.loads(Path("tag-ref-before.json").read_text(encoding="utf-8"))
+          if tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
+              raise SystemExit("tag does not bind the exact trusted source before release mutation")
+          PY
+          set +e
+          gh api --include "repos/$REPOSITORY/releases/tags/$TAG" > release-response.txt
+          api_status=$?
+          set -e
+          python -I -S - "$api_status" <<'PY'
+          import json, sys
+          from pathlib import Path
+          status = int(sys.argv[1])
+          raw = Path("release-response.txt").read_bytes()
+          header_end = raw.find(b"\r\n\r\n")
+          if header_end < 0:
+              raise SystemExit("release lookup did not return an HTTP response")
+          first_line = raw.splitlines()[0].decode("ascii", "strict").split()
+          if len(first_line) < 2 or not first_line[0].startswith("HTTP/"):
+              raise SystemExit("release lookup response status is invalid")
+          code = int(first_line[1])
+          if code == 200 and status == 0:
+              Path("release.json").write_bytes(raw[header_end + 4:])
+          elif code == 404 and status != 0:
+              Path("release-missing").write_text("404\n", encoding="ascii")
+          else:
+              raise SystemExit(f"release lookup failed with HTTP {code}")
+          PY
+          if [ -f release-missing ]; then
+            gh release create "$TAG" --repo "$REPOSITORY" --title "$TAG" --notes "Trusted paired preview release" --prerelease --draft --verify-tag
+            gh api "repos/$REPOSITORY/releases/tags/$TAG" > release.json
+          fi
+          fetch_assets release.json release-assets.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8")).get("files")
+          assets = json.loads(Path("release-assets.json").read_text(encoding="utf-8"))
+          tag = os.environ["TAG"]
+          if release.get("tag_name") != tag or release.get("name") != tag or release.get("body") != "Trusted paired preview release" or release.get("prerelease") is not True:
+              raise SystemExit("release identity is not owned by the trusted publisher")
+          if not isinstance(expected, dict) or not isinstance(assets, list):
+              raise SystemExit("release asset response is invalid")
+          draft = release.get("draft")
+          if draft is True:
+              if release.get("immutable") is True:
+                  raise SystemExit("draft release unexpectedly reports immutable")
+          elif draft is not False:
+              raise SystemExit("release draft state is invalid")
+          by_name = {}
+          seen = set()
+          delete_ids = []
+          for item in assets:
+              name = item.get("name")
+              if name in seen or name not in expected:
+                  raise SystemExit("release contains an unexpected or duplicate asset")
+              seen.add(name)
+              record = expected[name]
+              if item.get("size") != record["length"] or item.get("digest") != f"sha256:{record['sha256']}":
+                  if draft is not True:
+                      raise SystemExit(f"release asset metadata mismatch: {name}")
+                  asset_id = item.get("id")
+                  if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id < 1:
+                      raise SystemExit(f"draft release asset ID is invalid: {name}")
+                  delete_ids.append(asset_id)
+                  continue
+              by_name[name] = item
+          if draft is True:
+              Path("release-mutation").write_text("publish\n", encoding="ascii")
+              Path("delete-list").write_text("".join(f"{asset_id}\n" for asset_id in delete_ids), encoding="ascii")
+              Path("upload-list").write_text("".join(f"{name}\n" for name in sorted(set(expected) - set(by_name))), encoding="utf-8")
+          else:
+              if set(by_name) != set(expected) or release.get("immutable") is not True:
+                  raise SystemExit("published release is incomplete or not immutable")
+              Path("release-mutation").write_text("complete\n", encoding="ascii")
+              Path("delete-list").write_text("", encoding="ascii")
+              Path("upload-list").write_text("", encoding="utf-8")
+          PY
+          check_tag() {
+            gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref-current.json
+            python -I -S - "$SOURCE" "$TAG" <<'PY'
+          import json, sys
+          from pathlib import Path
+          source, tag = sys.argv[1:]
+          tag_ref = json.loads(Path("tag-ref-current.json").read_text(encoding="utf-8"))
+          if tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
+              raise SystemExit("tag moved before release mutation")
+          PY
+          }
+          if [ "$(cat release-mutation)" = publish ]; then
+            while IFS= read -r asset_id; do
+              [ -n "$asset_id" ] || continue
+              check_tag
+              gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
+            done < delete-list
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              check_tag
+              gh release upload "$TAG" --repo "$REPOSITORY" "release-assets/$name"
+            done < upload-list
+            check_tag
+            refresh_release release-before-publish.json
+            python -I -S - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
+          release = json.loads(Path("release-before-publish.json").read_text(encoding="utf-8"))
+          assets = json.loads(Path("release-before-publish.json.assets").read_text(encoding="utf-8"))
+          if release.get("draft") is not True or release.get("immutable") is True or not isinstance(assets, list):
+              raise SystemExit("release changed before draft byte verification")
+          if {item.get("name") for item in assets} != set(expected) or len(assets) != len(expected):
+              raise SystemExit("draft release asset inventory is not exactly the sealed set")
+          total_release = 0
+          for item in assets:
+              name = item["name"]
+              record = expected[name]
+              size = record["length"]
+              if item.get("size") != size or item.get("digest") != f"sha256:{record['sha256']}":
+                  raise SystemExit(f"draft release asset metadata mismatch: {name}")
+              if total_release > 16 * 1024 * 1024 * 1024 - size:
+                  raise SystemExit("draft release exceeds the aggregate download limit")
+              total_release += size
+              request = Request(item["url"], headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/octet-stream"})
+              digest = hashlib.sha256()
+              total = 0
+              with urlopen(request, timeout=120) as response:
+                  while chunk := response.read(min(1024 * 1024, size - total + 1)):
+                      total += len(chunk)
+                      if total > size:
+                          raise SystemExit(f"draft release asset exceeds sealed size: {name}")
+                      digest.update(chunk)
+              if total != size or digest.hexdigest() != record["sha256"]:
+                  raise SystemExit(f"draft release asset bytes mismatch: {name}")
+          PY
+            refresh_release release-before-edit.json
+            python -I -S - <<'PY'
+          import json
+          from pathlib import Path
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
+          release = json.loads(Path("release-before-edit.json").read_text(encoding="utf-8"))
+          assets = json.loads(Path("release-before-edit.json.assets").read_text(encoding="utf-8"))
+          if release.get("draft") is not True or release.get("immutable") is True or not isinstance(assets, list):
+              raise SystemExit("release changed before immutable transition")
+          if {item.get("name") for item in assets} != set(expected) or len(assets) != len(expected):
+              raise SystemExit("release inventory changed before immutable transition")
+          for item in assets:
+              record = expected[item["name"]]
+              if item.get("size") != record["length"] or item.get("digest") != f"sha256:{record['sha256']}":
+                  raise SystemExit(f"release asset metadata changed before immutable transition: {item['name']}")
+          PY
+            check_tag
+            gh release edit "$TAG" --repo "$REPOSITORY" --draft=false
+          fi
+          refresh_release release.json
+          gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref.json
+          python -I -S - "$SOURCE" "$TAG" <<'PY'
+          import json, sys
+          from pathlib import Path
+          source, tag = sys.argv[1:]
+          release = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          tag_ref = json.loads(Path("tag-ref.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != tag or tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
+              raise SystemExit("release or tag identity does not bind the exact source tag")
+          if release.get("draft") is not False or release.get("prerelease") is not True or release.get("immutable") is not True:
+              raise SystemExit("release is not an immutable prerelease")
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8")).get("files")
+          assets = json.loads(Path("release.json.assets").read_text(encoding="utf-8"))
+          if not isinstance(expected, dict) or not isinstance(assets, list) or {item.get("name") for item in assets} != set(expected):
+              raise SystemExit("published release asset inventory is not exactly the sealed set")
+          for item in assets:
+              record = expected[item["name"]]
+              if item.get("size") != record["length"] or item.get("digest") != f"sha256:{record['sha256']}":
+                  raise SystemExit(f"published release asset metadata mismatch: {item['name']}")
+          PY
+          refresh_release release.json
+          python -I -S - <<'PY'
+          import json
+          from pathlib import Path
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
+          total = sum(record["length"] for record in expected.values())
+          if total < 1 or total > 16 * 1024 * 1024 * 1024:
+              raise SystemExit("published release exceeds the aggregate download limit")
+          PY
+          gh release download "$TAG" --repo "$REPOSITORY" --dir remote-assets --pattern '*' --clobber
+          python -I -S - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          release = json.loads(Path("release.json").read_text(encoding="utf-8"))
+          expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
+          by_name = {item["name"]: item for item in json.loads(Path("release.json.assets").read_text(encoding="utf-8"))}
+          for name, record in expected.items():
+              path = Path("remote-assets") / name
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"published release asset is not a regular file: {name}")
+              size = path.stat().st_size
+              if size != record["length"] or size > max_file_bytes:
+                  raise SystemExit(f"published release size mismatch: {name}")
+              digest = hashlib.sha256()
+              total = 0
+              with path.open("rb") as payload:
+                  while chunk := payload.read(1024 * 1024):
+                      total += len(chunk)
+                      if total > size:
+                          raise SystemExit(f"published release grew while hashing: {name}")
+                      digest.update(chunk)
+              if total != size or digest.hexdigest() != record["sha256"]:
+                  raise SystemExit(f"published release bytes mismatch: {name}")
+              if by_name[name].get("digest") != f"sha256:{record['sha256']}":
+                  raise SystemExit(f"published release digest mismatch: {name}")
+          PY
+
+  phase-a-channel:
+    name: Phase A canary TUF handoff
+    needs: [validate-seal, publish-release]
+    runs-on: ubuntu-latest
+    environment: smarty-release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download final sealed release
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-final-release-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: .
+      - name: Create exact canary TUF promotion input
+        env:
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path("release-assets")
+          pair = json.loads((root / "smarty-pair.json").read_text(encoding="utf-8"))
+          handoff = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))
+          identity = {key: os.environ[key] for key in ("TAG", "PARENT", "SOURCE", "OMP")}
+          if pair["release"]["tag"] != identity["TAG"] or pair["sources"]["parent"]["commit"] != identity["PARENT"] or pair["sources"]["herdr"]["commit"] != identity["SOURCE"] or pair["sources"]["omp"]["commit"] != identity["OMP"]:
+              raise SystemExit("pair manifest identity mismatch")
+          record = handoff["files"]["smarty-pair.json"]
+          digest = hashlib.sha256()
+          total = 0
+          with (root / "smarty-pair.json").open("rb") as payload:
+              while chunk := payload.read(1024 * 1024):
+                  total += len(chunk)
+                  if total > record["length"]:
+                      raise SystemExit("sealed pair grew while hashing")
+                  digest.update(chunk)
+          if total != record["length"] or record["sha256"] != digest.hexdigest():
+              raise SystemExit("sealed pair digest mismatch")
+          output = {
+              "schema": 1,
+              "status": "awaiting-external-tuf-signing",
+              "channel": "canary",
+              "repository": "Smarty-Pants-Inc/herdr",
+              "identity": {"tag": identity["TAG"], "parent": identity["PARENT"], "source": identity["SOURCE"], "omp": identity["OMP"], "pair_id": pair["pair_id"]},
+              "target": {"name": "smarty-pair.json", "length": record["length"], "sha256": record["sha256"], "release_url": f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{identity['TAG']}/smarty-pair.json"},
+              "requires": {"tuf_root_keys": "external", "tuf_online_signers": "external", "channel_compare_and_swap": True},
+          }
+          Path("channel-handoff.json").write_text(json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+      - name: Upload canary TUF promotion input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-tuf-promotion-input-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: channel-handoff.json
+          if-no-files-found: error
+          compression-level: 0
+
+  phase-b-promotion:
+    name: Phase B protected TUF promotion gate
+    needs: [validate-seal, phase-a-channel]
+    runs-on: ubuntu-latest
+    environment:
+      name: smarty-preview-promotion
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download canary TUF promotion input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-tuf-promotion-input-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: .
+      - name: Validate protected promotion handoff and stop at external gate
+        env:
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - "$TAG" "$PARENT" "$SOURCE" "$OMP" <<'PY'
+          import hashlib, json, re, sys
+          from pathlib import Path
+          tag, parent, source, omp = sys.argv[1:]
+          handoff = json.loads(Path("channel-handoff.json").read_text(encoding="utf-8"))
+          if set(handoff) != {"schema", "status", "channel", "repository", "identity", "target", "requires"}:
+              raise SystemExit("canary TUF handoff fields are not exact")
+          if handoff["schema"] != 1 or handoff["status"] != "awaiting-external-tuf-signing" or handoff["channel"] != "canary" or handoff["repository"] != "Smarty-Pants-Inc/herdr":
+              raise SystemExit("canary TUF handoff status or repository mismatch")
+          identity = handoff["identity"]
+          if set(identity) != {"tag", "parent", "source", "omp", "pair_id"}:
+              raise SystemExit("canary TUF handoff identity fields are not exact")
+          if identity["tag"] != tag or identity["parent"] != parent or identity["source"] != source or identity["omp"] != omp:
+              raise SystemExit("canary TUF handoff P/R/O identity mismatch")
+          if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in (parent, source, omp)):
+              raise SystemExit("canary TUF handoff commit identity is malformed")
+          expected_pair_id = hashlib.sha256(("smarty.paired-release.v1\0" + "\0".join((parent, source, omp))).encode("ascii")).hexdigest()
+          if re.fullmatch(r"[0-9a-f]{64}", identity["pair_id"]) is None or identity["pair_id"] != expected_pair_id:
+              raise SystemExit("canary TUF handoff pair_id mismatch")
+          target = handoff["target"]
+          expected_url = f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{tag}/smarty-pair.json"
+          if set(target) != {"name", "length", "sha256", "release_url"} or target.get("name") != "smarty-pair.json" or target.get("release_url") != expected_url:
+              raise SystemExit("canary TUF target identity mismatch")
+          if isinstance(target.get("length"), bool) or not isinstance(target.get("length"), int) or target["length"] < 1 or re.fullmatch(r"[0-9a-f]{64}", target.get("sha256", "")) is None:
+              raise SystemExit("canary TUF target length or digest is malformed")
+          if handoff["requires"] != {"tuf_root_keys": "external", "tuf_online_signers": "external", "channel_compare_and_swap": True}:
+              raise SystemExit("canary TUF external requirements mismatch")
+          Path("promotion-gate.json").write_text(json.dumps({"schema": 1, "status": "blocked-external-gate", "environment": "smarty-preview-promotion", "handoff": handoff, "next": "publish a signed TUF generation and perform channel CAS outside this workflow"}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          echo "Protected Phase B gate is ready; TUF keys/KMS and channel CAS remain an external human-controlled gate."
+      - name: Upload protected promotion gate record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: promotion-gate.json
+          if-no-files-found: error
+          compression-level: 0

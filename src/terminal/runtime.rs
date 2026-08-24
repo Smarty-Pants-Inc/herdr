@@ -47,6 +47,15 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
+    pub fn remote_execution_ready(&self) -> bool {
+        self.0.remote_execution_ready()
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_remote_execution_ready_for_test(&self, ready: bool) {
+        self.0.set_remote_execution_ready_for_test(ready);
+    }
+
+    #[cfg(unix)]
     pub fn handoff_runtime_state(
         &self,
         pane_id: u32,
@@ -62,6 +71,7 @@ impl TerminalRuntime {
     #[cfg(unix)]
     pub fn from_handoff_fd(
         import: crate::handoff_runtime::ImportedHandoffRuntime,
+        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -71,6 +81,7 @@ impl TerminalRuntime {
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::from_handoff_fd(
             import,
+            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -81,6 +92,7 @@ impl TerminalRuntime {
         .map(Self)
     }
 
+    #[cfg(test)]
     // Wrapper mirrors pane runtime construction arguments.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -114,13 +126,47 @@ impl TerminalRuntime {
         .map(Self)
     }
 
-    // Wrapper mirrors pane runtime construction arguments.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_with_initial_history(
+    pub fn spawn_on(
         pane_id: PaneId,
         rows: u16,
         cols: u16,
         cwd: std::path::PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        launch_env: &crate::pane::PaneLaunchEnv,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
+        crate::pane::PaneRuntime::spawn_on(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            execution_target,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            launch_env,
+            events,
+            render_notify,
+            render_dirty,
+        )
+        .map(Self)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_initial_history_on(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -131,11 +177,12 @@ impl TerminalRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        crate::pane::PaneRuntime::spawn_with_initial_history(
+        crate::pane::PaneRuntime::spawn_with_initial_history_on(
             pane_id,
             rows,
             cols,
             cwd,
+            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -149,13 +196,13 @@ impl TerminalRuntime {
         .map(Self)
     }
 
-    // Wrapper mirrors pane runtime construction arguments.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_shell_command(
+    pub fn spawn_shell_command_on(
         pane_id: PaneId,
         rows: u16,
         cols: u16,
         cwd: std::path::PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
         command: &str,
         launch_env: &crate::pane::PaneLaunchEnv,
         agent_detection: crate::pane::AgentDetection,
@@ -166,11 +213,12 @@ impl TerminalRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        crate::pane::PaneRuntime::spawn_shell_command(
+        crate::pane::PaneRuntime::spawn_shell_command_on(
             pane_id,
             rows,
             cols,
             cwd,
+            execution_target,
             command,
             launch_env,
             agent_detection,
@@ -184,7 +232,6 @@ impl TerminalRuntime {
         .map(Self)
     }
 
-    // Wrapper mirrors pane runtime construction arguments, including detection policy.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_argv_command(
         pane_id: PaneId,
@@ -207,6 +254,81 @@ impl TerminalRuntime {
             cols,
             cwd,
             argv,
+            launch_env,
+            agent_detection,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            events,
+            render_notify,
+            render_dirty,
+        )
+        .map(Self)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_argv_command_on(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
+        argv: &[String],
+        launch_env: &crate::pane::PaneLaunchEnv,
+        agent_detection: crate::pane::AgentDetection,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
+        crate::pane::PaneRuntime::spawn_argv_command_on(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            execution_target,
+            argv,
+            launch_env,
+            agent_detection,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            events,
+            render_notify,
+            render_dirty,
+        )
+        .map(Self)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_plugin_command_on(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        execution_target: &crate::execution::ExecutionTarget,
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
+        launch_env: &crate::pane::PaneLaunchEnv,
+        agent_detection: crate::pane::AgentDetection,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
+        crate::pane::PaneRuntime::spawn_plugin_command_on(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            execution_target,
+            plugin_id,
+            entrypoint,
+            local_argv,
             launch_env,
             agent_detection,
             scrollback_limit_bytes,

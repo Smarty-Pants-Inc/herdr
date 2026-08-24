@@ -88,6 +88,7 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
@@ -501,11 +502,10 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use interprocess::local_socket::traits::Listener as _;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::path::PathBuf;
-
     #[test]
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {
         assert!(stale_socket_connect_error(io::ErrorKind::ConnectionRefused));
