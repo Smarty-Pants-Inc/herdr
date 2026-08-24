@@ -242,6 +242,7 @@ impl App {
         workspace_id: String,
         plugin_id: String,
         entrypoint: String,
+        execution_target: &crate::execution::ExecutionTarget,
         argv: &[String],
         cwd: PathBuf,
         extra_env: Vec<(String, String)>,
@@ -288,11 +289,14 @@ impl App {
             .max(2);
         let launch_env = PaneLaunchEnv::from_extra(extra_env)
             .with_workspace_identity(workspace_id.clone(), public_pane_id);
-        let runtime = TerminalRuntime::spawn_argv_command(
+        let runtime = TerminalRuntime::spawn_plugin_command_on(
             pane_id,
             rows,
             cols,
             cwd.clone(),
+            execution_target,
+            &plugin_id,
+            &entrypoint,
             argv,
             &launch_env,
             AgentDetection::Disabled,
@@ -303,7 +307,9 @@ impl App {
             self.render_notify.clone(),
             self.render_dirty.clone(),
         )?;
-        let terminal = TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv.to_vec());
+        let terminal = TerminalState::new(terminal_id.clone(), cwd)
+            .with_execution_target(execution_target.clone())
+            .with_launch_argv(argv.to_vec());
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         self.state.terminals.insert(terminal_id.clone(), terminal);
         self.state.workspace_plugin_panes.insert(

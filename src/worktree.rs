@@ -215,7 +215,6 @@ pub(crate) fn worktree_dirty_remove_message(path: &Path) -> String {
     )
 }
 
-#[cfg(any(windows, test))]
 pub(crate) fn checkout_has_dirty_files(
     path: &Path,
     trust_repository: bool,
@@ -962,14 +961,8 @@ prunable stale
             ],
         );
         let remove = build_worktree_remove_command(&repo, &clean_checkout, false, false);
-        run_worktree_remove_command_with_recovery(
-            &remove,
-            &repo,
-            &clean_checkout,
-            false,
-            false,
-        )
-        .unwrap();
+        run_worktree_remove_command_with_recovery(&remove, &repo, &clean_checkout, false, false)
+            .unwrap();
         assert!(!clean_checkout.exists());
 
         let dirty_checkout = unique_temp_path("worktree-dirty-submodule-checkout");

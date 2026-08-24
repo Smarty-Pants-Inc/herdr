@@ -406,7 +406,7 @@ min_herdr_version = "0.6.10"
 platforms = ["linux", "macos", "windows"]
 
 [[build]]
-command = ["sh", "-c", "echo built > built.txt; if [ -n \"$HERDR_SESSION\" ]; then echo \"$HERDR_SESSION\" > leaked-session.txt; fi"]
+command = ["sh", "-c", "echo built > built.txt; if [ -n \"$HERDR_SESSION\" ]; then echo \"$HERDR_SESSION\" > leaked-session.txt; fi; if [ -n \"$HERDR_VIEW_ID\" ]; then echo \"$HERDR_VIEW_ID\" > leaked-view-id.txt; fi"]
 
 [[actions]]
 id = "bootstrap"
@@ -447,6 +447,7 @@ command = ["sh", "-c", "echo bootstrap"]
         &[
             ("GIT_CONFIG_GLOBAL", &git_config),
             ("HERDR_SESSION", Path::new("leaked-session")),
+            ("HERDR_VIEW_ID", Path::new("leaked-view-id")),
         ],
     );
     assert!(
@@ -484,6 +485,13 @@ command = ["sh", "-c", "echo bootstrap"]
             .join("leaked-session.txt")
             .exists(),
         "build command should not inherit HERDR_SESSION"
+    );
+    assert!(
+        !managed_path
+            .join("worktree-bootstrap")
+            .join("leaked-view-id.txt")
+            .exists(),
+        "build command should not inherit HERDR_VIEW_ID"
     );
 
     let uninstall = run_named_cli(

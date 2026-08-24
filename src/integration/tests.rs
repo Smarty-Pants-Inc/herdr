@@ -2724,6 +2724,7 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_start\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_end\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"session_shutdown\""));
+    assert!(OMP_EXTENSION_ASSET.contains("pane.release_agent"));
     assert!(
         CLAUDE_HOOK_ASSET.contains("agent_session_id")
             || CLAUDE_HOOK_ASSET.contains("--agent-session-id")
@@ -2829,10 +2830,13 @@ fn bundled_integration_assets_report_session_refs() {
 }
 
 #[test]
-fn process_owned_integration_assets_do_not_report_release() {
+fn integration_asset_release_policy_keeps_omp_as_the_only_exception() {
+    assert!(
+        OMP_EXTENSION_ASSET.contains("pane.release_agent"),
+        "OMP reports remote lifecycle release because no local process detector exists"
+    );
     for (name, asset) in [
         ("pi", PI_EXTENSION_ASSET),
-        ("omp", OMP_EXTENSION_ASSET),
         ("mastracode", MASTRACODE_HOOK_ASSET),
         ("kimi", KIMI_HOOK_ASSET),
         ("kilo", KILO_PLUGIN_ASSET),
