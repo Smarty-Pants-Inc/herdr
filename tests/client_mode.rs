@@ -1043,7 +1043,12 @@ fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
         "hostname token was empty: {renamed}"
     );
 
-    send_pane_shell_command(&api_socket, &pane_id, r"printf '\033]0;⠋ building\007'");
+    send_pane_shell_command(
+        &api_socket,
+        &pane_id,
+        r"printf '\033]0;\342\240\213 building\007'; sleep 1",
+    );
+    wait_for_pane_terminal_title(&api_socket, &pane_id, "⠋ building");
     wait_for_window_title(&output, "|W=space-a|T=tab-a|P=pane-a|O=building");
 
     let second_tab = send_json_request(
