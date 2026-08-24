@@ -41,6 +41,11 @@ pub(crate) fn terminal_title_has_activity_glyph(title: &str) -> bool {
         && strip_leading_activity_glyph(after_first.trim_start()).is_some()
 }
 
+pub(crate) fn terminal_title_indicates_omp_working(title: &str) -> bool {
+    let title = crate::platform::terminal_title_for_presentation(title).trim();
+    terminal_title_has_activity_glyph(title) || title == "π :" || title.starts_with("π : ")
+}
+
 fn strip_leading_activity_glyph(title: &str) -> Option<&str> {
     let mut chars = title.chars();
     let first = chars.next()?;
@@ -54,7 +59,10 @@ fn strip_leading_activity_glyph(title: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{stripped_terminal_title, terminal_title_has_activity_glyph};
+    use super::{
+        stripped_terminal_title, terminal_title_has_activity_glyph,
+        terminal_title_indicates_omp_working,
+    };
 
     #[test]
     fn strips_one_recognized_leading_activity_glyph() {
@@ -104,6 +112,20 @@ mod tests {
         for title in ["π > task", "OMP ⠋ task", "task ⠋ detail"] {
             assert!(!terminal_title_has_activity_glyph(title));
         }
+    }
+
+    #[test]
+    fn recognizes_omp_windows_working_separator() {
+        for title in ["π :", "π : task", "  π : task  ", "π ⠋ task"] {
+            assert!(terminal_title_indicates_omp_working(title));
+        }
+        for title in ["π > task", "π ! task", "π :task", "task : detail"] {
+            assert!(!terminal_title_indicates_omp_working(title));
+        }
+        #[cfg(windows)]
+        assert!(terminal_title_indicates_omp_working(
+            "Administrator: π : task"
+        ));
     }
 
     #[test]

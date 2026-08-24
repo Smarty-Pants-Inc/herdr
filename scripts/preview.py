@@ -46,7 +46,7 @@ PAIR_MANIFEST_SCHEMA = "smarty.paired-release.v1"
 PAIR_MANIFEST_ASSET_NAME = "smarty-pair.json"
 SPDX_ASSET_NAME = "smarty-pair.spdx.json"
 SPDX_CREATOR = "Tool: smarty-preview-1.0"
-TRUSTED_BUN_VERSION = "1.3.14"
+TRUSTED_BUN_VERSION = "1.4.0"
 TRUSTED_ZIG_VERSION = "0.15.2"
 SEMANTIC_VERIFICATION_SCHEMA = "smarty.semantic-verification.v1"
 SOURCE_ARCHIVE_NAMES = ("herdr-source.tar", "omp-source.tar")
@@ -103,7 +103,7 @@ PLATFORM_MATRIX = {
         "os": "linux",
         "architecture": "x86_64",
         "abi": "glibc",
-        "runner": "ubuntu-22.04",
+        "runner": "smarty-linux-16-core",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["linux-x86_64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["linux-x86_64"],
@@ -113,7 +113,7 @@ PLATFORM_MATRIX = {
         "os": "linux",
         "architecture": "aarch64",
         "abi": "glibc",
-        "runner": "ubuntu-24.04-arm",
+        "runner": "smarty-linux-arm-16-core",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["linux-aarch64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["linux-aarch64"],
@@ -123,7 +123,7 @@ PLATFORM_MATRIX = {
         "os": "macos",
         "architecture": "x86_64",
         "abi": "darwin",
-        "runner": "macos-15-intel",
+        "runner": "smarty-macos-intel-12-core",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["macos-x86_64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["macos-x86_64"],
@@ -133,7 +133,7 @@ PLATFORM_MATRIX = {
         "os": "macos",
         "architecture": "aarch64",
         "abi": "darwin",
-        "runner": "macos-14",
+        "runner": "smarty-macos-arm-5-core",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["macos-aarch64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["macos-aarch64"],
@@ -143,7 +143,7 @@ PLATFORM_MATRIX = {
         "os": "windows",
         "architecture": "x86_64",
         "abi": "msvc",
-        "runner": "windows-latest",
+        "runner": "smarty-windows-16-core",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["windows-x86_64"],
             "omp": None,
@@ -660,12 +660,15 @@ def validate_retained_channel_build(build_id: str, value: Any) -> dict[str, Any]
     _one_line(
         build.get("base_version"), f"channel retained build {build_id} base_version"
     )
-    stored_built_at = build.get("built_at")
-    built_at = _timestamp(
-        stored_built_at, f"channel retained build {build_id} built_at"
-    )
+    built_at_label = f"channel retained build {build_id} built_at"
+    source_built_at = _one_line(build.get("built_at"), built_at_label)
+    built_at = _timestamp(source_built_at, built_at_label)
+    if legacy is not None and legacy.group("day") != source_built_at[:10]:
+        raise ValueError(
+            f"channel retained build {build_id} date does not match built_at"
+        )
     if paired is not None:
-        if stored_built_at != built_at:
+        if source_built_at != built_at:
             raise ValueError(
                 f"channel retained build {build_id} built_at is not canonical UTC Z"
             )
@@ -946,7 +949,7 @@ def build_legacy_bootstrap_manifest(paired_manifest: dict[str, Any]) -> str:
         "schema_version": 2,
         "build_id": alias,
         "canonical_build_id": paired_build_id,
-        "assets": {"windows-x86_64": windows},
+        "assets": current["assets"],
         "bootstrap": {
             "schema": LEGACY_BOOTSTRAP_SCHEMA,
             "paired_build_id": paired_build_id,
@@ -998,8 +1001,8 @@ def validate_legacy_bootstrap_manifest(
     }:
         if legacy.get(field) != paired.get(field):
             raise ValueError(f"legacy bootstrap {field} differs from paired manifest")
-    if legacy.get("assets") != {"windows-x86_64": current["assets"]["windows-x86_64"]}:
-        raise ValueError("legacy bootstrap top-level assets must be Windows-only")
+    if legacy.get("assets") != current["assets"]:
+        raise ValueError("legacy bootstrap top-level assets differ from paired manifest")
     builds = _mapping(legacy.get("builds"), "legacy bootstrap builds")
     if builds != paired["builds"]:
         raise ValueError("legacy bootstrap archive differs from paired manifest")

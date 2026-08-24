@@ -38,22 +38,35 @@ pub(super) fn launch_cwd_for_terminal(
     >,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> Option<PathBuf> {
+    let terminal = terminals.get(terminal_id)?;
+    if !terminal.execution_target.is_local() {
+        return Some(terminal.cwd.clone());
+    }
     terminal_runtimes
         .get(terminal_id)
         .and_then(|runtime| runtime.follow_cwd())
-        .or_else(|| {
-            terminals
-                .get(terminal_id)
-                .map(|terminal| terminal.cwd.clone())
-        })
+        .or_else(|| Some(terminal.cwd.clone()))
 }
 
 impl App {
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
-        self.state
-            .workspaces
-            .get(ws_idx)?
-            .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        let workspace = self.state.workspaces.get(ws_idx)?;
+        if !workspace.identity_execution_target.is_local() {
+            return None;
+        }
+        if let Some(root_pane) = workspace.tabs.first().map(|tab| tab.root_pane) {
+            if let Some(terminal_id) = workspace.terminal_id(root_pane) {
+                if self
+                    .state
+                    .terminals
+                    .get(terminal_id)
+                    .is_some_and(|terminal| !terminal.execution_target.is_local())
+                {
+                    return None;
+                }
+            }
+        }
+        workspace.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
     }
 
     pub(crate) fn launch_cwd_for_pane_in_workspace(
@@ -72,9 +85,52 @@ impl App {
         )
     }
 
+    pub(crate) fn launch_cwd_for_pane_in_workspace_on(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        execution_target: &crate::execution::ExecutionTarget,
+    ) -> Option<PathBuf> {
+        if self
+            .execution_target_for_pane_in_workspace(ws_idx, pane_id)
+            .as_ref()
+            != Some(execution_target)
+        {
+            return None;
+        }
+        self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
+    }
+
+    pub(super) fn execution_target_for_pane_in_workspace(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::execution::ExecutionTarget> {
+        let workspace = self.state.workspaces.get(ws_idx)?;
+        let tab = workspace
+            .tabs
+            .get(workspace.find_tab_index_for_pane(pane_id)?)?;
+        let terminal_id = tab.terminal_id(pane_id)?;
+        self.state
+            .terminals
+            .get(terminal_id)
+            .map(|terminal| terminal.execution_target.clone())
+    }
+    pub(super) fn focused_pane_execution_target_in_workspace(
+        &self,
+        ws_idx: usize,
+    ) -> Option<crate::execution::ExecutionTarget> {
+        let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
+        self.execution_target_for_pane_in_workspace(ws_idx, pane_id)
+    }
+
     pub(super) fn focused_pane_cwd_in_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
-        self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
+        self.launch_cwd_for_pane_in_workspace_on(
+            ws_idx,
+            pane_id,
+            &crate::execution::ExecutionTarget::Local,
+        )
     }
 
     pub(super) fn resolve_new_terminal_cwd(&self, follow_cwd: Option<PathBuf>) -> PathBuf {
@@ -452,8 +508,12 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+            execution_target: terminal.execution_target.clone(),
+            foreground_cwd: terminal
+                .execution_target
+                .is_local()
+                .then(|| ws.tabs[tab_idx].foreground_cwd_for_pane(pane_id, &self.terminal_runtimes))
+                .flatten()
                 .map(|cwd| cwd.display().to_string()),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),

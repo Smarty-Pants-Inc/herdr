@@ -25,6 +25,7 @@ impl App {
             context.correlation_id = provided.correlation_id.or(context.correlation_id);
             context.clicked_url = provided.clicked_url.or(context.clicked_url);
             context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
+            context.view_id = provided.view_id.or(context.view_id);
         }
         context
     }
@@ -33,6 +34,16 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return empty_plugin_context(correlation_id);
         };
+        if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
+            let source_pane_id =
+                crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(workspace_id);
+            if let Some((context, _)) = self.plugin_context_and_execution_target_for_source_pane(
+                &source_pane_id,
+                correlation_id,
+            ) {
+                return context;
+            }
+        }
         self.plugin_context_for_workspace(ws_idx, correlation_id)
     }
 
@@ -320,6 +331,48 @@ impl App {
         )
     }
 
+    pub(super) fn plugin_context_and_execution_target_for_source_pane(
+        &self,
+        source_pane_id: &str,
+        correlation_id: &str,
+    ) -> Option<(PluginInvocationContext, crate::execution::ExecutionTarget)> {
+        if let Some((ws_idx, pane_id)) = self.parse_pane_id(source_pane_id) {
+            return Some((
+                self.plugin_context_for_pane(ws_idx, pane_id, correlation_id),
+                self.execution_target_for_pane_in_workspace(ws_idx, pane_id)?,
+            ));
+        }
+
+        let ws_idx = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find_map(|(ws_idx, _)| {
+                (crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(
+                    &self.public_workspace_id(ws_idx),
+                ) == source_pane_id)
+                    .then_some(ws_idx)
+            })?;
+        let workspace_id = self.public_workspace_id(ws_idx);
+        let plugin_pane = self.state.workspace_plugin_panes.get(&workspace_id)?;
+        let terminal = self.state.terminals.get(&plugin_pane.terminal_id)?;
+        let cwd = crate::app::creation::launch_cwd_for_terminal(
+            &plugin_pane.terminal_id,
+            &self.state.terminals,
+            &self.terminal_runtimes,
+        )
+        .map(|cwd| cwd.display().to_string());
+        let mut context = self.plugin_context_for_workspace(ws_idx, correlation_id);
+        context.workspace_cwd = cwd.clone();
+        context.focused_pane_id = Some(source_pane_id.to_string());
+        context.focused_pane_cwd = cwd;
+        context.focused_pane_agent = None;
+        context.focused_pane_status = None;
+        context.selected_text = None;
+        Some((context, terminal.execution_target.clone()))
+    }
+
     pub(super) fn plugin_context_for_pane(
         &self,
         ws_idx: usize,
@@ -377,6 +430,7 @@ impl App {
             correlation_id: Some(correlation_id.to_string()),
             clicked_url: None,
             link_handler_id: None,
+            view_id: None,
         }
     }
 
@@ -424,5 +478,6 @@ fn empty_plugin_context(correlation_id: &str) -> PluginInvocationContext {
         correlation_id: Some(correlation_id.to_string()),
         clicked_url: None,
         link_handler_id: None,
+        view_id: None,
     }
 }

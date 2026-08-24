@@ -321,7 +321,7 @@ impl App {
         }
 
         let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+            ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
@@ -378,7 +378,7 @@ impl App {
         }
 
         let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+            ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
@@ -604,7 +604,7 @@ impl App {
             }
 
             let git_space = ws.git_space().cloned().or_else(|| {
-                ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                     .as_deref()
                     .and_then(crate::workspace::git_space_metadata)
             });
@@ -615,7 +615,7 @@ impl App {
                 return true;
             }
 
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+            ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .is_some_and(|cwd| {
                     crate::worktree::canonical_or_original(cwd) == canonical_checkout

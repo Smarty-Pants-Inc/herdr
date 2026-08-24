@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
@@ -121,11 +121,15 @@ function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolea
   });
 }
 
-async function sendRequestNow(request: unknown): Promise<void> {
-  if (await sendRequestAttempt(request, 500)) {
+async function sendRequestNow(
+  request: unknown,
+  firstAttemptTimeoutMs = 500,
+  retryAttemptTimeoutMs = 1500,
+): Promise<void> {
+  if (await sendRequestAttempt(request, firstAttemptTimeoutMs)) {
     return;
   }
-  await sendRequestAttempt(request, 1500);
+  await sendRequestAttempt(request, retryAttemptTimeoutMs);
 }
 
 function sendRequest(request: unknown): Promise<void> {
@@ -151,6 +155,7 @@ const retryableErrorPattern =
 let reportSeq = Date.now() * 1000;
 let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
+let pendingSessionStartSource: string | undefined;
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -230,6 +235,23 @@ function reportSession(sessionStartSource = "startup"): Promise<void> {
       ...sessionRef,
     },
   });
+}
+
+function releaseAgent(): Promise<void> {
+  return sendRequestNow(
+    {
+      id: `${source}:release:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.release_agent",
+      params: {
+        pane_id: paneId,
+        source,
+        agent: "omp",
+        seq: nextReportSeq(),
+      },
+    },
+    450,
+    1400,
+  );
 }
 
 function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
@@ -450,11 +472,24 @@ export default function (pi) {
   });
 
   pi.on("session_switch", (event, ctx) => {
-    if (!activateRootSession(ctx, event?.reason || "resume")) {
+    if (ctx?.hasUI !== true || !rootSession) {
+      return;
+    }
+    pendingSessionStartSource = event?.reason || "resume";
+  });
+
+  pi.on("session_ready", (_event, ctx) => {
+    const sessionStartSource = pendingSessionStartSource;
+    pendingSessionStartSource = undefined;
+    if (!sessionStartSource || !activateRootSession(ctx, sessionStartSource)) {
       return;
     }
     resetSessionState();
     publishState(true);
+  });
+
+  pi.on("session_rollback", () => {
+    pendingSessionStartSource = undefined;
   });
 
   pi.on("agent_start", (_event, ctx) => {
@@ -543,9 +578,13 @@ export default function (pi) {
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", () => {
-    if (rootSession) {
-      clearPendingTimers();
+  pi.on("session_shutdown", async () => {
+    if (!rootSession) {
+      return;
     }
+    clearPendingTimers();
+    queuedState = undefined;
+    rootSession = false;
+    await releaseAgent();
   });
 }

@@ -1,7 +1,7 @@
 use crate::api::schema::{
     InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
     PluginManifestLinkHandler, PluginManifestPane, PluginManifestStartup, PluginPanePlacement,
-    PluginPlatform, PluginSourceInfo, PluginSourceKind,
+    PluginPaneScope, PluginPlatform, PluginSourceInfo, PluginSourceKind,
 };
 use crate::popup_size::PopupSize;
 
@@ -78,6 +78,8 @@ struct RawPluginManifestPane {
     platforms: Option<Vec<RawPlatform>>,
     #[serde(default)]
     placement: PluginPanePlacement,
+    #[serde(default)]
+    scope: PluginPaneScope,
     #[serde(default)]
     width: Option<PopupSize>,
     #[serde(default)]
@@ -434,12 +436,20 @@ fn normalize_manifest_pane(
                 .to_string(),
         ));
     }
+    if pane.scope == PluginPaneScope::ClientPrivate && pane.placement != PluginPanePlacement::Popup
+    {
+        return Err((
+            "invalid_plugin_pane_scope",
+            "client-private panes require popup placement".to_string(),
+        ));
+    }
     Ok(PluginManifestPane {
         id,
         title,
         description,
         platforms,
         placement: pane.placement,
+        scope: pane.scope,
         width: pane.width,
         height: pane.height,
         command,
@@ -524,7 +534,7 @@ fn current_platform() -> PluginPlatform {
 /// Resolve the effective platforms for an action or event: use the item's own
 /// platforms if declared, otherwise inherit from the plugin-level platforms.
 /// Returns a reference to whichever `Option<Vec<PluginPlatform>>` applies.
-pub(super) fn effective_platforms<'a>(
+pub(crate) fn effective_platforms<'a>(
     item_platforms: &'a Option<Vec<PluginPlatform>>,
     plugin_platforms: &'a Option<Vec<PluginPlatform>>,
 ) -> &'a Option<Vec<PluginPlatform>> {
@@ -535,7 +545,7 @@ pub(super) fn effective_platforms<'a>(
     }
 }
 
-pub(super) fn ensure_platform_supported(
+pub(crate) fn ensure_platform_supported(
     platforms: &Option<Vec<PluginPlatform>>,
     subject: &str,
 ) -> Result<(), (&'static str, String)> {

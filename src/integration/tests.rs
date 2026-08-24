@@ -2724,6 +2724,7 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_start\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_end\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"session_shutdown\""));
+    assert!(OMP_EXTENSION_ASSET.contains("pane.release_agent"));
     assert!(
         CLAUDE_HOOK_ASSET.contains("agent_session_id")
             || CLAUDE_HOOK_ASSET.contains("--agent-session-id")
@@ -2829,10 +2830,13 @@ fn bundled_integration_assets_report_session_refs() {
 }
 
 #[test]
-fn process_owned_integration_assets_do_not_report_release() {
+fn integration_asset_release_policy_keeps_omp_as_the_only_exception() {
+    assert!(
+        OMP_EXTENSION_ASSET.contains("pane.release_agent"),
+        "OMP reports remote lifecycle release because no local process detector exists"
+    );
     for (name, asset) in [
         ("pi", PI_EXTENSION_ASSET),
-        ("omp", OMP_EXTENSION_ASSET),
         ("mastracode", MASTRACODE_HOOK_ASSET),
         ("kimi", KIMI_HOOK_ASSET),
         ("kilo", KILO_PLUGIN_ASSET),
@@ -2918,22 +2922,25 @@ fn omp_root_activation_requires_ui_context() {
 }
 
 #[test]
-fn omp_session_start_and_switch_use_root_activation() {
-    let session_start = OMP_EXTENSION_ASSET
-        .find("pi.on(\"session_start\", (_event, ctx)")
-        .expect("omp extension registers session_start handler");
-    let session_start_handler = &OMP_EXTENSION_ASSET[session_start..];
-    session_start_handler
-        .find("if (!activateRootSession(ctx))")
-        .expect("omp session_start handler should activate root session");
+fn omp_session_switch_reports_committed_identity_on_ready() {
+    let session_switch = omp_handler("session_switch");
+    session_switch
+        .find("pendingSessionStartSource = event?.reason || \"resume\";")
+        .expect("omp session_switch should retain the lifecycle reason");
+    assert!(!session_switch.contains("activateRootSession"));
 
-    let session_switch = OMP_EXTENSION_ASSET
-        .find("pi.on(\"session_switch\", (event, ctx)")
-        .expect("omp extension registers session_switch handler");
-    let session_switch_handler = &OMP_EXTENSION_ASSET[session_switch..];
-    session_switch_handler
-        .find("if (!activateRootSession(ctx, event?.reason || \"resume\"))")
-        .expect("omp session_switch handler should activate root session with switch reason");
+    let session_ready = omp_handler("session_ready");
+    let pending_source = session_ready
+        .find("const sessionStartSource = pendingSessionStartSource;")
+        .expect("omp session_ready should consume the retained lifecycle reason");
+    let activation = session_ready
+        .find("activateRootSession(ctx, sessionStartSource)")
+        .expect("omp session_ready should report the committed target identity");
+    assert!(pending_source < activation);
+
+    omp_handler("session_rollback")
+        .find("pendingSessionStartSource = undefined;")
+        .expect("omp session rollback should clear the pending transition");
 }
 
 #[test]

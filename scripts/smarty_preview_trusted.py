@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 import io
 import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -21,8 +20,6 @@ import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
-from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 REPOSITORY = "Smarty-Pants-Inc/herdr"
 WORKFLOW_NAME = "Smarty Preview"
@@ -375,86 +372,6 @@ def _load_json(path: Path, label: str) -> Any:
         return json.loads(_read_bounded_bytes(path, label, MAX_JSON_BYTES).decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{label} is not valid UTF-8 JSON") from error
-
-
-class _HttpsArtifactRedirectHandler(HTTPRedirectHandler):
-    def redirect_request(self, req: Request, fp: Any, code: int, msg: str,
-                         headers: Any, newurl: str) -> Request | None:
-        target = urlsplit(newurl)
-        if target.scheme != "https" or not target.hostname or target.username is not None or target.password is not None:
-            _fail("artifact redirect target must be an authenticated-free HTTPS URL")
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirected is not None and urlsplit(req.full_url).netloc != target.netloc:
-            redirected.remove_header("Authorization")
-        return redirected
-
-
-def download_artifacts(root: Path, identity: dict[str, Any], token: str) -> None:
-    if not token:
-        _fail("GH_TOKEN is required to download producer artifacts")
-    artifacts = _mapping(identity.get("artifacts"), "producer artifacts")
-    records: dict[str, dict[str, Any]] = {}
-    declared_total = 0
-    for name, value in artifacts.items():
-        if not isinstance(name, str) or ARTIFACT_NAME.fullmatch(name) is None:
-            _fail(f"producer artifact is outside the recognized attempt namespace: {name}")
-        record = _mapping(value, f"artifact record {name}")
-        size = _positive_int(record.get("size_in_bytes"), f"artifact size {name}")
-        artifact_id = _positive_int(record.get("id"), f"artifact ID {name}")
-        if record.get("archive_download_url") != _artifact_url(REPOSITORY, artifact_id):
-            _fail(f"artifact download URL is not canonical: {name}")
-        if size > MAX_FILE_BYTES or declared_total > MAX_TOTAL_DOWNLOAD_BYTES - size:
-            _fail("producer artifacts exceed the bounded download limit")
-        declared_total += size
-        records[name] = record
-    if declared_total < 1:
-        _fail("producer artifact aggregate is empty")
-    root.mkdir(parents=True, exist_ok=True)
-    opener = build_opener(_HttpsArtifactRedirectHandler())
-    for name, record in records.items():
-        expected_size = record["size_in_bytes"]
-        request = Request(record["archive_download_url"], headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-        })
-        path = root / f"{name}.zip"
-        partial = path.with_suffix(".zip.part")
-        total = 0
-        try:
-            with opener.open(request, timeout=120) as response, partial.open("wb") as output:
-                while True:
-                    chunk = response.read(min(1024 * 1024, expected_size - total + 1))
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > expected_size:
-                        _fail(f"artifact download exceeds declared size: {name}")
-                    output.write(chunk)
-            if total != expected_size:
-                _fail(f"artifact download is truncated: {name}")
-            partial.replace(path)
-        except BaseException:
-            partial.unlink(missing_ok=True)
-            raise
-
-
-def extract_producer_artifacts(root: Path, output: Path, identity: dict[str, Any]) -> None:
-    artifacts = _mapping(identity.get("artifacts"), "producer artifacts")
-    for name in artifacts:
-        match = ARTIFACT_NAME.fullmatch(name) if isinstance(name, str) else None
-        if match is None:
-            _fail(f"producer artifact is outside the recognized attempt namespace: {name}")
-        kind = name[: -(len(match.group("attempt")) + 1)]
-        archive = root / f"{name}.zip"
-        if kind == "smarty-candidate-sources":
-            destination = output / "source-archives"
-        elif kind in {"smarty-release-plan", "smarty-candidate-handoff"}:
-            destination = output
-        elif kind.startswith("candidate-"):
-            continue
-        else:
-            _fail(f"producer artifact has no trusted extraction route: {name}")
-        extract_zip(archive, destination)
 
 
 def verify_downloads(root: Path, identity: dict[str, Any]) -> dict[str, Any]:
@@ -1033,16 +950,6 @@ def cmd_validate_run(args: argparse.Namespace) -> int:
     return _write_output(args.output, result)
 
 
-def cmd_download_artifacts(args: argparse.Namespace) -> int:
-    download_artifacts(Path(args.root), _load(args.identity), os.environ.get("GH_TOKEN", ""))
-    return 0
-
-
-def cmd_extract_producer_artifacts(args: argparse.Namespace) -> int:
-    extract_producer_artifacts(Path(args.root), Path(args.output), _load(args.identity))
-    return 0
-
-
 def cmd_verify_downloads(args: argparse.Namespace) -> int:
     return _write_output(args.output, verify_downloads(Path(args.root), _load(args.identity)))
 
@@ -1108,17 +1015,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--event-run-attempt", type=int, required=True)
     run.add_argument("--output", required=True)
     run.set_defaults(func=cmd_validate_run)
-
-    download = sub.add_parser("download-artifacts")
-    download.add_argument("--root", required=True)
-    download.add_argument("--identity", required=True)
-    download.set_defaults(func=cmd_download_artifacts)
-
-    producer_extract = sub.add_parser("extract-producer-artifacts")
-    producer_extract.add_argument("--root", required=True)
-    producer_extract.add_argument("--output", required=True)
-    producer_extract.add_argument("--identity", required=True)
-    producer_extract.set_defaults(func=cmd_extract_producer_artifacts)
 
     downloads = sub.add_parser("verify-downloads")
     archive_validate = sub.add_parser("validate-git-archive")
