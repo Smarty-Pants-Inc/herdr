@@ -63,6 +63,14 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
 struct ClientLoopConfig {
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
+    #[cfg(unix)]
+    scrollback_limit_bytes: usize,
+    #[cfg(unix)]
+    copy_on_select: bool,
+    #[cfg(unix)]
+    copy_feedback_enabled: bool,
+    #[cfg(unix)]
+    copy_feedback_position: crate::config::ToastClipboardPosition,
     redraw_on_focus_gained: bool,
     host_cursor: crate::config::HostCursorModeConfig,
     kitty_graphics_enabled: bool,
@@ -97,7 +105,14 @@ struct ClientState {
     /// Rows scrolled for one direct-attach wheel notch.
     #[cfg(unix)]
     mouse_scroll_lines: usize,
-    /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    /// Whether native pane selections copy automatically.
+    #[cfg(unix)]
+    copy_on_select: bool,
+    /// Client-local clipboard feedback settings, refreshed with live config.
+    #[cfg(unix)]
+    copy_feedback_enabled: bool,
+    #[cfg(unix)]
+    copy_feedback_position: crate::config::ToastClipboardPosition,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
@@ -1515,7 +1530,6 @@ fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String
         TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),
     }
 }
-
 fn run_client_with_mode(
     requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
@@ -1529,8 +1543,17 @@ fn run_client_with_mode(
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
+    #[cfg(unix)]
+    let scrollback_limit_bytes = loaded_config.config.advanced.scrollback_limit_bytes;
+    #[cfg(unix)]
+    let copy_on_select = loaded_config.config.ui.copy_on_select;
+    #[cfg(unix)]
+    let copy_feedback_enabled = loaded_config.config.ui.toast.clipboard.enabled;
+    #[cfg(unix)]
+    let copy_feedback_position = loaded_config.config.ui.toast.clipboard.position;
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
+
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
     #[cfg(unix)]
@@ -1669,6 +1692,14 @@ fn run_client_with_mode(
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
+        #[cfg(unix)]
+        scrollback_limit_bytes,
+        #[cfg(unix)]
+        copy_on_select,
+        #[cfg(unix)]
+        copy_feedback_enabled,
+        #[cfg(unix)]
+        copy_feedback_position,
         redraw_on_focus_gained,
         host_cursor,
         kitty_graphics_enabled,
@@ -1838,10 +1869,8 @@ fn display_pending_omp_surface(
     state: &mut ClientState,
     write_stream: &mut LocalStream,
 ) -> Result<(), ClientError> {
-    if let Some(surface) = state
-        .omp_renderer
-        .next_frame(Instant::now(), state.reported_size)
-    {
+    let now = Instant::now();
+    if let Some(surface) = state.omp_renderer.next_frame(now, state.reported_size) {
         display_semantic_surface(state, surface.frame, surface.force_repaint);
     }
     for effect in state.omp_renderer.take_effects() {
@@ -1855,6 +1884,7 @@ fn display_pending_omp_surface(
             }
             omp_renderer::LocalEffect::ClipboardWrite(content) => {
                 crate::selection::write_osc52_bytes(&content);
+                let _ = state.omp_renderer.show_copy_feedback(Instant::now());
                 let _ = io::stdout().flush();
             }
             omp_renderer::LocalEffect::OpenUrl(url) => {
@@ -1864,6 +1894,14 @@ fn display_pending_omp_surface(
                     crate::platform::open_url,
                 );
             }
+        }
+    }
+    if state.omp_renderer.copy_feedback_active(Instant::now()) {
+        if let Some(surface) = state
+            .omp_renderer
+            .next_frame(Instant::now(), state.reported_size)
+        {
+            display_semantic_surface(state, surface.frame, surface.force_repaint);
         }
     }
     for message in state.omp_renderer.take_outbound_messages() {
@@ -1909,6 +1947,12 @@ async fn run_client_loop(
         attach_escape,
         #[cfg(unix)]
         mouse_scroll_lines: config.mouse_scroll_lines,
+        #[cfg(unix)]
+        copy_on_select: config.copy_on_select,
+        #[cfg(unix)]
+        copy_feedback_enabled: config.copy_feedback_enabled,
+        #[cfg(unix)]
+        copy_feedback_position: config.copy_feedback_position,
         remote_image_paste_key: config.remote_image_paste_key,
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
@@ -1916,7 +1960,14 @@ async fn run_client_loop(
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
         detached_process_children: Vec::new(),
         #[cfg(unix)]
-        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
+        omp_renderer: omp_renderer::ClientOmpRenderer::new(
+            config.omp_executable,
+            config.scrollback_limit_bytes,
+            config.mouse_scroll_lines,
+            config.copy_on_select,
+            config.copy_feedback_enabled,
+            config.copy_feedback_position,
+        ),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -2180,9 +2231,7 @@ async fn run_client_loop(
                 state.request_repaint();
                 #[cfg(unix)]
                 {
-                    state
-                        .omp_renderer
-                        .resize((new_cols, new_rows, cell_width_px, cell_height_px));
+                    state.omp_renderer.resize((cell_width_px, cell_height_px));
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                 }
                 let msg = ClientMessage::Resize {
@@ -2208,6 +2257,7 @@ async fn run_client_loop(
                     launch_id,
                     target_app_client_id,
                     route,
+                    rect,
                     bound,
                     surface_active,
                     prefix,
@@ -2221,12 +2271,8 @@ async fn run_client_loop(
                             bound,
                             surface_active,
                             prefix,
-                            (
-                                state.reported_size.0,
-                                state.reported_size.1,
-                                state.reported_cell_size_px.0,
-                                state.reported_cell_size_px.1,
-                            ),
+                            rect,
+                            (state.reported_cell_size_px.0, state.reported_cell_size_px.1),
                         );
                         display_pending_omp_surface(&mut state, &mut write_stream)?;
                     }
@@ -2235,6 +2281,7 @@ async fn run_client_loop(
                         launch_id,
                         target_app_client_id,
                         route,
+                        rect,
                         bound,
                         surface_active,
                         prefix,
@@ -2414,6 +2461,21 @@ async fn run_client_loop(
                         &mut state.redraw_on_focus_gained,
                         &mut state.draw_host_cursor,
                         &mut state.remote_image_paste_key,
+                        #[cfg(unix)]
+                        &mut state.mouse_scroll_lines,
+                        #[cfg(unix)]
+                        &mut state.copy_on_select,
+                        #[cfg(unix)]
+                        &mut state.copy_feedback_enabled,
+                        #[cfg(unix)]
+                        &mut state.copy_feedback_position,
+                    );
+                    #[cfg(unix)]
+                    state.omp_renderer.update_config(
+                        state.mouse_scroll_lines,
+                        state.copy_on_select,
+                        state.copy_feedback_enabled,
+                        state.copy_feedback_position,
                     );
                 }
                 ServerMessage::MouseCapture {
@@ -2615,9 +2677,21 @@ fn reload_local_client_config(
         crossterm::event::KeyCode,
         crossterm::event::KeyModifiers,
     )>,
+    #[cfg(unix)] mouse_scroll_lines: &mut usize,
+    #[cfg(unix)] copy_on_select: &mut bool,
+    #[cfg(unix)] copy_feedback_enabled: &mut bool,
+    #[cfg(unix)] copy_feedback_position: &mut crate::config::ToastClipboardPosition,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
+            #[cfg(unix)]
+            let loaded_mouse_scroll_lines = loaded.config.ui.mouse_scroll_lines();
+            #[cfg(unix)]
+            let loaded_copy_on_select = loaded.config.ui.copy_on_select;
+            #[cfg(unix)]
+            let loaded_copy_feedback_enabled = loaded.config.ui.toast.clipboard.enabled;
+            #[cfg(unix)]
+            let loaded_copy_feedback_position = loaded.config.ui.toast.clipboard.position;
             for diagnostic in loaded.config.ui.sound.diagnostics() {
                 warn!(diagnostic = %diagnostic, "local sound config diagnostic");
             }
@@ -2626,6 +2700,13 @@ fn reload_local_client_config(
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             *draw_host_cursor = should_draw_host_cursor(loaded.config.ui.host_cursor);
             *remote_image_paste_key = loaded_remote_image_paste_key;
+            #[cfg(unix)]
+            {
+                *mouse_scroll_lines = loaded_mouse_scroll_lines;
+                *copy_on_select = loaded_copy_on_select;
+                *copy_feedback_enabled = loaded_copy_feedback_enabled;
+                *copy_feedback_position = loaded_copy_feedback_position;
+            }
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
@@ -4400,7 +4481,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\n",
+            "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\nmouse_scroll_lines = 5\ncopy_on_select = false\n[ui.toast.clipboard]\nenabled = false\nposition = \"top-right\"\n",
         )
         .unwrap();
         let path_string = path.to_string_lossy().to_string();
@@ -4409,16 +4490,44 @@ mod tests {
         let mut redraw_on_focus_gained = true;
         let mut draw_host_cursor = false;
         let mut remote_image_paste_key = None;
+        #[cfg(unix)]
+        let mut mouse_scroll_lines = 1;
+        #[cfg(unix)]
+        let mut copy_on_select = true;
+        #[cfg(unix)]
+        let mut copy_feedback_enabled = true;
+        #[cfg(unix)]
+        let mut copy_feedback_position = crate::config::ToastClipboardPosition::BottomCenter;
 
         reload_local_client_config(
             &mut sound_config,
             &mut redraw_on_focus_gained,
             &mut draw_host_cursor,
             &mut remote_image_paste_key,
+            #[cfg(unix)]
+            &mut mouse_scroll_lines,
+            #[cfg(unix)]
+            &mut copy_on_select,
+            #[cfg(unix)]
+            &mut copy_feedback_enabled,
+            #[cfg(unix)]
+            &mut copy_feedback_position,
         );
 
         assert!(!redraw_on_focus_gained);
         assert!(draw_host_cursor);
+        #[cfg(unix)]
+        assert_eq!(mouse_scroll_lines, 5);
+        #[cfg(unix)]
+        assert!(!copy_on_select);
+        #[cfg(unix)]
+        {
+            assert!(!copy_feedback_enabled);
+            assert_eq!(
+                copy_feedback_position,
+                crate::config::ToastClipboardPosition::TopRight
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

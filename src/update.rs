@@ -4810,6 +4810,188 @@ mod tests {
     }
 
     #[test]
+    fn partial_unsealed_cached_omp_falls_back_to_manifest_and_repairs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("partial-unsealed-cached-omp");
+        let source = dir.join("omp-source");
+        let state_dir = dir.join("state");
+        let cache_dir = remote_client_build_dir(&state_dir, "herdr-build");
+        let herdr = cache_dir.join("herdr");
+        let omp = cache_dir.join("omp");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&source, asset).unwrap();
+        fs::write(&herdr, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&omp, b"#!/bin/sh\n# interrupted\n").unwrap();
+        fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&omp, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+                .unwrap()
+                .is_none()
+        );
+
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let manifest: PreviewManifest = serde_json::from_value(paired_omp_manifest_value(
+            &format!("file://{}", source.display()),
+            Some(&checksum),
+        ))
+        .unwrap();
+        let companion = install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            "herdr-build",
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+        assert_eq!(fs::read(companion.executable()).unwrap(), asset);
+        companion.verify().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_managed_omp_download_is_rejected_and_retry_repairs_cache() {
+        let dir = unique_test_dir("partial-managed-omp-download");
+        fs::create_dir(&dir).unwrap();
+        let partial_source = dir.join("partial-omp-source");
+        let complete_source = dir.join("complete-omp-source");
+        let state_dir = dir.join("state");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::write(&partial_source, b"#!/bin/sh\n# interrupted\n").unwrap();
+        fs::write(&complete_source, asset).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+
+        let error = install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &format!("file://{}", partial_source.display()),
+            &checksum,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("downloaded update checksum verification failed"),
+            "{error}"
+        );
+
+        let executable =
+            remote_omp_executable_path(&state_dir.canonicalize().unwrap(), "herdr-build");
+        assert!(!executable.exists());
+        assert!(fs::read_dir(executable.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+
+        let repaired = install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &format!("file://{}", complete_source.display()),
+            &checksum,
+        )
+        .unwrap();
+        assert_eq!(repaired, executable);
+        assert_eq!(fs::read(&repaired).unwrap(), asset);
+        validate_managed_omp(&repaired, &checksum).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_omp_rejects_incompatible_cached_executable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("incompatible-cached-omp");
+        fs::create_dir(&dir).unwrap();
+        let state_dir = private_managed_state_dir(&dir.join("state")).unwrap();
+        let executable = private_remote_client_build_dir(&state_dir, "herdr-build")
+            .unwrap()
+            .join("omp");
+        let cached_asset = b"#!/bin/sh\necho cached\n";
+        let expected_asset = b"#!/bin/sh\nexit 0\n";
+        fs::write(&executable, cached_asset).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(expected_asset));
+
+        let error = install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &format!("file://{}", dir.join("missing-omp-source").display()),
+            &checksum,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("download failed"), "{error}");
+        assert_eq!(fs::read(&executable).unwrap(), cached_asset);
+        assert!(validate_managed_omp(&executable, &checksum).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_omp_repair_waits_for_concurrent_install_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("concurrent-managed-omp-repair");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("omp-source");
+        let state_dir = private_managed_state_dir(&dir.join("state")).unwrap();
+        let executable = private_remote_client_build_dir(&state_dir, "herdr-build")
+            .unwrap()
+            .join("omp");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::write(&source, asset).unwrap();
+        fs::write(&executable, b"#!/bin/sh\n# interrupted\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+
+        let lock = acquire_update_lock_at(&executable, false).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let repair_state_dir = state_dir.clone();
+        let repair_url = format!("file://{}", dir.join("missing-omp-source").display());
+        let repair_checksum = checksum.clone();
+        let repair = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = install_exact_omp_asset_for_remote_build_at(
+                &repair_state_dir,
+                "herdr-build",
+                &repair_url,
+                &repair_checksum,
+            );
+            completed_tx.send(result).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            completed_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let update = download_update_asset_for_exe(
+            executable.clone(),
+            &format!("file://{}", source.display()),
+            Some(&checksum),
+        )
+        .unwrap();
+        install_downloaded_update(update).unwrap();
+        drop(lock);
+
+        let repaired = completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        repair.join().unwrap();
+        assert_eq!(repaired, executable);
+        assert_eq!(fs::read(&repaired).unwrap(), asset);
+        validate_managed_omp(&repaired, &checksum).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn managed_omp_install_is_build_scoped_and_repairs_invalid_cache() {
         use std::os::unix::fs::PermissionsExt as _;
 

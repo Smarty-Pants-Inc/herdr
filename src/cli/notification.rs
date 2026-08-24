@@ -296,10 +296,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         #[cfg(unix)]
-        let path = {
-            let _ = name;
-            PathBuf::from(format!("/tmp/hna-{}-{nanos}.sock", std::process::id()))
-        };
+        let path = PathBuf::from(format!(
+            "/tmp/hna-{name}-{}-{nanos}.sock",
+            std::process::id()
+        ));
         #[cfg(windows)]
         let path = std::env::temp_dir().join(format!(
             "herdr-{name}-hna-{}-{nanos}.sock",

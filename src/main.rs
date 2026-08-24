@@ -74,6 +74,7 @@ mod layout;
 mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
+mod omp_guest_state;
 mod pane;
 mod pane_graphics_files;
 mod persist;

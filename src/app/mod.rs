@@ -1531,6 +1531,15 @@ impl App {
                     .state
                     .sidebar_width
                     .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
+                if self.state.mouse_capture != config.ui.mouse_capture
+                    || self.state.copy_on_select != config.ui.copy_on_select
+                {
+                    self.state.request_client_config_reload = true;
+                }
+                let mouse_scroll_lines = config.ui.mouse_scroll_lines();
+                if self.state.mouse_scroll_lines != mouse_scroll_lines {
+                    self.state.request_client_config_reload = true;
+                }
                 self.state.mouse_capture = config.ui.mouse_capture;
                 self.state.copy_on_select = config.ui.copy_on_select;
                 if self.state.redraw_on_focus_gained != config.ui.redraw_on_focus_gained {
@@ -1541,7 +1550,7 @@ impl App {
                     self.state.request_client_config_reload = true;
                 }
                 self.loaded_host_cursor = config.ui.host_cursor;
-                self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
+                self.state.mouse_scroll_lines = mouse_scroll_lines;
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;

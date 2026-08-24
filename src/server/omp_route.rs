@@ -206,6 +206,20 @@ impl OmpRouteRegistry {
         Ok(route)
     }
 
+    pub(crate) fn is_current_attachment(
+        &self,
+        client_id: u64,
+        key: &OmpRouteKey,
+        attachment_epoch: u64,
+    ) -> bool {
+        self.routes
+            .get(&(key.pane_id.clone(), key.omp_session_id.clone()))
+            .is_some_and(|route| {
+                route.key.route_generation == key.route_generation
+                    && route.attachment(client_id, attachment_epoch).is_ok()
+            })
+    }
+
     pub(crate) fn attach(
         &mut self,
         client_id: u64,

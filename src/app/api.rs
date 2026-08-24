@@ -1578,12 +1578,15 @@ mod tests {
         let reset_notify = runtime.agent_detection_reset_notify_for_test();
         app.terminal_runtimes.insert(terminal_id, runtime);
 
-        let response = app.handle_api_request(crate::api::schema::Request {
-            id: "reload_manifests".into(),
-            method: crate::api::schema::Method::ServerReloadAgentManifests(
-                crate::api::schema::EmptyParams::default(),
-            ),
-        });
+        let response = {
+            let _guard = crate::config::test_config_env_lock().lock();
+            app.handle_api_request(crate::api::schema::Request {
+                id: "reload_manifests".into(),
+                method: crate::api::schema::Method::ServerReloadAgentManifests(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            })
+        };
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["type"], "agent_manifest_reload");
         assert!(!response["result"]["manifests"]
