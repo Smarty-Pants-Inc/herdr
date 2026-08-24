@@ -12,6 +12,27 @@ pub(crate) struct PopupGeometry {
     pub height: Option<PopupSize>,
 }
 
+fn popup_cwd_for_target(
+    explicit_cwd: Option<PathBuf>,
+    execution_target: &crate::execution::ExecutionTarget,
+    source_target: Option<&crate::execution::ExecutionTarget>,
+    source_cwd: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(cwd) = explicit_cwd {
+        return cwd;
+    }
+    if source_target == Some(execution_target) {
+        if let Some(cwd) = source_cwd {
+            return cwd;
+        }
+    }
+    if execution_target.is_local() {
+        std::env::current_dir().unwrap_or_else(|_| "/".into())
+    } else {
+        PathBuf::new()
+    }
+}
+
 impl App {
     pub(crate) fn popup_runtime(&self) -> Option<&TerminalRuntime> {
         let terminal_id = &self.state.popup_pane.as_ref()?.terminal_id;
@@ -56,16 +77,25 @@ impl App {
         extra_env: Vec<(String, String)>,
         geometry: PopupGeometry,
     ) -> std::io::Result<()> {
+        let ws_idx = self
+            .state
+            .active
+            .ok_or_else(|| std::io::Error::other("no active workspace"))?;
+        let execution_target = self
+            .focused_pane_execution_target_in_workspace(ws_idx)
+            .ok_or_else(|| std::io::Error::other("focused pane has no execution target"))?;
         self.spawn_popup_command(
             cwd,
+            &execution_target,
             extra_env,
             geometry,
             |pane_id, rows, cols, cwd, launch_env, app| {
-                TerminalRuntime::spawn_shell_command(
+                TerminalRuntime::spawn_shell_command_on(
                     pane_id,
                     rows,
                     cols,
                     cwd,
+                    &execution_target,
                     command,
                     launch_env,
                     crate::pane::AgentDetection::Disabled,
@@ -81,24 +111,32 @@ impl App {
         )
     }
 
-    pub(crate) fn spawn_popup_argv_command(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_popup_plugin_command(
         &mut self,
-        argv: &[String],
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         extra_env: Vec<(String, String)>,
         geometry: PopupGeometry,
     ) -> std::io::Result<()> {
         self.spawn_popup_command(
             cwd,
+            execution_target,
             extra_env,
             geometry,
             |pane_id, rows, cols, cwd, launch_env, app| {
-                TerminalRuntime::spawn_argv_command(
+                TerminalRuntime::spawn_plugin_command_on(
                     pane_id,
                     rows,
                     cols,
                     cwd,
-                    argv,
+                    execution_target,
+                    plugin_id,
+                    entrypoint,
+                    local_argv,
                     launch_env,
                     crate::pane::AgentDetection::Disabled,
                     app.state.pane_scrollback_limit_bytes,
@@ -108,7 +146,7 @@ impl App {
                     app.render_notify.clone(),
                     app.render_dirty.clone(),
                 )
-                .map(|runtime| (runtime, Some(argv.to_vec())))
+                .map(|runtime| (runtime, Some(local_argv.to_vec())))
             },
         )
     }
@@ -116,6 +154,7 @@ impl App {
     fn spawn_popup_command<F>(
         &mut self,
         cwd: Option<PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
         extra_env: Vec<(String, String)>,
         geometry: PopupGeometry,
         spawn: F,
@@ -147,10 +186,13 @@ impl App {
         let focused_pane = ws
             .focused_pane_id()
             .ok_or_else(|| std::io::Error::other("active tab has no focused pane"))?;
-        let cwd = cwd.or_else(|| {
-            active_tab.cwd_for_pane(focused_pane, &self.state.terminals, &self.terminal_runtimes)
-        });
-        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let source_target = active_tab
+            .terminal_id(focused_pane)
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+            .map(|terminal| &terminal.execution_target);
+        let source_cwd =
+            active_tab.cwd_for_pane(focused_pane, &self.state.terminals, &self.terminal_runtimes);
+        let cwd = popup_cwd_for_target(cwd, execution_target, source_target, source_cwd);
         let pane_id = PaneId::alloc();
         let terminal_id = TerminalId::alloc();
         let launch_env = PaneLaunchEnv::from_extra(extra_env).without_pane_identity();
@@ -171,8 +213,11 @@ impl App {
         let cols = resolved_geometry.inner.width;
         let (runtime, launch_argv) = spawn(pane_id, rows, cols, cwd.clone(), &launch_env, self)?;
         let terminal = match launch_argv {
-            Some(argv) => TerminalState::new(terminal_id.clone(), cwd).with_launch_argv(argv),
-            None => TerminalState::new(terminal_id.clone(), cwd),
+            Some(argv) => TerminalState::new(terminal_id.clone(), cwd)
+                .with_execution_target(execution_target.clone())
+                .with_launch_argv(argv),
+            None => TerminalState::new(terminal_id.clone(), cwd)
+                .with_execution_target(execution_target.clone()),
         };
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         self.state.terminals.insert(terminal_id.clone(), terminal);
@@ -273,6 +318,41 @@ mod tests {
         assert!(app.close_popup_pane());
 
         assert!(!app.state.direct_attach_resize_locks.contains(&terminal_id));
+    }
+
+    #[test]
+    fn popup_cwd_only_follows_matching_execution_target() {
+        let local = crate::execution::ExecutionTarget::Local;
+        let remote = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+        let other_remote = crate::execution::ExecutionTarget::ssh("other.example").unwrap();
+
+        assert_eq!(
+            popup_cwd_for_target(
+                None,
+                &remote,
+                Some(&remote),
+                Some(PathBuf::from("/remote/worktree")),
+            ),
+            PathBuf::from("/remote/worktree")
+        );
+        assert_eq!(
+            popup_cwd_for_target(
+                None,
+                &other_remote,
+                Some(&remote),
+                Some(PathBuf::from("/remote/worktree")),
+            ),
+            PathBuf::new()
+        );
+        assert_ne!(
+            popup_cwd_for_target(
+                None,
+                &local,
+                Some(&remote),
+                Some(PathBuf::from("/remote/worktree")),
+            ),
+            PathBuf::from("/remote/worktree")
+        );
     }
 
     #[test]

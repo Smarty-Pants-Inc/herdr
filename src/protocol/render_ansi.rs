@@ -678,12 +678,26 @@ fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a s
     let index = cell.hyperlink? as usize;
     frame.hyperlinks.get(index).map(String::as_str)
 }
+pub(crate) fn frame_has_hyperlink_at(frame: &FrameData, column: u16, row: u16) -> bool {
+    if column >= frame.width || row >= frame.height {
+        return false;
+    }
+    let index = (row as usize)
+        .saturating_mul(frame.width as usize)
+        .saturating_add(column as usize);
+    frame
+        .cells
+        .get(index)
+        .and_then(|cell| cell_hyperlink_uri(frame, cell))
+        .is_some_and(|uri| crate::app::actions::safe_osc8_url(uri).is_some())
+}
+
+fn is_hyperlink_char(ch: char) -> bool {
+    ch != '\x1b' && ch != '\x07' && !ch.is_control()
+}
 
 fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
-    let sanitized: String = uri
-        .chars()
-        .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
-        .collect();
+    let sanitized: String = uri.chars().filter(|ch| is_hyperlink_char(*ch)).collect();
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
@@ -1379,6 +1393,34 @@ mod tests {
         assert!(output_str.contains("\x1b]8;;https://example.com\x1b\\L"));
         assert!(output_str.contains('i'));
         assert!(output_str.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn hyperlink_hit_testing_accepts_clean_osc8_handler_urls() {
+        for uri in [
+            "https://example.com/docs",
+            "http://example.com/docs",
+            "file:///tmp/report.md?line=7",
+            "file://localhost/tmp/report.md?line=7",
+            "file://attacker/share/report.md",
+            "local://repo/src/main.rs",
+            "memory://artifact/report.md",
+            "mailto:hello@example.com",
+        ] {
+            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
+            frame.hyperlinks.push(uri.to_owned());
+            assert!(frame_has_hyperlink_at(&frame, 0, 0), "rejected {uri}");
+        }
+
+        for uri in [
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
+        ] {
+            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
+            frame.hyperlinks.push(uri.to_owned());
+            assert!(!frame_has_hyperlink_at(&frame, 0, 0), "accepted {uri:?}");
+        }
     }
 
     #[test]

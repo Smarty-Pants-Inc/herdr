@@ -29,11 +29,15 @@ pub struct PaneSplitParams {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
     pub direction: SplitDirection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<crate::execution::ExecutionTarget>,
     #[serde(default)]
     pub focus: bool,
     #[serde(default)]
@@ -203,6 +207,11 @@ pub struct LayoutPane {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::execution::ExecutionTarget::is_local"
+    )]
+    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
 }
@@ -466,6 +475,8 @@ pub struct PaneInfo {
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

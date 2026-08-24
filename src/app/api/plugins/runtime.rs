@@ -20,38 +20,37 @@ impl App {
         event: Option<String>,
         command: Vec<String>,
         context: &PluginInvocationContext,
+        execution_target: crate::execution::ExecutionTarget,
         event_json: Option<String>,
     ) -> Result<PluginCommandLogInfo, (&'static str, String)> {
-        let Some(program) = command.first().cloned() else {
-            return Err((
-                "invalid_plugin_command",
-                "command must not be empty".to_string(),
-            ));
+        let local_command = if execution_target.is_local() {
+            let Some(program) = command.first().cloned() else {
+                return Err((
+                    "invalid_plugin_command",
+                    "command must not be empty".to_string(),
+                ));
+            };
+            let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
+            super::env::ensure_plugin_user_dirs(plugin)
+                .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
+            Some((program, args))
+        } else {
+            None
         };
-        let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
         let context_json = serde_json::to_string(context)
             .map_err(|err| ("invalid_plugin_context", err.to_string()))?;
-        super::env::ensure_plugin_user_dirs(plugin)
-            .map_err(|err| ("plugin_user_dir_create_failed", err.to_string()))?;
         let log_id = format!("plugin-log-{}", self.state.next_plugin_command_log_id);
         self.state.next_plugin_command_log_id += 1;
         let started_unix_ms = current_unix_ms();
-        let mut env = super::env::plugin_path_env(plugin);
+        let mut env = Vec::new();
+        if execution_target.is_local() {
+            env.extend(super::env::local_plugin_runtime_env(plugin));
+        }
         env.extend([
-            (
-                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
-                crate::api::socket_path().display().to_string(),
-            ),
             ("HERDR_ENV".to_string(), "1".to_string()),
             ("HERDR_PLUGIN_ID".to_string(), plugin.plugin_id.clone()),
             ("HERDR_PLUGIN_CONTEXT_JSON".to_string(), context_json),
         ]);
-        if let Ok(current_exe) = std::env::current_exe() {
-            env.push((
-                "HERDR_BIN_PATH".to_string(),
-                current_exe.display().to_string(),
-            ));
-        }
         if let Some(action_id) = action_id.as_ref() {
             env.push(("HERDR_PLUGIN_ACTION_ID".to_string(), action_id.clone()));
         }
@@ -69,6 +68,9 @@ impl App {
         }
         if let Some(pane_id) = context.focused_pane_id.as_ref() {
             env.push(("HERDR_PANE_ID".to_string(), pane_id.clone()));
+        }
+        if let Some(view_id) = context.view_id.as_ref() {
+            env.push(("HERDR_VIEW_ID".to_string(), view_id.to_string()));
         }
         if let Some(clicked_url) = context.clicked_url.as_ref() {
             env.push(("HERDR_PLUGIN_CLICKED_URL".to_string(), clicked_url.clone()));
@@ -101,6 +103,7 @@ impl App {
             return Err(("plugin_command_limit_reached", message));
         }
         let plugin_root = std::path::PathBuf::from(&plugin.plugin_root);
+        let action_id_for_launch = action_id.clone();
         let log = PluginCommandLogInfo {
             log_id: log_id.clone(),
             plugin_id: plugin.plugin_id.clone(),
@@ -117,14 +120,47 @@ impl App {
         };
         self.push_plugin_command_log(log.clone());
         self.state.plugin_commands_in_flight += 1;
+        let plugin_id = plugin.plugin_id.clone();
+        let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let child =
-                crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root)
-                    .envs(env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn();
+            let (child, remote_request_channel) = if let Some((program, args)) = local_command {
+                let mut command =
+                    crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
+                command.env_remove("HERDR_VIEW_ID");
+                apply_plugin_runtime_env(&mut command, env);
+                (
+                    command
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn(),
+                    None,
+                )
+            } else {
+                let action_id = action_id_for_launch.expect("remote plugin action requires id");
+                match crate::execution::ssh_process_command(
+                    &execution_target,
+                    std::path::Path::new(""),
+                    crate::execution::RemoteCommand::Plugin {
+                        plugin_id,
+                        target: crate::plugin_command::PluginCommandTarget::Action {
+                            action_id,
+                            link_handler_id,
+                        },
+                    },
+                    env,
+                ) {
+                    Ok(mut prepared) => (
+                        prepared
+                            .command
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn(),
+                        Some(prepared.request_channel),
+                    ),
+                    Err(err) => (Err(err), None),
+                }
+            };
             let finished = match child {
                 Ok(mut child) => {
                     let stdout = child.stdout.take();
@@ -139,7 +175,41 @@ impl App {
                             read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
                         })
                     });
-                    match child.wait() {
+                    let status = {
+                        #[cfg(unix)]
+                        {
+                            if let Some(channel) = remote_request_channel {
+                                loop {
+                                    match channel.delivery_status() {
+                                        crate::execution::RemoteRequestDelivery::Delivered => {
+                                            break child.wait()
+                                        }
+                                        crate::execution::RemoteRequestDelivery::Failed(err) => {
+                                            let _ = child.kill();
+                                            let _ = child.wait();
+                                            break Err(std::io::Error::other(err));
+                                        }
+                                        crate::execution::RemoteRequestDelivery::Pending => {}
+                                    }
+                                    match child.try_wait() {
+                                        Ok(Some(status)) => break Ok(status),
+                                        Ok(None) => {
+                                            std::thread::sleep(std::time::Duration::from_millis(25))
+                                        }
+                                        Err(err) => break Err(err),
+                                    }
+                                }
+                            } else {
+                                child.wait()
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = remote_request_channel;
+                            child.wait()
+                        }
+                    };
+                    match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
@@ -166,18 +236,37 @@ impl App {
                         },
                     }
                 }
-                Err(err) => crate::events::AppEvent::PluginCommandFinished {
-                    log_id,
-                    finished_unix_ms: current_unix_ms(),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: Some(err.to_string()),
-                },
+                Err(err) => {
+                    if let Some(channel) = remote_request_channel {
+                        channel.cancel();
+                    }
+                    crate::events::AppEvent::PluginCommandFinished {
+                        log_id,
+                        finished_unix_ms: current_unix_ms(),
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(err.to_string()),
+                    }
+                }
             };
             let _ = event_tx.blocking_send(finished);
         });
         Ok(log)
+    }
+
+    pub(super) fn plugin_command_execution_target(
+        &self,
+        context: &PluginInvocationContext,
+    ) -> crate::execution::ExecutionTarget {
+        context
+            .focused_pane_id
+            .as_deref()
+            .and_then(|pane_id| {
+                self.plugin_context_and_execution_target_for_source_pane(pane_id, "plugin-target")
+            })
+            .map(|(_, target)| target)
+            .unwrap_or_default()
     }
 
     pub(crate) fn run_plugin_startup_hooks(&mut self) {
@@ -209,6 +298,7 @@ impl App {
                     Some("startup".to_string()),
                     startup.command,
                     &context,
+                    crate::execution::ExecutionTarget::Local,
                     None,
                 );
             }
@@ -259,6 +349,7 @@ impl App {
                     Some(event_name.to_string()),
                     hook.command.clone(),
                     &context,
+                    crate::execution::ExecutionTarget::Local,
                     event_json.clone(),
                 );
             }
@@ -272,6 +363,11 @@ impl App {
             self.state.plugin_command_logs.drain(0..extra);
         }
     }
+}
+
+fn apply_plugin_runtime_env(command: &mut std::process::Command, env: Vec<(String, String)>) {
+    command.envs(env);
+    command.env_remove("HERDR_BUILD_BIN_PATH");
 }
 
 fn current_unix_ms() -> u64 {
@@ -308,4 +404,26 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_runtime_env_does_not_expose_build_manager_path() {
+        let mut command = std::process::Command::new("true");
+        command.env("HERDR_BUILD_BIN_PATH", "inherited-manager");
+
+        apply_plugin_runtime_env(
+            &mut command,
+            vec![("HERDR_BUILD_BIN_PATH".into(), "spoofed-manager".into())],
+        );
+
+        let value = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("HERDR_BUILD_BIN_PATH"))
+            .map(|(_, value)| value);
+        assert_eq!(value, Some(None));
+    }
 }

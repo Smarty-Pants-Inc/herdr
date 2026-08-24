@@ -607,6 +607,14 @@ impl HeadlessServer {
             crate::render_prof::event("retained_graphics_fallback.full_redraw_pending");
             return RetainedGraphicsOutcome::Fallback;
         }
+        if self
+            .clients
+            .values()
+            .any(|client| client.is_full_app_client() && client.private_surface.is_some())
+        {
+            crate::render_prof::event("retained_graphics_fallback.private_surface");
+            return RetainedGraphicsOutcome::Fallback;
+        }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
         let mut app_view_size = None;
