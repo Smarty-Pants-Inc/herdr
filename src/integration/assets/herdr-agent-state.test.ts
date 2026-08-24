@@ -568,6 +568,60 @@ async function startDroppedFirstResponseServer(name: string) {
     connectionCount: () => connectionCount,
   };
 }
+async function startUnresponsiveServer(name: string): Promise<unknown[]> {
+  const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+
+  const requests: unknown[] = [];
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline !== -1) {
+        requests.push(JSON.parse(input.slice(0, newline)));
+      }
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  return requests;
+}
+
+test("Oh My Pi releases ahead of queued telemetry within the shutdown cap", async () => {
+  const requests = await startUnresponsiveServer("omp-shutdown-release");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => "omp-session",
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requests.length === 1);
+
+  const shutdown = handlers.get("session_shutdown");
+  expect(shutdown).toBeDefined();
+  const startedAt = Date.now();
+  await shutdown?.({}, context);
+
+  expect(Date.now() - startedAt).toBeLessThan(2_000);
+  expect(requests.slice(0, 2).map((request) => isRecord(request) && request.method)).toEqual([
+    "pane.report_agent_session",
+    "pane.release_agent",
+  ]);
+});
 
 test("Oh My Pi retries working before a queued idle state", async () => {
   const { attemptedRequests } = await startDroppedFirstResponseServer("omp-retry");

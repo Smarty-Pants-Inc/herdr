@@ -170,7 +170,7 @@ herdr pane focus --direction left|right|up|down [--pane ID|--current]
 herdr pane resize --direction left|right|up|down [--amount FLOAT] [--pane ID|--current]
 herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]
 herdr pane rename <pane_id> <label>|--clear
-herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace WORKSPACE] [--ratio FLOAT] [--cwd PATH] [--target local|ssh:HOST] [--env KEY=VALUE] [--focus] [--no-focus]
 herdr pane swap --direction left|right|up|down [--pane ID|--current]
 herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
@@ -179,7 +179,15 @@ herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--f
 herdr pane close <pane_id>
 ```
 
-`--current` を受け付けるペインコマンドは、Herdr ペイン内から実行した場合、呼び出し元の `HERDR_PANE_ID` を使います。`pane split` では、明示したペイン ID または `--pane ID` がそのペインを、`--current` が呼び出し元ペインを分割します。対象を省略すると UI でフォーカス中のペインを使います。分割レスポンスでは、新しいペイン ID は `.result.pane.pane_id` にあります。
+`--current` を受け付けるペインコマンドは、Herdr ペイン内から実行した場合、呼び出し元の `HERDR_PANE_ID` を使います。`pane split` では、明示したペイン ID、`--pane ID`、または `--current` で選択したペインが、挿入位置と継承する実行ターゲット/cwd の両方を決めます。ペイン選択を省略すると UI でフォーカス中のペインを使います。分割レスポンスでは、新しいペイン ID は `.result.pane.pane_id` にあります。
+
+`--workspace` は、そのワークスペースでフォーカス中のタイルペインを挿入位置として選びます。管理対象のワークスペース右側プラグインが、明示的なペイン選択なしでワークスペース指定の分割を呼び出した場合、新しいペインはワークスペースでフォーカス中のタイルペインを分割しながら、プラグイン呼び出し元の実行ターゲットと cwd を継承できます。
+
+ペイン単位の SSH 実行ターゲットは Unix 専用です。これはサーバー全体を対象とする `herdr --remote` とは別の機能で、後者は Windows クライアントから対応する Linux/macOS ホストへの接続でも利用できます。
+
+`--target` を省略すると、分割はソースペインの実行ターゲットを継承します。`--target local` でローカル実行を強制し、`--target ssh:HOST` で現在の Herdr UI 内に置いたまま信頼済み SSH ホスト上で新しいターミナルを実行できます。同じターゲットへの分割はソース cwd を引き継ぎます。ターゲットをまたぐローカル分割は設定済みの `terminal.new_cwd` を使い、ターゲットをまたぐ SSH 分割はリモートユーザーのホームから始まります。明示的な `--cwd` はどちらのデフォルトも上書きします。先に `herdr --remote HOST` を実行して対応するリモート Herdr を準備してください。ペイン単位の起動はリモートソフトウェアをインストールも置換もしません。非対話 OpenSSH と接続/リクエスト配信の制限時間を使うため、鍵または `ssh-agent` で事前に認証できる必要があります。詳細は[永続化とリモートアクセス](/ja/docs/persistence-remote/)を参照してください。
+
+`pane get` と `pane list` は各ペインの `execution_target` を報告します。リモート cwd はリモートターミナルから報告され、サーバーのファイルシステムでは検証されません。`pane process-info` はローカル専用で、リモートペインはローカルのプロセス情報ではなく `pane_process_info_unsupported` を返します。
 
 `pane move` の後続コマンドには `.result.move_result.pane.pane_id` を使います。別ワークスペースへの移動ではワークスペース修飾付きのペイン ID が変わり、以前の値は `.result.move_result.previous_pane_id` に残ります。実行中プロセスの `HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID` は起動時の値のままですが、Herdr は以前のペイン ID をそのターミナルの別名として保持するため、`--current` を使うペインコマンドは引き続き解決できます。ライブエージェント名もターミナルに追従します。
 
@@ -285,7 +293,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 エージェントターゲットは、一意なライブエージェント名、または現在そのエージェントをホストしているペイン ID です。ターミナル ID とエージェント kind のラベルだけでは指定できません。`agent start` で起動するエージェントには名前が必須で、手動で起動したエージェントは名前なしのままペイン ID で指定します。
 
-`agent start` は既存の利用可能なシェルペインを起動対象にします。対話シェル自身がフォアグラウンドを所有し、フォアグラウンドのコマンド、エディタ、エージェントが動いていない必要があります。トポロジーは別に作成します。名前はライブエージェント間で一意で、`[a-z][a-z0-9_-]{0,31}` に一致する必要があります。対応する kind は `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`qwen`、`maki` です。名前は現在のペイン占有者に属し、そのエージェントの終了、release、置換で消えます。一時的に検出できないだけでは消えません。
+`agent start` は既存の利用可能なシェルペインを起動対象にします。対話シェル自身がフォアグラウンドを所有し、フォアグラウンドのコマンド、エディタ、エージェントが動いていない必要があります。`agent start` は現在ローカルペインだけをサポートし、SSH バックエンドのペインを指定すると `agent_start_unsupported_execution_target` を返します。トポロジーは別に作成します。名前はライブエージェント間で一意で、`[a-z][a-z0-9_-]{0,31}` に一致する必要があります。対応する kind は `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`qwen`、`maki` です。名前は現在のペイン占有者に属し、そのエージェントの終了、release、置換で消えます。一時的に検出できないだけでは消えません。
 
 成功した start は、期待したエージェントが同じターミナルを所有し、対話入力の準備ができてから返ります。起動中の検出状態が `blocked` の場合、コマンドは直ちに `agent_not_ready` を返します。名前は `agent read` と `agent send-keys` で引き続き使用でき、検出状態が `idle` になるとプロンプトを送信できるようになります。デフォルトの起動タイムアウトは 30000 ミリ秒で、明示する値は 3000 より大きく 300000 以下でなければなりません。
 

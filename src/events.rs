@@ -54,8 +54,20 @@ pub struct WorktreeRemoveResult {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
-    /// A pane's child process exited.
-    PaneDied { pane_id: PaneId },
+    /// A pane's child process exited. Runtime-owned events carry the child PID so
+    /// a delayed exit cannot retire a replacement runtime for the same pane.
+    PaneDied {
+        pane_id: PaneId,
+        child_pid: Option<u32>,
+    },
+    /// The remote helper successfully spawned this pane's requested process.
+    /// Internal-only handshake; it is not part of the public socket event schema.
+    RemoteExecutionReady {
+        pane_id: PaneId,
+        child_pid: u32,
+        hostname: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    },
     /// Process detection identified an agent before its screen state was confirmed.
     AgentProcessDetected {
         pane_id: PaneId,
@@ -136,6 +148,9 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A pane child emitted a valid OSC 52 clipboard write attributed to its pane.
+    /// This lets client-private panes route the host-local side effect to their owner.
+    PaneClipboardWrite { pane_id: PaneId, content: Vec<u8> },
     /// Open a safe HTTP(S) URL on the process that owns the originating input source.
     OpenUrl {
         url: String,

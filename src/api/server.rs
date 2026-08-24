@@ -1054,6 +1054,7 @@ mod tests {
             tab_id: "tab_1".into(),
             focused: true,
             cwd: None,
+            execution_target: crate::execution::ExecutionTarget::Local,
             foreground_cwd: None,
             label: None,
             agent: Some("pi".into()),

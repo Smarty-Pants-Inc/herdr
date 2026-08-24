@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import io
+import json
+import re
+import tarfile
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+from unittest import mock
+
+import scripts.smarty_preview_trusted as trusted
+
+
+class TrustedSourceTests(unittest.TestCase):
+    parent = "1" * 40
+    source = "2" * 40
+    omp = "3" * 40
+    parent_tree = "4" * 40
+    omp_tree = "5" * 40
+    version = "17.4.0"
+    build_id = f"managed-omp-{omp_tree}"
+
+    def test_validate_sources_binds_parent_release_and_checkout_trees(self) -> None:
+        tag = f"smarty-preview-2026-08-22-p{self.parent}-r{self.source}-o{self.omp}"
+        identity = {
+            "tag": tag,
+            "build_id": tag.removeprefix("smarty-preview-"),
+            "parent": self.parent,
+            "source": self.source,
+            "omp": self.omp,
+        }
+        plan = dict(identity)
+        descriptor = {
+            "repository": trusted.OMP_REPOSITORY,
+            "commit": self.omp,
+            "tree": self.omp_tree,
+            "version": self.version,
+            "build_id": self.build_id,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent_root = root / "parent"
+            omp_root = root / "omp"
+            release_path = parent_root / "integrations/omp/release.json"
+            release_path.parent.mkdir(parents=True)
+            release_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "sourceRevision": self.omp,
+                        "sourceTree": self.omp_tree,
+                        "version": self.version,
+                        "buildId": self.build_id,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            package_path = omp_root / "packages/coding-agent/package.json"
+            package_path.parent.mkdir(parents=True)
+            package_path.write_text(json.dumps({"version": self.version}), encoding="utf-8")
+
+            def git(command: list[str], *, text: bool) -> str:
+                self.assertTrue(text)
+                checkout = Path(command[2])
+                operation = command[3:]
+                if operation == ["rev-parse", "HEAD"]:
+                    return self.parent if checkout == parent_root else self.omp
+                if operation == ["rev-parse", "HEAD^{tree}"]:
+                    return self.parent_tree if checkout == parent_root else self.omp_tree
+                if operation == ["ls-tree", "HEAD", "repos/herdr"]:
+                    return f"160000 commit {self.source}\trepos/herdr"
+                if operation == ["ls-tree", "HEAD", "repos/omp"]:
+                    return f"160000 commit {self.omp}\trepos/omp"
+                raise AssertionError(command)
+
+            output = root / "trusted-source-record.json"
+            with mock.patch.object(trusted.subprocess, "check_output", side_effect=git):
+                result = trusted.validate_trusted_sources(
+                    identity, plan, parent_root, omp_root, descriptor, output
+                )
+            self.assertEqual(result["omp"]["build_id"], self.build_id)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), result)
+            self.assertEqual(trusted.managed_omp_build_id(self.omp_tree), self.build_id)
+            bad_descriptor = {**descriptor, "build_id": f"managed-omp-{self.omp}"}
+            with mock.patch.object(trusted.subprocess, "check_output", side_effect=git):
+                with self.assertRaises(ValueError):
+                    trusted.validate_trusted_sources(
+                        identity, plan, parent_root, omp_root, bad_descriptor, output
+                    )
+
+            release = json.loads(release_path.read_text(encoding="utf-8"))
+            release["buildId"] = "wrong-build"
+            release_path.write_text(json.dumps(release), encoding="utf-8")
+            with mock.patch.object(trusted.subprocess, "check_output", side_effect=git):
+                with self.assertRaises(ValueError):
+                    trusted.validate_trusted_sources(
+                        identity, plan, parent_root, omp_root, descriptor, output
+                    )
+
+
+class TrustedIdentityTests(unittest.TestCase):
+    parent = "1" * 40
+    source = "2" * 40
+    omp = "3" * 40
+    tag = f"smarty-preview-2026-08-22-p{parent}-r{source}-o{omp}"
+
+    def test_paired_identity_binds_source_and_timestamp_day(self) -> None:
+        identity = trusted.paired_identity(
+            self.tag,
+            source_sha=self.source,
+            built_at="2026-08-22T03:00:00-07:00",
+        )
+        self.assertEqual(identity["build_id"], self.tag.removeprefix("smarty-preview-"))
+        self.assertEqual(identity["day"], "2026-08-22")
+
+    def test_paired_identity_rejects_wrong_source_or_day(self) -> None:
+        with self.assertRaises(ValueError):
+            trusted.paired_identity(self.tag, source_sha="4" * 40)
+        with self.assertRaises(ValueError):
+            trusted.paired_identity(self.tag, source_sha=self.source, built_at="2026-08-23T00:00:00Z")
+
+
+class TrustedRunTests(unittest.TestCase):
+    parent = "1" * 40
+    source = "2" * 40
+    omp = "3" * 40
+    tag = f"smarty-preview-2026-08-22-p{parent}-r{source}-o{omp}"
+
+    def _records(self, attempt: int = 2) -> list[dict[str, object]]:
+        values = []
+        for index, kind in enumerate(trusted.PRODUCER_ARTIFACT_KINDS, start=1):
+            values.append(
+                {
+                    "id": 1000 + index,
+                    "name": f"{kind}-{attempt}",
+                    "expired": False,
+                    "size_in_bytes": 1,
+                    "digest": "sha256:" + "a" * 64,
+                    "archive_download_url": f"https://api.github.com/repos/{trusted.REPOSITORY}/actions/artifacts/{1000 + index}/zip",
+                    "created_at": "2026-08-22T00:00:01Z",
+                    "updated_at": "2026-08-22T00:00:02Z",
+                    "workflow_run": {"id": 42, "head_sha": self.source, "run_attempt": attempt},
+                }
+            )
+        return values
+
+    def _run(self, attempt: int = 2) -> dict[str, object]:
+        return {
+            "id": 42,
+            "repository": {"full_name": trusted.REPOSITORY},
+            "event": "push",
+            "status": "completed",
+            "conclusion": "success",
+            "name": trusted.WORKFLOW_NAME,
+            "path": trusted.WORKFLOW_PATH,
+            "workflow_id": 77,
+            "run_attempt": attempt,
+            "run_started_at": "2026-08-21T23:59:59Z",
+            "head_repository": {"full_name": trusted.REPOSITORY},
+            "head_sha": self.source,
+            "head_commit": {"id": self.source, "timestamp": "2026-08-22T03:00:00Z"},
+            "head_branch": self.tag,
+        }
+
+    def test_run_validation_requires_exact_attempt_scoped_artifacts(self) -> None:
+        result = trusted.validate_workflow_run(
+            self._run(),
+            {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+            {"total_count": 8, "artifacts": self._records()},
+            run_id=42,
+        )
+        self.assertEqual(result["run_attempt"], 2)
+        self.assertEqual(set(result["artifacts"]), set(trusted._artifact_names(2)))
+
+    def test_run_validation_rejects_wrong_artifact_attempt(self) -> None:
+        records = self._records()
+        records[-1]["name"] = "smarty-candidate-handoff-1"
+        with self.assertRaises(ValueError):
+            trusted.validate_workflow_run(
+                self._run(),
+                {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+                {"total_count": 8, "artifacts": records},
+                run_id=42,
+            )
+
+    def test_run_validation_binds_workflow_event_attempt(self) -> None:
+        result = trusted.validate_workflow_run(
+            self._run(),
+            {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+            {"total_count": 8, "artifacts": self._records()},
+            run_id=42,
+            event_run_attempt=2,
+        )
+        self.assertEqual(result["event_run_attempt"], 2)
+        with self.assertRaises(ValueError):
+            trusted.validate_workflow_run(
+                self._run(),
+                {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+                {"total_count": 8, "artifacts": self._records()},
+                run_id=42,
+                event_run_attempt=1,
+            )
+    def test_run_validation_allows_stale_prior_attempt_artifacts(self) -> None:
+        stale = self._records(attempt=1)
+        current = self._records(attempt=2)
+        result = trusted.validate_workflow_run(
+            self._run(attempt=2),
+            {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+            {"total_count": 16, "artifacts": stale + current},
+            run_id=42,
+        )
+        self.assertEqual(set(result["artifacts"]), set(trusted._artifact_names(2)))
+
+    def test_run_validation_rejects_future_attempt_artifacts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "future run attempt"):
+            trusted.validate_workflow_run(
+                self._run(attempt=2),
+                {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+                {"total_count": 8, "artifacts": self._records(attempt=3)},
+                run_id=42,
+            )
+    def test_run_validation_rejects_preseeded_current_attempt_artifact(self) -> None:
+        records = self._records()
+        records[0]["created_at"] = "2026-08-21T23:59:58Z"
+        with self.assertRaisesRegex(ValueError, "predates"):
+            trusted.validate_workflow_run(
+                self._run(),
+                {"id": 77, "name": trusted.WORKFLOW_NAME, "path": trusted.WORKFLOW_PATH},
+                {"total_count": 8, "artifacts": records},
+                run_id=42,
+            )
+
+
+class TrustedArchiveTests(unittest.TestCase):
+    def test_tar_traversal_and_links_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traversal = root / "traversal.tar"
+            with tarfile.open(traversal, "w") as archive:
+                info = tarfile.TarInfo("../escape")
+                info.size = 1
+                import io
+                archive.addfile(info, io.BytesIO(b"x"))
+            with self.assertRaises(ValueError):
+                trusted._safe_tar(traversal, "fixture")
+
+            linked = root / "linked.tar"
+            with tarfile.open(linked, "w") as archive:
+                info = tarfile.TarInfo("link")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "target"
+                archive.addfile(info)
+            with self.assertRaises(ValueError):
+                trusted._safe_tar(linked, "fixture")
+
+    def test_tar_extraction_writes_only_regular_members(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "source.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                payload = b"ok"
+                info = tarfile.TarInfo("src/file")
+                info.size = len(payload)
+                info.mode = 0o755
+                archive.addfile(info, __import__("io").BytesIO(payload))
+            output = root / "out"
+            trusted.extract_tar(archive_path, output)
+            self.assertEqual((output / "src/file").read_bytes(), b"ok")
+            self.assertEqual((output / "src/file").stat().st_mode & 0o777, 0o755)
+
+    def test_tar_extraction_preserves_safe_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "symlink.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                payload = b"ok"
+                info = tarfile.TarInfo("src/file")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+                link = tarfile.TarInfo("CLAUDE.md")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "src/file"
+                archive.addfile(link)
+            output = root / "out"
+            trusted.extract_tar(archive_path, output)
+            self.assertTrue((output / "CLAUDE.md").is_symlink())
+            self.assertEqual((output / "CLAUDE.md").read_bytes(), b"ok")
+
+    def test_tar_aggregate_expanded_limit_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "aggregate.tar"
+            with tarfile.open(archive_path, "w") as archive:
+                payload = b"12"
+                info = tarfile.TarInfo("src/file")
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            old_total = trusted.MAX_TOTAL_EXTRACTED_BYTES
+            try:
+                trusted.MAX_TOTAL_EXTRACTED_BYTES = 1
+                with self.assertRaises(ValueError):
+                    trusted.extract_tar(archive_path, root / "out")
+            finally:
+                trusted.MAX_TOTAL_EXTRACTED_BYTES = old_total
+    def test_zip_rejects_root_and_drive_members(self) -> None:
+        for name in ("/escape", "C:/escape", "C:escape"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    trusted._safe_member_name(name, "fixture.zip")
+
+    def test_zip_member_and_expanded_limits_are_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "fixture.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("one", b"1")
+                archive.writestr("two", b"2")
+            output = root / "out"
+            old_members = trusted.MAX_ZIP_MEMBERS
+            old_bytes = trusted.MAX_ZIP_EXPANDED_BYTES
+            old_total = trusted.MAX_TOTAL_EXTRACTED_BYTES
+            try:
+                trusted.MAX_ZIP_MEMBERS = 1
+                with self.assertRaises(ValueError):
+                    trusted.extract_zip(archive_path, output)
+                trusted.MAX_ZIP_MEMBERS = 200_000
+                trusted.MAX_ZIP_EXPANDED_BYTES = 1
+                with self.assertRaises(ValueError):
+                    trusted.extract_zip(archive_path, output)
+                trusted.MAX_ZIP_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+                trusted.MAX_TOTAL_EXTRACTED_BYTES = 1
+                with self.assertRaises(ValueError):
+                    trusted.extract_zip(archive_path, root / "aggregate-out")
+            finally:
+                trusted.MAX_ZIP_MEMBERS = old_members
+                trusted.MAX_ZIP_EXPANDED_BYTES = old_bytes
+                trusted.MAX_TOTAL_EXTRACTED_BYTES = old_total
+
+
+class TrustedSealTests(unittest.TestCase):
+    parent = "1" * 40
+    source = "2" * 40
+    omp = "3" * 40
+
+    def _fixture(self, root: Path) -> tuple[Path, dict[str, str]]:
+        tag = f"smarty-preview-2026-08-22-p{self.parent}-r{self.source}-o{self.omp}"
+        identity = {
+            "tag": tag,
+            "build_id": tag.removeprefix("smarty-preview-"),
+            "built_at": "2026-08-22T00:00:00Z",
+            "parent": self.parent,
+            "source": self.source,
+            "omp": self.omp,
+        }
+        assets = root / "assets"
+        assets.mkdir()
+        for name in trusted.PAYLOAD_ASSETS:
+            (assets / name).write_bytes(b"payload")
+            (assets / f"{name}.sha256").write_text(
+                f"{trusted.file_record(assets / name)['sha256']}  {name}\n", encoding="ascii"
+            )
+        pair = {
+            "release": {
+                "repository": trusted.REPOSITORY,
+                "tag": tag,
+                "build_id": identity["build_id"],
+                "built_at": identity["built_at"],
+                "immutable": True,
+            },
+            "sources": {
+                "parent": {"commit": self.parent},
+                "herdr": {"commit": self.source},
+                "omp": {"commit": self.omp},
+            },
+        }
+        (assets / "smarty-pair.json").write_text(json.dumps(pair), encoding="utf-8")
+        for name in trusted.FULL_RELEASE_ASSETS:
+            path = assets / name
+            if not path.exists():
+                path.write_bytes(b"evidence")
+        return assets, identity
+
+    def test_seal_binds_nested_pair_source_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            assets, identity = self._fixture(Path(directory))
+            result = trusted.seal_release(assets, identity, Path(directory) / "sealed")
+            self.assertEqual(
+                result["identity"],
+                trusted.paired_identity(identity["tag"], source_sha=identity["source"], built_at=identity["built_at"]),
+            )
+            pair = json.loads((assets / "smarty-pair.json").read_text(encoding="utf-8"))
+            pair["sources"]["omp"]["commit"] = "4" * 40
+            (assets / "smarty-pair.json").write_text(json.dumps(pair), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "pair manifest does not bind sealed source identity"):
+                trusted.seal_release(assets, identity, Path(directory) / "sealed-bad")
+
+class TrustedWorkflowTests(unittest.TestCase):
+    workflow = Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview-publish.yml"
+
+    def test_workflow_uses_exact_source_handoff_and_isolates_build(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertNotIn("eval(", source)
+        self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
+        self.assertIn("validate-sources", source)
+        self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
+        self.assertIn("token: ${{ github.token }}", source)
+        self.assertIn('json.dumps(record["omp"]', source)
+        trusted_source = source.split("\n  trusted-source:", 1)[1].split("\n  trusted-build:", 1)[0]
+        self.assertIn("needs: [validate-seal]", trusted_source)
+        self.assertNotIn("trusted-build", trusted_source)
+        trusted_build = source.split("\n  trusted-build:", 1)[1].split("\n  trusted-omp-build:", 1)[0]
+        omp_build = source.split("\n  trusted-omp-build:", 1)[1].split("\n  trusted-assemble:", 1)[0]
+        self.assertIn("runs-on: ${{ matrix.os }}", omp_build)
+        self.assertIn("Build trusted Herdr source", trusted_build)
+        self.assertNotIn("trusted-source/omp-source.tar", trusted_build)
+        self.assertNotIn("publisher-source", trusted_build)
+        self.assertIn("Download validated OMP source handoff", omp_build)
+        self.assertIn("trusted-tools/smarty_preview_trusted.py", omp_build)
+        self.assertNotIn("Checkout exact Herdr source", omp_build)
+        self.assertNotIn("HERDR_BUILD_OMP", omp_build)
+        self.assertIn('(cd omp-source && bun scripts/ci-release-build-binaries.ts --targets "$OMP_TARGET")', omp_build)
+        self.assertIn('cp "omp-source/packages/coding-agent/binaries/omp-$OMP_TARGET" "release-assets/omp-$PLATFORM"', omp_build)
+        self.assertIn('test "$(release-assets/omp-$PLATFORM __build-id)" = "$OMP_BUILD_ID"', omp_build)
+        self.assertNotIn('bun build omp-source/packages/coding-agent/src/cli.ts --compile --outfile "release-assets/omp-$PLATFORM"', omp_build)
+
+    def test_workflow_pins_executing_revision_and_publisher_attempt(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertIn("ref: ${{ github.workflow_sha }}", source)
+        self.assertIn("WORKFLOW_SHA: ${{ github.workflow_sha }}", source)
+        self.assertIn("publisher_sha != workflow_sha", source)
+        artifact_names = re.findall(
+            r"uses: actions/(?:upload|download)-artifact@[^\n]+\n\s+with:\n\s+name: ([^\n]+)",
+            source,
+        )
+        self.assertTrue(artifact_names)
+        for name in artifact_names:
+            self.assertIn("${{ github.run_attempt }}", name, name)
+
+    def test_workflow_replaces_only_mismatched_draft_assets(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertIn('Path("delete-list").write_text', source)
+        self.assertIn('gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"', source)
+        self.assertIn('raise SystemExit(f"release asset metadata mismatch: {name}")', source)
+        self.assertLess(source.index("done < delete-list"), source.index("done < upload-list"))
+
+
+if __name__ == "__main__":
+    unittest.main()

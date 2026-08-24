@@ -15,6 +15,7 @@ pub(crate) mod omp_maintenance;
 pub(crate) mod omp_private_renderer;
 pub(crate) mod omp_route;
 pub(crate) mod omp_service;
+pub(crate) mod private_surface;
 pub(crate) mod render_stream;
 pub mod socket_paths;
 pub(crate) mod terminal_attach;

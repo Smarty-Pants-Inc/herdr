@@ -94,7 +94,8 @@ try {
 function Get-ReleaseDirectoryForIdentity {
     param(
         [string]$ReleasesDir,
-        [string]$VersionIdentity
+        [string]$VersionIdentity,
+        [string]$ExpectedSha256
     )
 
     $matches = @()
@@ -127,10 +128,11 @@ function Get-ReleaseDirectoryForIdentity {
         }
 
         if (
-            $metadata.PSObject.Properties.Count -ne 4 -or
+            $metadata.PSObject.Properties.Count -ne 5 -or
             [int]$metadata.schema_version -ne 1 -or
             [string]$metadata.target_triple -cne "x86_64-pc-windows-msvc" -or
-            [string]$metadata.format -cne "zip"
+            [string]$metadata.format -cne "zip" -or
+            [string]$metadata.sha256 -cne $ExpectedSha256
         ) {
             throw "installer wrote invalid release identity metadata for $VersionIdentity"
         }
@@ -231,6 +233,24 @@ $previewBuilds[$previewBuildId] = @{
     assets = $previewHerdrAssets
     omp = $previewOmpMetadata
 }
+$previewLegacyBuildId = "2026-08-09-" + ("e" * 12)
+$previewLegacyTag = "smarty-preview-$previewLegacyBuildId"
+$previewLegacyReleaseUrl = "https://github.com/Smarty-Pants-Inc/herdr/releases/download/$previewLegacyTag"
+$previewLegacyAssets = @{
+    "linux-x86_64" = @{ url = "$previewLegacyReleaseUrl/herdr-linux-x86_64"; sha256 = ("d" * 64) }
+    "linux-aarch64" = @{ url = "$previewLegacyReleaseUrl/herdr-linux-aarch64"; sha256 = ("d" * 64) }
+    "macos-x86_64" = @{ url = "$previewLegacyReleaseUrl/herdr-macos-x86_64"; sha256 = ("d" * 64) }
+    "macos-aarch64" = @{ url = "$previewLegacyReleaseUrl/herdr-macos-aarch64"; sha256 = ("d" * 64) }
+    "windows-x86_64" = @{ url = "$previewLegacyReleaseUrl/herdr-windows-x86_64.zip"; sha256 = ("d" * 64); format = "zip" }
+}
+$previewBuilds[$previewLegacyBuildId] = @{
+    base_version = "0.0.0"
+    commit = ("e" * 40)
+    built_at = "2026-08-09T23:30:00-04:00"
+    protocol = 1
+    tag = $previewLegacyTag
+    assets = $previewLegacyAssets
+}
 $previewManifest = @{
     schema_version = 2
     channel = "preview"
@@ -241,7 +261,7 @@ $previewManifest = @{
     built_at = "2026-08-11T00:00:00Z"
     protocol = 1
     notes = "Windows bootstrap bridge"
-    assets = @{ "windows-x86_64" = $previewWindowsAsset }
+    assets = $previewHerdrAssets
     omp = $previewOmpMetadata
     bootstrap = @{
         schema = "smarty.windows-bootstrap.v1"
@@ -288,12 +308,13 @@ $oldInstallerUrl = $env:HERDR_INSTALLER_URL
 $oldHerdrHome = $env:HERDR_HOME
 $oldProcessPath = $env:Path
 $previousGlobalInvokeWebRequest = Get-Item -LiteralPath Function:\global:Invoke-WebRequest -ErrorAction SilentlyContinue
+$previousGlobalInvokeRestMethod = Get-Item -LiteralPath Function:\global:Invoke-RestMethod -ErrorAction SilentlyContinue
 $previewDownloadShimInstalled = $false
-
+$previewManifestShimInstalled = $false
 try {
     $server = Start-Process python -ArgumentList @("-m", "http.server", "$port", "--bind", "127.0.0.1", "--directory", $webRoot) -PassThru -WindowStyle Hidden
     $env:HERDR_HOME = Join-Path $root "unused\..\home"
-    $previewManifestUrl = "http://127.0.0.1:$port/preview.json"
+    $previewManifestUrl = "https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"
     $stableManifestUrl = "http://127.0.0.1:$port/latest.json"
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         try {
@@ -305,6 +326,21 @@ try {
         }
     }
     $global:HerdrInstallerTestPreviewArchive = $archive
+    $global:HerdrInstallerTestPreviewManifestPath = $previewManifestPath
+    function global:Invoke-RestMethod {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)]
+            [Uri]$Uri
+        )
+
+        if ([string]$Uri -ceq $global:HerdrInstallerTestPreviewManifestUrl) {
+            return (Get-Content -LiteralPath $global:HerdrInstallerTestPreviewManifestPath -Raw | ConvertFrom-Json)
+        }
+        Microsoft.PowerShell.Utility\Invoke-RestMethod @PSBoundParameters
+    }
+    $global:HerdrInstallerTestPreviewManifestUrl = $previewManifestUrl
+    $previewManifestShimInstalled = $true
     $global:HerdrInstallerTestPreviewUrl = $previewWindowsAsset.url
     $global:HerdrInstallerTestPreviewDownloadAvailable = $true
     function global:Invoke-WebRequest {
@@ -343,7 +379,8 @@ try {
     $env:HERDR_INSTALLER_URL = $oldInstallerUrl
     $freshStableRelease = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path $freshStableHome "packages\standalone\releases") `
-        -VersionIdentity "0.0.1"
+        -VersionIdentity "0.0.1" `
+        -ExpectedSha256 $hash
 
     $legacyStableManifest | Out-File -LiteralPath $stableManifestPath -Encoding utf8
     $env:HERDR_HOME = Join-Path $root "unused\..\home"
@@ -440,12 +477,13 @@ try {
         @{ Name = "retained-omp-url"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewBuildId].Value.omp.assets."linux-x86_64".url = "https://example.invalid/omp" } },
         @{ Name = "top-windows-digest"; Mutate = { param($m) $m.assets."windows-x86_64".sha256 = "0" * 64 } },
         @{ Name = "top-windows-format"; Mutate = { param($m) $m.assets."windows-x86_64".format = "exe" } },
-        @{ Name = "coordinated-windows-url"; Mutate = { param($m) $m.assets."windows-x86_64".url = "https://example.invalid/herdr.zip"; $m.builds.PSObject.Properties[$previewBuildId].Value.assets."windows-x86_64".url = "https://example.invalid/herdr.zip" } },
+        @{ Name = "extra-top-asset"; Mutate = { param($m) $m.assets | Add-Member -NotePropertyName "unexpected" -NotePropertyValue @{ url = "https://example.invalid/herdr"; sha256 = ("d" * 64) } } },
         @{ Name = "retained-windows-digest"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewBuildId].Value.assets."windows-x86_64".sha256 = "0" * 64 } },
         @{ Name = "retained-herdr-url"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewBuildId].Value.assets."linux-x86_64".url = "https://example.invalid/herdr" } },
-        @{ Name = "extra-top-asset"; Mutate = { param($m) $m.assets | Add-Member -NotePropertyName "linux-x86_64" -NotePropertyValue @{ url = "https://example.invalid/herdr"; sha256 = ("d" * 64) } } },
         @{ Name = "missing-top-asset"; Mutate = { param($m) $m.assets.PSObject.Properties.Remove("windows-x86_64") } },
-        @{ Name = "missing-retained-asset"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewBuildId].Value.assets.PSObject.Properties.Remove("linux-x86_64") } }
+        @{ Name = "missing-retained-asset"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewBuildId].Value.assets.PSObject.Properties.Remove("linux-x86_64") } },
+        @{ Name = "legacy-retained-literal-date-mismatch"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewLegacyBuildId].Value.built_at = "2026-08-08T23:30:00-04:00" } },
+        @{ Name = "legacy-retained-invalid-date"; Mutate = { param($m) $m.builds.PSObject.Properties[$previewLegacyBuildId].Value.built_at = "2026-02-30T23:30:00-04:00" } }
     ) + $pairedTimestampMutations
 
     foreach ($mutation in $bridgeMutations) {
@@ -493,7 +531,8 @@ try {
         -ExpectedBuildId $previewBootstrapBuildId
     $null = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path $herdrHome "packages\standalone\releases") `
-        -VersionIdentity $previewVersionIdentity
+        -VersionIdentity $previewVersionIdentity `
+        -ExpectedSha256 $hash
     $previewManifest | Out-File -LiteralPath $previewManifestPath -Encoding utf8
     function Assert-CanonicalPreviewManifestRejected {
         param(
@@ -586,7 +625,8 @@ try {
     }
     $null = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path (Join-Path $root "local-home") "packages\standalone\releases") `
-        -VersionIdentity $localPackageIdentity
+        -VersionIdentity $localPackageIdentity `
+        -ExpectedSha256 $hash
     $env:HERDR_HOME = $herdrHome
 
     $required = @(
@@ -607,7 +647,8 @@ try {
     $releasesDir = Join-Path $herdrHome "packages\standalone\releases"
     $releaseDir = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir $releasesDir `
-        -VersionIdentity $previewVersionIdentity
+        -VersionIdentity $previewVersionIdentity `
+        -ExpectedSha256 $hash
     Remove-Item -LiteralPath (Join-Path $releaseDir.FullName "conpty\conpty.dll") -Force
 
     $global:HerdrInstallerTestPreviewDownloadAvailable = $false
@@ -789,7 +830,8 @@ try {
         -InstallDir $installDir
     $stableReleaseDir = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path $herdrHome "packages\standalone\releases") `
-        -VersionIdentity "0.0.1"
+        -VersionIdentity "0.0.1" `
+        -ExpectedSha256 $hash
     foreach ($relative in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $installDir $relative) -PathType Leaf)) {
             throw "stable installer did not activate required file $relative"
@@ -797,8 +839,10 @@ try {
     }
 
     $customPreviewManifestPath = Join-Path $webRoot "candidate.json"
-    $customPreviewManifest = $canonicalPreviewManifest
-    $customPreviewManifest | Out-File -LiteralPath $customPreviewManifestPath -Encoding utf8
+    $customPreviewManifest = $canonicalPreviewManifest | ConvertFrom-Json
+    $customPreviewManifest.PSObject.Properties.Remove("omp")
+    $customPreviewManifest.builds.PSObject.Properties[$previewBuildId].Value.PSObject.Properties.Remove("omp")
+    $customPreviewManifest | ConvertTo-Json -Depth 12 | Out-File -LiteralPath $customPreviewManifestPath -Encoding utf8
 
     $fakeBin = Join-Path $root "fake-existing"
     New-Item -ItemType Directory -Force -Path $fakeBin | Out-Null
@@ -821,7 +865,8 @@ exit /b 1
         -ExpectedBuildId $previewBuildId
     $preservedPreview = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path $preserveHome "packages\standalone\releases") `
-        -VersionIdentity $previewVersionIdentity
+        -VersionIdentity $previewVersionIdentity `
+        -ExpectedSha256 $hash
 
     & "$PSScriptRoot\..\website\install.ps1" `
         -Channel stable `
@@ -829,7 +874,8 @@ exit /b 1
         -InstallDir $preserveBin
     $explicitStable = Get-ReleaseDirectoryForIdentity `
         -ReleasesDir (Join-Path $preserveHome "packages\standalone\releases") `
-        -VersionIdentity "0.0.1"
+        -VersionIdentity "0.0.1" `
+        -ExpectedSha256 $hash
 } finally {
     $env:HERDR_HOME = $oldHerdrHome
     $env:HERDR_INSTALLER_URL = $oldInstallerUrl
@@ -840,9 +886,17 @@ exit /b 1
             Set-Item -LiteralPath Function:\global:Invoke-WebRequest -Value $previousGlobalInvokeWebRequest.ScriptBlock
         }
     }
+    if ($previewManifestShimInstalled) {
+        Remove-Item -LiteralPath Function:\global:Invoke-RestMethod -Force
+        if ($null -ne $previousGlobalInvokeRestMethod) {
+            Set-Item -LiteralPath Function:\global:Invoke-RestMethod -Value $previousGlobalInvokeRestMethod.ScriptBlock
+        }
+    }
     Remove-Variable -Name HerdrInstallerTestPreviewArchive -Scope Global -ErrorAction SilentlyContinue
     Remove-Variable -Name HerdrInstallerTestPreviewUrl -Scope Global -ErrorAction SilentlyContinue
     Remove-Variable -Name HerdrInstallerTestPreviewDownloadAvailable -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name HerdrInstallerTestPreviewManifestPath -Scope Global -ErrorAction SilentlyContinue
+    Remove-Variable -Name HerdrInstallerTestPreviewManifestUrl -Scope Global -ErrorAction SilentlyContinue
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
     }
