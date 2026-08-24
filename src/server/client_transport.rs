@@ -20,7 +20,8 @@ use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
     ClientLaunchMode, ClientMessage, NotificationActivation, RenderEncoding, ServerMessage,
-    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, MAX_LINK_URL_LENGTH,
+    PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -539,6 +540,12 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         route: crate::server::omp_route::OmpRouteKey,
         retry_id: u64,
+    },
+    ActivateOmpLink {
+        client_id: u64,
+        launch_id: u64,
+        request_id: u64,
+        url: String,
     },
     /// A client attached to an OMP logical pane.
     OmpPaneAttach {
@@ -1358,6 +1365,29 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
+            ClientMessage::ActivateOmpLink {
+                launch_id,
+                request_id,
+                url,
+            } => {
+                if url.len() > MAX_LINK_URL_LENGTH {
+                    warn!(
+                        client_id,
+                        size = url.len(),
+                        max = MAX_LINK_URL_LENGTH,
+                        "oversized OMP link activation from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ActivateOmpLink {
+                    client_id,
+                    launch_id,
+                    request_id,
+                    url,
+                }
+            }
             ClientMessage::IdentityPersistenceAck {
                 request_id,
                 display_name,

@@ -71,6 +71,10 @@ pub(crate) fn load_plugin_manifest(
 ) -> Result<crate::api::schema::InstalledPluginInfo, (&'static str, String)> {
     api::plugins::load_plugin_manifest(path, enabled)
 }
+pub(crate) use api::plugins::{
+    effective_platforms, ensure_platform_supported, ensure_plugin_user_dirs, plugin_path_env,
+    ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec,
+};
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
 #[derive(Debug, Clone)]
@@ -96,6 +100,29 @@ impl PaneClickState {
             && next.at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
             && self.viewport_row.abs_diff(next.viewport_row) <= 1
             && self.col.abs_diff(next.col) <= 1
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LinkClickState {
+    source_id: InputSourceId,
+    source_key: String,
+    url: String,
+    at: Instant,
+}
+
+impl LinkClickState {
+    fn is_duplicate_for(
+        &self,
+        source_id: InputSourceId,
+        source_key: &str,
+        url: &str,
+        at: Instant,
+    ) -> bool {
+        self.source_id == source_id
+            && self.source_key == source_key
+            && self.url == url
+            && at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +173,7 @@ pub struct App {
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
+    pub(crate) last_link_click: Option<LinkClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) hover_generation: u64,
     pub(crate) next_resize_poll: Instant,
@@ -155,7 +183,7 @@ pub struct App {
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
-    pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    pub(crate) pending_agent_resume_retry_at: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) findr_scan_deadline: Option<Instant>,
@@ -359,7 +387,6 @@ fn resolve_palette_for_theme_name(
     name: &str,
     fallback_name: &str,
     runtime: &state::ThemeRuntimeConfig,
-    mode_custom: Option<&crate::config::ModeThemeColors>,
 ) -> state::Palette {
     let mut palette = state::Palette::from_name(name).unwrap_or_else(|| {
         tracing::warn!(
@@ -376,9 +403,6 @@ fn resolve_palette_for_theme_name(
     if let Some(accent) = &runtime.legacy_accent {
         palette.accent = crate::config::parse_color(accent);
     }
-    if let Some(custom) = mode_custom {
-        palette = palette.with_mode_overrides(custom);
-    }
 
     palette
 }
@@ -387,32 +411,28 @@ fn resolve_effective_theme(
     runtime: &state::ThemeRuntimeConfig,
     appearance: Option<crate::terminal_theme::HostAppearance>,
 ) -> (state::Palette, String) {
-    let (name, fallback, mode_custom) = if runtime.auto_switch {
-        match appearance.unwrap_or(crate::terminal_theme::HostAppearance::Dark) {
-            crate::terminal_theme::HostAppearance::Dark => (
-                &runtime.dark_name,
-                "catppuccin",
-                runtime
-                    .custom
-                    .as_ref()
-                    .and_then(|custom| custom.dark.as_ref()),
-            ),
-            crate::terminal_theme::HostAppearance::Light => (
-                &runtime.light_name,
-                "catppuccin-latte",
-                runtime
-                    .custom
-                    .as_ref()
-                    .and_then(|custom| custom.light.as_ref()),
-            ),
+    let appearance = appearance.unwrap_or(crate::terminal_theme::HostAppearance::Dark);
+    let (name, fallback) = if runtime.auto_switch {
+        match appearance {
+            crate::terminal_theme::HostAppearance::Dark => (&runtime.dark_name, "catppuccin"),
+            crate::terminal_theme::HostAppearance::Light => {
+                (&runtime.light_name, "catppuccin-latte")
+            }
         }
     } else {
-        (&runtime.manual_name, "catppuccin", None)
+        (&runtime.manual_name, "catppuccin")
     };
-    (
-        resolve_palette_for_theme_name(name, fallback, runtime, mode_custom),
-        name.clone(),
-    )
+    let mut palette = resolve_palette_for_theme_name(name, fallback, runtime);
+    if runtime.auto_switch {
+        let mode_overrides = runtime.custom.as_ref().and_then(|custom| match appearance {
+            crate::terminal_theme::HostAppearance::Dark => custom.dark.as_ref(),
+            crate::terminal_theme::HostAppearance::Light => custom.light.as_ref(),
+        });
+        if let Some(mode_overrides) = mode_overrides {
+            palette = palette.with_mode_overrides(mode_overrides);
+        }
+    }
+    (palette, name.clone())
 }
 
 impl App {
@@ -769,10 +789,9 @@ impl App {
         };
 
         state.terminals = restored_terminals;
-
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
-                .resolved_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
+                .local_git_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
             state.workspaces[ws_idx].cached_git_branch =
                 cwd.as_deref().and_then(crate::workspace::git_branch);
         }
@@ -828,6 +847,7 @@ impl App {
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
+            last_link_click: None,
             pending_url_click_sources: HashSet::new(),
             hover_generation: 0,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
@@ -839,7 +859,7 @@ impl App {
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
-            pending_agent_resume_deadline: None,
+            pending_agent_resume_retry_at: None,
             session_save_deadline: None,
             session_save_thread: None,
             detached_process_children: Vec::new(),
@@ -1205,8 +1225,8 @@ impl App {
                         cell_size,
                     )?;
                 }
-                self.sync_pending_agent_resume_deadline(now);
-                if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
+                self.sync_pending_agent_resume_retry_at(now);
+                if self.start_pending_agent_resumes(now, self.pending_agent_resume_retry_due(now)) {
                     self.render_dirty.request_generic();
                     self.render_notify.notify_one();
                 }
@@ -1766,6 +1786,7 @@ impl App {
     fn execute_repeat_plan_headless(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         lease_key: input::InputLeaseKey,
         key: crate::input::TerminalKey,
         plan: input::RepeatPlan,
@@ -1808,7 +1829,7 @@ impl App {
                         self.handle_findr_key(key.clone());
                         None
                     } else {
-                        self.handle_terminal_key_headless_from(source_id, key.clone())
+                        self.handle_terminal_key_headless_from_view(source_id, view_id, key.clone())
                     };
                     if let Some(target) = target {
                         if tracked {
@@ -1843,6 +1864,7 @@ impl App {
     pub(crate) fn route_client_pixel_mouse(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         data: &[u8],
         geometry: crate::input::mouse::HostGeometry,
     ) -> bool {
@@ -1860,7 +1882,7 @@ impl App {
             return false;
         }
         self.state.host_mouse_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
-        self.route_client_events_from(source_id, std::mem::take(&mut events), false);
+        self.route_client_events_from_view(source_id, view_id, std::mem::take(&mut events), false);
         self.state.host_mouse_pixels = None;
         true
     }
@@ -1877,6 +1899,16 @@ impl App {
     pub(crate) fn route_client_events_from(
         &mut self,
         source_id: InputSourceId,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        apply_host_terminal_theme: bool,
+    ) -> bool {
+        self.route_client_events_from_view(source_id, None, events, apply_host_terminal_theme)
+    }
+
+    pub(crate) fn route_client_events_from_view(
+        &mut self,
+        source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
     ) -> bool {
@@ -1902,9 +1934,16 @@ impl App {
                                 self.handle_findr_key(key.clone());
                                 None
                             } else if initial_context.is_some() {
-                                self.handle_terminal_key_headless_from(source_id, key.clone())
+                                self.handle_terminal_key_headless_from_view(
+                                    source_id,
+                                    view_id,
+                                    key.clone(),
+                                )
                             } else {
-                                self.handle_non_terminal_key_headless(key.clone());
+                                self.handle_non_terminal_key_headless_for_view(
+                                    key.clone(),
+                                    view_id,
+                                );
                                 None
                             };
                             event_forwarded = target.is_some();
@@ -1916,7 +1955,9 @@ impl App {
                                 resulting_context.as_ref(),
                                 target,
                             );
-                            self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            self.execute_repeat_plan_headless(
+                                source_id, view_id, lease_key, key, plan,
+                            );
                         }
                         crossterm::event::KeyEventKind::Repeat => {
                             let current_context = self.terminal_input_context();
@@ -1925,8 +1966,9 @@ impl App {
                                 &key,
                                 current_context.as_ref(),
                             );
-                            event_forwarded =
-                                self.execute_repeat_plan_headless(source_id, lease_key, key, plan);
+                            event_forwarded = self.execute_repeat_plan_headless(
+                                source_id, view_id, lease_key, key, plan,
+                            );
                         }
                         crossterm::event::KeyEventKind::Release => {
                             if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
@@ -1948,7 +1990,7 @@ impl App {
                         self.request_scroll_render();
                     }
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                        self.handle_mouse_event_headless(source_id, mouse);
+                        self.handle_mouse_event_headless(source_id, view_id, mouse);
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -2019,7 +2061,11 @@ impl App {
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
     /// since the server doesn't have the async context of the monolithic App.
-    fn handle_non_terminal_key_headless(&mut self, key: crate::input::TerminalKey) {
+    fn handle_non_terminal_key_headless_for_view(
+        &mut self,
+        key: crate::input::TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key_event = key.as_key_event();
         if input::modal_paste_target_active(&self.state)
             && input::is_modal_paste_shortcut(&key_event)
@@ -2032,10 +2078,10 @@ impl App {
 
         match self.state.mode {
             Mode::Prefix => {
-                self.handle_prefix_key(key);
+                self.handle_prefix_key_for_view(key, view_id);
             }
             Mode::Navigate => {
-                self.handle_navigate_key(key);
+                self.handle_navigate_key_for_view(key, view_id);
             }
             Mode::Copy => {
                 self.handle_copy_mode_key(key);
@@ -2099,9 +2145,10 @@ impl App {
     fn handle_mouse_event_headless(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         mouse: crossterm::event::MouseEvent,
     ) {
-        self.handle_mouse_from_input_source(source_id, mouse);
+        self.handle_mouse_from_input_source_for_view(source_id, view_id, mouse);
     }
 }
 
@@ -2115,8 +2162,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use std::cell::Cell;
     use std::rc::Rc;
-    #[cfg(windows)]
-    use std::sync::Mutex;
 
     fn raw_key(
         code: KeyCode,
@@ -2947,17 +2992,6 @@ mod tests {
     fn theme_auto_switch_is_opt_in_and_preserves_manual_default() {
         let mut config = Config::default();
         config.theme.name = Some("tokyo-night".to_string());
-        config.theme.custom = Some(crate::config::CustomThemeColors {
-            light: Some(crate::config::ModeThemeColors {
-                accent: Some("#010203".to_string()),
-                ..Default::default()
-            }),
-            dark: Some(crate::config::ModeThemeColors {
-                accent: Some("#040506".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -2991,6 +3025,10 @@ mod tests {
         config.theme.auto_switch = true;
         config.theme.custom = Some(crate::config::CustomThemeColors {
             accent: Some("#010203".to_string()),
+            light: Some(crate::config::ModeThemeColors {
+                accent: Some("#040506".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3001,57 +3039,8 @@ mod tests {
         assert_eq!(app.state.theme_name, "gruvbox-light");
         assert_eq!(
             app.state.palette.accent,
-            ratatui::style::Color::Rgb(1, 2, 3)
+            ratatui::style::Color::Rgb(4, 5, 6)
         );
-    }
-
-    #[test]
-    fn theme_auto_switch_layers_active_mode_overrides_last() {
-        let mut config = Config::default();
-        config.theme.name = Some("gruvbox".to_string());
-        config.theme.auto_switch = true;
-        config.theme.custom = Some(crate::config::CustomThemeColors {
-            accent: Some("#010203".to_string()),
-            text: Some("#040506".to_string()),
-            light: Some(crate::config::ModeThemeColors {
-                accent: Some("#070809".to_string()),
-                ..Default::default()
-            }),
-            dark: Some(crate::config::ModeThemeColors {
-                text: Some("#0a0b0c".to_string()),
-                sidebar_bg: Some("#0d0e0f".to_string()),
-                active_row_bg: Some("#101112".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
-
-        assert_eq!(
-            app.state.palette.accent,
-            ratatui::style::Color::Rgb(1, 2, 3)
-        );
-        assert_eq!(
-            app.state.palette.text,
-            ratatui::style::Color::Rgb(10, 11, 12)
-        );
-        assert_eq!(
-            app.state.palette.sidebar_bg,
-            ratatui::style::Color::Rgb(13, 14, 15)
-        );
-        assert_eq!(
-            app.state.palette.active_row_bg,
-            ratatui::style::Color::Rgb(16, 17, 18)
-        );
-
-        app.set_host_terminal_appearance(crate::terminal_theme::HostAppearance::Light, true);
-
-        assert_eq!(
-            app.state.palette.accent,
-            ratatui::style::Color::Rgb(7, 8, 9)
-        );
-        assert_eq!(app.state.palette.text, ratatui::style::Color::Rgb(4, 5, 6));
     }
 
     #[test]
@@ -4759,9 +4748,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4840,9 +4831,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4901,9 +4894,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: Some(workspace_id.clone()),
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -4959,9 +4954,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: Some(target_pane_id),
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: Some(0.333),
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: crate::api::schema::PaneRightClickTarget::Pane,
                 env: Default::default(),
@@ -5014,9 +5011,11 @@ mod tests {
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction: crate::api::schema::SplitDirection::Right,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),

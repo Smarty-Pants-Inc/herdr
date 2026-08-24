@@ -4,6 +4,8 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
+- On Unix, panes can now execute locally or on a trusted SSH host while sharing one Herdr layout; new panes created from an existing pane, such as splits and plugin child surfaces, inherit the source pane's execution target unless explicitly overridden. Whole-server `herdr --remote` remains available on Windows clients connecting to supported Linux and macOS hosts.
+- Plugin popups can now be scoped to one connected app client, with independent rendering, input, links, and lifecycle per client.
 
 ### Fixed
 - Claude Code integration hooks now ignore Cursor CLI's Claude-compatible session events, preventing Cursor sessions from being stored as resumable Claude sessions. (#2832)
@@ -17,6 +19,7 @@
 - Prefix bindings such as `prefix+|` now recognize characters produced by macOS Option and custom keyboard layouts, while exact chords such as `prefix+alt+w` keep priority. (#3079, thanks @vlcinsky)
 - Direct terminal attaches now preserve multiline pastes as one paste instead of submitting each line separately. (#3054)
 - Windows clients now preserve layout-generated text for Shift-only keys, so characters such as `/` on German keyboards reach shell panes and pasted input. (#3045)
+- Unix SSH-backed workspace-right plugin panes now keep their managed workspace identity, and file-opening splits inherit the plugin's execution target instead of an unrelated tiled pane's locality.
 - Windows panes now keep bare `cursor-agent` launches detected after Cursor hands off to its bundled Node process. (#3032)
 - Oversized Kitty images no longer prevent smaller images shown later in the same pane from rendering. (#3033)
 - `herdr agent explain --file` now reports fixture read failures as structured JSON instead of exposing Rust I/O debug output. (#3022)

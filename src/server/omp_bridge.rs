@@ -463,19 +463,30 @@ mod tests {
         accept_pending(&listener, &bridge, event_tx.clone(), &limiter);
 
         let mut excess = TcpStream::connect(address).unwrap();
-        accept_pending(&listener, &bridge, event_tx.clone(), &limiter);
-        excess
-            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
-            .unwrap();
-        let mut byte = [0];
-        match excess.read(&mut byte) {
-            Ok(0) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
-                ) => {}
-            result => panic!("excess handshake remained open: {result:?}"),
+        excess.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            accept_pending(&listener, &bridge, event_tx.clone(), &limiter);
+            let mut byte = [0];
+            match excess.read(&mut byte) {
+                Ok(0) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "excess handshake remained open"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => panic!("excess handshake close failed: {result:?}"),
+            }
         }
 
         first.shutdown(Shutdown::Both).unwrap();
