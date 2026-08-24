@@ -21,7 +21,7 @@ pub(super) const OMP_RENDERER_LAUNCH_ID_ENV: &str = "HERDR_OMP_RENDERER_LAUNCH_I
 
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_DAMAGE_TIMEOUT: Duration = Duration::from_secs(10);
-
+const MAX_QUEUED_LINK_INPUTS: usize = 256;
 pub(super) fn capabilities(
     encoding: RenderEncoding,
     app_surface: bool,
@@ -60,6 +60,25 @@ enum DeferredMessage {
         geometry: crate::input::mouse::HostGeometry,
         generation: u64,
     },
+}
+
+enum LinkInput {
+    Events {
+        events: Vec<ClientInputEvent>,
+        generation: u64,
+    },
+    Pixels {
+        inputs: Vec<(Vec<u8>, crate::input::mouse::HostGeometry)>,
+        generation: u64,
+    },
+}
+
+impl LinkInput {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Events { generation, .. } | Self::Pixels { generation, .. } => *generation,
+        }
+    }
 }
 
 impl DeferredMessage {
@@ -203,7 +222,7 @@ impl LocalTarget {
         }
         while let Ok(event) = self.events.try_recv() {
             match event {
-                AppEvent::PaneDied { pane_id } if pane_id == self.pane_id => {
+                AppEvent::PaneDied { pane_id, .. } if pane_id == self.pane_id => {
                     self.fail();
                     return true;
                 }
@@ -213,6 +232,11 @@ impl LocalTarget {
                     effects.push(LocalEffect::Bell(count));
                 }
                 AppEvent::ClipboardWrite { content } if self.promoted => {
+                    effects.push(LocalEffect::ClipboardWrite(content));
+                }
+                AppEvent::PaneClipboardWrite { pane_id, content }
+                    if self.promoted && pane_id == self.pane_id =>
+                {
                     effects.push(LocalEffect::ClipboardWrite(content));
                 }
                 AppEvent::OpenUrl { url, .. } if self.promoted => {
@@ -257,7 +281,11 @@ pub(super) struct ClientOmpRenderer {
     handoff_frame: Option<FrameData>,
     local_selected: bool,
     server_owned_input: bool,
+    next_link_request_id: u64,
     pending_link_click: bool,
+    pending_link_request_id: Option<u64>,
+    pending_link_input: Option<LinkInput>,
+    queued_link_inputs: Vec<LinkInput>,
     pointer_cell: Option<(u16, u16)>,
     pointer_pixels: Option<crate::input::mouse::HostPixels>,
     hovered_link_cells: Option<Vec<(u16, u16)>>,
@@ -282,7 +310,11 @@ impl ClientOmpRenderer {
             handoff_frame: None,
             local_selected: false,
             server_owned_input: false,
+            next_link_request_id: 1,
             pending_link_click: false,
+            pending_link_request_id: None,
+            pending_link_input: None,
+            queued_link_inputs: Vec::new(),
             pointer_cell: None,
             pointer_pixels: None,
             hovered_link_cells: None,
@@ -434,6 +466,7 @@ impl ClientOmpRenderer {
         host_geometry: Option<crate::input::mouse::HostGeometry>,
         current_input_generation: u64,
     ) {
+        self.cancel_stale_link_inputs(current_input_generation);
         self.deferred_messages
             .retain_mut(|message| message.retain_for_generation(current_input_generation));
         self.pointer_pixels = self.pointer_pixels.and_then(|mut pointer| {
@@ -548,10 +581,70 @@ impl ClientOmpRenderer {
         )
     }
 
-    fn link_activation_message(&self, column: u16, row: u16) -> Option<ClientMessage> {
+    fn allocate_link_request_id(&mut self) -> u64 {
+        let request_id = self.next_link_request_id;
+        self.next_link_request_id = self.next_link_request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    fn queue_link_input(&mut self, input: LinkInput) {
+        if self.queued_link_inputs.len() < MAX_QUEUED_LINK_INPUTS {
+            self.queued_link_inputs.push(input);
+        } else {
+            self.fail_link_input_overflow(input);
+        }
+    }
+
+    fn retain_link_inputs_for_generation(&mut self, current_generation: u64) -> bool {
+        let queued = std::mem::take(&mut self.queued_link_inputs);
+        let mut retained = Vec::with_capacity(queued.len());
+        let mut changed = false;
+        for input in queued {
+            match input {
+                LinkInput::Events {
+                    mut events,
+                    generation,
+                } if generation != current_generation => {
+                    changed = true;
+                    events.retain(|event| !matches!(event, ClientInputEvent::Mouse { .. }));
+                    if !events.is_empty() {
+                        retained.push(LinkInput::Events { events, generation });
+                    }
+                }
+                LinkInput::Pixels { generation, .. } if generation != current_generation => {
+                    changed = true;
+                }
+                input => retained.push(input),
+            }
+        }
+        self.queued_link_inputs = retained;
+        changed
+    }
+
+    fn cancel_stale_link_inputs(&mut self, current_generation: u64) {
+        let stale_pending = self
+            .pending_link_input
+            .as_ref()
+            .is_some_and(|input| input.generation() != current_generation);
+        let changed = self.retain_link_inputs_for_generation(current_generation);
+        if stale_pending {
+            self.clear_pending_link_activation();
+        }
+        if stale_pending || changed {
+            self.drain_queued_link_inputs();
+        }
+    }
+
+    fn link_activation_message(
+        &self,
+        column: u16,
+        row: u16,
+        request_id: u64,
+    ) -> Option<ClientMessage> {
         let link = self.resolved_link_at(column, row)?;
         Some(ClientMessage::ActivateOmpLink {
             launch_id: self.target.as_ref()?.launch_id,
+            request_id,
             url: link.url,
         })
     }
@@ -569,6 +662,7 @@ impl ClientOmpRenderer {
         events: Vec<crate::raw_input::RawInputEvent>,
         input_generation: u64,
     ) -> Vec<ClientMessage> {
+        self.cancel_stale_link_inputs(input_generation);
         self.route_input_inner(events, input_generation, true)
     }
 
@@ -597,17 +691,32 @@ impl ClientOmpRenderer {
             if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.pending_link_click = false;
+                        if self.pending_link_request_id.is_none() {
+                            self.clear_pending_link_click();
+                        } else {
+                            self.pending_link_click = false;
+                        }
                     }
                     MouseEventKind::Drag(MouseButton::Left) if self.pending_link_click => {
+                        self.append_pending_link_event(protocol_event);
                         continue;
                     }
                     MouseEventKind::Up(MouseButton::Left) if self.pending_link_click => {
+                        self.append_pending_link_event(protocol_event);
                         self.pending_link_click = false;
                         continue;
                     }
                     _ => {}
                 }
+            }
+            if self.pending_link_request_id.is_some() {
+                if let Some(event) = protocol_event {
+                    self.queue_link_input(LinkInput::Events {
+                        events: vec![event],
+                        generation: input_generation,
+                    });
+                }
+                continue;
             }
             if self.awaiting_fallback || self.awaiting_promotion {
                 if let Some(event) = protocol_event {
@@ -618,8 +727,9 @@ impl ClientOmpRenderer {
             if self.local_selected && !self.server_owned_input {
                 if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
                     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                        self.pending_link_click = false;
-                        if let Some(message) = self.link_activation_message(mouse.column, mouse.row)
+                        let request_id = self.allocate_link_request_id();
+                        if let Some(message) =
+                            self.link_activation_message(mouse.column, mouse.row, request_id)
                         {
                             if !server_batch.is_empty() {
                                 messages.push(ClientMessage::InputEvents {
@@ -628,6 +738,12 @@ impl ClientOmpRenderer {
                             }
                             messages.push(message);
                             self.pending_link_click = true;
+                            self.pending_link_request_id = Some(request_id);
+                            self.pending_link_input =
+                                protocol_event.map(|event| LinkInput::Events {
+                                    events: vec![event],
+                                    generation: input_generation,
+                                });
                             continue;
                         }
                     }
@@ -670,14 +786,7 @@ impl ClientOmpRenderer {
                 .and_then(|target| target.runtime.as_ref())
                 .is_some_and(|runtime| forward_local_event(runtime, event));
             if !sent {
-                self.prepare_surface_handoff();
-                if let Some(target) = self.target.as_mut() {
-                    target.fail();
-                }
-                self.awaiting_fallback = true;
-                self.cached_server_frame = None;
-                self.needs_render = true;
-                self.force_repaint = true;
+                self.begin_local_forward_fallback();
                 if let Some(event) = protocol_event {
                     deferred_events.push(event);
                 }
@@ -703,6 +812,7 @@ impl ClientOmpRenderer {
         geometry: crate::input::mouse::HostGeometry,
         input_generation: u64,
     ) -> Option<ClientMessage> {
+        self.cancel_stale_link_inputs(input_generation);
         self.route_pixel_input_inner(data, geometry, input_generation, true)
     }
 
@@ -726,16 +836,29 @@ impl ClientOmpRenderer {
             .and_then(|target| decode_local_pixel_mouse(&data, geometry, target.size));
         match mouse_kind {
             Some(MouseEventKind::Down(MouseButton::Left)) => {
-                self.pending_link_click = false;
+                if self.pending_link_request_id.is_none() {
+                    self.clear_pending_link_click();
+                } else {
+                    self.pending_link_click = false;
+                }
             }
             Some(MouseEventKind::Drag(MouseButton::Left)) if self.pending_link_click => {
+                self.append_pending_link_pixels(data, geometry);
                 return None;
             }
             Some(MouseEventKind::Up(MouseButton::Left)) if self.pending_link_click => {
+                self.append_pending_link_pixels(data, geometry);
                 self.pending_link_click = false;
                 return None;
             }
             _ => {}
+        }
+        if self.pending_link_request_id.is_some() {
+            self.queue_link_input(LinkInput::Pixels {
+                inputs: vec![(data, geometry)],
+                generation: input_generation,
+            });
+            return None;
         }
         if self.awaiting_fallback || self.awaiting_promotion {
             self.deferred_messages.push(DeferredMessage::InputPixels {
@@ -748,13 +871,22 @@ impl ClientOmpRenderer {
         if self.server_owned_input || !self.local_selected {
             return Some(pixel_input_message(data, geometry));
         }
-        if let Some(local_mouse) = local_mouse
+        if let Some(local_mouse) = self
+            .target
+            .as_ref()
+            .and_then(|target| decode_local_pixel_mouse(&data, geometry, target.size))
             .filter(|mouse| matches!(mouse.mouse.kind, MouseEventKind::Down(MouseButton::Left)))
         {
+            let request_id = self.allocate_link_request_id();
             if let Some(message) =
-                self.link_activation_message(local_mouse.cell.0, local_mouse.cell.1)
+                self.link_activation_message(local_mouse.cell.0, local_mouse.cell.1, request_id)
             {
                 self.pending_link_click = true;
+                self.pending_link_request_id = Some(request_id);
+                self.pending_link_input = Some(LinkInput::Pixels {
+                    inputs: vec![(data, geometry)],
+                    generation: input_generation,
+                });
                 return Some(message);
             }
         }
@@ -766,19 +898,12 @@ impl ClientOmpRenderer {
             Some(true) => None,
             None => Some(pixel_input_message(data, geometry)),
             Some(false) => {
-                self.prepare_surface_handoff();
-                if let Some(target) = self.target.as_mut() {
-                    target.fail();
-                }
-                self.awaiting_fallback = true;
-                self.cached_server_frame = None;
+                self.begin_local_forward_fallback();
                 self.deferred_messages.push(DeferredMessage::InputPixels {
                     data,
                     geometry,
                     generation: input_generation,
                 });
-                self.needs_render = true;
-                self.force_repaint = true;
                 None
             }
         }
@@ -872,6 +997,255 @@ impl ClientOmpRenderer {
         std::mem::take(&mut self.outbound_messages)
     }
 
+    pub(super) fn resolve_link_activation(
+        &mut self,
+        launch_id: u64,
+        request_id: u64,
+        activated: bool,
+        input_generation: u64,
+    ) {
+        if self.pending_link_request_id != Some(request_id) {
+            return;
+        }
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|target| target.launch_id != launch_id)
+        {
+            self.clear_pending_link_activation();
+            self.drain_link_inputs_for_generation(input_generation);
+            return;
+        }
+        self.pending_link_request_id = None;
+        if activated {
+            // Keep suppressing the remainder of the current mouse gesture, but
+            // discard the buffered events because the server handled the link.
+            self.pending_link_input = None;
+            self.drain_link_inputs_for_generation(input_generation);
+            return;
+        }
+        let Some(input) = self.pending_link_input.take() else {
+            self.pending_link_click = false;
+            self.drain_link_inputs_for_generation(input_generation);
+            return;
+        };
+        self.pending_link_click = false;
+        if input.generation() != input_generation {
+            self.clear_pending_link_activation();
+            self.drain_link_inputs_for_generation(input_generation);
+            return;
+        }
+
+        let replay_locally = self.local_selected && !self.server_owned_input;
+        let runtime_missing = self
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .is_none();
+        match input {
+            LinkInput::Events {
+                events,
+                generation: _,
+            } if !replay_locally => {
+                self.outbound_messages
+                    .push(ClientMessage::InputEvents { events });
+            }
+            LinkInput::Events { events, generation } => {
+                let failed_at = self
+                    .target
+                    .as_ref()
+                    .and_then(|target| target.runtime.as_ref())
+                    .and_then(|runtime| {
+                        events.iter().enumerate().find_map(|(index, event)| {
+                            (!forward_local_event(runtime, event.to_raw_input_event()))
+                                .then_some(index)
+                        })
+                    })
+                    .or_else(|| runtime_missing.then_some(0));
+                if let Some(index) = failed_at {
+                    self.begin_local_forward_fallback();
+                    self.deferred_messages.push(DeferredMessage::InputEvents {
+                        events: events.into_iter().skip(index).collect(),
+                        generation,
+                    });
+                }
+            }
+            LinkInput::Pixels {
+                inputs,
+                generation: _,
+            } if !replay_locally => {
+                self.outbound_messages.extend(
+                    inputs
+                        .into_iter()
+                        .map(|(data, geometry)| pixel_input_message(data, geometry)),
+                );
+            }
+            LinkInput::Pixels { inputs, generation } => {
+                let failed_at = self
+                    .target
+                    .as_ref()
+                    .and_then(|target| {
+                        target
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| (runtime, target.size))
+                    })
+                    .and_then(|(runtime, size)| {
+                        inputs
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, (data, geometry))| {
+                                let sent = decode_local_pixel_mouse(data, *geometry, size)
+                                    .is_some_and(|mouse| forward_local_pixel_mouse(runtime, mouse));
+                                (!sent).then_some(index)
+                            })
+                    })
+                    .or_else(|| runtime_missing.then_some(0));
+                if let Some(index) = failed_at {
+                    self.begin_local_forward_fallback();
+                    for (data, geometry) in inputs.into_iter().skip(index) {
+                        self.deferred_messages.push(DeferredMessage::InputPixels {
+                            data,
+                            geometry,
+                            generation,
+                        });
+                    }
+                }
+            }
+        }
+        self.drain_queued_link_inputs();
+    }
+
+    fn append_pending_link_event(&mut self, event: Option<ClientInputEvent>) -> bool {
+        let Some(event) = event else {
+            return true;
+        };
+        let overflow_generation = self.pending_link_input.as_ref().and_then(|input| {
+            let LinkInput::Events { events, generation } = input else {
+                return None;
+            };
+            (events.len() >= MAX_QUEUED_LINK_INPUTS).then_some(*generation)
+        });
+        if let Some(generation) = overflow_generation {
+            self.fail_link_input_overflow(LinkInput::Events {
+                events: vec![event],
+                generation,
+            });
+            return false;
+        }
+        if let Some(LinkInput::Events { events, .. }) = self.pending_link_input.as_mut() {
+            events.push(event);
+        }
+        true
+    }
+
+    fn append_pending_link_pixels(
+        &mut self,
+        data: Vec<u8>,
+        geometry: crate::input::mouse::HostGeometry,
+    ) -> bool {
+        let overflow_generation = self.pending_link_input.as_ref().and_then(|input| {
+            let LinkInput::Pixels { inputs, generation } = input else {
+                return None;
+            };
+            (inputs.len() >= MAX_QUEUED_LINK_INPUTS).then_some(*generation)
+        });
+        if let Some(generation) = overflow_generation {
+            self.fail_link_input_overflow(LinkInput::Pixels {
+                inputs: vec![(data, geometry)],
+                generation,
+            });
+            return false;
+        }
+        if let Some(LinkInput::Pixels { inputs, .. }) = self.pending_link_input.as_mut() {
+            inputs.push((data, geometry));
+        }
+        true
+    }
+
+    fn fail_link_input_overflow(&mut self, input: LinkInput) {
+        let mut inputs = Vec::with_capacity(self.queued_link_inputs.len() + 2);
+        if let Some(pending) = self.pending_link_input.take() {
+            inputs.push(pending);
+        }
+        inputs.extend(std::mem::take(&mut self.queued_link_inputs));
+        inputs.push(input);
+        self.clear_pending_link_activation();
+        self.begin_local_forward_fallback();
+        for input in inputs {
+            self.defer_link_input(input);
+        }
+    }
+
+    fn defer_link_input(&mut self, input: LinkInput) {
+        match input {
+            LinkInput::Events { events, generation } => {
+                self.deferred_messages
+                    .push(DeferredMessage::InputEvents { events, generation });
+            }
+            LinkInput::Pixels { inputs, generation } => {
+                for (data, geometry) in inputs {
+                    self.deferred_messages.push(DeferredMessage::InputPixels {
+                        data,
+                        geometry,
+                        generation,
+                    });
+                }
+            }
+        }
+    }
+
+    fn drain_queued_link_inputs(&mut self) {
+        let queued = std::mem::take(&mut self.queued_link_inputs);
+        for input in queued {
+            match input {
+                LinkInput::Events { events, generation } => {
+                    let raw_events = events
+                        .into_iter()
+                        .map(|event| event.to_raw_input_event())
+                        .collect();
+                    let messages = self.route_input_inner(raw_events, generation, false);
+                    self.outbound_messages.extend(messages);
+                }
+                LinkInput::Pixels { inputs, generation } => {
+                    for (data, geometry) in inputs {
+                        if let Some(message) =
+                            self.route_pixel_input_inner(data, geometry, generation, false)
+                        {
+                            self.outbound_messages.push(message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn drain_link_inputs_for_generation(&mut self, current_generation: u64) {
+        self.retain_link_inputs_for_generation(current_generation);
+        self.drain_queued_link_inputs();
+    }
+
+    fn begin_local_forward_fallback(&mut self) {
+        self.prepare_surface_handoff();
+        if let Some(target) = self.target.as_mut() {
+            target.fail();
+        }
+        self.awaiting_fallback = true;
+        self.cached_server_frame = None;
+        self.needs_render = true;
+        self.force_repaint = true;
+    }
+
+    fn clear_pending_link_activation(&mut self) {
+        self.pending_link_click = false;
+        self.pending_link_request_id = None;
+        self.pending_link_input = None;
+    }
+
+    fn clear_pending_link_click(&mut self) {
+        self.clear_pending_link_activation();
+        self.queued_link_inputs.clear();
+    }
+
     pub(super) fn take_effects(&mut self) -> Vec<LocalEffect> {
         std::mem::take(&mut self.effects)
     }
@@ -939,6 +1313,7 @@ impl ClientOmpRenderer {
         }
         self.local_selected = false;
         self.server_owned_input = false;
+        self.clear_pending_link_click();
         self.hovered_link_cells = None;
         self.needs_render = true;
     }
@@ -1338,6 +1713,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_native_link_replays_the_buffered_mouse_gesture_locally() {
+        let url = "artifact://native";
+        let screen = format!("\x1b[?1003h\x1b[?1006h\x1b]8;;{url}\x1b\\x\x1b]8;;\x1b\\");
+        let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 1);
+        runtime.test_process_pty_bytes(screen.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_pointer_cell(Some((0, 0)));
+        let mouse = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        let messages = renderer.route_input(vec![
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            mouse(MouseEventKind::Drag(MouseButton::Left)),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::ActivateOmpLink { url: produced, .. }] if produced == url
+        ));
+        assert!(!renderer.pending_link_click);
+
+        renderer.resolve_link_activation(1, 1, false, 0);
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<0;1;1M");
+        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<32;1;1M");
+        assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<0;1;1m");
+    }
+    #[tokio::test]
+    async fn queued_native_links_resolve_in_gesture_order() {
+        let url = "artifact://native-queued";
+        let screen = format!("\x1b[?1003h\x1b[?1006h\x1b]8;;{url}\x1b\\x\x1b]8;;\x1b\\");
+        let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 1);
+        runtime.test_process_pty_bytes(screen.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_pointer_cell(Some((0, 0)));
+        let mouse = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        let messages = renderer.route_input(vec![
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::ActivateOmpLink {
+                request_id: 1,
+                url: produced,
+                ..
+            }] if produced == url
+        ));
+
+        renderer.resolve_link_activation(1, 1, false, 0);
+        let queued = renderer.take_outbound_messages();
+        assert!(matches!(
+            queued.as_slice(),
+            [ClientMessage::ActivateOmpLink {
+                request_id: 2,
+                url: produced,
+                ..
+            }] if produced == url
+        ));
+
+        renderer.resolve_link_activation(1, 2, false, 0);
+        assert!(renderer.take_outbound_messages().is_empty());
+        for expected in [
+            b"\x1b[<0;1;1M".as_slice(),
+            b"\x1b[<0;1;1m".as_slice(),
+            b"\x1b[<0;1;1M".as_slice(),
+            b"\x1b[<0;1;1m".as_slice(),
+        ] {
+            assert_eq!(input.try_recv().unwrap().as_ref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn input_generation_change_cancels_stale_native_link_queue() {
+        let url = "artifact://native-stale";
+        let screen = format!("\x1b[?1003h\x1b[?1006h\x1b]8;;{url}\x1b\\x\x1b]8;;\x1b\\");
+        let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 1);
+        runtime.test_process_pty_bytes(screen.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_pointer_cell(Some((0, 0)));
+        let mouse = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        let messages = renderer.route_input_at_generation(
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+                crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::empty(),
+                )),
+            ],
+            0,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::ActivateOmpLink { request_id: 1, .. }]
+        ));
+
+        let geometry = crate::input::mouse::HostGeometry::new(80, 1, 800, 20).unwrap();
+        renderer.resize((80, 1, 10, 20), Some(geometry), 1);
+        renderer.resolve_link_activation(1, 1, false, 1);
+
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert_eq!(input.try_recv().unwrap().as_ref(), b"x");
+        assert!(input.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn accepted_native_link_drops_stale_generation_mouse_queue() {
+        let url = "artifact://native-accepted-stale";
+        let screen = format!("\x1b[?1003h\x1b[?1006h\x1b]8;;{url}\x1b\\x\x1b]8;;\x1b\\");
+        let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 1);
+        runtime.test_process_pty_bytes(screen.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_pointer_cell(Some((0, 0)));
+        let mouse = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+
+        let messages = renderer.route_input_at_generation(
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+            ],
+            0,
+        );
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::ActivateOmpLink { request_id: 1, .. }]
+        ));
+
+        renderer.resolve_link_activation(1, 1, true, 1);
+
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert!(renderer.queued_link_inputs.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn native_link_queue_overflow_enters_fallback_without_dropping_input() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.pending_link_request_id = Some(1);
+        renderer.pending_link_click = true;
+        renderer.pending_link_input = Some(LinkInput::Events {
+            events: vec![ClientInputEvent::FocusGained],
+            generation: 0,
+        });
+        renderer.queued_link_inputs = (0..MAX_QUEUED_LINK_INPUTS)
+            .map(|_| LinkInput::Events {
+                events: vec![ClientInputEvent::FocusLost],
+                generation: 0,
+            })
+            .collect();
+
+        assert!(renderer
+            .route_input_at_generation(
+                vec![crate::raw_input::RawInputEvent::Key(
+                    crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
+                )],
+                0,
+            )
+            .is_empty());
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.pending_link_request_id.is_none());
+        assert!(renderer.pending_link_input.is_none());
+        assert!(renderer.queued_link_inputs.is_empty());
+        assert_eq!(renderer.deferred_messages.len(), MAX_QUEUED_LINK_INPUTS + 2);
+    }
+
+    #[tokio::test]
+    async fn native_link_gesture_overflow_enters_fallback_without_dropping_release() {
+        let url = "artifact://native-gesture-overflow";
+        let screen = format!("\x1b[?1003h\x1b[?1006h\x1b]8;;{url}\x1b\\x\x1b]8;;\x1b\\");
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 1);
+        runtime.test_process_pty_bytes(screen.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_pointer_cell(Some((0, 0)));
+        let mouse = |kind| {
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        assert!(matches!(
+            renderer.route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left))]).as_slice(),
+            [ClientMessage::ActivateOmpLink { url: produced, .. }] if produced == url
+        ));
+
+        for _ in 0..=MAX_QUEUED_LINK_INPUTS {
+            renderer.route_input(vec![mouse(MouseEventKind::Drag(MouseButton::Left))]);
+        }
+        renderer.route_input(vec![mouse(MouseEventKind::Up(MouseButton::Left))]);
+
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.pending_link_input.is_none());
+        assert!(renderer.deferred_messages.len() >= 2);
+    }
+
+    #[tokio::test]
     async fn pixel_mouse_maps_host_pixels_to_the_local_pty() {
         let (runtime, mut input) = TerminalRuntime::test_with_channel(40, 12);
         runtime.resize(12, 40, 10, 20);
@@ -1605,7 +2210,10 @@ mod tests {
         assert!(renderer.cache_server_frame(ignored_server_frame).is_none());
         assert!(renderer.handoff_frame.is_some());
         events
-            .try_send(AppEvent::PaneDied { pane_id })
+            .try_send(AppEvent::PaneDied {
+                pane_id,
+                child_pid: None,
+            })
             .expect("queue local pane death");
 
         let cleanup = renderer
@@ -1719,15 +2327,22 @@ mod tests {
             let clicked_index = usize::from(row) * usize::from(frame.width) + usize::from(column);
             assert_eq!(frame.cells[clicked_index].hyperlink.is_some(), explicit);
 
-            assert!(matches!(
-                renderer
-                    .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left))])
-                    .as_slice(),
-                [ClientMessage::ActivateOmpLink { launch_id: 1, url }] if url == expected_url
-            ));
+            let request_id = match renderer
+                .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left))])
+                .as_slice()
+            {
+                [ClientMessage::ActivateOmpLink {
+                    launch_id: 1,
+                    request_id,
+                    url,
+                    ..
+                }] if url == expected_url => *request_id,
+                _ => panic!("expected native link activation request"),
+            };
             assert!(renderer
                 .route_input(vec![mouse(MouseEventKind::Up(MouseButton::Left))])
                 .is_empty());
+            renderer.resolve_link_activation(1, request_id, false, 0);
         }
     }
 
@@ -1782,8 +2397,11 @@ mod tests {
             renderer
                 .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left))])
                 .as_slice(),
-            [ClientMessage::ActivateOmpLink { launch_id: 1, url }]
-                if url == "file:///tmp/report.md?line=7"
+            [ClientMessage::ActivateOmpLink {
+                launch_id: 1,
+                url,
+                ..
+            }] if url == "file:///tmp/report.md?line=7"
         ));
         renderer.server_owned_input = true;
         assert!(renderer
@@ -1797,6 +2415,7 @@ mod tests {
             input.try_recv().is_err(),
             "link click must not reach the local OMP guest"
         );
+        renderer.resolve_link_activation(1, 1, true, 0);
 
         renderer.server_owned_input = true;
         assert!(matches!(
@@ -1809,15 +2428,25 @@ mod tests {
 
         renderer.target.as_mut().unwrap().size = (80, 24, 10, 20);
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        renderer.server_owned_input = true;
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<0;11;1M".to_vec(), geometry, 0),
-            Some(ClientMessage::ActivateOmpLink { launch_id: 1, url })
-                if url == "file:///tmp/report.md?line=7"
+            Some(ClientMessage::InputPixels { .. })
+        ));
+        renderer.server_owned_input = false;
+        assert!(matches!(
+            renderer.route_pixel_input(b"\x1b[<0;11;1M".to_vec(), geometry, 0),
+            Some(ClientMessage::ActivateOmpLink {
+                launch_id: 1,
+                url,
+                ..
+            }) if url == "file:///tmp/report.md?line=7"
         ));
         renderer.apply_target(2, 2, None, false, false, test_prefix(), (80, 24, 10, 20), 0);
-        assert!(renderer
-            .route_pixel_input(b"\x1b[<0;11;1m".to_vec(), geometry, 0)
-            .is_none());
+        assert!(matches!(
+            renderer.route_pixel_input(b"\x1b[<0;11;1m".to_vec(), geometry, 0),
+            Some(ClientMessage::InputPixels { .. })
+        ));
         assert!(
             input.try_recv().is_err(),
             "pixel link click must not reach the local OMP guest after target replacement"
@@ -1886,7 +2515,12 @@ mod tests {
         let (mut renderer, events, pane_id) = active_renderer(runtime, prefix.clone());
         let route = renderer.target.as_ref().unwrap().route.clone();
 
-        events.try_send(AppEvent::PaneDied { pane_id }).unwrap();
+        events
+            .try_send(AppEvent::PaneDied {
+                pane_id,
+                child_pid: None,
+            })
+            .unwrap();
         assert!(renderer.next_frame(Instant::now(), (80, 24)).is_none());
         assert!(renderer.target.as_ref().unwrap().failed);
         assert!(!renderer.local_selected);

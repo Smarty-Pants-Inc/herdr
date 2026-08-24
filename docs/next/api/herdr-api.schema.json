@@ -757,6 +757,38 @@
           ],
           "type": "string"
         },
+        "ExecutionTarget": {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "host": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ssh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "host"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
@@ -789,6 +821,12 @@
                 "string",
                 "null"
               ]
+            },
+            "execution_target": {
+              "$ref": "#/schemas/event/$defs/ExecutionTarget",
+              "default": {
+                "kind": "local"
+              }
             },
             "focused": {
               "type": "boolean"
@@ -2104,6 +2142,38 @@
           ],
           "type": "object"
         },
+        "ExecutionTarget": {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "host": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ssh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "host"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2222,6 +2292,9 @@
                     "type": "string"
                   },
                   "type": "object"
+                },
+                "execution_target": {
+                  "$ref": "#/schemas/request/$defs/ExecutionTarget"
                 },
                 "label": {
                   "type": [
@@ -3101,6 +3174,12 @@
         },
         "PaneSplitParams": {
           "properties": {
+            "caller_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cwd": {
               "type": [
                 "string",
@@ -3115,6 +3194,16 @@
                 "type": "string"
               },
               "type": "object"
+            },
+            "execution_target": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/ExecutionTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "focus": {
               "default": false,
@@ -3368,6 +3457,12 @@
                 "null"
               ]
             },
+            "view_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "workspace_cwd": {
               "type": [
                 "string",
@@ -3530,7 +3625,23 @@
             "plugin_id": {
               "type": "string"
             },
+            "scope": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/PluginPaneScope"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "target_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "view_id": {
               "type": [
                 "string",
                 "null"
@@ -3567,6 +3678,13 @@
             "split",
             "tab",
             "zoomed"
+          ],
+          "type": "string"
+        },
+        "PluginPaneScope": {
+          "enum": [
+            "shared",
+            "client_private"
           ],
           "type": "string"
         },
@@ -7098,6 +7216,38 @@
           ],
           "type": "string"
         },
+        "ExecutionTarget": {
+          "oneOf": [
+            {
+              "properties": {
+                "kind": {
+                  "const": "local",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "host": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "ssh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "host"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "InstalledPluginInfo": {
           "properties": {
             "actions": {
@@ -7299,6 +7449,9 @@
                   },
                   "type": "object"
                 },
+                "execution_target": {
+                  "$ref": "#/schemas/success_response/$defs/ExecutionTarget"
+                },
                 "label": {
                   "type": [
                     "string",
@@ -7475,6 +7628,12 @@
                 "string",
                 "null"
               ]
+            },
+            "execution_target": {
+              "$ref": "#/schemas/success_response/$defs/ExecutionTarget",
+              "default": {
+                "kind": "local"
+              }
             },
             "focused": {
               "type": "boolean"
@@ -8305,6 +8464,12 @@
                 "null"
               ]
             },
+            "view_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "workspace_cwd": {
               "type": [
                 "string",
@@ -8501,6 +8666,9 @@
                 "null"
               ]
             },
+            "scope": {
+              "$ref": "#/schemas/success_response/$defs/PluginPaneScope"
+            },
             "title": {
               "type": "string"
             },
@@ -8572,6 +8740,13 @@
             "split",
             "tab",
             "zoomed"
+          ],
+          "type": "string"
+        },
+        "PluginPaneScope": {
+          "enum": [
+            "shared",
+            "client_private"
           ],
           "type": "string"
         },

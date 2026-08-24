@@ -734,8 +734,11 @@ pub enum ClientMessage {
     },
     /// The App displayed the first frame for this exact client-local renderer launch.
     OmpRendererReady { launch_id: u64 },
-    /// Request activation of a safe link from this client-local OMP renderer launch.
-    ActivateOmpLink { launch_id: u64, url: String },
+    ActivateOmpLink {
+        launch_id: u64,
+        request_id: u64,
+        url: String,
+    },
 }
 
 /// Herdr-owned controller operations; payload bytes remain owned by OMP.
@@ -1109,6 +1112,11 @@ pub enum ServerMessage {
         surface_active: bool,
         prefix: OmpRendererPrefix,
     },
+    OmpLinkActivationResult {
+        launch_id: u64,
+        request_id: u64,
+        activated: bool,
+    },
 }
 
 /// Host liveness plus the currently assigned OMP controller, if any.
@@ -1455,6 +1463,7 @@ mod tests {
         assert_eq!(
             tag(&ClientMessage::ActivateOmpLink {
                 launch_id: 9,
+                request_id: 3,
                 url: "https://example.com".into(),
             }),
             20
@@ -1504,6 +1513,14 @@ mod tests {
                 },
             }),
             22
+        );
+        assert_eq!(
+            tag(&ServerMessage::OmpLinkActivationResult {
+                launch_id: 9,
+                request_id: 3,
+                activated: true,
+            }),
+            23
         );
     }
 
@@ -1682,10 +1699,23 @@ mod tests {
     fn activate_omp_link_roundtrip() {
         let message = ClientMessage::ActivateOmpLink {
             launch_id: 9,
+            request_id: 3,
             url: "file:///tmp/report.md?line=7".into(),
         };
         let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(message, decoded);
+    }
+    #[test]
+    fn omp_link_activation_result_roundtrip() {
+        let message = ServerMessage::OmpLinkActivationResult {
+            launch_id: 9,
+            request_id: 3,
+            activated: false,
+        };
+        let encoded = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(message, decoded);
     }

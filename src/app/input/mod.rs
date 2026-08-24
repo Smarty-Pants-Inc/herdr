@@ -349,6 +349,15 @@ impl App {
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) -> bool {
+        self.handle_mouse_from_input_source_for_view(source_id, None, mouse)
+    }
+
+    pub(super) fn handle_mouse_from_input_source_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        mouse: MouseEvent,
+    ) -> bool {
         let hover_changed = self.update_hovered_pane_link(mouse)
             || (matches!(
                 mouse.kind,
@@ -414,7 +423,7 @@ impl App {
             }
         }
 
-        if self.handle_url_click(source_id, mouse) {
+        if self.handle_url_click_for_view(source_id, view_id, mouse) {
             return hover_changed;
         }
 
@@ -622,9 +631,10 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> bool {
         self.pending_url_click_sources.insert(source_id);
-        if self.activate_link_once(source_id, pane_id, url) {
+        if self.activate_link_once(source_id, pane_id, url, view_id) {
             true
         } else {
             self.pending_url_click_sources.remove(&source_id);
@@ -637,12 +647,44 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> bool {
+        self.activate_link_once_with_key(source_id, pane_id.raw().to_string(), url, |app, url| {
+            app.activate_resolved_link(source_id, pane_id, url, view_id)
+        })
+    }
+
+    pub(crate) fn activate_link_once_from_source_with_fallback(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_pane_id: &str,
+        url: String,
+        view_id: &crate::api::schema::ViewId,
+        fallback: impl FnOnce(String) -> bool,
+    ) -> bool {
+        self.activate_link_once_with_key(source_id, source_pane_id.to_owned(), url, |app, url| {
+            app.activate_resolved_link_with(
+                url,
+                move |app, url| {
+                    app.invoke_plugin_link_handler_for_url_from_source(url, source_pane_id, view_id)
+                },
+                move |_, url| fallback(url),
+            )
+        })
+    }
+
+    fn activate_link_once_with_key(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_key: String,
+        url: String,
+        activate: impl FnOnce(&mut Self, String) -> bool,
     ) -> bool {
         let at = std::time::Instant::now();
         if self
             .last_link_click
             .as_ref()
-            .is_some_and(|last| last.is_duplicate_for(source_id, pane_id, &url, at))
+            .is_some_and(|last| last.is_duplicate_for(source_id, &source_key, &url, at))
         {
             if let Some(last) = self.last_link_click.as_mut() {
                 last.at = at;
@@ -650,10 +692,10 @@ impl App {
             return true;
         }
         self.last_link_click = None;
-        if self.activate_resolved_link(source_id, pane_id, url.clone()) {
+        if activate(self, url.clone()) {
             self.last_link_click = Some(LinkClickState {
                 source_id,
-                pane_id,
+                source_key,
                 url,
                 at,
             });
@@ -668,30 +710,54 @@ impl App {
         source_id: super::InputSourceId,
         pane_id: crate::layout::PaneId,
         url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> bool {
+        self.activate_resolved_link_with(
+            url,
+            move |app, url| app.invoke_plugin_link_handler_for_url_for_view(url, pane_id, view_id),
+            move |app, url| app.queue_open_url(source_id, url),
+        )
+    }
+
+    fn activate_resolved_link_with(
+        &mut self,
+        url: String,
+        invoke_plugin_handler: impl FnOnce(&mut Self, &str) -> Result<bool, String>,
+        fallback: impl FnOnce(&mut Self, String) -> bool,
     ) -> bool {
         self.last_pane_click = None;
         let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
             return false;
         };
-        match self.invoke_plugin_link_handler_for_url(&url, pane_id) {
+        match invoke_plugin_handler(self, &url) {
             Ok(true) => return true,
             Ok(false) => {}
             Err(err) => {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
-        if crate::web_url::safe_web_url(&url).is_some()
-            && self
-                .event_tx
-                .try_send(crate::events::AppEvent::OpenUrl { url, source_id })
-                .is_err()
-        {
-            tracing::warn!("failed to queue pane URL opening");
-        }
-        true
+        let Some(url) = crate::web_url::safe_web_url(&url).map(str::to_owned) else {
+            return false;
+        };
+        fallback(self, url)
     }
 
-    fn handle_url_click(&mut self, source_id: super::InputSourceId, mouse: MouseEvent) -> bool {
+    fn queue_open_url(&mut self, source_id: super::InputSourceId, url: String) -> bool {
+        let result = self
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl { url, source_id });
+        if result.is_err() {
+            tracing::warn!("failed to queue pane URL opening");
+        }
+        result.is_ok()
+    }
+
+    fn handle_url_click_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        mouse: MouseEvent,
+    ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -712,7 +778,7 @@ impl App {
             return false;
         };
 
-        self.activate_link_click(source_id, info.id, link.url)
+        self.activate_link_click(source_id, info.id, link.url, view_id)
     }
 
     fn update_hovered_pane_link(&mut self, mouse: MouseEvent) -> bool {
@@ -1125,6 +1191,35 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn full_open_url_queue_rejects_safe_link_without_consuming_it() {
+        let mut app = test_app();
+        for _ in 0..crate::app::APP_EVENT_CHANNEL_CAPACITY {
+            app.event_tx
+                .try_send(crate::events::AppEvent::OpenUrl {
+                    url: "https://example.com/fill".into(),
+                    source_id: 0,
+                })
+                .expect("fill OpenUrl queue");
+        }
+        assert!(app
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl {
+                url: "https://example.com/overflow".into(),
+                source_id: 0,
+            })
+            .is_err());
+
+        let source_id = 41;
+        assert!(!app.activate_link_click(
+            source_id,
+            crate::layout::PaneId::alloc(),
+            "https://example.com/click".into(),
+            None,
+        ));
+        assert!(!app.pending_url_click_sources.contains(&source_id));
     }
 
     #[tokio::test]
