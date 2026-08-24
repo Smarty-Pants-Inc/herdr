@@ -1817,18 +1817,22 @@ mod tests {
             .set_send_timeout(Some(Duration::from_millis(100)))
             .expect("set test send timeout");
         let (writer, queue) = test_queue_writer();
-        let (server_event_tx, _server_event_rx) = mpsc::channel(4);
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             client_writer_loop(server_stream, 13, queue, server_event_tx);
             let _ = done_tx.send(());
         });
 
-        drop(client_stream);
         writer
             .control
             .send(vec![b'x'; 1024 * 1024])
             .expect("message is accepted before the writer observes socket failure");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "writer dequeued failure payload"),
+            ServerEvent::ClientWriterControlDrained { client_id: 13 }
+        ));
+        drop(client_stream);
         done_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("writer exits after socket write failure");
