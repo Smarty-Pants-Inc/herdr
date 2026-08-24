@@ -9001,8 +9001,10 @@ mod tests {
             borders: ratatui::widgets::Borders::NONE,
             is_focused: true,
         }];
-        let (writer, control_rx, _render_rx) = test_client_writer();
-        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        // Inspect the queue synchronously: test_client_writer forwards control records on a
+        // background thread, so try_recv can race with delivery of an already queued message.
+        let writer = ClientWriter::test_backpressured();
+        let mut client = test_identity_client(Some("Ada"), Some(writer.clone()));
         client.renderer_binding_token = Some("binding".into());
         client.omp_renderer_capabilities.client_local_native = true;
         server.clients.insert(7, client);
@@ -9022,7 +9024,7 @@ mod tests {
             surface_active: true,
             ..target
         });
-        while control_rx.try_recv().is_ok() {}
+        while writer.test_pop_control().is_some() {}
         assert_eq!(server.private_omp_pending_routes.get(&7), Some(&route));
 
         assert!(
@@ -9044,10 +9046,7 @@ mod tests {
         assert!(native_target.bound);
         assert!(native_target.ready);
         assert!(native_target.surface_active);
-        assert!(matches!(
-            control_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
+        assert!(writer.test_control_records().is_empty());
         assert!(server.independent_omp_pane_info(7).is_some());
 
         let (remaining, consumed) = server.partition_native_omp_input(
@@ -9084,8 +9083,8 @@ mod tests {
         assert!(!fallback_target.ready);
         assert!(!fallback_target.surface_active);
         match read_server_message(
-            control_rx
-                .recv_timeout(Duration::from_millis(100))
+            writer
+                .test_pop_control()
                 .expect("terminal failure target release"),
         ) {
             ServerMessage::OmpRendererTarget {
