@@ -1,7 +1,7 @@
 {
   "repository": "Smarty-Pants-Inc/oh-my-pi",
-  "commit": "92cee14b9ae22ce5241bcf8fa1242a3a4ebaa5b2",
-  "tree": "b18910eece1cf32e94659d1304a7fcb9623344f3",
-  "version": "17.4.0",
-  "build_id": "managed-omp-b18910eece1cf32e94659d1304a7fcb9623344f3"
+  "commit": "ce9f0b25d90f707a4b2d4082c794c8c075824380",
+  "tree": "2d8fbca013d44ba103161d541177aa769b8aa61d",
+  "version": "18.0.11",
+  "build_id": "managed-omp-2d8fbca013d44ba103161d541177aa769b8aa61d"
 }

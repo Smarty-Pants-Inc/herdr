@@ -167,9 +167,44 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p producer
-          python scripts/smarty_preview_trusted.py download-artifacts --root artifact-zips --identity identity.json
-          python scripts/smarty_preview_trusted.py extract-producer-artifacts --root artifact-zips --output producer --identity identity.json
+          mkdir -p artifact-zips producer
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          identity=json.load(open("identity.json"))
+          token=os.environ["GH_TOKEN"]
+          root=Path("artifact-zips")
+          max_bytes=4 * 1024 * 1024 * 1024
+          max_total_bytes=16 * 1024 * 1024 * 1024
+          declared_total=sum(record.get("size_in_bytes", 0) for record in identity["artifacts"].values())
+          if declared_total < 1 or declared_total > max_total_bytes:
+              raise SystemExit("producer artifact aggregate exceeds download limit")
+          for name, record in identity["artifacts"].items():
+              expected_size=record["size_in_bytes"]
+              if not isinstance(expected_size, int) or expected_size < 1 or expected_size > max_bytes:
+                  raise SystemExit(f"artifact size exceeds download limit: {name}")
+              request=Request(record["archive_download_url"], headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+              path=root / f"{name}.zip"
+              total=0
+              with urlopen(request, timeout=120) as response, path.open("wb") as output:
+                  while True:
+                      chunk=response.read(min(1024 * 1024, expected_size - total + 1))
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      if total > expected_size:
+                          raise SystemExit(f"artifact download exceeds declared size: {name}")
+                      output.write(chunk)
+              if total != expected_size:
+                  raise SystemExit(f"artifact download is truncated: {name}")
+          PY
+          python -I -S - <<'PY'
+          import subprocess
+          from pathlib import Path
+          for archive in sorted(Path("artifact-zips").glob("*.zip")):
+              subprocess.run(["python", "scripts/smarty_preview_trusted.py", "extract-zip", "--archive", str(archive), "--output", "producer"], check=True)
+          PY
           python scripts/smarty_preview_trusted.py verify-downloads --root artifact-zips --identity identity.json --output download-record.json
           python scripts/smarty_preview_trusted.py validate-producer --root producer --identity identity.json --output producer-record.json
           python -I -S - <<'PY'
@@ -193,7 +228,7 @@ jobs:
           compression-level: 0
 
   trusted-source:
-    name: Validate exact private source closure
+    name: Validate and hand off exact private sources
     needs: [validate-seal]
     outputs:
       omp_build_id: ${{ steps.source_identity.outputs.omp_build_id }}
@@ -297,13 +332,79 @@ jobs:
               for key in ("build_id", "commit", "tree", "version"):
                   output.write(f"omp_{key}={omp[key]}\n")
           PY
-      - name: Stage validated source record
+      - name: Archive validated OMP source handoff
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p trusted-source-handoff
           cp trusted-source-record.json trusted-source-handoff/trusted-source-record.json
-      - name: Upload trusted source record
+          python -I -S - <<'PY'
+          import io, json, subprocess, tarfile
+          from pathlib import Path
+          record = json.loads(Path("trusted-source-record.json").read_text(encoding="utf-8"))
+          Path("trusted-source-handoff/omp-descriptor.json").write_text(
+              json.dumps(record["omp"], sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          records = subprocess.check_output(["git", "-C", "omp-source", "ls-tree", "-r", "--full-tree", "-z", "HEAD"])
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          total = 0
+          with tarfile.open("trusted-source-handoff/omp-source.tar", "w") as archive:
+              for tree_record in records.split(b"\0"):
+                  if not tree_record:
+                      continue
+                  header, raw_name = tree_record.split(b"\t", 1)
+                  mode, kind, object_id = header.split()
+                  if kind != b"blob":
+                      raise SystemExit(f"unsupported non-blob OMP source tree entry: {raw_name!r}")
+                  object_name = object_id.decode("ascii")
+                  git_mode = int(mode, 8)
+                  size = int(subprocess.check_output(["git", "-C", "omp-source", "cat-file", "-s", object_name], text=True).strip())
+                  if size > max_file_bytes or total > max_total_bytes - size:
+                      raise SystemExit(f"OMP source exceeds the bounded archive size limit: {raw_name!r}")
+                  total += size
+                  info = tarfile.TarInfo(raw_name.decode("utf-8"))
+                  info.mtime = 0
+                  if git_mode & 0o170000 == 0o120000:
+                      if size < 1 or size > 4096:
+                          raise SystemExit(f"OMP symlink target exceeds the bounded size limit: {raw_name!r}")
+                      target_bytes = subprocess.check_output(["git", "-C", "omp-source", "cat-file", "blob", object_name])
+                      if len(target_bytes) != size:
+                          raise SystemExit(f"OMP symlink target size changed: {raw_name!r}")
+                      target = target_bytes.decode("utf-8")
+                      if (not target or "\x00" in target or "\\" in target or target.startswith("/")
+                              or any(part in ("", ".") for part in target.split("/"))):
+                          raise SystemExit(f"unsafe OMP symlink target: {raw_name!r}")
+                      info.type = tarfile.SYMTYPE
+                      info.linkname = target
+                      info.mode = 0
+                      info.size = 0
+                      archive.addfile(info)
+                      continue
+                  info.mode = git_mode & 0o7777
+                  info.size = size
+                  process = subprocess.Popen(["git", "-C", "omp-source", "cat-file", "blob", object_name], stdout=subprocess.PIPE)
+                  if process.stdout is None:
+                      process.kill()
+                      process.wait()
+                      raise SystemExit("OMP Git blob stream is unavailable")
+                  try:
+                      archive.addfile(info, process.stdout)
+                      if process.stdout.read(1):
+                          raise SystemExit(f"OMP Git blob exceeds declared size: {raw_name!r}")
+                  except BaseException:
+                      if process.poll() is None:
+                          process.kill()
+                      process.wait()
+                      raise
+                  if process.wait() != 0:
+                      raise SystemExit(f"OMP Git blob could not be read: {raw_name!r}")
+          PY
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
+            --archive trusted-source-handoff/omp-source.tar \
+            --repository omp-source
+      - name: Upload trusted source handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: trusted-source-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
@@ -313,33 +414,33 @@ jobs:
 
   trusted-build:
     name: Independently build trusted Herdr ${{ matrix.platform }}
-    needs: [validate-seal, trusted-source]
+    needs: [validate-seal]
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux-x86_64
-            os: ubuntu-22.04
+            os: smarty-linux-16-core
             target: x86_64-unknown-linux-musl
             omp_target: ''
             native_targets: ''
           - platform: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: smarty-linux-arm-16-core
             target: aarch64-unknown-linux-musl
             omp_target: ''
             native_targets: ''
           - platform: macos-x86_64
-            os: macos-15-intel
+            os: smarty-macos-intel-12-core
             target: x86_64-apple-darwin
             omp_target: ''
             native_targets: ''
           - platform: macos-aarch64
-            os: macos-14
+            os: smarty-macos-arm-5-core
             target: aarch64-apple-darwin
             omp_target: ''
             native_targets: ''
           - platform: windows-x86_64
-            os: windows-latest
+            os: smarty-windows-16-core
             target: x86_64-pc-windows-msvc
             omp_target: ''
             native_targets: ''
@@ -349,6 +450,7 @@ jobs:
       contents: read
     steps:
       - name: Install Zig
+        if: runner.os == 'Linux'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
@@ -483,19 +585,19 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            os: ubuntu-22.04
+            os: smarty-linux-16-core
             omp_target: linux-x64
             native_targets: "linux-x64-baseline linux-x64-modern"
           - platform: linux-aarch64
-            os: ubuntu-24.04-arm
+            os: smarty-linux-arm-16-core
             omp_target: linux-arm64
             native_targets: "linux-arm64"
           - platform: macos-x86_64
-            os: macos-15-intel
+            os: smarty-macos-intel-12-core
             omp_target: darwin-x64
             native_targets: "darwin-x64-baseline"
           - platform: macos-aarch64
-            os: macos-14
+            os: smarty-macos-arm-5-core
             omp_target: darwin-arm64
             native_targets: "darwin-arm64"
     permissions:
@@ -523,35 +625,19 @@ jobs:
           set -euo pipefail
           mkdir -p trusted-tools
           cp publisher-source/scripts/smarty_preview_trusted.py trusted-tools/smarty_preview_trusted.py
-          cp publisher-source/scripts/smarty_preview_release.py trusted-tools/preview.py
+          cp publisher-source/scripts/preview.py trusted-tools/preview.py
           rm -rf publisher-source
-      - name: Download validated OMP source record
+      - name: Download validated OMP source handoff
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: trusted-source-${{ needs.validate-seal.outputs.run_id }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
           path: trusted-source
-      - name: Checkout exact validated private OMP source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: Smarty-Pants-Inc/oh-my-pi
-          ref: ${{ needs.validate-seal.outputs.omp }}
-          token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
-          path: omp-source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Verify exact validated private OMP checkout
+      - name: Extract validated OMP source handoff
         shell: bash
         run: |
           set -euo pipefail
-          python -I -S - <<'PY'
-          import json, subprocess
-          from pathlib import Path
-          record = json.loads(Path("trusted-source/trusted-source-record.json").read_text(encoding="utf-8"))["omp"]
-          commit = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD"], text=True).strip()
-          tree = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD^{tree}"], text=True).strip()
-          if commit != record["commit"] or tree != record["tree"]:
-              raise SystemExit("private OMP checkout differs from validated source record")
-          PY
+          python trusted-tools/smarty_preview_trusted.py extract-tar \
+            --archive trusted-source/omp-source.tar --output omp-source
       - name: Cache trusted OMP Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -687,28 +773,12 @@ jobs:
           python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
             --archive validation/producer/source-archives/herdr-source.tar \
             --repository herdr-source
-      - name: Checkout exact validated private OMP source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: Smarty-Pants-Inc/oh-my-pi
-          ref: ${{ needs.validate-seal.outputs.omp }}
-          token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
-          path: omp-source
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Verify exact validated private OMP checkout
+      - name: Extract validated OMP source handoff
         shell: bash
         run: |
           set -euo pipefail
-          python -I -S - <<'PY'
-          import json, subprocess
-          from pathlib import Path
-          record = json.loads(Path("trusted-source/trusted-source-record.json").read_text(encoding="utf-8"))["omp"]
-          commit = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD"], text=True).strip()
-          tree = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD^{tree}"], text=True).strip()
-          if commit != record["commit"] or tree != record["tree"]:
-              raise SystemExit("private OMP checkout differs from validated source record")
-          PY
+          python publisher-source/scripts/smarty_preview_trusted.py extract-tar \
+            --archive trusted-source/omp-source.tar --output omp-source
       - name: Setup pinned Bazelisk for OMP metadata
         uses: bazel-contrib/setup-bazel@5bab119910beb57b5848d5090ee6d35c031fb26e # main 2026-07-30
         with:
@@ -812,6 +882,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets metadata/cargo-metadata source-archives
           cp trusted-source/trusted-source-record.json metadata/source-validation.json
+          cp trusted-source/omp-source.tar source-archives/omp-source.tar
           cp validation/producer/producer-plan.json metadata/producer-plan.json
           cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar
           python -I -S - <<'PY'
@@ -863,7 +934,7 @@ jobs:
           )"
           test "$plan_protocol" = "$protocol"
           omp_version="$(python -I -S -c 'import json; print(json.load(open("metadata/omp-descriptor.json"))["version"])')"
-          python publisher-source/scripts/smarty_preview_release.py spdx --output release-assets/smarty-pair.spdx.json --asset-dir release-assets --built-at "$BUILT_AT" --parent-commit "$PARENT" --herdr-commit "$SOURCE" --omp-commit "$OMP" --herdr-version "${base_version}-preview.${TAG#smarty-preview-}" --omp-version "$omp_version" --herdr-root herdr-source --omp-root omp-source --omp-bazel-graph metadata/omp-bazel-graph.json --cargo-metadata-dir metadata/cargo-metadata
+          python publisher-source/scripts/preview.py spdx --output release-assets/smarty-pair.spdx.json --asset-dir release-assets --built-at "$BUILT_AT" --parent-commit "$PARENT" --herdr-commit "$SOURCE" --omp-commit "$OMP" --herdr-version "${base_version}-preview.${TAG#smarty-preview-}" --omp-version "$omp_version" --herdr-root herdr-source --omp-root omp-source --omp-bazel-graph metadata/omp-bazel-graph.json --cargo-metadata-dir metadata/cargo-metadata
           python -I -S - <<'PY'
           import json, os
           from pathlib import Path
@@ -879,7 +950,7 @@ jobs:
             release-assets
             sealed
             metadata
-            source-archives/herdr-source.tar
+            source-archives
           if-no-files-found: error
           compression-level: 0
 
@@ -905,21 +976,12 @@ jobs:
           fetch-depth: 1
           path: publisher-source
           persist-credentials: false
-      - name: Checkout exact validated private OMP source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: Smarty-Pants-Inc/oh-my-pi
-          ref: ${{ needs.validate-seal.outputs.omp }}
-          token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}
-          path: omp-source
-          fetch-depth: 1
-          persist-credentials: false
       - name: Download sealed inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: trusted-sealed-inputs-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
           path: .
-      - name: Restore exact sources without persisting private bytes
+      - name: Extract trusted source archives with bounded verifier
         shell: bash
         run: |
           set -euo pipefail
@@ -1243,7 +1305,7 @@ jobs:
           PY
           )"
           test "$PLAN_PROTOCOL" = "$PROTOCOL"
-          python publisher-source/scripts/smarty_preview_release.py pair-manifest \
+          python publisher-source/scripts/preview.py pair-manifest \
             --output release-assets/smarty-pair.json --asset-dir release-assets \
             --tag "$TAG" --build-id "$BUILD_ID" --built-at "$BUILT_AT" \
             --parent-commit "$PARENT" --parent-tree "$PARENT_TREE" \
@@ -1279,7 +1341,7 @@ jobs:
           PARENT_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["parent"])')"
           SOURCE_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["source"])')"
           OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["omp"])')"
-          python publisher-source/scripts/smarty_preview_release.py verify-pair \
+          python publisher-source/scripts/preview.py verify-pair \
             --asset-dir release-assets --expected-parent "$PARENT" --expected-source "$SOURCE" --expected-omp "$OMP" \
             --expected-parent-tree "$PARENT_TREE" --expected-source-tree "$SOURCE_TREE" --expected-omp-tree "$OMP_TREE" \
             --expected-tag "$TAG" --expected-build-id "$BUILD_ID" --herdr-root herdr-source --omp-root omp-source \

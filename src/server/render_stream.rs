@@ -327,25 +327,27 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    render_virtual_with_runtime_registry_and_identity(
+    render_virtual_with_runtime_registry_and_identity_and_private_surface(
         app_state,
         terminal_runtimes,
         area,
         resize_panes,
         cell_size,
         &crate::ui::IdentityUiState::default(),
+        None,
     )
 }
 
-pub(crate) fn render_virtual_with_runtime_registry_and_identity(
+pub(crate) fn render_virtual_with_runtime_registry_and_identity_and_private_surface(
     app_state: &mut AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
     identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some();
+    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
@@ -360,20 +362,21 @@ pub(crate) fn render_virtual_with_runtime_registry_and_identity(
         app_state,
         terminal_runtimes,
         area,
-        popup_visible,
         suppress_focused_terminal_cursor,
         identity,
+        private_surface,
     )
 }
 
-pub(crate) fn render_precomputed_virtual_with_runtime_registry(
+pub(crate) fn render_precomputed_virtual_with_runtime_registry_and_private_surface(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     pre_compute_suppresses_focused_terminal_cursor: bool,
     identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some();
+    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || (!popup_visible
             && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
@@ -381,9 +384,9 @@ pub(crate) fn render_precomputed_virtual_with_runtime_registry(
         app_state,
         terminal_runtimes,
         area,
-        popup_visible,
         suppress_focused_terminal_cursor,
         identity,
+        private_surface,
     )
 }
 
@@ -391,9 +394,9 @@ fn render_precomputed_virtual_inner(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
-    popup_visible: bool,
     suppress_focused_terminal_cursor: bool,
     identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
@@ -410,9 +413,11 @@ fn render_precomputed_virtual_inner(
         .expect("render to TestBackend should never fail");
 
     let buffer = terminal.backend().buffer().clone();
-    let cursor = if identity.editor_open {
+    let cursor = if let Some(surface) = private_surface {
+        surface.cursor(app_state.view.terminal_area)
+    } else if identity.editor_open {
         terminal.backend().rendered_cursor()
-    } else if popup_visible {
+    } else if app_state.popup_pane.is_some() {
         popup_terminal_cursor(app_state, terminal_runtimes)
     } else if suppress_focused_terminal_cursor {
         None
@@ -425,6 +430,30 @@ fn render_precomputed_virtual_inner(
     };
 
     (buffer, cursor)
+}
+
+pub(crate) fn overlay_private_surface(
+    buffer: &mut ratatui::buffer::Buffer,
+    surface: &crate::server::private_surface::PrivateSurface,
+    palette: &crate::app::state::Palette,
+    area: Rect,
+) {
+    let Some(outer) = surface.outer_rect(area) else {
+        return;
+    };
+    let backend = CursorTrackingBackend::new(buffer.area.right(), buffer.area.bottom());
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    terminal
+        .draw(|frame| surface.render(frame, palette, area))
+        .expect("render to TestBackend should never fail");
+    let overlay = terminal.backend().buffer();
+    let x_end = outer.right().min(buffer.area.right());
+    let y_end = outer.bottom().min(buffer.area.bottom());
+    for y in outer.y.max(buffer.area.y)..y_end {
+        for x in outer.x.max(buffer.area.x)..x_end {
+            buffer[(x, y)] = overlay[(x, y)].clone();
+        }
+    }
 }
 
 fn popup_terminal_cursor(

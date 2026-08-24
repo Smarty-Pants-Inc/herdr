@@ -182,6 +182,9 @@ impl App {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        if !terminal.execution_target.is_local() {
+            return Err(AgentStartError::UnsupportedExecutionTarget(params.pane_id));
+        }
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
@@ -192,11 +195,6 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-        argv.extend(params.args);
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
-            .ok_or(AgentStartError::InvalidArgument)?;
-        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
             params
                 .timeout_ms
@@ -205,6 +203,14 @@ impl App {
         if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
             return Err(AgentStartError::InvalidTimeout);
         }
+
+        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+        argv.extend(params.args);
+        let argv = resolve_agent_argv(crate::detect::agent_label(kind), argv, true)
+            .map_err(AgentStartError::OmpUnavailable)?;
+        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+            .ok_or(AgentStartError::InvalidArgument)?;
+        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
 
         let now = Instant::now();
         let terminal = self
@@ -247,10 +253,20 @@ impl App {
                 code: "invalid_agent_timeout".into(),
                 message: INVALID_AGENT_TIMEOUT_MESSAGE.into(),
             },
+            AgentStartError::OmpUnavailable(message) => crate::api::schema::ErrorBody {
+                code: "agent_omp_unavailable".into(),
+                message: format!("failed to resolve the paired OMP executable: {message}"),
+            },
             AgentStartError::TargetNotFound(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_not_found".into(),
                 message: format!("agent target pane {target} not found"),
             },
+            AgentStartError::UnsupportedExecutionTarget(target) => {
+                crate::api::schema::ErrorBody {
+                    code: "agent_start_unsupported_execution_target".into(),
+                    message: format!("agent start only supports local panes; {target} is remote"),
+                }
+            }
             AgentStartError::TargetBusy(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_busy".into(),
                 message: format!("agent target pane {target} is not an available shell"),
@@ -417,6 +433,37 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
     }
     crate::platform::available_pane_shell(runtime.child_pid()?)
 }
+/// Resolve a managed agent executable when Herdr starts it in a local pane.
+/// Persisted resume plans keep the logical `omp` command and resolve the
+/// release-local companion only at execution time.
+pub(crate) fn resolve_agent_argv(
+    agent: &str,
+    argv: Vec<String>,
+    local: bool,
+) -> Result<Vec<String>, String> {
+    resolve_agent_argv_with(
+        agent,
+        argv,
+        local,
+        crate::update::server_private_omp_executable,
+    )
+}
+
+fn resolve_agent_argv_with(
+    agent: &str,
+    mut argv: Vec<String>,
+    local: bool,
+    resolve: impl FnOnce() -> Result<crate::update::OmpExecutable, String>,
+) -> Result<Vec<String>, String> {
+    if !local || agent != "omp" || argv.is_empty() {
+        return Ok(argv);
+    }
+
+    let executable = resolve()?;
+    executable.verify()?;
+    argv[0] = executable.executable().to_string_lossy().into_owned();
+    Ok(argv)
+}
 
 pub(super) fn runtime_hosts_agent(
     runtime: &crate::terminal::TerminalRuntime,
@@ -445,7 +492,9 @@ pub(super) enum AgentStartError {
     UnsupportedKind(String),
     InvalidArgument,
     InvalidTimeout,
+    OmpUnavailable(String),
     TargetNotFound(String),
+    UnsupportedExecutionTarget(String),
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),
@@ -468,7 +517,7 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use super::{resolve_agent_argv_with, valid_agent_name};
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
@@ -487,5 +536,43 @@ mod tests {
         ] {
             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
         }
+    }
+    #[test]
+    fn local_omp_launch_uses_exact_companion_without_mutating_plan() {
+        let argv = vec!["omp".into(), "--resume=session".into()];
+        let expected = std::env::current_exe().unwrap();
+        let resolved = resolve_agent_argv_with("omp", argv.clone(), true, || {
+            Ok(crate::update::OmpExecutable::Explicit(expected.clone()))
+        })
+        .unwrap();
+
+        assert_eq!(resolved[0], expected.to_string_lossy());
+        assert_eq!(resolved[1], "--resume=session");
+        assert_eq!(argv[0], "omp");
+    }
+
+    #[test]
+    fn local_omp_launch_fails_closed_when_companion_resolution_fails() {
+        let err = resolve_agent_argv_with("omp", vec!["omp".into()], true, || {
+            Err("paired companion is unavailable".into())
+        })
+        .unwrap_err();
+        assert_eq!(err, "paired companion is unavailable");
+    }
+
+    #[test]
+    fn remote_and_non_omp_launches_do_not_resolve_a_companion() {
+        let argv = vec!["omp".into(), "--resume=session".into()];
+        let remote = resolve_agent_argv_with("omp", argv.clone(), false, || {
+            panic!("remote launches must not resolve a local companion")
+        })
+        .unwrap();
+        assert_eq!(remote, argv);
+
+        let other = resolve_agent_argv_with("codex", argv.clone(), true, || {
+            panic!("non-OMP launches must not resolve a companion")
+        })
+        .unwrap();
+        assert_eq!(other, argv);
     }
 }

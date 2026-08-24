@@ -2137,7 +2137,7 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry) => {
-                if let Some(message) = state.omp_renderer.route_pixel_input(data, geometry) {
+                if let Some(message) = state.omp_renderer.route_pixel_input(data, geometry, 0) {
                     if let Err(err) = write_to_server(&mut write_stream, &message) {
                         return Err(ClientError::ConnectionLost(err));
                     }
@@ -2188,9 +2188,11 @@ async fn run_client_loop(
                 state.request_repaint();
                 #[cfg(unix)]
                 {
-                    state
-                        .omp_renderer
-                        .resize((new_cols, new_rows, cell_width_px, cell_height_px));
+                    state.omp_renderer.resize(
+                        (new_cols, new_rows, cell_width_px, cell_height_px),
+                        crate::input::mouse::HostGeometry::current(),
+                        0,
+                    );
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                 }
                 let msg = ClientMessage::Resize {
@@ -2235,6 +2237,7 @@ async fn run_client_loop(
                                 state.reported_cell_size_px.0,
                                 state.reported_cell_size_px.1,
                             ),
+                            0,
                         );
                         display_pending_omp_surface(&mut state, &mut write_stream)?;
                     }
@@ -2247,6 +2250,21 @@ async fn run_client_loop(
                         surface_active,
                         prefix,
                     );
+                }
+                ServerMessage::OmpLinkActivationResult {
+                    launch_id,
+                    request_id,
+                    activated,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        state
+                            .omp_renderer
+                            .resolve_link_activation(launch_id, request_id, activated, 0);
+                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (launch_id, request_id, activated);
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {

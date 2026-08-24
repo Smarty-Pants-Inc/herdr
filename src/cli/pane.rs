@@ -639,13 +639,14 @@ fn parse_pane_split_args(
     args: &[String],
     env_pane_id: Option<&str>,
 ) -> Result<PaneSplitParams, String> {
-    let args = super::expand_equals_args(args, &["--right-click"]);
+    let args = super::expand_equals_args(args, &["--right-click", "--target", "--workspace"]);
     let mut env = std::collections::HashMap::new();
     let mut pane_id = None;
     let mut workspace_id = None;
     let mut direction = None;
     let mut ratio = None;
     let mut cwd = None;
+    let mut execution_target = None;
     let mut focus = false;
     let mut right_click = PaneRightClickTarget::Herdr;
 
@@ -709,6 +710,13 @@ fn parse_pane_split_args(
                 cwd = Some(value.clone());
                 index += 2;
             }
+            "--target" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --target".into());
+                };
+                execution_target = Some(value.parse::<crate::execution::ExecutionTarget>()?);
+                index += 2;
+            }
             "--right-click" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err("missing value for --right-click".into());
@@ -742,7 +750,7 @@ fn parse_pane_split_args(
 
     let Some(direction) = direction else {
         return Err(
-            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
+            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--target local|ssh:HOST] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
                 .into(),
         );
     };
@@ -750,9 +758,11 @@ fn parse_pane_split_args(
     Ok(PaneSplitParams {
         workspace_id,
         target_pane_id: pane_id,
+        caller_pane_id: env_pane_id.map(super::normalize_pane_id),
         direction,
         ratio,
         cwd,
+        execution_target,
         focus,
         right_click,
         env,
@@ -1734,7 +1744,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane");
     eprintln!(
-        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
+        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace ID] [--ratio FLOAT] [--cwd PATH] [--target local|ssh:HOST] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]"
     );
     eprintln!("  herdr pane swap --direction left|right|up|down [--pane ID|--current]");
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
@@ -1777,12 +1787,13 @@ mod tests {
     fn parse_pane_split_args_accepts_workspace_target() {
         let params = parse_pane_split_args(
             &args(&["--workspace", "issue-1", "--direction", "right"]),
-            None,
+            Some("w1:plugin"),
         )
         .unwrap();
 
         assert_eq!(params.workspace_id, Some("issue-1".into()));
         assert_eq!(params.target_pane_id, None);
+        assert_eq!(params.caller_pane_id, Some("w1:plugin".into()));
     }
 
     #[test]
@@ -1896,6 +1907,15 @@ mod tests {
 
         assert_eq!(params.target_pane_id, None);
         assert_eq!(params.direction, crate::api::schema::SplitDirection::Down);
+    }
+    #[test]
+    fn parse_pane_split_args_accepts_workspace() {
+        let params =
+            parse_pane_split_args(&args(&["--direction", "down", "--workspace", "w2"]), None)
+                .unwrap();
+
+        assert_eq!(params.workspace_id.as_deref(), Some("w2"));
+        assert_eq!(params.target_pane_id, None);
     }
 
     #[test]

@@ -154,7 +154,7 @@ jobs:
 
   windows-conpty-package:
     name: Windows ConPTY package
-    runs-on: windows-2022
+    runs-on: ${{ github.event_name == 'pull_request' && 'windows-2022' || 'smarty-windows-16-core' }}
     timeout-minutes: 25
     steps:
       - name: Checkout
