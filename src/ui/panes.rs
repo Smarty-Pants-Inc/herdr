@@ -577,7 +577,7 @@ pub(super) fn render_popup_pane(
     let Some((outer, inner)) = popup_pane_rects(app, area) else {
         return;
     };
-    let Some(rt) = terminal_runtimes.get(&popup.terminal_id) else {
+    let Some(runtime) = terminal_runtimes.get(&popup.terminal_id) else {
         return;
     };
     let title = app
@@ -585,14 +585,25 @@ pub(super) fn render_popup_pane(
         .get(&popup.terminal_id)
         .and_then(|terminal| terminal.manual_label.as_deref())
         .unwrap_or("popup");
+    render_popup_runtime(frame, outer, inner, runtime, title, &app.palette);
+}
+
+pub(crate) fn render_popup_runtime(
+    frame: &mut Frame,
+    outer: Rect,
+    inner: Rect,
+    runtime: &crate::terminal::TerminalRuntime,
+    title: &str,
+    palette: &crate::app::state::Palette,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.palette.accent))
+        .border_style(Style::default().fg(palette.accent))
         .title(pane_border_title(title, outer.width, true).unwrap_or_default())
-        .style(Style::default().bg(app.palette.panel_bg));
+        .style(Style::default().bg(palette.panel_bg));
     frame.render_widget(Clear, outer);
     frame.render_widget(block, outer);
-    rt.render(frame, inner, !pane_is_scrolled_back(rt));
+    runtime.render(frame, inner, !pane_is_scrolled_back(runtime));
 }
 
 #[derive(Clone, Copy, Default)]

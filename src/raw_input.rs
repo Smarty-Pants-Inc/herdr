@@ -301,6 +301,7 @@ impl RawInputByteFramer {
         !self.buffer.is_empty()
     }
 
+    #[cfg(any(unix, test))]
     pub(crate) fn pending_len(&self) -> usize {
         self.buffer.len()
     }

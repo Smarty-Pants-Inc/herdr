@@ -1632,6 +1632,55 @@ impl AppState {
             .pane_state(pane_id)
             .map(|pane| pane.attached_terminal_id.clone())
     }
+    pub(crate) fn terminal_id_for_runtime_pane(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<crate::terminal::TerminalId> {
+        self.workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .pane_state(pane_id)
+                    .map(|pane| pane.attached_terminal_id.clone())
+            })
+            .or_else(|| {
+                self.workspace_plugin_panes
+                    .values()
+                    .find(|pane| pane.pane_id == pane_id)
+                    .map(|pane| pane.terminal_id.clone())
+            })
+            .or_else(|| {
+                self.popup_pane
+                    .as_ref()
+                    .filter(|pane| pane.pane_id == pane_id)
+                    .map(|pane| pane.terminal_id.clone())
+            })
+    }
+
+    pub(crate) fn update_terminal_cwd(&mut self, pane_id: PaneId, cwd: std::path::PathBuf) -> bool {
+        let Some(terminal_id) = self.terminal_id_for_runtime_pane(pane_id) else {
+            return false;
+        };
+        let changed = {
+            let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                return false;
+            };
+            let Some(cwd) = crate::pane::usable_reported_cwd(cwd, &terminal.execution_target)
+            else {
+                return false;
+            };
+            if terminal.cwd == cwd {
+                false
+            } else {
+                terminal.cwd = cwd;
+                true
+            }
+        };
+        if changed {
+            self.mark_session_dirty();
+        }
+        changed
+    }
 
     pub(crate) fn remove_unattached_terminal_ids(
         &mut self,
@@ -2362,27 +2411,7 @@ impl AppState {
 }
 
 pub(crate) fn safe_osc8_url(url: &str) -> Option<&str> {
-    crate::web_url::safe_web_url(url).or_else(|| {
-        if url.bytes().any(|byte| byte < b' ' || byte == 0x7f) {
-            return None;
-        }
-        let remainder = url.strip_prefix("file://")?;
-        let path_after_root = if let Some(path) = remainder.strip_prefix('/') {
-            path
-        } else {
-            let (authority, path) = remainder.split_once('/')?;
-            if !authority.eq_ignore_ascii_case("localhost") {
-                return None;
-            }
-            path
-        };
-        let folded = path_after_root.to_ascii_lowercase();
-        (!path_after_root.starts_with('/')
-            && !path_after_root.starts_with('\\')
-            && !folded.starts_with("%2f")
-            && !folded.starts_with("%5c"))
-        .then_some(url)
-    })
+    (!url.is_empty() && !url.bytes().any(|byte| byte < b' ' || byte == 0x7f)).then_some(url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2749,10 +2778,11 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, .. } => {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
+            AppEvent::RemoteExecutionReady { .. } => Vec::new(),
             AppEvent::UpdateReady {
                 version,
                 install_command,
@@ -2937,41 +2967,29 @@ impl AppState {
                 agent_label,
                 seq,
                 ..
-            } => {
-                if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
-                    Vec::new()
-                } else {
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.release_agent_with_mutation(&source, &agent_label, seq)
-                    })
-                    .into_iter()
-                    .collect()
-                }
-            }
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    let remote_omp = terminal
+                        .remote_lifecycle_report_is_process_authority(&source, &agent_label);
+                    if crate::agent_resume::is_official_agent_source(&source, &agent_label)
+                        && !remote_omp
+                    {
+                        return None;
+                    }
+                    terminal.release_agent_with_mutation(&source, &agent_label, seq)
+                })
+                .into_iter()
+                .collect(),
             // Intercepted before this dispatch — in App::handle_internal_event (monolithic)
             // or via HeadlessServer forwarding to the originating input client (server); never
             // touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
+            AppEvent::PaneClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
             AppEvent::OpenUrl { .. } => Vec::new(),
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
-                if !cwd.is_absolute() || !cwd.is_dir() {
-                    return Vec::new();
-                }
-                let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
-                    ws.pane_state(pane_id)
-                        .map(|pane| pane.attached_terminal_id.clone())
-                }) else {
-                    return Vec::new();
-                };
-                let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-                    return Vec::new();
-                };
-                if terminal.cwd != cwd {
-                    terminal.cwd = cwd;
-                    self.mark_session_dirty();
-                }
+                self.update_terminal_cwd(pane_id, cwd);
                 Vec::new()
             }
             AppEvent::GitStatusRefreshed {
@@ -3702,27 +3720,24 @@ mod tests {
     }
 
     #[test]
-    fn osc8_file_urls_require_local_absolute_paths() {
-        assert_eq!(
-            safe_osc8_url("file:///tmp/report.md?line=7"),
-            Some("file:///tmp/report.md?line=7")
-        );
-        assert_eq!(
-            safe_osc8_url("file://localhost/tmp/report.md?line=7"),
-            Some("file://localhost/tmp/report.md?line=7")
-        );
-        assert_eq!(safe_osc8_url("file://attacker/share/report.md"), None);
-        assert_eq!(safe_osc8_url("file://localhost-relative"), None);
-        for unsafe_url in [
-            "file:////attacker/share/report.md",
-            "file://localhost//attacker/share/report.md",
-            "file:///%2Fattacker/share/report.md",
-            "file:///%5C%5Cattacker/share/report.md",
-            "file:///\\\\attacker\\share\\report.md",
-            "file:///tmp/report.md\nHERDR_PLUGIN_CLICKED_URL=forged",
+    fn osc8_urls_are_safe_for_handlers_without_becoming_platform_openers() {
+        for url in [
+            "https://example.com/report",
+            "file:///tmp/report.md?line=7",
+            "file://build.example/tmp/report.md?line=7",
+            "artifact://5776",
         ] {
-            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url}");
+            assert_eq!(safe_osc8_url(url), Some(url));
         }
+        for unsafe_url in [
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
+        ] {
+            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url:?}");
+        }
+        assert!(crate::web_url::safe_web_url("artifact://5776").is_none());
+        assert!(crate::web_url::safe_web_url("file://build.example/tmp/report.md").is_none());
     }
 
     #[test]
@@ -5408,6 +5423,7 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
             pane_id: bg_pane_id,
+            child_pid: None,
         });
 
         assert!(state.pending_agent_notifications.is_empty());
@@ -5598,6 +5614,66 @@ mod tests {
     }
 
     #[test]
+    fn remote_omp_release_clears_report_owned_agent() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("omp-remote");
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::ssh("dev1").expect("valid SSH host");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:omp".into(),
+            "omp".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Idle,
+            None,
+            session_ref,
+            Some(2),
+        );
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+
+        let stale = state.handle_app_event(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "herdr:omp".into(),
+            agent_label: "omp".into(),
+            known_agent: Some(Agent::Omp),
+            seq: Some(2),
+        });
+        assert!(stale.is_empty());
+        assert_eq!(
+            state.terminals[&terminal_id].detected_agent,
+            Some(Agent::Omp)
+        );
+        assert!(state.terminals[&terminal_id].hook_authority.is_some());
+
+        state.handle_app_event(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "herdr:omp".into(),
+            agent_label: "omp".into(),
+            known_agent: Some(Agent::Omp),
+            seq: Some(3),
+        });
+
+        let terminal = &state.terminals[&terminal_id];
+        assert!(terminal.detected_agent.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
+    #[test]
     fn devin_state_report_refreshes_session_without_overriding_screen_state() {
         let mut state = app_with_workspaces(&["active"]);
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
@@ -5724,6 +5800,49 @@ mod tests {
         assert_eq!(state.terminals.get(&terminal_id).unwrap().cwd, cwd);
         assert!(state.session_dirty);
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn terminal_cwd_report_requires_existence_only_for_local_targets() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let missing = std::env::temp_dir().join(format!(
+            "herdr-missing-cwd-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        ));
+        assert!(!missing.exists());
+        let original_cwd = state.terminals[&terminal_id].cwd.clone();
+        state.session_dirty = false;
+
+        state.handle_app_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: missing.clone(),
+        });
+
+        assert_eq!(state.terminals[&terminal_id].cwd, original_cwd);
+        assert!(!state.session_dirty);
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("primary").unwrap();
+        state.handle_app_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: missing.clone(),
+        });
+
+        assert_eq!(state.terminals[&terminal_id].cwd, missing);
+        assert!(state.session_dirty);
     }
 
     #[test]

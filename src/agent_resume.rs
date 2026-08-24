@@ -18,7 +18,7 @@ pub enum AgentSessionRefKind {
     Path,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentResumePlan {
     pub agent: String,
     pub argv: Vec<String>,

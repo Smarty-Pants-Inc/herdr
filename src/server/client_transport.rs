@@ -541,10 +541,10 @@ pub(crate) enum ServerEvent {
         route: crate::server::omp_route::OmpRouteKey,
         retry_id: u64,
     },
-    /// A client-local OMP renderer activated one resolved link.
     ActivateOmpLink {
         client_id: u64,
         launch_id: u64,
+        request_id: u64,
         url: String,
     },
     /// A client attached to an OMP logical pane.
@@ -1365,7 +1365,11 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
-            ClientMessage::ActivateOmpLink { launch_id, url } => {
+            ClientMessage::ActivateOmpLink {
+                launch_id,
+                request_id,
+                url,
+            } => {
                 if url.len() > MAX_LINK_URL_LENGTH {
                     warn!(
                         client_id,
@@ -1380,6 +1384,7 @@ fn client_read_loop(
                 ServerEvent::ActivateOmpLink {
                     client_id,
                     launch_id,
+                    request_id,
                     url,
                 }
             }

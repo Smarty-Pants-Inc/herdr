@@ -161,6 +161,20 @@ back to its pane menu. Right-clicking the pane frame always opens Herdr's menu.
 `pane.split` accepts the same optional `right_click` value for the newly created
 pane.
 
+`pane.split` also accepts an optional `execution_target`: `{"kind":"local"}`
+or, on Unix, `{"kind":"ssh","host":"HOST"}`. When it is omitted, the new
+pane inherits the source pane's target. An explicit `target_pane_id` supplies
+both the insertion point and the source target/cwd. Managed workspace-right
+plugin `caller_pane_id` locality applies only to a workspace-selected split
+without an explicit target pane. A same-target split follows the source cwd; a
+cross-target local split uses the configured `terminal.new_cwd`, while a
+cross-target SSH split starts in the remote user's home. Explicit `cwd`
+overrides either default.
+
+Per-pane SSH execution targets are Unix-only. This does not affect whole-server
+`herdr --remote`, which remains available on Windows clients connecting to
+supported Linux and macOS hosts.
+
 `PaneInfo` includes `scroll` when terminal scroll metrics are available:
 
 ```json
@@ -172,6 +186,10 @@ pane.
 ```
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
+
+Every `PaneInfo` includes its `execution_target`, so clients can keep local and
+SSH-backed panes distinct without inferring locality from paths or process
+metadata.
 
 ### Experimental pane graphics
 
@@ -251,13 +269,14 @@ export the tab containing that pane.
 
 The response includes `workspace_id`, `tab_id`, `zoomed`, `focused_pane_id`, and
 `root`. `root` is a BSP tree of `pane` and `split` nodes. Pane nodes can include
-`pane_id`, `label`, `cwd`, and argv `command`. Split nodes use
-`direction` (`right` or `down`), `ratio`, `first`, and `second`.
+`pane_id`, `label`, `cwd`, argv `command`, and `execution_target`. The target is
+`{"kind":"local"}` by default or, on Unix, `{"kind":"ssh","host":"HOST"}`.
+Split nodes use `direction` (`right` or `down`), `ratio`, `first`, and `second`.
 
 `layout.apply` creates a fresh tab from a declarative tree. If `tab_id` is
 provided, Herdr creates the replacement tab first and then closes the old tab.
-This restores structure, labels, cwd, env, and optional argv commands; it does
-not preserve live PTYs, scrollback, or running processes.
+This restores structure, labels, cwd, execution targets, env, and optional argv
+commands; it does not preserve live PTYs, scrollback, or running processes.
 
 ```json
 {
@@ -281,6 +300,7 @@ not preserve live PTYs, scrollback, or running processes.
         "label": "tests",
         "cwd": "/repo",
         "command": ["sh", "-c", "just test"],
+        "execution_target": { "kind": "ssh", "host": "build.example" },
         "env": { "HERDR_ROLE": "tests" }
       }
     }
@@ -632,12 +652,14 @@ Open a workspace-attached right pane:
 {"id":"req_plugin_right","method":"plugin.pane.open","params":{"plugin_id":"example.explorer","entrypoint":"explorer","placement":"workspace_right","workspace_id":"w1","width":"30%","focus":true}}
 ```
 
-`plugin.pane.open` requires an installed, enabled, platform-compatible plugin,
-then launches the requested manifest `[[panes]]` entrypoint as an argv-backed
-terminal pane. Manifest pane `placement` defaults to `overlay`; request
-`placement` overrides the manifest with `overlay`, `popup`, `workspace_right`,
-`split`, `tab`, or `zoomed`. Overlay and popup placements use the active tiled
-pane as launch context.
+`plugin.pane.open` requires an installed, enabled plugin that is compatible
+with the effective execution target. It launches the requested manifest
+`[[panes]]` entrypoint as an argv-backed terminal surface. Manifest pane
+`placement` defaults to `overlay`; request `placement` overrides it with
+`overlay`, `popup`, `workspace_right`, `split`, `tab`, or `zoomed`. The optional
+`scope` is `shared` by default. `client_private` is valid only for popup
+placement and requires the connected app client's `view_id`. Overlay and popup
+placements use the active tiled pane as launch context.
 
 `workspace_right` targets the specified or active workspace and accepts `width`
 but not `height`. Each workspace can own one right pane outside its tab split
@@ -649,17 +671,24 @@ but not `HERDR_TAB_ID`. The pane closes with its workspace or process and is not
 restored from session snapshots. It otherwise remains outside general
 `pane.*`, layout, persistence, and agent APIs.
 
-Popup terminals are session-modal and do not change the tab layout; optional
-`width` and `height` fields set their outer size as terminal cells or
-percentages such as `"80%"`. Omitted dimensions default to half the terminal
-size, with too-small values clamped to the popup minimum. A popup has no pane
-ID, remains outside all `pane.*` and agent APIs, emits no pane lifecycle events,
-leaves plugin focus context on the underlying tiled pane, and does not export
-`HERDR_PANE_ID` to its process. Popup launch returns `ok`; `popup.close` closes
-the active popup and returns `popup_not_open` when none exists. Split and
-zoomed panes target an existing pane; tab panes can target a workspace. Split,
-tab, zoomed, and overlay panes behave like normal Herdr panes, and
-`plugin.pane.focus` and `plugin.pane.close` continue to operate on those panes.
+A shared popup is session-modal and does not change the tab layout. Optional
+`width` and `height` fields set its outer size as terminal cells or percentages
+such as `"80%"`. It has no pane ID, remains outside `pane.*` and agent APIs,
+emits no pane lifecycle events, keeps plugin focus context on the underlying
+tiled pane, and does not export `HERDR_PANE_ID`. Launch returns `ok`;
+`popup.close` closes only this shared popup and returns `popup_not_open` when
+none exists.
+
+A `client_private` popup is owned by one connected full app client. Its
+rendering, input, cursor, hyperlinks, and terminal size are visible only to
+that client. Each client can own one; a successful replacement closes its old
+popup, and disconnect closes it. Private popups are not snapshotted, restored,
+or handed off, and they exit through their own process rather than
+`popup.close`.
+
+Split and zoomed panes target an existing pane; tab panes can target a
+workspace. Split, tab, zoomed, and overlay panes behave like normal Herdr panes,
+and `plugin.pane.focus` and `plugin.pane.close` continue to operate on them.
 
 ## Socket transport
 

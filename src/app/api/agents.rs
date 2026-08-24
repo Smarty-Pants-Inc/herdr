@@ -332,6 +332,35 @@ mod tests {
         app
     }
 
+    #[test]
+    fn agent_start_rejects_remote_panes_explicitly() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: Vec::new(),
+                timeout_ms: None,
+                allow_cross_pane: false,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_start_unsupported_execution_target");
+    }
+
     #[tokio::test]
     async fn agent_prompt_sends_text_then_delays_enter() {
         let mut app = app_with_agent();

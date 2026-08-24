@@ -64,6 +64,7 @@ mod client;
 mod config;
 mod detect;
 mod events;
+mod execution;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -557,6 +558,21 @@ fn main() -> io::Result<()> {
         eprintln!("error: --remote can only be used with the default launch command");
         eprintln!("run 'herdr --help' for usage");
         std::process::exit(2);
+    }
+
+    if args.get(1).map(String::as_str) == Some("remote-exec") {
+        let Some(request_socket) = args.get(2) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote-exec requires a request socket",
+            ));
+        };
+        if request_socket == "--protocol" {
+            println!("{}", execution::REMOTE_EXEC_PROTOCOL);
+            return Ok(());
+        }
+        let code = execution::run_remote_exec(request_socket)?;
+        std::process::exit(code);
     }
 
     match cli::maybe_run(&args) {
