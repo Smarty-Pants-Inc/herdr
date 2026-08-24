@@ -619,9 +619,9 @@ impl HeadlessServer {
         })
     }
 
-    // Independent renderers either replace the full client surface or restart a
-    // focus-scoped guest. Production enables these paths; tests can disable them
-    // to exercise the pane-local fallback.
+    // Server-private OMP guests are enabled in production for focus-scoped client
+    // surfaces. Full-surface native OMP remains capability-gated by the client
+    // handshake; tests can disable this path to exercise pane-local fallback.
     fn independent_omp_renderers_enabled(&self) -> bool {
         #[cfg(test)]
         {
