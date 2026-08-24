@@ -390,17 +390,10 @@ fn start_remote_request_channel(
 
     for _ in 0..REMOTE_SOCKET_BIND_ATTEMPTS {
         let local_socket = random_socket_path(LOCAL_REQUEST_SOCKET_PREFIX)?;
-        let listener = match bind_private_request_listener(&local_socket) {
+        let (listener, socket_identity) = match bind_private_request_listener(&local_socket) {
             Ok(listener) => listener,
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(err) => return Err(err),
-        };
-        let socket_identity = match crate::ipc::socket_file_identity(&local_socket) {
-            Ok(identity) => identity,
-            Err(err) => {
-                drop(listener);
-                return Err(err);
-            }
         };
 
         let cleanup_identity = socket_identity.clone();
@@ -440,7 +433,9 @@ fn start_remote_request_channel(
 }
 
 #[cfg(unix)]
-fn bind_private_request_listener(path: &Path) -> std::io::Result<UnixListener> {
+fn bind_private_request_listener(
+    path: &Path,
+) -> std::io::Result<(UnixListener, crate::ipc::SocketFileIdentity)> {
     let listener = UnixListener::bind(path)?;
     let socket_identity = match crate::ipc::socket_file_identity(path) {
         Ok(identity) => identity,
@@ -457,7 +452,7 @@ fn bind_private_request_listener(path: &Path) -> std::io::Result<UnixListener> {
         let _ = crate::ipc::remove_socket_file_if_owned(path, &socket_identity);
         return Err(err);
     }
-    Ok(listener)
+    Ok((listener, socket_identity))
 }
 
 #[cfg(unix)]
@@ -1141,8 +1136,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let socket = random_socket_path(LOCAL_REQUEST_SOCKET_PREFIX).unwrap();
-        let listener = bind_private_request_listener(&socket).unwrap();
-        let identity = crate::ipc::socket_file_identity(&socket).unwrap();
+        let (listener, identity) = bind_private_request_listener(&socket).unwrap();
 
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, REMOTE_SOCKET_PERMISSION_MODE);
@@ -1195,8 +1189,7 @@ mod tests {
         };
         let payload = encode_remote_exec_request(&request).unwrap();
         let socket = random_socket_path(LOCAL_REQUEST_SOCKET_PREFIX).unwrap();
-        let listener = bind_private_request_listener(&socket).unwrap();
-        let identity = crate::ipc::socket_file_identity(&socket).unwrap();
+        let (listener, identity) = bind_private_request_listener(&socket).unwrap();
 
         let result = serve_remote_exec_request(
             listener,

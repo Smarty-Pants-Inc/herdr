@@ -153,6 +153,31 @@ enum PaneLaunchIdentity {
     },
     NoIdentity,
 }
+impl PaneLaunchIdentity {
+    fn apply_env(&self, mut apply: impl FnMut(&str, &str)) -> Option<&str> {
+        match self {
+            Self::Managed {
+                workspace_id,
+                tab_id,
+                pane_id,
+            } => {
+                apply(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+                apply(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
+                apply(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+                Some(pane_id)
+            }
+            Self::WorkspaceManaged {
+                workspace_id,
+                pane_id,
+            } => {
+                apply(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+                apply(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
+                Some(pane_id)
+            }
+            Self::Inherit | Self::NoIdentity => None,
+        }
+    }
+}
 
 impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
@@ -226,40 +251,9 @@ impl PaneLaunchEnv {
             env.retain(|(key, _)| key != "HERDR_VIEW_ID");
         }
         env.push((crate::HERDR_ENV_VAR.into(), crate::HERDR_ENV_VALUE.into()));
-        match &self.identity {
-            PaneLaunchIdentity::Managed {
-                workspace_id,
-                tab_id,
-                pane_id,
-            } => {
-                env.push((
-                    crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.into(),
-                    workspace_id.clone(),
-                ));
-                env.push((
-                    crate::integration::HERDR_TAB_ID_ENV_VAR.into(),
-                    tab_id.clone(),
-                ));
-                env.push((
-                    crate::integration::HERDR_PANE_ID_ENV_VAR.into(),
-                    pane_id.clone(),
-                ));
-            }
-            PaneLaunchIdentity::WorkspaceManaged {
-                workspace_id,
-                pane_id,
-            } => {
-                env.push((
-                    crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.into(),
-                    workspace_id.clone(),
-                ));
-                env.push((
-                    crate::integration::HERDR_PANE_ID_ENV_VAR.into(),
-                    pane_id.clone(),
-                ));
-            }
-            PaneLaunchIdentity::Inherit | PaneLaunchIdentity::NoIdentity => {}
-        }
+        let _ = self
+            .identity
+            .apply_env(|key, value| env.push((key.into(), value.into())));
         env
     }
 }
@@ -289,28 +283,15 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
-    let pane_id = match &launch_env.identity {
-        PaneLaunchIdentity::Inherit | PaneLaunchIdentity::NoIdentity => None,
-        PaneLaunchIdentity::Managed {
-            workspace_id,
-            tab_id,
-            pane_id,
-        } => {
-            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
-            cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
-            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
-            Some(pane_id.as_str())
-        }
-        PaneLaunchIdentity::WorkspaceManaged {
-            workspace_id,
-            pane_id,
-        } => {
-            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
-            cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
-            Some(pane_id.as_str())
-        }
-    };
+    if matches!(
+        &launch_env.identity,
+        PaneLaunchIdentity::WorkspaceManaged { .. }
+    ) {
+        cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
+    }
+    let pane_id = launch_env.identity.apply_env(|key, value| {
+        cmd.env(key, value);
+    });
     if let (Some(bridge), Some(pane_id)) = (&launch_env.omp_bridge, pane_id) {
         cmd.env("HERDR_OMP_BRIDGE", bridge.address());
         cmd.env("HERDR_OMP_BRIDGE_TOKEN", bridge.token(pane_id));

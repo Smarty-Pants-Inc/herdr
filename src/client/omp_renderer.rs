@@ -1037,6 +1037,11 @@ impl ClientOmpRenderer {
         }
 
         let replay_locally = self.local_selected && !self.server_owned_input;
+        let runtime_missing = self
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .is_none();
         match input {
             LinkInput::Events {
                 events,
@@ -1046,11 +1051,6 @@ impl ClientOmpRenderer {
                     .push(ClientMessage::InputEvents { events });
             }
             LinkInput::Events { events, generation } => {
-                let runtime_missing = self
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.runtime.as_ref())
-                    .is_none();
                 let failed_at = self
                     .target
                     .as_ref()
@@ -1081,11 +1081,6 @@ impl ClientOmpRenderer {
                 );
             }
             LinkInput::Pixels { inputs, generation } => {
-                let runtime_missing = self
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.runtime.as_ref())
-                    .is_none();
                 let failed_at = self
                     .target
                     .as_ref()

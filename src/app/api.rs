@@ -1631,6 +1631,15 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git init failed for {}", path.display());
     }
+    fn test_app() -> App {
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        )
+    }
 
     fn app_with_overlay(
         workspace: crate::workspace::Workspace,
@@ -2385,15 +2394,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_died_reschedules_unconfirmed_remote_agent_resume() {
-        let event_hub = crate::api::EventHub::default();
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            event_hub.clone(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-resume");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
@@ -2445,7 +2446,8 @@ mod tests {
         assert!(app.state.terminals[&terminal_id]
             .pending_agent_resume_plan
             .is_some());
-        assert!(event_hub
+        assert!(app
+            .event_hub
             .events_after(0)
             .iter()
             .all(|(_, event)| { event.event != crate::api::schema::EventKind::PaneExited }));
@@ -2453,14 +2455,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pane_died_does_not_retire_replacement_runtime() {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-resume");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
@@ -2506,14 +2501,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_died_retries_unconfirmed_remote_shell_until_ready_event() {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-shell");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
@@ -2577,14 +2565,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_event_before_pane_died_closes_confirmed_remote_shell() {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("ready-remote-shell");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
@@ -2618,14 +2599,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_ready_updates_workspace_plugin_caller_cwd() {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-plugin");
         let workspace_id = workspace.id.clone();
         app.state.workspaces = vec![workspace];
@@ -2676,14 +2650,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_remote_resume_report_cannot_confirm_new_attempt() {
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(
-            &crate::config::Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("remote-resume-attempts");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
