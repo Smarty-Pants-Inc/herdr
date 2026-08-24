@@ -620,8 +620,8 @@ impl HeadlessServer {
     }
 
     // Independent renderers either replace the full client surface or restart a
-    // focus-scoped guest. Keep the live host PTY pane-local until they can compose
-    // inside a pane and retain one process per route.
+    // focus-scoped guest. Production enables these paths; tests can disable them
+    // to exercise the pane-local fallback.
     fn independent_omp_renderers_enabled(&self) -> bool {
         #[cfg(test)]
         {
@@ -629,7 +629,7 @@ impl HeadlessServer {
         }
         #[cfg(not(test))]
         {
-            false
+            true
         }
     }
 
