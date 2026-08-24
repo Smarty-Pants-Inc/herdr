@@ -108,10 +108,11 @@ impl App {
                 return encode_error(id, "workspace_not_found", "workspace not found");
             };
             if let Some(argv) = command.as_deref() {
-                ws.create_tab_argv_command(
+                ws.create_tab_argv_command_on(
                     rows,
                     cols,
                     first_cwd,
+                    &root_leaf.execution_target,
                     argv,
                     extra_env,
                     scrollback_limit_bytes,
@@ -119,10 +120,11 @@ impl App {
                     host_terminal_appearance,
                 )
             } else {
-                ws.create_tab(
+                ws.create_tab_on(
                     rows,
                     cols,
                     first_cwd,
+                    &root_leaf.execution_target,
                     scrollback_limit_bytes,
                     host_terminal_theme,
                     host_terminal_appearance,
@@ -328,6 +330,9 @@ impl App {
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
             command: terminal.and_then(|terminal| terminal.launch_argv.clone()),
+            execution_target: terminal
+                .map(|terminal| terminal.execution_target.clone())
+                .unwrap_or_default(),
             env: Default::default(),
         })
     }
@@ -341,20 +346,27 @@ impl App {
         if let Some(cwd) = pane.cwd.as_ref() {
             return PathBuf::from(cwd);
         }
-        let follow_cwd = replace_target.and_then(|(_, tab_idx)| {
-            let pane_id = self
-                .state
-                .workspaces
-                .get(ws_idx)?
-                .tabs
-                .get(tab_idx)?
-                .layout
-                .focused();
-            self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
-        });
-        self.resolve_new_terminal_cwd(
-            follow_cwd.or_else(|| self.focused_pane_cwd_in_workspace(ws_idx)),
-        )
+        let follow_cwd = replace_target
+            .and_then(|(_, tab_idx)| {
+                let pane_id = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)?
+                    .tabs
+                    .get(tab_idx)?
+                    .layout
+                    .focused();
+                self.launch_cwd_for_pane_in_workspace_on(ws_idx, pane_id, &pane.execution_target)
+            })
+            .or_else(|| {
+                let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
+                self.launch_cwd_for_pane_in_workspace_on(ws_idx, pane_id, &pane.execution_target)
+            });
+        if pane.execution_target.is_local() {
+            self.resolve_new_terminal_cwd(follow_cwd)
+        } else {
+            follow_cwd.unwrap_or_default()
+        }
     }
 
     fn apply_layout_node_to_pane(
@@ -401,11 +413,17 @@ impl App {
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
         let host_terminal_appearance = self.state.host_terminal_appearance;
-        let cwd = pane
-            .cwd
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id));
+        let source_target = self
+            .execution_target_for_pane_in_workspace(ws_idx, target_pane_id)
+            .unwrap_or_default();
+        let source_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
+        let cwd = Some(super::panes::split_cwd_for_target(
+            pane.cwd.clone(),
+            &pane.execution_target,
+            &source_target,
+            &self.state.new_terminal_cwd,
+            source_cwd,
+        ));
         let extra_env = super::env::normalize_launch_env(pane.env.clone())
             .map_err(|(_, message)| message.to_string())?;
         let direction = match direction {
@@ -418,13 +436,14 @@ impl App {
                 return Err("workspace not found".into());
             };
             if let Some(argv) = command.as_deref() {
-                ws.split_pane_argv_command_with_ratio(
+                ws.split_pane_argv_command_with_ratio_on(
                     target_pane_id,
                     direction,
                     ratio,
                     rows,
                     cols,
                     cwd,
+                    &pane.execution_target,
                     argv,
                     extra_env,
                     scrollback_limit_bytes,
@@ -433,13 +452,14 @@ impl App {
                     false,
                 )
             } else {
-                ws.split_pane_with_ratio(
+                ws.split_pane_with_ratio_on(
                     target_pane_id,
                     direction,
                     ratio,
                     rows,
                     cols,
                     cwd,
+                    &pane.execution_target,
                     scrollback_limit_bytes,
                     host_terminal_theme,
                     host_terminal_appearance,
@@ -636,11 +656,10 @@ mod tests {
             .terminal_id(right)
             .cloned()
             .unwrap();
-        app.state
-            .terminals
-            .get_mut(&right_terminal_id)
-            .unwrap()
-            .set_manual_label("tests".into());
+        let remote_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+        let right_terminal = app.state.terminals.get_mut(&right_terminal_id).unwrap();
+        right_terminal.set_manual_label("tests".into());
+        right_terminal.execution_target = remote_target.clone();
 
         let response = app.handle_layout_export(
             "req".into(),
@@ -672,6 +691,7 @@ mod tests {
         };
         assert_eq!(pane.label.as_deref(), Some("tests"));
         assert_eq!(pane.pane_id, Some(app.public_pane_id(0, right).unwrap()));
+        assert_eq!(pane.execution_target, remote_target);
     }
 
     #[test]
@@ -834,6 +854,52 @@ mod tests {
             crate::worktree::canonical_or_original(&cached_cwd)
         );
         shutdown_test_runtimes(&mut app);
+    }
+
+    #[test]
+    fn layout_root_cwd_only_follows_matching_execution_target() {
+        let mut app = app_with_workspace();
+        let focused_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(focused_pane)
+            .cloned()
+            .unwrap();
+        let remote_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+        let remote_cwd = PathBuf::from("/remote/worktree");
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target = remote_target.clone();
+        terminal.cwd = remote_cwd.clone();
+        let local_default = std::env::temp_dir();
+        app.state.new_terminal_cwd =
+            crate::config::NewTerminalCwdConfig::Path(local_default.display().to_string());
+
+        assert_eq!(
+            app.layout_root_cwd(0, None, &LayoutPane::default()),
+            local_default
+        );
+        assert_eq!(
+            app.layout_root_cwd(
+                0,
+                None,
+                &LayoutPane {
+                    execution_target: remote_target,
+                    ..Default::default()
+                },
+            ),
+            remote_cwd
+        );
+        assert_eq!(
+            app.layout_root_cwd(
+                0,
+                None,
+                &LayoutPane {
+                    execution_target: crate::execution::ExecutionTarget::ssh("other.example")
+                        .unwrap(),
+                    ..Default::default()
+                },
+            ),
+            PathBuf::new()
+        );
     }
 
     #[tokio::test]

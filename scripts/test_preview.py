@@ -28,18 +28,15 @@ HERDR_SHAS = {target: "d" * 64 for target in preview.ASSET_TARGETS}
 WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview.yml"
 )
-PROMOTION_WORKFLOW_PATH = (
-    Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview-promote.yml"
-)
+CI_WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 INSTALLER_PATH = Path(__file__).resolve().parents[1] / "website/install.ps1"
-
-
-def promotion_workflow_source() -> str:
-    return PROMOTION_WORKFLOW_PATH.read_text(encoding="utf-8")
 
 
 def workflow_source() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+def ci_workflow_source() -> str:
+    return CI_WORKFLOW_PATH.read_text(encoding="utf-8")
 
 
 def workflow_jobs(source: str) -> dict[str, str]:
@@ -76,6 +73,25 @@ def workflow_steps(job: str) -> dict[str, str]:
         elif current is not None:
             steps[current].append(line)
     return {name: "".join(body) for name, body in steps.items()}
+
+
+class CiWorkflowTests(unittest.TestCase):
+    def test_title_gate_rechecks_edits_and_exempts_only_mergify_queue_prs(self):
+        source = ci_workflow_source()
+        self.assertIn("types: [opened, synchronize, reopened, edited]", source)
+        title_step = workflow_steps(workflow_jobs(source)["conventional-commits"])[
+            "Validate PR title"
+        ]
+        self.assertIn("github.actor != 'mergify[bot]'", title_step)
+        self.assertIn(
+            "startsWith(github.head_ref, 'mergify/merge-queue/') == false",
+            title_step,
+        )
+        self.assertFalse(
+            conventional_commits.valid_subject(
+                "merge queue: checking main (abc1234) and #1 together"
+            )
+        )
 
 
 class PreviewNotesTests(unittest.TestCase):
@@ -261,6 +277,62 @@ class PreviewNotesTests(unittest.TestCase):
             retain=retain,
         )
 
+    def test_smarty_channel_binds_legacy_source_date_before_utc_normalization(self):
+        legacy_id = "2026-08-09-eeeeeeeeeeee"
+        tag = f"smarty-preview-{legacy_id}"
+        legacy = {
+            "base_version": "0.8.1",
+            "commit": "e" * 40,
+            "built_at": "2026-08-09T03:00:00Z",
+            "protocol": 12,
+            "tag": tag,
+            "assets": preview.asset_objects(
+                preview.default_asset_urls("Smarty-Pants-Inc/herdr", tag),
+                HERDR_SHAS,
+            ),
+        }
+        self.assertEqual(
+            preview.validate_retained_channel_build(legacy_id, legacy), legacy
+        )
+
+        offset_legacy = json.loads(json.dumps(legacy))
+        offset_legacy["built_at"] = "2026-08-09T23:30:00-04:00"
+        self.assertEqual(
+            preview.validate_retained_channel_build(legacy_id, offset_legacy),
+            offset_legacy,
+        )
+        wrong_source_day = json.loads(json.dumps(offset_legacy))
+        wrong_source_day["built_at"] = "2026-08-08T23:30:00-04:00"
+        with self.assertRaises(ValueError):
+            preview.validate_retained_channel_build(legacy_id, wrong_source_day)
+
+        invalid_timestamp = json.loads(json.dumps(offset_legacy))
+        invalid_timestamp["built_at"] = "2026-02-30T23:30:00-04:00"
+        with self.assertRaisesRegex(ValueError, "ISO-8601"):
+            preview.validate_retained_channel_build(legacy_id, invalid_timestamp)
+
+        for malformed in (
+            "2026-02-30-eeeeeeeeeeee",
+            "2026-08-09-EEEEEEEEEEEE",
+            "2026-08-09-eeeeeeeeeee",
+        ):
+            with self.assertRaises(ValueError):
+                preview.validate_retained_channel_build(malformed, legacy)
+
+        for mutate in (
+            lambda value: value.update(commit="f" * 40),
+            lambda value: value.update(built_at="2026-08-10T03:00:00Z"),
+            lambda value: value["assets"]["linux-x86_64"].update(
+                url="https://attacker.invalid/herdr-linux-x86_64",
+                sha256="a" * 64,
+            ),
+        ):
+            tampered = json.loads(json.dumps(legacy))
+            mutate(tampered)
+            with self.assertRaises(ValueError):
+                preview.validate_retained_channel_build(legacy_id, tampered)
+
+
     def test_windows_bootstrap_bridge_round_trips_exact_canonical_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "preview.json"
@@ -274,7 +346,9 @@ class PreviewNotesTests(unittest.TestCase):
             self.assertEqual(bridge["schema_version"], 2)
             self.assertEqual(bridge["build_id"], alias)
             self.assertEqual(bridge["canonical_build_id"], canonical["build_id"])
-            self.assertEqual(set(bridge["assets"]), {"windows-x86_64"})
+            self.assertEqual(set(bridge["assets"]), set(preview.ASSET_TARGETS))
+            for target in preview.ASSET_TARGETS:
+                self.assertEqual(bridge["assets"][target], canonical["assets"][target])
             self.assertEqual(bridge["builds"], canonical["builds"])
             self.assertEqual(
                 bridge["bootstrap"],
@@ -875,710 +949,175 @@ file: ../../../public/assets/logo.svg
         )
         self.assertIn("blob/v0.7.4/SKILL.md", output)
 
-    def test_smarty_preview_verifies_compiled_omp_version(self):
-        workflow = workflow_source()
-        steps = workflow_steps(workflow_jobs(workflow)["build"])
-        source_identity = steps["Verify paired OMP source identity"]
-        build_identity = steps["Verify candidate OMP build identity"]
-
-        self.assertIn("packages/coding-agent/package.json", source_identity)
-        self.assertIn("needs.preflight.outputs.omp_version", source_identity)
-        self.assertLess(
-            workflow.index("- name: Verify candidate OMP build identity"),
-            workflow.index("- name: Upload paired candidate payload"),
-        )
-        self.assertIn(
-            'test "$("$omp_binary" __build-id)" = "$EXPECTED_OMP_BUILD_ID"',
-            build_identity,
-        )
-        self.assertIn(
-            'test "$("$omp_binary" --version)" = "omp/$EXPECTED_OMP_VERSION"',
-            build_identity,
-        )
-        self.assertIn('"$omp_binary" --smoke-test', build_identity)
-        self.assertNotIn("${{", build_identity.split("run: |", 1)[1])
-
-    def test_smarty_preview_checks_exact_macos_zig_version(self):
-        workflow = (
-            Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview.yml"
-        ).read_text(encoding="utf-8")
-        install = workflow.split("- name: Install patched Zig on macOS", 1)[1].split(
-            "- name: Prefer official Ubuntu mirrors over Azure", 1
-        )[0]
-
-        self.assertIn('zig_prefix="$(brew --prefix zig@0.15)"', install)
-        self.assertIn(
-            'test "$("$zig_prefix/bin/zig" version)" = "$ZIG_VERSION"', install
-        )
-
-    def test_smarty_preview_uses_injective_paired_build_identity(self):
-        root = Path(__file__).resolve().parents[1]
-        official = (root / ".github/workflows/preview.yml").read_text(encoding="utf-8")
-        smarty = (root / ".github/workflows/smarty-preview.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("on:\n  push:\n    tags:\n      - 'smarty-preview-*'", smarty)
-        self.assertNotIn("workflow_dispatch", smarty)
-        self.assertIn('tag="$EVENT_REF_NAME"', smarty)
-        self.assertIn('test "$EVENT_SHA" = "$source"', smarty)
-        self.assertIn("ref: ${{ github.sha }}", smarty)
-        self.assertIn(
-            'merge-base --is-ancestor "$EXPECTED_PARENT" refs/remotes/origin/main',
-            smarty,
-        )
-        self.assertIn('--source-ref "refs/tags/$TAG"', smarty)
-
-        self.assertIn('build_id="$day-$short_sha"', official)
-        self.assertNotIn("--format=%cs", smarty)
-        self.assertIn(
-            'build_id = f"{source_built_at[:10]}-p{expected_parent}-r{expected_source}-o{expected_omp}"',
-            smarty,
-        )
-        self.assertIn('"build_id": build_id', smarty)
-        self.assertIn('"tag": tag', smarty)
-        self.assertIn('output.write(f"{key}={value}\\n")', smarty)
-
-    def test_smarty_preview_guards_authorization_and_records_native_toolchains(self):
-        workflow = workflow_source()
-        jobs = workflow_jobs(workflow)
-        candidate_validation = workflow_steps(jobs["preflight"])[
-            "Validate exact P/R/O candidate"
-        ]
-        render = workflow_steps(jobs["render-channel"])
-        snapshot = render["Snapshot Smarty channel for rendering"]
-        advance = workflow_steps(jobs["advance-channel"])[
-            "Advance Smarty channel with compare-and-swap"
-        ]
-
-        self.assertIn(
-            'git_auth -C parent-source fetch --no-tags "$parent_remote"', workflow
-        )
-        self.assertIn("'+refs/heads/main:refs/remotes/origin/main'", workflow)
-        self.assertIn('-c credential.helper= -c core.askPass="$askpass"', workflow)
-        self.assertNotIn("https://x-access-token:", workflow)
-        self.assertIn(
-            "authorization_ref=refs/heads/smarty-preview-authorization", workflow
-        )
-        self.assertIn(
-            "authorization_ref: ${{ steps.plan.outputs.authorization_ref }}", workflow
-        )
-        self.assertIn(
-            "authorization_state: ${{ steps.plan.outputs.authorization_state }}",
-            workflow,
-        )
-        self.assertIn('authorization_state = "consumed"', candidate_validation)
-        self.assertNotIn("EXPECTED_AUTHORIZATION_LEASE", workflow)
-        self.assertIn(
-            '"--force-with-lease=$authorization_ref:$EXPECTED_AUTHORIZATION_REF"',
-            advance,
-        )
-        self.assertIn(
-            '"--force-with-lease=$channel_ref:$EXPECTED_CHANNEL_COMMIT"', advance
-        )
-        self.assertIn(
-            '"$candidate:$channel_ref" "$candidate:$authorization_ref"', advance
-        )
-        self.assertIn("push --atomic", advance)
-        self.assertIn("commit-tree", advance)
-        self.assertIn('cat-file blob "$observed_channel:preview.json"', advance)
-        self.assertIn("EXPECTED_AUTHORIZATION_STATE", advance)
-        self.assertIn("--toolchain_resolution_debug='.*rules_rust.*'", workflow)
-        self.assertIn("report: omp-rules-rust-linux-x86_64.json", jobs["build"])
-        self.assertIn('f"omp-rules-rust-{platform}.json"', jobs["assemble-spdx"])
-        self.assertIn(
-            "--omp-rules-rust-toolchains candidate/metadata/omp-rules-rust-toolchains.json",
-            jobs["attest-pair"],
-        )
-
-        self.assertIn("unset SMARTY_RELEASE_TOKEN", candidate_validation)
-        self.assertIn("env -i", candidate_validation)
-        self.assertNotIn("from scripts.preview", candidate_validation)
-        self.assertNotIn("scripts/preview.py", candidate_validation)
-        self.assertNotIn("scripts.preview", snapshot)
-        self.assertNotIn("python3", snapshot)
-        self.assertNotIn("python3", advance)
-        self.assertNotIn("scripts.preview", advance)
-
-        credential_variables = (
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "SMARTY_RELEASE_TOKEN",
-            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-            "ACTIONS_ID_TOKEN_REQUEST_URL",
-        )
-        sanitized = (
-            render["Render Smarty channel candidate"],
-            render["Verify rendered channel transition with candidate code"],
-        )
-        for step in sanitized:
-            self.assertIn("env -i", step)
-            for credential in credential_variables:
-                self.assertNotIn(credential, step)
-        for step in sanitized:
-            for forwarded in ('BASE_VERSION="$BASE_VERSION"', 'BUILT_AT="$BUILT_AT"'):
-                self.assertIn(forwarded, step)
-
-        for name in (
-            "Require release token",
-            "Parse immutable release tag",
-            "Validate exact P/R/O candidate",
-            "Inspect immutable release reuse",
-            "Verify publication prerequisites",
-            "Fetch exact immutable release before build reuse",
-            "Verify exact immutable release attestations before build reuse",
-            "Create or reconcile draft-first paired release",
-            "Fetch reconciled draft release",
-            "Verify reconciled draft attestations",
-            "Publish verified draft",
-            "Fetch immutable paired release",
-            "Verify immutable paired release attestations",
-            "Record TUF promotion input for external signing",
-            "Verify rendered Smarty channel candidate",
-            "Advance Smarty channel with compare-and-swap",
-        ):
-            authenticated = workflow.split(f"- name: {name}\n", 1)[1].split(
-                "\n      - name:", 1
-            )[0]
-            for candidate_command in (
-                "scripts/preview.py",
-                "from scripts.preview",
-                "herdr-source/",
-                "cargo fmt",
-                "cargo build",
-                "cargo metadata",
-                "bazel --",
-                "bun install",
-                "bun scripts",
-                "just test",
-            ):
-                self.assertNotIn(candidate_command, authenticated, name)
-
-        windows_package = workflow_steps(jobs["build"])[
-            "Package Windows candidate payload"
-        ]
-        self.assertIn(".\\herdr-source\\scripts\\package_windows_conpty.ps1", workflow)
-        for credential in credential_variables:
-            self.assertNotIn(credential, windows_package)
-
-    def test_privileged_preview_verifiers_are_env_isolated(self):
-        jobs = workflow_jobs(workflow_source())
-        cases = (
-            (
-                "attest-spdx",
-                "Verify exact SPDX attestation inputs",
-                "candidate/handoff/trusted-release-verifier.py spdx",
-            ),
-            (
-                "attest-pair",
-                "Verify exact pair attestation inputs",
-                "candidate/handoff/trusted-release-verifier.py pair-manifest",
-            ),
-        )
-        for job, step, command in cases:
-            self.assertIn("id-token: write", jobs[job])
-            body = workflow_steps(jobs[job])[step]
-            invocation = f"/usr/bin/env -i /usr/bin/python3 -I -S {command}"
-            self.assertIn(invocation, body)
-            isolated = body[body.index(invocation) :]
-            for credential in (
-                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-                "ACTIONS_ID_TOKEN_REQUEST_URL",
-                "GH_TOKEN",
-                "GITHUB_TOKEN",
-                "SMARTY_RELEASE_TOKEN",
-            ):
-                self.assertNotIn(credential, isolated)
-
-    def test_promotion_renderer_drops_release_credentials_before_helpers(self):
-        render = workflow_steps(workflow_jobs(promotion_workflow_source())["promote"])[
-            "Render exact canonical channel from authenticated verifier"
-        ]
-        cleanup = '          /bin/rm -f "$askpass"\n'
-        unset = "          unset GH_TOKEN\n"
-        helper = (
-            "/usr/bin/git -C promotion-repo show "
-            "refs/smarty/promotion-source:scripts/preview.py"
-        )
-        invocation = (
-            "/usr/bin/env -i /usr/bin/python3 -I -S trusted-preview.py "
-            "promote-bootstrap-manifest"
-        )
-        self.assertLess(render.index(cleanup), render.index(unset))
-        self.assertLess(render.index(unset), render.index("git_public() {"))
-        self.assertLess(render.index(unset), render.index(helper))
-        self.assertLess(render.index(helper), render.index(invocation))
-        isolated = render[render.index(invocation) :]
-        self.assertNotIn("GH_TOKEN", isolated)
-        self.assertNotIn("GIT_ASKPASS", isolated)
-
-    def test_candidate_packagers_and_legacy_renderer_are_env_isolated(self):
-        jobs = workflow_jobs(workflow_source())
-        windows = workflow_steps(jobs["build"])["Package Windows candidate payload"]
-        self.assertIn("& $envExe -i `", windows)
-        self.assertIn("$pwsh -NoLogo -NoProfile -NonInteractive", windows)
-        self.assertIn('"DOTNET_CLI_HOME=$trustedHome"', windows)
-        for credential in (
-            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-            "ACTIONS_ID_TOKEN_REQUEST_URL",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "SMARTY_RELEASE_TOKEN",
-        ):
-            self.assertNotIn(credential, windows)
-        render = workflow_steps(jobs["render-channel"])[
-            "Render Smarty channel candidate"
-        ]
-        self.assertIn(
-            "/usr/bin/env -i /usr/bin/python3 -S "
-            "herdr-source/scripts/preview.py legacy-bootstrap-manifest",
-            render,
-        )
-        self.assertGreaterEqual(render.count("env -i"), 2)
-
-    def test_consumed_channel_requires_exact_tree_modes_at_every_boundary(self):
-        jobs = workflow_jobs(workflow_source())
-        candidate = workflow_steps(jobs["preflight"])["Validate exact P/R/O candidate"]
-        archive = workflow_steps(jobs["preflight"])["Archive validated source inputs"]
-        advance = workflow_steps(jobs["advance-channel"])[
-            "Advance Smarty channel with compare-and-swap"
-        ]
-        self.assertIn('"install.sh": ("100755", "blob")', candidate)
-        self.assertIn('"preview.json": ("100644", "blob")', candidate)
-        for body in (archive, advance):
-            self.assertIn("install.sh:100755|preview.json:100644", body)
-            self.assertIn("ls-tree -r", body)
-        self.assertIn('cat-file blob "$observed_channel:preview.json"', advance)
-        self.assertIn('cat-file blob "$observed_channel:install.sh"', advance)
-
-    def test_workflows_canonicalize_source_commit_time_to_utc_z(self):
-        candidate = workflow_steps(workflow_jobs(workflow_source())["preflight"])[
-            "Validate exact P/R/O candidate"
-        ]
-        promotion = workflow_steps(
-            workflow_jobs(promotion_workflow_source())["promote"]
-        )["Render exact canonical channel from authenticated verifier"]
-        self.assertEqual(candidate.count("--format=%cI"), 1)
-        self.assertNotIn("--format=%cs", candidate)
-        self.assertIn("from datetime import datetime, timezone", candidate)
-        self.assertIn("source_time.astimezone(timezone.utc).strftime(", candidate)
-        self.assertIn('"%Y-%m-%dT%H:%M:%SZ"', candidate)
-        self.assertIn('"built_at": source_built_at', candidate)
-        self.assertNotIn('"built_at": git(', candidate)
-        self.assertIn(
-            'build_id = f"{source_built_at[:10]}-p{expected_parent}-r{expected_source}-o{expected_omp}"',
-            candidate,
-        )
-        self.assertEqual(promotion.count("--format=%cI"), 1)
-        self.assertIn(
-            "/usr/bin/env -i GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1",
-            promotion,
-        )
-        self.assertIn(
-            'test "$(git_public rev-parse "$source_ref")" = "$EXPECTED_SOURCE"',
-            promotion,
-        )
-        self.assertIn(
-            'test "$(git_public cat-file -t "$source_ref")" = commit', promotion
-        )
-        self.assertIn(
-            '/usr/bin/env -i SOURCE_BUILT_AT_RAW="$source_built_at_raw"', promotion
-        )
-        self.assertIn('test "$source_built_at" = "$EXPECTED_BUILT_AT"', promotion)
-        self.assertIn('"${BUILD_ID:0:10}" != "${source_built_at:0:10}"', promotion)
-        canonical = (
-            datetime.fromisoformat("2026-08-21T20:00:00-07:00")
-            .astimezone(timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%SZ")
-        )
-        self.assertEqual(canonical, "2026-08-22T03:00:00Z")
-        self.assertEqual(canonical[:10], "2026-08-22")
-
-    def test_smarty_preview_job_graph_is_least_privilege_and_fresh(self):
-        jobs = workflow_jobs(workflow_source())
-        self.assertEqual(
-            list(jobs),
-            [
-                "preflight",
-                "candidate-checks",
-                "build",
-                "attest-platform",
-                "assemble-spdx",
-                "attest-spdx",
-                "assemble-pair",
-                "attest-pair",
-                "verify-release",
-                "render-channel",
-                "reuse-release",
-                "verify-reuse",
-                "publish-release",
-                "verify-publication",
-                "advance-channel",
-                "promote-canonical",
-            ],
-        )
-        for name, body in jobs.items():
-            for dependency in re.findall(r"needs\.([a-z][a-z0-9-]*)\.", body):
-                self.assertIn(dependency, jobs, f"{name} needs {dependency}")
-        for name in (
-            "candidate-checks",
-            "build",
-            "assemble-spdx",
-            "assemble-pair",
-            "verify-release",
-            "render-channel",
-            "verify-reuse",
-        ):
-            body = jobs[name]
-            self.assertIn("    permissions: {}\n", body, name)
-            self.assertNotIn("secrets.", body, name)
-            self.assertNotIn("id-token", body, name)
-            self.assertNotIn("environment:", body, name)
-            self.assertNotIn("contents: write", body, name)
-        for name in ("attest-platform", "attest-spdx", "attest-pair"):
-            body = jobs[name]
-            self.assertIn("id-token: write", body, name)
-            self.assertIn("attestations: write", body, name)
-            self.assertNotIn("secrets.", body, name)
-            self.assertNotIn("contents: write", body, name)
-        for name in (
-            "preflight",
-            "reuse-release",
-            "publish-release",
-            "verify-publication",
-            "advance-channel",
-        ):
-            body = jobs[name]
-            self.assertIn("environment: smarty-release", body, name)
-            self.assertIn("secrets.SMARTY_RELEASE_TOKEN", body, name)
-            self.assertNotIn("id-token", body, name)
-        self.assertIn("contents: write", jobs["publish-release"])
-        for name in (
-            "preflight",
-            "reuse-release",
-            "verify-publication",
-            "advance-channel",
-        ):
-            self.assertNotIn("contents: write", jobs[name], name)
-        for name, key in (("build", "target"), ("attest-platform", "platform")):
-            self.assertEqual(
-                re.findall(r"^          - (\w+):", jobs[name], re.MULTILINE),
-                [key] * 5,
-                name,
-            )
-            self.assertNotIn("|-", jobs[name].split("    steps:", 1)[0], name)
-        self.assertIn("subject-path: subjects/*", jobs["attest-platform"])
-        self.assertIn(
-            "staged attestation subjects are not the exact platform payloads",
-            jobs["attest-platform"],
-        )
-        for name in (
-            "attest-platform",
-            "attest-spdx",
-            "attest-pair",
-            "reuse-release",
-            "publish-release",
-            "verify-publication",
-            "advance-channel",
-        ):
-            body = jobs[name]
-            for command in (
-                "scripts/preview.py",
-                "from scripts.preview",
-                "herdr-source",
-                "omp-source",
-                "cargo ",
-                "bazel",
-                "bun ",
-                "just ",
-            ):
-                self.assertNotIn(command, body, f"{name}: {command}")
-
-    def test_smarty_preview_artifacts_are_bound_to_producer_attempts(self):
+    def test_smarty_preview_is_a_passive_attempt_scoped_producer(self):
         source = workflow_source()
         jobs = workflow_jobs(source)
-        actions = re.findall(
-            r"^        uses: actions/(upload|download)-artifact@[^\n]+\n"
-            r"        with:\n"
-            r"          name: ([^\n]+)$",
-            source,
-            re.MULTILINE,
+        self.assertEqual(list(jobs), ["preflight", "candidate-checks", "build", "candidate-handoff"])
+        self.assertIn("on:\n  push:\n    tags:\n      - 'smarty-preview-*'", source)
+        for forbidden in ("secrets.", "environment:", "id-token:", "contents: write", "attestations: write", "gh api", "gh release", "git push", "workflow_call"):
+            self.assertNotIn(forbidden, source, forbidden)
+        self.assertIn("ref: ${{ github.sha }}", source)
+        self.assertIn("github.run_attempt", source)
+        self.assertIn("smarty-candidate-handoff-${{ needs.preflight.outputs.artifact_attempt }}", source)
+        self.assertIn("candidate-*-${{ needs.preflight.outputs.artifact_attempt }}", source)
+        self.assertIn("source-archives/herdr-source.tar", source)
+        self.assertNotIn("scripts/smarty_preview_trusted.py", source)
+        for pool in (
+            "smarty-linux-16-core",
+            "smarty-linux-arm-16-core",
+            "smarty-macos-intel-12-core",
+            "smarty-macos-arm-5-core",
+            "smarty-windows-16-core",
+        ):
+            self.assertIn(pool, source)
+        self.assertIn("Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6", source)
+        self.assertIn("workspaces: candidate-source", source)
+
+    def test_smarty_preview_prepares_source_archive_and_windows_dependency(self):
+        source = workflow_source()
+        self.assertLess(
+            source.index('Path("source-archives").mkdir()'),
+            source.index('with tarfile.open("source-archives/herdr-source.tar", "w")'),
         )
-        expected_count = source.count("uses: actions/upload-artifact@") + source.count(
-            "uses: actions/download-artifact@"
-        )
-        self.assertEqual(len(actions), expected_count)
-        uploads = [name for kind, name in actions if kind == "upload"]
-        downloads = [name for kind, name in actions if kind == "download"]
-        self.assertGreater(len(uploads), 0)
-        self.assertGreater(len(downloads), 0)
-        suffix = "-${{ github.run_attempt }}"
+        self.assertIn('Get-Content -Raw -LiteralPath "candidate-source\\packaging\\windows\\conpty.json"', source)
+        self.assertIn("Invoke-WebRequest -Uri $metadata.package.url -OutFile $package", source)
+        self.assertIn("Get-FileHash -Algorithm SHA256 -LiteralPath $package", source)
+        self.assertIn("-PackagePath $package", source)
+        self.assertNotIn("-Package $package", source)
+
+
+    def test_smarty_preview_binds_exact_paired_tag_to_source_timestamp(self):
+        source = workflow_source()
+        self.assertIn("EVENT_REF_NAME", source)
+        self.assertIn("EVENT_SHA", source)
+        self.assertIn("git", source)
+        self.assertIn("datetime.fromisoformat", source)
+        self.assertIn('match["day"] != built_at[:10]', source)
+        self.assertIn("build_id = f\"{match['day']}-p{match['parent']}-r{match['source']}-o{match['omp']}\"", source)
+        self.assertIn('"legacy_day_binding": "literal-built_at-prefix"', source)
+        self.assertIn('"workflow_path": ".github/workflows/smarty-preview.yml"', source)
+
+    def test_smarty_preview_artifacts_are_attempt_scoped_and_consumed_by_identity(self):
+        source = workflow_source()
+        uploads = re.findall(r"^          name: ([^\n]+)$", source, re.MULTILINE)
+        self.assertTrue(uploads)
         for name in uploads:
-            self.assertTrue(name.endswith(suffix), f"artifact is not attempt-scoped: {name}")
-            self.assertEqual(name.count("${{ github.run_attempt }}"), 1, name)
-        for name in downloads:
-            self.assertNotIn("github.run_attempt", name, name)
+            if "needs." not in name:
+                self.assertIn("${{ github.run_attempt }}", name, name)
+        self.assertIn("name: smarty-release-plan-${{ needs.preflight.outputs.artifact_attempt }}", source)
+        self.assertIn("name: smarty-candidate-sources-${{ needs.preflight.outputs.artifact_attempt }}", source)
+        self.assertIn("pattern: candidate-*-${{ needs.preflight.outputs.artifact_attempt }}", source)
+        self.assertIn("merge-multiple: true", source)
 
-        producer_attempt = "1"
-        consumer_attempt = "2"
-        self.assertNotEqual(producer_attempt, consumer_attempt)
-        self.assertEqual("smarty-release-plan-" + producer_attempt, "smarty-release-plan-1")
-        self.assertNotEqual(
-            "smarty-release-plan-" + producer_attempt,
-            "smarty-release-plan-" + consumer_attempt,
-        )
-        producer_links = (
-            ("candidate-checks", "smarty-release-plan", "needs.preflight.outputs.artifact_attempt"),
-            ("build", "smarty-candidate-sources", "needs.preflight.outputs.artifact_attempt"),
-            ("attest-spdx", "smarty-spdx-candidate", "needs.assemble-spdx.outputs.artifact_attempt"),
-            ("assemble-pair", "smarty-spdx-attested", "needs.attest-spdx.outputs.artifact_attempt"),
-            ("attest-pair", "smarty-pair-candidate", "needs.assemble-pair.outputs.artifact_attempt"),
-            ("verify-release", "smarty-release-ready", "needs.attest-pair.outputs.artifact_attempt"),
-            ("verify-reuse", "smarty-release-reuse", "needs.reuse-release.outputs.artifact_attempt"),
-            ("advance-channel", "smarty-channel-candidate", "needs.render-channel.outputs.artifact_attempt"),
-        )
-        for job, artifact, producer_output in producer_links:
-            self.assertIn(
-                "name: " + artifact + "-${{ " + producer_output + " }}",
-                jobs[job],
-                f"{job} must consume {artifact} from its producer",
-            )
-
-        for platform in (
-            "linux-x86_64",
-            "linux-aarch64",
-            "macos-x86_64",
-            "macos-aarch64",
-            "windows-x86_64",
-        ):
-            suffix = platform.replace("-", "_") + "_attempt"
-            candidate = "candidate_" + suffix
-            attested = "attested_" + suffix
-            self.assertIn(
-                candidate + ": ${{ steps.candidate-artifact.outputs." + candidate + " }}",
-                jobs["build"],
-            )
-            self.assertIn(
-                "artifact_attempt: ${{ needs.build.outputs." + candidate + " }}",
-                jobs["attest-platform"],
-            )
-            self.assertIn(
-                attested + ": ${{ steps.attested-artifact.outputs." + attested + " }}",
-                jobs["attest-platform"],
-            )
-            self.assertIn(
-                "name: attested-" + platform + "-${{ needs.attest-platform.outputs." + attested + " }}",
-                jobs["assemble-spdx"],
-            )
-        self.assertIn(
-            "name: candidate-${{ matrix.platform }}-${{ matrix.artifact_attempt }}",
-            jobs["attest-platform"],
-        )
-        self.assertNotIn("overwrite:", source)
-        self.assertNotIn("merge-multiple:", source)
-
-    def test_verify_publication_downloads_the_exact_sealed_producer_artifact(self):
-        jobs = workflow_jobs(workflow_source())
-        fetch = workflow_steps(jobs["verify-publication"])["Fetch immutable paired release"]
-        self.assertIn(
-            "RELEASE_READY_ATTEMPT: ${{ needs.publish-release.result == 'success' && needs.publish-release.outputs.release_ready_attempt || needs.verify-reuse.outputs.artifact_attempt }}",
-            jobs["verify-publication"],
-        )
-        self.assertIn(
-            '--name "smarty-release-ready-$RELEASE_READY_ATTEMPT"',
-            fetch,
-        )
-        self.assertNotIn("--name smarty-release-ready --", fetch)
-        self.assertIn(
-            "release_ready_attempt: ${{ needs.attest-pair.outputs.artifact_attempt }}",
-            jobs["verify-release"],
-        )
-        self.assertIn(
-            "release_ready_attempt: ${{ needs.verify-release.outputs.release_ready_attempt }}",
-            jobs["publish-release"],
-        )
-
-    def test_smarty_preview_pair_candidate_artifact_has_one_producer_and_consumer(self):
-        jobs = workflow_jobs(workflow_source())
-        produced_name = "name: smarty-pair-candidate-${{ github.run_attempt }}"
-        consumed_name = "name: smarty-pair-candidate-${{ needs.assemble-pair.outputs.artifact_attempt }}"
+    def test_trusted_publisher_is_default_branch_workflow_run_gate(self):
+        root = Path(__file__).resolve().parents[1]
+        trusted = (root / ".github/workflows/smarty-preview-publish.yml").read_text(encoding="utf-8")
+        jobs = workflow_jobs(trusted)
+        self.assertIn("workflow_run:\n    workflows: [\"Smarty Preview\"]\n    types: [completed]", trusted)
         self.assertEqual(
-            [name for name, body in jobs.items() if produced_name in body],
-            ["assemble-pair"],
+            list(jobs),
+            ["validate-seal", "trusted-source", "trusted-build", "trusted-omp-build", "trusted-assemble", "attest-and-seal", "publish-release", "phase-a-channel", "phase-b-promotion"],
         )
-        self.assertEqual(
-            [name for name, body in jobs.items() if consumed_name in body],
-            ["attest-pair"],
-        )
-        self.assertIn("uses: actions/upload-artifact@", jobs["assemble-pair"])
-        self.assertIn("uses: actions/download-artifact@", jobs["attest-pair"])
-        self.assertNotIn("paired-preview", workflow_source())
-
-    def test_smarty_preview_fixed_native_rebuild_is_fresh_and_precedes_upload(self):
-        build = workflow_jobs(workflow_source())["build"]
-        steps = workflow_steps(build)
-        fixed_name = "Independently rebuild fixed native targets and toolchain report"
-        fixed = steps[fixed_name]
-        names = list(steps)
-        self.assertLess(
-            names.index("Package Windows candidate payload"), names.index(fixed_name)
-        )
-        for upload in (
-            "Upload paired candidate payload",
-            "Upload Windows candidate payload",
+        for required in (
+            "github.event.workflow_run.id",
+            "actions/runs/{run_id}",
+            "actions/workflows/smarty-preview.yml",
+            "actions/runs/{run_id}/artifacts?per_page=100",
+            "validate-run",
+            "validate-tag",
+            "validate-producer",
+            "publisher-branch.json",
+            "publisher-revision.json",
+            "ref: ${{ needs.validate-seal.outputs.publisher_commit }}",
         ):
-            self.assertLess(names.index(fixed_name), names.index(upload))
-        self.assertIn("source-archives/omp-source.tar", fixed)
-        self.assertIn("fixed-omp-source", fixed)
-        self.assertIn("--ignore_all_rc_files build --lockfile_mode=error", fixed)
-        self.assertIn('expected = set(os.environ["OMP_NATIVE_ASSETS"].split())', fixed)
-        self.assertIn("path.read_bytes() != (candidate / name).read_bytes()", fixed)
-        self.assertIn("    permissions: {}\n", build)
-
-    def test_phase_a_restores_bridge_installer_execute_mode(self):
-        advance = workflow_steps(workflow_jobs(workflow_source())["advance-channel"])[
-            "Advance Smarty channel with compare-and-swap"
-        ]
-        copied = "/bin/cp channel/preview.json channel/install.sh channel-repo/"
-        chmod = "/bin/chmod 0755 channel-repo/install.sh"
-        staged = "/usr/bin/git -C channel-repo add preview.json install.sh"
-        self.assertLess(advance.index(copied), advance.index(chmod))
-        self.assertLess(advance.index(chmod), advance.index(staged))
-
-    def test_phase_b_idempotence_uses_one_fetched_ref_snapshot(self):
-        promote = workflow_steps(workflow_jobs(promotion_workflow_source())["promote"])[
-            "Promote bridge to canonical channel with compare-and-swap"
-        ]
-        self.assertNotIn("ls-remote", promote)
-        fetch = "git_auth -C channel-repo fetch --no-tags"
-        fetched_channel = 'fetched_channel="$(fetched_ref channel)"'
-        fetched_primary = (
-            'fetched_primary_authorization="$(fetched_ref primary-authorization)"'
-        )
-        fetched_promotion = (
-            'fetched_authorization="$(fetched_ref promotion-authorization)"'
-        )
-        idempotent = 'if [ "$fetched_channel" = "$candidate_commit" ]'
-        for fetched in (fetched_channel, fetched_primary, fetched_promotion):
-            self.assertLess(promote.index(fetch), promote.index(fetched))
-        self.assertLess(promote.index(fetched_channel), promote.index(idempotent))
-        self.assertIn('"$fetched_channel" != "$BRIDGE_COMMIT"', promote)
-        self.assertIn('"$fetched_primary_authorization" != "$BRIDGE_COMMIT"', promote)
+            self.assertIn(required, trusted)
+        self.assertIn("contents/.github/workflows/smarty-preview-publish.yml?ref=", trusted)
+        self.assertIn("ref: ${{ github.workflow_sha }}", trusted)
         self.assertIn(
-            '"$fetched_authorization" != "$EXPECTED_AUTHORIZATION_COMMIT"',
-            promote,
-        )
-
-    def test_bootstrap_promotion_workflow_is_reviewed_verified_and_atomic(self):
-        source = promotion_workflow_source()
-        jobs = workflow_jobs(source)
-        caller = workflow_jobs(workflow_source())["promote-canonical"]
-        self.assertEqual(list(jobs), ["promote"])
-        self.assertIn("  workflow_call:\n", source)
-        self.assertNotIn("workflow_dispatch", source)
-        self.assertIn("    environment: smarty-preview-promotion\n", jobs["promote"])
-        self.assertIn("uses: ./.github/workflows/smarty-preview-promote.yml", caller)
-        self.assertIn("needs.advance-channel.outputs.bridge_commit", caller)
-        self.assertIn('os.environ["EVENT_NAME"] != "push"', source)
-        self.assertIn('os.environ["EVENT_REF"] != f"refs/tags/{tag}"', source)
-        self.assertIn('os.environ["EVENT_SHA"] != match.group("source")', source)
-        self.assertNotIn("pull_request", source)
-        self.assertIn("refs/heads/smarty-preview-promotion-authorization", source)
-        self.assertIn("refs/heads/smarty-preview-authorization", source)
-        self.assertIn('"action": "promote-windows-bootstrap-to-canonical"', source)
-        self.assertIn(
-            '"workflow": ".github/workflows/smarty-preview-promote.yml"', source
+            "trusted-publisher-anchor-${{ steps.identity.outputs.tag }}-${{ steps.identity.outputs.run_attempt }}-${{ github.run_attempt }}",
+            trusted,
         )
         self.assertIn(
-            'expected_authorization_commit="$(create_promotion_lease)"', source
+            "trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
+            trusted,
         )
-        self.assertIn(
-            'test "$authorization_commit" = "$expected_authorization_commit"', source
+        self.assertNotIn(
+            "name: trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}\n",
+            trusted,
         )
-        self.assertIn(
-            "promotion release is not the exact 37-file immutable release", source
-        )
-        self.assertIn("/usr/bin/gh attestation verify", source)
-        self.assertIn("pi_natives.linux-x64-modern.node", source)
-        self.assertLess(
-            source.index("Cryptographically verify immutable release evidence"),
-            source.index("Render exact canonical channel from authenticated verifier"),
-        )
-        self.assertIn("trusted-preview.py promote-bootstrap-manifest", source)
-        self.assertIn(
-            "cmp -s candidate/preview.json bridge/canonical-preview.json", source
-        )
-        self.assertIn("push --atomic", source)
-        self.assertIn('"--force-with-lease=$channel_ref:$BRIDGE_COMMIT"', source)
-        self.assertIn(
-            '"--force-with-lease=$primary_authorization_ref:$BRIDGE_COMMIT"',
-            source,
-        )
-        self.assertIn(
-            '"--force-with-lease=$promotion_authorization_ref:$EXPECTED_AUTHORIZATION_COMMIT"',
-            source,
-        )
-        self.assertIn("already promoted to canonical", source)
-
-    def test_phase_b_pair_bridge_scalar_mutations_fail_closed(self):
-        source = promotion_workflow_source()
-        start = source.index("          def validate_pair_bridge_sources(")
-        end = source.index('\n          if (\n              pair.get("pair_id")', start)
-        function_source = "\n".join(
-            line[10:] for line in source[start:end].splitlines()
-        )
-        namespace = {}
-        exec(function_source, namespace)
-        validate = namespace["validate_pair_bridge_sources"]
-        parent = "1" * 40
-        herdr = "2" * 40
-        omp = "3" * 40
-        build_id = f"2026-08-22-p{parent}-r{herdr}-o{omp}"
-        canonical = {
-            "base_version": "0.8.0",
-            "protocol": 21,
-            "omp": {
-                "tree": "4" * 40,
-                "version": "18.2.0",
-                "build_id": "omp-build-3",
-            },
-        }
-        pair = {
-            "sources": {
-                "parent": {"commit": parent},
-                "herdr": {
-                    "commit": herdr,
-                    "build_id": build_id,
-                    "version": canonical["base_version"],
-                    "protocol": canonical["protocol"],
-                },
-                "omp": {
-                    "commit": omp,
-                    **canonical["omp"],
-                },
-            }
-        }
-        validate(pair, canonical, parent, herdr, omp, build_id)
-        mutations = (
-            lambda value: value.update(base_version="9.9.9"),
-            lambda value: value.update(protocol=22),
-            lambda value: value["omp"].update(tree="5" * 40),
-            lambda value: value["omp"].update(version="18.2.1"),
-            lambda value: value["omp"].update(build_id="omp-build-other"),
-        )
-        for mutate in mutations:
-            tampered = json.loads(json.dumps(canonical))
-            mutate(tampered)
-            with self.assertRaisesRegex(
-                SystemExit,
-                "promotion pair sources do not match the exact bridge scalars",
-            ):
-                validate(pair, tampered, parent, herdr, omp, build_id)
-
-    def test_smarty_preview_embedded_python_gates_compile(self):
-        for label, source, minimum in (
-            ("smarty-preview", workflow_source(), 30),
-            ("smarty-preview-promote", promotion_workflow_source(), 4),
+        for pool in (
+            "smarty-linux-16-core",
+            "smarty-linux-arm-16-core",
+            "smarty-macos-intel-12-core",
+            "smarty-macos-arm-5-core",
+            "smarty-windows-16-core",
         ):
+            self.assertIn(pool, trusted)
+        self.assertIn("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9", trusted)
+        self.assertIn("workspaces: source", trusted)
+
+    def test_trusted_publisher_separates_source_release_and_attestation_authority(self):
+        root = Path(__file__).resolve().parents[1]
+        trusted = (root / ".github/workflows/smarty-preview-publish.yml").read_text(encoding="utf-8")
+        jobs = workflow_jobs(trusted)
+        self.assertIn("secrets.SMARTY_SOURCE_READ_TOKEN", jobs["trusted-source"])
+        self.assertNotIn("secrets.SMARTY_SOURCE_READ_TOKEN", jobs["trusted-build"])
+        self.assertNotIn("secrets.SMARTY_SOURCE_READ_TOKEN", jobs["trusted-omp-build"])
+        self.assertNotIn("secrets.SMARTY_SOURCE_READ_TOKEN", jobs["trusted-assemble"])
+        self.assertNotIn("secrets.SMARTY_RELEASE_TOKEN", jobs["validate-seal"])
+        self.assertNotIn("secrets.SMARTY_RELEASE_TOKEN", jobs["trusted-build"])
+        self.assertNotIn("secrets.SMARTY_RELEASE_TOKEN", jobs["trusted-omp-build"])
+        self.assertIn("secrets.SMARTY_RELEASE_TOKEN", jobs["publish-release"])
+        self.assertNotIn("secrets.SMARTY_RELEASE_TOKEN", jobs["phase-a-channel"])
+        self.assertNotIn("secrets.SMARTY_RELEASE_TOKEN", jobs["phase-b-promotion"])
+        self.assertIn("id-token: write", jobs["attest-and-seal"])
+        self.assertIn("attestations: write", jobs["attest-and-seal"])
+        self.assertIn("environment: smarty-release", jobs["publish-release"])
+        self.assertIn("smarty-preview-promotion", jobs["phase-b-promotion"])
+        self.assertNotIn("contents: write", jobs["validate-seal"])
+        self.assertNotIn("contents: write", jobs["trusted-build"])
+        self.assertNotIn("contents: write", jobs["trusted-omp-build"])
+        self.assertNotIn("contents: write", jobs["trusted-assemble"])
+
+    def test_trusted_publisher_builds_and_seals_the_canonical_release_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        trusted = (root / ".github/workflows/smarty-preview-publish.yml").read_text(encoding="utf-8")
+        self.assertIn("mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29", trusted)
+        self.assertIn("version: ${{ env.ZIG_VERSION }}", trusted)
+        self.assertIn("setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6", trusted)
+        self.assertIn("bun-version: 1.4.0", trusted)
+        self.assertIn("Build trusted OMP and native assets", trusted)
+        self.assertIn("scripts/preview.py spdx", trusted)
+        self.assertIn("scripts/preview.py pair-manifest", trusted)
+        self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6", trusted)
+        self.assertIn("smarty-provenance-", trusted)
+        self.assertIn("trusted-final-release-", trusted)
+        self.assertIn('gh api "repos/$REPOSITORY/releases/tags/$TAG"', trusted)
+        self.assertIn("gh release upload", trusted)
+        self.assertIn("smarty_preview_trusted.py seal", trusted)
+        self.assertIn('export HERDR_BUILD_UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"', trusted)
+        self.assertIn("export HERDR_BUILD_AUTO_UPDATE=true", trusted)
+        self.assertIn("setup-bazel@5bab119910beb57b5848d5090ee6d35c031fb26e", trusted)
+        for platform in ("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"):
+            self.assertIn("trusted-herdr-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
+            self.assertIn("trusted-omp-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
+        self.assertIn("trusted-herdr-windows-x86_64-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
+        self.assertIn("canary TUF handoff pair_id mismatch", trusted)
+        self.assertIn("canary TUF target length or digest is malformed", trusted)
+        self.assertIn('"release_url"', trusted)
+        self.assertEqual(len(preview.FULL_RELEASE_ASSET_NAMES), 37)
+        self.assertEqual(len(set(preview.FULL_RELEASE_ASSET_NAMES)), 37)
+        jobs = workflow_jobs(trusted)
+        self.assertNotIn("trusted-source/omp-source.tar", jobs["trusted-build"])
+        self.assertNotIn("publisher-source", jobs["trusted-build"])
+        self.assertIn("source\\scripts\\package_windows_conpty.ps1", jobs["trusted-build"])
+        self.assertNotIn("Checkout exact Herdr source", jobs["trusted-omp-build"])
+        self.assertNotIn("HERDR_BUILD_OMP", jobs["trusted-omp-build"])
+
+    def test_trusted_and_candidate_embedded_python_blocks_compile(self):
+        root = Path(__file__).resolve().parents[1]
+        for label, path in (("candidate", WORKFLOW_PATH), ("trusted", root / ".github/workflows/smarty-preview-publish.yml")):
+            source = path.read_text(encoding="utf-8")
             lines = source.splitlines()
             blocks = []
             index = 0
@@ -1586,346 +1125,32 @@ file: ../../../public/assets/logo.svg
                 if lines[index].rstrip().endswith("<<'PY'"):
                     body = []
                     index += 1
-                    while lines[index].strip() != "PY":
+                    while index < len(lines) and lines[index].strip() != "PY":
                         body.append(lines[index][10:])
                         index += 1
                     blocks.append("\n".join(body))
                 index += 1
-            self.assertGreaterEqual(len(blocks), minimum, label)
+            self.assertGreaterEqual(len(blocks), 1, label)
             for block in blocks:
                 compile(block, f"<{label}>", "exec")
 
-    def test_smarty_preview_pins_exact_trusted_verifier_bytes(self):
-        source = workflow_source()
-        match = re.search(
-            r"^  TRUSTED_RELEASE_VERIFIER_SHA256: ([0-9a-f]{64})$",
-            source,
-            re.MULTILINE,
-        )
-        self.assertIsNotNone(match)
-        expected = hashlib.sha256(Path(preview.__file__).read_bytes()).hexdigest()
-        self.assertNotEqual(match.group(1), "0" * 64)
-        self.assertEqual(match.group(1), expected)
-        archive = workflow_steps(workflow_jobs(source)["preflight"])[
-            "Archive validated source inputs"
-        ]
-        self.assertIn("sha256sum scripts/preview.py", archive)
-        self.assertIn('= "$TRUSTED_RELEASE_VERIFIER_SHA256"', archive)
-        self.assertIn(
-            "cp scripts/preview.py handoff/trusted-release-verifier.py", archive
-        )
-
-    def test_smarty_preview_semantic_verification_uses_fixed_handoff_verifier(self):
-        source = workflow_source()
-        jobs = workflow_jobs(source)
-        spdx = workflow_steps(jobs["attest-spdx"])[
-            "Verify exact SPDX attestation inputs"
-        ]
-        pair = workflow_steps(jobs["attest-pair"])[
-            "Verify exact pair attestation inputs"
-        ]
-        verified = workflow_steps(jobs["verify-release"])[
-            "Verify complete paired release with candidate metadata code"
-        ]
-        reused = workflow_steps(jobs["verify-reuse"])[
-            "Verify reused release bytes and exact 37-file identity"
-        ]
-        publishing = workflow_steps(jobs["publish-release"])[
-            "Verify sealed release bytes before publication"
-        ]
-        published = workflow_steps(jobs["verify-publication"])[
-            "Verify immutable paired release bytes"
-        ]
-
-        self.assertIn("candidate/handoff/trusted-release-verifier.py spdx", spdx)
-        self.assertIn('cmp -s "$RUNNER_TEMP/trusted-spdx.json"', spdx)
-        self.assertLess(
-            source.index('cmp -s "$RUNNER_TEMP/trusted-spdx.json"'),
-            source.index("- name: Attest payloads and deterministic SPDX"),
-        )
-        self.assertIn(
-            "candidate/handoff/trusted-release-verifier.py pair-manifest", pair
-        )
-        self.assertIn('cmp -s "$RUNNER_TEMP/trusted-pair.json"', pair)
-        self.assertLess(
-            source.index('cmp -s "$RUNNER_TEMP/trusted-pair.json"'),
-            source.index("- name: Attest exact pair manifest"),
-        )
-        for body in (verified, publishing, published):
-            self.assertIn("trusted-release-verifier.py verify-pair", body)
-            self.assertIn("--omp-rules-rust-toolchains", body)
-        self.assertIn("--cargo-metadata-dir", verified)
-        self.assertIn("--dependency-metadata", publishing)
-        self.assertIn("--dependency-metadata", published)
-        self.assertIn("trusted-release-verifier.py verify-attested-pair", reused)
-        self.assertIn("trusted-release-verifier.py verify-attested-pair", published)
-        self.assertIn('"verification"', pair)
-        self.assertIn("EXPECTED_VERIFIER_SHA256", spdx)
-        self.assertIn("EXPECTED_VERIFIER_SHA256", pair)
-
-    def test_smarty_preview_never_interpolates_expressions_into_shell(self):
-        inside = False
-        for line in workflow_source().splitlines():
-            if re.fullmatch(r" {8}run: \|", line):
-                inside = True
-                continue
-            single = re.fullmatch(r" {8}run: (?!\|)(.*)", line)
-            if single:
-                inside = False
-                self.assertNotIn("${{", single.group(1))
-                continue
-            if inside:
-                if line.strip() and not line.startswith(" " * 10):
+    def test_workflows_never_interpolate_expressions_into_shell_blocks(self):
+        root = Path(__file__).resolve().parents[1]
+        for path in (WORKFLOW_PATH, root / ".github/workflows/smarty-preview-publish.yml"):
+            inside = False
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if re.fullmatch(r" {8}run: \|", line):
+                    inside = True
+                    continue
+                if re.fullmatch(r" {8}run: (?!\|)(.*)", line):
                     inside = False
-                else:
                     self.assertNotIn("${{", line)
-
-    def test_smarty_preview_release_gates_use_the_exact_37_file_set(self):
-        jobs = workflow_jobs(workflow_source())
-        self.assertEqual(len(preview.FULL_RELEASE_ASSET_NAMES), 37)
-        self.assertEqual(len(set(preview.FULL_RELEASE_ASSET_NAMES)), 37)
-        for name, message in (
-            (
-                "attest-pair",
-                "sealed release does not match the exact 37-name allow-list",
-            ),
-            ("verify-reuse", "reuse allow-list is not the exact 37-file release set"),
-            (
-                "publish-release",
-                "publication allow-list is not the exact 37-file release set",
-            ),
-            (
-                "verify-publication",
-                "publication allow-list is not the exact 37-file release set",
-            ),
-            (
-                "render-channel",
-                "render sealed file set is not the exact 37-file release set",
-            ),
-            (
-                "reuse-release",
-                "reused release does not match the exact 37-name allow-list",
-            ),
-        ):
-            self.assertIn(message, jobs[name], name)
-        for name in ("verify-reuse", "publish-release", "verify-publication"):
-            self.assertIn("if len(expected) != 37:", jobs[name], name)
-        for name in ("publish-release", "verify-publication"):
-            self.assertIn("!= 37", jobs[name], name)
-
-    def test_smarty_preview_publication_and_channel_tail_is_complete(self):
-        source = workflow_source()
-        jobs = workflow_jobs(source)
-        self.assertEqual(
-            list(workflow_steps(jobs["publish-release"])),
-            [
-                "Download exact sealed release",
-                "Verify publication prerequisites",
-                "Verify sealed release bytes before publication",
-                "Create or reconcile draft-first paired release",
-                "Fetch reconciled draft release",
-                "Verify reconciled draft bytes",
-                "Verify reconciled draft attestations",
-                "Publish verified draft",
-            ],
-        )
-        self.assertEqual(
-            list(workflow_steps(jobs["verify-publication"])),
-            [
-                "Fetch immutable paired release",
-                "Verify immutable paired release bytes",
-                "Verify immutable paired release attestations",
-                "Record TUF promotion input for external signing",
-                "Upload verified publication records",
-                "Upload TUF promotion input",
-            ],
-        )
-        self.assertEqual(
-            list(workflow_steps(jobs["advance-channel"])),
-            [
-                "Download immutable release plan",
-                "Download exact rendered channel candidate",
-                "Download verified publication records",
-                "Verify rendered Smarty channel candidate",
-                "Advance Smarty channel with compare-and-swap",
-            ],
-        )
-        self.assertEqual(
-            list(workflow_steps(jobs["render-channel"]))[3:],
-            [
-                "Generate legacy channel inputs",
-                "Snapshot Smarty channel for rendering",
-                "Render Smarty channel candidate",
-                "Verify rendered channel transition with candidate code",
-                "Seal exact rendered channel candidate",
-                "Upload exact rendered channel candidate",
-            ],
-        )
-        self.assertEqual(
-            list(workflow_steps(jobs["verify-reuse"])),
-            [
-                "Download immutable release plan",
-                "Download exact immutable release reuse",
-                "Verify reused release bytes and exact 37-file identity",
-                "Seal verified reuse as the exact release handoff",
-                "Upload exact sealed release",
-            ],
-        )
-        publish = workflow_steps(jobs["publish-release"])
-        create = publish["Create or reconcile draft-first paired release"]
-        self.assertIn("--draft \\\n", create)
-        self.assertIn("--prerelease\n", create)
-        self.assertIn('release.get("draft") is True', create)
-        self.assertIn('release.get("immutable") is False', create)
-        self.assertIn('release.get("draft") is False', create)
-        self.assertIn('release.get("immutable") is True', create)
-        self.assertIn("publication-already-complete", create)
-        self.assertIn("--clobber", create)
-        self.assertLess(source.index("--draft \\"), source.index("--draft=false"))
-        published = publish["Publish verified draft"]
-        self.assertIn("--draft=false", published)
-        self.assertIn('release.get("immutable") is not True', published)
-        reconciled = publish["Verify reconciled draft bytes"]
-        self.assertIn("not in ((True, False), (False, True))", reconciled)
-        self.assertIn("if [ ! -f publication-already-complete ]", published)
-        self.assertIn(
-            "needs.publish-release.result == 'success' || "
-            "needs.verify-reuse.result == 'success'",
-            jobs["verify-publication"],
-        )
-        self.assertIn(
-            "needs.verify-release.result == 'success' || "
-            "needs.verify-reuse.result == 'success'",
-            jobs["render-channel"],
-        )
-        self.assertIn("smarty-release-ready", jobs["verify-reuse"])
-        self.assertIn("smarty-release-ready", jobs["attest-pair"])
-
-    def test_smarty_preview_channel_update_is_authenticated_compare_and_swap(self):
-        steps = workflow_steps(workflow_jobs(workflow_source())["advance-channel"])
-        verify = steps["Verify rendered Smarty channel candidate"]
-        advance = steps["Advance Smarty channel with compare-and-swap"]
-        self.assertIn(
-            "keep = max(retain - 1, ordered.index(previous_current) + 1)", verify
-        )
-        self.assertIn(
-            "channel history is not the deterministic retained prefix", verify
-        )
-        self.assertIn("channel candidate changed retained build", verify)
-        self.assertIn(
-            "authenticated channel snapshot is not the observed channel commit", verify
-        )
-        self.assertIn(
-            "rendered channel asset does not match the published release", verify
-        )
-        self.assertIn(
-            "rendered channel installer is not the authenticated candidate installer",
-            verify,
-        )
-        self.assertIn(
-            "consumed channel candidate differs from the authenticated snapshot", verify
-        )
-        self.assertIn("Smarty channel moved from", advance)
-        self.assertIn(
-            "already advanced to the deterministic bootstrap candidate", advance
-        )
-        self.assertIn('GIT_AUTHOR_DATE="$BUILT_AT"', advance)
-        self.assertIn('GIT_COMMITTER_DATE="$BUILT_AT"', advance)
-        self.assertIn("CHANNEL_KEYS = {", verify)
-        self.assertIn("exact_keys(manifest, CHANNEL_KEYS", verify)
-        self.assertIn('candidate["base_version"] != expected_base_version', verify)
-        self.assertIn('candidate["protocol"] != expected_protocol', verify)
-        self.assertIn('manifest.get("notes"), str', verify)
-        self.assertIn('asset.get("format") != "zip"', verify)
-        self.assertIn('observed_channel="$(observe_ref "$channel_ref")"', advance)
-        self.assertIn(
-            'observed_authorization="$(observe_ref "$authorization_ref")"', advance
-        )
-        self.assertIn(
-            'observed_promotion_authorization="$(observe_ref "$promotion_authorization_ref")"',
-            advance,
-        )
-        self.assertIn(
-            '[ "$observed_channel" = "$candidate" ] \\\n'
-            '            && [ "$observed_authorization" = "$candidate" ] \\\n'
-            '            && [ "$observed_promotion_authorization" = "$promotion_lease" ]',
-            advance,
-        )
-        self.assertIn(
-            'if [ "$observed_authorization" != "$EXPECTED_AUTHORIZATION_REF" ]',
-            advance,
-        )
-        self.assertIn("Smarty authorization moved from", advance)
-        self.assertIn(".smarty-preview-promotion-authorization.json", advance)
-        self.assertIn("$promotion_lease:$promotion_authorization_ref", advance)
-
-    def test_smarty_preview_tuf_promotion_input_is_deterministic_and_unsigned(self):
-        steps = workflow_steps(workflow_jobs(workflow_source())["verify-publication"])
-        promotion = steps["Record TUF promotion input for external signing"]
-        self.assertLess(
-            list(steps).index("Verify immutable paired release attestations"),
-            list(steps).index("Record TUF promotion input for external signing"),
-        )
-        self.assertIn('"schema": "smarty.tuf-promotion-input.v1"', promotion)
-        self.assertIn('"canary": "canary/smarty-pair.json"', promotion)
-        self.assertIn('"stable": "stable/smarty-pair.json"', promotion)
-        self.assertIn('"target_name": "smarty-pair.json"', promotion)
-        self.assertIn(
-            '"gates": {"keys": "external", "performed": False, "signing": "external"}',
-            promotion,
-        )
-        self.assertIn("json.dumps(promotion, indent=2, sort_keys=True)", promotion)
-        self.assertIn(
-            "TUF promotion input requires an immutable published release", promotion
-        )
-        self.assertIn(
-            "verified publication record does not match the TUF target bytes", promotion
-        )
-        for forbidden in (
-            "--signers",
-            "prepare-root",
-            "approve-root",
-            "smarty-tuf",
-            "PRIVATE KEY",
-            "keyid",
-            "gh release",
-            "git push",
-        ):
-            self.assertNotIn(forbidden, promotion, forbidden)
-        self.assertEqual(preview.PAIR_MANIFEST_ASSET_NAME, "smarty-pair.json")
-        self.assertEqual(preview.PAIR_MANIFEST_SCHEMA, "smarty.paired-release.v1")
-        self.assertEqual(preview.PAIR_ID_DOMAIN, b"smarty.paired-release.v1\x00")
-
-    def test_smarty_preview_reconstructs_sbom_and_binds_channel_pair_fields(self):
-        workflow = workflow_source()
-        jobs = workflow_jobs(workflow)
-        channel = workflow_steps(jobs["render-channel"])[
-            "Generate legacy channel inputs"
-        ]
-
-        self.assertEqual(
-            workflow.count("- name: Checkout exact OMP source for metadata"), 1
-        )
-        self.assertEqual(
-            workflow.count("mod --lockfile_mode=error graph --output=json"), 2
-        )
-        self.assertEqual(workflow.count("--herdr-root herdr-source"), 3)
-        self.assertEqual(workflow.count("--omp-root omp-source"), 3)
-        self.assertIn(
-            "--omp-bazel-graph verification/omp-bazel-graph.json",
-            jobs["verify-release"],
-        )
-        self.assertIn(
-            "--omp-bazel-graph metadata/omp-bazel-graph.json", jobs["assemble-spdx"]
-        )
-        self.assertIn(
-            'pair["sources"]["herdr"]["version"] != os.environ["BASE_VERSION"]',
-            channel,
-        )
-        self.assertIn('pair["release"]["built_at"] != os.environ["BUILT_AT"]', channel)
-        self.assertIn("Render Smarty channel candidate", workflow)
-        self.assertIn("Verify rendered Smarty channel candidate", workflow)
-
+                    continue
+                if inside:
+                    if line.strip() and not line.startswith(" " * 10):
+                        inside = False
+                    else:
+                        self.assertNotIn("${{", line)
 
 class PairedReleaseMetadataTests(unittest.TestCase):
     parent_commit = "1" * 40
@@ -2639,7 +1864,7 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
                 source_archive_dir=source_archive_dir,
                 omp_bazel_graph=bazel_graph,
                 cargo_metadata_dir=cargo_metadata_dir,
-                bun_version="1.3.14",
+                bun_version="1.4.0",
                 zig_version="0.15.2",
             ),
             encoding="utf-8",
@@ -3219,7 +2444,7 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             self.assertEqual(document["sources"]["herdr"]["tree"], self.herdr_tree)
             self.assertEqual(document["sources"]["omp"]["tree"], OMP_SOURCE["tree"])
             self.assertEqual(document["toolchains"]["herdr"]["zig"], "0.15.2")
-            self.assertEqual(document["toolchains"]["omp"]["bun"], "1.3.14")
+            self.assertEqual(document["toolchains"]["omp"]["bun"], "1.4.0")
             self.assertEqual(
                 document["toolchains"]["herdr"]["declarations"]["rust"]["path"],
                 "rust-toolchain.toml",
@@ -3277,7 +2502,17 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             )
             self.assertEqual(document["platforms"]["linux-x86_64"]["abi"], "glibc")
             self.assertEqual(
-                document["platforms"]["linux-x86_64"]["runner"], "ubuntu-22.04"
+                {
+                    target: platform["runner"]
+                    for target, platform in document["platforms"].items()
+                },
+                {
+                    "linux-x86_64": "smarty-linux-16-core",
+                    "linux-aarch64": "smarty-linux-arm-16-core",
+                    "macos-x86_64": "smarty-macos-intel-12-core",
+                    "macos-aarch64": "smarty-macos-arm-5-core",
+                    "windows-x86_64": "smarty-windows-16-core",
+                },
             )
             self.assertEqual(document["artifacts"]["herdr-linux-x86_64"]["abi"], "musl")
             self.assertEqual(document["artifacts"]["omp-linux-x86_64"]["abi"], "glibc")
@@ -3756,11 +2991,14 @@ class WindowsBridgeInstallerStaticTests(unittest.TestCase):
             '"schema", "paired_build_id", "paired_tag", "paired_manifest", "windows_asset_sha256"',
             "Get-PhaseARetainedBuild",
             "Assert-BridgeOmpMatch",
-            'Assert-ExactManifestProperties -Value $topAssets -Expected @("windows-x86_64")',
-            "Get-BridgeReleaseAssetUrl -Canonical $canonical",
+            "Get-BridgeHerdrAssets",
             "AcceptedBuildIds = @($alias, $canonical.BuildId)",
         ):
             self.assertIn(key, bridge)
+        self.assertIn("Get-BridgeReleaseAssetUrl -Canonical $Canonical", source)
+        self.assertIn('"windows-x86_64" = "herdr-windows-x86_64.zip"', source)
+        self.assertIn('ExpectedSha256 $asset.Sha256', source)
+        self.assertIn('identity.sha256', source)
 
         main = source[source.index('Write-Step "Fetching Herdr $Channel manifest"') :]
         bridge_detection = main.index(
@@ -3829,6 +3067,64 @@ class WindowsBridgeInstallerStaticTests(unittest.TestCase):
                 resolver.index("Get-PhaseARetainedBuild"),
                 resolver.index("AcceptedBuildIds"),
             )
+
+    def test_legacy_retained_date_binding_uses_literal_source_day(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        retained = source[
+            source.index("function Get-RetainedPreviewBuild") : source.index(
+                "function Get-RetainedPreviewBuilds"
+            )
+        ]
+        legacy = retained[
+            retained.index('if ($identity.Kind -eq "legacy")') : retained.index(
+                "    } else {", retained.index('if ($identity.Kind -eq "legacy")')
+            )
+        ]
+        self.assertIn("$sourceBuiltAt = Get-RequiredManifestProperty", retained)
+        self.assertIn(
+            "$builtAt = Get-RequiredManifestTimestamp -Value $sourceBuiltAt", retained
+        )
+        self.assertIn("$identity.Day -cne $sourceBuiltAt.Substring(0, 10)", legacy)
+        self.assertNotIn("$builtAt.Substring(0, 10)", legacy)
+        self.assertLess(
+            retained.index("Get-RequiredManifestTimestamp"),
+            retained.index("$sourceBuiltAt.Substring(0, 10)"),
+        )
+
+        fixture = (INSTALLER_PATH.parent.parent / "scripts/windows_install_conpty_package_test.ps1").read_text(
+            encoding="utf-8"
+        )
+        for built_at in (
+            'built_at = "2026-08-09T23:30:00-04:00"',
+            '"2026-08-08T23:30:00-04:00"',
+            '"2026-02-30T23:30:00-04:00"',
+        ):
+            self.assertIn(built_at, fixture)
+
+    def test_preview_contract_routes_exact_manifest_urls(self):
+        source = INSTALLER_PATH.read_text(encoding="utf-8")
+        resolver = source[
+            source.index("function Resolve-PreviewManifest") : source.index(
+                "function ConvertTo-ManifestObject"
+            )
+        ]
+        self.assertIn(
+            '$smartyManifestUrl = "https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"',
+            resolver,
+        )
+        self.assertIn("Resolve-UpstreamPreviewManifest -Manifest $Manifest -Target $Target", resolver)
+        self.assertIn("Resolve-CustomPreviewManifest -Manifest $Manifest -Target $Target", resolver)
+        self.assertIn(
+            'throw "Smarty Phase A bridge manifests require the exact Smarty channel manifest URL."',
+            resolver,
+        )
+        main = source[source.index('Write-Step "Fetching Herdr $Channel manifest"') :]
+        self.assertIn(
+            "$previewSelection = Resolve-PreviewManifest -Manifest $manifest -Target $target -ManifestUrl $ManifestUrl",
+            main,
+        )
+        self.assertIn("function Get-UpstreamHerdrAssets", source)
+        self.assertIn("function Get-CustomPreviewAssets", source)
 
 
 class ConventionalCommitTests(unittest.TestCase):

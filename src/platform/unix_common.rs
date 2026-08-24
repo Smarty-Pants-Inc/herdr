@@ -97,7 +97,8 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
 }
 
 pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
+    let user_dir_name = format!("herdr-{}", unsafe { libc::geteuid() });
+    let tmp = std::env::temp_dir().join(&user_dir_name);
     let readable = tmp.join(readable_name);
     if fits_unix_socket_path(&readable) {
         return readable;
@@ -106,7 +107,7 @@ pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str)
     if fits_unix_socket_path(&short) {
         return short;
     }
-    PathBuf::from("/tmp").join(short_name)
+    PathBuf::from("/tmp").join(user_dir_name).join(short_name)
 }
 
 pub(crate) fn remote_reattach_program(program: &str) -> String {

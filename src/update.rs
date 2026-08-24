@@ -34,9 +34,14 @@ use sha2::{Digest, Sha256};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const SMARTY_PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
-const PREVIEW_RELEASE_DOWNLOAD_URL: &str =
+const UPSTREAM_PREVIEW_RELEASE_DOWNLOAD_URL: &str =
+    "https://github.com/herdrdev/herdr/releases/download";
+const SMARTY_PREVIEW_RELEASE_DOWNLOAD_URL: &str =
     "https://github.com/Smarty-Pants-Inc/herdr/releases/download";
+const PREVIEW_RELEASE_DOWNLOAD_URL: &str = SMARTY_PREVIEW_RELEASE_DOWNLOAD_URL;
 const CANONICAL_PREVIEW_HERDR_ASSETS: &[(&str, &str)] = &[
     ("linux-x86_64", "herdr-linux-x86_64"),
     ("linux-aarch64", "herdr-linux-aarch64"),
@@ -137,6 +142,21 @@ enum UpdateChannel {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewManifestContract {
+    UpstreamLegacy,
+    SmartyPaired,
+    Custom,
+}
+
+fn preview_manifest_contract(build_manifest_url: Option<&str>) -> PreviewManifestContract {
+    match build_manifest_url {
+        None => PreviewManifestContract::UpstreamLegacy,
+        Some(SMARTY_PREVIEW_UPDATE_MANIFEST_URL) => PreviewManifestContract::SmartyPaired,
+        Some(_) => PreviewManifestContract::Custom,
+    }
+}
+
 impl UpdateChannel {
     fn configured() -> Self {
         let configured = match crate::config::Config::load().config.update.channel {
@@ -189,16 +209,37 @@ impl<'de> Deserialize<'de> for AssetRef {
                 format: None,
             }),
             serde_json::Value::Object(mut object) => {
-                let url = object
-                    .remove("url")
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
-                let sha256 = object
-                    .remove("sha256")
-                    .and_then(|value| value.as_str().map(str::to_string));
-                let format = object
-                    .remove("format")
-                    .and_then(|value| value.as_str().map(str::to_string));
+                let url = match object.remove("url") {
+                    Some(serde_json::Value::String(value)) => value,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "asset object is missing string url",
+                        ));
+                    }
+                };
+                let sha256 = match object.remove("sha256") {
+                    None => None,
+                    Some(serde_json::Value::String(value)) => Some(value),
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "asset object sha256 must be a string",
+                        ));
+                    }
+                };
+                let format = match object.remove("format") {
+                    None => None,
+                    Some(serde_json::Value::String(value)) => Some(value),
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "asset object format must be a string",
+                        ));
+                    }
+                };
+                if !object.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "asset object has unexpected fields",
+                    ));
+                }
                 if url.trim().is_empty() {
                     return Err(serde::de::Error::custom("asset url must not be empty"));
                 }
@@ -298,6 +339,7 @@ where
 
 #[derive(Deserialize)]
 struct PreviewManifest {
+    schema_version: u32,
     channel: String,
     base_version: String,
     build_id: String,
@@ -319,6 +361,9 @@ impl PreviewManifest {
         let CanonicalBuildId::Present(canonical_build_id) = &self.canonical_build_id else {
             return Ok(None);
         };
+        if self.schema_version != 2 {
+            return Err("preview Phase A bridge schema_version must be 2".into());
+        }
         let canonical_build_id = canonical_build_id
             .as_deref()
             .ok_or("preview manifest canonical_build_id must not be null")?;
@@ -367,22 +412,12 @@ impl PreviewManifest {
                 "preview manifest canonical build {canonical_build_id} OMP commit does not match retained metadata"
             ));
         }
-        if self.assets.len() != 1 || !self.assets.contains_key("windows-x86_64") {
-            return Err(
-                "preview bridge manifest top-level assets must contain only windows-x86_64".into(),
-            );
-        }
-        let canonical_windows_asset = archived.assets.get("windows-x86_64").ok_or_else(|| {
-            format!(
-                "preview manifest retained canonical build {canonical_build_id} has no Windows asset"
-            )
-        })?;
-        if self.assets.get("windows-x86_64") != Some(canonical_windows_asset) {
+        if self.assets != archived.assets {
             return Err(format!(
-                "preview manifest retained canonical build {canonical_build_id} Windows asset differs from top-level metadata"
+                "preview manifest retained canonical build {canonical_build_id} assets differ from top-level metadata"
             ));
         }
-        self.validate_current_and_retained_builds(canonical_build_id)?;
+        self.validate_smarty_retained_builds()?;
         Ok(Some((canonical_build_id, archived)))
     }
 
@@ -391,34 +426,139 @@ impl PreviewManifest {
             return Ok(canonical_build_id);
         }
         let build_id = self.build_id.trim();
-        if parse_canonical_paired_build_id(build_id).is_none() {
-            return Err(
-                "preview manifest build_id must be a full lowercase P/R/O build identity".into(),
-            );
+        let identity = parse_canonical_paired_build_id(build_id).ok_or_else(|| {
+            "preview manifest build_id must be a full lowercase P/R/O build identity".to_string()
+        })?;
+        if self.schema_version != 1 {
+            return Err("Smarty paired preview manifest schema_version must be 1".into());
+        }
+        validate_exact_preview_assets(
+            build_id,
+            &self.assets,
+            CANONICAL_PREVIEW_HERDR_ASSETS,
+            "Herdr",
+            false,
+        )?;
+        let omp = self.omp.as_ref().ok_or_else(|| {
+            format!("preview manifest build {build_id} has no paired OMP metadata")
+        })?;
+        validate_smarty_omp(build_id, omp, Some(identity.omp_commit))?;
+        self.validate_smarty_retained_builds()?;
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("preview manifest has no retained canonical build {build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp != self.omp
+        {
+            return Err(format!(
+                "preview manifest retained canonical build {build_id} metadata differs from top-level metadata"
+            ));
         }
         Ok(build_id)
     }
 
-    fn validate_current_and_retained_builds(&self, build_id: &str) -> Result<(), String> {
-        validate_canonical_preview_build(build_id, &self.commit, &self.assets, self.omp.as_ref())?;
-        for (retained_build_id, retained) in &self.builds {
-            validate_canonical_preview_build(
-                retained_build_id,
-                &retained.commit,
-                &retained.assets,
-                retained.omp.as_ref(),
-            )?;
+    fn validate_smarty_retained_builds(&self) -> Result<(), String> {
+        if self.builds.is_empty() {
+            return Err("preview manifest retained build history is empty".into());
+        }
+        for (build_id, build) in &self.builds {
+            validate_smarty_retained_preview_build(build_id, build)?;
         }
         Ok(())
     }
+
+    fn upstream_legacy_build(&self) -> Result<(&str, &PreviewBuildMetadata), String> {
+        if self.schema_version != 1 {
+            return Err("upstream preview manifest schema_version must be 1".into());
+        }
+        if !matches!(self.canonical_build_id, CanonicalBuildId::Absent) {
+            return Err("upstream preview manifest cannot use the Smarty Phase A bridge".into());
+        }
+        let build_id = self.build_id.trim();
+        let identity = parse_legacy_preview_build_id(build_id)
+            .ok_or("upstream preview manifest build_id must use YYYY-MM-DD-<12 lowercase hex>")?;
+        if self.omp.is_some() {
+            return Err(
+                "upstream legacy preview current build must not claim paired OMP metadata".into(),
+            );
+        }
+        if self.builds.is_empty() {
+            return Err("upstream preview manifest retained build history is empty".into());
+        }
+        for (retained_id, retained) in &self.builds {
+            validate_upstream_retained_preview_build(retained_id, retained)?;
+        }
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("upstream preview manifest has no retained current build {build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp.is_some()
+        {
+            return Err("upstream preview manifest top-level/current archive mismatch".into());
+        }
+        if !self.commit.starts_with(identity.commit_prefix) {
+            return Err(
+                "upstream preview manifest commit does not match its legacy build ID".into(),
+            );
+        }
+        Ok((build_id, archived))
+    }
+
+    fn custom_build(&self) -> Result<(&str, Option<&PreviewBuildMetadata>), String> {
+        if self.schema_version != 1 {
+            return Err("custom preview manifest schema_version must be 1".into());
+        }
+        if !matches!(self.canonical_build_id, CanonicalBuildId::Absent) {
+            return Err(
+                "Smarty Phase A bridge manifests require the exact Smarty manifest URL".into(),
+            );
+        }
+        let build_id = required_preview_string(&self.build_id, "custom preview manifest build_id")?;
+        validate_custom_preview_metadata(
+            build_id,
+            &self.base_version,
+            &self.commit,
+            &self.built_at,
+            self.protocol,
+            &self.assets,
+            self.omp.as_ref(),
+        )?;
+        if self.builds.is_empty() {
+            return Err("custom preview manifest retained build history is empty".into());
+        }
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("custom preview manifest has no retained current build {build_id}")
+        })?;
+        validate_custom_retained_preview_build(build_id, archived)?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp != self.omp
+        {
+            return Err("custom preview manifest top-level/current archive mismatch".into());
+        }
+        Ok((build_id, Some(archived)))
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 struct PreviewBuildMetadata {
     base_version: String,
     commit: String,
     built_at: String,
     protocol: u32,
+    #[serde(default)]
+    tag: Option<String>,
     assets: BTreeMap<String, AssetRef>,
     #[serde(default)]
     omp: Option<OmpCompanionMetadata>,
@@ -437,6 +577,209 @@ fn canonical_preview_asset_url(build_id: &str, asset_name: &str) -> String {
     format!("{PREVIEW_RELEASE_DOWNLOAD_URL}/smarty-preview-{build_id}/{asset_name}")
 }
 
+fn upstream_preview_asset_url(build_id: &str, asset_name: &str) -> String {
+    format!("{UPSTREAM_PREVIEW_RELEASE_DOWNLOAD_URL}/preview-{build_id}/{asset_name}")
+}
+
+fn required_preview_string<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value || value.contains('\n') || value.contains('\r') {
+        return Err(format!("{label} must be a nonempty one-line string"));
+    }
+    Ok(value)
+}
+
+fn is_lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_preview_commit(value: &str, label: &str) -> Result<(), String> {
+    if !is_lowercase_hex(value, 40) {
+        return Err(format!(
+            "{label} must be a lowercase 40-character Git object ID"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_preview_sha256(value: Option<&str>, label: &str) -> Result<(), String> {
+    let value = value.ok_or_else(|| format!("{label} is missing a SHA-256 checksum"))?;
+    if !is_lowercase_hex(value, 64) {
+        return Err(format!("{label} has an invalid SHA-256 checksum"));
+    }
+    Ok(())
+}
+
+fn validate_preview_timestamp(value: &str, label: &str) -> Result<(), String> {
+    required_preview_string(value, label)?;
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.get(10) != Some(&b'T') {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    let time_end = if bytes.last() == Some(&b'Z') {
+        bytes.len() - 1
+    } else if bytes.len() >= 25
+        && matches!(bytes[bytes.len() - 6], b'+' | b'-')
+        && bytes[bytes.len() - 3] == b':'
+        && bytes[bytes.len() - 5..bytes.len() - 3]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 2..].iter().all(u8::is_ascii_digit)
+    {
+        bytes.len() - 6
+    } else {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    };
+    if time_end < 19
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+        || !bytes[17..19].iter().all(u8::is_ascii_digit)
+        || (time_end > 19
+            && (bytes[19] != b'.'
+                || time_end == 20
+                || !bytes[20..time_end].iter().all(u8::is_ascii_digit)))
+    {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    let hour = std::str::from_utf8(&bytes[11..13])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let minute = std::str::from_utf8(&bytes[14..16])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let second = std::str::from_utf8(&bytes[17..19])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let date = std::str::from_utf8(&bytes[..10]).ok();
+    if date.is_none_or(|date| !valid_calendar_date(date))
+        || hour.is_none_or(|value| value > 23)
+        || minute.is_none_or(|value| value > 59)
+        || second.is_none_or(|value| value > 60)
+    {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_preview_assets(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    expected_assets: &[(&str, &str)],
+    component: &str,
+    upstream: bool,
+) -> Result<(), String> {
+    if assets.len() != expected_assets.len()
+        || expected_assets
+            .iter()
+            .any(|(target, _)| !assets.contains_key(*target))
+    {
+        return Err(format!(
+            "preview manifest {component} asset allow-list is incomplete or unexpected"
+        ));
+    }
+    for &(target, asset_name) in expected_assets {
+        let asset = &assets[target];
+        let expected_url = if upstream {
+            upstream_preview_asset_url(build_id, asset_name)
+        } else {
+            canonical_preview_asset_url(build_id, asset_name)
+        };
+        if asset.url != expected_url {
+            return Err(format!(
+                "preview manifest {component} asset {target} URL does not bind the canonical release tag"
+            ));
+        }
+        validate_preview_sha256(
+            asset.sha256.as_deref(),
+            &format!("preview manifest {component} asset {target}"),
+        )?;
+        if asset_name.ends_with(".zip") {
+            if asset.format.as_deref() != Some("zip") {
+                return Err(format!(
+                    "preview manifest {component} asset {target} must use zip format"
+                ));
+            }
+        } else if asset.format.is_some() {
+            return Err(format!(
+                "preview manifest {component} asset {target} has unexpected format metadata"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upstream_preview_assets(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+) -> Result<(), String> {
+    const MODERN_ZIP: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+        ("windows-x86_64", "herdr-windows-x86_64.zip"),
+    ];
+    const LEGACY_EXE: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+        ("windows-x86_64", "herdr-windows-x86_64.exe"),
+    ];
+    const UNIX_ONLY: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+    ];
+
+    for shape in [MODERN_ZIP, LEGACY_EXE, UNIX_ONLY] {
+        if assets.len() != shape.len()
+            || shape
+                .iter()
+                .any(|(target, _)| !assets.contains_key(*target))
+        {
+            continue;
+        }
+        let mut matches = true;
+        for &(target, asset_name) in shape {
+            let asset = &assets[target];
+            let expected_format = asset_name.ends_with(".zip").then_some("zip");
+            if asset.url != upstream_preview_asset_url(build_id, asset_name)
+                || asset.format.as_deref() != expected_format
+            {
+                matches = false;
+                break;
+            }
+            validate_preview_sha256(
+                asset.sha256.as_deref(),
+                &format!("preview manifest upstream Herdr asset {target}"),
+            )?;
+        }
+        if matches {
+            return Ok(());
+        }
+    }
+    Err(
+        "upstream preview manifest Herdr asset shape is not an authenticated historical allow-list"
+            .into(),
+    )
+}
+
+#[cfg(unix)]
 fn validate_canonical_preview_asset_urls(
     build_id: &str,
     assets: &BTreeMap<String, AssetRef>,
@@ -456,6 +799,264 @@ fn validate_canonical_preview_asset_urls(
     Ok(())
 }
 
+fn validate_custom_preview_assets(
+    assets: &BTreeMap<String, AssetRef>,
+    label: &str,
+) -> Result<(), String> {
+    if assets.is_empty() {
+        return Err(format!("{label} asset allow-list must not be empty"));
+    }
+    for (target, asset) in assets {
+        required_preview_string(&asset.url, &format!("{label} asset {target} URL"))?;
+        validate_preview_sha256(asset.sha256.as_deref(), &format!("{label} asset {target}"))?;
+        if asset
+            .format
+            .as_deref()
+            .is_some_and(|format| !matches!(format, "zip" | "exe"))
+        {
+            return Err(format!("{label} asset {target} has unsupported format"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_smarty_omp(
+    build_id: &str,
+    omp: &OmpCompanionMetadata,
+    expected_commit: Option<&str>,
+) -> Result<(), String> {
+    required_preview_string(&omp.build_id, "preview manifest OMP build_id")?;
+    required_preview_string(&omp.version, "preview manifest OMP version")?;
+    validate_preview_commit(&omp.commit, "preview manifest OMP commit")?;
+    validate_preview_commit(&omp.tree, "preview manifest OMP tree")?;
+    if expected_commit.is_some_and(|expected| omp.commit != expected) {
+        return Err(format!(
+            "preview manifest build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_exact_preview_assets(
+        build_id,
+        &omp.assets,
+        CANONICAL_PREVIEW_OMP_ASSETS,
+        "OMP",
+        false,
+    )
+}
+
+fn validate_smarty_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    required_preview_string(build_id, "preview manifest retained build ID")?;
+    if build.tag.as_deref() != Some(&format!("smarty-preview-{build_id}")) {
+        return Err(format!(
+            "preview manifest retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    if Version::parse(&build.base_version).is_none() {
+        return Err(format!(
+            "preview manifest retained build {build_id} has an invalid base_version"
+        ));
+    }
+    validate_preview_commit(
+        &build.commit,
+        &format!("preview manifest retained build {build_id} commit"),
+    )?;
+    let built_at_label = format!("preview manifest retained build {build_id} built_at");
+    validate_preview_timestamp(&build.built_at, &built_at_label)?;
+    let source_built_at = &build.built_at;
+    let source_day = &source_built_at[..10];
+    if build.protocol == 0 {
+        return Err(format!(
+            "preview manifest retained build {build_id} protocol must be positive"
+        ));
+    }
+    validate_exact_preview_assets(
+        build_id,
+        &build.assets,
+        CANONICAL_PREVIEW_HERDR_ASSETS,
+        "Herdr",
+        false,
+    )?;
+    if let Some(identity) = parse_canonical_paired_build_id(build_id) {
+        if build.commit != identity.herdr_commit {
+            return Err(format!(
+                "preview manifest build {build_id} Herdr commit does not match its P/R/O identity"
+            ));
+        }
+        if source_built_at.len() != 20
+            || !source_built_at.ends_with('Z')
+            || source_day != identity.day
+        {
+            return Err(format!(
+                "preview manifest retained build {build_id} built_at does not match its paired build date"
+            ));
+        }
+        let omp = build.omp.as_ref().ok_or_else(|| {
+            format!("preview manifest build {build_id} has no paired OMP metadata")
+        })?;
+        validate_smarty_omp(build_id, omp, Some(identity.omp_commit))?;
+        return Ok(());
+    }
+    let legacy = parse_legacy_preview_build_id(build_id).ok_or_else(|| {
+        format!(
+            "preview manifest retained build {build_id} must use a paired or legacy preview identity"
+        )
+    })?;
+    if !build.commit.starts_with(legacy.commit_prefix) {
+        return Err(format!(
+            "preview manifest retained build {build_id} commit does not match its legacy identity"
+        ));
+    }
+    if source_day != legacy.day {
+        return Err(format!(
+            "preview manifest retained build {build_id} built_at does not match its legacy build date"
+        ));
+    }
+    if let Some(omp) = build.omp.as_ref() {
+        validate_smarty_omp(build_id, omp, None)?;
+    }
+    Ok(())
+}
+
+fn validate_upstream_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    let identity = parse_legacy_preview_build_id(build_id).ok_or_else(|| {
+        format!("upstream preview retained build {build_id} must use YYYY-MM-DD-<12 lowercase hex>")
+    })?;
+    if build.tag.as_deref() != Some(&format!("preview-{build_id}")) {
+        return Err(format!(
+            "upstream preview retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    if Version::parse(&build.base_version).is_none() {
+        return Err(format!(
+            "upstream preview retained build {build_id} has an invalid base_version"
+        ));
+    }
+    validate_preview_commit(
+        &build.commit,
+        &format!("upstream preview retained build {build_id} commit"),
+    )?;
+    if !build.commit.starts_with(identity.commit_prefix) {
+        return Err(format!(
+            "upstream preview retained build {build_id} commit does not match its legacy identity"
+        ));
+    }
+    validate_preview_timestamp(
+        &build.built_at,
+        &format!("upstream preview retained build {build_id} built_at"),
+    )?;
+    if build.protocol == 0 {
+        return Err(format!(
+            "upstream preview retained build {build_id} protocol must be positive"
+        ));
+    }
+    if build.omp.is_some() {
+        return Err(format!(
+            "upstream preview retained build {build_id} must not claim paired OMP metadata"
+        ));
+    }
+    validate_upstream_preview_assets(build_id, &build.assets)
+}
+
+fn validate_custom_omp(
+    build_id: &str,
+    omp: &OmpCompanionMetadata,
+    expected_commit: Option<&str>,
+) -> Result<(), String> {
+    required_preview_string(&omp.build_id, "custom preview OMP build_id")?;
+    required_preview_string(&omp.version, "custom preview OMP version")?;
+    validate_preview_commit(&omp.commit, "custom preview OMP commit")?;
+    validate_preview_commit(&omp.tree, "custom preview OMP tree")?;
+    if expected_commit.is_some_and(|expected| omp.commit != expected) {
+        return Err(format!(
+            "custom preview build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_custom_preview_assets(&omp.assets, "custom preview OMP")
+}
+
+fn validate_custom_preview_metadata(
+    build_id: &str,
+    base_version: &str,
+    commit: &str,
+    built_at: &str,
+    protocol: u32,
+    assets: &BTreeMap<String, AssetRef>,
+    omp: Option<&OmpCompanionMetadata>,
+) -> Result<(), String> {
+    if Version::parse(base_version).is_none() {
+        return Err("custom preview manifest has an invalid base_version".into());
+    }
+    validate_preview_commit(commit, "custom preview manifest commit")?;
+    validate_preview_timestamp(built_at, "custom preview manifest built_at")?;
+    if protocol == 0 {
+        return Err("custom preview manifest protocol must be positive".into());
+    }
+    validate_custom_preview_assets(assets, "custom preview manifest")?;
+    let paired = parse_canonical_paired_build_id(build_id);
+    if let Some(identity) = paired.as_ref() {
+        if commit != identity.herdr_commit {
+            return Err("custom preview manifest commit does not match its P/R/O build ID".into());
+        }
+        if !built_at.starts_with(identity.day) {
+            return Err(
+                "custom preview manifest built_at does not match its paired build date".into(),
+            );
+        }
+    } else if let Some(identity) = parse_legacy_preview_build_id(build_id) {
+        if !commit.starts_with(identity.commit_prefix) {
+            return Err("custom preview manifest commit does not match its legacy build ID".into());
+        }
+        if !built_at.starts_with(identity.day) {
+            return Err(
+                "custom preview manifest built_at does not match its legacy build date".into(),
+            );
+        }
+    } else {
+        return Err(
+            "custom preview manifest build_id must use a paired or legacy preview identity".into(),
+        );
+    }
+    if let Some(omp) = omp {
+        validate_custom_omp(
+            build_id,
+            omp,
+            paired.as_ref().map(|identity| identity.omp_commit),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_custom_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    let tag = build
+        .tag
+        .as_deref()
+        .ok_or_else(|| format!("custom preview retained build {build_id} has no tag"))?;
+    required_preview_string(tag, "custom preview retained build tag")?;
+    if !tag.ends_with(build_id) {
+        return Err(format!(
+            "custom preview retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    validate_custom_preview_metadata(
+        build_id,
+        &build.base_version,
+        &build.commit,
+        &build.built_at,
+        build.protocol,
+        &build.assets,
+        build.omp.as_ref(),
+    )
+}
+
+#[cfg(unix)]
 fn validate_canonical_preview_build(
     build_id: &str,
     commit: &str,
@@ -629,38 +1230,94 @@ where
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn preview_omp_metadata_for_build<'a>(
     manifest: &'a PreviewManifest,
     herdr_build_id: &str,
 ) -> Result<&'a OmpCompanionMetadata, String> {
-    let canonical_build_id = manifest.effective_build_id()?;
-    if canonical_build_id == herdr_build_id {
-        manifest.validate_current_and_retained_builds(canonical_build_id)?;
-        let omp = if let Some((_, archived)) = manifest.bridge_build()? {
-            archived.omp.as_ref()
-        } else {
-            manifest.omp.as_ref()
-        };
-        return omp.ok_or_else(|| {
-            format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
-        });
-    }
-    let retained = manifest
-        .builds
-        .get(herdr_build_id)
-        .ok_or_else(|| format!("preview manifest has no retained build {herdr_build_id}"))?;
-    validate_canonical_preview_build(
+    preview_omp_metadata_for_build_with_contract(
+        manifest,
         herdr_build_id,
-        &retained.commit,
-        &retained.assets,
-        retained.omp.as_ref(),
-    )?;
-    retained.omp.as_ref().ok_or_else(|| {
-        format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
-    })
+        PreviewManifestContract::SmartyPaired,
+    )
 }
 
+#[cfg(unix)]
+fn preview_omp_metadata_for_build_with_contract<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    contract: PreviewManifestContract,
+) -> Result<&'a OmpCompanionMetadata, String> {
+    if parse_legacy_preview_build_id(herdr_build_id).is_some() {
+        return Err(format!(
+            "preview manifest legacy build {herdr_build_id} cannot provide a paired OMP companion"
+        ));
+    }
+    match contract {
+        PreviewManifestContract::UpstreamLegacy => {
+            Err("upstream legacy preview builds do not have a paired OMP companion".into())
+        }
+        PreviewManifestContract::SmartyPaired => {
+            if parse_canonical_paired_build_id(herdr_build_id).is_none() {
+                return Err(format!(
+                    "preview manifest build {herdr_build_id} is not a paired build"
+                ));
+            }
+            if manifest.builds.is_empty() {
+                if manifest.build_id != herdr_build_id {
+                    return Err(format!(
+                        "preview manifest has no retained build {herdr_build_id}"
+                    ));
+                }
+                let identity =
+                    parse_canonical_paired_build_id(herdr_build_id).ok_or_else(|| {
+                        format!("preview manifest build {herdr_build_id} is not a paired build")
+                    })?;
+                if manifest.commit != identity.herdr_commit {
+                    return Err(format!(
+                        "preview manifest build {herdr_build_id} identity does not bind Herdr metadata"
+                    ));
+                }
+                let omp = manifest.omp.as_ref().ok_or_else(|| {
+                    format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+                })?;
+                if omp.commit != identity.omp_commit {
+                    return Err(format!(
+                        "preview manifest build {herdr_build_id} OMP commit does not match its P/R/O identity"
+                    ));
+                }
+                return Ok(omp);
+            }
+            let canonical_build_id = manifest.effective_build_id()?;
+            if canonical_build_id == herdr_build_id {
+                let omp = if let Some((_, archived)) = manifest.bridge_build()? {
+                    archived.omp.as_ref()
+                } else {
+                    manifest.omp.as_ref()
+                };
+                return omp.ok_or_else(|| {
+                    format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+                });
+            }
+            let retained = manifest.builds.get(herdr_build_id).ok_or_else(|| {
+                format!("preview manifest has no retained build {herdr_build_id}")
+            })?;
+            validate_canonical_preview_build(
+                herdr_build_id,
+                &retained.commit,
+                &retained.assets,
+                retained.omp.as_ref(),
+            )?;
+            validate_smarty_retained_preview_build(herdr_build_id, retained)?;
+            retained.omp.as_ref().ok_or_else(|| {
+                format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+            })
+        }
+        PreviewManifestContract::Custom => {
+            Err("custom preview manifests cannot provide a managed paired OMP companion".into())
+        }
+    }
+}
 #[cfg(unix)]
 fn validate_omp_source_value(field: &str, value: &str) -> Result<(), String> {
     let value = value.trim();
@@ -683,14 +1340,31 @@ fn validate_omp_git_oid(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn preview_omp_asset_for_build<'a>(
     manifest: &'a PreviewManifest,
     herdr_build_id: &str,
     expected: OmpBuildIdentity<'_>,
     asset_key: &str,
 ) -> Result<(&'a OmpCompanionMetadata, &'a AssetRef, &'a str), String> {
-    let omp = preview_omp_metadata_for_build(manifest, herdr_build_id)?;
+    preview_omp_asset_for_build_with_contract(
+        manifest,
+        herdr_build_id,
+        expected,
+        asset_key,
+        PreviewManifestContract::SmartyPaired,
+    )
+}
+
+#[cfg(unix)]
+fn preview_omp_asset_for_build_with_contract<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+    contract: PreviewManifestContract,
+) -> Result<(&'a OmpCompanionMetadata, &'a AssetRef, &'a str), String> {
+    let omp = preview_omp_metadata_for_build_with_contract(manifest, herdr_build_id, contract)?;
     validate_omp_source_value("build_id", &omp.build_id)?;
     validate_omp_git_oid("commit", &omp.commit)?;
     validate_omp_git_oid("tree", &omp.tree)?;
@@ -711,17 +1385,29 @@ fn preview_omp_asset_for_build<'a>(
             omp.build_id
         )
     })?;
+    if matches!(contract, PreviewManifestContract::SmartyPaired) {
+        let asset_name = CANONICAL_PREVIEW_OMP_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .ok_or_else(|| format!("paired OMP has unsupported asset target {asset_key}"))?;
+        if asset.url != canonical_preview_asset_url(herdr_build_id, asset_name) {
+            return Err(format!(
+                "preview manifest OMP asset {asset_key} URL does not bind the canonical release tag"
+            ));
+        }
+        if asset.format.is_some() {
+            return Err(format!(
+                "preview manifest OMP asset {asset_key} has unexpected format metadata"
+            ));
+        }
+    }
     let checksum = asset
         .sha256
         .as_deref()
         .map(str::trim)
         .filter(|checksum| !checksum.is_empty())
         .ok_or_else(|| format!("paired OMP asset {asset_key} is missing a SHA-256 checksum"))?;
-    if checksum.len() != 64
-        || !checksum
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
+    if !is_lowercase_hex(checksum, 64) {
         return Err(format!(
             "paired OMP asset {asset_key} has an invalid SHA-256 checksum"
         ));
@@ -916,58 +1602,110 @@ pub(crate) fn windows_bootstrap_build_alias(canonical_build_id: &str) -> String 
 }
 
 struct CanonicalPairedBuildId<'a> {
+    day: &'a str,
     herdr_commit: &'a str,
     omp_commit: &'a str,
 }
 
-fn parse_canonical_paired_build_id(value: &str) -> Option<CanonicalPairedBuildId<'_>> {
-    fn is_lowercase_oid(value: &str) -> bool {
-        value.len() == 40
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }
+struct LegacyBuildId<'a> {
+    day: &'a str,
+    commit_prefix: &'a str,
+}
 
-    let (date, identities) = value.split_once("-p")?;
-    let date = date.as_bytes();
-    if date.len() != 10
-        || date[4] != b'-'
-        || date[7] != b'-'
-        || !date
-            .iter()
+fn valid_calendar_date(value: &str) -> bool {
+    if value.len() != 10
+        || value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+        || !value
+            .bytes()
             .enumerate()
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
     {
+        return false;
+    }
+    let year = value[0..4].parse::<u32>().ok();
+    let month = value[5..7].parse::<u32>().ok();
+    let day = value[8..10].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
+}
+
+fn parse_canonical_paired_build_id(value: &str) -> Option<CanonicalPairedBuildId<'_>> {
+    let (date, identities) = value.split_once("-p")?;
+    if !valid_calendar_date(date) {
         return None;
     }
     let (parent, identities) = identities.split_once("-r")?;
     let (herdr_commit, omp_commit) = identities.split_once("-o")?;
-    if !is_lowercase_oid(parent) || !is_lowercase_oid(herdr_commit) || !is_lowercase_oid(omp_commit)
+    if !is_lowercase_hex(parent, 40)
+        || !is_lowercase_hex(herdr_commit, 40)
+        || !is_lowercase_hex(omp_commit, 40)
     {
         return None;
     }
     Some(CanonicalPairedBuildId {
+        day: date,
         herdr_commit,
         omp_commit,
     })
 }
 
+fn parse_legacy_preview_build_id(value: &str) -> Option<LegacyBuildId<'_>> {
+    if value.len() != 23 || value.as_bytes().get(10) != Some(&b'-') {
+        return None;
+    }
+    let day = &value[..10];
+    let commit_prefix = &value[11..];
+    if !valid_calendar_date(day) || !is_lowercase_hex(commit_prefix, 12) {
+        return None;
+    }
+    Some(LegacyBuildId { day, commit_prefix })
+}
+
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
-    release_info_from_preview_manifest_for_build(
+    let contract = preview_manifest_contract(crate::build_info::update_manifest_url());
+    release_info_from_preview_manifest_with_contract(
         manifest,
-        crate::build_info::update_manifest_url().is_some(),
+        true,
         crate::build_info::uses_preview_update_manifest(),
         crate::build_info::build_id(),
+        contract,
     )
 }
-
+#[cfg(test)]
 fn release_info_from_preview_manifest_for_build(
     manifest: &PreviewManifest,
     require_checksum: bool,
     installed_is_preview: bool,
     current_build_id: Option<&str>,
+) -> Result<Option<ReleaseInfo>, String> {
+    release_info_from_preview_manifest_with_contract(
+        manifest,
+        require_checksum,
+        installed_is_preview,
+        current_build_id,
+        PreviewManifestContract::SmartyPaired,
+    )
+}
+
+fn release_info_from_preview_manifest_with_contract(
+    manifest: &PreviewManifest,
+    require_checksum: bool,
+    installed_is_preview: bool,
+    current_build_id: Option<&str>,
+    contract: PreviewManifestContract,
 ) -> Result<Option<ReleaseInfo>, String> {
     if manifest.channel != "preview" {
         return Err(format!(
@@ -975,11 +1713,29 @@ fn release_info_from_preview_manifest_for_build(
             manifest.channel
         ));
     }
-    let (canonical_build_id, retained_build) = match manifest.bridge_build()? {
-        Some((canonical_build_id, retained_build)) => (canonical_build_id, Some(retained_build)),
-        None => (manifest.effective_build_id()?, None),
+
+    let (selected_build_id, retained_build) = match contract {
+        PreviewManifestContract::UpstreamLegacy => {
+            let (build_id, retained) = manifest.upstream_legacy_build()?;
+            (build_id, Some(retained))
+        }
+        PreviewManifestContract::SmartyPaired => match manifest.bridge_build()? {
+            Some((canonical_build_id, retained_build)) => {
+                (canonical_build_id, Some(retained_build))
+            }
+            None => {
+                let canonical_build_id = manifest.effective_build_id()?;
+                let retained_build = manifest.builds.get(canonical_build_id).ok_or_else(|| {
+                    format!("preview manifest has no retained canonical build {canonical_build_id}")
+                })?;
+                (canonical_build_id, Some(retained_build))
+            }
+        },
+        PreviewManifestContract::Custom => {
+            let (build_id, retained) = manifest.custom_build()?;
+            (build_id, retained)
+        }
     };
-    manifest.validate_current_and_retained_builds(canonical_build_id)?;
 
     let version = Version::parse(&manifest.base_version).ok_or_else(|| {
         format!(
@@ -993,58 +1749,40 @@ fn release_info_from_preview_manifest_for_build(
     }
     let (os, arch) = platform_target();
     let asset_key = format!("{os}-{arch}");
-    let asset = if let Some(retained_build) = retained_build {
-        retained_build.assets.get(&asset_key)
-    } else {
-        manifest.assets.get(&asset_key).or_else(|| {
-            manifest
-                .builds
-                .get(canonical_build_id)
-                .and_then(|build| build.assets.get(&asset_key))
-        })
-    }
-    .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
+    let asset = retained_build
+        .and_then(|build| build.assets.get(&asset_key))
+        .or_else(|| manifest.assets.get(&asset_key))
+        .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
     let sha256 = asset.sha256.clone();
-    if require_checksum {
-        let checksum = sha256
-            .as_deref()
-            .map(str::trim)
-            .filter(|checksum| !checksum.is_empty())
-            .ok_or_else(|| {
-                format!("preview manifest asset {asset_key} is missing a SHA-256 checksum")
-            })?;
-        if checksum.len() != 64
-            || !checksum
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        {
-            return Err(format!(
-                "preview manifest asset {asset_key} has an invalid SHA-256 checksum"
-            ));
-        }
+    if require_checksum || matches!(contract, PreviewManifestContract::SmartyPaired) {
+        validate_preview_sha256(
+            sha256.as_deref(),
+            &format!("preview manifest asset {asset_key}"),
+        )?;
     }
     #[cfg(windows)]
     let package_format = asset.package_format()?;
     #[cfg(windows)]
     let needs_windows_storage_canonicalization = manifest.canonical_build_id.is_absent()
         && windows_same_build_storage_needs_canonicalization(
-            &preview_display_version(&manifest.base_version, canonical_build_id),
+            &preview_display_version(&manifest.base_version, selected_build_id),
             &package_format,
+            sha256.as_deref(),
         );
     #[cfg(not(windows))]
     let needs_windows_storage_canonicalization = false;
     if installed_is_preview
-        && current_build_id.is_some_and(|current| current == canonical_build_id)
+        && current_build_id.is_some_and(|current| current == selected_build_id)
         && !needs_windows_storage_canonicalization
     {
         return Ok(None);
     }
 
     Ok(Some(ReleaseInfo {
-        identity: preview_display_version(&manifest.base_version, canonical_build_id),
+        identity: preview_display_version(&manifest.base_version, selected_build_id),
         version,
         channel: UpdateChannel::Preview,
-        build_id: Some(canonical_build_id.to_string()),
+        build_id: Some(selected_build_id.to_string()),
         commit: Some(manifest.commit.clone()),
         #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
@@ -1970,11 +2708,12 @@ fn load_current_omp_companion() -> Result<Option<ManagedOmpCompanion>, String> {
             manifest.channel
         ));
     }
-    let (omp_metadata, asset, checksum) = preview_omp_asset_for_build(
+    let (omp_metadata, asset, checksum) = preview_omp_asset_for_build_with_contract(
         &manifest,
         expected.herdr_build_id,
         expected.omp,
         &omp_platform,
+        preview_manifest_contract(crate::build_info::update_manifest_url()),
     )?;
     let executable = install_exact_omp_asset_for_remote_build_at(
         &crate::config::state_dir(),
@@ -2184,6 +2923,7 @@ struct WindowsReleaseIdentityMetadata {
     version_identity: String,
     target_triple: String,
     format: String,
+    sha256: String,
 }
 
 #[cfg(any(windows, test))]
@@ -2191,6 +2931,7 @@ fn windows_release_metadata_matches(
     path: &Path,
     version_identity: &str,
     package_format: &str,
+    expected_sha256: Option<&str>,
 ) -> bool {
     fs::read_to_string(path)
         .ok()
@@ -2202,6 +2943,7 @@ fn windows_release_metadata_matches(
         })
         .is_some_and(|metadata| {
             matches!(package_format, "zip" | "exe")
+                && expected_sha256.is_some_and(|expected| metadata.sha256 == expected)
                 && metadata.schema_version == 1
                 && metadata.version_identity == version_identity
                 && metadata.target_triple == WINDOWS_RELEASE_TARGET_TRIPLE
@@ -2210,11 +2952,12 @@ fn windows_release_metadata_matches(
 }
 
 #[cfg(any(windows, test))]
-fn windows_same_build_storage_needs_canonicalization_at(
+fn windows_same_build_storage_needs_canonicalization_at_with_sha(
     current_exe: &Path,
     standalone_root: &Path,
     version_identity: &str,
     package_format: &str,
+    expected_sha256: Option<&str>,
 ) -> bool {
     let current_link = standalone_root.join("current").join("herdr.exe");
     let releases_dir = standalone_root.join("releases");
@@ -2240,6 +2983,7 @@ fn windows_same_build_storage_needs_canonicalization_at(
         &release_dir.join(WINDOWS_RELEASE_METADATA_FILE),
         version_identity,
         package_format,
+        expected_sha256,
     )
 }
 
@@ -2247,6 +2991,7 @@ fn windows_same_build_storage_needs_canonicalization_at(
 fn windows_same_build_storage_needs_canonicalization(
     version_identity: &str,
     package_format: &str,
+    expected_sha256: Option<&str>,
 ) -> bool {
     let herdr_home = env::var_os("HERDR_HOME")
         .filter(|value| !value.is_empty())
@@ -2255,11 +3000,28 @@ fn windows_same_build_storage_needs_canonicalization(
     let (Some(herdr_home), Ok(current_exe)) = (herdr_home, env::current_exe()) else {
         return false;
     };
-    windows_same_build_storage_needs_canonicalization_at(
+    windows_same_build_storage_needs_canonicalization_at_with_sha(
         &current_exe,
         &herdr_home.join("packages").join("standalone"),
         version_identity,
         package_format,
+        expected_sha256,
+    )
+}
+
+#[cfg(test)]
+fn windows_same_build_storage_needs_canonicalization_at(
+    current_exe: &Path,
+    standalone_root: &Path,
+    version_identity: &str,
+    package_format: &str,
+) -> bool {
+    windows_same_build_storage_needs_canonicalization_at_with_sha(
+        current_exe,
+        standalone_root,
+        version_identity,
+        package_format,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     )
 }
 
@@ -4292,7 +5054,8 @@ mod tests {
     );
 
     fn paired_omp_manifest_value(checksum: Option<&str>) -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
+            "schema_version": 1,
             "channel": "preview",
             "base_version": "0.8.0",
             "build_id": TEST_PAIRED_OMP_HERDR_BUILD_ID,
@@ -4312,13 +5075,118 @@ mod tests {
                             TEST_PAIRED_OMP_HERDR_BUILD_ID,
                             "omp-macos-aarch64",
                         ),
-                        "sha256": checksum,
                     }
                 }
             }
+        });
+        if let Some(checksum) = checksum {
+            value["omp"]["assets"]["macos-aarch64"]["sha256"] =
+                serde_json::Value::String(checksum.into());
+        }
+        value
+    }
+
+    fn exact_herdr_assets_value(build_id: &str, smarty: bool) -> serde_json::Value {
+        let mut assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_HERDR_ASSETS {
+            let url = if smarty {
+                canonical_preview_asset_url(build_id, asset_name)
+            } else {
+                upstream_preview_asset_url(build_id, asset_name)
+            };
+            let mut asset = serde_json::json!({
+                "url": url,
+                "sha256": "d".repeat(64),
+            });
+            if target == "windows-x86_64" {
+                asset["format"] = serde_json::json!("zip");
+            }
+            assets.insert(target.into(), asset);
+        }
+        serde_json::Value::Object(assets)
+    }
+
+    fn upstream_legacy_manifest_value() -> (String, serde_json::Value) {
+        let build_id = "2026-08-19-eeeeeeeeeeee".to_string();
+        let commit = "e".repeat(40);
+        let assets = exact_herdr_assets_value(&build_id, false);
+        let retained = serde_json::json!({
+            "base_version": "9.9.9",
+            "commit": commit,
+            "built_at": "2026-08-19T03:00:00Z",
+            "protocol": 77,
+            "tag": format!("preview-{build_id}"),
+            "assets": assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(build_id.clone(), retained);
+        (
+            build_id.clone(),
+            serde_json::json!({
+                "schema_version": 1,
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": build_id,
+                "commit": "e".repeat(40),
+                "built_at": "2026-08-19T03:00:00Z",
+                "protocol": 77,
+                "notes": "### Fixed\n- Upstream preview",
+                "assets": exact_herdr_assets_value("2026-08-19-eeeeeeeeeeee", false),
+                "builds": builds,
+            }),
+        )
+    }
+
+    fn smarty_legacy_retained_value(build_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "base_version": "9.9.8",
+            "commit": "e".repeat(40),
+            "built_at": "2026-08-19T03:00:00Z",
+            "protocol": 76,
+            "tag": format!("smarty-preview-{build_id}"),
+            "assets": exact_herdr_assets_value(build_id, true),
         })
     }
 
+    fn custom_legacy_manifest_value() -> (String, serde_json::Value) {
+        let build_id = "2026-08-18-ffffffffffff".to_string();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let mut assets = serde_json::Map::new();
+        assets.insert(
+            asset_key,
+            serde_json::json!({
+                "url": "https://downloads.example.test/herdr-custom",
+                "sha256": "f".repeat(64),
+            }),
+        );
+        let assets = serde_json::Value::Object(assets);
+        let retained = serde_json::json!({
+            "base_version": "9.9.7",
+            "commit": "f".repeat(40),
+            "built_at": "2026-08-18T03:00:00Z",
+            "protocol": 75,
+            "tag": format!("fork-preview-{build_id}"),
+            "assets": assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(build_id.clone(), retained);
+        (
+            build_id.clone(),
+            serde_json::json!({
+                "schema_version": 1,
+                "channel": "preview",
+                "base_version": "9.9.7",
+                "build_id": build_id,
+                "commit": "f".repeat(40),
+                "built_at": "2026-08-18T03:00:00Z",
+                "protocol": 75,
+                "notes": "### Fixed\n- Custom preview",
+                "assets": assets,
+                "builds": builds,
+            }),
+        )
+    }
     fn bridge_manifest_value() -> (String, serde_json::Value) {
         let canonical_build_id = concat!(
             "2026-08-22-paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-",
@@ -4342,10 +5210,6 @@ mod tests {
             }
             retained_assets.insert(target.into(), asset);
         }
-        let windows_asset = retained_assets
-            .get("windows-x86_64")
-            .expect("Windows asset")
-            .clone();
         let mut omp_assets = serde_json::Map::new();
         for &(target, asset_name) in CANONICAL_PREVIEW_OMP_ASSETS {
             omp_assets.insert(
@@ -4371,13 +5235,15 @@ mod tests {
                 "commit": "b".repeat(40),
                 "built_at": "2026-08-22T03:00:00Z",
                 "protocol": 77,
-                "assets": retained_assets,
+                "tag": format!("smarty-preview-{canonical_build_id}"),
+                "assets": retained_assets.clone(),
                 "omp": omp.clone(),
             }),
         );
         (
             canonical_build_id.clone(),
             serde_json::json!({
+                "schema_version": 2,
                 "channel": "preview",
                 "base_version": "9.9.9",
                 "build_id": windows_bootstrap_build_alias(&canonical_build_id),
@@ -4386,7 +5252,7 @@ mod tests {
                 "built_at": "2026-08-22T03:00:00Z",
                 "protocol": 77,
                 "notes": "### Fixed\n- One",
-                "assets": { "windows-x86_64": windows_asset },
+                "assets": retained_assets,
                 "omp": omp,
                 "builds": builds,
             }),
@@ -4400,6 +5266,7 @@ mod tests {
             .as_object_mut()
             .expect("preview manifest")
             .remove("canonical_build_id");
+        manifest["schema_version"] = serde_json::json!(1);
         manifest["build_id"] = serde_json::json!(canonical_build_id);
         manifest["assets"] = retained["assets"].clone();
         manifest["omp"] = retained["omp"].clone();
@@ -5410,12 +6277,13 @@ mod tests {
         let current_link = standalone_root.join("current");
         let current_exe = release_dir.join("herdr.exe");
         let version_identity = "0.8.2-preview.canonical-build";
-        let metadata_json = |format: &str| {
+        let metadata_json = |format: &str, sha256: &str| {
             serde_json::json!({
                 "schema_version": 1,
                 "version_identity": version_identity,
                 "target_triple": WINDOWS_RELEASE_TARGET_TRIPLE,
                 "format": format,
+                "sha256": sha256,
             })
             .to_string()
         };
@@ -5431,7 +6299,17 @@ mod tests {
         ));
 
         let metadata = release_dir.join(WINDOWS_RELEASE_METADATA_FILE);
-        fs::write(&metadata, format!("\u{feff}{}", metadata_json("zip"))).unwrap();
+        fs::write(
+            &metadata,
+            format!(
+                "\u{feff}{}",
+                metadata_json(
+                    "zip",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+            ),
+        )
+        .unwrap();
         assert!(!windows_same_build_storage_needs_canonicalization_at(
             &current_exe,
             &standalone_root,
@@ -5441,7 +6319,10 @@ mod tests {
 
         fs::write(
             &metadata,
-            format!("\u{feff}\u{feff}{}", metadata_json("zip")),
+            metadata_json(
+                "zip",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
         )
         .unwrap();
         assert!(windows_same_build_storage_needs_canonicalization_at(
@@ -5451,7 +6332,32 @@ mod tests {
             "zip",
         ));
 
-        fs::write(&metadata, metadata_json("exe")).unwrap();
+        fs::write(
+            &metadata,
+            format!(
+                "\u{feff}\u{feff}{}",
+                metadata_json(
+                    "zip",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+            ),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(
+            &metadata,
+            metadata_json(
+                "exe",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        )
+        .unwrap();
         assert!(!windows_same_build_storage_needs_canonicalization_at(
             &current_exe,
             &standalone_root,
@@ -6576,6 +7482,281 @@ mod tests {
         );
         assert_eq!(preview_manifest_url(None), PREVIEW_UPDATE_MANIFEST_URL);
     }
+    #[test]
+    fn preview_manifest_contract_is_bound_to_the_compiled_manifest_url() {
+        const FORK_MANIFEST: &str = "https://example.com/fork-preview.json";
+        assert_eq!(
+            preview_manifest_contract(None),
+            PreviewManifestContract::UpstreamLegacy
+        );
+        assert_eq!(
+            preview_manifest_contract(Some(SMARTY_PREVIEW_UPDATE_MANIFEST_URL)),
+            PreviewManifestContract::SmartyPaired
+        );
+        assert_eq!(
+            preview_manifest_contract(Some(FORK_MANIFEST)),
+            PreviewManifestContract::Custom
+        );
+    }
+
+    #[test]
+    fn upstream_default_preview_accepts_exact_legacy_current_build() {
+        let (build_id, value) = upstream_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::UpstreamLegacy,
+        )
+        .unwrap()
+        .expect("upstream preview update");
+
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset");
+        assert_eq!(release.build_id.as_deref(), Some(build_id.as_str()));
+        assert_eq!(
+            release.download_url,
+            upstream_preview_asset_url(&build_id, asset_name)
+        );
+        assert_eq!(release.sha256.as_deref(), Some("d".repeat(64).as_str()));
+    }
+
+    #[test]
+    fn smarty_paired_current_accepts_exact_legacy_retained_history() {
+        let (current_build_id, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        value["builds"].as_object_mut().expect("builds").insert(
+            legacy_build_id.into(),
+            smarty_legacy_retained_value(legacy_build_id),
+        );
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap()
+        .expect("paired preview update");
+        assert_eq!(release.build_id.as_deref(), Some(current_build_id.as_str()));
+
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            legacy_build_id,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy build"), "{error}");
+    }
+
+    #[test]
+    fn smarty_paired_current_accepts_legacy_literal_date_across_utc_midnight() {
+        let (current_build_id, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut legacy = smarty_legacy_retained_value(legacy_build_id);
+        legacy["built_at"] = serde_json::json!("2026-08-19T23:30:00-04:00");
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), legacy);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap()
+        .expect("paired preview update");
+        assert_eq!(release.build_id.as_deref(), Some(current_build_id.as_str()));
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_literal_date_mismatch_and_invalid_timestamp_date() {
+        for built_at in ["2026-08-08T23:30:00-04:00", "2026-02-30T23:30:00-04:00"] {
+            let (_, mut value) = canonical_manifest_value();
+            let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+            let mut legacy = smarty_legacy_retained_value(legacy_build_id);
+            legacy["built_at"] = serde_json::json!(built_at);
+            value["builds"]
+                .as_object_mut()
+                .expect("builds")
+                .insert(legacy_build_id.into(), legacy);
+            let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+            let error = release_info_from_preview_manifest_with_contract(
+                &manifest,
+                true,
+                false,
+                None,
+                PreviewManifestContract::SmartyPaired,
+            )
+            .unwrap_err();
+            if built_at.starts_with("2026-02-30") {
+                assert!(error.contains("ISO-8601 timestamp"), "{error}");
+            } else {
+                assert!(error.contains("legacy build date"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_malformed_ids_and_commit_prefix_mismatch() {
+        for build_id in [
+            "2026-02-30-eeeeeeeeeeee",
+            "2026-08-19-EEEEEEEEEEEE",
+            "2026-08-19-eeeeeeeeeee",
+        ] {
+            let (_, mut value) = canonical_manifest_value();
+            value["builds"]
+                .as_object_mut()
+                .expect("builds")
+                .insert(build_id.into(), smarty_legacy_retained_value(build_id));
+            let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+            let error = release_info_from_preview_manifest_with_contract(
+                &manifest,
+                true,
+                false,
+                None,
+                PreviewManifestContract::SmartyPaired,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("paired or legacy preview identity"),
+                "{error}"
+            );
+        }
+
+        let (_, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut retained = smarty_legacy_retained_value(legacy_build_id);
+        retained["commit"] = serde_json::json!("f".repeat(40));
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy identity"), "{error}");
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_coordinated_attacker_url_and_sha() {
+        let (_, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut retained = smarty_legacy_retained_value(legacy_build_id);
+        retained["assets"]["linux-x86_64"]["url"] =
+            serde_json::json!("https://attacker.invalid/herdr-linux-x86_64");
+        retained["assets"]["linux-x86_64"]["sha256"] = serde_json::json!("a".repeat(64));
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn legacy_current_never_downgrades_the_smarty_paired_contract() {
+        let (legacy_build_id, value) = upstream_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            &legacy_build_id,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy build"), "{error}");
+    }
+
+    #[test]
+    fn custom_preview_keeps_its_url_trust_boundary_without_smarty_or_omp_semantics() {
+        let (build_id, value) = custom_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value.clone()).unwrap();
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap()
+        .expect("custom preview update");
+        assert_eq!(release.build_id.as_deref(), Some(build_id.as_str()));
+        assert_eq!(
+            release.download_url,
+            "https://downloads.example.test/herdr-custom"
+        );
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            &build_id,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot provide"), "{error}");
+
+        let mut malformed = value;
+        let retained = malformed["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .remove(&build_id)
+            .expect("current archive");
+        let malformed_id = "malformed-current";
+        malformed["build_id"] = serde_json::json!(malformed_id);
+        malformed["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(malformed_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(malformed).unwrap();
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("paired or legacy preview identity"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn build_scoped_preview_manifest_rejects_missing_or_invalid_asset_checksum() {
@@ -6737,31 +7918,25 @@ mod tests {
             "a".repeat(40),
         );
         assert!(parse_canonical_paired_build_id(&retained_build_id).is_some());
+        let canonical_retained = bridge["builds"]
+            .as_object()
+            .expect("builds")
+            .values()
+            .next()
+            .expect("canonical retained build")
+            .clone();
+        let mut retained_value = canonical_retained;
+        retained_value["commit"] = serde_json::json!("e".repeat(40));
+        retained_value["built_at"] = serde_json::json!("2026-08-21T03:00:00Z");
+        retained_value["tag"] = serde_json::json!(format!("smarty-preview-{retained_build_id}"));
+        retained_value["omp"]["commit"] = serde_json::json!("a".repeat(40));
+        retained_value["omp"]["assets"]["macos-aarch64"]["url"] = serde_json::json!(
+            canonical_preview_asset_url(&retained_build_id, "omp-macos-aarch64")
+        );
         bridge["builds"]
             .as_object_mut()
             .expect("builds")
-            .insert(
-                retained_build_id.clone(),
-                serde_json::json!({
-                    "base_version": "9.9.9",
-                    "commit": "e".repeat(40),
-                    "built_at": "2026-08-21T03:00:00Z",
-                    "protocol": 77,
-                    "assets": {},
-                    "omp": {
-                        "build_id": "omp-build",
-                        "commit": "a".repeat(40),
-                        "tree": "b".repeat(40),
-                        "version": "17.3.7",
-                        "assets": {
-                            "macos-aarch64": {
-                                "url": canonical_preview_asset_url(&retained_build_id, "omp-macos-aarch64"),
-                                "sha256": "c".repeat(64),
-                            },
-                        },
-                    },
-                }),
-            );
+            .insert(retained_build_id.clone(), retained_value);
         let retained = bridge["builds"]
             .as_object_mut()
             .expect("builds")
@@ -6960,30 +8135,27 @@ mod tests {
         assert!(bridge_release_error(omp, &canonical_build_id).contains("OMP metadata differs"));
 
         let mut extra_top_level_asset = bridge.clone();
-        extra_top_level_asset["assets"]["linux-x86_64"] = serde_json::json!({
+        extra_top_level_asset["assets"]["unexpected"] = serde_json::json!({
             "url": "https://example.com/unbound-linux",
             "sha256": "d".repeat(64),
         });
         assert!(
             bridge_release_error(extra_top_level_asset, &canonical_build_id)
-                .contains("only windows-x86_64")
+                .contains("assets differ")
         );
 
         let mut windows_url = bridge.clone();
         windows_url["assets"]["windows-x86_64"]["url"] =
             serde_json::json!("https://example.com/other-windows.zip");
-        assert!(bridge_release_error(windows_url, &canonical_build_id)
-            .contains("Windows asset differs"));
+        assert!(bridge_release_error(windows_url, &canonical_build_id).contains("assets differ"));
 
         let mut windows_sha = bridge.clone();
         windows_sha["assets"]["windows-x86_64"]["sha256"] = serde_json::json!("d".repeat(64));
-        assert!(bridge_release_error(windows_sha, &canonical_build_id)
-            .contains("Windows asset differs"));
+        assert!(bridge_release_error(windows_sha, &canonical_build_id).contains("assets differ"));
 
         let mut windows_format = bridge.clone();
         windows_format["assets"]["windows-x86_64"]["format"] = serde_json::json!("exe");
-        assert!(bridge_release_error(windows_format, &canonical_build_id)
-            .contains("Windows asset differs"));
+        assert!(bridge_release_error(windows_format, &canonical_build_id).contains("assets differ"));
 
         let mut missing_windows = bridge;
         missing_windows["builds"]
@@ -6994,8 +8166,9 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("windows-x86_64");
-        assert!(bridge_release_error(missing_windows, &canonical_build_id)
-            .contains("has no Windows asset"));
+        assert!(
+            bridge_release_error(missing_windows, &canonical_build_id).contains("assets differ")
+        );
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     }
 
     let exit_code = match command {
+        "build-info" => run_build_info_command(&args[2..])?,
         "server" => {
             let Some(exit_code) = server::run_server_command(&args[2..])? else {
                 return Ok(CommandOutcome::NotCli);
@@ -127,6 +128,41 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     };
 
     Ok(CommandOutcome::Handled(exit_code))
+}
+
+fn run_build_info_command(args: &[String]) -> std::io::Result<i32> {
+    if args != ["--json"] {
+        eprintln!("usage: herdr build-info --json");
+        return Ok(2);
+    }
+    let mut value = serde_json::Map::new();
+    value.insert("schema".into(), serde_json::json!(1));
+    value.insert(
+        "channel".into(),
+        serde_json::json!(crate::build_info::channel()),
+    );
+    value.insert(
+        "buildId".into(),
+        serde_json::json!(crate::build_info::build_id()),
+    );
+    value.insert(
+        "ompBuildId".into(),
+        serde_json::json!(crate::build_info::omp_build_id()),
+    );
+    value.insert(
+        "ompCommit".into(),
+        serde_json::json!(crate::build_info::omp_commit()),
+    );
+    value.insert(
+        "ompTree".into(),
+        serde_json::json!(crate::build_info::omp_tree()),
+    );
+    value.insert(
+        "ompVersion".into(),
+        serde_json::json!(crate::build_info::omp_version()),
+    );
+    println!("{}", serde_json::Value::Object(value));
+    Ok(0)
 }
 
 fn run_channel_command(args: &[String]) -> std::io::Result<i32> {

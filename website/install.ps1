@@ -362,6 +362,19 @@ function Get-RequiredManifestTimestamp {
     }
     return $timestamp
 }
+function Get-RequiredManifestVersion {
+    param(
+        [object]$Value,
+        [string]$Label
+    )
+
+    $version = Get-RequiredManifestString -Value $Value -Label $Label
+    if ($version -notmatch '^v?[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "$Label must be a semantic version."
+    }
+    return $version.TrimStart('v')
+}
+
 
 
 function Get-RequiredManifestPositiveInteger {
@@ -399,6 +412,120 @@ function Get-BridgeReleaseAssetUrl {
 
     return "https://github.com/Smarty-Pants-Inc/herdr/releases/download/smarty-preview-$($Canonical.BuildId)/$AssetName"
 }
+function Get-UpstreamPreviewReleaseAssetUrl {
+    param(
+        [string]$BuildId,
+        [string]$AssetName
+    )
+
+    return "https://github.com/herdrdev/herdr/releases/download/preview-$BuildId/$AssetName"
+}
+
+function Get-UpstreamHerdrAssets {
+    param(
+        [object]$Value,
+        [object]$Identity,
+        [string]$Label
+    )
+
+    Assert-ManifestObject -Value $Value -Label $Label
+    $shapes = @(
+        [PSCustomObject]@{
+            Targets = @("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64")
+            Names = @{
+                "linux-x86_64" = "herdr-linux-x86_64"
+                "linux-aarch64" = "herdr-linux-aarch64"
+                "macos-x86_64" = "herdr-macos-x86_64"
+                "macos-aarch64" = "herdr-macos-aarch64"
+                "windows-x86_64" = "herdr-windows-x86_64.zip"
+            }
+            Formatted = @("windows-x86_64")
+            WindowsFormatted = $true
+        }
+        [PSCustomObject]@{
+            Targets = @("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64")
+            Names = @{
+                "linux-x86_64" = "herdr-linux-x86_64"
+                "linux-aarch64" = "herdr-linux-aarch64"
+                "macos-x86_64" = "herdr-macos-x86_64"
+                "macos-aarch64" = "herdr-macos-aarch64"
+                "windows-x86_64" = "herdr-windows-x86_64.exe"
+            }
+            Formatted = @()
+            WindowsFormatted = $false
+        }
+        [PSCustomObject]@{
+            Targets = @("linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64")
+            Names = @{
+                "linux-x86_64" = "herdr-linux-x86_64"
+                "linux-aarch64" = "herdr-linux-aarch64"
+                "macos-x86_64" = "herdr-macos-x86_64"
+                "macos-aarch64" = "herdr-macos-aarch64"
+            }
+            Formatted = @()
+            WindowsFormatted = $null
+        }
+    )
+    $actualTargets = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+    $windowsProperty = $Value.PSObject.Properties["windows-x86_64"]
+    $windowsHasFormat = $null -ne $windowsProperty -and $null -ne $windowsProperty.Value.PSObject.Properties["format"]
+    $selected = $null
+    foreach ($shape in $shapes) {
+        $windowsShapeMatches = if ($null -eq $shape.WindowsFormatted) {
+            $null -eq $windowsProperty
+        } else {
+            $null -ne $windowsProperty -and $windowsHasFormat -eq $shape.WindowsFormatted
+        }
+        if ($windowsShapeMatches -and
+            $actualTargets.Count -eq $shape.Targets.Count -and
+            @($shape.Targets | Where-Object { $actualTargets -cnotcontains $_ }).Count -eq 0) {
+            $selected = $shape
+            break
+        }
+    }
+    if ($null -eq $selected) {
+        throw "$Label must use one of the authenticated upstream asset shapes."
+    }
+    $assets = @{}
+    foreach ($targetName in $selected.Targets) {
+        $withFormat = $selected.Formatted -contains $targetName
+        $asset = Get-BridgeAsset `
+            -Value (Get-RequiredManifestProperty -Value $Value -Name $targetName -Label $Label) `
+            -Label "$Label.$targetName" `
+            -ExpectedUrl (Get-UpstreamPreviewReleaseAssetUrl -BuildId $Identity.BuildId -AssetName $selected.Names[$targetName]) `
+            -WithFormat:$withFormat
+        if ($withFormat -and $asset.Format -cne "zip") {
+            throw "$Label.windows-x86_64.format must be zip."
+        }
+        if ($targetName -eq "windows-x86_64" -and -not $withFormat) {
+            $asset.Format = "exe"
+        }
+        $assets[$targetName] = $asset
+    }
+    return $assets
+}
+
+function Get-CustomPreviewAssets {
+    param(
+        [object]$Value,
+        [string]$Label
+    )
+
+    Assert-ManifestObject -Value $Value -Label $Label
+    $assets = @{}
+    foreach ($property in $Value.PSObject.Properties) {
+        $asset = Get-ManifestAsset -Manifest ([PSCustomObject]@{ assets = $Value }) -Target $property.Name
+        $null = Get-RequiredManifestSha256 -Value $asset.Sha256 -Label "$Label.$($property.Name).sha256"
+        if ($asset.Format -notin @("zip", "exe")) {
+            throw "$Label.$($property.Name) has unsupported format '$($asset.Format)'."
+        }
+        $assets[$property.Name] = $asset
+    }
+    if ($assets.Count -eq 0) {
+        throw "$Label must not be empty."
+    }
+    return $assets
+}
 
 
 function Get-PairedBuildId {
@@ -427,10 +554,47 @@ function Get-PairedBuildId {
     }
     return [PSCustomObject]@{
         BuildId = $buildId
+        Kind = "paired"
         Day = $match.Groups["day"].Value
         Parent = $match.Groups["parent"].Value
         Herdr = $match.Groups["herdr"].Value
         Omp = $match.Groups["omp"].Value
+        CommitPrefix = $null
+    }
+}
+
+function Get-LegacyBuildId {
+    param(
+        [object]$Value,
+        [string]$Label
+    )
+
+    $buildId = Get-RequiredManifestString -Value $Value -Label $Label
+    $match = [regex]::Match(
+        $buildId,
+        '^(?<day>[0-9]{4}-[0-9]{2}-[0-9]{2})-(?<commit>[0-9a-f]{12})$'
+    )
+    if (-not $match.Success) {
+        throw "$Label must use YYYY-MM-DD-<12 lowercase hex>."
+    }
+    try {
+        $null = [DateTime]::ParseExact(
+            $match.Groups["day"].Value,
+            "yyyy-MM-dd",
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None
+        )
+    } catch {
+        throw "$Label has an invalid build date."
+    }
+    return [PSCustomObject]@{
+        BuildId = $buildId
+        Kind = "legacy"
+        Day = $match.Groups["day"].Value
+        Parent = $null
+        Herdr = $null
+        Omp = $null
+        CommitPrefix = $match.Groups["commit"].Value
     }
 }
 
@@ -440,7 +604,11 @@ function Get-RetainedBuildId {
         [string]$Label
     )
 
-    return Get-PairedBuildId -Value $Value -Label $Label
+    $buildId = Get-RequiredManifestString -Value $Value -Label $Label
+    if ($buildId -match '-p[0-9a-f]{40}-r[0-9a-f]{40}-o[0-9a-f]{40}$') {
+        return Get-PairedBuildId -Value $buildId -Label $Label
+    }
+    return Get-LegacyBuildId -Value $buildId -Label $Label
 }
 
 function Get-BridgeAsset {
@@ -562,6 +730,36 @@ function Get-BridgeHerdrAssets {
     return $assets
 }
 
+function Get-UpstreamRetainedPreviewBuild {
+    param(
+        [string]$BuildId,
+        [object]$Build,
+        [string]$Label
+    )
+
+    $identity = Get-LegacyBuildId -Value $BuildId -Label $Label
+    Assert-ManifestObject -Value $Build -Label $Label
+    Assert-ExactManifestProperties -Value $Build -Expected @("assets", "base_version", "built_at", "commit", "protocol", "tag") -Label $Label
+    $tag = Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Build -Name "tag" -Label $Label) -Label "$Label.tag"
+    if ($tag -cne "preview-$($identity.BuildId)") {
+        throw "$Label.tag does not bind the retained build ID."
+    }
+    $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Build -Name "commit" -Label $Label) -Label "$Label.commit"
+    if (-not $commit.StartsWith($identity.CommitPrefix, [System.StringComparison]::Ordinal)) {
+        throw "$Label.commit does not match the retained legacy build ID."
+    }
+    $builtAt = Get-RequiredManifestTimestamp -Value (Get-RequiredManifestProperty -Value $Build -Name "built_at" -Label $Label) -Label "$Label.built_at"
+    return [PSCustomObject]@{
+        Identity = $identity
+        BaseVersion = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Build -Name "base_version" -Label $Label) -Label "$Label.base_version"
+        BuiltAt = $builtAt
+        Commit = $commit
+        Protocol = Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Build -Name "protocol" -Label $Label) -Label "$Label.protocol"
+        Assets = Get-UpstreamHerdrAssets -Value (Get-RequiredManifestProperty -Value $Build -Name "assets" -Label $Label) -Identity $identity -Label "$Label.assets"
+        Omp = $null
+    }
+}
+
 function Get-RetainedPreviewBuild {
     param(
         [string]$BuildId,
@@ -571,7 +769,11 @@ function Get-RetainedPreviewBuild {
 
     $identity = Get-RetainedBuildId -Value $BuildId -Label $Label
     Assert-ManifestObject -Value $Build -Label $Label
-    $fields = @("assets", "base_version", "built_at", "commit", "omp", "protocol", "tag")
+    $fields = @("assets", "base_version", "built_at", "commit", "protocol", "tag")
+    $ompProperty = $Build.PSObject.Properties["omp"]
+    if ($null -ne $ompProperty) {
+        $fields += "omp"
+    }
     Assert-ExactManifestProperties -Value $Build -Expected $fields -Label $Label
 
     $tag = Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Build -Name "tag" -Label $Label) -Label "$Label.tag"
@@ -579,19 +781,40 @@ function Get-RetainedPreviewBuild {
         throw "$Label.tag does not bind the retained build ID."
     }
     $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Build -Name "commit" -Label $Label) -Label "$Label.commit"
-    if ($commit -cne $identity.Herdr) {
-        throw "$Label.commit does not match the retained P/R/O build ID."
+    if ($identity.Kind -eq "paired") {
+        if ($commit -cne $identity.Herdr) {
+            throw "$Label.commit does not match the retained P/R/O build ID."
+        }
+        if ($null -eq $ompProperty) {
+            throw "$Label has no paired OMP metadata."
+        }
+    } elseif (-not $commit.StartsWith($identity.CommitPrefix, [System.StringComparison]::Ordinal)) {
+        throw "$Label.commit does not match the retained legacy build ID."
     }
-    $builtAt = Get-RequiredManifestTimestamp -Value (Get-RequiredManifestProperty -Value $Build -Name "built_at" -Label $Label) -Label "$Label.built_at"
-    if ($builtAt -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') {
-        throw "$Label.built_at must be a canonical second-precision UTC timestamp."
+
+    $sourceBuiltAt = Get-RequiredManifestProperty -Value $Build -Name "built_at" -Label "$Label.built_at"
+    $builtAt = Get-RequiredManifestTimestamp -Value $sourceBuiltAt -Label "$Label.built_at"
+    if ($identity.Kind -eq "legacy") {
+        if ($identity.Day -cne $sourceBuiltAt.Substring(0, 10)) {
+            throw "$Label.built_at date does not match the retained legacy build ID."
+        }
+    } else {
+        if ($builtAt -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$') {
+            throw "$Label.built_at must be a canonical second-precision UTC timestamp."
+        }
+        if ($identity.Day -cne $builtAt.Substring(0, 10)) {
+            throw "$Label.built_at date does not match the retained P/R/O build ID."
+        }
     }
-    if ($identity.Day -cne $builtAt.Substring(0, 10)) {
-        throw "$Label.built_at date does not match the retained P/R/O build ID."
+
+    $omp = if ($null -ne $ompProperty) {
+        Get-BridgeOmp -Value $ompProperty.Value -Canonical $identity -Label "$Label.omp"
+    } else {
+        $null
     }
-    $omp = Get-BridgeOmp -Value (Get-RequiredManifestProperty -Value $Build -Name "omp" -Label $Label) -Canonical $identity -Label "$Label.omp"
     return [PSCustomObject]@{
-        BaseVersion = Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Build -Name "base_version" -Label $Label) -Label "$Label.base_version"
+        Identity = $identity
+        BaseVersion = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Build -Name "base_version" -Label $Label) -Label "$Label.base_version"
         BuiltAt = $builtAt
         Commit = $commit
         Protocol = Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Build -Name "protocol" -Label $Label) -Label "$Label.protocol"
@@ -603,16 +826,226 @@ function Get-RetainedPreviewBuild {
 function Get-RetainedPreviewBuilds {
     param(
         [object]$Builds,
-        [string]$Label
+        [string]$Label,
+        [ValidateSet("Smarty", "Upstream")]
+        [string]$Contract = "Smarty"
     )
 
     Assert-ManifestObject -Value $Builds -Label $Label
     $records = @{}
     foreach ($property in $Builds.PSObject.Properties) {
         $recordLabel = "$Label.$($property.Name)"
-        $records[$property.Name] = Get-RetainedPreviewBuild -BuildId $property.Name -Build $property.Value -Label $recordLabel
+        if ($Contract -eq "Upstream") {
+            $records[$property.Name] = Get-UpstreamRetainedPreviewBuild -BuildId $property.Name -Build $property.Value -Label $recordLabel
+        } else {
+            $records[$property.Name] = Get-RetainedPreviewBuild -BuildId $property.Name -Build $property.Value -Label $recordLabel
+        }
+    }
+    if ($records.Count -eq 0) {
+        throw "$Label must not be empty."
     }
     return $records
+}
+
+function Get-CustomRetainedPreviewBuild {
+    param(
+        [string]$BuildId,
+        [object]$Build,
+        [string]$Label
+    )
+
+    $identity = Get-RetainedBuildId -Value $BuildId -Label $Label
+    Assert-ManifestObject -Value $Build -Label $Label
+    $fields = @("assets", "base_version", "built_at", "commit", "protocol", "tag")
+    $ompProperty = $Build.PSObject.Properties["omp"]
+    if ($null -ne $ompProperty) {
+        $fields += "omp"
+    }
+    Assert-ExactManifestProperties -Value $Build -Expected $fields -Label $Label
+    $tag = Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Build -Name "tag" -Label $Label) -Label "$Label.tag"
+    if (-not $tag.EndsWith($identity.BuildId, [System.StringComparison]::Ordinal)) {
+        throw "$Label.tag does not bind the retained build ID."
+    }
+    $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Build -Name "commit" -Label $Label) -Label "$Label.commit"
+    if ($identity.Kind -eq "paired" -and $commit -cne $identity.Herdr) {
+        throw "$Label.commit does not match the retained P/R/O build ID."
+    }
+    if ($identity.Kind -eq "legacy" -and -not $commit.StartsWith($identity.CommitPrefix, [System.StringComparison]::Ordinal)) {
+        throw "$Label.commit does not match the retained legacy build ID."
+    }
+    $builtAt = Get-RequiredManifestTimestamp -Value (Get-RequiredManifestProperty -Value $Build -Name "built_at" -Label $Label) -Label "$Label.built_at"
+    if ($identity.Day -cne $builtAt.Substring(0, 10)) {
+        throw "$Label.built_at date does not match the retained build ID."
+    }
+    return [PSCustomObject]@{
+        Identity = $identity
+        BaseVersion = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Build -Name "base_version" -Label $Label) -Label "$Label.base_version"
+        BuiltAt = $builtAt
+        Commit = $commit
+        Protocol = Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Build -Name "protocol" -Label $Label) -Label "$Label.protocol"
+        Assets = Get-CustomPreviewAssets -Value (Get-RequiredManifestProperty -Value $Build -Name "assets" -Label $Label) -Label "$Label.assets"
+        Omp = if ($null -eq $ompProperty) { $null } else { Get-CustomPreviewOmp -Value $ompProperty.Value -Identity $identity -Label "$Label.omp" }
+    }
+}
+
+function Get-CustomPreviewOmp {
+    param(
+        [object]$Value,
+        [object]$Identity,
+        [string]$Label
+    )
+
+    Assert-ExactManifestProperties -Value $Value -Expected @("assets", "build_id", "commit", "tree", "version") -Label $Label
+    $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Value -Name "commit" -Label $Label) -Label "$Label.commit"
+    if ($Identity.Kind -eq "paired" -and $commit -cne $Identity.Omp) {
+        throw "$Label.commit does not match the custom P/R/O build ID."
+    }
+    $tree = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Value -Name "tree" -Label $Label) -Label "$Label.tree"
+    $buildId = Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Value -Name "build_id" -Label $Label) -Label "$Label.build_id"
+    $version = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Value -Name "version" -Label $Label) -Label "$Label.version"
+    $assets = Get-CustomPreviewAssets -Value (Get-RequiredManifestProperty -Value $Value -Name "assets" -Label $Label) -Label "$Label.assets"
+    return [PSCustomObject]@{ BuildId = $buildId; Commit = $commit; Tree = $tree; Version = $version; Assets = $assets }
+}
+
+function Assert-CustomOmpMatch {
+    param(
+        [object]$Actual,
+        [object]$Expected,
+        [string]$Label
+    )
+
+    if (($null -eq $Actual) -ne ($null -eq $Expected)) {
+        throw "$Label presence differs from the retained current build."
+    }
+    if ($null -eq $Actual) {
+        return
+    }
+    foreach ($field in @("BuildId", "Commit", "Tree", "Version")) {
+        if ($Actual.$field -cne $Expected.$field) {
+            throw "$Label scalar metadata differs from the retained current build."
+        }
+    }
+    if ($Actual.Assets.Count -ne $Expected.Assets.Count) {
+        throw "$Label asset allow-list differs from the retained current build."
+    }
+    foreach ($targetName in $Expected.Assets.Keys) {
+        if ($null -eq $Actual.Assets[$targetName] -or
+            $Actual.Assets[$targetName].Url -cne $Expected.Assets[$targetName].Url -or
+            $Actual.Assets[$targetName].Sha256 -cne $Expected.Assets[$targetName].Sha256 -or
+            $Actual.Assets[$targetName].Format -cne $Expected.Assets[$targetName].Format) {
+            throw "$Label asset $targetName differs from the retained current build."
+        }
+    }
+}
+
+function Resolve-UpstreamPreviewManifest {
+    param(
+        [object]$Manifest,
+        [string]$Target
+    )
+    $topLevelFields = @("assets", "base_version", "build_id", "builds", "built_at", "channel", "commit", "notes", "protocol", "schema_version")
+    Assert-ExactManifestProperties -Value $Manifest -Expected $topLevelFields -Label "Upstream preview manifest"
+    if ((Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Manifest -Name "schema_version" -Label "Upstream preview manifest") -Label "Upstream preview manifest.schema_version") -ne 1 -or
+        (Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Manifest -Name "channel" -Label "Upstream preview manifest") -Label "Upstream preview manifest.channel") -cne "preview") {
+        throw "Upstream preview manifest schema or channel mismatch."
+    }
+    $currentId = Get-LegacyBuildId -Value (Get-RequiredManifestProperty -Value $Manifest -Name "build_id" -Label "Upstream preview manifest") -Label "Upstream preview manifest.build_id"
+    if ($null -ne $Manifest.PSObject.Properties["omp"]) {
+        throw "Upstream preview manifest must not claim paired OMP metadata."
+    }
+    $builds = Get-RetainedPreviewBuilds -Builds (Get-RequiredManifestProperty -Value $Manifest -Name "builds" -Label "Upstream preview manifest") -Label "Upstream preview manifest.builds" -Contract Upstream
+    if (-not $builds.ContainsKey($currentId.BuildId)) {
+        throw "Upstream preview manifest is missing its current retained build."
+    }
+    $retained = $builds[$currentId.BuildId]
+    if (-not $retained.Assets.ContainsKey($target)) {
+        throw "Upstream preview manifest has no binary for $target."
+    }
+    $topAssets = Get-UpstreamHerdrAssets -Value (Get-RequiredManifestProperty -Value $Manifest -Name "assets" -Label "Upstream preview manifest") -Identity $currentId -Label "Upstream preview manifest.assets"
+    $baseVersion = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Manifest -Name "base_version" -Label "Upstream preview manifest") -Label "Upstream preview manifest.base_version"
+    $builtAt = Get-RequiredManifestTimestamp -Value (Get-RequiredManifestProperty -Value $Manifest -Name "built_at" -Label "Upstream preview manifest") -Label "Upstream preview manifest.built_at"
+    $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Manifest -Name "commit" -Label "Upstream preview manifest") -Label "Upstream preview manifest.commit"
+    $protocol = Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Manifest -Name "protocol" -Label "Upstream preview manifest") -Label "Upstream preview manifest.protocol"
+    if ($baseVersion -cne $retained.BaseVersion -or $builtAt -cne $retained.BuiltAt -or $commit -cne $retained.Commit -or $protocol -ne $retained.Protocol) {
+        throw "Upstream preview manifest top-level/current archive mismatch."
+    }
+    if ($topAssets.Count -ne $retained.Assets.Count) {
+        throw "Upstream preview manifest top-level/current asset allow-list mismatch."
+    }
+    foreach ($targetName in $retained.Assets.Keys) {
+        Assert-BridgeAssetMatch -Actual $topAssets[$targetName] -Expected $retained.Assets[$targetName] -Label "Upstream preview manifest asset $targetName" | Out-Null
+    }
+    if (-not $commit.StartsWith($currentId.CommitPrefix, [System.StringComparison]::Ordinal)) {
+        throw "Upstream preview manifest commit does not match its legacy build ID."
+    }
+    $notes = Get-RequiredManifestProperty -Value $Manifest -Name "notes" -Label "Upstream preview manifest"
+    if ($notes -isnot [string] -or [string]::IsNullOrWhiteSpace($notes)) {
+        throw "Upstream preview manifest.notes must be a nonempty string."
+    }
+    return [PSCustomObject]@{
+        Asset = $retained.Assets[$target]
+        VersionIdentity = "$($retained.BaseVersion)-preview.$($currentId.BuildId)"
+        AcceptedBuildIds = @($currentId.BuildId)
+    }
+}
+
+function Resolve-CustomPreviewManifest {
+    param(
+        [object]$Manifest,
+        [string]$Target
+    )
+
+    $topLevelFields = @("assets", "base_version", "build_id", "builds", "built_at", "channel", "commit", "notes", "protocol", "schema_version")
+    $ompProperty = $Manifest.PSObject.Properties["omp"]
+    if ($null -ne $ompProperty) {
+        $topLevelFields += "omp"
+    }
+    Assert-ExactManifestProperties -Value $Manifest -Expected $topLevelFields -Label "Custom preview manifest"
+    if ((Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Manifest -Name "schema_version" -Label "Custom preview manifest") -Label "Custom preview manifest.schema_version") -ne 1 -or
+        (Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $Manifest -Name "channel" -Label "Custom preview manifest") -Label "Custom preview manifest.channel") -cne "preview") {
+        throw "Custom preview manifest schema or channel mismatch."
+    }
+    $currentId = Get-RetainedBuildId -Value (Get-RequiredManifestProperty -Value $Manifest -Name "build_id" -Label "Custom preview manifest") -Label "Custom preview manifest.build_id"
+    $buildsValue = Get-RequiredManifestProperty -Value $Manifest -Name "builds" -Label "Custom preview manifest"
+    Assert-ManifestObject -Value $buildsValue -Label "Custom preview manifest.builds"
+    if (@($buildsValue.PSObject.Properties).Count -eq 0) {
+        throw "Custom preview manifest.builds must not be empty."
+    }
+    $currentProperty = $buildsValue.PSObject.Properties[$currentId.BuildId]
+    if ($null -eq $currentProperty) {
+        throw "Custom preview manifest is missing its current retained build."
+    }
+    $retained = Get-CustomRetainedPreviewBuild -BuildId $currentId.BuildId -Build $currentProperty.Value -Label "Custom preview manifest.builds.$($currentId.BuildId)"
+    $topOmp = if ($null -eq $ompProperty) { $null } else { Get-CustomPreviewOmp -Value $ompProperty.Value -Identity $currentId -Label "Custom preview manifest.omp" }
+    $topAssets = Get-CustomPreviewAssets -Value (Get-RequiredManifestProperty -Value $Manifest -Name "assets" -Label "Custom preview manifest") -Label "Custom preview manifest.assets"
+    $baseVersion = Get-RequiredManifestVersion -Value (Get-RequiredManifestProperty -Value $Manifest -Name "base_version" -Label "Custom preview manifest") -Label "Custom preview manifest.base_version"
+    $builtAt = Get-RequiredManifestTimestamp -Value (Get-RequiredManifestProperty -Value $Manifest -Name "built_at" -Label "Custom preview manifest") -Label "Custom preview manifest.built_at"
+    $commit = Get-RequiredManifestGitObject -Value (Get-RequiredManifestProperty -Value $Manifest -Name "commit" -Label "Custom preview manifest") -Label "Custom preview manifest.commit"
+    $protocol = Get-RequiredManifestPositiveInteger -Value (Get-RequiredManifestProperty -Value $Manifest -Name "protocol" -Label "Custom preview manifest") -Label "Custom preview manifest.protocol"
+    if ($baseVersion -cne $retained.BaseVersion -or $builtAt -cne $retained.BuiltAt -or $commit -cne $retained.Commit -or $protocol -ne $retained.Protocol) {
+        throw "Custom preview manifest top-level/current archive mismatch."
+    }
+    Assert-CustomOmpMatch -Actual $topOmp -Expected $retained.Omp -Label "Custom preview manifest.omp"
+    if ($topAssets.Count -ne $retained.Assets.Count -or $null -eq $retained.Assets[$Target]) {
+        throw "Custom preview manifest asset allow-list differs from the retained current build."
+    }
+    foreach ($targetName in $retained.Assets.Keys) {
+        if ($null -eq $topAssets[$targetName] -or
+            $topAssets[$targetName].Url -cne $retained.Assets[$targetName].Url -or
+            $topAssets[$targetName].Sha256 -cne $retained.Assets[$targetName].Sha256 -or
+            $topAssets[$targetName].Format -cne $retained.Assets[$targetName].Format) {
+            throw "Custom preview manifest asset $targetName does not match the retained current build."
+        }
+    }
+    $notes = Get-RequiredManifestProperty -Value $Manifest -Name "notes" -Label "Custom preview manifest"
+    if ($notes -isnot [string] -or [string]::IsNullOrWhiteSpace($notes)) {
+        throw "Custom preview manifest.notes must be a nonempty string."
+    }
+    return [PSCustomObject]@{
+        Asset = $retained.Assets[$Target]
+        VersionIdentity = "$($retained.BaseVersion)-preview.$($currentId.BuildId)"
+        AcceptedBuildIds = @($currentId.BuildId)
+    }
 }
 
 function Get-PhaseARetainedBuild {
@@ -659,11 +1092,11 @@ function Resolve-PhaseABridgeManifest {
         throw "Preview Phase A bridge.notes must be a string."
     }
     Assert-BridgeOmpMatch -Actual (Get-RequiredManifestProperty -Value $Manifest -Name "omp" -Label "Preview Phase A bridge") -Expected $retained.Omp -Canonical $canonical -Label "Preview Phase A bridge"
-    $topAssets = Get-RequiredManifestProperty -Value $Manifest -Name "assets" -Label "Preview Phase A bridge"
-    Assert-ExactManifestProperties -Value $topAssets -Expected @("windows-x86_64") -Label "Preview Phase A bridge.assets"
-    $asset = Get-BridgeAsset -Value (Get-RequiredManifestProperty -Value $topAssets -Name "windows-x86_64" -Label "Preview Phase A bridge.assets") -Label "Preview Phase A bridge.assets.windows-x86_64" -ExpectedUrl (Get-BridgeReleaseAssetUrl -Canonical $canonical -AssetName "herdr-windows-x86_64.zip") -WithFormat
-
-    $asset = Assert-BridgeAssetMatch -Actual $asset -Expected $retained.Assets["windows-x86_64"] -Label "Preview Phase A bridge Windows asset"
+    $topAssets = Get-BridgeHerdrAssets -Value (Get-RequiredManifestProperty -Value $Manifest -Name "assets" -Label "Preview Phase A bridge") -Canonical $canonical -Label "Preview Phase A bridge.assets"
+    foreach ($targetName in $retained.Assets.Keys) {
+        Assert-BridgeAssetMatch -Actual $topAssets[$targetName] -Expected $retained.Assets[$targetName] -Label "Preview Phase A bridge asset $targetName" | Out-Null
+    }
+    $asset = $topAssets["windows-x86_64"]
     $bootstrap = Get-RequiredManifestProperty -Value $Manifest -Name "bootstrap" -Label "Preview Phase A bridge"
     Assert-ExactManifestProperties -Value $bootstrap -Expected @("schema", "paired_build_id", "paired_tag", "paired_manifest", "windows_asset_sha256") -Label "Preview Phase A bridge.bootstrap"
     if ((Get-RequiredManifestString -Value (Get-RequiredManifestProperty -Value $bootstrap -Name "schema" -Label "Preview Phase A bridge.bootstrap") -Label "Preview Phase A bridge.bootstrap.schema") -cne "smarty.windows-bootstrap.v1" -or
@@ -733,14 +1166,26 @@ function Test-PhaseABridgeManifestCandidate {
 function Resolve-PreviewManifest {
     param(
         [object]$Manifest,
-        [string]$Target
+        [string]$Target,
+        [string]$ManifestUrl
     )
 
     Assert-ManifestObject -Value $Manifest -Label "Preview manifest"
-    if (Test-PhaseABridgeManifestCandidate -Manifest $Manifest) {
-        return Resolve-PhaseABridgeManifest -Manifest $Manifest
+    $smartyManifestUrl = "https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"
+    $isBridge = Test-PhaseABridgeManifestCandidate -Manifest $Manifest
+    if ($ManifestUrl -ceq $smartyManifestUrl) {
+        if ($isBridge) {
+            return Resolve-PhaseABridgeManifest -Manifest $Manifest
+        }
+        return Resolve-CanonicalPreviewManifest -Manifest $Manifest
     }
-    return Resolve-CanonicalPreviewManifest -Manifest $Manifest
+    if ($isBridge) {
+        throw "Smarty Phase A bridge manifests require the exact Smarty channel manifest URL."
+    }
+    if ([string]::IsNullOrWhiteSpace($ManifestUrl) -or $ManifestUrl -ceq "https://herdr.dev/preview.json") {
+        return Resolve-UpstreamPreviewManifest -Manifest $Manifest -Target $Target
+    }
+    return Resolve-CustomPreviewManifest -Manifest $Manifest -Target $Target
 }
 
 function ConvertTo-ManifestObject {
@@ -834,10 +1279,11 @@ function Write-ReleaseIdentityMetadata {
         [string]$ReleaseDir,
         [string]$VersionIdentity,
         [string]$TargetTriple,
-        [string]$Format
+        [string]$Format,
+        [string]$Sha256
     )
 
-    @{ schema_version = 1; version_identity = $VersionIdentity; target_triple = $TargetTriple; format = $Format } |
+    @{ schema_version = 1; version_identity = $VersionIdentity; target_triple = $TargetTriple; format = $Format; sha256 = $Sha256 } |
         ConvertTo-Json -Compress |
         Set-Content -LiteralPath (Join-Path $ReleaseDir ".herdr-release.json") -Encoding utf8 -NoNewline
 }
@@ -847,7 +1293,8 @@ function Test-HerdrReleaseComplete {
         [string]$ReleaseDir,
         [string]$Format,
         [string]$VersionIdentity,
-        [string]$TargetTriple
+        [string]$TargetTriple,
+        [string]$ExpectedSha256
     )
 
     if (-not (Test-RegularDirectory -Path $ReleaseDir)) {
@@ -859,11 +1306,12 @@ function Test-HerdrReleaseComplete {
     }
     try {
         $identity = ConvertTo-ManifestObject -Manifest (Get-Content -LiteralPath $identityPath -Raw)
-        if ($identity.PSObject.Properties.Count -ne 4 -or
+        if (@($identity.PSObject.Properties).Count -ne 5 -or
             $null -eq $identity.PSObject.Properties["schema_version"] -or [int]$identity.schema_version -ne 1 -or
             $null -eq $identity.PSObject.Properties["version_identity"] -or [string]$identity.version_identity -cne $VersionIdentity -or
             $null -eq $identity.PSObject.Properties["target_triple"] -or [string]$identity.target_triple -cne $TargetTriple -or
-            $null -eq $identity.PSObject.Properties["format"] -or [string]$identity.format -cne $Format) {
+            $null -eq $identity.PSObject.Properties["format"] -or [string]$identity.format -cne $Format -or
+            $null -eq $identity.PSObject.Properties["sha256"] -or [string]$identity.sha256 -cne $ExpectedSha256) {
             return $false
         }
     } catch {
@@ -1306,14 +1754,14 @@ if ($useLocalPackage) {
         if ($Channel -ne "preview") {
             throw "Preview Phase A bridge requires the preview channel."
         }
-        $previewSelection = Resolve-PreviewManifest -Manifest $manifest -Target $target
+        $previewSelection = Resolve-PreviewManifest -Manifest $manifest -Target $target -ManifestUrl $ManifestUrl
         $asset = $previewSelection.Asset
         $versionIdentity = $previewSelection.VersionIdentity
         $acceptedBuildIds = @($previewSelection.AcceptedBuildIds)
     } else {
         $asset = Get-ManifestAsset -Manifest $manifest -Target $target
         $versionIdentity = Resolve-HerdrVersion -Manifest $manifest -SelectedChannel $Channel
-        $acceptedBuildIds = @([string]$manifest.build_id)
+        $acceptedBuildIds = @()
     }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and $acceptedBuildIds -cnotcontains $ExpectedBuildId) {
         throw "Preview manifest changed while updating. Expected build $ExpectedBuildId but found $($acceptedBuildIds -join ' or '). Run herdr update again."
@@ -1330,7 +1778,7 @@ try {
     Invoke-WithInstallLock -LockPath $lockPath -Script {
         Remove-StaleInstallArtifacts -ReleasesDir $releasesDir
 
-        if (-not (Test-HerdrReleaseComplete -ReleaseDir $releaseDir -Format $asset.Format -VersionIdentity $versionIdentity -TargetTriple $targetTriple)) {
+        if (-not (Test-HerdrReleaseComplete -ReleaseDir $releaseDir -Format $asset.Format -VersionIdentity $versionIdentity -TargetTriple $targetTriple -ExpectedSha256 $asset.Sha256)) {
             $downloadPath = if ($useLocalPackage) {
                 $LocalPackagePath
             } else {
@@ -1349,8 +1797,8 @@ try {
                 New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
                 Copy-Item -LiteralPath $downloadPath -Destination (Join-Path $stagingDir "herdr.exe")
             }
-            Write-ReleaseIdentityMetadata -ReleaseDir $stagingDir -VersionIdentity $versionIdentity -TargetTriple $targetTriple -Format $asset.Format
-            if (-not (Test-HerdrReleaseComplete -ReleaseDir $stagingDir -Format $asset.Format -VersionIdentity $versionIdentity -TargetTriple $targetTriple)) {
+            Write-ReleaseIdentityMetadata -ReleaseDir $stagingDir -VersionIdentity $versionIdentity -TargetTriple $targetTriple -Format $asset.Format -Sha256 $asset.Sha256
+            if (-not (Test-HerdrReleaseComplete -ReleaseDir $stagingDir -Format $asset.Format -VersionIdentity $versionIdentity -TargetTriple $targetTriple -ExpectedSha256 $asset.Sha256)) {
                 throw "Downloaded Herdr package is incomplete or failed ConPTY verification."
             }
             $stagedHerdr = Join-Path $stagingDir "herdr.exe"

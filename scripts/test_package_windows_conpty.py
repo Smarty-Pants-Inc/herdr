@@ -37,6 +37,12 @@ class WindowsConptyPackageTests(unittest.TestCase):
             self.assertNotIn(item["sha256"], installer)
         self.assertIn('Get-Content -LiteralPath $markerPath -Raw', installer)
         self.assertIn('$filesProperty.Value.PSObject.Properties[$relative]', installer)
+        self.assertNotIn(".PSObject.Properties.Count", installer)
+        self.assertIn("@($identity.PSObject.Properties).Count", installer)
+        fixture = (
+            package.PROJECT_ROOT / "scripts/windows_install_conpty_package_test.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(".PSObject.Properties.Count", fixture)
         for notice in metadata["notices"]:
             source = package.PROJECT_ROOT / notice["source"]
             self.assertEqual(package.sha256_file(source), notice["sha256"])
