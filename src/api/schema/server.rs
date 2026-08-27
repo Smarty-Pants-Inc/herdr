@@ -70,8 +70,10 @@ pub struct ServerOmpMaintenanceStatus {
     pub permit: Option<ServerOmpMaintenancePermit>,
     pub route_count: usize,
     pub routes: Vec<ServerOmpMaintenanceRoute>,
+    /// Monotonic revision of the host-wide public route membership set.
+    #[serde(default)]
+    pub route_revision: u64,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,

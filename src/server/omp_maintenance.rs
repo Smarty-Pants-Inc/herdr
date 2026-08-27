@@ -102,6 +102,9 @@ struct PersistedState {
     completed_operations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     routes: Vec<PersistedRoute>,
+    /// Monotonic revision of the persisted public route membership set.
+    #[serde(default)]
+    route_revision: u64,
 }
 
 impl Default for PersistedState {
@@ -111,6 +114,7 @@ impl Default for PersistedState {
             lease: None,
             completed_operations: Vec::new(),
             routes: Vec::new(),
+            route_revision: 0,
         }
     }
 }
@@ -393,6 +397,10 @@ impl OmpMaintenance {
         }
     }
 
+    pub(crate) fn route_set_revision(&self) -> Result<u64, OmpMaintenanceError> {
+        self.inspect().map(|status| status.route_revision)
+    }
+
     pub(crate) fn acquire(
         &self,
         operation_id: &str,
@@ -545,6 +553,7 @@ impl OmpMaintenance {
                 key,
                 proof,
             ));
+            state.route_revision = state.route_revision.saturating_add(1);
             *dirty = true;
             Ok(admitted)
         })
@@ -569,7 +578,10 @@ impl OmpMaintenance {
             state
                 .routes
                 .retain(|route| !route.matches(&self.instance.id, &self.session, key));
-            *dirty |= state.routes.len() != before;
+            if state.routes.len() != before {
+                state.route_revision = state.route_revision.saturating_add(1);
+                *dirty = true;
+            }
         })
     }
 
@@ -711,6 +723,7 @@ impl PersistedState {
             permit: self.lease.as_ref().and_then(|lease| lease.permit.clone()),
             route_count: routes.len(),
             routes,
+            route_revision: self.route_revision,
         }
     }
 
@@ -1025,6 +1038,7 @@ fn reconcile_stale_routes(
     state
         .routes
         .retain(|route| !stale.contains(&route.server_instance_id));
+    state.route_revision = state.route_revision.saturating_add(1);
     Ok(true)
 }
 
@@ -1872,6 +1886,35 @@ mod tests {
             ))
     }
 
+    #[test]
+    fn shared_route_revision_changes_only_with_public_route_membership() {
+        let store = TestOmpMaintenanceStore::new();
+        let host = OmpMaintenance::for_test("host", store.clone());
+        let inspector = OmpMaintenance::for_test("inspector", store.clone());
+        let key = route("w1:p1");
+
+        assert_eq!(inspector.route_set_revision().unwrap(), 0);
+        host.admit(&key, || Ok::<_, ()>(())).unwrap();
+        let admitted = inspector.inspect().unwrap();
+        assert_eq!(admitted.route_revision, 1);
+        assert_eq!(admitted.route_count, 1);
+
+        store.fail_next_unregisters(1);
+        assert!(host.unregister_route(&key).is_err());
+        assert_eq!(inspector.route_set_revision().unwrap(), 1);
+        assert_eq!(inspector.inspect().unwrap().route_count, 1);
+
+        host.unregister_route(&key).unwrap();
+        let removed = inspector.inspect().unwrap();
+        assert_eq!(removed.route_revision, 2);
+        assert_eq!(removed.route_count, 0);
+        host.unregister_route(&key).unwrap();
+        assert_eq!(inspector.route_set_revision().unwrap(), 2);
+
+        host.acquire(&operation_id(30)).unwrap();
+        assert_eq!(inspector.route_set_revision().unwrap(), 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn ambient_environment_cannot_partition_the_account_maintenance_root() {
@@ -2029,11 +2072,16 @@ mod tests {
         let state_path = dir.join("state.json");
         let crashed = OmpMaintenance::file_for_test("crashed", state_path.clone()).unwrap();
         crashed.admit(&route("w1:p1"), || Ok::<_, ()>(())).unwrap();
-        assert_eq!(crashed.status().unwrap().route_count, 1);
+        let live = crashed.status().unwrap();
+        assert_eq!(live.route_count, 1);
+        assert_eq!(live.route_revision, 1);
+
         drop(crashed);
 
         let reopened = OmpMaintenance::file_for_test("controller", state_path).unwrap();
-        assert_eq!(reopened.status().unwrap().route_count, 0);
+        let reconciled = reopened.status().unwrap();
+        assert_eq!(reconciled.route_count, 0);
+        assert_eq!(reconciled.route_revision, 2);
         assert!(reopened.acquire(&operation_id(2)).unwrap().held);
         let _ = fs::remove_dir_all(dir);
     }

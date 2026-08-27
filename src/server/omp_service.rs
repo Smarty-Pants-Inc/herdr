@@ -11,7 +11,7 @@ use crate::protocol::{
     select_omp_renderer, OmpControlAction, OmpFrameDirection, OmpRendererMode, ServerMessage,
 };
 use crate::server::client_transport::{OmpHostAdmission, ServerEvent};
-use crate::server::clients::ClientConnection;
+use crate::server::clients::{ClientConnection, CommittedIdentity};
 use crate::server::omp_bridge;
 #[cfg(unix)]
 use crate::server::omp_maintenance::OmpMaintenanceHandoffState;
@@ -31,6 +31,8 @@ pub(crate) struct OmpService {
     renderer_modes: HashMap<u64, OmpRendererMode>,
     bound_apps: HashMap<u64, u64>,
     route_bindings: HashMap<u64, OmpRouteKey>,
+    /// Validated display-only identities for external guest bridge peers.
+    external_peer_identities: HashMap<u64, CommittedIdentity>,
     routes: OmpRouteRegistry,
     maintenance: Result<OmpMaintenance, OmpMaintenanceError>,
     pending_maintenance_unregisters: Vec<OmpRouteKey>,
@@ -75,6 +77,7 @@ impl OmpService {
             renderer_modes: HashMap::new(),
             bound_apps: HashMap::new(),
             route_bindings: HashMap::new(),
+            external_peer_identities: HashMap::new(),
             routes: OmpRouteRegistry::default(),
             maintenance,
             pending_maintenance_unregisters: Vec::new(),
@@ -129,6 +132,7 @@ impl OmpService {
             self.renderer_modes.remove(renderer_id);
             self.bound_apps.remove(renderer_id);
             self.route_bindings.remove(renderer_id);
+            self.external_peer_identities.remove(renderer_id);
         }
         if preserve_private_peer {
             return Vec::new();
@@ -236,6 +240,10 @@ impl OmpService {
         &self,
     ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
         self.maintenance()?.inspect()
+    }
+
+    pub(crate) fn route_set_revision(&self) -> Result<u64, OmpMaintenanceError> {
+        self.maintenance()?.route_set_revision()
     }
 
     pub(crate) fn acquire_maintenance(
@@ -355,6 +363,7 @@ impl OmpService {
                 renderer_capabilities,
                 renderer_launch_id,
                 renderer_request,
+                external_peer_identity,
             } => {
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     self.send_error(
@@ -375,6 +384,32 @@ impl OmpService {
                     return messages;
                 }
                 if renderer_request == crate::protocol::OmpRendererRequest::LegacySharedHostPty {
+                    self.send_error(
+                        &mut messages,
+                        client_id,
+                        pane_id,
+                        OmpRouteError::UnknownRoute,
+                    );
+                    return messages;
+                }
+                let external_guest_bridge =
+                    renderer_request == crate::protocol::OmpRendererRequest::ExternalGuestBridge;
+                let has_external_identity = external_peer_identity.is_some();
+                let external_identity = external_peer_identity.and_then(|identity| {
+                    crate::config::validate_display_name(&identity.display_name)
+                        .ok()
+                        .map(|()| CommittedIdentity {
+                            name: identity.display_name,
+                            revision: 1,
+                        })
+                });
+                if (external_guest_bridge
+                    && (renderer_capabilities.client_local_native
+                        || target_app_client_id.is_some()
+                        || renderer_launch_id.is_some()
+                        || external_identity.is_none()))
+                    || (!external_guest_bridge && has_external_identity)
+                {
                     self.send_error(
                         &mut messages,
                         client_id,
@@ -409,33 +444,52 @@ impl OmpService {
                     self.send_error(&mut messages, client_id, pane_id, OmpRouteError::RouteBusy);
                     return messages;
                 }
-                let app_client_id = match self.bind_app_client(
-                    client_id,
-                    target_app_client_id,
-                    renderer_launch_id,
-                    &key,
-                    clients,
-                ) {
-                    Some(app_client_id) => app_client_id,
-                    None => {
-                        self.send_error(
-                            &mut messages,
-                            client_id,
-                            pane_id,
-                            OmpRouteError::UnknownRoute,
-                        );
-                        return messages;
-                    }
-                };
-                if self.app_has_native_renderer(app_client_id) {
+                if external_guest_bridge
+                    && self
+                        .external_peer_identities
+                        .get(&client_id)
+                        .is_some_and(|existing| Some(existing) != external_identity.as_ref())
+                {
                     self.send_error(&mut messages, client_id, pane_id, OmpRouteError::RouteBusy);
                     return messages;
                 }
-                match self.routes.attach(app_client_id, &key) {
+                let app_client_id = if external_guest_bridge {
+                    client_id
+                } else {
+                    match self.bind_app_client(
+                        client_id,
+                        target_app_client_id,
+                        renderer_launch_id,
+                        &key,
+                        clients,
+                    ) {
+                        Some(app_client_id) => app_client_id,
+                        None => {
+                            self.send_error(
+                                &mut messages,
+                                client_id,
+                                pane_id,
+                                OmpRouteError::UnknownRoute,
+                            );
+                            return messages;
+                        }
+                    }
+                };
+                let attached = if external_guest_bridge {
+                    self.routes.attach_observer(client_id, &key)
+                } else {
+                    self.routes.attach(client_id, &key)
+                };
+                match attached {
                     Ok(deliveries) => {
                         self.renderer_modes.insert(client_id, renderer_mode);
                         self.bound_apps.insert(client_id, app_client_id);
                         self.route_bindings.insert(client_id, key.clone());
+                        if let Some(identity) = external_identity {
+                            self.external_peer_identities
+                                .entry(client_id)
+                                .or_insert(identity);
+                        }
                         if self.sync_authority(&key, &deliveries, &mut messages, clients) {
                             self.deliver(&key, deliveries, &mut messages, clients);
                         }
@@ -487,6 +541,7 @@ impl OmpService {
                         self.renderer_modes.remove(&client_id);
                         self.bound_apps.remove(&client_id);
                         self.route_bindings.remove(&client_id);
+                        self.external_peer_identities.remove(&client_id);
                         if self.send_peer_left(&key, peer_id, &mut messages, clients)
                             && self.sync_authority(&key, &deliveries, &mut messages, clients)
                         {
@@ -1046,15 +1101,22 @@ impl OmpService {
         clients: &HashMap<u64, ClientConnection>,
         messages: &mut Vec<(u64, ServerMessage)>,
     ) -> bool {
-        let Some(identity) = clients
+        let record = if let Some(identity) = self.external_peer_identities.get(&client_id) {
+            omp_bridge::guest_record(client_id, frame, &identity.name, identity.revision)
+        } else if let Some(identity) = clients
             .get(&client_id)
             .and_then(ClientConnection::committed_identity)
-        else {
+        {
+            omp_bridge::guest_record(client_id, frame, &identity.name, identity.revision)
+        } else if self.renderer_modes.get(&client_id) == Some(&OmpRendererMode::ExternalGuestBridge)
+        {
+            tracing::warn!(client_id, "external OMP guest has no validated identity");
+            self.close_host_route(key, messages, clients);
+            return false;
+        } else {
             return true;
         };
-        let Some(record) =
-            omp_bridge::guest_record(client_id, frame, &identity.name, identity.revision)
-        else {
+        let Some(record) = record else {
             tracing::warn!("invalid OMP guest JSON payload; closing route");
             self.close_host_route(key, messages, clients);
             return false;
@@ -1496,19 +1558,23 @@ mod tests {
             admission(second_admitted),
             OmpHostAdmission::Accepted
         ));
+        assert_eq!(controller.route_set_revision().unwrap(), 2);
 
         store.fail_next_unregisters(1);
         stop_host(&mut first, "w1:p1", "omp-1", 1, 1);
         assert!(first.live_route_keys().is_empty());
         assert_eq!(controller.maintenance_status().unwrap().route_count, 2);
+        assert_eq!(controller.route_set_revision().unwrap(), 2);
 
         assert!(first.enforce_maintenance(&HashMap::new()).is_empty());
         let status = controller.maintenance_status().unwrap();
         assert_eq!(status.route_count, 1);
         assert_eq!(status.routes[0].session, "second");
+        assert_eq!(controller.route_set_revision().unwrap(), 3);
         assert_eq!(second.live_route_keys().len(), 1);
 
         stop_host(&mut second, "w2:p1", "omp-2", 1, 2);
+        assert_eq!(controller.route_set_revision().unwrap(), 4);
         drop((first_peer, second_peer));
     }
 
@@ -1963,6 +2029,7 @@ mod tests {
                 },
                 renderer_launch_id: Some(7),
                 renderer_request: crate::protocol::OmpRendererRequest::Independent,
+                external_peer_identity: None,
             },
             true,
             &clients,
@@ -1971,6 +2038,228 @@ mod tests {
         assert!(!messages
             .iter()
             .any(|(_, message)| matches!(message, ServerMessage::OmpError { .. })));
+    }
+
+    #[test]
+    fn external_guest_bridge_attaches_only_to_the_live_generation_as_an_observer() {
+        let mut service = OmpService::new(None).unwrap();
+        let key = OmpRouteKey {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 7,
+        };
+        service.routes.host_started(key.clone()).unwrap();
+        let clients = HashMap::from([(
+            1,
+            client(
+                crate::server::clients::ClientConnectionMode::OmpPane,
+                None,
+                None,
+            ),
+        )]);
+        let attach = |route_generation| ServerEvent::OmpPaneAttach {
+            client_id: 1,
+            pane_id: key.pane_id.clone(),
+            omp_session_id: key.omp_session_id.clone(),
+            route_generation,
+            target_app_client_id: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
+            renderer_launch_id: None,
+            renderer_request: crate::protocol::OmpRendererRequest::ExternalGuestBridge,
+            external_peer_identity: Some(crate::protocol::OmpExternalPeerIdentity {
+                display_name: "Ada".into(),
+            }),
+        };
+        let messages = service.handle_event(attach(6), true, &clients);
+        assert!(messages.iter().any(|(_, message)| matches!(
+            message,
+            ServerMessage::OmpError { code, .. } if code == "stale_generation"
+        )));
+
+        let messages = service.handle_event(attach(7), true, &clients);
+        assert!(messages.iter().any(|(_, message)| matches!(
+            message,
+            ServerMessage::OmpPane {
+                renderer_mode: OmpRendererMode::ExternalGuestBridge,
+                controller: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn external_guest_bridge_routes_both_directions_and_controller_mutation() {
+        let mut service = OmpService::new(None).unwrap();
+        let key = OmpRouteKey {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        let (peer, socket) = host_socket_pair();
+        let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(8);
+        let (admission_tx, admitted) = std::sync::mpsc::sync_channel(1);
+
+        let clients = HashMap::from([(
+            1,
+            client(
+                crate::server::clients::ClientConnectionMode::OmpPane,
+                None,
+                None,
+            ),
+        )]);
+        assert!(clients[&1].committed_identity().is_none());
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                host_id: 7,
+                outbound,
+                socket,
+                admission: admission_tx,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+
+        let attached = service.handle_event(
+            ServerEvent::OmpPaneAttach {
+                client_id: 1,
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                target_app_client_id: None,
+                renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
+                renderer_launch_id: None,
+                renderer_request: crate::protocol::OmpRendererRequest::ExternalGuestBridge,
+                external_peer_identity: Some(crate::protocol::OmpExternalPeerIdentity {
+                    display_name: "Ada".into(),
+                }),
+            },
+            true,
+            &clients,
+        );
+        let attachment_epoch = attached
+            .iter()
+            .find_map(|(_, message)| match message {
+                ServerMessage::OmpPane {
+                    attachment_epoch,
+                    renderer_mode: OmpRendererMode::ExternalGuestBridge,
+                    controller: false,
+                    ..
+                } => Some(*attachment_epoch),
+                _ => None,
+            })
+            .expect("external guest attachment");
+        let authority: serde_json::Value = serde_json::from_str(
+            &outbound_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("observer authority record"),
+        )
+        .unwrap();
+        assert_eq!(authority["t"], "peer-authority");
+        assert_eq!(authority["canWrite"], false);
+
+        let ordinary = crate::protocol::encode_omp_frame(
+            OmpFrameDirection::GuestToHost,
+            br#"{"t":"hello","proto":1,"name":"external"}"#,
+        )
+        .unwrap();
+        assert!(service
+            .handle_event(
+                ServerEvent::OmpFrame {
+                    client_id: 1,
+                    pane_id: key.pane_id.clone(),
+                    omp_session_id: key.omp_session_id.clone(),
+                    route_generation: key.route_generation,
+                    attachment_epoch,
+                    frame: ordinary,
+                },
+                true,
+                &clients,
+            )
+            .is_empty());
+        let ordinary: serde_json::Value = serde_json::from_str(
+            &outbound_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("ordinary guest frame"),
+        )
+        .unwrap();
+        assert_eq!(ordinary["fromPeer"], 1);
+        assert_eq!(ordinary["displayName"], "Ada");
+        assert_eq!(ordinary["displayNameRevision"], 1);
+        assert_eq!(ordinary["frame"]["t"], "hello");
+
+        service.handle_event(
+            ServerEvent::OmpControl {
+                client_id: 1,
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                attachment_epoch,
+                action: OmpControlAction::RequestController,
+            },
+            true,
+            &clients,
+        );
+        let authority: serde_json::Value = serde_json::from_str(
+            &outbound_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("controller authority record"),
+        )
+        .unwrap();
+        assert_eq!(authority["canWrite"], true);
+
+        let mutation = crate::protocol::encode_omp_frame(
+            OmpFrameDirection::GuestToHost,
+            br#"{"t":"prompt","text":"hello"}"#,
+        )
+        .unwrap();
+        assert!(service
+            .handle_event(
+                ServerEvent::OmpControl {
+                    client_id: 1,
+                    pane_id: key.pane_id.clone(),
+                    omp_session_id: key.omp_session_id.clone(),
+                    route_generation: key.route_generation,
+                    attachment_epoch,
+                    action: OmpControlAction::Mutation { frame: mutation },
+                },
+                true,
+                &clients,
+            )
+            .is_empty());
+        let mutation: serde_json::Value = serde_json::from_str(
+            &outbound_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .expect("controller mutation"),
+        )
+        .unwrap();
+        assert_eq!(mutation["displayName"], "Ada");
+        assert_eq!(mutation["frame"]["t"], "prompt");
+
+        let host_frame =
+            crate::protocol::encode_omp_frame(OmpFrameDirection::HostToGuest, br#"{"t":"state"}"#)
+                .unwrap();
+        let delivered = service.handle_event(
+            ServerEvent::OmpHostFrame {
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                host_id: 7,
+                target_client_id: Some(1),
+                frame: host_frame,
+            },
+            false,
+            &clients,
+        );
+        assert!(matches!(
+            delivered.as_slice(),
+            [(1, ServerMessage::OmpFrame { attachment_epoch: epoch, .. })]
+                if *epoch == attachment_epoch
+        ));
+        drop(peer);
     }
     #[test]
     fn warming_native_renderer_is_quarantined_until_ready() {
@@ -2412,6 +2701,7 @@ mod tests {
             },
             renderer_launch_id: Some(launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         };
         service.handle_event(attach(&first, 1), true, &clients);
         clients.get_mut(&22).unwrap().omp_renderer_target = Some(target(&second, 2));

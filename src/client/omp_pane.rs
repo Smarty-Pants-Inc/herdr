@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::Digest as _;
 
@@ -33,6 +33,37 @@ struct GuestRecord {
     frame: Option<Box<RawValue>>,
     #[serde(default)]
     mutation: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuestMode {
+    Native,
+    ExternalBridge,
+}
+
+#[derive(PartialEq, Eq, Serialize)]
+struct OmpGuestBridgeCredential {
+    schema: &'static str,
+    address: String,
+    #[serde(rename = "roomId")]
+    room_id: String,
+    token: String,
+    #[serde(rename = "paneId")]
+    pane_id: String,
+    #[serde(rename = "ompSessionId")]
+    omp_session_id: String,
+    #[serde(rename = "routeGeneration")]
+    route_generation: u64,
+}
+
+fn write_guest_bridge_credential(credential: &OmpGuestBridgeCredential) -> io::Result<()> {
+    let record = serde_json::to_string(credential).map_err(|error| {
+        io::Error::other(format!("failed to encode OMP guest credential: {error}"))
+    })?;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(record.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 struct OmpGuestChild(std::process::Child);
 
@@ -295,7 +326,38 @@ pub(super) fn run(
     route_generation: u64,
     target_app_client_id: Option<u64>,
 ) -> io::Result<()> {
+    run_with_guest(
+        pane_id,
+        omp_session_id,
+        route_generation,
+        target_app_client_id,
+        GuestMode::Native,
+    )
+}
+
+pub(super) fn run_guest_bridge(
+    pane_id: String,
+    omp_session_id: String,
+    route_generation: u64,
+) -> io::Result<()> {
+    run_with_guest(
+        pane_id,
+        omp_session_id,
+        route_generation,
+        None,
+        GuestMode::ExternalBridge,
+    )
+}
+
+fn run_with_guest(
+    pane_id: String,
+    omp_session_id: String,
+    route_generation: u64,
+    target_app_client_id: Option<u64>,
+    guest_mode: GuestMode,
+) -> io::Result<()> {
     init_logging();
+    let identity = super::load_client_identity_or_exit();
     let socket_path = omp_pane_socket_path();
     let mut stream = crate::ipc::connect_local_stream(&socket_path)?;
     let (cols, rows, _, _, _) = initial_terminal_geometry(false);
@@ -307,11 +369,20 @@ pub(super) fn run(
         0,
         RenderEncoding::SemanticFrame,
         ClientLaunchMode::OmpPane,
-        &super::load_client_identity_or_exit(),
+        &identity,
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    let renderer_launch_id = std::env::var(super::omp_renderer::OMP_RENDERER_LAUNCH_ID_ENV)
-        .ok()
+    let external_peer_identity = (guest_mode == GuestMode::ExternalBridge)
+        .then(|| {
+            identity
+                .display_name
+                .clone()
+                .map(|display_name| protocol::OmpExternalPeerIdentity { display_name })
+        })
+        .flatten();
+    let renderer_launch_id = (guest_mode == GuestMode::Native)
+        .then(|| std::env::var(super::omp_renderer::OMP_RENDERER_LAUNCH_ID_ENV).ok())
+        .flatten()
         .and_then(|value| value.parse::<u64>().ok());
     write_to_server(
         &mut stream,
@@ -323,8 +394,12 @@ pub(super) fn run(
             renderer_capabilities: OmpRendererCapabilities {
                 client_local_native: renderer_launch_id.is_some(),
             },
-            renderer_request: OmpRendererRequest::Independent,
+            renderer_request: match guest_mode {
+                GuestMode::Native => OmpRendererRequest::Independent,
+                GuestMode::ExternalBridge => OmpRendererRequest::ExternalGuestBridge,
+            },
             renderer_launch_id,
+            external_peer_identity,
         },
     )?;
 
@@ -370,11 +445,27 @@ pub(super) fn run(
     getrandom::fill(&mut bridge_token_bytes)
         .map_err(|error| io::Error::other(error.to_string()))?;
     let bridge_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bridge_token_bytes);
-    let omp = crate::update::native_omp_executable().map_err(io::Error::other)?;
-    omp.verify().map_err(io::Error::other)?;
-    let mut command = Command::new(omp.executable());
-    configure_omp_guest_command(&mut command, &address, &room_id, &bridge_token);
-    let mut child = OmpGuestChild(command.spawn()?);
+    let mut child = match guest_mode {
+        GuestMode::Native => {
+            let omp = crate::update::native_omp_executable().map_err(io::Error::other)?;
+            omp.verify().map_err(io::Error::other)?;
+            let mut command = Command::new(omp.executable());
+            configure_omp_guest_command(&mut command, &address, &room_id, &bridge_token);
+            Some(OmpGuestChild(command.spawn()?))
+        }
+        GuestMode::ExternalBridge => {
+            write_guest_bridge_credential(&OmpGuestBridgeCredential {
+                schema: "herdr.omp_guest_bridge.v1",
+                address: address.clone(),
+                room_id: room_id.clone(),
+                token: bridge_token.clone(),
+                pane_id: pane_id.clone(),
+                omp_session_id: omp_session_id.clone(),
+                route_generation,
+            })?;
+            None
+        }
+    };
     listener.set_nonblocking(true)?;
     let accept_deadline = Instant::now() + Duration::from_secs(30);
     let (guest, mut guest_reader) = accept_omp_guest(
@@ -382,7 +473,10 @@ pub(super) fn run(
         &bridge_token,
         accept_deadline,
         Duration::from_secs(5),
-        || child.try_wait(),
+        || match child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        },
     )?;
     guest.set_nodelay(true)?;
     let guest_reader_shutdown = guest_reader.get_ref().try_clone()?;
@@ -479,10 +573,12 @@ pub(super) fn run(
             }
             break Ok(());
         }
-        match child.try_wait() {
-            Ok(Some(_)) => break Ok(()),
-            Ok(None) => {}
-            Err(error) => break Err(error),
+        if let Some(child) = child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
         }
         match server_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ServerMessage::OmpFrame {
@@ -566,7 +662,9 @@ pub(super) fn run(
     let _ = crate::ipc::shutdown_local_stream_write(&stream);
     shutdown_herdr_socket(&stream);
     drop(guest_writer);
-    let _ = child.kill();
+    if let Some(child) = child.as_mut() {
+        let _ = child.kill();
+    }
     let _ = server_to_guest.join();
     match loop_result {
         Err(error) => Err(error),
@@ -827,5 +925,28 @@ mod tests {
             closed.store(true, Ordering::Release);
         }));
         assert!(closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn external_guest_bridge_credential_is_versioned_and_contains_no_host_token() {
+        let credential = OmpGuestBridgeCredential {
+            schema: "herdr.omp_guest_bridge.v1",
+            address: "127.0.0.1:1234".into(),
+            room_id: "room".into(),
+            token: "guest-capability".into(),
+            pane_id: "w1:p1".into(),
+            omp_session_id: "omp-session".into(),
+            route_generation: 7,
+        };
+        let record = serde_json::to_value(&credential).unwrap();
+        assert_eq!(record["schema"], "herdr.omp_guest_bridge.v1");
+        assert_eq!(record["address"], "127.0.0.1:1234");
+        assert_eq!(record["roomId"], "room");
+        assert_eq!(record["token"], "guest-capability");
+        assert_eq!(record["paneId"], "w1:p1");
+        assert_eq!(record["ompSessionId"], "omp-session");
+        assert_eq!(record["routeGeneration"], 7);
+        assert_eq!(record.as_object().unwrap().len(), 7);
+        assert!(record.get("HERDR_OMP_BRIDGE_TOKEN").is_none());
     }
 }

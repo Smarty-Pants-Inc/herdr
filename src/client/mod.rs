@@ -1198,6 +1198,16 @@ pub fn run_omp_pane(
     )
 }
 
+/// Runs the public loopback bridge for one external OMP guest.
+#[cfg(unix)]
+pub fn run_omp_guest_bridge(
+    pane_id: String,
+    omp_session_id: String,
+    route_generation: u64,
+) -> io::Result<()> {
+    omp_pane::run_guest_bridge(pane_id, omp_session_id, route_generation)
+}
+
 #[cfg(not(unix))]
 pub fn run_omp_pane(
     _pane_id: String,
@@ -1208,6 +1218,18 @@ pub fn run_omp_pane(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "OMP pane POC is Unix-only",
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn run_omp_guest_bridge(
+    _pane_id: String,
+    _omp_session_id: String,
+    _route_generation: u64,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OMP guest bridge is Unix-only",
     ))
 }
 /// This is the entry point called from `main.rs` when running in client mode.

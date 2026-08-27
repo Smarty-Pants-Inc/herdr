@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 25,
+  "protocol": 26,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -723,6 +723,19 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "Low-volume invalidation signal with no route contents or credentials.",
+              "properties": {
+                "type": {
+                  "const": "omp_routes_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -753,7 +766,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "omp.routes_updated"
           ],
           "type": "string"
         },
@@ -4253,6 +4267,19 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "description": "Low-volume invalidation signal; re-read `server.omp_maintenance.inspect` for routes.",
+              "properties": {
+                "type": {
+                  "const": "omp.routes_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7300,6 +7327,19 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "description": "Low-volume invalidation signal with no route contents or credentials.",
+              "properties": {
+                "type": {
+                  "const": "omp_routes_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7345,7 +7385,8 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "omp.routes_updated"
           ],
           "type": "string"
         },
@@ -10369,6 +10410,13 @@
             },
             "route_count": {
               "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "route_revision": {
+              "default": 0,
+              "description": "Monotonic revision of the host-wide public route membership set.",
+              "format": "uint64",
               "minimum": 0,
               "type": "integer"
             },

@@ -632,6 +632,10 @@ fn event_envelope_round_trips() {
                 },
             },
         },
+        EventEnvelope {
+            event: EventKind::OmpRoutesUpdated,
+            data: EventData::OmpRoutesUpdated {},
+        },
     ];
 
     for event in events {
@@ -696,6 +700,30 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         &params.subscriptions[2],
         Subscription::PaneScrollChanged { pane_id } if pane_id == "p_1_1"
     ));
+}
+
+#[test]
+fn omp_routes_updated_subscription_uses_a_secret_free_invalidation_shape() {
+    let request: Request = serde_json::from_str(
+        r#"{"id":"sub_omp","method":"events.subscribe","params":{"subscriptions":[{"type":"omp.routes_updated"}]}}"#,
+    )
+    .unwrap();
+    let Method::EventsSubscribe(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert!(matches!(
+        params.subscriptions.as_slice(),
+        [Subscription::OmpRoutesUpdated {}]
+    ));
+
+    let event = EventEnvelope {
+        event: EventKind::OmpRoutesUpdated,
+        data: EventData::OmpRoutesUpdated {},
+    };
+    assert_eq!(
+        serde_json::to_value(event).unwrap(),
+        serde_json::json!({"event":"omp.routes_updated","data":{"type":"omp_routes_updated"}})
+    );
 }
 
 #[test]

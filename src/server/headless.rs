@@ -357,6 +357,8 @@ pub struct HeadlessServer {
     /// Fresh server-owned launch identity for each App-local native renderer offer.
     next_omp_renderer_launch_id: u64,
     omp_service: OmpService,
+    /// Last persisted host-wide public OMP route-set revision observed by this server.
+    last_omp_route_revision: Option<u64>,
     /// Recent private pane ids retained to consume late or duplicate actor events.
     retired_private_pane_ids: VecDeque<crate::layout::PaneId>,
     #[cfg(unix)]
@@ -548,6 +550,7 @@ impl HeadlessServer {
         prepare_socket_path(&client_path)?;
 
         let omp_service = OmpService::new(prepared_omp_bridge)?;
+        let last_omp_route_revision = omp_service.route_set_revision().ok();
         app.omp_bridge = Some(omp_service.bridge().clone());
         for workspace in &mut app.state.workspaces {
             workspace.omp_bridge = Some(omp_service.bridge().clone());
@@ -596,6 +599,7 @@ impl HeadlessServer {
             private_omp_test_executable: None,
             next_omp_renderer_launch_id: 1,
             omp_service,
+            last_omp_route_revision,
             retired_private_pane_ids: VecDeque::new(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -4084,12 +4088,30 @@ impl HeadlessServer {
         render
     }
 
-    fn enforce_omp_maintenance(&mut self) -> bool {
-        let messages = self.omp_service.enforce_maintenance(&self.clients);
-        if messages.is_empty() {
+    fn poll_omp_route_revision(&mut self) -> bool {
+        let Ok(current) = self.omp_service.route_set_revision() else {
+            return false;
+        };
+        let Some(previous) = self.last_omp_route_revision.replace(current) else {
+            return false;
+        };
+        if previous == current {
             return false;
         }
-        self.apply_omp_messages(messages) | self.reconcile_omp_renderers()
+        self.app.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::OmpRoutesUpdated,
+            data: crate::api::schema::EventData::OmpRoutesUpdated {},
+        });
+        true
+    }
+
+    fn enforce_omp_maintenance(&mut self) -> bool {
+        let messages = self.omp_service.enforce_maintenance(&self.clients);
+        let routes_updated = self.poll_omp_route_revision();
+        if messages.is_empty() {
+            return routes_updated;
+        }
+        self.apply_omp_messages(messages) | self.reconcile_omp_renderers() | routes_updated
     }
 
     fn detach_failed_private_omp_guest(&mut self, client_id: u64) {
@@ -5501,7 +5523,16 @@ impl HeadlessServer {
         };
         let client_is_omp_pane = omp_client_id.is_some_and(|client_id| {
             self.client_is_omp_pane(client_id)
-                && (!matches!(&ev, ServerEvent::OmpPaneAttach { .. }) || native_app.is_some())
+                && (!matches!(&ev, ServerEvent::OmpPaneAttach { .. })
+                    || native_app.is_some()
+                    || matches!(
+                        &ev,
+                        ServerEvent::OmpPaneAttach {
+                            renderer_request:
+                                crate::protocol::OmpRendererRequest::ExternalGuestBridge,
+                            ..
+                        }
+                    ))
         });
         let messages = self
             .omp_service
@@ -8913,6 +8944,9 @@ mod tests {
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
+        let omp_service = OmpService::new(Some(omp_bridge::bind().expect("bind test OMP bridge")))
+            .expect("create test OMP service");
+        let last_omp_route_revision = omp_service.route_set_revision().ok();
 
         HeadlessServer {
             app,
@@ -8937,8 +8971,8 @@ mod tests {
                 std::env::current_exe().expect("locate the headless test executable"),
             ),
             next_omp_renderer_launch_id: 1,
-            omp_service: OmpService::new(Some(omp_bridge::bind().expect("bind test OMP bridge")))
-                .expect("create test OMP service"),
+            omp_service,
+            last_omp_route_revision,
             retired_private_pane_ids: VecDeque::new(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -8984,6 +9018,44 @@ mod tests {
             admission: test_host_admission_sender(),
         });
         (peer, outbound_rx)
+    }
+
+    #[test]
+    fn omp_route_membership_changes_emit_one_secret_free_invalidation_each() {
+        let event_hub = api::EventHub::default();
+        let mut server = test_headless_server_with_event_hub(event_hub.clone());
+        let after_setup = event_hub.current_sequence();
+        let pane_id = "w1:p1".to_owned();
+        let (peer, _outbound) = start_test_omp_host(&mut server, pane_id.clone(), "session", 7);
+        assert!(server.poll_omp_route_revision());
+        let after_start = event_hub.events_after(after_setup);
+        assert!(matches!(
+            after_start.as_slice(),
+            [(
+                _,
+                api::schema::EventEnvelope {
+                    event: api::schema::EventKind::OmpRoutesUpdated,
+                    data: api::schema::EventData::OmpRoutesUpdated {},
+                }
+            )]
+        ));
+
+        assert!(!server.handle_server_event(ServerEvent::OmpHostStopped {
+            pane_id,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 7,
+        }));
+        drop(peer);
+        assert!(server.poll_omp_route_revision());
+        let after_stop = event_hub.events_after(after_setup);
+        assert_eq!(
+            after_stop
+                .iter()
+                .filter(|(_, event)| event.event == api::schema::EventKind::OmpRoutesUpdated)
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -10108,6 +10180,7 @@ mod tests {
             },
             renderer_launch_id: Some(renderer_launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         }));
         while writer.test_pop_control().is_some() {}
 
@@ -10313,6 +10386,7 @@ mod tests {
             },
             renderer_launch_id: Some(renderer_launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         }));
         assert!(server.omp_service.app_has_native_renderer(2));
         while background_control_rx
@@ -10519,6 +10593,7 @@ mod tests {
             },
             renderer_launch_id: Some(renderer_launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         }));
         assert!(server.omp_service.app_has_native_renderer(2));
 
@@ -10766,6 +10841,7 @@ mod tests {
             },
             renderer_launch_id: Some(renderer_launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         }));
         assert!(server.clients[&1].private_omp_guest.is_some());
         while app_control.try_recv().is_ok() {}
@@ -10900,6 +10976,7 @@ mod tests {
             },
             renderer_launch_id: Some(renderer_launch_id),
             renderer_request: crate::protocol::OmpRendererRequest::Independent,
+            external_peer_identity: None,
         }));
         assert!(server.omp_service.app_has_native_renderer(1));
         assert!(server.handle_server_event(ServerEvent::OmpRendererReady {

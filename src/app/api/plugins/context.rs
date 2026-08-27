@@ -196,6 +196,7 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            EventData::OmpRoutesUpdated {} => empty_plugin_context(correlation_id),
         }
     }
 

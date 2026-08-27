@@ -211,6 +211,26 @@ impl OmpRouteRegistry {
         client_id: u64,
         key: &OmpRouteKey,
     ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        self.attach_with_controller(client_id, key, true)
+    }
+
+    /// Attaches a bridge guest without granting controller authority.
+    pub(crate) fn attach_observer(
+        &mut self,
+        client_id: u64,
+        key: &OmpRouteKey,
+    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        self.route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)?
+            .require_live()?;
+        self.attach_with_controller(client_id, key, false)
+    }
+
+    fn attach_with_controller(
+        &mut self,
+        client_id: u64,
+        key: &OmpRouteKey,
+        assign_controller: bool,
+    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
         let route = self.route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)?;
         let epoch = match route.attachments.get(&client_id) {
             Some(&epoch) => epoch,
@@ -221,7 +241,7 @@ impl OmpRouteRegistry {
                 epoch
             }
         };
-        if route.controller.is_none() {
+        if assign_controller && route.controller.is_none() {
             route.controller = Some((client_id, epoch));
         }
         Ok(route.pane_deliveries())
@@ -414,6 +434,49 @@ mod tests {
             ),
             Err(OmpRouteError::InvalidFrame(_))
         ));
+    }
+
+    #[test]
+    fn observer_attach_keeps_controller_unassigned_until_requested() {
+        let mut routes = OmpRouteRegistry::default();
+        routes.host_started(key()).unwrap();
+        let attached = routes.attach_observer(10, &key()).unwrap();
+        let attachment_epoch = epoch(&attached, 10);
+        assert!(attached.iter().all(|delivery| matches!(
+            delivery,
+            OmpRouteDelivery::Pane {
+                controller: false,
+                ..
+            }
+        )));
+        let requested = routes
+            .control(
+                10,
+                &key(),
+                attachment_epoch,
+                OmpControlAction::RequestController,
+            )
+            .unwrap();
+        assert!(requested.iter().all(|delivery| matches!(
+            delivery,
+            OmpRouteDelivery::Pane {
+                controller: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn observer_attach_rejects_retained_non_live_route() {
+        let mut routes = OmpRouteRegistry::default();
+        routes.host_started(key()).unwrap();
+        let existing = routes.attach_observer(10, &key()).unwrap();
+        assert!(routes.host_stopped(&key()).is_ok());
+        assert!(matches!(
+            routes.attach_observer(20, &key()),
+            Err(OmpRouteError::HostUnavailable)
+        ));
+        assert_eq!(epoch(&existing, 10), 1);
     }
 
     #[test]

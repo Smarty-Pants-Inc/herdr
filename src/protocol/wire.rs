@@ -68,6 +68,15 @@ pub struct OmpRendererCapabilities {
     /// This client can render through a locally-owned OMP guest.
     pub client_local_native: bool,
 }
+/// Display-only attribution for a guest connected through the external bridge.
+///
+/// This is accepted only for `ExternalGuestBridge` attachments. It is never
+/// installed as an App identity and does not grant route or controller
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpExternalPeerIdentity {
+    pub display_name: String,
+}
 
 /// One live OMP route offered by the server to an App-owned native renderer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +111,8 @@ pub enum OmpRendererRequest {
     Independent,
     /// Use the shared host PTY only when explicitly requested.
     LegacySharedHostPty,
+    /// Relay one external guest over a local authenticated bridge.
+    ExternalGuestBridge,
 }
 
 /// Renderer selected for exactly one OMP pane attachment.
@@ -110,6 +121,7 @@ pub enum OmpRendererMode {
     ClientLocalNative,
     ServerPrivateGuestPty,
     LegacySharedHostPty,
+    ExternalGuestBridge,
 }
 
 /// The requested attachment has no usable independent renderer.
@@ -140,6 +152,9 @@ pub const fn select_omp_renderer(
         client_capabilities.client_local_native,
         server_private_guest_pty,
     ) {
+        (OmpRendererRequest::ExternalGuestBridge, false, false) => {
+            Ok(OmpRendererMode::ExternalGuestBridge)
+        }
         (_, true, _) => Ok(OmpRendererMode::ClientLocalNative),
         (_, false, true) => Ok(OmpRendererMode::ServerPrivateGuestPty),
         (OmpRendererRequest::LegacySharedHostPty, false, false) => {
@@ -698,6 +713,9 @@ pub enum ClientMessage {
         renderer_request: OmpRendererRequest,
         /// Server-issued launch identity for exact native sideband acceptance.
         renderer_launch_id: Option<u64>,
+        /// Display-only identity for an external guest; never an App authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_peer_identity: Option<OmpExternalPeerIdentity>,
     },
 
     /// Detaches this server-assigned connection from an OMP logical pane.
@@ -1418,6 +1436,7 @@ mod tests {
                 renderer_capabilities: OmpRendererCapabilities::default(),
                 renderer_request: OmpRendererRequest::Independent,
                 renderer_launch_id: Some(9),
+                external_peer_identity: None,
             }),
             14
         );
@@ -1637,6 +1656,15 @@ mod tests {
             ),
             Ok(OmpRendererMode::ServerPrivateGuestPty),
         );
+
+        assert_eq!(
+            select_omp_renderer(
+                OmpRendererRequest::ExternalGuestBridge,
+                OmpRendererCapabilities::default(),
+                false,
+            ),
+            Ok(OmpRendererMode::ExternalGuestBridge),
+        );
     }
 
     #[test]
@@ -1734,7 +1762,6 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
     }
-
     #[test]
     fn protocol_26_hello_carries_app_renderer_capability() {
         assert_eq!(PROTOCOL_VERSION, 26);

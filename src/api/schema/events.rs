@@ -82,6 +82,9 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    /// Low-volume invalidation signal; re-read `server.omp_maintenance.inspect` for routes.
+    #[serde(rename = "omp.routes_updated")]
+    OmpRoutesUpdated {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -218,6 +221,8 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    #[serde(rename = "omp.routes_updated")]
+    OmpRoutesUpdated,
 }
 
 impl EventKind {
@@ -249,6 +254,7 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::OmpRoutesUpdated => "omp.routes_updated",
         }
     }
 }
@@ -281,6 +287,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::OmpRoutesUpdated,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -553,4 +560,6 @@ pub enum EventData {
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
     },
+    /// Low-volume invalidation signal with no route contents or credentials.
+    OmpRoutesUpdated {},
 }

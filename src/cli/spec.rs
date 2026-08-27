@@ -32,6 +32,7 @@ pub(super) fn command() -> Command {
         .subcommand(config_command())
         .subcommand(channel_command())
         .subcommand(server_command())
+        .subcommand(omp_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
@@ -145,6 +146,26 @@ fn update_command() -> Command {
     Command::new("update")
         .about("Download and install the latest version")
         .arg(flag("handoff").help("Try live handoff after installing"))
+}
+
+fn omp_command() -> Command {
+    Command::new("omp")
+        .about("Control OMP bridge helpers")
+        .subcommand(
+            Command::new("guest-bridge")
+                .about("Attach one external OMP guest to an exact live route")
+                .arg(Arg::new("pane-id").value_name("PANE_ID").required(true))
+                .arg(
+                    Arg::new("omp-session-id")
+                        .value_name("OMP_SESSION_ID")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("route-generation")
+                        .value_name("ROUTE_GENERATION")
+                        .required(true),
+                ),
+        )
 }
 
 fn status_command() -> Command {
@@ -1391,6 +1412,24 @@ mod tests {
         for option in ["operation-id-stdin", "proof-session", "proof-pane", "json"] {
             assert!(has_option(permit, option));
         }
+    }
+
+    #[test]
+    fn spec_includes_exact_omp_guest_bridge_arguments() {
+        let cmd = super::command();
+        let bridge = command_path(&cmd, &["omp", "guest-bridge"]);
+        assert_eq!(bridge.get_positionals().count(), 3);
+        let matches = super::parse_leaf_args(
+            &["omp", "guest-bridge"],
+            &["w1:p1".into(), "omp-session".into(), "7".into()],
+        )
+        .unwrap();
+        assert_eq!(matches.get_one::<String>("pane-id").unwrap(), "w1:p1");
+        assert_eq!(
+            matches.get_one::<String>("omp-session-id").unwrap(),
+            "omp-session"
+        );
+        assert_eq!(matches.get_one::<String>("route-generation").unwrap(), "7");
     }
 
     #[test]

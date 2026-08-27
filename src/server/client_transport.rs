@@ -557,6 +557,7 @@ pub(crate) enum ServerEvent {
         renderer_capabilities: crate::protocol::OmpRendererCapabilities,
         renderer_launch_id: Option<u64>,
         renderer_request: crate::protocol::OmpRendererRequest,
+        external_peer_identity: Option<crate::protocol::OmpExternalPeerIdentity>,
     },
     /// A client detached from one OMP logical pane attachment.
     OmpPaneDetach {
@@ -1311,6 +1312,7 @@ fn client_read_loop(
                 renderer_capabilities,
                 renderer_request,
                 renderer_launch_id,
+                external_peer_identity,
             } => ServerEvent::OmpPaneAttach {
                 client_id,
                 pane_id,
@@ -1320,6 +1322,7 @@ fn client_read_loop(
                 renderer_capabilities,
                 renderer_request,
                 renderer_launch_id,
+                external_peer_identity,
             },
             ClientMessage::OmpPaneDetach {
                 pane_id,
@@ -1489,6 +1492,7 @@ mod tests {
                 },
                 renderer_request: crate::protocol::OmpRendererRequest::Independent,
                 renderer_launch_id: Some(9),
+                external_peer_identity: None,
             },
         )
         .unwrap();
