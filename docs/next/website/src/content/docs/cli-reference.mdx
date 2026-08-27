@@ -198,20 +198,27 @@ When a managed workspace-right plugin invokes a workspace-selected split without
 an explicit pane selector, the new pane may inherit the plugin caller's execution
 target and cwd while still splitting the workspace's focused tiled pane.
 
-Per-pane SSH execution targets are Unix-only. This is separate from whole-server
-`herdr --remote`, which remains available on Windows clients connecting to
-supported Linux and macOS hosts.
+Per-pane SSH and execution-provider targets require a Unix Herdr server. This
+is separate from whole-server `herdr --remote`, which remains available on
+Windows clients connecting to supported Linux and macOS hosts. Provider plugins
+must also support the server platform.
 
 Without `--target`, a split inherits the source pane's execution target. Use
-`--target local` to force local execution or `--target ssh:HOST` to run the new
-terminal on a trusted SSH host while keeping it in the current Herdr UI. A
-same-target split follows the source cwd. A cross-target local split uses the
-configured `terminal.new_cwd`; a cross-target SSH split starts in the remote
-user's home. An explicit `--cwd` overrides either default. Prepare a matching
-remote Herdr first by running `herdr --remote HOST`; per-pane launches never
-install or replace remote software. See [Persistence and remote access](/docs/persistence-remote/).
+`--target local` to force local execution, `--target ssh:HOST` for built-in SSH,
+or `--target SCHEME:TARGET` for an installed execution provider. For example,
+`--target runtime:dev2` resolves the enabled plugin that declares `runtime` and
+passes `dev2` to it. A same-target split follows the source cwd. A cross-target
+local split uses the configured `terminal.new_cwd`; a cross-target remote split
+starts with the target provider's default cwd. An explicit `--cwd` overrides
+that default. Built-in SSH requires a matching remote Herdr prepared through
+`herdr --remote HOST`; per-pane launches never install or replace remote
+software. See [Persistence and remote access](/docs/persistence-remote/) and
+[Plugins](/docs/plugins/).
 
-Per-pane launches use non-interactive OpenSSH with bounded connection and request-delivery timeouts, so authentication must already be available through keys or `ssh-agent`.
+Built-in SSH uses non-interactive OpenSSH with bounded connection and
+request-delivery timeouts, so authentication must already be available through
+keys or `ssh-agent`. Execution-provider transport and authentication are owned
+by the provider plugin.
 
 `pane get` and `pane list` report each pane's `execution_target`. Remote cwd
 reports come from the remote terminal and are not checked against the server's
@@ -333,7 +340,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 Agent targets are either a unique live agent name or the pane ID that currently hosts the agent. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
 
-`agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. `agent start` currently supports local panes only; targeting an SSH-backed pane returns `agent_start_unsupported_execution_target`. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `maki`, and `muse`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
+`agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. Local, SSH-backed, and execution-provider-backed panes are supported. Remote panes must use a POSIX-compatible interactive shell; Herdr sends a shell-safe launch command and relies on terminal lifecycle detection instead of local process-table inspection. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, and `maki`. A name follows the same terminal after pane moves.
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 

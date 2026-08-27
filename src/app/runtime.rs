@@ -351,6 +351,7 @@ impl App {
             let panes = self.state.reconcile_managed_agents_at(now);
             if !panes.is_empty() {
                 for (ws_idx, pane_id) in panes {
+                    self.sync_managed_agent_detection_hint(ws_idx, pane_id);
                     self.emit_pane_updated(ws_idx, pane_id);
                 }
                 self.schedule_session_save();

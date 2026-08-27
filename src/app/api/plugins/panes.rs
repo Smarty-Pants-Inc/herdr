@@ -854,6 +854,7 @@ mod tests {
             platforms: None,
             build: Vec::new(),
             startup: Vec::new(),
+            execution_providers: Vec::new(),
             actions: Vec::new(),
             events: Vec::new(),
             panes: Vec::new(),

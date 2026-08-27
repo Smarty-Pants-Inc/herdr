@@ -124,41 +124,80 @@ impl App {
         let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let (child, remote_request_channel) = if let Some((program, args)) = local_command {
-                let mut command =
-                    crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
-                command.env_remove("HERDR_VIEW_ID");
-                apply_plugin_runtime_env(&mut command, env);
-                (
-                    command
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn(),
-                    None,
-                )
-            } else {
-                let action_id = action_id_for_launch.expect("remote plugin action requires id");
-                match crate::execution::ssh_process_command(
-                    &execution_target,
-                    std::path::Path::new(""),
-                    crate::execution::RemoteCommand::Plugin {
-                        plugin_id,
-                        target: crate::plugin_command::PluginCommandTarget::Action {
-                            action_id,
-                            link_handler_id,
-                        },
-                    },
-                    env,
-                ) {
-                    Ok(mut prepared) => (
-                        prepared
-                            .command
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn(),
-                        Some(prepared.request_channel),
+            let (child, remote_request_channel) = match execution_target {
+                crate::execution::ExecutionTarget::Local => match local_command {
+                    Some((program, args)) => {
+                        let mut command = crate::plugin_command::command_for_argv_in_dir(
+                            &program,
+                            &args,
+                            &plugin_root,
+                        );
+                        command.env_remove("HERDR_VIEW_ID");
+                        apply_plugin_runtime_env(&mut command, env);
+                        (
+                            command
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn(),
+                            None,
+                        )
+                    }
+                    None => (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "local plugin command is missing",
+                        )),
+                        None,
                     ),
-                    Err(err) => (Err(err), None),
+                },
+                crate::execution::ExecutionTarget::Ssh { .. } => match action_id_for_launch {
+                    Some(action_id) => match crate::execution::ssh_process_command(
+                        &execution_target,
+                        std::path::Path::new(""),
+                        crate::execution::RemoteCommand::Plugin {
+                            plugin_id,
+                            target: crate::plugin_command::PluginCommandTarget::Action {
+                                action_id,
+                                link_handler_id,
+                            },
+                        },
+                        env,
+                    ) {
+                        Ok(mut prepared) => (
+                            prepared
+                                .command
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn(),
+                            Some(prepared.request_channel),
+                        ),
+                        Err(err) => (Err(err), None),
+                    },
+                    None => (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "remote SSH plugin action id is missing",
+                        )),
+                        None,
+                    ),
+                },
+                crate::execution::ExecutionTarget::Extension { .. } => {
+                    match crate::execution::execution_provider_process_command(
+                        &execution_target,
+                        std::path::Path::new(""),
+                        crate::execution::RemoteCommand::Argv { argv: command },
+                        env,
+                    ) {
+                        Ok(mut prepared) => (
+                            prepared
+                                .command
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn(),
+                            None,
+                        ),
+                        Err(err) => (Err(err), None),
+                    }
                 }
             };
             let finished = match child {

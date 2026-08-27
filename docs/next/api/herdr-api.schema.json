@@ -786,6 +786,26 @@
                 "host"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "extension",
+                  "type": "string"
+                },
+                "scheme": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scheme",
+                "target"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -2169,6 +2189,26 @@
               "required": [
                 "kind",
                 "host"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "extension",
+                  "type": "string"
+                },
+                "scheme": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scheme",
+                "target"
               ],
               "type": "object"
             }
@@ -7404,6 +7444,26 @@
                 "host"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "extension",
+                  "type": "string"
+                },
+                "scheme": {
+                  "type": "string"
+                },
+                "target": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scheme",
+                "target"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -7433,6 +7493,12 @@
             "events": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/PluginManifestEventHook"
+              },
+              "type": "array"
+            },
+            "execution_providers": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginManifestExecutionProvider"
               },
               "type": "array"
             },
@@ -8750,6 +8816,46 @@
           "required": [
             "on",
             "command"
+          ],
+          "type": "object"
+        },
+        "PluginManifestExecutionProvider": {
+          "properties": {
+            "platforms": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginPlatform"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "process_command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pty_command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scheme": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "scheme",
+            "protocol",
+            "pty_command",
+            "process_command"
           ],
           "type": "object"
         },

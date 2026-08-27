@@ -72,8 +72,9 @@ pub(crate) fn load_plugin_manifest(
     api::plugins::load_plugin_manifest(path, enabled)
 }
 pub(crate) use api::plugins::{
-    effective_platforms, ensure_platform_supported, ensure_plugin_user_dirs, plugin_path_env,
-    ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec,
+    effective_platforms, ensure_platform_supported, ensure_plugin_user_dirs,
+    normalize_execution_provider_scheme, plugin_path_env, ClientPrivatePluginPopupOrigin,
+    ClientPrivatePluginPopupSpec,
 };
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
