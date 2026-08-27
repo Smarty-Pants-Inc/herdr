@@ -79,6 +79,7 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &params.target);
         };
+        let local_execution = terminal.execution_target.is_local();
         if terminal.state == crate::detect::AgentState::Blocked {
             return encode_error(
                 id,
@@ -98,7 +99,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        if local_execution && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
             return encode_error(
                 id,
                 "agent_not_ready",
@@ -259,18 +260,17 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let Some(expected_agent) = self
-            .state
-            .terminals
-            .get(terminal_id)
-            .and_then(|terminal| terminal.effective_known_agent())
-        else {
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return agent_not_ready(id, &params.target);
+        };
+        let local_execution = terminal.execution_target.is_local();
+        let Some(expected_agent) = terminal.effective_known_agent() else {
             return agent_not_ready(id, &params.target);
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        if local_execution && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
             return agent_not_ready(id, &params.target);
         }
         let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
@@ -332,8 +332,56 @@ mod tests {
         app
     }
 
-    #[test]
-    fn agent_start_rejects_remote_panes_explicitly() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_routes_provider_backed_panes_through_argv_request() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-provider-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let plugin_root = root.join("example.runtime");
+        std::fs::create_dir_all(plugin_root.join("bin")).unwrap();
+        let provider = plugin_root.join("bin/provider");
+        std::fs::write(
+            &provider,
+            "#!/bin/sh\nprintf '%s' \"$HERDR_EXECUTION_PROVIDER_REQUEST\" > request.json\nexec sleep 30\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+        let manifest_path = plugin_root.join("herdr-plugin.toml");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"
+id = "example.runtime"
+name = "Runtime"
+version = "0.1.0"
+min_herdr_version = "{}"
+platforms = ["macos", "linux"]
+
+[[execution_providers]]
+scheme = "runtime"
+protocol = 1
+pty_command = ["bin/provider", "connect"]
+process_command = ["bin/provider", "exec"]
+"#,
+                crate::build_info::BASE_VERSION
+            ),
+        )
+        .unwrap();
+        let plugin =
+            crate::app::load_plugin_manifest(&manifest_path.display().to_string(), true).unwrap();
+        let registry_path = root.join("plugins.json");
+        crate::persist::plugin_registry::save_to_path(&registry_path, &[plugin]).unwrap();
+
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -343,22 +391,70 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .execution_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+            .execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        let (live_runtime, _old_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(terminal_id.clone(), live_runtime);
+        let (view_runtime, _view_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, view_runtime);
 
-        let response = app.handle_agent_start(
-            "req".into(),
-            AgentStartParams {
-                name: "reviewer".into(),
-                kind: "codex".into(),
-                pane_id: app.public_pane_id(0, pane_id).unwrap(),
-                args: Vec::new(),
-                timeout_ms: None,
-                allow_cross_pane: false,
-            },
+        let response =
+            crate::persist::plugin_registry::with_test_registry_path(registry_path, || {
+                app.handle_agent_start(
+                    "req".into(),
+                    AgentStartParams {
+                        name: "reviewer".into(),
+                        kind: "codex".into(),
+                        pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                        args: Vec::new(),
+                        timeout_ms: None,
+                        allow_cross_pane: false,
+                    },
+                )
+            });
+
+        let success: crate::api::schema::SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|error| panic!("unexpected response ({error}): {response}"));
+        let crate::api::schema::ResponseResult::AgentStarted { argv, .. } = success.result else {
+            panic!("expected agent started response");
+        };
+        assert_eq!(argv, vec!["codex"]);
+        let request_path = plugin_root.join("request.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !request_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "provider request was not captured"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+        assert_eq!(request["version"], 1);
+        assert_eq!(request["target"], "dev2");
+        assert_eq!(request["command"]["kind"], "argv");
+        assert_eq!(request["command"]["argv"], serde_json::json!(["codex"]));
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .managed_agent_hint_for_test(),
+            Some(Agent::Codex)
         );
+        assert_eq!(
+            app.state.terminals[&terminal_id].launch_argv,
+            Some(vec!["codex".into()])
+        );
+        assert!(app.state.terminals[&terminal_id].respawn_shell_on_exit);
 
-        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "agent_start_unsupported_execution_target");
+        app.terminal_runtimes
+            .remove(&terminal_id)
+            .unwrap()
+            .shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

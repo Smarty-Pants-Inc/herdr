@@ -55,6 +55,8 @@ pub struct InstalledPluginInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub startup: Vec<PluginManifestStartup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_providers: Vec<PluginManifestExecutionProvider>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<PluginManifestAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<PluginManifestEventHook>,
@@ -241,6 +243,16 @@ pub struct PluginManifestStartup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<PluginPlatform>>,
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginManifestExecutionProvider {
+    pub scheme: String,
+    pub protocol: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<PluginPlatform>>,
+    pub pty_command: Vec<String>,
+    pub process_command: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

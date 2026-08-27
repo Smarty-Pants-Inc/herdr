@@ -39,7 +39,7 @@ A pane ID such as `w1:p2` identifies the terminal location. An agent name such a
 
 Agent commands accept either a unique live name or the pane ID that currently hosts the agent.
 
-An available shell pane is at its interactive shell prompt: the shell itself owns the foreground, with no foreground command, editor, or agent running. Return the pane to its prompt before calling `agent start`. `agent start` currently supports local panes only; an SSH-backed target returns `agent_start_unsupported_execution_target`.
+An available shell pane is at its interactive shell prompt: the shell itself owns the foreground, with no foreground command, editor, or agent running. Return the pane to its prompt before calling `agent start`. Local, SSH-backed, and execution-provider-backed panes are supported. Remote panes must use a POSIX-compatible interactive shell; Herdr relies on terminal lifecycle detection instead of local process-table inspection.
 
 `--kind` selects a supported agent and its canonical executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `maki`, and `muse`. Arguments after `--` are passed unchanged to that executable.
 

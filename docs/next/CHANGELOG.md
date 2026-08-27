@@ -5,6 +5,7 @@
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 - On Unix, panes can now execute locally or on a trusted SSH host while sharing one Herdr layout; new panes created from an existing pane, such as splits and plugin child surfaces, inherit the source pane's execution target unless explicitly overridden. Whole-server `herdr --remote` remains available on Windows clients connecting to supported Linux and macOS hosts.
+- Plugins can now declare versioned execution providers for PTY panes and non-TTY actions. Generic `SCHEME:TARGET` panes keep Herdr rendering local while the provider owns execution transport, and remote shell panes can launch managed agents through `agent start`.
 - Plugin popups can now be scoped to one connected app client, with independent rendering, input, links, and lifecycle per client.
 
 ### Fixed

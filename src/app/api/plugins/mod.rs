@@ -13,6 +13,7 @@ use crate::api::schema::{
     PluginSetEnabledParams, PluginUnlinkParams, ResponseResult, ViewId,
 };
 use crate::app::App;
+pub(crate) use manifest::normalize_execution_provider_scheme;
 pub(super) use manifest::normalize_plugin_id;
 use manifest::{normalize_action_id, normalize_plugin_source};
 
