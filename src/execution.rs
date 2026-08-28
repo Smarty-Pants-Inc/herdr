@@ -894,10 +894,17 @@ fn apply_remote_exec_env(
     for key in ["TMUX", "STY", "ZELLIJ"] {
         command.env_remove(key);
     }
-    command.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
-    command.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-    command.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
-    command.env_remove("HERDR_VIEW_ID");
+    for key in [
+        crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
+        crate::integration::HERDR_TAB_ID_ENV_VAR,
+        crate::integration::HERDR_PANE_ID_ENV_VAR,
+        "HERDR_VIEW_ID",
+    ] {
+        command.env_remove(key);
+    }
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        command.env_remove(key);
+    }
     for key in remove_env {
         command.env_remove(key);
     }
@@ -1186,6 +1193,9 @@ mod tests {
         ] {
             command.env(key, "stale");
         }
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+            command.env(key, "stale");
+        }
 
         apply_remote_exec_env(
             &mut command,
@@ -1218,6 +1228,9 @@ mod tests {
             crate::integration::HERDR_TAB_ID_ENV_VAR,
             crate::integration::HERDR_PANE_ID_ENV_VAR,
         ] {
+            assert_eq!(env_value(key), Some(None), "{key} should remain scrubbed");
+        }
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
             assert_eq!(env_value(key), Some(None), "{key} should remain scrubbed");
         }
     }
