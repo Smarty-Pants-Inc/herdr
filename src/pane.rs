@@ -230,7 +230,12 @@ impl PaneLaunchEnv {
         self
     }
     pub(crate) fn remote_env_with_removals(&self) -> (Vec<(String, String)>, Vec<String>) {
-        (self.remote_env(), self.remove.clone())
+        let mut remove = crate::integration::HERDR_OMP_BRIDGE_ENV_VARS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<Vec<_>>();
+        remove.extend(self.remove.clone());
+        (self.remote_env(), remove)
     }
     pub(crate) fn remote_env(&self) -> Vec<(String, String)> {
         let mut env = self.extra.clone();
@@ -265,6 +270,12 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         cmd.env_remove(key);
     }
     cmd.env_remove("HERDR_VIEW_ID");
+    // Bridge capabilities belong to the Herdr server launching this pane, not to
+    // any parent pane or remote client. Trusted launch extras and this server's
+    // pane-scoped host credentials are applied below.
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        cmd.env_remove(key);
+    }
     for key in &launch_env.remove {
         cmd.env_remove(key);
     }
@@ -4265,7 +4276,16 @@ mod tests {
             .without_env("BUN_OPTIONS")
             .remote_env_with_removals();
 
-        assert_eq!(remove_env, vec!["BUN_OPTIONS"]);
+        assert_eq!(
+            remove_env,
+            [
+                "HERDR_OMP_BRIDGE",
+                "HERDR_OMP_BRIDGE_TOKEN",
+                "HERDR_OMP_GUEST_BRIDGE_TOKEN",
+                "BUN_OPTIONS",
+            ]
+            .map(String::from)
+        );
     }
 
     #[test]
@@ -4336,6 +4356,9 @@ mod tests {
             .with_omp_bridge(Some(bridge.clone()))
             .with_identity("w1".into(), "w1:t1".into(), "w1:p1".into());
         let mut cmd = CommandBuilder::new("shell");
+        cmd.env("HERDR_OMP_BRIDGE", "stale-address");
+        cmd.env("HERDR_OMP_BRIDGE_TOKEN", "stale-host-token");
+        cmd.env("HERDR_OMP_GUEST_BRIDGE_TOKEN", "stale-guest-token");
 
         apply_pane_launch_env(&mut cmd, &launch);
         assert_eq!(
@@ -4365,6 +4388,7 @@ mod tests {
             .unwrap();
         assert!(bridge.validates("w1:p1", token));
         assert!(!bridge.validates("w1:p2", token));
+        assert_eq!(cmd.get_env("HERDR_OMP_GUEST_BRIDGE_TOKEN"), None);
     }
 
     #[test]
