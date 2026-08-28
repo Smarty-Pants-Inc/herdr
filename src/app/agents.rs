@@ -19,19 +19,6 @@ fn valid_agent_name(name: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
 }
 
-fn remote_managed_agent_command(argv: &[String]) -> Option<String> {
-    let (program, _) = argv.split_first()?;
-    let program = crate::remote::shell_quote(program);
-    let command = argv
-        .iter()
-        .map(|arg| crate::remote::shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!(
-        "if command -v {program} >/dev/null 2>&1; then exec {command}; else printf 'herdr: agent executable not found: %s\\n' {program} >&2; exit 127; fi"
-    ))
-}
-
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         self.state
@@ -91,9 +78,12 @@ impl App {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return;
         };
-        let hint = (!terminal.execution_target.is_local())
-            .then(|| terminal.managed_agent_kind())
-            .flatten();
+        let hint = matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Extension { .. }
+        )
+        .then(|| terminal.managed_agent_kind())
+        .flatten();
         if let Some(runtime) = self.terminal_runtimes.get(terminal_id) {
             runtime.set_managed_agent_hint(hint);
         }
@@ -220,6 +210,12 @@ impl App {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        if matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Ssh { .. }
+        ) {
+            return Err(AgentStartError::UnsupportedExecutionTarget(params.pane_id));
+        }
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
@@ -233,12 +229,8 @@ impl App {
 
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
         argv.extend(params.args);
-        let argv = resolve_agent_argv(
-            crate::detect::agent_label(kind),
-            argv,
-            local_execution,
-        )
-        .map_err(AgentStartError::OmpUnavailable)?;
+        let argv = resolve_agent_argv(crate::detect::agent_label(kind), argv, local_execution)
+            .map_err(AgentStartError::OmpUnavailable)?;
         let (rows, cols, submission) = {
             let runtime = self
                 .terminal_runtimes
@@ -248,14 +240,10 @@ impl App {
             let submission = if provider_execution {
                 None
             } else {
-                let command = if local_execution {
-                    let shell_name = available_shell_name(runtime)
-                        .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
-                    crate::platform::interactive_shell_command(&argv, &shell_name)
-                } else {
-                    remote_managed_agent_command(&argv)
-                }
-                .ok_or(AgentStartError::InvalidArgument)?;
+                let shell_name = available_shell_name(runtime)
+                    .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
+                let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+                    .ok_or(AgentStartError::InvalidArgument)?;
                 Some(Bytes::from(crate::app::api_helpers::encode_api_submission(
                     runtime, &command,
                 )))
@@ -320,9 +308,6 @@ impl App {
                 .terminal_runtimes
                 .get(&terminal_id)
                 .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-            if !local_execution {
-                runtime.set_managed_agent_hint(Some(kind));
-            }
             if let Err(err) = runtime.try_send_bytes(submission.expect("submission is prepared")) {
                 runtime.set_managed_agent_hint(None);
                 terminal.clear_agent_name();
@@ -367,6 +352,14 @@ impl App {
                 code: "agent_pane_not_found".into(),
                 message: format!("agent target pane {target} not found"),
             },
+            AgentStartError::UnsupportedExecutionTarget(target) => {
+                crate::api::schema::ErrorBody {
+                    code: "agent_start_unsupported_execution_target".into(),
+                    message: format!(
+                        "agent start does not support built-in SSH panes; {target} is SSH-backed"
+                    ),
+                }
+            }
             AgentStartError::TargetBusy(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_busy".into(),
                 message: format!("agent target pane {target} is not an available shell"),
@@ -598,6 +591,7 @@ pub(super) enum AgentStartError {
     InvalidTimeout,
     OmpUnavailable(String),
     TargetNotFound(String),
+    UnsupportedExecutionTarget(String),
     TargetBusy(String),
     TargetUnavailable(String),
     InputFailed(String),

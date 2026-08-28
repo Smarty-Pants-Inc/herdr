@@ -908,6 +908,131 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+struct ManagedAgentHintState<'a> {
+    agent_presence: &'a mut AgentDetectionPresence,
+    state: &'a mut AgentState,
+    last_visible_idle: &'a mut bool,
+    last_foreground_pgid: &'a mut Option<u32>,
+    has_process_probe: &'a mut bool,
+    acquisition_started_at: &'a mut Option<std::time::Instant>,
+    last_content_change_at: &'a mut Option<std::time::Instant>,
+    pending_foreground_shell_clear: &'a mut bool,
+    pending_restore_probe: &'a mut bool,
+    foreground_shell_exit_reported: &'a mut bool,
+    last_visible_blocker: &'a mut bool,
+    last_visible_working: &'a mut bool,
+    last_visible_signal_refresh: &'a mut Option<std::time::Instant>,
+    last_detection_text: &'a mut String,
+    last_screen_scan_detection_content_seq: &'a mut Option<u64>,
+    agent_startup_grace_until: &'a mut Option<std::time::Instant>,
+    pending_idle: &'a mut PendingIdleConfirmation,
+    last_managed_agent_hint: &'a mut Option<Agent>,
+}
+
+impl ManagedAgentHintState<'_> {
+    fn reset_for_agent_switch(&mut self, agent: Agent, now: std::time::Instant) {
+        *self.agent_presence = AgentDetectionPresence::from_agent(Some(agent));
+        *self.state = AgentState::Unknown;
+        *self.last_visible_idle = false;
+        *self.last_foreground_pgid = None;
+        *self.has_process_probe = false;
+        *self.acquisition_started_at = None;
+        *self.last_content_change_at = None;
+        *self.pending_foreground_shell_clear = false;
+        *self.pending_restore_probe = false;
+        *self.foreground_shell_exit_reported = false;
+        *self.last_visible_blocker = false;
+        *self.last_visible_working = false;
+        *self.last_visible_signal_refresh = None;
+        self.last_detection_text.clear();
+        *self.last_screen_scan_detection_content_seq = None;
+        *self.agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
+        self.pending_idle.clear();
+    }
+}
+
+enum ManagedAgentHintOutcome {
+    Continue {
+        suppressed_agent: Option<Agent>,
+        hinted_agent: Option<Agent>,
+        agent_changed: bool,
+    },
+    ResetRequested,
+}
+
+struct ManagedAgentHintContext<'a> {
+    pane_id: PaneId,
+    terminal: &'a PaneTerminal,
+    state_events: &'a mpsc::Sender<AppEvent>,
+    pending_release: &'a Mutex<Option<PendingAgentRelease>>,
+    managed_agent_hint: &'a Mutex<Option<Agent>>,
+    detect_reset: &'a Notify,
+}
+
+impl ManagedAgentHintContext<'_> {
+    async fn apply(
+        &self,
+        now: std::time::Instant,
+        mut detection: ManagedAgentHintState<'_>,
+    ) -> ManagedAgentHintOutcome {
+        let mut suppressed_agent = active_pending_release(self.pending_release, now);
+        let hinted_agent = self.managed_agent_hint.lock().ok().and_then(|hint| *hint);
+        if let (Some(suppressed), Some(hinted)) = (suppressed_agent, hinted_agent) {
+            if hinted != suppressed {
+                if let Ok(mut pending_release) = self.pending_release.lock() {
+                    *pending_release = None;
+                }
+                suppressed_agent = None;
+            }
+        }
+
+        let mut agent_changed = false;
+        if let Some(hinted_agent) = hinted_agent {
+            if Some(hinted_agent) != suppressed_agent
+                && detection.agent_presence.current_agent() != Some(hinted_agent)
+            {
+                detection.reset_for_agent_switch(hinted_agent, now);
+                self.terminal.clear_agent_osc_state();
+                publish_agent_process_detected_event(
+                    self.state_events.clone(),
+                    self.pane_id,
+                    hinted_agent,
+                    now,
+                )
+                .await;
+                agent_changed = true;
+            }
+        }
+
+        if detection.last_managed_agent_hint.is_some()
+            && hinted_agent.is_none()
+            && suppressed_agent.is_none()
+        {
+            publish_state_changed_event(
+                self.state_events.clone(),
+                self.pane_id,
+                None,
+                AgentState::Unknown,
+                false,
+                false,
+                false,
+                now,
+            )
+            .await;
+            *detection.last_managed_agent_hint = hinted_agent;
+            self.detect_reset.notify_one();
+            return ManagedAgentHintOutcome::ResetRequested;
+        }
+
+        *detection.last_managed_agent_hint = hinted_agent;
+        ManagedAgentHintOutcome::Continue {
+            suppressed_agent,
+            hinted_agent,
+            agent_changed,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -984,70 +1109,48 @@ fn spawn_basic_detection_task(
             }
 
             let now = std::time::Instant::now();
-            let mut suppressed_agent = active_pending_release(&pending_release_for_task, now);
-            let hinted_agent = managed_agent_hint_for_task
-                .lock()
-                .ok()
-                .and_then(|hint| *hint);
-            if let (Some(suppressed), Some(hinted)) = (suppressed_agent, hinted_agent) {
-                if hinted != suppressed {
-                    if let Ok(mut pending_release) = pending_release_for_task.lock() {
-                        *pending_release = None;
-                    }
-                    suppressed_agent = None;
-                }
-            }
-            let mut agent_changed = false;
-            if let Some(hinted_agent) = hinted_agent {
-                if Some(hinted_agent) != suppressed_agent
-                    && agent_presence.current_agent() != Some(hinted_agent)
-                {
-                    agent_presence = AgentDetectionPresence::from_agent(Some(hinted_agent));
-                    state = AgentState::Unknown;
-                    last_visible_idle = false;
-                    last_visible_blocker = false;
-                    last_visible_working = false;
-                    last_visible_signal_refresh = None;
-                    acquisition_started_at = None;
-                    last_content_change_at = None;
-                    pending_foreground_shell_clear = false;
-                    pending_restore_probe = false;
-                    foreground_shell_exit_reported = false;
-                    last_detection_text.clear();
-                    last_screen_scan_detection_content_seq = None;
-                    agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
-                    pending_idle.clear();
-                    terminal.clear_agent_osc_state();
-                    publish_agent_process_detected_event(
-                        state_events.clone(),
-                        pane_id,
-                        hinted_agent,
-                        now,
-                    )
-                    .await;
-                    agent_changed = true;
-                }
-            }
-            if last_managed_agent_hint.is_some()
-                && hinted_agent.is_none()
-                && suppressed_agent.is_none()
-            {
-                publish_state_changed_event(
-                    state_events.clone(),
+            let (suppressed_agent, hinted_agent, mut agent_changed) =
+                match (ManagedAgentHintContext {
                     pane_id,
-                    None,
-                    AgentState::Unknown,
-                    false,
-                    false,
-                    false,
+                    terminal: &terminal,
+                    state_events: &state_events,
+                    pending_release: &pending_release_for_task,
+                    managed_agent_hint: &managed_agent_hint_for_task,
+                    detect_reset: &detect_reset,
+                })
+                .apply(
                     now,
+                    ManagedAgentHintState {
+                        agent_presence: &mut agent_presence,
+                        state: &mut state,
+                        last_visible_idle: &mut last_visible_idle,
+                        last_foreground_pgid: &mut last_foreground_pgid,
+                        has_process_probe: &mut has_process_probe,
+                        acquisition_started_at: &mut acquisition_started_at,
+                        last_content_change_at: &mut last_content_change_at,
+                        pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+                        pending_restore_probe: &mut pending_restore_probe,
+                        foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+                        last_visible_blocker: &mut last_visible_blocker,
+                        last_visible_working: &mut last_visible_working,
+                        last_visible_signal_refresh: &mut last_visible_signal_refresh,
+                        last_detection_text: &mut last_detection_text,
+                        last_screen_scan_detection_content_seq:
+                            &mut last_screen_scan_detection_content_seq,
+                        agent_startup_grace_until: &mut agent_startup_grace_until,
+                        pending_idle: &mut pending_idle,
+                        last_managed_agent_hint: &mut last_managed_agent_hint,
+                    },
                 )
-                .await;
-                last_managed_agent_hint = hinted_agent;
-                detect_reset.notify_one();
-                continue;
-            }
-            last_managed_agent_hint = hinted_agent;
+                .await
+                {
+                    ManagedAgentHintOutcome::Continue {
+                        suppressed_agent,
+                        hinted_agent,
+                        agent_changed,
+                    } => (suppressed_agent, hinted_agent, agent_changed),
+                    ManagedAgentHintOutcome::ResetRequested => continue,
+                };
             if suppressed_agent.is_none() && release_was_active {
                 has_process_probe = false;
                 acquisition_started_at = None;
@@ -3073,73 +3176,48 @@ impl PaneRuntime {
                     }
 
                     let now = Instant::now();
-                    let mut suppressed_agent =
-                        active_pending_release(&pending_release_for_task, now);
-                    let hinted_agent = managed_agent_hint_for_task
-                        .lock()
-                        .ok()
-                        .and_then(|hint| *hint);
-                    if let (Some(suppressed), Some(hinted)) = (suppressed_agent, hinted_agent) {
-                        if hinted != suppressed {
-                            if let Ok(mut pending_release) = pending_release_for_task.lock() {
-                                *pending_release = None;
-                            }
-                            suppressed_agent = None;
-                        }
-                    }
-                    let mut agent_changed = false;
-                    if let Some(hinted_agent) = hinted_agent {
-                        if Some(hinted_agent) != suppressed_agent
-                            && agent_presence.current_agent() != Some(hinted_agent)
-                        {
-                            agent_presence = AgentDetectionPresence::from_agent(Some(hinted_agent));
-                            state = AgentState::Unknown;
-                            last_visible_idle = false;
-                            last_foreground_pgid = None;
-                            has_process_probe = false;
-                            acquisition_started_at = None;
-                            last_content_change_at = None;
-                            pending_foreground_shell_clear = false;
-                            foreground_shell_exit_reported = false;
-                            pending_restore_probe = false;
-                            last_visible_blocker = false;
-                            last_visible_working = false;
-                            last_visible_signal_refresh = None;
-                            last_detection_text.clear();
-                            last_screen_scan_detection_content_seq = None;
-                            agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
-                            pending_idle.clear();
-                            terminal.clear_agent_osc_state();
-                            publish_agent_process_detected_event(
-                                state_events.clone(),
-                                pane_id,
-                                hinted_agent,
-                                now,
-                            )
-                            .await;
-                            agent_changed = true;
-                        }
-                    }
-                    if last_managed_agent_hint.is_some()
-                        && hinted_agent.is_none()
-                        && suppressed_agent.is_none()
-                    {
-                        publish_state_changed_event(
-                            state_events.clone(),
+                    let (suppressed_agent, hinted_agent, mut agent_changed) =
+                        match (ManagedAgentHintContext {
                             pane_id,
-                            None,
-                            AgentState::Unknown,
-                            false,
-                            false,
-                            false,
+                            terminal: &terminal,
+                            state_events: &state_events,
+                            pending_release: &pending_release_for_task,
+                            managed_agent_hint: &managed_agent_hint_for_task,
+                            detect_reset: &detect_reset,
+                        })
+                        .apply(
                             now,
+                            ManagedAgentHintState {
+                                agent_presence: &mut agent_presence,
+                                state: &mut state,
+                                last_visible_idle: &mut last_visible_idle,
+                                last_foreground_pgid: &mut last_foreground_pgid,
+                                has_process_probe: &mut has_process_probe,
+                                acquisition_started_at: &mut acquisition_started_at,
+                                last_content_change_at: &mut last_content_change_at,
+                                pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+                                pending_restore_probe: &mut pending_restore_probe,
+                                foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+                                last_visible_blocker: &mut last_visible_blocker,
+                                last_visible_working: &mut last_visible_working,
+                                last_visible_signal_refresh: &mut last_visible_signal_refresh,
+                                last_detection_text: &mut last_detection_text,
+                                last_screen_scan_detection_content_seq:
+                                    &mut last_screen_scan_detection_content_seq,
+                                agent_startup_grace_until: &mut agent_startup_grace_until,
+                                pending_idle: &mut pending_idle,
+                                last_managed_agent_hint: &mut last_managed_agent_hint,
+                            },
                         )
-                        .await;
-                        last_managed_agent_hint = hinted_agent;
-                        detect_reset.notify_one();
-                        continue;
-                    }
-                    last_managed_agent_hint = hinted_agent;
+                        .await
+                        {
+                            ManagedAgentHintOutcome::Continue {
+                                suppressed_agent,
+                                hinted_agent,
+                                agent_changed,
+                            } => (suppressed_agent, hinted_agent, agent_changed),
+                            ManagedAgentHintOutcome::ResetRequested => continue,
+                        };
                     if suppressed_agent.is_none() && release_was_active {
                         has_process_probe = false;
                         acquisition_started_at = None;
@@ -4160,6 +4238,89 @@ mod tests {
         .unwrap();
         runtime.set_handoff_reader_paused(false);
         (runtime, event_rx, child)
+    }
+
+    #[test]
+    fn managed_agent_switch_resets_process_probe_state() {
+        let now = std::time::Instant::now();
+        let mut agent_presence = AgentDetectionPresence::from_agent(Some(Agent::Omp));
+        let mut state = AgentState::Working;
+        let mut last_visible_idle = true;
+        let mut last_foreground_pgid = Some(42);
+        let mut has_process_probe = true;
+        let mut acquisition_started_at = Some(now);
+        let mut last_content_change_at = Some(now);
+        let mut pending_foreground_shell_clear = true;
+        let mut pending_restore_probe = true;
+        let mut foreground_shell_exit_reported = true;
+        let mut last_visible_blocker = true;
+        let mut last_visible_working = true;
+        let mut last_visible_signal_refresh = Some(now);
+        let mut last_detection_text = "stale".to_string();
+        let mut last_screen_scan_detection_content_seq = Some(7);
+        let mut agent_startup_grace_until = None;
+        let mut pending_idle = PendingIdleConfirmation::default();
+        let mut last_managed_agent_hint = Some(Agent::Omp);
+
+        ManagedAgentHintState {
+            agent_presence: &mut agent_presence,
+            state: &mut state,
+            last_visible_idle: &mut last_visible_idle,
+            last_foreground_pgid: &mut last_foreground_pgid,
+            has_process_probe: &mut has_process_probe,
+            acquisition_started_at: &mut acquisition_started_at,
+            last_content_change_at: &mut last_content_change_at,
+            pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+            pending_restore_probe: &mut pending_restore_probe,
+            foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+            last_visible_blocker: &mut last_visible_blocker,
+            last_visible_working: &mut last_visible_working,
+            last_visible_signal_refresh: &mut last_visible_signal_refresh,
+            last_detection_text: &mut last_detection_text,
+            last_screen_scan_detection_content_seq: &mut last_screen_scan_detection_content_seq,
+            agent_startup_grace_until: &mut agent_startup_grace_until,
+            pending_idle: &mut pending_idle,
+            last_managed_agent_hint: &mut last_managed_agent_hint,
+        }
+        .reset_for_agent_switch(Agent::Codex, now);
+
+        assert_eq!(agent_presence.current_agent(), Some(Agent::Codex));
+        assert_eq!(last_foreground_pgid, None);
+        assert!(!has_process_probe);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_detection_adopts_managed_agent_switch() {
+        let mut handoff = handoff_test_state(0, true, Some("build-alias"));
+        handoff.agent_state = Some(
+            serde_json::from_value(serde_json::json!({
+                "agent": "omp",
+                "state": "idle",
+                "seen": true
+            }))
+            .unwrap(),
+        );
+        let (runtime, mut events, mut child) = import_handoff_state_with_output("", handoff);
+
+        runtime.set_managed_agent_hint(Some(Agent::Codex));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Some(AppEvent::AgentProcessDetected {
+                        agent: Agent::Codex,
+                        ..
+                    }) => break,
+                    Some(_) => {}
+                    None => panic!("handoff event channel closed before managed-agent switch"),
+                }
+            }
+        })
+        .await
+        .expect("handoff detection should use the shared managed-agent transition");
+
+        assert_eq!(runtime.managed_agent_hint_for_test(), Some(Agent::Codex));
+        child.wait().unwrap();
     }
 
     #[test]

@@ -79,7 +79,10 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return agent_not_found(id, &params.target);
         };
-        let local_execution = terminal.execution_target.is_local();
+        let provider_execution = matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Extension { .. }
+        );
         if terminal.state == crate::detect::AgentState::Blocked {
             return encode_error(
                 id,
@@ -99,7 +102,9 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if local_execution && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        if !provider_execution
+            && !super::super::agents::runtime_hosts_agent(runtime, expected_agent)
+        {
             return encode_error(
                 id,
                 "agent_not_ready",
@@ -263,14 +268,19 @@ impl App {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return agent_not_ready(id, &params.target);
         };
-        let local_execution = terminal.execution_target.is_local();
+        let provider_execution = matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Extension { .. }
+        );
         let Some(expected_agent) = terminal.effective_known_agent() else {
             return agent_not_ready(id, &params.target);
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if local_execution && !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+        if !provider_execution
+            && !super::super::agents::runtime_hosts_agent(runtime, expected_agent)
+        {
             return agent_not_ready(id, &params.target);
         }
         let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
@@ -490,6 +500,35 @@ process_command = ["bin/provider", "exec"]
         let submitted = String::from_utf8(input.try_recv().unwrap().to_vec()).unwrap();
         assert!(submitted.contains(&expected));
         assert!(submitted.contains("--resume=session"));
+    }
+
+    #[test]
+    fn agent_start_rejects_ssh_panes_explicitly() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: Vec::new(),
+                timeout_ms: None,
+                allow_cross_pane: false,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_start_unsupported_execution_target");
     }
 
     #[tokio::test]
