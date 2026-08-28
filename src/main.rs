@@ -620,12 +620,12 @@ fn main() -> io::Result<()> {
         } else {
             match args.get(index) {
                 Some(value) => match value.parse::<u64>() {
-                    Ok(1) => {
+                    Ok(generation) if generation != 0 => {
                         index += 1;
-                        1
+                        generation
                     }
                     Ok(_) => {
-                        eprintln!("error: OMP route generation is server-owned; only generation 1 is valid in this POC");
+                        eprintln!("error: OMP route generation must be greater than zero");
                         std::process::exit(2);
                     }
                     Err(_) => {

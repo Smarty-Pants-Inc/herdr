@@ -418,7 +418,7 @@ impl ClientWriterQueue {
 
 #[derive(Debug)]
 pub(crate) enum OmpHostAdmission {
-    Accepted,
+    Accepted { route_generation: u64 },
     Rejected { code: String, message: String },
 }
 

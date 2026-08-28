@@ -373,13 +373,7 @@ fn run_with_guest(
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
     let external_peer_identity = (guest_mode == GuestMode::ExternalBridge)
-        .then(|| {
-            identity
-                .display_name
-                .clone()
-                .map(|display_name| protocol::OmpExternalPeerIdentity { display_name })
-        })
-        .flatten();
+        .then(|| super::omp_external_peer_identity(&identity));
     let renderer_launch_id = (guest_mode == GuestMode::Native)
         .then(|| std::env::var(super::omp_renderer::OMP_RENDERER_LAUNCH_ID_ENV).ok())
         .flatten()
@@ -403,7 +397,7 @@ fn run_with_guest(
         },
     )?;
 
-    let (initial_attachment_epoch, _controller) = loop {
+    let (initial_attachment_epoch, _controller, route_generation) = loop {
         match protocol::read_message::<_, ServerMessage>(&mut stream, MAX_FRAME_SIZE)
             .map_err(|error| io::Error::other(error.to_string()))?
         {
@@ -414,11 +408,8 @@ fn run_with_guest(
                 attachment_epoch,
                 controller,
                 ..
-            } if attached_pane == pane_id
-                && attached_session == omp_session_id
-                && attached_generation == route_generation =>
-            {
-                break (attachment_epoch, controller)
+            } if attached_pane == pane_id && attached_session == omp_session_id => {
+                break (attachment_epoch, controller, attached_generation);
             }
             ServerMessage::OmpError { code, message, .. } => {
                 return Err(io::Error::other(format!("{code}: {message}")));
@@ -928,24 +919,32 @@ mod tests {
     }
 
     #[test]
-    fn external_guest_bridge_credential_is_versioned_and_contains_no_host_token() {
+    fn external_guest_bridge_credential_matches_current_route_generation() {
+        let current_route = crate::api::schema::ServerOmpMaintenanceRoute {
+            session: "default".into(),
+            pane_id: "w1:p1".into(),
+            omp_session_id: "omp-session".into(),
+            route_generation: 7,
+            proof: false,
+        };
         let credential = OmpGuestBridgeCredential {
             schema: "herdr.omp_guest_bridge.v1",
             address: "127.0.0.1:1234".into(),
             room_id: "room".into(),
             token: "guest-capability".into(),
-            pane_id: "w1:p1".into(),
-            omp_session_id: "omp-session".into(),
-            route_generation: 7,
+            pane_id: current_route.pane_id.clone(),
+            omp_session_id: current_route.omp_session_id.clone(),
+            route_generation: current_route.route_generation,
         };
+        assert_eq!(credential.route_generation, current_route.route_generation);
         let record = serde_json::to_value(&credential).unwrap();
         assert_eq!(record["schema"], "herdr.omp_guest_bridge.v1");
         assert_eq!(record["address"], "127.0.0.1:1234");
         assert_eq!(record["roomId"], "room");
         assert_eq!(record["token"], "guest-capability");
-        assert_eq!(record["paneId"], "w1:p1");
-        assert_eq!(record["ompSessionId"], "omp-session");
-        assert_eq!(record["routeGeneration"], 7);
+        assert_eq!(record["paneId"], current_route.pane_id);
+        assert_eq!(record["ompSessionId"], current_route.omp_session_id);
+        assert_eq!(record["routeGeneration"], current_route.route_generation);
         assert_eq!(record.as_object().unwrap().len(), 7);
         assert!(record.get("HERDR_OMP_BRIDGE_TOKEN").is_none());
     }

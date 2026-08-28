@@ -975,6 +975,21 @@ fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
     }
 }
 
+const DEFAULT_OMP_EXTERNAL_GUEST_DISPLAY_NAME: &str = "External guest";
+
+/// Returns display-only attribution for an external OMP guest. The fallback is
+/// not persisted and never participates in App authority binding.
+pub(crate) fn omp_external_peer_identity(
+    identity: &crate::config::ClientIdentity,
+) -> crate::protocol::OmpExternalPeerIdentity {
+    crate::protocol::OmpExternalPeerIdentity {
+        display_name: identity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_OMP_EXTERNAL_GUEST_DISPLAY_NAME.to_owned()),
+    }
+}
+
 /// Performs the client→server handshake.
 ///
 /// Sends Hello with the terminal size and protocol version, reads the Welcome

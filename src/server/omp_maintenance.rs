@@ -150,6 +150,12 @@ impl PersistedRoute {
         }
     }
 
+    fn same_slot(&self, instance_id: &str, session: &str, key: &OmpRouteKey) -> bool {
+        self.server_instance_id == instance_id
+            && self.session == session
+            && self.pane_id == key.pane_id
+    }
+
     fn matches(&self, instance_id: &str, session: &str, key: &OmpRouteKey) -> bool {
         self.server_instance_id == instance_id
             && self.session == session
@@ -527,6 +533,17 @@ impl OmpMaintenance {
         key: &OmpRouteKey,
         admit_route: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, OmpMaintenanceAdmissionError<E>> {
+        let admitted_key = key.clone();
+        self.admit_replacement(key, || {
+            admit_route().map(|admitted| (admitted_key, admitted))
+        })
+    }
+
+    pub(crate) fn admit_replacement<T, E>(
+        &self,
+        announced_key: &OmpRouteKey,
+        admit_route: impl FnOnce() -> Result<(OmpRouteKey, T), E>,
+    ) -> Result<T, OmpMaintenanceAdmissionError<E>> {
         self.with_state(|state, dirty| {
             let proof = match state.lease.as_mut() {
                 None => false,
@@ -534,25 +551,36 @@ impl OmpMaintenance {
                     let Some(permit) = lease.permit.as_ref() else {
                         return Err(OmpMaintenanceAdmissionError::Active);
                     };
-                    if permit.session != self.session || permit.pane_id != key.pane_id {
+                    if permit.session != self.session || permit.pane_id != announced_key.pane_id {
                         return Err(OmpMaintenanceAdmissionError::Active);
                     }
                     true
                 }
             };
 
-            let admitted = admit_route().map_err(OmpMaintenanceAdmissionError::Route)?;
+            let (key, admitted) = admit_route().map_err(OmpMaintenanceAdmissionError::Route)?;
+            if key.pane_id != announced_key.pane_id {
+                return Err(OmpMaintenanceAdmissionError::State(
+                    OmpMaintenanceError::StateInvalid(
+                        "OMP route admission changed its durable pane slot".into(),
+                    ),
+                ));
+            }
             if proof {
                 if let Some(lease) = state.lease.as_mut() {
                     lease.permit = None;
                 }
             }
-            state.routes.push(PersistedRoute::new(
-                &self.instance.id,
-                &self.session,
-                key,
-                proof,
-            ));
+            let route = PersistedRoute::new(&self.instance.id, &self.session, &key, proof);
+            if let Some(current) = state
+                .routes
+                .iter_mut()
+                .find(|current| current.same_slot(&self.instance.id, &self.session, &key))
+            {
+                *current = route;
+            } else {
+                state.routes.push(route);
+            }
             state.route_revision = state.route_revision.saturating_add(1);
             *dirty = true;
             Ok(admitted)
@@ -1913,6 +1941,36 @@ mod tests {
 
         host.acquire(&operation_id(30)).unwrap();
         assert_eq!(inspector.route_set_revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn canonical_replacement_updates_the_public_route_in_place() {
+        let store = TestOmpMaintenanceStore::new();
+        let host = OmpMaintenance::for_test("host", store.clone());
+        let inspector = OmpMaintenance::for_test("inspector", store);
+        let announced = route("w1:p1");
+        host.admit(&announced, || Ok::<_, ()>(())).unwrap();
+        let canonical = OmpRouteKey {
+            pane_id: announced.pane_id.clone(),
+            omp_session_id: "replacement-session".into(),
+            route_generation: 2,
+        };
+
+        let admitted_generation = host
+            .admit_replacement(&announced, || {
+                Ok::<_, ()>((canonical.clone(), canonical.route_generation))
+            })
+            .unwrap();
+        let status = inspector.inspect().unwrap();
+
+        assert_eq!(admitted_generation, 2);
+        assert_eq!(status.route_revision, 2);
+        assert_eq!(status.route_count, 1);
+        assert_eq!(status.routes[0].omp_session_id, canonical.omp_session_id);
+        assert_eq!(
+            status.routes[0].route_generation,
+            canonical.route_generation
+        );
     }
 
     #[cfg(unix)]

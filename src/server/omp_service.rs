@@ -676,37 +676,41 @@ impl OmpService {
                     });
                     return messages;
                 }
-                let key = OmpRouteKey {
+                let announced_key = OmpRouteKey {
                     pane_id,
                     omp_session_id,
                     route_generation,
                 };
-                let route_key = (
-                    key.pane_id.clone(),
-                    key.omp_session_id.clone(),
-                    key.route_generation,
-                );
-                let mut route_started = false;
                 let admission_result: Result<
-                    Vec<OmpRouteDelivery>,
+                    OmpRouteKey,
                     OmpMaintenanceAdmissionError<OmpRouteError>,
                 > = match self.maintenance.as_ref() {
                     Ok(maintenance) => {
-                        let routes = &mut self.routes;
-                        maintenance.admit(&key, || {
-                            let deliveries = routes.host_started(key.clone())?;
-                            route_started = true;
-                            Ok(deliveries)
+                        let routes = &self.routes;
+                        maintenance.admit_replacement(&announced_key, || {
+                            let key = routes.prepare_host_start(&announced_key)?;
+                            Ok((key.clone(), key))
                         })
                     }
                     Err(error) => Err(OmpMaintenanceAdmissionError::State(error.clone())),
                 };
                 match admission_result {
-                    Ok(deliveries) => {
+                    Ok(key) => {
+                        let route_key = (
+                            key.pane_id.clone(),
+                            key.omp_session_id.clone(),
+                            key.route_generation,
+                        );
+                        let deliveries = self.routes.commit_host_start(key.clone());
                         self.pending_maintenance_unregisters
                             .retain(|pending| pending != &key);
                         self.replace_host(route_key, host_id, outbound, socket);
-                        if admission.send(OmpHostAdmission::Accepted).is_err() {
+                        if admission
+                            .send(OmpHostAdmission::Accepted {
+                                route_generation: key.route_generation,
+                            })
+                            .is_err()
+                        {
                             self.remove_host(&key);
                             if let Ok(deliveries) = self.routes.host_stopped(&key) {
                                 self.deliver(&key, deliveries, &mut messages, clients);
@@ -720,9 +724,9 @@ impl OmpService {
                     }
                     Err(OmpMaintenanceAdmissionError::Active) => {
                         tracing::warn!(
-                            pane_id = %key.pane_id,
-                            omp_session_id = %key.omp_session_id,
-                            route_generation = key.route_generation,
+                            pane_id = %announced_key.pane_id,
+                            omp_session_id = %announced_key.omp_session_id,
+                            route_generation = announced_key.route_generation,
                             "rejected OMP bridge host during maintenance"
                         );
                         let _ = admission.send(OmpHostAdmission::Rejected {
@@ -731,20 +735,10 @@ impl OmpService {
                         });
                     }
                     Err(OmpMaintenanceAdmissionError::State(error)) => {
-                        if route_started {
-                            if let Ok(deliveries) = self.routes.host_stopped(&key) {
-                                self.deliver(&key, deliveries, &mut messages, clients);
-                                self.routes.remove_if_inactive_and_empty(&key);
-                                self.unregister_maintenance_route(
-                                    &key,
-                                    "failed to roll back rejected OMP maintenance route",
-                                );
-                            }
-                        }
                         tracing::warn!(
-                            pane_id = %key.pane_id,
-                            omp_session_id = %key.omp_session_id,
-                            route_generation = key.route_generation,
+                            pane_id = %announced_key.pane_id,
+                            omp_session_id = %announced_key.omp_session_id,
+                            route_generation = announced_key.route_generation,
                             code = error.code(),
                             message = %error.message(),
                             "rejected OMP bridge host because maintenance state is unavailable"
@@ -756,9 +750,9 @@ impl OmpService {
                     }
                     Err(OmpMaintenanceAdmissionError::Route(error)) => {
                         tracing::warn!(
-                            pane_id = %key.pane_id,
-                            omp_session_id = %key.omp_session_id,
-                            route_generation = key.route_generation,
+                            pane_id = %announced_key.pane_id,
+                            omp_session_id = %announced_key.omp_session_id,
+                            route_generation = announced_key.route_generation,
                             code = error.code(),
                             "rejected OMP bridge host"
                         );
@@ -1373,53 +1367,80 @@ mod tests {
     }
 
     #[test]
-    fn host_route_admission_reports_acceptance_and_route_busy_rejection() {
-        let mut service = OmpService::new(None).unwrap();
-        let clients = HashMap::new();
-        let (peer, socket) = host_socket_pair();
-        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
-        let (admission, admitted) = std::sync::mpsc::sync_channel(1);
-        service.handle_event(
-            ServerEvent::OmpHostStarted {
+    fn host_route_replacement_advances_generation_and_rejects_stale_claims() {
+        use std::io::Read as _;
+
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut service =
+            OmpService::with_test_maintenance(None, "default", store).expect("service");
+        let (mut first_peer, first_admitted) = start_host(&mut service, "pane", "session", 1, 1);
+        assert!(matches!(
+            admission(first_admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 1
+            }
+        ));
+        assert_eq!(
+            service.maintenance_status().unwrap().routes[0].route_generation,
+            1
+        );
+
+        stop_host(&mut service, "pane", "session", 1, 1);
+        assert_eq!(first_peer.read(&mut [0]).unwrap(), 0);
+
+        let (mut replacement_peer, replacement_admitted) =
+            start_host(&mut service, "pane", "session", 1, 2);
+        assert!(matches!(
+            admission(replacement_admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 2
+            }
+        ));
+        assert_eq!(
+            service.live_route_keys(),
+            vec![OmpRouteKey {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
-                route_generation: 1,
-                host_id: 1,
-                outbound,
-                socket,
-                admission,
-            },
-            false,
-            &clients,
+                route_generation: 2,
+            }]
         );
+        let status = service.maintenance_status().unwrap();
+        assert_eq!(status.route_count, 1);
+        assert_eq!(status.routes[0].route_generation, 2);
+
+        let (stale_peer, stale) = start_host(&mut service, "pane", "session", 1, 3);
         assert!(matches!(
-            admitted.recv_timeout(std::time::Duration::from_secs(1)),
-            Ok(OmpHostAdmission::Accepted)
+            admission(stale),
+            OmpHostAdmission::Rejected { code, .. } if code == "stale_generation"
+        ));
+        let (forged_peer, forged) = start_host(&mut service, "pane", "session", 3, 4);
+        assert!(matches!(
+            admission(forged),
+            OmpHostAdmission::Rejected { code, .. } if code == "stale_generation"
+        ));
+        let (busy_peer, busy) = start_host(&mut service, "pane", "session", 2, 5);
+        assert!(matches!(
+            admission(busy),
+            OmpHostAdmission::Rejected { code, .. } if code == "route_busy"
         ));
 
-        let (replacement_peer, replacement_socket) = host_socket_pair();
-        let (replacement_outbound, _replacement_outbound_rx) = std::sync::mpsc::sync_channel(1);
-        let (replacement_admission, replacement_admitted) = std::sync::mpsc::sync_channel(1);
-        service.handle_event(
-            ServerEvent::OmpHostStarted {
-                pane_id: "pane".into(),
-                omp_session_id: "session".into(),
-                route_generation: 1,
-                host_id: 2,
-                outbound: replacement_outbound,
-                socket: replacement_socket,
-                admission: replacement_admission,
-            },
-            false,
-            &clients,
-        );
+        stop_host(&mut service, "pane", "session", 2, 2);
+        assert_eq!(replacement_peer.read(&mut [0]).unwrap(), 0);
+
+        let (mut third_peer, third_admitted) = start_host(&mut service, "pane", "session", 2, 6);
         assert!(matches!(
-            replacement_admitted.recv_timeout(std::time::Duration::from_secs(1)),
-            Ok(OmpHostAdmission::Rejected { code, message })
-                if code == "route_busy" && message == "OMP host route is already active"
+            admission(third_admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 3
+            }
         ));
-        drop(peer);
-        drop(replacement_peer);
+        assert_eq!(
+            service.maintenance_status().unwrap().routes[0].route_generation,
+            3
+        );
+        stop_host(&mut service, "pane", "session", 3, 6);
+        assert_eq!(third_peer.read(&mut [0]).unwrap(), 0);
+        drop((stale_peer, forged_peer, busy_peer));
     }
 
     #[test]
@@ -1463,7 +1484,12 @@ mod tests {
             key.route_generation,
             1,
         );
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 1
+            }
+        ));
 
         store.fail_next_state_accesses(1);
         let (retry_peer, rejected) = start_host(
@@ -1518,8 +1544,13 @@ mod tests {
         let mut service =
             OmpService::with_test_maintenance(None, "default", store).expect("create service");
 
-        let (peer, admitted) = start_host(&mut service, "w1:p1", "omp-1", 4, 7);
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        let (peer, admitted) = start_host(&mut service, "w1:p1", "omp-1", 1, 7);
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 1
+            }
+        ));
         let status = service.maintenance_status().unwrap();
         assert!(!status.held);
         assert_eq!(status.route_count, 1);
@@ -1529,12 +1560,12 @@ mod tests {
                 session: "default".into(),
                 pane_id: "w1:p1".into(),
                 omp_session_id: "omp-1".into(),
-                route_generation: 4,
+                route_generation: 1,
                 proof: false,
             }]
         );
 
-        stop_host(&mut service, "w1:p1", "omp-1", 4, 7);
+        stop_host(&mut service, "w1:p1", "omp-1", 1, 7);
         assert_eq!(service.maintenance_status().unwrap().route_count, 0);
         drop(peer);
     }
@@ -1552,11 +1583,11 @@ mod tests {
         let (second_peer, second_admitted) = start_host(&mut second, "w2:p1", "omp-2", 1, 2);
         assert!(matches!(
             admission(first_admitted),
-            OmpHostAdmission::Accepted
+            OmpHostAdmission::Accepted { .. }
         ));
         assert!(matches!(
             admission(second_admitted),
-            OmpHostAdmission::Accepted
+            OmpHostAdmission::Accepted { .. }
         ));
         assert_eq!(controller.route_set_revision().unwrap(), 2);
 
@@ -1589,7 +1620,10 @@ mod tests {
             .expect("create controller service");
         let (mut existing_peer, admitted) =
             start_host(&mut existing, "w1:p1", "omp-existing", 1, 1);
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted { .. }
+        ));
 
         let acquired = controller.acquire_maintenance(OWNER).unwrap();
         assert!(acquired.held);
@@ -1637,7 +1671,10 @@ mod tests {
         assert!(controller.maintenance_status().unwrap().permit.is_some());
 
         let (proof_peer, admitted) = start_host(&mut proof, "w1:p1", "omp-proof", 1, 3);
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted { .. }
+        ));
         let consumed = controller.maintenance_status().unwrap();
         assert!(consumed.permit.is_none());
         assert_eq!(consumed.route_count, 1);
@@ -1665,7 +1702,10 @@ mod tests {
         let mut service =
             OmpService::with_test_maintenance(None, "default", store).expect("create service");
         let (peer, admitted) = start_host(&mut service, "w1:p1", "omp-1", 1, 1);
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted { .. }
+        ));
 
         let first = service.acquire_maintenance(OWNER).unwrap();
         let second = service.acquire_maintenance(OWNER).unwrap();
@@ -2041,12 +2081,71 @@ mod tests {
     }
 
     #[test]
+    fn fresh_profile_external_guest_admission_uses_display_only_fallback() {
+        let mut service = OmpService::new(None).unwrap();
+        let key = OmpRouteKey {
+            pane_id: "pane".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        service.routes.host_started(key.clone()).unwrap();
+        let clients = HashMap::from([(
+            1,
+            client(
+                crate::server::clients::ClientConnectionMode::OmpPane,
+                None,
+                None,
+            ),
+        )]);
+        assert!(clients[&1].committed_identity().is_none());
+        let fresh_identity = crate::config::ClientIdentity {
+            display_name: None,
+            frontend_profile_id: "fresh-profile".into(),
+            renderer_binding_token: "fresh-renderer-token".into(),
+        };
+        let external_identity = crate::client::omp_external_peer_identity(&fresh_identity);
+        assert!(crate::config::validate_display_name(&external_identity.display_name).is_ok());
+        assert!(fresh_identity.display_name.is_none());
+        let display_name = external_identity.display_name.clone();
+
+        let messages = service.handle_event(
+            ServerEvent::OmpPaneAttach {
+                client_id: 1,
+                pane_id: key.pane_id.clone(),
+                omp_session_id: key.omp_session_id.clone(),
+                route_generation: key.route_generation,
+                target_app_client_id: None,
+                renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
+                renderer_launch_id: None,
+                renderer_request: crate::protocol::OmpRendererRequest::ExternalGuestBridge,
+                external_peer_identity: Some(external_identity),
+            },
+            true,
+            &clients,
+        );
+
+        assert!(messages.iter().any(|(_, message)| matches!(
+            message,
+            ServerMessage::OmpPane {
+                route_generation: 1,
+                renderer_mode: OmpRendererMode::ExternalGuestBridge,
+                controller: false,
+                ..
+            }
+        )));
+        assert_eq!(service.bound_app_for_renderer(1), Some(1));
+        let stored = service.external_peer_identities.get(&1).unwrap();
+        assert_eq!(stored.name, display_name);
+        assert_eq!(stored.revision, 1);
+    }
+
+    #[test]
     fn external_guest_bridge_attaches_only_to_the_live_generation_as_an_observer() {
         let mut service = OmpService::new(None).unwrap();
         let key = OmpRouteKey {
             pane_id: "pane".into(),
             omp_session_id: "session".into(),
-            route_generation: 7,
+            route_generation: 1,
         };
         service.routes.host_started(key.clone()).unwrap();
         let clients = HashMap::from([(
@@ -2070,13 +2169,13 @@ mod tests {
                 display_name: "Ada".into(),
             }),
         };
-        let messages = service.handle_event(attach(6), true, &clients);
+        let messages = service.handle_event(attach(0), true, &clients);
         assert!(messages.iter().any(|(_, message)| matches!(
             message,
             ServerMessage::OmpError { code, .. } if code == "stale_generation"
         )));
 
-        let messages = service.handle_event(attach(7), true, &clients);
+        let messages = service.handle_event(attach(1), true, &clients);
         assert!(messages.iter().any(|(_, message)| matches!(
             message,
             ServerMessage::OmpPane {
@@ -2121,7 +2220,10 @@ mod tests {
             false,
             &clients,
         );
-        assert!(matches!(admission(admitted), OmpHostAdmission::Accepted));
+        assert!(matches!(
+            admission(admitted),
+            OmpHostAdmission::Accepted { .. }
+        ));
 
         let attached = service.handle_event(
             ServerEvent::OmpPaneAttach {
