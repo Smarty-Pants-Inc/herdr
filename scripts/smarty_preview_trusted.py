@@ -648,6 +648,25 @@ def download_artifacts(root: Path, identity: dict[str, Any], token: str) -> None
             raise
 
 
+def extract_producer_artifacts(root: Path, output: Path, identity: dict[str, Any]) -> None:
+    artifacts = _mapping(identity.get("artifacts"), "producer artifacts")
+    for name in artifacts:
+        match = ARTIFACT_NAME.fullmatch(name) if isinstance(name, str) else None
+        if match is None:
+            _fail(f"producer artifact is outside the recognized attempt namespace: {name}")
+        kind = name[: -(len(match.group("attempt")) + 1)]
+        archive = root / f"{name}.zip"
+        if kind == "smarty-candidate-sources":
+            destination = output / "source-archives"
+        elif kind in {"smarty-release-plan", "smarty-candidate-handoff"}:
+            destination = output
+        elif kind.startswith("candidate-"):
+            continue
+        else:
+            _fail(f"producer artifact has no trusted extraction route: {name}")
+        extract_zip(archive, destination)
+
+
 def verify_downloads(root: Path, identity: dict[str, Any]) -> dict[str, Any]:
     records = {}
     for name, expected in _mapping(identity.get("artifacts"), "producer artifacts").items():
@@ -1266,6 +1285,11 @@ def cmd_download_artifacts(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_extract_producer_artifacts(args: argparse.Namespace) -> int:
+    extract_producer_artifacts(Path(args.root), Path(args.output), _load(args.identity))
+    return 0
+
+
 def cmd_verify_downloads(args: argparse.Namespace) -> int:
     return _write_output(args.output, verify_downloads(Path(args.root), _load(args.identity)))
 
@@ -1358,6 +1382,12 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--root", required=True)
     download.add_argument("--identity", required=True)
     download.set_defaults(func=cmd_download_artifacts)
+
+    producer_extract = sub.add_parser("extract-producer-artifacts")
+    producer_extract.add_argument("--root", required=True)
+    producer_extract.add_argument("--output", required=True)
+    producer_extract.add_argument("--identity", required=True)
+    producer_extract.set_defaults(func=cmd_extract_producer_artifacts)
 
     downloads = sub.add_parser("verify-downloads")
     archive_validate = sub.add_parser("validate-git-archive")

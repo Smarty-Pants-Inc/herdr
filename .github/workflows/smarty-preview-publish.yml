@@ -169,12 +169,7 @@ jobs:
           set -euo pipefail
           mkdir -p producer
           python scripts/smarty_preview_trusted.py download-artifacts --root artifact-zips --identity identity.json
-          python -I -S - <<'PY'
-          import subprocess
-          from pathlib import Path
-          for archive in sorted(Path("artifact-zips").glob("*.zip")):
-              subprocess.run(["python", "scripts/smarty_preview_trusted.py", "extract-zip", "--archive", str(archive), "--output", "producer"], check=True)
-          PY
+          python scripts/smarty_preview_trusted.py extract-producer-artifacts --root artifact-zips --output producer --identity identity.json
           python scripts/smarty_preview_trusted.py verify-downloads --root artifact-zips --identity identity.json --output download-record.json
           python scripts/smarty_preview_trusted.py validate-producer --root producer --identity identity.json --output producer-record.json
           python -I -S - <<'PY'
