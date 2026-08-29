@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -13,6 +14,51 @@ from unittest import mock
 
 import scripts.smarty_preview_trusted as trusted
 import scripts.test_preview_promotion as promotion_tests
+
+
+STRICT_YAML_TO_JSON = r'''
+require "json"
+require "psych"
+
+def convert(node)
+  case node
+  when Psych::Nodes::Mapping
+    abort "tagged or anchored mapping" unless node.anchor.nil? && node.tag.nil?
+    result = {}
+    node.children.each_slice(2) do |key, value|
+      abort "non-scalar mapping key" unless key.is_a?(Psych::Nodes::Scalar) && key.anchor.nil? && key.tag.nil?
+      abort "duplicate mapping key: #{key.value}" if result.key?(key.value)
+      result[key.value] = convert(value)
+    end
+    result
+  when Psych::Nodes::Sequence
+    abort "tagged or anchored sequence" unless node.anchor.nil? && node.tag.nil?
+    node.children.map { |child| convert(child) }
+  when Psych::Nodes::Scalar
+    abort "tagged or anchored scalar" unless node.anchor.nil? && node.tag.nil?
+    node.value
+  else
+    abort "unsupported YAML node"
+  end
+end
+
+stream = Psych.parse_stream(STDIN.read)
+abort "expected one YAML document" unless stream.children.one?
+puts JSON.generate(convert(stream.children.first.root))
+'''
+
+
+def load_workflow(path: Path) -> dict[str, object]:
+    result = subprocess.run(
+        ["ruby", "-e", STRICT_YAML_TO_JSON],
+        input=path.read_text(encoding="utf-8"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AssertionError(result.stderr.strip())
+    return json.loads(result.stdout)
 
 
 class TrustedCliTests(unittest.TestCase):
@@ -110,6 +156,61 @@ class TrustedPairAttestationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "certificate subjectAlternativeName mismatch"):
                 trusted.validate_pair_attestation(report, subject)
 
+
+class TrustedArtifactDownloadTests(unittest.TestCase):
+    def test_cross_origin_redirect_strips_github_authorization(self) -> None:
+        request = trusted.Request(
+            "https://api.github.com/repos/Smarty-Pants-Inc/herdr/actions/artifacts/42/zip",
+            headers={"Authorization": "Bearer secret", "Accept": "application/vnd.github+json"},
+        )
+        redirected = trusted._HttpsArtifactRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://productionresultssa.blob.core.windows.net/actions-results/signed",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_artifact_redirect_rejects_non_https_targets(self) -> None:
+        request = trusted.Request(
+            "https://api.github.com/repos/Smarty-Pants-Inc/herdr/actions/artifacts/42/zip",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with self.assertRaisesRegex(ValueError, "HTTPS URL"):
+            trusted._HttpsArtifactRedirectHandler().redirect_request(
+                request, None, 302, "Found", {}, "http://example.com/artifact.zip"
+            )
+
+    def test_download_rejects_foreign_initial_url_before_opening(self) -> None:
+        identity = {
+            "artifacts": {
+                "candidate-macos-x86_64-1": {
+                    "id": 42,
+                    "size_in_bytes": 1,
+                    "archive_download_url": "https://example.com/artifact.zip",
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(trusted, "build_opener") as opener:
+            with self.assertRaisesRegex(ValueError, "not canonical"):
+                trusted.download_artifacts(Path(directory), identity, "secret")
+        opener.assert_not_called()
+
+
+class TrustedWorkflowRegistrationTests(unittest.TestCase):
+    def test_producer_workflow_is_registered_on_protected_default(self) -> None:
+        workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+        producer = load_workflow(workflows / "smarty-preview.yml")
+        publisher = load_workflow(workflows / "smarty-preview-publish.yml")
+        self.assertEqual(producer["name"], "Smarty Preview")
+        self.assertEqual(producer["on"], {"push": {"tags": ["smarty-preview-*"]}})
+        self.assertEqual(
+            publisher["on"],
+            {"workflow_run": {"workflows": ["Smarty Preview"], "types": ["completed"]}},
+        )
 
 class TrustedSourceTests(unittest.TestCase):
     parent = "1" * 40
@@ -691,6 +792,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertNotIn("eval(", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
+        self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
         self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
         self.assertIn("token: ${{ github.token }}", source)
         self.assertIn('json.dumps(record["omp"]', source)

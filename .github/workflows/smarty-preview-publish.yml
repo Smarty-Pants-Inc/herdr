@@ -167,38 +167,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifact-zips producer
-          python -I -S - <<'PY'
-          import json, os
-          from pathlib import Path
-          from urllib.request import Request, urlopen
-          identity=json.load(open("identity.json"))
-          token=os.environ["GH_TOKEN"]
-          root=Path("artifact-zips")
-          max_bytes=4 * 1024 * 1024 * 1024
-          max_total_bytes=16 * 1024 * 1024 * 1024
-          declared_total=sum(record.get("size_in_bytes", 0) for record in identity["artifacts"].values())
-          if declared_total < 1 or declared_total > max_total_bytes:
-              raise SystemExit("producer artifact aggregate exceeds download limit")
-          for name, record in identity["artifacts"].items():
-              expected_size=record["size_in_bytes"]
-              if not isinstance(expected_size, int) or expected_size < 1 or expected_size > max_bytes:
-                  raise SystemExit(f"artifact size exceeds download limit: {name}")
-              request=Request(record["archive_download_url"], headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
-              path=root / f"{name}.zip"
-              total=0
-              with urlopen(request, timeout=120) as response, path.open("wb") as output:
-                  while True:
-                      chunk=response.read(min(1024 * 1024, expected_size - total + 1))
-                      if not chunk:
-                          break
-                      total += len(chunk)
-                      if total > expected_size:
-                          raise SystemExit(f"artifact download exceeds declared size: {name}")
-                      output.write(chunk)
-              if total != expected_size:
-                  raise SystemExit(f"artifact download is truncated: {name}")
-          PY
+          mkdir -p producer
+          python scripts/smarty_preview_trusted.py download-artifacts --root artifact-zips --identity identity.json
           python -I -S - <<'PY'
           import subprocess
           from pathlib import Path
