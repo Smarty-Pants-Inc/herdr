@@ -1013,6 +1013,18 @@ file: ../../../public/assets/logo.svg
         self.assertIn("Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6", source)
         self.assertIn("workspaces: candidate-source", source)
 
+    def test_release_workflows_use_available_runners(self):
+        root = Path(__file__).resolve().parents[1] / ".github/workflows"
+        for name in (
+            "build-artifacts-manual.yml",
+            "ci.yml",
+            "preview.yml",
+            "release.yml",
+            "windows-arm64.yml",
+        ):
+            source = (root / name).read_text(encoding="utf-8")
+            self.assertNotRegex(source, r"\bsmarty-(?:linux|macos|windows)", name)
+
     def test_smarty_preview_prepares_source_archive_and_windows_dependency(self):
         source = workflow_source()
         self.assertLess(
