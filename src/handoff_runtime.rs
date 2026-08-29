@@ -140,7 +140,6 @@ fn legacy_handoff_input_written() -> bool {
 /// preserve transient coordination such as in-flight requests, waits,
 /// subscriptions, client sockets, or pane-to-pane messages; clients reconnect
 /// and retry those operations after replacement.
-
 #[cfg(unix)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HandoffRuntimeState {
