@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -13,10 +14,67 @@ from unittest import mock
 
 import scripts.smarty_preview_trusted as trusted
 
+STRICT_YAML_TO_JSON = r'''
+require "json"
+require "psych"
+
+def convert(node)
+  case node
+  when Psych::Nodes::Mapping
+    abort "tagged or anchored mapping" unless node.anchor.nil? && node.tag.nil?
+    result = {}
+    node.children.each_slice(2) do |key, value|
+      abort "non-scalar mapping key" unless key.is_a?(Psych::Nodes::Scalar) && key.anchor.nil? && key.tag.nil?
+      abort "duplicate mapping key: #{key.value}" if result.key?(key.value)
+      result[key.value] = convert(value)
+    end
+    result
+  when Psych::Nodes::Sequence
+    abort "tagged or anchored sequence" unless node.anchor.nil? && node.tag.nil?
+    node.children.map { |child| convert(child) }
+  when Psych::Nodes::Scalar
+    abort "tagged or anchored scalar" unless node.anchor.nil? && node.tag.nil?
+    node.value
+  else
+    abort "unsupported YAML node"
+  end
+end
+
+stream = Psych.parse_stream(STDIN.read)
+abort "expected one YAML document" unless stream.children.one?
+puts JSON.generate(convert(stream.children.first.root))
+'''
+
+
+def load_workflow(path: Path) -> dict[str, object]:
+    result = subprocess.run(
+        ["ruby", "-e", STRICT_YAML_TO_JSON],
+        input=path.read_text(encoding="utf-8"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AssertionError(result.stderr.strip())
+    return json.loads(result.stdout)
+
 
 class TrustedCliTests(unittest.TestCase):
     def test_cli_parser_builds(self) -> None:
         self.assertIn("validate-sources", trusted.build_parser().format_help())
+
+
+class TrustedWorkflowRegistrationTests(unittest.TestCase):
+    def test_producer_workflow_is_registered_on_protected_default(self) -> None:
+        workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+        producer = load_workflow(workflows / "smarty-preview.yml")
+        publisher = load_workflow(workflows / "smarty-preview-publish.yml")
+        self.assertEqual(producer["name"], "Smarty Preview")
+        self.assertEqual(producer["on"], {"push": {"tags": ["smarty-preview-*"]}})
+        self.assertEqual(
+            publisher["on"],
+            {"workflow_run": {"workflows": ["Smarty Preview"], "types": ["completed"]}},
+        )
 
 
 class TrustedSourceTests(unittest.TestCase):
