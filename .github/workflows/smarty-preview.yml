@@ -182,23 +182,23 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            os: smarty-linux-16-core
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             asset: herdr-linux-x86_64
           - platform: linux-aarch64
-            os: smarty-linux-arm-16-core
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: herdr-linux-aarch64
           - platform: macos-x86_64
-            os: smarty-macos-intel-12-core
+            os: macos-15-intel
             target: x86_64-apple-darwin
             asset: herdr-macos-x86_64
           - platform: macos-aarch64
-            os: smarty-macos-arm-5-core
+            os: macos-14
             target: aarch64-apple-darwin
             asset: herdr-macos-aarch64
           - platform: windows-x86_64
-            os: smarty-windows-16-core
+            os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: herdr-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
