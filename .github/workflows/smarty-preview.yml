@@ -171,7 +171,7 @@ jobs:
           set -euo pipefail
           mkdir candidate-source
           tar --extract --no-same-owner --no-same-permissions --file source-archives/herdr-source.tar --directory candidate-source
-          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal --component rustfmt
           (cd candidate-source && cargo +"$RUST_TOOLCHAIN_VERSION" fmt --all -- --check)
 
   build:
