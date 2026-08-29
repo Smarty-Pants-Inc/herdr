@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -1763,8 +1763,8 @@ mod tests {
         assert_eq!(msg, decoded);
     }
     #[test]
-    fn protocol_26_hello_carries_app_renderer_capability() {
-        assert_eq!(PROTOCOL_VERSION, 26);
+    fn protocol_27_hello_carries_app_renderer_capability() {
+        assert_eq!(PROTOCOL_VERSION, 27);
         let profile = "a".repeat(43);
         let app = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
