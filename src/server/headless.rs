@@ -9397,7 +9397,7 @@ mod tests {
         let replacement_route = OmpRouteKey {
             pane_id: pane_id.clone(),
             omp_session_id: "a".into(),
-            route_generation: 1,
+            route_generation: 2,
         };
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
@@ -9412,6 +9412,15 @@ mod tests {
         server.private_omp_resolving = Some((1, old_route.clone()));
         assert!(server.reconcile_omp_renderers());
         assert_eq!(server.private_omp_pending_routes.get(&1), Some(&old_route));
+
+        assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
+            pane_id: pane_id.clone(),
+            omp_session_id: "old".into(),
+            route_generation: 1,
+            host_id: 1,
+            ready: true,
+        }));
+        assert!(!server.private_omp_pending_routes.contains_key(&1));
 
         let (_new_host, _new_messages) = start_test_omp_host(&mut server, pane_id, "a", 2);
         assert_eq!(
@@ -11199,7 +11208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_stop_reconciles_private_guest_to_started_replacement() {
+    async fn host_restart_reconciles_private_guest_to_new_generation() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-replacement");
         let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
@@ -11241,35 +11250,24 @@ mod tests {
                 .omp_session_id,
             "old"
         );
-        assert!(!server.handle_server_event(host_started(2, "replacement")));
-        assert_eq!(
-            server.clients[&1]
-                .private_omp_guest
-                .as_ref()
-                .unwrap()
-                .route()
-                .omp_session_id,
-            "old",
-            "deterministic ordering keeps the selected route while both are live"
-        );
-
         assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
-            pane_id: route,
+            pane_id: route.clone(),
             omp_session_id: "old".into(),
             route_generation: 1,
             host_id: 1,
             ready: true,
         }));
-        assert_eq!(
-            server.clients[&1]
-                .private_omp_guest
-                .as_ref()
-                .unwrap()
-                .route()
-                .omp_session_id,
-            "replacement",
-            "stopping the selected live route immediately attaches its replacement"
-        );
+        assert!(server.clients[&1].private_omp_guest.is_none());
+
+        assert!(server.handle_server_event(host_started(2, "replacement")));
+        let replacement = server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("new route generation gets a replacement private guest")
+            .route();
+        assert_eq!(replacement.omp_session_id, "replacement");
+        assert_eq!(replacement.route_generation, 2);
+        shutdown_test_runtimes(&mut server);
     }
     fn pane_updated_events(event_hub: &api::EventHub) -> usize {
         event_hub

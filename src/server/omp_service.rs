@@ -485,7 +485,7 @@ impl OmpService {
                 let attached = if external_guest_bridge {
                     self.routes.attach_observer(client_id, &key)
                 } else {
-                    self.routes.attach(client_id, &key)
+                    self.routes.attach(app_client_id, &key)
                 };
                 match attached {
                     Ok(deliveries) => {
