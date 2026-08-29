@@ -539,6 +539,7 @@ class TrustedWorkflowTests(unittest.TestCase):
     def test_workflow_uses_exact_source_handoff_and_isolates_build(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
         self.assertNotIn("eval(", source)
+        self.assertNotIn("omp-source.tar", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
         self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
@@ -547,17 +548,27 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn("token: ${{ github.token }}", source)
         self.assertIn('json.dumps(record["omp"]', source)
         trusted_source = source.split("\n  trusted-source:", 1)[1].split("\n  trusted-build:", 1)[0]
+        trusted_build = source.split("\n  trusted-build:", 1)[1].split("\n  trusted-omp-build:", 1)[0]
+        omp_build = source.split("\n  trusted-omp-build:", 1)[1].split("\n  trusted-assemble:", 1)[0]
+        assemble = source.split("\n  trusted-assemble:", 1)[1].split("\n  attest-and-seal:", 1)[0]
+        attest = source.split("\n  attest-and-seal:", 1)[1].split("\n  publish-release:", 1)[0]
         self.assertIn("needs: [validate-seal]", trusted_source)
         self.assertNotIn("trusted-build", trusted_source)
         self.assertIn("fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'", trusted_source)
         self.assertIn('git -C parent-source merge-base --is-ancestor "$PARENT" refs/remotes/origin/main', trusted_source)
-        trusted_build = source.split("\n  trusted-build:", 1)[1].split("\n  trusted-omp-build:", 1)[0]
-        omp_build = source.split("\n  trusted-omp-build:", 1)[1].split("\n  trusted-assemble:", 1)[0]
+        self.assertNotIn("tarfile.open", trusted_source)
         self.assertIn("runs-on: ${{ matrix.os }}", omp_build)
         self.assertIn("Build trusted Herdr source", trusted_build)
-        self.assertNotIn("trusted-source/omp-source.tar", trusted_build)
+        self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
         self.assertNotIn("publisher-source", trusted_build)
-        self.assertIn("Download validated OMP source handoff", omp_build)
+        self.assertIn("Download validated OMP identity handoff", omp_build)
+        for job in (omp_build, assemble, attest):
+            self.assertIn("Checkout exact private OMP source", job)
+            self.assertIn("ref: ${{ needs.trusted-source.outputs.omp_commit }}", job)
+            self.assertEqual(job.count("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}"), 1)
+            self.assertIn('git -C omp-source rev-parse HEAD^{commit}', job)
+            self.assertIn('git -C omp-source rev-parse HEAD^{tree}', job)
+        self.assertNotIn("extract-tar", omp_build)
         self.assertIn("trusted-tools/smarty_preview_trusted.py", omp_build)
         self.assertNotIn("Checkout exact Herdr source", omp_build)
         self.assertNotIn("HERDR_BUILD_OMP", omp_build)
