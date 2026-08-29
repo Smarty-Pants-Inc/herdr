@@ -714,7 +714,7 @@ pub enum ClientMessage {
         /// Server-issued launch identity for exact native sideband acceptance.
         renderer_launch_id: Option<u64>,
         /// Display-only identity for an external guest; never an App authority.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         external_peer_identity: Option<OmpExternalPeerIdentity>,
     },
 
