@@ -559,11 +559,13 @@ fn pane_omp_bridge_request_and_response_round_trip() {
             pane_id: "w1:p1".into(),
             address: "127.0.0.1:1234".into(),
             token: "opaque".into(),
+            route_generation: 7,
         },
     };
     let json = serde_json::to_value(&response).unwrap();
     assert_eq!(json["result"]["type"], "pane_omp_bridge");
     assert_eq!(json["result"]["pane_id"], "w1:p1");
+    assert_eq!(json["result"]["route_generation"], 7);
     let restored: SuccessResponse = serde_json::from_value(json).unwrap();
     assert_eq!(restored, response);
 }

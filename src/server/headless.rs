@@ -6495,6 +6495,7 @@ impl HeadlessServer {
             result: api::schema::ResponseResult::PaneOmpBridge {
                 token: bridge.token(&pane_id),
                 address: bridge.address().to_string(),
+                route_generation: self.omp_service.expected_host_generation(&pane_id),
                 pane_id,
             },
         })
@@ -9045,6 +9046,7 @@ mod tests {
             omp_session_id: "session".into(),
             route_generation: 1,
             host_id: 7,
+            ready: true,
         }));
         drop(peer);
         assert!(server.poll_omp_route_revision());
@@ -9570,6 +9572,7 @@ mod tests {
             pane_id,
             address,
             token,
+            route_generation,
         } = response.result
         else {
             panic!("expected pane OMP bridge response");
@@ -9578,6 +9581,7 @@ mod tests {
         assert_ne!(pane_id, target_pane_id);
         assert_eq!(address, server.omp_service.bridge().address());
         assert!(server.omp_service.bridge().validates(&pane_id, &token));
+        assert_eq!(route_generation, 1);
 
         for (id, requested_pane, peer_pid) in [
             ("missing-peer", source_pane_id.as_str(), None),
@@ -11254,6 +11258,7 @@ mod tests {
             omp_session_id: "old".into(),
             route_generation: 1,
             host_id: 1,
+            ready: true,
         }));
         assert_eq!(
             server.clients[&1]

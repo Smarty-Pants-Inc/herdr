@@ -36,6 +36,7 @@ pub(crate) struct OmpService {
     routes: OmpRouteRegistry,
     maintenance: Result<OmpMaintenance, OmpMaintenanceError>,
     pending_maintenance_unregisters: Vec<OmpRouteKey>,
+    pending_maintenance_aborts: Vec<OmpRouteKey>,
 }
 
 impl OmpService {
@@ -81,6 +82,7 @@ impl OmpService {
             routes: OmpRouteRegistry::default(),
             maintenance,
             pending_maintenance_unregisters: Vec::new(),
+            pending_maintenance_aborts: Vec::new(),
         })
     }
 
@@ -230,6 +232,10 @@ impl OmpService {
             .collect()
     }
 
+    pub(crate) fn expected_host_generation(&self, pane_id: &str) -> u64 {
+        self.routes.expected_host_generation(pane_id)
+    }
+
     pub(crate) fn maintenance_status(
         &self,
     ) -> Result<crate::api::schema::ServerOmpMaintenanceStatus, OmpMaintenanceError> {
@@ -274,6 +280,7 @@ impl OmpService {
         &mut self,
         clients: &HashMap<u64, ClientConnection>,
     ) -> Vec<(u64, ServerMessage)> {
+        self.retry_maintenance_aborts();
         self.retry_maintenance_unregisters();
         let local_routes = self.live_route_keys();
         if local_routes.is_empty() {
@@ -668,6 +675,14 @@ impl OmpService {
                 socket,
                 admission,
             } => {
+                self.retry_maintenance_aborts();
+                if !self.pending_maintenance_aborts.is_empty() {
+                    let _ = admission.send(OmpHostAdmission::Rejected {
+                        code: OmpRouteError::RouteBusy.code().to_owned(),
+                        message: "OMP route cleanup is still pending".into(),
+                    });
+                    return messages;
+                }
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     tracing::warn!("rejected oversized OMP host route identifier");
                     let _ = admission.send(OmpHostAdmission::Rejected {
@@ -704,6 +719,8 @@ impl OmpService {
                         let deliveries = self.routes.commit_host_start(key.clone());
                         self.pending_maintenance_unregisters
                             .retain(|pending| pending != &key);
+                        self.pending_maintenance_aborts
+                            .retain(|pending| pending != &key);
                         self.replace_host(route_key, host_id, outbound, socket);
                         if admission
                             .send(OmpHostAdmission::Accepted {
@@ -711,11 +728,12 @@ impl OmpService {
                             })
                             .is_err()
                         {
-                            self.remove_host(&key);
-                            if let Ok(deliveries) = self.routes.host_stopped(&key) {
-                                self.deliver(&key, deliveries, &mut messages, clients);
-                                self.routes.remove_if_inactive_and_empty(&key);
-                            }
+                            self.abort_host_admission(
+                                &key,
+                                announced_key.route_generation,
+                                &mut messages,
+                                clients,
+                            );
                             return messages;
                         }
                         if self.sync_authority(&key, &deliveries, &mut messages, clients) {
@@ -815,6 +833,7 @@ impl OmpService {
                 omp_session_id,
                 route_generation,
                 host_id,
+                ready,
             } => {
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     return messages;
@@ -822,14 +841,11 @@ impl OmpService {
                 let Some(key) = self.canonical_host_key(host_id) else {
                     return messages;
                 };
-                if key.route_generation != route_generation {
-                    tracing::debug!(
-                        host_id,
-                        announced_route_generation = route_generation,
-                        canonical_route_generation = key.route_generation,
-                        "resolved OMP host stop to its canonical route generation"
-                    );
+                if !ready {
+                    self.abort_host_admission(&key, route_generation, &mut messages, clients);
+                    return messages;
                 }
+                debug_assert_eq!(key.route_generation, route_generation);
                 self.remove_host(&key);
                 if let Ok(deliveries) = self.routes.host_stopped(&key) {
                     self.deliver(&key, deliveries, &mut messages, clients);
@@ -1196,6 +1212,40 @@ impl OmpService {
         }
     }
 
+    fn abort_host_admission(
+        &mut self,
+        key: &OmpRouteKey,
+        announced_generation: u64,
+        messages: &mut Vec<(u64, ServerMessage)>,
+        clients: &HashMap<u64, ClientConnection>,
+    ) {
+        self.remove_host_connection(key);
+        let deliveries = match self.routes.abort_host_start(key, announced_generation) {
+            Ok(deliveries) => deliveries,
+            Err(error) => {
+                tracing::warn!(
+                    pane_id = %key.pane_id,
+                    omp_session_id = %key.omp_session_id,
+                    route_generation = key.route_generation,
+                    code = error.code(),
+                    "failed to abort OMP host admission"
+                );
+                if let Ok(deliveries) = self.routes.host_stopped(key) {
+                    self.unregister_maintenance_route(
+                        key,
+                        "failed to unregister aborted OMP route",
+                    );
+                    self.deliver(key, deliveries, messages, clients);
+                    self.routes.remove_if_inactive_and_empty(key);
+                }
+                return;
+            }
+        };
+        self.abort_maintenance_route(key, "failed to persist aborted OMP route cleanup");
+        self.deliver(key, deliveries, messages, clients);
+        self.routes.remove_if_inactive_and_empty(key);
+    }
+
     fn canonical_host_key(&self, host_id: u64) -> Option<OmpRouteKey> {
         self.hosts.iter().find_map(
             |((pane_id, omp_session_id, route_generation), (current_host_id, _, _))| {
@@ -1220,7 +1270,7 @@ impl OmpService {
         }
     }
 
-    fn remove_host(&mut self, key: &OmpRouteKey) {
+    fn remove_host_connection(&mut self, key: &OmpRouteKey) {
         if let Some((_, _, socket)) = self.hosts.remove(&(
             key.pane_id.clone(),
             key.omp_session_id.clone(),
@@ -1228,7 +1278,37 @@ impl OmpService {
         )) {
             let _ = socket.shutdown(Shutdown::Both);
         }
+    }
+
+    fn remove_host(&mut self, key: &OmpRouteKey) {
+        self.remove_host_connection(key);
         self.unregister_maintenance_route(key, "failed to unregister closed OMP route");
+    }
+
+    fn abort_maintenance_route(&mut self, key: &OmpRouteKey, message: &'static str) {
+        let Ok(maintenance) = self.maintenance.as_ref() else {
+            return;
+        };
+        match maintenance.abort_route_admission(key) {
+            Ok(()) => {
+                self.pending_maintenance_aborts
+                    .retain(|pending| pending != key);
+            }
+            Err(error) => {
+                if !self
+                    .pending_maintenance_aborts
+                    .iter()
+                    .any(|pending| pending == key)
+                {
+                    self.pending_maintenance_aborts.push(key.clone());
+                }
+                tracing::warn!(
+                    code = error.code(),
+                    message = %error.message(),
+                    "{message}"
+                );
+            }
+        }
     }
 
     fn unregister_maintenance_route(&mut self, key: &OmpRouteKey, message: &'static str) {
@@ -1266,6 +1346,16 @@ impl OmpService {
             );
         }
     }
+
+    fn retry_maintenance_aborts(&mut self) {
+        let pending = std::mem::take(&mut self.pending_maintenance_aborts);
+        for key in pending {
+            self.abort_maintenance_route(
+                &key,
+                "failed to retry aborted OMP maintenance route cleanup",
+            );
+        }
+    }
 }
 
 impl Drop for OmpService {
@@ -1283,8 +1373,11 @@ impl Drop for OmpService {
                 "failed to unregister OMP route while stopping service",
             );
         }
+        self.retry_maintenance_aborts();
         self.retry_maintenance_unregisters();
-        if self.pending_maintenance_unregisters.is_empty() {
+        if self.pending_maintenance_aborts.is_empty()
+            && self.pending_maintenance_unregisters.is_empty()
+        {
             if let Ok(maintenance) = self.maintenance.as_mut() {
                 maintenance.retire_instance();
             }
@@ -1362,6 +1455,7 @@ mod tests {
                 omp_session_id: omp_session_id.into(),
                 route_generation,
                 host_id,
+                ready: true,
             },
             false,
             &HashMap::new(),
@@ -1455,7 +1549,7 @@ mod tests {
     fn late_replacement_acceptance_cleans_canonical_route_and_allows_retry() {
         let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
         let mut service =
-            OmpService::with_test_maintenance(None, "default", store).expect("service");
+            OmpService::with_test_maintenance(None, "default", store.clone()).expect("service");
         let (first_peer, first_admitted) = start_host(&mut service, "pane", "session", 1, 1);
         assert!(matches!(
             admission(first_admitted),
@@ -1501,30 +1595,40 @@ mod tests {
                 route_generation: 2,
             }]
         );
+        store.fail_next_state_accesses(2);
         service.handle_event(
             ServerEvent::OmpHostStopped {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
                 route_generation: 1,
                 host_id: 2,
+                ready: false,
             },
             false,
             &HashMap::new(),
         );
 
         assert!(service.live_route_keys().is_empty());
-        assert_eq!(service.maintenance_status().unwrap().route_count, 0);
+        let (blocked_peer, blocked) = start_host(&mut service, "pane", "session", 1, 3);
+        assert!(matches!(
+            admission(blocked),
+            OmpHostAdmission::Rejected { code, .. } if code == "route_busy"
+        ));
 
-        let (retry_peer, retry_admitted) = start_host(&mut service, "pane", "session", 2, 3);
+        let (retry_peer, retry_admitted) = start_host(&mut service, "pane", "session", 1, 4);
         assert!(matches!(
             admission(retry_admitted),
             OmpHostAdmission::Accepted {
-                route_generation: 3
+                route_generation: 2
             }
         ));
-        stop_host(&mut service, "pane", "session", 3, 3);
+        assert_eq!(
+            service.maintenance_status().unwrap().routes[0].route_generation,
+            2
+        );
+        stop_host(&mut service, "pane", "session", 2, 4);
         assert_eq!(service.maintenance_status().unwrap().route_count, 0);
-        drop((peer, retry_peer));
+        drop((peer, blocked_peer, retry_peer));
     }
 
     #[test]
@@ -1869,6 +1973,7 @@ mod tests {
                 omp_session_id: key.omp_session_id.clone(),
                 route_generation: key.route_generation,
                 host_id: 1,
+                ready: true,
             },
             false,
             &HashMap::new(),

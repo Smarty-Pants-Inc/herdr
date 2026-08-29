@@ -9593,6 +9593,11 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "route_generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "token": {
                   "type": "string"
                 },
@@ -9605,7 +9610,8 @@
                 "type",
                 "pane_id",
                 "address",
-                "token"
+                "token",
+                "route_generation"
               ],
               "type": "object"
             },

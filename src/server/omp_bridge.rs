@@ -177,6 +177,7 @@ fn spawn_host(
             );
             return;
         };
+        let announced_generation = route_generation;
         if !bridge.validates(&pane_id, &token) {
             tracing::warn!(pane_id, "rejected unauthenticated OMP bridge host");
             write_host_error(
@@ -256,8 +257,9 @@ fn spawn_host(
                         &event_tx,
                         &pane_id,
                         &omp_session_id,
-                        route_generation,
+                        announced_generation,
                         host_id,
+                        false,
                     );
                     return;
                 }
@@ -268,8 +270,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -283,8 +286,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -298,8 +302,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -361,6 +366,7 @@ fn spawn_host(
             &omp_session_id,
             route_generation,
             host_id,
+            true,
         );
     });
 }
@@ -371,12 +377,14 @@ fn notify_host_stopped(
     omp_session_id: &str,
     route_generation: u64,
     host_id: u64,
+    ready: bool,
 ) {
     let _ = event_tx.blocking_send(ServerEvent::OmpHostStopped {
         pane_id: pane_id.to_owned(),
         omp_session_id: omp_session_id.to_owned(),
         route_generation,
         host_id,
+        ready,
     });
 }
 

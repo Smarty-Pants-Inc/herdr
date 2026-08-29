@@ -147,6 +147,7 @@ pub enum ResponseResult {
         pane_id: String,
         address: String,
         token: String,
+        route_generation: u64,
     },
     LayoutExport {
         layout: LayoutDescription,

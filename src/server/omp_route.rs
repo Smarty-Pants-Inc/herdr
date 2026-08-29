@@ -133,6 +133,13 @@ pub(crate) struct OmpRouteRegistry {
     route_generations: HashMap<String, u64>,
 }
 impl OmpRouteRegistry {
+    pub(crate) fn expected_host_generation(&self, pane_id: &str) -> u64 {
+        self.route_generations
+            .get(pane_id)
+            .copied()
+            .unwrap_or(INITIAL_ROUTE_GENERATION)
+    }
+
     /// Validates an expected-current host claim and returns the server-assigned key.
     /// The announcement never chooses the next generation.
     pub(crate) fn prepare_host_start(
@@ -182,6 +189,38 @@ impl OmpRouteRegistry {
         );
         self.route_generations.insert(pane_id, key.route_generation);
         Vec::new()
+    }
+
+    pub(crate) fn abort_host_start(
+        &mut self,
+        key: &OmpRouteKey,
+        announced_generation: u64,
+    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        let previous_generation = if key.route_generation == INITIAL_ROUTE_GENERATION
+            && announced_generation == INITIAL_ROUTE_GENERATION
+        {
+            None
+        } else if announced_generation.checked_add(1) == Some(key.route_generation) {
+            Some(announced_generation)
+        } else {
+            return Err(OmpRouteError::StaleGeneration);
+        };
+        if self.route_generations.get(&key.pane_id).copied() != Some(key.route_generation) {
+            return Err(OmpRouteError::StaleGeneration);
+        }
+        self.route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)?
+            .require_live()?;
+        let deliveries = self.host_stopped(key)?;
+        match previous_generation {
+            Some(generation) => {
+                self.route_generations
+                    .insert(key.pane_id.clone(), generation);
+            }
+            None => {
+                self.route_generations.remove(&key.pane_id);
+            }
+        }
+        Ok(deliveries)
     }
 
     pub(crate) fn host_started(

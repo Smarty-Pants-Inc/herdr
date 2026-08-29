@@ -3,7 +3,6 @@
 //! The JSON API owns this state. OMP hosts only consult it at the existing
 //! admission boundary, and live handoff only carries the active lease proof.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -319,6 +318,7 @@ pub(crate) struct OmpMaintenance {
     session: String,
     backend: Backend,
     instance: ServerInstance,
+    state_commit_uncertain: Cell<bool>,
     #[cfg(test)]
     post_replace_sync_failures: Cell<usize>,
 }
@@ -351,6 +351,7 @@ impl OmpMaintenance {
                 instance_dir,
             },
             instance,
+            state_commit_uncertain: Cell::new(false),
             #[cfg(test)]
             post_replace_sync_failures: Cell::new(0),
         })
@@ -362,6 +363,7 @@ impl OmpMaintenance {
             session: session.to_owned(),
             backend: Backend::Memory(TestBackend { store: store.0 }),
             instance: ServerInstance::memory(),
+            state_commit_uncertain: Cell::new(false),
             post_replace_sync_failures: Cell::new(0),
         }
     }
@@ -382,12 +384,17 @@ impl OmpMaintenance {
             let remaining = self.post_replace_sync_failures.get();
             if remaining != 0 {
                 self.post_replace_sync_failures.set(remaining - 1);
+                self.state_commit_uncertain.set(true);
                 return Err(io::Error::other(
                     "injected OMP maintenance post-replace sync failure",
                 ));
             }
         }
-        sync_parent_directory(directory)
+        let result = sync_parent_directory(directory);
+        if result.is_err() {
+            self.state_commit_uncertain.set(true);
+        }
+        result
     }
 
     pub(crate) fn status(&self) -> Result<ServerOmpMaintenanceStatus, OmpMaintenanceError> {
@@ -613,6 +620,34 @@ impl OmpMaintenance {
         })
         .map_err(OmpMaintenanceAdmissionError::State)?
     }
+
+    pub(crate) fn abort_route_admission(
+        &self,
+        key: &OmpRouteKey,
+    ) -> Result<(), OmpMaintenanceError> {
+        self.with_state(|state, dirty| {
+            let Some(index) = state
+                .routes
+                .iter()
+                .position(|route| route.matches(&self.instance.id, &self.session, key))
+            else {
+                return;
+            };
+            let route = state.routes.remove(index);
+            if route.proof {
+                if let Some(lease) = state.lease.as_mut() {
+                    debug_assert!(lease.permit.is_none());
+                    lease.permit = Some(ServerOmpMaintenancePermit {
+                        session: route.session,
+                        pane_id: route.pane_id,
+                    });
+                }
+            }
+            state.route_revision = state.route_revision.saturating_add(1);
+            *dirty = true;
+        })
+    }
+
     pub(crate) fn unregister_route(&self, key: &OmpRouteKey) -> Result<(), OmpMaintenanceError> {
         #[cfg(test)]
         if let Backend::Memory(backend) = &self.backend {
@@ -706,6 +741,13 @@ impl OmpMaintenance {
     }
 
     pub(crate) fn retire_instance(&mut self) {
+        if self.state_commit_uncertain.get() {
+            tracing::warn!(
+                instance_id = %self.instance.id,
+                "retaining OMP maintenance server-instance identity after uncertain state commit"
+            );
+            return;
+        }
         self.instance.retire();
     }
 
@@ -1091,9 +1133,20 @@ fn reconcile_stale_routes(
     if stale.is_empty() {
         return Ok(false);
     }
+    let restored_permit = state
+        .routes
+        .iter()
+        .find(|route| route.proof && stale.contains(&route.server_instance_id))
+        .map(|route| ServerOmpMaintenancePermit {
+            session: route.session.clone(),
+            pane_id: route.pane_id.clone(),
+        });
     state
         .routes
         .retain(|route| !stale.contains(&route.server_instance_id));
+    if let (Some(lease), Some(permit)) = (state.lease.as_mut(), restored_permit) {
+        lease.permit = Some(permit);
+    }
     state.route_revision = state.route_revision.saturating_add(1);
     Ok(true)
 }
@@ -1179,16 +1232,7 @@ fn save_state_with_hooks(
     replace_state_file(temporary.path(), path)
         .map_err(|error| state_io(path, "replace state", error))?;
     temporary.persist();
-    // The rename is the commit point. Returning an error now would let callers reject state
-    // that is already visible, stranding its route and server-instance identity.
-    if let Err(error) = sync_parent(parent) {
-        tracing::warn!(
-            path = %path.display(),
-            %error,
-            "OMP maintenance state committed but parent directory sync failed"
-        );
-    }
-    Ok(())
+    sync_parent(parent).map_err(|error| state_io(parent, "sync state directory", error))
 }
 
 struct TemporaryStateFile {
@@ -2277,37 +2321,35 @@ mod tests {
             route_generation: 2,
             ..announced.clone()
         };
-        let host = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let mut host = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
 
         host.acquire(&owner).unwrap();
         host.grant_permit(&owner, "default", &announced.pane_id)
             .unwrap();
         host.fail_next_post_replace_syncs(1);
 
-        assert_eq!(
+        assert!(matches!(
             host.admit_replacement(&announced, || {
                 Ok::<_, ()>((replacement.clone(), replacement.route_generation))
-            })
-            .unwrap(),
-            replacement.route_generation
-        );
-        let committed = host.status().unwrap();
-        assert!(committed.held);
-        assert!(committed.permit.is_none());
-        assert_eq!(committed.route_revision, 1);
-        assert_eq!(committed.route_count, 1);
-        assert!(committed.routes[0].proof);
-        assert_eq!(
-            committed.routes[0].route_generation,
-            replacement.route_generation
-        );
-
+            }),
+            Err(OmpMaintenanceAdmissionError::State(
+                OmpMaintenanceError::StateIo(_)
+            ))
+        ));
+        host.retire_instance();
         drop(host);
         let reopened = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
         let reconciled = reopened.status().unwrap();
         assert!(reconciled.held);
         assert_eq!(reconciled.route_count, 0);
         assert_eq!(reconciled.route_revision, 2);
+        assert_eq!(
+            reconciled.permit,
+            Some(ServerOmpMaintenancePermit {
+                session: "default".into(),
+                pane_id: announced.pane_id.clone(),
+            })
+        );
         assert!(!reopened.release(&owner).unwrap().held);
 
         let retry = route("w2:p1");
