@@ -106,6 +106,36 @@ class TrustedArtifactDownloadTests(unittest.TestCase):
                 trusted.download_artifacts(Path(directory), identity, "secret")
         opener.assert_not_called()
 
+    def test_producer_artifacts_reconstruct_download_action_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archives = root / "archives"
+            output = root / "producer"
+            archives.mkdir()
+            fixtures = {
+                "smarty-release-plan-2": {"producer-plan.json": b"plan"},
+                "smarty-candidate-sources-2": {
+                    "herdr-source.tar": b"source",
+                    "omp-descriptor.json": b"descriptor",
+                },
+                "smarty-candidate-handoff-2": {
+                    "candidate-artifacts/herdr-linux-x86_64": b"handoff",
+                    "producer-handoff.json": b"handoff-record",
+                },
+                "candidate-linux-x86_64-2": {"herdr-linux-x86_64": b"raw"},
+            }
+            for name, members in fixtures.items():
+                with zipfile.ZipFile(archives / f"{name}.zip", "w") as archive:
+                    for member, payload in members.items():
+                        archive.writestr(member, payload)
+            identity = {"artifacts": {name: {} for name in fixtures}}
+            trusted.extract_producer_artifacts(archives, output, identity)
+            self.assertEqual((output / "producer-plan.json").read_bytes(), b"plan")
+            self.assertEqual((output / "source-archives/herdr-source.tar").read_bytes(), b"source")
+            self.assertEqual((output / "source-archives/omp-descriptor.json").read_bytes(), b"descriptor")
+            self.assertEqual((output / "candidate-artifacts/herdr-linux-x86_64").read_bytes(), b"handoff")
+            self.assertFalse((output / "herdr-linux-x86_64").exists())
+
 
 class TrustedWorkflowRegistrationTests(unittest.TestCase):
     def test_producer_workflow_is_registered_on_protected_default(self) -> None:
@@ -512,6 +542,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
         self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
+        self.assertIn("extract-producer-artifacts --root artifact-zips --output producer --identity identity.json", source)
         self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
         self.assertIn("token: ${{ github.token }}", source)
         self.assertIn('Path("trusted-source-record.json")', source)
