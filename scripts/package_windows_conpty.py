@@ -203,7 +203,13 @@ def archive_bundle(
 ) -> None:
     validate_stage(metadata_path, architecture, stage_dir)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    with zipfile.ZipFile(
+        output_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+        strict_timestamps=False,
+    ) as archive:
         for path in sorted(stage_dir.rglob("*")):
             if path.is_file():
                 archive.write(path, path.relative_to(stage_dir).as_posix())

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -121,6 +122,7 @@ class WindowsConptyPackageTests(unittest.TestCase):
             stage = root / "stage"
             package.stage_bundle(metadata_path, "x86_64", nupkg, herdr, stage)
             package.validate_stage(metadata_path, "x86_64", stage)
+            os.utime(stage / "herdr.exe", (0, 0))
 
             output = root / "herdr.zip"
             package.archive_bundle(metadata_path, "x86_64", stage, output)

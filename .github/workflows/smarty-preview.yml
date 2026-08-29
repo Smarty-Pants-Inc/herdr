@@ -233,7 +233,6 @@ jobs:
           workspaces: candidate-source
           key: smarty-preview-${{ matrix.target }}
       - name: Install Zig
-        if: runner.os == 'Linux'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
