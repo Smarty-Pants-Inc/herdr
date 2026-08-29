@@ -64,6 +64,49 @@ class TrustedCliTests(unittest.TestCase):
         self.assertIn("validate-sources", trusted.build_parser().format_help())
 
 
+class TrustedArtifactDownloadTests(unittest.TestCase):
+    def test_cross_origin_redirect_strips_github_authorization(self) -> None:
+        request = trusted.Request(
+            "https://api.github.com/repos/Smarty-Pants-Inc/herdr/actions/artifacts/42/zip",
+            headers={"Authorization": "Bearer secret", "Accept": "application/vnd.github+json"},
+        )
+        redirected = trusted._HttpsArtifactRedirectHandler().redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://productionresultssa.blob.core.windows.net/actions-results/signed",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_artifact_redirect_rejects_non_https_targets(self) -> None:
+        request = trusted.Request(
+            "https://api.github.com/repos/Smarty-Pants-Inc/herdr/actions/artifacts/42/zip",
+            headers={"Authorization": "Bearer secret"},
+        )
+        with self.assertRaisesRegex(ValueError, "HTTPS URL"):
+            trusted._HttpsArtifactRedirectHandler().redirect_request(
+                request, None, 302, "Found", {}, "http://example.com/artifact.zip"
+            )
+
+    def test_download_rejects_foreign_initial_url_before_opening(self) -> None:
+        identity = {
+            "artifacts": {
+                "candidate-macos-x86_64-1": {
+                    "id": 42,
+                    "size_in_bytes": 1,
+                    "archive_download_url": "https://example.com/artifact.zip",
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(trusted, "build_opener") as opener:
+            with self.assertRaisesRegex(ValueError, "not canonical"):
+                trusted.download_artifacts(Path(directory), identity, "secret")
+        opener.assert_not_called()
+
+
 class TrustedWorkflowRegistrationTests(unittest.TestCase):
     def test_producer_workflow_is_registered_on_protected_default(self) -> None:
         workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
@@ -468,6 +511,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertNotIn("eval(", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
+        self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
         self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
         self.assertIn("token: ${{ github.token }}", source)
         self.assertIn('Path("trusted-source-record.json")', source)
