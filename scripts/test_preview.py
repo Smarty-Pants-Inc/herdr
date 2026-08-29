@@ -997,14 +997,19 @@ file: ../../../public/assets/logo.svg
         self.assertIn("candidate-*-${{ needs.preflight.outputs.artifact_attempt }}", source)
         self.assertIn("source-archives/herdr-source.tar", source)
         self.assertNotIn("scripts/smarty_preview_trusted.py", source)
-        for pool in (
-            "smarty-linux-16-core",
-            "smarty-linux-arm-16-core",
-            "smarty-macos-intel-12-core",
-            "smarty-macos-arm-5-core",
-            "smarty-windows-16-core",
-        ):
-            self.assertIn(pool, source)
+        build = jobs["build"]
+        self.assertEqual(
+            tuple(re.findall(r"^            os: (.+)$", build, flags=re.MULTILINE)),
+            (
+                "ubuntu-22.04",
+                "ubuntu-24.04-arm",
+                "macos-15-intel",
+                "macos-14",
+                "windows-latest",
+            ),
+        )
+        self.assertNotIn("if: runner.os == 'Linux'", build)
+        self.assertLess(build.index("- name: Install Zig"), build.index("- name: Build candidate Herdr"))
         self.assertIn("Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6", source)
         self.assertIn("workspaces: candidate-source", source)
 
