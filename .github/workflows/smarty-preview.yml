@@ -205,7 +205,6 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       ASSET: ${{ matrix.asset }}
-      RUST_TOOLCHAIN_VERSION: ${{ env.RUST_TOOLCHAIN_VERSION }}
     steps:
       - name: Install Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
