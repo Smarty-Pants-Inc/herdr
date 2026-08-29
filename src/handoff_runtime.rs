@@ -136,6 +136,11 @@ fn detect_agent_state(state: crate::api::schema::PaneAgentState) -> crate::detec
 /// subscriptions, client sockets, or pane-to-pane messages; clients reconnect
 /// and retry those operations after replacement.
 #[cfg(unix)]
+fn legacy_handoff_input_written() -> bool {
+    true
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HandoffRuntimeState {
     pub pane_id: u32,
@@ -146,6 +151,8 @@ pub(crate) struct HandoffRuntimeState {
     pub cell_height_px: u32,
     #[serde(default)]
     pub remote_execution_ready: bool,
+    #[serde(default = "legacy_handoff_input_written")]
+    pub input_written: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_hostname: Option<String>,
     #[serde(default)]
@@ -204,6 +211,7 @@ mod tests {
         }"#;
         let older: HandoffRuntimeState = serde_json::from_str(older).unwrap();
         assert!(!older.remote_execution_ready);
+        assert!(older.input_written);
         assert_eq!(older.remote_hostname, None);
         assert!(older.pending_agent_resume_plan.is_none());
         assert!(older.pending_agent_resume_attempt_pid.is_none());
@@ -218,6 +226,7 @@ mod tests {
             "cell_width_px": 0,
             "cell_height_px": 0,
             "remote_execution_ready": true,
+            "input_written": true,
             "remote_hostname": "actual-node",
             "pending_agent_resume_plan": {
                 "agent": "codex",
@@ -231,6 +240,7 @@ mod tests {
         let current: HandoffRuntimeState = serde_json::from_value(current).unwrap();
         let encoded = serde_json::to_value(current).unwrap();
         assert_eq!(encoded["remote_execution_ready"], true);
+        assert_eq!(encoded["input_written"], true);
         assert_eq!(encoded["remote_hostname"], "actual-node");
         assert_eq!(encoded["pending_agent_resume_plan"]["agent"], "codex");
         assert_eq!(encoded["pending_agent_resume_attempt_pid"], 42);

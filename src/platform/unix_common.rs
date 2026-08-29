@@ -171,30 +171,42 @@ pub(crate) fn status_commands_supported() -> bool {
     true
 }
 
-pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+pub(crate) fn configure_process_tree_command(process: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
     process.process_group(0);
 }
 
-pub(crate) struct StatusCommandGuard {
+pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+    configure_process_tree_command(process);
+}
+
+pub(crate) struct ProcessTreeGuard {
     process_group_id: Option<i32>,
 }
 
-impl StatusCommandGuard {
-    pub(crate) fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
-        let process_id = child
-            .id()
-            .ok_or_else(|| std::io::Error::other("status command has no process id"))?;
+pub(crate) type StatusCommandGuard = ProcessTreeGuard;
+
+impl ProcessTreeGuard {
+    fn for_process_id(process_id: u32, subject: &str) -> std::io::Result<Self> {
         let process_group_id = i32::try_from(process_id)
-            .map_err(|_| std::io::Error::other("status command process id exceeds i32"))?;
+            .map_err(|_| std::io::Error::other(format!("{subject} process id exceeds i32")))?;
         Ok(Self {
             process_group_id: Some(process_group_id),
         })
     }
-}
 
-impl StatusCommandGuard {
+    pub(crate) fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
+        let process_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("status command has no process id"))?;
+        Self::for_process_id(process_id, "status command")
+    }
+
+    pub(crate) fn new_std(child: &std::process::Child) -> std::io::Result<Self> {
+        Self::for_process_id(child.id(), "child process")
+    }
+
     pub(crate) fn terminate(&mut self) {
         if let Some(process_group_id) = self.process_group_id.take() {
             // The command was spawned as this process group's leader. Killing the
@@ -206,7 +218,7 @@ impl StatusCommandGuard {
     }
 }
 
-impl Drop for StatusCommandGuard {
+impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
         self.terminate();
     }

@@ -1489,6 +1489,7 @@ pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
+    input_written: Arc<AtomicBool>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -2257,6 +2258,10 @@ impl PaneRuntime {
     pub fn remote_execution_ready(&self) -> bool {
         self.remote_execution_ready.load(Ordering::Acquire)
     }
+
+    pub fn input_written(&self) -> bool {
+        self.input_written.load(Ordering::Acquire)
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn set_remote_execution_ready_for_test(&self, ready: bool) {
         self.remote_execution_ready.store(ready, Ordering::Release);
@@ -2277,6 +2282,7 @@ impl PaneRuntime {
             cell_width_px,
             cell_height_px,
             remote_execution_ready: self.remote_execution_ready.load(Ordering::Acquire),
+            input_written: self.input_written.load(Ordering::Acquire),
             remote_hostname: self
                 .remote_hostname
                 .lock()
@@ -2645,6 +2651,7 @@ impl PaneRuntime {
             cell_width_px,
             cell_height_px,
             remote_execution_ready: handoff_remote_execution_ready,
+            input_written: handoff_input_written,
             remote_hostname: handoff_remote_hostname,
             remote_exec_ready_filter,
             keyboard_protocol_flags,
@@ -2694,6 +2701,7 @@ impl PaneRuntime {
         terminal.seed_remote_exec_ready_filter(remote_exec_ready_filter);
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
+        let input_written = Arc::new(AtomicBool::new(handoff_input_written));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -2808,6 +2816,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_written,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2883,6 +2892,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let remote_execution_ready = Arc::new(AtomicBool::new(execution_target.is_local()));
+        let input_written = Arc::new(AtomicBool::new(false));
         let remote_hostname = Arc::new(Mutex::new(None));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -3529,6 +3539,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_written,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -3884,14 +3895,23 @@ impl PaneRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.io.send_bytes(bytes).await
+        let result = self.io.send_bytes(bytes).await;
+        if result.is_ok() {
+            self.input_written.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        let result = self.io.try_send_bytes(bytes);
+        if result.is_ok() {
+            self.input_written.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        self.input_written.store(true, Ordering::Release);
         self.io.send_bytes_after(bytes, delay);
     }
 
@@ -4123,6 +4143,7 @@ impl PaneRuntime {
                     sender: tx,
                     resize_tx,
                 },
+                input_written: Arc::new(AtomicBool::new(false)),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
@@ -4167,6 +4188,7 @@ mod tests {
             cell_width_px: 0,
             cell_height_px: 0,
             remote_execution_ready,
+            input_written: false,
             remote_hostname: remote_hostname.map(str::to_owned),
             remote_exec_ready_filter: RemoteExecReadyFilter::default(),
             pending_agent_resume_plan: None,
@@ -5165,6 +5187,18 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn handoff_runtime_state_preserves_written_input() {
+        let (runtime, _input) = PaneRuntime::test_with_channel(80, 24);
+        assert!(!runtime.input_written());
+
+        runtime.try_send_bytes(Bytes::from_static(b"x")).unwrap();
+
+        assert!(runtime.input_written());
+        assert!(runtime.handoff_runtime_state(12).input_written);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn handoff_runtime_state_captures_remote_execution_confirmation() {
         let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
         runtime
@@ -5485,6 +5519,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -5525,6 +5560,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),

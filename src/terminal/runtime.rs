@@ -55,6 +55,10 @@ impl TerminalRuntime {
         self.0.set_remote_execution_ready_for_test(ready);
     }
 
+    pub fn input_written(&self) -> bool {
+        self.0.input_written()
+    }
+
     #[cfg(unix)]
     pub fn handoff_runtime_state(
         &self,

@@ -12,6 +12,90 @@ const PLUGIN_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
 
+const PLUGIN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+pub(crate) struct PluginCommandRuntime {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PluginCommandRuntime {
+    fn new(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            cancelled,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for PluginCommandRuntime {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_plugin_command(
+    mut command: std::process::Command,
+) -> std::io::Result<(std::process::Child, crate::platform::ProcessTreeGuard)> {
+    crate::platform::configure_process_tree_command(&mut command);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    match crate::platform::ProcessTreeGuard::new_std(&child) {
+        Ok(process_tree) => Ok((child, process_tree)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+fn terminate_plugin_child(
+    child: &mut std::process::Child,
+    process_tree: &mut crate::platform::ProcessTreeGuard,
+) {
+    process_tree.terminate();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                let _ = child.kill();
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL);
+    }
+}
+
+fn publish_plugin_command_finished(
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut event: crate::events::AppEvent,
+) {
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                event = returned;
+                std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+}
+
 impl App {
     pub(super) fn start_plugin_command(
         &mut self,
@@ -123,7 +207,10 @@ impl App {
         let plugin_id = plugin.plugin_id.clone();
         let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
+        let runtime_log_id = log_id.clone();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = std::thread::spawn(move || {
             let (child, remote_request_channel) = match execution_target {
                 crate::execution::ExecutionTarget::Local => match local_command {
                     Some((program, args)) => {
@@ -134,13 +221,7 @@ impl App {
                         );
                         command.env_remove("HERDR_VIEW_ID");
                         apply_plugin_runtime_env(&mut command, env);
-                        (
-                            command
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn(),
-                            None,
-                        )
+                        (spawn_plugin_command(command), None)
                     }
                     None => (
                         Err(std::io::Error::new(
@@ -163,12 +244,8 @@ impl App {
                         },
                         env,
                     ) {
-                        Ok(mut prepared) => (
-                            prepared
-                                .command
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn(),
+                        Ok(prepared) => (
+                            spawn_plugin_command(prepared.command),
                             Some(prepared.request_channel),
                         ),
                         Err(err) => (Err(err), None),
@@ -188,20 +265,13 @@ impl App {
                         crate::execution::RemoteCommand::Argv { argv: command },
                         env,
                     ) {
-                        Ok(mut prepared) => (
-                            prepared
-                                .command
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn(),
-                            None,
-                        ),
+                        Ok(prepared) => (spawn_plugin_command(prepared.command), None),
                         Err(err) => (Err(err), None),
                     }
                 }
             };
             let finished = match child {
-                Ok(mut child) => {
+                Ok((mut child, mut process_tree)) => {
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let stdout_reader = stdout.map(|stdout| {
@@ -214,38 +284,53 @@ impl App {
                             read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
                         })
                     });
-                    let status = {
+                    let mut remote_request_channel = remote_request_channel;
+                    #[cfg(unix)]
+                    let mut request_delivered = remote_request_channel.is_none();
+                    let status = loop {
+                        if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            if let Some(channel) = remote_request_channel.take() {
+                                channel.cancel();
+                            }
+                            terminate_plugin_child(&mut child, &mut process_tree);
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "plugin command cancelled",
+                            ));
+                        }
                         #[cfg(unix)]
-                        {
-                            if let Some(channel) = remote_request_channel {
-                                loop {
-                                    match channel.delivery_status() {
-                                        crate::execution::RemoteRequestDelivery::Delivered => {
-                                            break child.wait()
-                                        }
-                                        crate::execution::RemoteRequestDelivery::Failed(err) => {
-                                            let _ = child.kill();
-                                            let _ = child.wait();
-                                            break Err(std::io::Error::other(err));
-                                        }
-                                        crate::execution::RemoteRequestDelivery::Pending => {}
-                                    }
-                                    match child.try_wait() {
-                                        Ok(Some(status)) => break Ok(status),
-                                        Ok(None) => {
-                                            std::thread::sleep(std::time::Duration::from_millis(25))
-                                        }
-                                        Err(err) => break Err(err),
-                                    }
+                        if !request_delivered {
+                            match remote_request_channel
+                                .as_ref()
+                                .expect("pending request channel")
+                                .delivery_status()
+                            {
+                                crate::execution::RemoteRequestDelivery::Delivered => {
+                                    request_delivered = true;
                                 }
-                            } else {
-                                child.wait()
+                                crate::execution::RemoteRequestDelivery::Failed(err) => {
+                                    if let Some(channel) = remote_request_channel.take() {
+                                        channel.cancel();
+                                    }
+                                    terminate_plugin_child(&mut child, &mut process_tree);
+                                    break Err(std::io::Error::other(err));
+                                }
+                                crate::execution::RemoteRequestDelivery::Pending => {}
                             }
                         }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = remote_request_channel;
-                            child.wait()
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                process_tree.terminate();
+                                break Ok(status);
+                            }
+                            Ok(None) => std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
+                            Err(err) => {
+                                if let Some(channel) = remote_request_channel.take() {
+                                    channel.cancel();
+                                }
+                                terminate_plugin_child(&mut child, &mut process_tree);
+                                break Err(err);
+                            }
                         }
                     };
                     match status {
@@ -289,9 +374,16 @@ impl App {
                     }
                 }
             };
-            let _ = event_tx.blocking_send(finished);
+            publish_plugin_command_finished(&event_tx, worker_cancelled.as_ref(), finished);
         });
+        self.plugin_command_runtimes
+            .insert(runtime_log_id, PluginCommandRuntime::new(cancelled, worker));
         Ok(log)
+    }
+
+    pub(crate) fn shutdown_plugin_commands(&mut self) {
+        self.plugin_command_runtimes.clear();
+        self.state.plugin_commands_in_flight = 0;
     }
 
     pub(super) fn plugin_command_execution_target(

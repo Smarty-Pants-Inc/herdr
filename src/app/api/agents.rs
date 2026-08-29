@@ -466,6 +466,75 @@ process_command = ["bin/provider", "exec"]
             .shutdown();
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_rejects_a_provider_shell_after_input() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime
+            .try_send_bytes(bytes::Bytes::from_static(b"echo occupied\n"))
+            .unwrap();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: Vec::new(),
+                timeout_ms: None,
+                allow_cross_pane: false,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_pane_busy");
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_rejects_a_provider_direct_command_pane() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        terminal.launch_argv = Some(vec!["explorr".into(), "--explorer".into()]);
+        let (runtime, _input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: Vec::new(),
+                timeout_ms: None,
+                allow_cross_pane: false,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_pane_busy");
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_start_uses_the_exact_local_omp_companion() {
