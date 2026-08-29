@@ -4454,6 +4454,45 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     Some(version_dir.to_path_buf())
 }
 
+#[cfg(not(windows))]
+fn installed_release_for_handoff(current: &Version) -> ReleaseInfo {
+    ReleaseInfo {
+        version: current.clone(),
+        identity: crate::build_info::version(),
+        channel: UpdateChannel::configured(),
+        build_id: crate::build_info::build_id().map(str::to_string),
+        commit: crate::build_info::commit().map(str::to_string),
+        target_protocol: Some(crate::protocol::PROTOCOL_VERSION),
+        download_url: String::new(),
+        sha256: None,
+        notes_body: String::new(),
+    }
+}
+
+#[cfg(not(windows))]
+fn retry_installed_release_handoff(
+    options: SelfUpdateOptions,
+    current: Version,
+) -> Result<Version, String> {
+    let release = installed_release_for_handoff(&current);
+    let plans = plan_running_server_updates(&release)?;
+    let decisions = confirm_running_server_update_action(plans, &release, options)?;
+    let current_exe = env::current_exe()
+        .map_err(|error| format!("can't find current binary for live handoff: {error}"))?;
+    let outcomes = apply_running_session_update_decisions(&release, &current_exe, decisions)?;
+    if !outcomes.is_empty() {
+        print_running_session_update_outcomes(&outcomes, &release);
+    }
+    if options.automatic && !automatic_handoff_completed(&outcomes) {
+        return Err(
+            "automatic update found the latest binary installed, but live handoff did not complete for every running Herdr server"
+                .to_string(),
+        );
+    }
+    eprintln!("already up to date ({})", crate::build_info::version());
+    Ok(current)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -4508,6 +4547,10 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let release = match check_latest()? {
         Some(r) => r,
         None => {
+            #[cfg(not(windows))]
+            if options.live_handoff {
+                return retry_installed_release_handoff(options, current);
+            }
             eprintln!("already up to date ({})", crate::build_info::version());
             return Ok(current);
         }
@@ -6631,6 +6674,22 @@ mod tests {
             parse_self_update_args(&["--unknown".to_string()]).unwrap_err(),
             "unknown update option: --unknown"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn installed_handoff_targets_the_running_binary_identity() {
+        let current = Version::current();
+        let release = installed_release_for_handoff(&current);
+
+        assert_eq!(release.version, current);
+        assert_eq!(release.label(), crate::build_info::version());
+        assert_eq!(
+            release.target_protocol,
+            Some(crate::protocol::PROTOCOL_VERSION)
+        );
+        assert_eq!(release.build_id.as_deref(), crate::build_info::build_id());
+        assert_eq!(release.commit.as_deref(), crate::build_info::commit());
     }
 
     #[cfg(not(windows))]

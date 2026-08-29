@@ -1302,8 +1302,26 @@ fn running_server_client_plan(
             "running remote server advertised build metadata without a protocol",
         ));
     }
+    let Some(local_build) = local_build else {
+        return Err(io::Error::other(
+            "running remote server build differs, but this client has no locally trusted build metadata",
+        ));
+    };
+    if build.channel != local_build.channel
+        || build.update_manifest_url != local_build.update_manifest_url
+    {
+        return Err(io::Error::other(
+            "running remote server build does not match this client's trusted update channel",
+        ));
+    }
 
-    Ok(RunningServerClientPlan::Reexec(build.clone()))
+    Ok(RunningServerClientPlan::Reexec(
+        crate::api::schema::ServerBuildIdentity {
+            channel: local_build.channel.clone(),
+            build_id: build.build_id.clone(),
+            update_manifest_url: local_build.update_manifest_url.clone(),
+        },
+    ))
 }
 
 fn reconcile_local_client_to_running_server(status: &RemoteServerStatus) -> io::Result<()> {
@@ -3512,6 +3530,53 @@ mod tests {
             running_server_client_plan(&status, Some(&local_build), "0.6.0-preview.local").unwrap(),
             RunningServerClientPlan::Reexec(server_build)
         );
+    }
+
+    #[test]
+    fn mismatched_running_server_build_requires_a_local_trust_root() {
+        let server_build = crate::api::schema::ServerBuildIdentity {
+            channel: "preview".into(),
+            build_id: "server".into(),
+            update_manifest_url: "https://example.com/preview.json".into(),
+        };
+        let status = RemoteServerStatus::Running {
+            version: Some("0.6.0-preview.server".into()),
+            protocol: Some(CURRENT_PROTOCOL),
+            live_handoff: false,
+            detached_server_daemon: true,
+            build: Some(server_build),
+        };
+
+        let error = running_server_client_plan(&status, None, "0.6.0")
+            .expect_err("remote metadata must not authorize local code execution");
+        assert!(error
+            .to_string()
+            .contains("no locally trusted build metadata"));
+    }
+
+    #[test]
+    fn mismatched_running_server_manifest_is_rejected() {
+        let server_build = crate::api::schema::ServerBuildIdentity {
+            channel: "preview".into(),
+            build_id: "server".into(),
+            update_manifest_url: "https://attacker.invalid/preview.json".into(),
+        };
+        let local_build = crate::api::schema::ServerBuildIdentity {
+            channel: "preview".into(),
+            build_id: "local".into(),
+            update_manifest_url: "https://example.com/preview.json".into(),
+        };
+        let status = RemoteServerStatus::Running {
+            version: Some("0.6.0-preview.server".into()),
+            protocol: Some(CURRENT_PROTOCOL),
+            live_handoff: false,
+            detached_server_daemon: true,
+            build: Some(server_build),
+        };
+
+        let error = running_server_client_plan(&status, Some(&local_build), "0.6.0-preview.local")
+            .expect_err("remote manifest URLs must not replace the local trust root");
+        assert!(error.to_string().contains("trusted update channel"));
     }
 
     #[test]

@@ -568,6 +568,7 @@ class TrustedWorkflowTests(unittest.TestCase):
             self.assertEqual(job.count("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}"), 1)
             self.assertIn('git -C omp-source rev-parse HEAD^{commit}', job)
             self.assertIn('git -C omp-source rev-parse HEAD^{tree}', job)
+            self.assertIn('git -C omp-source status --porcelain=v1 --untracked-files=all', job)
         self.assertNotIn("extract-tar", omp_build)
         self.assertIn("trusted-tools/smarty_preview_trusted.py", omp_build)
         self.assertNotIn("Checkout exact Herdr source", omp_build)
@@ -579,15 +580,12 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('cp "omp-source/packages/coding-agent/binaries/omp-$OMP_TARGET" "release-assets/omp-$PLATFORM"', omp_build)
         self.assertIn('test "$(release-assets/omp-$PLATFORM __build-id)" = "$OMP_BUILD_ID"', omp_build)
         self.assertNotIn('bun build omp-source/packages/coding-agent/src/cli.ts --compile --outfile "release-assets/omp-$PLATFORM"', omp_build)
-        for public_handoff in (trusted_source, omp_build, trusted_assemble):
+        for public_handoff in (trusted_source, omp_build, assemble, attest):
             self.assertNotIn("omp-source.tar", public_handoff)
-        self.assertIn("source-archives/herdr-source.tar", trusted_assemble)
-        self.assertIn('Path("validation/producer-record.json")', trusted_assemble)
-        self.assertNotIn('Path("validation/producer/producer-record.json")', trusted_assemble)
-        self.assertIn("git -C omp-source archive --format=tar", attest)
-        self.assertIn("validate-git-archive --archive source-archives/omp-source.tar", attest)
-        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json", trusted_assemble)
-        self.assertEqual(source.count("omp-source.tar"), 2)
+        self.assertIn("source-archives/herdr-source.tar", assemble)
+        self.assertIn('Path("validation/producer-record.json")', assemble)
+        self.assertNotIn('Path("validation/producer/producer-record.json")', assemble)
+        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json", assemble)
 
     def test_workflow_pins_executing_revision_and_publisher_attempt(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")

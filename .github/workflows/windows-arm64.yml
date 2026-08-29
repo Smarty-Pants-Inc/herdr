@@ -24,7 +24,7 @@ concurrency:
 jobs:
   installer:
     name: installer
-    runs-on: ${{ github.event_name == 'pull_request' && 'windows-11-arm' || 'smarty-windows-arm-16-core' }}
+    runs-on: windows-11-arm
     timeout-minutes: 10
     steps:
       - name: Checkout

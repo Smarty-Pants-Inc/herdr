@@ -127,19 +127,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: smarty-linux-16-core
+            os: ubuntu-22.04
             name: herdr-linux-x86_64
           - target: aarch64-unknown-linux-musl
-            os: smarty-linux-arm-16-core
+            os: ubuntu-24.04-arm
             name: herdr-linux-aarch64
           - target: x86_64-apple-darwin
-            os: smarty-macos-intel-12-core
+            os: macos-15-intel
             name: herdr-macos-x86_64
           - target: aarch64-apple-darwin
-            os: smarty-macos-arm-5-core
+            os: macos-14
             name: herdr-macos-aarch64
           - target: x86_64-pc-windows-msvc
-            os: smarty-windows-16-core
+            os: windows-latest
             name: herdr-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     env:

@@ -46,15 +46,15 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            fast_os: smarty-linux-16-core
+            fast_os: ubuntu-latest
             kind: unix
             nextest_filter: all()
           - os: macos-latest
-            fast_os: smarty-macos-intel-12-core
+            fast_os: macos-latest
             kind: unix
             nextest_filter: not binary(live_handoff)
           - os: windows-latest
-            fast_os: smarty-windows-16-core
+            fast_os: windows-latest
             kind: windows
     runs-on: ${{ github.event_name == 'pull_request' && matrix.os || matrix.fast_os }}
     timeout-minutes: 15
@@ -154,7 +154,7 @@ jobs:
 
   windows-conpty-package:
     name: Windows ConPTY package
-    runs-on: ${{ github.event_name == 'pull_request' && 'windows-2022' || 'smarty-windows-16-core' }}
+    runs-on: windows-2022
     timeout-minutes: 25
     steps:
       - name: Checkout
