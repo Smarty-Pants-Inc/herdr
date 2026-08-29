@@ -818,7 +818,7 @@ jobs:
           import json, os, subprocess
           from pathlib import Path
           source_record = json.loads(Path("trusted-source/trusted-source-record.json").read_text(encoding="utf-8"))
-          validation_record = json.loads(Path("validation/producer/producer-record.json").read_text(encoding="utf-8"))
+          validation_record = json.loads(Path("validation/producer-record.json").read_text(encoding="utf-8"))
           Path("metadata/omp-descriptor.json").write_text(json.dumps(source_record["omp"], sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
           identity = source_record.get("identity", {})
           expected = {"tag": os.environ["TAG"], "build_id": os.environ["TAG"].removeprefix("smarty-preview-"), "parent": os.environ["PARENT"], "source": os.environ["SOURCE"], "omp": os.environ["OMP"]}

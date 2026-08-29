@@ -581,6 +581,8 @@ class TrustedWorkflowTests(unittest.TestCase):
         for public_handoff in (trusted_source, omp_build, trusted_assemble):
             self.assertNotIn("omp-source.tar", public_handoff)
         self.assertIn("source-archives/herdr-source.tar", trusted_assemble)
+        self.assertIn('Path("validation/producer-record.json")', trusted_assemble)
+        self.assertNotIn('Path("validation/producer/producer-record.json")', trusted_assemble)
         self.assertIn("git -C omp-source archive --format=tar", attest)
         self.assertIn("validate-git-archive --archive source-archives/omp-source.tar", attest)
         self.assertEqual(source.count("omp-source.tar"), 2)
