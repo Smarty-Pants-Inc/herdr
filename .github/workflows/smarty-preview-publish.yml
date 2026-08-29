@@ -579,7 +579,7 @@ jobs:
           export OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["tree"])')"
           export OMP_VERSION="$(python -I -S -c 'import json; print(json.load(open("trusted-source/trusted-source-record.json"))["omp"]["version"])')"
           test -n "$OMP_BUILD_ID" -a -n "$OMP_COMMIT" -a -n "$OMP_TREE" -a -n "$OMP_VERSION"
-          (cd omp-source && bun install --frozen-lockfile && bun run gen:bundle)
+          (cd omp-source && bun install --frozen-lockfile)
           read -r -a native_targets <<< "$NATIVE_TARGETS"
           toolchain_log="$RUNNER_TEMP/rules-rust-toolchain.log"
           (cd omp-source && bun scripts/bazel-natives.ts "${native_targets[@]}" --dest packages/natives/native -- --toolchain_resolution_debug='.*rules_rust.*' 2> >(tee "$toolchain_log" >&2))
