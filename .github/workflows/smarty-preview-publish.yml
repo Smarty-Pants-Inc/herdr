@@ -1130,6 +1130,13 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Checkout trusted publisher source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.validate-seal.outputs.publisher_commit }}
+          fetch-depth: 1
+          path: publisher-source
+          persist-credentials: false
       - name: Download final sealed bytes
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -1327,9 +1334,11 @@ jobs:
             check_tag
             refresh_release release-before-publish.json
             python -I -S - <<'PY'
-          import hashlib, json, os
+          import hashlib, json, os, sys
           from pathlib import Path
-          from urllib.request import Request, urlopen
+          from urllib.request import Request, build_opener
+          sys.path.insert(0, "publisher-source/scripts")
+          from smarty_preview_trusted import _HttpsArtifactRedirectHandler
           expected = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))["files"]
           release = json.loads(Path("release-before-publish.json").read_text(encoding="utf-8"))
           assets = json.loads(Path("release-before-publish.json.assets").read_text(encoding="utf-8"))
@@ -1337,6 +1346,7 @@ jobs:
               raise SystemExit("release changed before draft byte verification")
           if {item.get("name") for item in assets} != set(expected) or len(assets) != len(expected):
               raise SystemExit("draft release asset inventory is not exactly the sealed set")
+          opener = build_opener(_HttpsArtifactRedirectHandler())
           total_release = 0
           for item in assets:
               name = item["name"]
@@ -1350,7 +1360,7 @@ jobs:
               request = Request(item["url"], headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}", "Accept": "application/octet-stream"})
               digest = hashlib.sha256()
               total = 0
-              with urlopen(request, timeout=120) as response:
+              with opener.open(request, timeout=120) as response:
                   while chunk := response.read(min(1024 * 1024, size - total + 1)):
                       total += len(chunk)
                       if total > size:
