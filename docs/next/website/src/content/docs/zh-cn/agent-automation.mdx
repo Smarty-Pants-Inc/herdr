@@ -39,7 +39,7 @@ review_pane=$(printf '%s\n' "$split" | jq -r '.result.pane.pane_id')
 
 智能体命令既可以接受唯一的实时名称,也可以接受当前托管该智能体的窗格 ID。
 
-可用的 shell 窗格必须停在交互式 shell 提示符,由 shell 自身占用前台,没有正在前台运行的命令、编辑器或智能体。调用 `agent start` 前先让窗格回到提示符。本地、SSH 后端和执行提供程序后端窗格都受支持。远程窗格必须使用兼容 POSIX 的交互式 shell;Herdr 依靠终端生命周期检测,而不是本地进程表。
+可用的 shell 窗格必须停在交互式 shell 提示符,由 shell 自身占用前台,没有正在前台运行的命令、编辑器或智能体。调用 `agent start` 前先让窗格回到提示符。本地窗格和执行提供程序后端窗格受支持。内置 SSH 窗格会返回 `agent_start_unsupported_execution_target`。
 
 `--kind` 选择受支持的智能体及其标准可执行文件。支持的 kind 是 `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`qwen`、`maki` 和 `muse`。`--` 后的参数会原样传给该可执行文件。
 
