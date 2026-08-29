@@ -1079,6 +1079,7 @@ mod tests {
             cell_width_px: 0,
             cell_height_px: 0,
             remote_execution_ready: false,
+            input_written: false,
             remote_hostname: None,
             remote_exec_ready_filter: crate::pane::RemoteExecReadyFilter::default(),
             pending_agent_resume_plan: None,

@@ -33,6 +33,7 @@ pub(crate) enum ExecutionProviderCommandKind {
     Pty,
     Process,
 }
+#[cfg(unix)]
 const EXECUTION_PROVIDER_INHERITED_ENV_REMOVALS: &[&str] = &[
     "CODEX_THREAD_ID",
     "TMUX",

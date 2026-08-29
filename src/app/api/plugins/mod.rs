@@ -23,6 +23,7 @@ pub(crate) use env::{ensure_plugin_user_dirs, plugin_path_env};
 pub(crate) use manifest::load_plugin_manifest;
 pub(crate) use manifest::{effective_platforms, ensure_platform_supported};
 pub(crate) use panes::{ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec};
+pub(crate) use runtime::PluginCommandRuntime;
 #[cfg(test)]
 use runtime::{read_capped_plugin_output, MAX_PLUGIN_COMMANDS_IN_FLIGHT};
 
@@ -3040,6 +3041,262 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_ACTION_ID\""]
         assert_eq!(finished.stdout.as_deref(), Some("run"));
         assert_eq!(finished.exit_code, Some(0));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_shutdown_cancels_and_reaps_a_running_plugin_command() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-shutdown");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.long-running"
+name = "Long Running"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.long-running"].clone();
+        let parent_pid_path = root.join("command-parent.pid");
+        let child_pid_path = root.join("command-child.pid");
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf '%s' $$ > {}; sleep 30 & child=$!; printf '%s' \"$child\" > {}; wait \"$child\"",
+                parent_pid_path.display(),
+                child_pid_path.display()
+            ),
+        ];
+
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("long-running".into()),
+                None,
+                command,
+                &app.current_plugin_context("shutdown-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !parent_pid_path.is_file() || !child_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its process ids"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let read_pid = |path: &std::path::Path| -> i32 {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let parent_pid = read_pid(&parent_pid_path);
+        let child_pid = read_pid(&child_pid_path);
+        assert!(app.plugin_command_runtimes.contains_key(&log.log_id));
+
+        app.shutdown_plugin_commands();
+
+        assert!(app.plugin_command_runtimes.is_empty());
+        assert_eq!(app.state.plugin_commands_in_flight, 0);
+        for pid in [parent_pid, child_pid] {
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_completion_kills_descendants_that_outlive_the_direct_child() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-orphan");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.orphan"
+name = "Orphan"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.orphan"].clone();
+        let child_pid_path = root.join("orphan-child.pid");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("orphan".into()),
+                None,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "sleep 30 & child=$!; printf '%s' \"$child\" > {}; exit 0",
+                        child_pid_path.display()
+                    ),
+                ],
+                &app.current_plugin_context("orphan-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !child_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_pid: i32 = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        while app.plugin_command_runtimes.contains_key(&log.log_id) {
+            app.drain_all_internal_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command completion remained blocked on descendant pipes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plugin_completion_kills_windows_descendants_that_outlive_the_direct_child() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-windows-orphan");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.windows-orphan"
+name = "Windows Orphan"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["windows"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.windows-orphan"].clone();
+        let child_pid_path = root.join("orphan-child.pid");
+        let escaped_pid_path = child_pid_path.display().to_string().replace('\'', "''");
+        let child_script = format!(
+            "[Console]::Out.Write('child-stdout-marker'); [Console]::Out.Flush(); [Console]::Error.Write('child-stderr-marker'); [Console]::Error.Flush(); [IO.File]::WriteAllText('{escaped_pid_path}', [string]$PID); Start-Sleep -Seconds 30"
+        );
+        let encoded_child_script = {
+            use base64::Engine as _;
+            let utf16 = child_script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            base64::engine::general_purpose::STANDARD.encode(utf16)
+        };
+        let script = format!(
+            "$child = Start-Process -PassThru -NoNewWindow powershell.exe -ArgumentList @('-NoLogo','-NoProfile','-EncodedCommand','{encoded_child_script}'); while (-not (Test-Path -LiteralPath '{escaped_pid_path}')) {{ Start-Sleep -Milliseconds 10 }}; exit 0"
+        );
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("orphan".into()),
+                None,
+                vec![
+                    "powershell.exe".into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    script,
+                ],
+                &app.current_plugin_context("windows-orphan-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !child_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_pid: u32 = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        while app.plugin_command_runtimes.contains_key(&log.log_id) {
+            app.drain_all_internal_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command completion remained blocked on descendant pipes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .expect("plugin command log should remain available");
+        assert_eq!(finished.status, PluginCommandStatus::Succeeded);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished
+            .stdout
+            .as_deref()
+            .is_some_and(|stdout| stdout.contains("child-stdout-marker")));
+        assert!(finished
+            .stderr
+            .as_deref()
+            .is_some_and(|stderr| stderr.contains("child-stderr-marker")));
+
+        let process = unsafe {
+            windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                child_pid,
+            )
+        };
+        if process.is_null() {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32)
+            );
+        } else {
+            let mut exit_code = 0;
+            let queried = unsafe {
+                windows_sys::Win32::System::Threading::GetExitCodeProcess(process, &mut exit_code)
+            };
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(process);
+            }
+            assert_ne!(queried, 0, "failed to query plugin descendant exit status");
+            assert_ne!(
+                exit_code, 259,
+                "plugin command descendant survived completion"
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -226,6 +226,7 @@ impl App {
             &execution_target,
             crate::execution::ExecutionTarget::Extension { .. }
         );
+        let provider_shell = terminal.launch_argv.is_none();
 
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
         argv.extend(params.args);
@@ -238,6 +239,13 @@ impl App {
                 .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
             let (rows, cols) = runtime.current_size();
             let submission = if provider_execution {
+                #[cfg(unix)]
+                let remote_ready = runtime.remote_execution_ready();
+                #[cfg(not(unix))]
+                let remote_ready = true;
+                if !provider_shell || !remote_ready || runtime.input_written() {
+                    return Err(AgentStartError::TargetBusy(params.pane_id.clone()));
+                }
                 None
             } else {
                 let shell_name = available_shell_name(runtime)

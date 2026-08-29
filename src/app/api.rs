@@ -240,6 +240,7 @@ impl App {
             error,
         } = ev
         {
+            self.plugin_command_runtimes.remove(&log_id);
             self.state.plugin_commands_in_flight =
                 self.state.plugin_commands_in_flight.saturating_sub(1);
             if let Some(log) = self

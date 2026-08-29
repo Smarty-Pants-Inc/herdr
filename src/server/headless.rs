@@ -1381,6 +1381,13 @@ impl HeadlessServer {
                 "live handoff is unavailable while OMP host routes are live; restart Herdr normally",
             ));
         }
+        if self.app.state.plugin_commands_in_flight != 0
+            || !self.app.plugin_command_runtimes.is_empty()
+        {
+            return Err(io::Error::other(
+                "live handoff is unavailable while plugin commands are running; wait for them to finish or restart Herdr normally",
+            ));
+        }
         for workspace in &self.app.state.workspaces {
             for tab in &workspace.tabs {
                 for (pane_id, pane) in &tab.panes {
@@ -1415,7 +1422,7 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
-        let omp_maintenance = self.authorize_live_handoff()?;
+        self.authorize_live_handoff()?;
 
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
@@ -1475,6 +1482,13 @@ impl HeadlessServer {
         // events. Reconcile only the queued snapshot before capturing terminal state;
         // private runtimes remain live and must not keep handoff draining forever.
         self.drain_internal_event_snapshot_with_forwarding();
+        let omp_maintenance = match self.authorize_live_handoff() {
+            Ok(state) => state,
+            Err(err) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(err);
+            }
+        };
 
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
@@ -8260,6 +8274,8 @@ impl HeadlessServer {
         // Reject only the requests already queued when shutdown reached cleanup.
         self.reject_queued_api_requests_for_shutdown();
 
+        self.app.shutdown_plugin_commands();
+
         // Close all client connections.
         let staged_files = self
             .clients
@@ -11023,6 +11039,21 @@ mod tests {
             .unwrap();
         assert!(
             matches!(host.read(&mut [0]), Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_rejects_running_plugin_commands() {
+        let mut server = test_headless_server();
+        server.app.state.plugin_commands_in_flight = 1;
+
+        let error = server
+            .authorize_live_handoff()
+            .expect_err("running plugin command must block handoff");
+
+        assert_eq!(
+            error.to_string(),
+            "live handoff is unavailable while plugin commands are running; wait for them to finish or restart Herdr normally"
         );
     }
 
