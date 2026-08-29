@@ -128,6 +128,11 @@ fn detect_agent_state(state: crate::api::schema::PaneAgentState) -> crate::detec
     }
 }
 
+#[cfg(unix)]
+fn legacy_handoff_input_written() -> bool {
+    true
+}
+
 /// Long-lived pane runtime transferred during server replacement.
 ///
 /// Handoff preserves server-owned session state such as PTYs, processes, agent
@@ -135,10 +140,6 @@ fn detect_agent_state(state: crate::api::schema::PaneAgentState) -> crate::detec
 /// preserve transient coordination such as in-flight requests, waits,
 /// subscriptions, client sockets, or pane-to-pane messages; clients reconnect
 /// and retry those operations after replacement.
-#[cfg(unix)]
-fn legacy_handoff_input_written() -> bool {
-    true
-}
 
 #[cfg(unix)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
