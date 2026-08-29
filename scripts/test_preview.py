@@ -1046,11 +1046,11 @@ file: ../../../public/assets/logo.svg
             trusted,
         )
         for pool in (
-            "smarty-linux-16-core",
-            "smarty-linux-arm-16-core",
-            "smarty-macos-intel-12-core",
-            "smarty-macos-arm-5-core",
-            "smarty-windows-16-core",
+            "ubuntu-22.04",
+            "ubuntu-24.04-arm",
+            "macos-15-intel",
+            "macos-14",
+            "windows-latest",
         ):
             self.assertIn(pool, trusted)
         self.assertIn("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9", trusted)
@@ -2507,11 +2507,11 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
                     for target, platform in document["platforms"].items()
                 },
                 {
-                    "linux-x86_64": "smarty-linux-16-core",
-                    "linux-aarch64": "smarty-linux-arm-16-core",
-                    "macos-x86_64": "smarty-macos-intel-12-core",
-                    "macos-aarch64": "smarty-macos-arm-5-core",
-                    "windows-x86_64": "smarty-windows-16-core",
+                    "linux-x86_64": "ubuntu-22.04",
+                    "linux-aarch64": "ubuntu-24.04-arm",
+                    "macos-x86_64": "macos-15-intel",
+                    "macos-aarch64": "macos-14",
+                    "windows-x86_64": "windows-latest",
                 },
             )
             self.assertEqual(document["artifacts"]["herdr-linux-x86_64"]["abi"], "musl")

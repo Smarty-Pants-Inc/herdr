@@ -103,7 +103,7 @@ PLATFORM_MATRIX = {
         "os": "linux",
         "architecture": "x86_64",
         "abi": "glibc",
-        "runner": "smarty-linux-16-core",
+        "runner": "ubuntu-22.04",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["linux-x86_64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["linux-x86_64"],
@@ -113,7 +113,7 @@ PLATFORM_MATRIX = {
         "os": "linux",
         "architecture": "aarch64",
         "abi": "glibc",
-        "runner": "smarty-linux-arm-16-core",
+        "runner": "ubuntu-24.04-arm",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["linux-aarch64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["linux-aarch64"],
@@ -123,7 +123,7 @@ PLATFORM_MATRIX = {
         "os": "macos",
         "architecture": "x86_64",
         "abi": "darwin",
-        "runner": "smarty-macos-intel-12-core",
+        "runner": "macos-15-intel",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["macos-x86_64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["macos-x86_64"],
@@ -133,7 +133,7 @@ PLATFORM_MATRIX = {
         "os": "macos",
         "architecture": "aarch64",
         "abi": "darwin",
-        "runner": "smarty-macos-arm-5-core",
+        "runner": "macos-14",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["macos-aarch64"],
             "omp": OMP_EXPECTED_ASSET_NAMES["macos-aarch64"],
@@ -143,7 +143,7 @@ PLATFORM_MATRIX = {
         "os": "windows",
         "architecture": "x86_64",
         "abi": "msvc",
-        "runner": "smarty-windows-16-core",
+        "runner": "windows-latest",
         "payloads": {
             "herdr": EXPECTED_ASSET_NAMES["windows-x86_64"],
             "omp": None,
