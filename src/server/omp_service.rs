@@ -819,26 +819,21 @@ impl OmpService {
                 if !valid_route_id(&pane_id) || !valid_route_id(&omp_session_id) {
                     return messages;
                 }
-                let key = OmpRouteKey {
-                    pane_id,
-                    omp_session_id,
-                    route_generation,
+                let Some(key) = self.canonical_host_key(host_id) else {
+                    return messages;
                 };
-                let route_key = (
-                    key.pane_id.clone(),
-                    key.omp_session_id.clone(),
-                    key.route_generation,
-                );
-                if self
-                    .hosts
-                    .get(&route_key)
-                    .is_some_and(|(current, _, _)| *current == host_id)
-                {
-                    self.remove_host(&key);
-                    if let Ok(deliveries) = self.routes.host_stopped(&key) {
-                        self.deliver(&key, deliveries, &mut messages, clients);
-                        self.routes.remove_if_inactive_and_empty(&key);
-                    }
+                if key.route_generation != route_generation {
+                    tracing::debug!(
+                        host_id,
+                        announced_route_generation = route_generation,
+                        canonical_route_generation = key.route_generation,
+                        "resolved OMP host stop to its canonical route generation"
+                    );
+                }
+                self.remove_host(&key);
+                if let Ok(deliveries) = self.routes.host_stopped(&key) {
+                    self.deliver(&key, deliveries, &mut messages, clients);
+                    self.routes.remove_if_inactive_and_empty(&key);
                 }
             }
             _ => unreachable!("only OMP events are dispatched to OmpService"),
@@ -1200,6 +1195,19 @@ impl OmpService {
             self.routes.remove_if_inactive_and_empty(key);
         }
     }
+
+    fn canonical_host_key(&self, host_id: u64) -> Option<OmpRouteKey> {
+        self.hosts.iter().find_map(
+            |((pane_id, omp_session_id, route_generation), (current_host_id, _, _))| {
+                (*current_host_id == host_id).then(|| OmpRouteKey {
+                    pane_id: pane_id.clone(),
+                    omp_session_id: omp_session_id.clone(),
+                    route_generation: *route_generation,
+                })
+            },
+        )
+    }
+
     fn replace_host(
         &mut self,
         key: (String, String, u64),
@@ -1441,6 +1449,82 @@ mod tests {
         stop_host(&mut service, "pane", "session", 3, 6);
         assert_eq!(third_peer.read(&mut [0]).unwrap(), 0);
         drop((stale_peer, forged_peer, busy_peer));
+    }
+
+    #[test]
+    fn late_replacement_acceptance_cleans_canonical_route_and_allows_retry() {
+        let store = crate::server::omp_maintenance::TestOmpMaintenanceStore::new();
+        let mut service =
+            OmpService::with_test_maintenance(None, "default", store).expect("service");
+        let (first_peer, first_admitted) = start_host(&mut service, "pane", "session", 1, 1);
+        assert!(matches!(
+            admission(first_admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 1
+            }
+        ));
+        stop_host(&mut service, "pane", "session", 1, 1);
+        drop(first_peer);
+
+        let (peer, socket) = host_socket_pair();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
+        let (admission_tx, admitted) = std::sync::mpsc::sync_channel(1);
+        assert!(matches!(
+            admitted.recv_timeout(std::time::Duration::from_millis(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        service.handle_event(
+            ServerEvent::OmpHostStarted {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                host_id: 2,
+                outbound,
+                socket,
+                admission: admission_tx,
+            },
+            false,
+            &HashMap::new(),
+        );
+        assert!(matches!(
+            admitted.try_recv(),
+            Ok(OmpHostAdmission::Accepted {
+                route_generation: 2
+            })
+        ));
+        assert_eq!(
+            service.live_route_keys(),
+            vec![OmpRouteKey {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 2,
+            }]
+        );
+        service.handle_event(
+            ServerEvent::OmpHostStopped {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+                host_id: 2,
+            },
+            false,
+            &HashMap::new(),
+        );
+
+        assert!(service.live_route_keys().is_empty());
+        assert_eq!(service.maintenance_status().unwrap().route_count, 0);
+
+        let (retry_peer, retry_admitted) = start_host(&mut service, "pane", "session", 2, 3);
+        assert!(matches!(
+            admission(retry_admitted),
+            OmpHostAdmission::Accepted {
+                route_generation: 3
+            }
+        ));
+        stop_host(&mut service, "pane", "session", 3, 3);
+        assert_eq!(service.maintenance_status().unwrap().route_count, 0);
+        drop((peer, retry_peer));
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! The JSON API owns this state. OMP hosts only consult it at the existing
 //! admission boundary, and live handoff only carries the active lease proof.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::{CStr, CString, OsString};
@@ -317,6 +319,8 @@ pub(crate) struct OmpMaintenance {
     session: String,
     backend: Backend,
     instance: ServerInstance,
+    #[cfg(test)]
+    post_replace_sync_failures: Cell<usize>,
 }
 
 impl OmpMaintenance {
@@ -347,6 +351,8 @@ impl OmpMaintenance {
                 instance_dir,
             },
             instance,
+            #[cfg(test)]
+            post_replace_sync_failures: Cell::new(0),
         })
     }
 
@@ -356,12 +362,32 @@ impl OmpMaintenance {
             session: session.to_owned(),
             backend: Backend::Memory(TestBackend { store: store.0 }),
             instance: ServerInstance::memory(),
+            post_replace_sync_failures: Cell::new(0),
         }
     }
 
     #[cfg(test)]
     fn file_for_test(session: &str, state_path: PathBuf) -> Result<Self, OmpMaintenanceError> {
         Self::file(session.to_owned(), state_path)
+    }
+
+    #[cfg(test)]
+    fn fail_next_post_replace_syncs(&self, count: usize) {
+        self.post_replace_sync_failures.set(count);
+    }
+
+    fn sync_state_parent_directory(&self, directory: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let remaining = self.post_replace_sync_failures.get();
+            if remaining != 0 {
+                self.post_replace_sync_failures.set(remaining - 1);
+                return Err(io::Error::other(
+                    "injected OMP maintenance post-replace sync failure",
+                ));
+            }
+        }
+        sync_parent_directory(directory)
     }
 
     pub(crate) fn status(&self) -> Result<ServerOmpMaintenanceStatus, OmpMaintenanceError> {
@@ -699,6 +725,7 @@ impl OmpMaintenance {
                 lock_path,
                 instance_dir,
                 &self.instance.id,
+                |directory| self.sync_state_parent_directory(directory),
                 apply,
             ),
             #[cfg(test)]
@@ -974,6 +1001,7 @@ fn with_file_state<T>(
     lock_path: &Path,
     instance_dir: &Path,
     current_instance_id: &str,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
     apply: impl FnOnce(&mut PersistedState, &mut bool) -> T,
 ) -> Result<T, OmpMaintenanceError> {
     if state_path.parent() != Some(state_root)
@@ -1003,7 +1031,7 @@ fn with_file_state<T>(
     let result = apply(&mut state, &mut dirty);
     if dirty {
         state.validate()?;
-        save_state(state_path, &state)?;
+        save_state(state_path, &state, sync_parent)?;
     }
     Ok(result)
 }
@@ -1089,14 +1117,28 @@ fn load_state(path: &Path) -> Result<PersistedState, OmpMaintenanceError> {
     })
 }
 
-fn save_state(path: &Path, state: &PersistedState) -> Result<(), OmpMaintenanceError> {
-    save_state_with_hook(path, state, |_| Ok(()))
+fn save_state(
+    path: &Path,
+    state: &PersistedState,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), OmpMaintenanceError> {
+    save_state_with_hooks(path, state, |_| Ok(()), sync_parent)
 }
 
+#[cfg(test)]
 fn save_state_with_hook(
     path: &Path,
     state: &PersistedState,
     before_replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), OmpMaintenanceError> {
+    save_state_with_hooks(path, state, before_replace, sync_parent_directory)
+}
+
+fn save_state_with_hooks(
+    path: &Path,
+    state: &PersistedState,
+    before_replace: impl FnOnce(&Path) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), OmpMaintenanceError> {
     let content = serde_json::to_vec(state).map_err(|error| {
         OmpMaintenanceError::StateInvalid(format!(
@@ -1137,7 +1179,16 @@ fn save_state_with_hook(
     replace_state_file(temporary.path(), path)
         .map_err(|error| state_io(path, "replace state", error))?;
     temporary.persist();
-    sync_parent_directory(parent).map_err(|error| state_io(parent, "sync state directory", error))
+    // The rename is the commit point. Returning an error now would let callers reject state
+    // that is already visible, stranding its route and server-instance identity.
+    if let Err(error) = sync_parent(parent) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "OMP maintenance state committed but parent directory sync failed"
+        );
+    }
+    Ok(())
 }
 
 struct TemporaryStateFile {
@@ -2212,6 +2263,62 @@ mod tests {
         assert_eq!(status.routes[0].session, "second");
         drop(second);
         assert_eq!(controller.status().unwrap().route_count, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn post_replace_sync_failure_keeps_committed_replacement_recoverable() {
+        let dir = test_dir("post-replace-sync");
+        let _ = fs::remove_dir_all(&dir);
+        let state_path = dir.join("state.json");
+        let owner = operation_id(26);
+        let announced = route("w1:p1");
+        let replacement = OmpRouteKey {
+            route_generation: 2,
+            ..announced.clone()
+        };
+        let host = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+
+        host.acquire(&owner).unwrap();
+        host.grant_permit(&owner, "default", &announced.pane_id)
+            .unwrap();
+        host.fail_next_post_replace_syncs(1);
+
+        assert_eq!(
+            host.admit_replacement(&announced, || {
+                Ok::<_, ()>((replacement.clone(), replacement.route_generation))
+            })
+            .unwrap(),
+            replacement.route_generation
+        );
+        let committed = host.status().unwrap();
+        assert!(committed.held);
+        assert!(committed.permit.is_none());
+        assert_eq!(committed.route_revision, 1);
+        assert_eq!(committed.route_count, 1);
+        assert!(committed.routes[0].proof);
+        assert_eq!(
+            committed.routes[0].route_generation,
+            replacement.route_generation
+        );
+
+        drop(host);
+        let reopened = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let reconciled = reopened.status().unwrap();
+        assert!(reconciled.held);
+        assert_eq!(reconciled.route_count, 0);
+        assert_eq!(reconciled.route_revision, 2);
+        assert!(!reopened.release(&owner).unwrap().held);
+
+        let retry = route("w2:p1");
+        reopened.admit(&retry, || Ok::<_, ()>(())).unwrap();
+        assert_eq!(reopened.status().unwrap().route_count, 1);
+        reopened.unregister_route(&retry).unwrap();
+        let final_status = reopened.status().unwrap();
+        assert!(!final_status.held);
+        assert_eq!(final_status.route_count, 0);
+        assert_eq!(final_status.route_revision, 4);
+        drop(reopened);
         let _ = fs::remove_dir_all(dir);
     }
 
