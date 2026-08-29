@@ -841,7 +841,7 @@ jobs:
           EOF
           bazel_tool="$(command -v bazelisk || command -v bazel || true)"
           test -n "$bazel_tool"
-          (cd omp-source && "$bazel_tool" --ignore_all_rc_files mod --lockfile_mode=error graph --output=json) > metadata/omp-bazel-graph.json
+          (cd omp-source && "$bazel_tool" --ignore_all_rc_files mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json) > metadata/omp-bazel-graph.json
           python -I -S - <<'PY'
           import json
           from pathlib import Path
