@@ -425,6 +425,9 @@ class TrustedWorkflowTests(unittest.TestCase):
         for label in ("ubuntu-22.04", "ubuntu-24.04-arm", "macos-15-intel", "macos-14", "windows-latest"):
             self.assertIn(f"os: {label}", source)
         self.assertNotRegex(source, r"os: smarty-(?:linux|macos|windows)")
+        self.assertIn("mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29", trusted_build)
+        self.assertIn("version: ${{ env.ZIG_VERSION }}", trusted_build)
+        self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
         self.assertIn("Build trusted Herdr source", trusted_build)
         self.assertNotIn("publisher-source", trusted_build)
         self.assertIn("Download validated OMP source record", omp_build)
