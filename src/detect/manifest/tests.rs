@@ -40,7 +40,7 @@ id = "codex"
 }
 
 fn with_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
+    let _guard = crate::config::test_config_env_lock().lock();
     let old_config = std::env::var_os("XDG_CONFIG_HOME");
     let old_state = std::env::var_os("XDG_STATE_HOME");
     let base = std::env::temp_dir().join(format!(
@@ -710,6 +710,30 @@ fn claude_empty_osc_empty_screen_is_idle_fallback() {
         Some(DEFAULT_KNOWN_AGENT_IDLE_FALLBACK)
     );
     assert!(!result.visible_idle);
+}
+
+// --- OMP OSC rules ---
+
+#[test]
+fn omp_osc_title_braille_spinner_is_working() {
+    let result = osc_explain(Agent::Omp, "", "π ⠴ Merge main and rebuild Herdr", "");
+    assert_eq!(result.state, AgentState::Working);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("osc_title_working")
+    );
+    assert!(result.visible_working);
+}
+
+#[test]
+fn omp_osc_title_plain_is_idle() {
+    let result = osc_explain(Agent::Omp, "", "π > Merge main and rebuild Herdr", "");
+    assert_eq!(result.state, AgentState::Idle);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("osc_title_idle")
+    );
+    assert!(result.visible_idle);
 }
 
 // --- Codex OSC rules ---

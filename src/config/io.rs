@@ -86,10 +86,18 @@ fn platform_state_dir() -> PathBuf {
 
 #[cfg(not(windows))]
 fn platform_state_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
+    platform_state_dir_for_home(std::env::var("HOME").ok().as_deref())
+}
+
+#[cfg(not(windows))]
+fn platform_state_dir_for_home(home: Option<&str>) -> PathBuf {
+    if let Some(home) = home {
         PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
     } else {
-        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+        // The temporary directory is shared; the UID keeps one user from precreating
+        // another user's managed state root.
+        let uid = unsafe { libc::geteuid() };
+        std::env::temp_dir().join(format!("{}-state-{uid}", app_dir_name()))
     }
 }
 
@@ -725,6 +733,17 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
+    #[test]
+    fn homeless_state_directory_is_scoped_to_effective_user() {
+        let path = platform_state_dir_for_home(None);
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            path.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(format!("{}-state-{uid}", app_dir_name()).as_str())
+        );
+    }
+
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
         let content = "onboarding = true\n[keys]\nprefix = \"ctrl+b\"\n";
@@ -836,7 +855,7 @@ mod tests {
 
     #[test]
     fn config_loaders_report_unreadable_path() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path =
             std::env::temp_dir().join(format!("herdr-config-unreadable-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
@@ -1016,7 +1035,7 @@ mouse_captur = true
 
     #[test]
     fn startup_config_accepts_legacy_agent_panel_scope_without_warning() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-legacy-agent-panel-scope-{}.toml",
             std::process::id()
@@ -1034,7 +1053,7 @@ mouse_captur = true
 
     #[test]
     fn startup_config_load_warns_about_unknown_top_level_sections() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-config-unknown-section-{}.toml",
             std::process::id()

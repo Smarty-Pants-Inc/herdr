@@ -4,6 +4,8 @@
 
 ### Added
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
+- On Unix, panes can now execute locally or on a trusted SSH host while sharing one Herdr layout; new panes created from an existing pane, such as splits and plugin child surfaces, inherit the source pane's execution target unless explicitly overridden. Whole-server `herdr --remote` remains available on Windows clients connecting to supported Linux and macOS hosts.
+- Plugin popups can now be scoped to one connected app client, with independent rendering, input, links, and lifecycle per client.
 
 ### Fixed
 - Running named servers now activate remote agent-detection manifests downloaded by another server, preventing stale agent states and `agent explain` output until restart. (#2711)
@@ -15,6 +17,7 @@
 - Prefix bindings such as `prefix+|` now recognize characters produced by macOS Option and custom keyboard layouts, while exact chords such as `prefix+alt+w` keep priority. (#3079, thanks @vlcinsky)
 - Direct terminal attaches now preserve multiline pastes as one paste instead of submitting each line separately. (#3054)
 - Windows clients now preserve layout-generated text for Shift-only keys, so characters such as `/` on German keyboards reach shell panes and pasted input. (#3045)
+- Unix SSH-backed workspace-right plugin panes now keep their managed workspace identity, and file-opening splits inherit the plugin's execution target instead of an unrelated tiled pane's locality.
 - Windows panes now keep bare `cursor-agent` launches detected after Cursor hands off to its bundled Node process. (#3032)
 - Oversized Kitty images no longer prevent smaller images shown later in the same pane from rendering. (#3033)
 - `herdr agent explain --file` now reports fixture read failures as structured JSON instead of exposing Rust I/O debug output. (#3022)
@@ -29,6 +32,7 @@
 
 ### Added
 - CLI help now points coding agents to Herdr's plain-text guide, documentation index, and built-in control skill.
+- Added `ui.toast.delivery = "hybrid"`, which keeps notifications in Herdr while the outer terminal is focused or its focus is unknown and sends system notifications only when it is unfocused.
 - Added Qwen Code detection for idle, working, and user-confirmation states, plus optional native session restore. (#2730, #2743)
 - Herdr now keeps the outer terminal window title in sync with the session through `ui.window_title`, so window managers and terminal tab bars show the active workspace and the host the panes actually run on. (#2627, thanks @dhh)
 - The desktop tab bar now has configurable right-aligned status entries for zoom state, hostname, date/time, literal text, and asynchronously refreshed command output.
@@ -43,12 +47,16 @@
 - Navigate-mode selection rows now use a dedicated per-theme cursor color, customizable via `theme.custom.selection_bg`, so the cursor stays distinguishable from the active Space and Agent highlight.
 - Copy mode now supports `B`, `E`, and `W` motions over whitespace-delimited big words. (#2270, thanks @jplew)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+- Workspace-right plugin panes can collapse to a one-cell sidebar control, use borderless sidebar chrome, and receive the active palette through protected `HERDR_THEME_*` environment variables.
 
 ### Changed
 - Windows support is now generally available through stable releases and uses the stable update channel by default. Existing preview installs stay on preview until explicitly switched.
 - Headless servers now use a configurable 120×40 virtual terminal instead of 80×24 when no client is attached, giving newly created panes a practical default size. (#2828)
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding. (#2570, thanks @dhh)
+- Bumped the client/server protocol version to 21 for typed live-handoff reconnect signaling and client-local HTTP(S) link opening.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
+- Full-app clients attached to the same session now navigate workspaces, tabs, pane focus, focus history, and zoom independently while continuing to share panes, processes, and output.
+- Pane links now open on a plain left click, with the hovered link underlined before opening.
 
 ### Fixed
 - Live handoff now preserves mouse forwarding for running pane applications. (#3000, thanks @xkrogen)
@@ -85,6 +93,7 @@
 - Session Navigator movement ignores modified `j`, `k`, and arrow keys instead of consuming unrelated pane input. (#1981, #2377, thanks @atomsbaza)
 - OpenCode panes now track the root conversation selected in their own TUI for native restore without adopting activity from attached clients. (#2450)
 - Server stop requests now bypass pane and API traffic, preventing busy sessions from blocking shutdown or admitting a client while shutdown is pending. (#2612)
+- Safe worktree removal now handles clean initialized submodules after checking the checkout and nested repositories for dirt.
 - Fish `Ctrl+Alt` keybindings now work in panes after legacy Alt-prefixed control bytes are decoded with both modifiers. (#2514)
 - Windows recent-history reads no longer perform redundant snapshots, restoring `recent` output while reducing read cost. (#962, #2474, thanks @Pimpmuckl)
 - The Windows installer now activates releases with an atomic directory swap, preventing interrupted updates from leaving an empty release directory. (#2356, #2530, thanks @Pimpmuckl)
@@ -114,6 +123,7 @@
 - Host terminal appearance is re-queried when focus returns, keeping automatic light and dark themes current. (#2416, #2417)
 - The bundled and installable Herdr agent skill now matches this stable release's CLI and lifecycle behavior. (#2847)
 - `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+- Remote attaches now open unhandled HTTP(S) pane links on the clicking client's desktop while plugin-handled `file://` links stay in the remote workspace.
 
 ## [0.8.0] - 2026-08-03
 

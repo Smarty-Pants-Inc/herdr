@@ -40,6 +40,35 @@ impl App {
         id
     }
 
+    pub(super) fn launch_created_worktree_session(
+        &self,
+        ws_idx: usize,
+        created_workspace: bool,
+    ) -> Result<(), String> {
+        if !created_workspace {
+            return Ok(());
+        }
+        let root_pane = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+            .map(|tab| tab.root_pane)
+            .ok_or_else(|| format!("created worktree workspace {ws_idx} has no root pane"))?;
+        let runtime = self
+            .lookup_runtime_sender(ws_idx, root_pane)
+            .ok_or_else(|| {
+                format!(
+                    "created worktree root pane {} has no runtime",
+                    root_pane.raw()
+                )
+            })?;
+        let input = crate::app::api_helpers::encode_api_submission(runtime, "sp");
+        runtime
+            .try_send_bytes(bytes::Bytes::from(input))
+            .map_err(|err| err.to_string())
+    }
+
     fn api_create_source_workspace_idx(&self, api: &ApiWorktreeAddRequest) -> Option<usize> {
         let Some(source_workspace_id) = api.source_workspace_id.as_ref() else {
             return self.find_parent_workspace_by_key(&api.repo_key);
@@ -75,7 +104,7 @@ impl App {
         }
         let git_space = workspace.git_space().cloned().or_else(|| {
             workspace
-                .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                .local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
@@ -439,6 +468,17 @@ impl App {
             self.state.mode = crate::app::Mode::Terminal;
         }
         self.state.mark_session_dirty();
+        if let Err(err) = self.launch_created_worktree_session(ws_idx, created_workspace) {
+            Self::send_api_response(
+                api.respond_to,
+                encode_error(
+                    api.id,
+                    "worktree_launch_failed",
+                    format!("created worktree but failed to launch sp: {err}"),
+                ),
+            );
+            return;
+        }
         if created_workspace {
             self.emit_workspace_open_events(ws_idx);
         }

@@ -240,6 +240,107 @@ test("OMP accepts POSIX and Windows session paths", async () => {
   expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
 });
 
+test("nested OMP sessions do not replace the root session", async () => {
+  const requests: unknown[] = [];
+  configureIntegrationEnvironment(
+    join(tmpdir(), `herdr-omp-nested-lock-${process.pid}-${importCounter}.sock`),
+  );
+  net.createConnection = (() => {
+    const handlers = new Map<string, (value?: unknown) => void>();
+    const socket = {
+      on(event: string, handler: (value?: unknown) => void) {
+        handlers.set(event, handler);
+        return socket;
+      },
+      destroy() {},
+      write(data: string) {
+        requests.push(JSON.parse(data));
+        queueMicrotask(() => handlers.get("data")?.());
+        return true;
+      },
+    };
+    queueMicrotask(() => handlers.get("connect")?.());
+    // The integration only uses this small net.Socket surface.
+    return socket;
+  }) as unknown as typeof net.createConnection;
+
+  const root = createExtensionHarness();
+  const moduleUrl = new URL("./omp/herdr-agent-state.ts", import.meta.url).href;
+  const { default: installRoot } = await importFresh("./omp/herdr-agent-state.ts");
+  installRoot(root.pi);
+  const rootContext = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-root.jsonl",
+      getSessionId: () => "omp-root",
+    },
+  };
+  root.handlers.get("session_start")?.({ reason: "startup" }, rootContext);
+  for (let turn = 0; turn < 20; turn += 1) {
+    await Promise.resolve();
+  }
+  expect(requests).toHaveLength(2);
+
+  const childSource = `
+    import net from "node:net";
+    let connections = 0;
+    net.createConnection = () => {
+      connections += 1;
+      const socket = { on() { return socket; }, destroy() {}, write() { return true; } };
+      return socket;
+    };
+    const handlers = new Map();
+    // Dynamic import is required because the parent test supplies the module file URL.
+    const { default: install } = await import(${JSON.stringify(moduleUrl)});
+    install({
+      on(event, handler) { handlers.set(event, handler); },
+      events: { on() { return () => {}; } },
+    });
+    const context = {
+      hasUI: true,
+      isIdle: () => false,
+      sessionManager: {
+        getSessionFile: () => "/tmp/omp-nested.jsonl",
+        getSessionId: () => "omp-nested",
+      },
+    };
+    handlers.get("session_start")?.({ reason: "startup" }, context);
+    handlers.get("agent_start")?.({}, context);
+    handlers.get("tool_execution_start")?.({ toolName: "bash", args: {} }, context);
+    handlers.get("agent_end")?.({ messages: [] }, context);
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    console.log(JSON.stringify({ connections }));
+  `;
+  const child = Bun.spawn([process.execPath, "-e", childSource], {
+    env: { ...process.env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+
+  expect(exitCode).toBe(0);
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual({ connections: 0 });
+  expect(requests.map((request) => (isRecord(request) ? request.method : undefined))).toEqual([
+    "pane.report_agent_session",
+    "pane.report_agent",
+  ]);
+  expect(
+    requests
+      .filter((request) => isRecord(request) && request.method === "pane.report_agent_session")
+      .map((request) =>
+        isRecord(request) && isRecord(request.params)
+          ? request.params.agent_session_path
+          : undefined,
+      ),
+  ).toEqual(["/tmp/omp-root.jsonl"]);
+});
+
 test("Pi reports idle only after the agent settles", async () => {
   const requests = await startRecordingServer("pi-settled");
   const { handlers, pi } = createExtensionHarness();
@@ -467,6 +568,60 @@ async function startDroppedFirstResponseServer(name: string) {
     connectionCount: () => connectionCount,
   };
 }
+async function startUnresponsiveServer(name: string): Promise<unknown[]> {
+  const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+
+  const requests: unknown[] = [];
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline !== -1) {
+        requests.push(JSON.parse(input.slice(0, newline)));
+      }
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  return requests;
+}
+
+test("Oh My Pi releases ahead of queued telemetry within the shutdown cap", async () => {
+  const requests = await startUnresponsiveServer("omp-shutdown-release");
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => "omp-session",
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requests.length === 1);
+
+  const shutdown = handlers.get("session_shutdown");
+  expect(shutdown).toBeDefined();
+  const startedAt = Date.now();
+  await shutdown?.({}, context);
+
+  expect(Date.now() - startedAt).toBeLessThan(2_000);
+  expect(requests.slice(0, 2).map((request) => isRecord(request) && request.method)).toEqual([
+    "pane.report_agent_session",
+    "pane.release_agent",
+  ]);
+});
 
 test("Oh My Pi retries working before a queued idle state", async () => {
   const { attemptedRequests } = await startDroppedFirstResponseServer("omp-retry");
@@ -537,6 +692,59 @@ test("Oh My Pi keeps working when a turn ends with a scheduled continuation", as
   expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
 });
 
+test("Oh My Pi reasserts working when a continuation starts a tool without agent_start", async () => {
+  const requests = await startRecordingServer("omp-tool-continuation");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("agent_end")?.({ messages: [] }, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  handlers.get("tool_execution_start")?.({ toolName: "hub", args: {} }, context);
+  await waitFor(() => requestStates(requests).length === 3);
+
+  expect(requestStates(requests)).toEqual(["working", "idle", "working"]);
+});
+
+test("Oh My Pi stays working when a continuation agent_end arrives after tool start", async () => {
+  const requests = await startRecordingServer("omp-nonterminal-agent-end");
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  const context = {
+    hasUI: true,
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => undefined,
+      getSessionId: () => undefined,
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+
+  handlers.get("tool_execution_start")?.({ toolName: "bash", args: {} }, context);
+  handlers.get("agent_end")?.({ messages: [], willContinue: true }, context);
+  await Bun.sleep(25);
+
+  expect(requestStates(requests)).toEqual(["working"]);
+});
 test("Pi retries working state after an unanswered socket attempt", async () => {
   const { attemptedRequests, deliveredRequests, connectionCount } =
     await startDroppedFirstResponseServer("pi-retry");

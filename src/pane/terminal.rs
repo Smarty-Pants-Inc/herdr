@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,7 +33,8 @@ use super::{
         maybe_filter_primary_screen_scrollback_clear, parse_reported_cwd,
         restore_host_terminal_theme_if_needed, write_host_terminal_theme_selective,
         AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
-        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker,
+        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker, RemoteExecReady,
+        RemoteExecReadyFilter, ReportedCwd,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -67,6 +68,41 @@ pub(crate) struct TerminalTextMatch {
     pub scan_cols: u16,
     pub scan_screen: crate::ghostty::ActiveScreen,
 }
+
+/// Identity of the retained terminal snapshot used by one search chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalTextSearchSnapshot {
+    pub screen: crate::ghostty::ActiveScreen,
+    pub cols: u16,
+    pub total_rows: u32,
+    pub content_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTextSearchChunkStatus {
+    Scanned,
+    SnapshotMismatch,
+    InsufficientBudget,
+    InvalidQuery,
+    Unavailable,
+}
+
+/// Bounded reverse search results for a retained terminal buffer chunk.
+///
+/// Rows use the absolute retained-buffer coordinate system. `start_row..end_row`
+/// is the searched reverse chunk; pass `start_row` as the next exclusive end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalTextSearchChunk {
+    pub matches: Vec<TerminalTextMatch>,
+    pub start_row: u32,
+    pub end_row: u32,
+    pub snapshot: Option<TerminalTextSearchSnapshot>,
+    pub status: TerminalTextSearchChunkStatus,
+}
+
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS: usize = 256;
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_CELLS: usize = 32 * 1024;
+pub(crate) const TERMINAL_TEXT_SEARCH_MAX_MATCHES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalWordMotion {
@@ -152,7 +188,8 @@ pub(crate) struct ProcessBytesResult {
     pub terminal_title_changed: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
-    pub reported_cwd: Option<std::path::PathBuf>,
+    pub reported_cwd: Option<ReportedCwd>,
+    pub remote_exec_ready: Option<RemoteExecReady>,
     pub terminal_responses: Vec<Bytes>,
 }
 
@@ -170,6 +207,7 @@ pub(crate) struct GhosttyPaneTerminal {
 
 pub(crate) struct GhosttyPaneCore {
     pub terminal: crate::ghostty::Terminal,
+    content_generation: u64,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -183,6 +221,7 @@ pub(crate) struct GhosttyPaneCore {
     pub child_default_foreground_changed: bool,
     pub child_default_background_changed: bool,
     pub osc_debug_tracker: OscDebugTracker,
+    remote_exec_ready_filter: RemoteExecReadyFilter,
     pub agent_osc_state: AgentOscStateTracker,
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
     decscusr_tracker: DecscusrTracker,
@@ -208,6 +247,23 @@ impl PaneTerminal {
     ) -> ProcessBytesResult {
         self.ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
+    }
+    #[cfg(unix)]
+    pub(crate) fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
+        self.ghostty.remote_exec_ready_filter_state()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn seed_remote_exec_ready_filter(&self, state: RemoteExecReadyFilter) {
+        self.ghostty.seed_remote_exec_ready_filter(state);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_remote_exec_ready_nonce(
+        &self,
+        nonce: Option<crate::execution::RemoteExecReadyNonce>,
+    ) {
+        self.ghostty.set_remote_exec_ready_nonce(nonce);
     }
 
     pub fn resize(
@@ -250,6 +306,98 @@ impl PaneTerminal {
             return Vec::new();
         };
         buffer.search(query, case_sensitive, active_screen)
+    }
+
+    pub(crate) fn search_text_matches_reverse_chunk(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        end_row_exclusive: u32,
+        max_cells: usize,
+        max_matches: usize,
+        expected_snapshot: Option<TerminalTextSearchSnapshot>,
+    ) -> TerminalTextSearchChunk {
+        let unavailable = || TerminalTextSearchChunk {
+            matches: Vec::new(),
+            start_row: 0,
+            end_row: 0,
+            snapshot: None,
+            status: TerminalTextSearchChunkStatus::Unavailable,
+        };
+        let (snapshot, start_row, end_row, buffer) = {
+            let Ok(core) = self.ghostty.core.lock() else {
+                return unavailable();
+            };
+            let (Ok(total_rows), Ok(cols), Ok(screen)) = (
+                core.terminal.total_rows(),
+                core.terminal.cols(),
+                core.terminal.active_screen(),
+            ) else {
+                return unavailable();
+            };
+            let snapshot = TerminalTextSearchSnapshot {
+                screen,
+                cols,
+                total_rows: u32::try_from(total_rows).unwrap_or(u32::MAX),
+                content_generation: core.content_generation,
+            };
+            let end_row = end_row_exclusive.min(snapshot.total_rows);
+            let empty = |status| TerminalTextSearchChunk {
+                matches: Vec::new(),
+                start_row: end_row,
+                end_row,
+                snapshot: Some(snapshot),
+                status,
+            };
+            let query_chars = query.chars().count();
+            if expected_snapshot.is_some_and(|expected| expected != snapshot) {
+                return empty(TerminalTextSearchChunkStatus::SnapshotMismatch);
+            }
+            if query.is_empty()
+                || query_chars > TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS
+                || max_cells == 0
+                || max_matches == 0
+            {
+                return empty(TerminalTextSearchChunkStatus::InvalidQuery);
+            }
+            let cols_usize = usize::from(cols);
+            let query_cells = crate::ghostty::unicode_text_width(query).max(1);
+            let Some((start_row, scan_end_row)) = terminal_text_search_chunk_range(
+                total_rows,
+                end_row as usize,
+                cols_usize,
+                max_cells,
+                query_cells,
+            ) else {
+                return empty(TerminalTextSearchChunkStatus::InsufficientBudget);
+            };
+            let mut buffer = RetainedTextBuffer::new_search_streamed(cols);
+            if core
+                .terminal
+                .visit_screen_text_rows_range(start_row, scan_end_row, |item| {
+                    buffer.push_search_item(item);
+                })
+                .is_err()
+            {
+                return unavailable();
+            }
+            buffer.finish_search_stream();
+            (snapshot, start_row as u32, end_row, buffer)
+        };
+        TerminalTextSearchChunk {
+            matches: buffer.search_bounded_reverse(
+                query,
+                case_sensitive,
+                snapshot.screen,
+                start_row,
+                end_row,
+                max_matches.min(TERMINAL_TEXT_SEARCH_MAX_MATCHES),
+            ),
+            start_row,
+            end_row,
+            snapshot: Some(snapshot),
+            status: TerminalTextSearchChunkStatus::Scanned,
+        }
     }
 
     pub(crate) fn text_match_is_current(&self, text_match: TerminalTextMatch) -> bool {
@@ -495,6 +643,27 @@ impl PaneTerminal {
         self.ghostty.visible_hyperlinks(area)
     }
 
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportHyperlink> {
+        self.ghostty
+            .hyperlink_at_viewport_cell(col, row, width, height)
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportLogicalLine> {
+        self.ghostty
+            .logical_line_at_viewport_row(row, width, height)
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
@@ -594,6 +763,32 @@ impl PaneTerminal {
         self.ghostty.encode_mouse_wheel(kind, position, modifiers)
     }
 }
+fn terminal_text_search_chunk_range(
+    total_rows: usize,
+    end_row: usize,
+    cols: usize,
+    max_cells: usize,
+    query_cells: usize,
+) -> Option<(usize, usize)> {
+    if cols == 0 || end_row == 0 {
+        return None;
+    }
+    let row_budget = max_cells.min(TERMINAL_TEXT_SEARCH_MAX_CELLS) / cols;
+    if row_budget == 0 {
+        return None;
+    }
+
+    let wanted_overlap_rows = query_cells.div_ceil(cols);
+    let available_overlap_rows = total_rows.saturating_sub(end_row);
+    let overlap_rows = wanted_overlap_rows.min(available_overlap_rows);
+    if row_budget <= overlap_rows {
+        return None;
+    }
+    let owned_rows = row_budget - overlap_rows;
+    let start_row = end_row.saturating_sub(owned_rows);
+    let scan_end_row = end_row.saturating_add(overlap_rows).min(total_rows);
+    Some((start_row, scan_end_row))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextClass {
@@ -640,6 +835,83 @@ impl RetainedTextBuffer {
         Self::build(cols, rows, row_offset, true, false)
     }
 
+    fn new_search_streamed(cols: u16) -> Self {
+        Self {
+            cols,
+            lines: vec![LogicalTextLine::default()],
+            atoms: Vec::new(),
+        }
+    }
+
+    fn push_search_item(&mut self, item: crate::ghostty::ScreenTextVisit<'_>) {
+        match item {
+            crate::ghostty::ScreenTextVisit::Cell {
+                row,
+                col,
+                wide,
+                graphemes,
+            } => {
+                if matches!(
+                    wide,
+                    crate::ghostty::CellWide::SpacerTail | crate::ghostty::CellWide::SpacerHead
+                ) {
+                    return;
+                }
+                let Ok(row) = u32::try_from(row) else {
+                    return;
+                };
+                let width = if wide == crate::ghostty::CellWide::Wide {
+                    2
+                } else {
+                    1
+                };
+                let line = self.lines.last_mut().expect("search line");
+                let byte_start = line.text.len();
+                append_terminal_cell_text(graphemes, &mut line.text);
+                line.spans.push(TextSpan {
+                    byte_start,
+                    byte_end: line.text.len(),
+                    start: TerminalTextPoint { row, col },
+                    end: TerminalTextPoint {
+                        row,
+                        col: col.saturating_add(width - 1),
+                    },
+                });
+            }
+            crate::ghostty::ScreenTextVisit::RowEnd { soft_wrapped, .. } => {
+                if !soft_wrapped {
+                    Self::trim_search_line(self.lines.last_mut().expect("search line"));
+                    self.lines.push(LogicalTextLine::default());
+                }
+            }
+        }
+    }
+
+    fn finish_search_stream(&mut self) {
+        if let Some(line) = self.lines.last_mut() {
+            Self::trim_search_line(line);
+        }
+        if self
+            .lines
+            .last()
+            .is_some_and(|line| line.text.is_empty() && line.spans.is_empty())
+        {
+            self.lines.pop();
+        }
+    }
+
+    fn trim_search_line(line: &mut LogicalTextLine) {
+        let trimmed_len = line.text.trim_end().len();
+        while line
+            .spans
+            .last()
+            .is_some_and(|span| span.byte_start >= trimmed_len)
+        {
+            line.spans.pop();
+        }
+        line.text.truncate(trimmed_len);
+    }
+
     fn new_words(cols: u16, rows: Vec<crate::ghostty::ScreenTextRow>, row_offset: u32) -> Self {
         Self::build(cols, rows, row_offset, false, true)
     }
@@ -654,6 +926,7 @@ impl RetainedTextBuffer {
         let mut lines = Vec::new();
         let mut line = LogicalTextLine::default();
         let mut atoms: Vec<TextAtom> = Vec::new();
+        let mut cell_text = String::new();
 
         for (row_idx, row) in rows.into_iter().enumerate() {
             let Some(row_idx) = u32::try_from(row_idx).ok() else {
@@ -684,19 +957,19 @@ impl RetainedTextBuffer {
                 } else {
                     1
                 };
-                let text = terminal_cell_text(&cell.graphemes);
                 let start = TerminalTextPoint { row: row_idx, col };
                 let end = TerminalTextPoint {
                     row: row_idx,
                     col: col.saturating_add(width - 1),
                 };
+                cell_text.clear();
+                append_terminal_cell_text(&cell.graphemes, &mut cell_text);
                 if build_lines {
                     let byte_start = line.text.len();
-                    line.text.push_str(&text);
-                    let byte_end = line.text.len();
+                    line.text.push_str(&cell_text);
                     line.spans.push(TextSpan {
                         byte_start,
-                        byte_end,
+                        byte_end: line.text.len(),
                         start,
                         end,
                     });
@@ -705,7 +978,7 @@ impl RetainedTextBuffer {
                     atoms.push(TextAtom {
                         point: Some(start),
                         end_col: end.col,
-                        class: text_class(&text),
+                        class: text_class(&cell_text),
                     });
                 }
             }
@@ -782,6 +1055,65 @@ impl RetainedTextBuffer {
                     scan_screen: active_screen,
                 });
             }
+        }
+        matches
+    }
+
+    fn search_bounded_reverse(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        active_screen: crate::ghostty::ActiveScreen,
+        start_row: u32,
+        end_row: u32,
+        max_matches: usize,
+    ) -> Vec<TerminalTextMatch> {
+        if query.is_empty() || max_matches == 0 {
+            return Vec::new();
+        }
+        let Ok(regex) = regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(!case_sensitive)
+            .build()
+        else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        for line in self.lines.iter().rev() {
+            let remaining = max_matches.saturating_sub(matches.len());
+            if remaining == 0 {
+                break;
+            }
+            let mut line_matches = VecDeque::new();
+            for found in regex.find_iter(&line.text) {
+                let Ok(start_index) = line
+                    .spans
+                    .binary_search_by_key(&found.start(), |span| span.byte_start)
+                else {
+                    continue;
+                };
+                let Ok(end_index) = line
+                    .spans
+                    .binary_search_by_key(&found.end(), |span| span.byte_end)
+                else {
+                    continue;
+                };
+                let start_span = &line.spans[start_index];
+                if start_span.start.row < start_row || start_span.start.row >= end_row {
+                    continue;
+                }
+                if line_matches.len() == remaining {
+                    line_matches.pop_front();
+                }
+                let end_span = &line.spans[end_index];
+                line_matches.push_back(TerminalTextMatch {
+                    start: start_span.start,
+                    end: end_span.end,
+                    source_fingerprint: text_fingerprint(found.as_str()),
+                    scan_cols: self.cols,
+                    scan_screen: active_screen,
+                });
+            }
+            matches.extend(line_matches.into_iter().rev());
         }
         matches
     }
@@ -987,16 +1319,18 @@ impl RetainedTextBuffer {
     }
 }
 
-fn terminal_cell_text(graphemes: &[u32]) -> String {
+fn append_terminal_cell_text(graphemes: &[u32], text: &mut String) {
     if graphemes.is_empty()
         || graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
     {
-        return " ".to_string();
+        text.push(' ');
+        return;
     }
-    graphemes
-        .iter()
-        .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect()
+    text.extend(
+        graphemes
+            .iter()
+            .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER)),
+    );
 }
 
 fn text_class(text: &str) -> TextClass {
@@ -1047,6 +1381,7 @@ impl GhosttyPaneTerminal {
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
+                content_generation: 0,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1060,6 +1395,7 @@ impl GhosttyPaneTerminal {
                 child_default_foreground_changed: false,
                 child_default_background_changed: false,
                 osc_debug_tracker: OscDebugTracker::default(),
+                remote_exec_ready_filter: RemoteExecReadyFilter::default(),
                 agent_osc_state: AgentOscStateTracker::default(),
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
                 decscusr_tracker: DecscusrTracker::default(),
@@ -1212,6 +1548,27 @@ impl GhosttyPaneTerminal {
             core.agent_osc_state.clear_retained();
         }
     }
+    #[cfg(unix)]
+    fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
+        self.core
+            .lock()
+            .map(|core| core.remote_exec_ready_filter.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn seed_remote_exec_ready_filter(&self, state: RemoteExecReadyFilter) {
+        if let Ok(mut core) = self.core.lock() {
+            core.remote_exec_ready_filter = state.validated_handoff_state();
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_remote_exec_ready_nonce(&self, nonce: Option<crate::execution::RemoteExecReadyNonce>) {
+        if let Ok(mut core) = self.core.lock() {
+            core.remote_exec_ready_filter.set_expected_nonce(nonce);
+        }
+    }
 
     pub fn process_pty_bytes(
         &self,
@@ -1230,6 +1587,7 @@ impl GhosttyPaneTerminal {
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
                 reported_cwd: None,
+                remote_exec_ready: None,
                 terminal_responses: Vec::new(),
             };
         };
@@ -1239,7 +1597,10 @@ impl GhosttyPaneTerminal {
         // Those effects must not be delivered as live pane output.
         let _ = core.terminal.take_bell_count();
         let _ = core.terminal.take_clipboard_writes();
-        let default_color_observation = core.default_color_tracker.observe(bytes);
+        let filtered_remote_exec = core.remote_exec_ready_filter.filter(bytes);
+        let remote_exec_ready = filtered_remote_exec.ready;
+        let bytes = filtered_remote_exec.bytes;
+        let default_color_observation = core.default_color_tracker.observe(bytes.as_ref());
         if shell_pid > 0 && default_color_observation {
             if let Some(owner_pgid) = current_transient_default_color_owner(shell_pid) {
                 core.transient_default_color_owner_pgid = Some(owner_pgid);
@@ -1250,7 +1611,7 @@ impl GhosttyPaneTerminal {
             }
         }
 
-        core.osc_debug_tracker.observe(bytes);
+        core.osc_debug_tracker.observe(bytes.as_ref());
         for event in core.osc_debug_tracker.drain_pending() {
             debug!(
                 pane = pane_id.raw(),
@@ -1259,7 +1620,7 @@ impl GhosttyPaneTerminal {
                 "agent OSC evidence observed"
             );
         }
-        let terminal_title_changed = core.agent_osc_state.observe(bytes);
+        let terminal_title_changed = core.agent_osc_state.observe(bytes.as_ref());
 
         let alternate_screen = core
             .terminal
@@ -1267,16 +1628,17 @@ impl GhosttyPaneTerminal {
             .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
             .unwrap_or(false);
         let filtered_bytes = if shell_pid > 0 {
-            let foreground_job = (!alternate_screen && contains_scrollback_clear_sequence(bytes))
-                .then(|| crate::detect::foreground_job(shell_pid))
-                .flatten();
+            let foreground_job = (!alternate_screen
+                && contains_scrollback_clear_sequence(bytes.as_ref()))
+            .then(|| crate::detect::foreground_job(shell_pid))
+            .flatten();
             maybe_filter_primary_screen_scrollback_clear(
-                bytes,
+                bytes.as_ref(),
                 alternate_screen,
                 foreground_job.as_ref(),
             )
         } else {
-            Cow::Borrowed(bytes)
+            Cow::Borrowed(bytes.as_ref())
         };
         if filtered_bytes.len() != bytes.len() {
             debug!(
@@ -1304,6 +1666,9 @@ impl GhosttyPaneTerminal {
             xtgettcap_responses,
             &mut terminal_responses,
         );
+        if !filtered_bytes.is_empty() {
+            core.content_generation = core.content_generation.wrapping_add(1);
+        }
         let terminal_bells = core.terminal.take_bell_count();
         let clipboard_writes = core.terminal.take_clipboard_writes();
         let reported_cwd = core
@@ -1337,18 +1702,24 @@ impl GhosttyPaneTerminal {
         }
         #[cfg(windows)]
         let reported_cwd = if core.windows_powershell_prompt_cwd_reporting {
-            reported_cwd.or_else(|| windows_powershell_current_prompt_cwd(&mut core))
+            reported_cwd
+                .or_else(|| windows_powershell_current_prompt_cwd(&mut core).map(|cwd| (cwd, None)))
         } else {
             reported_cwd
         };
 
-        let request_render = !synchronized_output;
-        let render_delay = render_delay_after_pty_write(
-            synchronized_output,
-            has_kitty_graphics_sequence,
-            cursor_position_settle_pending(&core),
-            CURSOR_POSITION_SETTLE_ENABLED,
-        );
+        let has_terminal_bytes = !filtered_bytes.is_empty();
+        let request_render = has_terminal_bytes && !synchronized_output;
+        let render_delay = has_terminal_bytes
+            .then(|| {
+                render_delay_after_pty_write(
+                    synchronized_output,
+                    has_kitty_graphics_sequence,
+                    cursor_position_settle_pending(&core),
+                    CURSOR_POSITION_SETTLE_ENABLED,
+                )
+            })
+            .flatten();
         if request_render {
             crate::render_prof::event("pty.request_render");
         }
@@ -1364,6 +1735,7 @@ impl GhosttyPaneTerminal {
             terminal_title_changed,
             terminal_bells,
             clipboard_writes,
+            remote_exec_ready,
             reported_cwd,
             terminal_responses,
         }
@@ -1452,6 +1824,7 @@ impl GhosttyPaneTerminal {
         #[cfg(windows)]
         core.kitty_keyboard.observe(ansi.as_bytes());
         core.terminal.write(ansi.as_bytes());
+        core.content_generation = core.content_generation.wrapping_add(1);
         #[cfg(windows)]
         windows_recent_fallback::update(&mut core);
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
@@ -1516,6 +1889,9 @@ impl GhosttyPaneTerminal {
         if input_state.modify_other_keys {
             core.terminal.write(b"\x1b[>4;2m");
         }
+        if input_state.alternate_screen || input_state.modify_other_keys {
+            core.content_generation = core.content_generation.wrapping_add(1);
+        }
 
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
@@ -1540,6 +1916,7 @@ impl GhosttyPaneTerminal {
         };
         core.kitty_keyboard.observe(ansi.as_bytes());
         core.terminal.write(ansi.as_bytes());
+        core.content_generation = core.content_generation.wrapping_add(1);
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
         }
@@ -1583,6 +1960,7 @@ impl GhosttyPaneTerminal {
             let _ = core
                 .terminal
                 .resize(cols, rows, cell_width_px, cell_height_px);
+            core.content_generation = core.content_generation.wrapping_add(1);
             let terminal_responses = self.drain_pending_pty_responses();
 
             let bottom_is_blank = ghostty_detection_text(&mut core)
@@ -2073,6 +2451,37 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    pub(crate) fn hyperlink_at_viewport_cell(
+        &self,
+        col: u16,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportHyperlink> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|mut core| {
+                ghostty_hyperlink_at_viewport_cell(&mut core, col, row, width, height).ok()
+            })
+            .flatten()
+    }
+
+    pub(crate) fn logical_line_at_viewport_row(
+        &self,
+        row: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<ViewportLogicalLine> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|mut core| {
+                ghostty_logical_line_at_viewport_row(&mut core, row, width, height).ok()
+            })
+            .flatten()
+    }
+
     pub fn kitty_image_placements_with_data_filter<F>(
         &self,
         needs_data: F,
@@ -2299,6 +2708,26 @@ fn cursor_state_from_render_state(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewportHyperlink {
+    pub(crate) uri: String,
+    pub(crate) cells: Vec<(u16, u16)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ViewportTextCell {
+    pub(crate) byte_index: usize,
+    pub(crate) viewport_col: u16,
+    pub(crate) viewport_row: u16,
+    pub(crate) width: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ViewportLogicalLine {
+    pub(crate) text: String,
+    pub(crate) cells: Vec<ViewportTextCell>,
+}
+
 type VisibleHyperlinks = Vec<((u16, u16), String, String)>;
 
 fn ghostty_clear_render_dirty(render_state: &mut crate::ghostty::RenderState, area_height: u16) {
@@ -2474,6 +2903,121 @@ fn ghostty_collect_dirty_patch(
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
         rows: patch_rows
     }));
+}
+
+fn ghostty_hyperlink_at_viewport_cell(
+    core: &mut GhosttyPaneCore,
+    col: u16,
+    row: u16,
+    width: u16,
+    height: u16,
+) -> Result<Option<ViewportHyperlink>, crate::ghostty::Error> {
+    let width = width.min(core.terminal.cols()?);
+    let height = height.min(core.terminal.rows()?);
+    if col >= width || row >= height {
+        return Ok(None);
+    }
+    let Some(uri) = core.terminal.viewport_hyperlink_uri(col, row.into())? else {
+        return Ok(None);
+    };
+    let mut first = (col, row);
+    loop {
+        let candidate = if first.0 > 0 {
+            Some((first.0 - 1, first.1))
+        } else if first.1 > 0 && core.terminal.viewport_wrap_state(first.1.into())?.1 {
+            Some((width - 1, first.1 - 1))
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else {
+            break;
+        };
+        if core
+            .terminal
+            .viewport_hyperlink_uri(candidate.0, candidate.1.into())?
+            .as_deref()
+            != Some(uri.as_str())
+        {
+            break;
+        }
+        first = candidate;
+    }
+    let mut cells = Vec::new();
+    let mut current = first;
+    loop {
+        if core
+            .terminal
+            .viewport_hyperlink_uri(current.0, current.1.into())?
+            .as_deref()
+            != Some(uri.as_str())
+        {
+            break;
+        }
+        cells.push(current);
+        let candidate = if current.0.saturating_add(1) < width {
+            Some((current.0 + 1, current.1))
+        } else if current.1.saturating_add(1) < height
+            && core.terminal.viewport_wrap_state(current.1.into())?.0
+        {
+            Some((0, current.1 + 1))
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else {
+            break;
+        };
+        current = candidate;
+    }
+    Ok(Some(ViewportHyperlink { uri, cells }))
+}
+
+fn ghostty_logical_line_at_viewport_row(
+    core: &mut GhosttyPaneCore,
+    row: u16,
+    width: u16,
+    height: u16,
+) -> Result<Option<ViewportLogicalLine>, crate::ghostty::Error> {
+    let width = width.min(core.terminal.cols()?);
+    let height = height.min(core.terminal.rows()?);
+    if width == 0 || row >= height {
+        return Ok(None);
+    }
+    let mut first = row;
+    while first > 0 && core.terminal.viewport_wrap_state(first.into())?.1 {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < height && core.terminal.viewport_wrap_state(last.into())?.0 {
+        last += 1;
+    }
+    let mut text = String::new();
+    let mut cells = Vec::new();
+    for (row_offset, screen_row) in core
+        .terminal
+        .viewport_text_rows_range(first, last.saturating_add(1))?
+        .into_iter()
+        .enumerate()
+    {
+        let viewport_row = first.saturating_add(row_offset as u16);
+        for (viewport_col, cell) in screen_row.cells.into_iter().enumerate() {
+            let width = match cell.wide {
+                crate::ghostty::CellWide::Wide => 2,
+                crate::ghostty::CellWide::Narrow => 1,
+                crate::ghostty::CellWide::SpacerHead | crate::ghostty::CellWide::SpacerTail => {
+                    continue;
+                }
+            };
+            let byte_index = text.len();
+            append_terminal_cell_text(&cell.graphemes, &mut text);
+            cells.push(ViewportTextCell {
+                byte_index,
+                viewport_col: viewport_col as u16,
+                viewport_row,
+                width,
+            });
+        }
+    }
+    Ok(Some(ViewportLogicalLine { text, cells }))
 }
 
 fn ghostty_visible_hyperlinks(
@@ -3398,7 +3942,7 @@ mod tests {
             },
             crate::ghostty::ScreenTextCell {
                 wide: crate::ghostty::CellWide::SpacerTail,
-                graphemes: Vec::new(),
+                graphemes: Box::default(),
             },
         ]
     }
@@ -3452,6 +3996,221 @@ mod tests {
         assert_eq!(matches[0].end, TerminalTextPoint { row: 1, col: 0 });
         assert!(search_primary(&buffer, "hab", true).is_empty());
     }
+    #[test]
+    fn retained_text_bounded_reverse_search_paginates_and_caps() {
+        let buffer = RetainedTextBuffer::new(
+            6,
+            vec![
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("skip  ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+                text_row("hit   ".chars().map(|ch| text_cell(&ch.to_string())), false),
+            ],
+        );
+
+        let newest = buffer.search_bounded_reverse(
+            "hit",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            2,
+            4,
+            1,
+        );
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].start.row, 3);
+
+        let older = buffer.search_bounded_reverse(
+            "hit",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            0,
+            2,
+            4,
+        );
+        assert_eq!(
+            older
+                .into_iter()
+                .map(|text_match| text_match.start.row)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_chunks_cap_overlap_and_paginate_to_zero() {
+        let cols = 80;
+        let total_rows = 900;
+        let cell_budget = TERMINAL_TEXT_SEARCH_MAX_CELLS;
+        let mut end_row = total_rows;
+        let mut matched_rows = Vec::new();
+
+        while end_row > 0 {
+            let (start_row, scan_end_row) = terminal_text_search_chunk_range(
+                total_rows,
+                end_row,
+                cols,
+                cell_budget,
+                "needle".len() * 2,
+            )
+            .unwrap();
+            assert!(start_row < end_row);
+            assert!((scan_end_row - start_row) * cols <= cell_budget);
+
+            let rows = (start_row..scan_end_row)
+                .map(|_| text_row("needle".chars().map(|ch| text_cell(&ch.to_string())), false));
+            let buffer =
+                RetainedTextBuffer::new_search(cols as u16, rows.collect(), start_row as u32);
+            matched_rows.extend(
+                buffer
+                    .search_bounded_reverse(
+                        "needle",
+                        true,
+                        crate::ghostty::ActiveScreen::Primary,
+                        start_row as u32,
+                        end_row as u32,
+                        TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+                    )
+                    .into_iter()
+                    .map(|text_match| text_match.start.row as usize),
+            );
+            end_row = start_row;
+        }
+
+        assert_eq!(matched_rows, (0..total_rows).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn terminal_text_search_overlap_uses_display_cells() {
+        let query = "👩‍💻";
+        let query_cells = crate::ghostty::unicode_text_width(query);
+        assert_eq!(query_cells, 2);
+        assert_eq!(
+            terminal_text_search_chunk_range(10, 7, 4, 8, query_cells),
+            Some((6, 8))
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_rejects_content_changed_between_chunks() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(12, 3, 100).unwrap();
+        terminal.write(b"alpha needle");
+        let pane = PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap());
+
+        let first = pane.search_text_matches_reverse_chunk(
+            "needle",
+            true,
+            u32::MAX,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+            None,
+        );
+        assert_eq!(first.status, TerminalTextSearchChunkStatus::Scanned);
+
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\roverwrite", &tx);
+        let second = pane.search_text_matches_reverse_chunk(
+            "needle",
+            true,
+            first.start_row,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+            first.snapshot,
+        );
+        assert_eq!(
+            second.status,
+            TerminalTextSearchChunkStatus::SnapshotMismatch
+        );
+    }
+
+    #[test]
+    fn terminal_text_search_chunk_requires_room_for_soft_wrap_overlap() {
+        assert_eq!(terminal_text_search_chunk_range(10, 7, 80, 80, 2), None);
+        assert_eq!(
+            terminal_text_search_chunk_range(10, 10, 80, 80, 2),
+            Some((9, 10))
+        );
+        assert_eq!(terminal_text_search_chunk_range(10, 7, 80, 79, 2), None);
+    }
+
+    #[test]
+    fn terminal_text_search_chunks_keep_soft_wrap_overlap_within_cell_cap() {
+        let cols = 80;
+        let total_rows = 1_000;
+        let end_row = 498;
+        let (start_row, scan_end_row) = terminal_text_search_chunk_range(
+            total_rows,
+            end_row,
+            cols,
+            TERMINAL_TEXT_SEARCH_MAX_CELLS,
+            "needle".len() * 2,
+        )
+        .unwrap();
+        assert!((scan_end_row - start_row) * cols <= TERMINAL_TEXT_SEARCH_MAX_CELLS);
+        assert!(scan_end_row > end_row);
+
+        let rows = (start_row..scan_end_row).map(|row| match row {
+            row if row == end_row - 1 => {
+                text_row("nee".chars().map(|ch| text_cell(&ch.to_string())), true)
+            }
+            row if row == end_row => {
+                text_row("dle".chars().map(|ch| text_cell(&ch.to_string())), false)
+            }
+            _ => text_row("skip".chars().map(|ch| text_cell(&ch.to_string())), false),
+        });
+        let buffer = RetainedTextBuffer::new_search(cols as u16, rows.collect(), start_row as u32);
+
+        let matches = buffer.search_bounded_reverse(
+            "needle",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            start_row as u32,
+            end_row as u32,
+            TERMINAL_TEXT_SEARCH_MAX_MATCHES,
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start.row, (end_row - 1) as u32);
+        assert_eq!(matches[0].end.row, end_row as u32);
+    }
+    #[test]
+    fn retained_text_bounded_reverse_search_keeps_soft_wrap_overlap() {
+        let buffer = RetainedTextBuffer::new(
+            5,
+            vec![
+                text_row("abcde".chars().map(|ch| text_cell(&ch.to_string())), true),
+                text_row("fgh  ".chars().map(|ch| text_cell(&ch.to_string())), false),
+            ],
+        );
+
+        let matches = buffer.search_bounded_reverse(
+            "def",
+            true,
+            crate::ghostty::ActiveScreen::Primary,
+            0,
+            1,
+            4,
+        );
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start, TerminalTextPoint { row: 0, col: 3 });
+        assert_eq!(matches[0].end, TerminalTextPoint { row: 1, col: 0 });
+    }
+
+    #[test]
+    fn retained_text_bounded_reverse_search_handles_empty_limits() {
+        let buffer = RetainedTextBuffer::new(
+            5,
+            vec![text_row(
+                "hit  ".chars().map(|ch| text_cell(&ch.to_string())),
+                false,
+            )],
+        );
+
+        assert!(buffer
+            .search_bounded_reverse("", true, crate::ghostty::ActiveScreen::Primary, 0, 1, 4,)
+            .is_empty());
+        assert!(buffer
+            .search_bounded_reverse("hit", true, crate::ghostty::ActiveScreen::Primary, 0, 1, 0,)
+            .is_empty());
+    }
 
     #[test]
     fn retained_text_search_maps_wide_and_combining_graphemes_to_cells() {
@@ -3476,7 +4235,7 @@ mod tests {
             .collect::<Vec<_>>();
         first.push(crate::ghostty::ScreenTextCell {
             wide: crate::ghostty::CellWide::SpacerHead,
-            graphemes: Vec::new(),
+            graphemes: Box::default(),
         });
         let mut second = wide_text_cells("界").to_vec();
         second.extend("xyz".chars().map(|ch| text_cell(&ch.to_string())));
@@ -3497,7 +4256,7 @@ mod tests {
             .collect::<Vec<_>>();
         first.push(crate::ghostty::ScreenTextCell {
             wide: crate::ghostty::CellWide::SpacerHead,
-            graphemes: Vec::new(),
+            graphemes: Box::default(),
         });
         let mut second = wide_text_cells("界").to_vec();
         second.extend("xyz".chars().map(|ch| text_cell(&ch.to_string())));
@@ -3786,19 +4545,26 @@ mod tests {
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
 
-        let partial = pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file:///tmp/herdr%20", &tx);
+        let partial =
+            pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file://build-host/tmp/herdr%20", &tx);
         assert_eq!(partial.reported_cwd, None);
 
         let completed = pane.process_pty_bytes(pane_id, 0, b"repo\x07", &tx);
         #[cfg(not(windows))]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("/tmp/herdr repo"))
+            Some((
+                std::path::PathBuf::from("/tmp/herdr repo"),
+                Some("build-host".into())
+            ))
         );
         #[cfg(windows)]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("\\tmp\\herdr repo"))
+            Some((
+                std::path::PathBuf::from("\\tmp\\herdr repo"),
+                Some("build-host".into())
+            ))
         );
 
         let latest = pane.process_pty_bytes(
@@ -3809,8 +4575,52 @@ mod tests {
         );
         assert_eq!(
             latest.reported_cwd,
-            Some(std::path::PathBuf::from("/tmp/iterm2"))
+            Some((std::path::PathBuf::from("/tmp/iterm2"), None))
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn process_pty_bytes_requires_exact_remote_ready_nonce() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        let expected = crate::execution::RemoteExecReadyNonce::generate().unwrap();
+        let wrong = crate::execution::RemoteExecReadyNonce::generate().unwrap();
+
+        let spoof = format!(
+            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"spoof\"}}\x1b\\",
+            wrong.as_str()
+        );
+        let spoof_result = pane.process_pty_bytes(pane_id, 0, spoof.as_bytes(), &tx);
+        assert_eq!(spoof_result.remote_exec_ready, None);
+
+        pane.set_remote_exec_ready_nonce(Some(expected.clone()));
+        let first = pane.process_pty_bytes(
+            pane_id,
+            0,
+            format!(
+                "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"build",
+                expected.as_str()
+            )
+            .as_bytes(),
+            &tx,
+        );
+        assert_eq!(first.remote_exec_ready, None);
+        let second = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"-node\",\"cwd\":\"/remote/plugin-root\"}\x1b\\",
+            &tx,
+        );
+        assert_eq!(
+            second.remote_exec_ready,
+            Some(RemoteExecReady {
+                hostname: Some("build-node".into()),
+                cwd: Some("/remote/plugin-root".into()),
+            })
+        );
+        assert!(pane.detection_text().trim().is_empty());
     }
 
     #[test]
@@ -3949,7 +4759,7 @@ mod tests {
 
         let result = process_windows_powershell_prompt_bytes(bytes.as_bytes(), 80, 24, true);
 
-        assert_eq!(result.reported_cwd.as_ref(), Some(&cwd));
+        assert_eq!(result.reported_cwd.as_ref(), Some(&(cwd, None)));
     }
 
     #[cfg(windows)]
@@ -3960,7 +4770,7 @@ mod tests {
 
         let result = process_windows_powershell_prompt_bytes(bytes.as_bytes(), 12, 8, true);
 
-        assert_eq!(result.reported_cwd.as_ref(), Some(&cwd));
+        assert_eq!(result.reported_cwd.as_ref(), Some(&(cwd, None)));
     }
 
     #[cfg(windows)]

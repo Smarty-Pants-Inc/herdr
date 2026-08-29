@@ -25,6 +25,17 @@ pub(crate) struct PopupPaneState {
     pub height: Option<crate::popup_size::PopupSize>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspacePluginPaneState {
+    pub pane_id: PaneId,
+    pub terminal_id: crate::terminal::TerminalId,
+    pub plugin_id: String,
+    pub entrypoint: String,
+    pub width: Option<crate::popup_size::PopupSize>,
+    pub focused: bool,
+    pub collapsed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -877,6 +888,8 @@ pub struct ViewState {
     pub tab_scroll_right_hit_area: Rect,
     pub new_tab_hit_area: Rect,
     pub terminal_area: Rect,
+    pub workspace_plugin_pane_outer: Rect,
+    pub workspace_plugin_pane_inner: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
@@ -893,6 +906,7 @@ pub enum Mode {
     Prefix,
     Copy,
     Terminal,
+    Findr,
     RenameWorkspace,
     RenameTab,
     RenamePane,
@@ -1069,6 +1083,60 @@ pub(crate) struct CopyModeSearchState {
     pub geometry: Option<(u16, u16)>,
 }
 
+pub(crate) const FINDR_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(24);
+pub(crate) use crate::pane::{
+    TERMINAL_TEXT_SEARCH_MAX_CELLS as FINDR_SCAN_MAX_CELLS,
+    TERMINAL_TEXT_SEARCH_MAX_MATCHES as FINDR_MAX_MATCHES,
+    TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS as FINDR_MAX_QUERY_CHARS,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FindrState {
+    pub pane_id: PaneId,
+    pub query: String,
+    pub scrollback: bool,
+    pub matches: Vec<crate::pane::TerminalTextMatch>,
+    pub visible_range: Option<(u32, u32)>,
+    pub visible_geometry: Option<(u16, u16)>,
+    pub scan_snapshot: Option<crate::pane::TerminalTextSearchSnapshot>,
+    pub scan_start_row: u32,
+    pub scan_end_row_exclusive: u32,
+    pub complete: bool,
+    pub budget_limited: bool,
+    pub capped: bool,
+}
+
+impl FindrState {
+    pub(crate) fn new(pane_id: PaneId) -> Self {
+        Self {
+            pane_id,
+            query: String::new(),
+            scrollback: false,
+            matches: Vec::new(),
+            visible_range: None,
+            visible_geometry: None,
+            scan_snapshot: None,
+            scan_start_row: 0,
+            scan_end_row_exclusive: 0,
+            complete: true,
+            budget_limited: false,
+            capped: false,
+        }
+    }
+
+    pub(crate) fn reset_scan(&mut self) {
+        self.matches.clear();
+        self.visible_range = None;
+        self.visible_geometry = None;
+        self.scan_snapshot = None;
+        self.scan_start_row = 0;
+        self.scan_end_row_exclusive = 0;
+        self.complete = self.query.is_empty();
+        self.budget_limited = false;
+        self.capped = false;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AgentPanelSort {
     #[default]
@@ -1233,6 +1301,11 @@ pub(crate) enum DragTarget {
         grab_row_offset: u16,
     },
     SidebarDivider,
+    WorkspacePluginDivider {
+        workspace_id: String,
+        right_edge: u16,
+        available_width: u16,
+    },
     SidebarSectionDivider,
 }
 
@@ -1487,6 +1560,7 @@ pub struct AppState {
     pub navigator: NavigatorState,
     pub copy_mode: Option<CopyModeState>,
     pub workspace_scroll: usize,
+    pub findr: Option<FindrState>,
     pub agent_panel_scroll: usize,
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
@@ -1500,6 +1574,10 @@ pub struct AppState {
     pub selection: Option<Selection>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub context_menu: Option<ContextMenuState>,
+    /// Pointer cell last resolved for terminal-link hover; reset with the rendered link.
+    pub(crate) hovered_pane_cell: Option<crate::app::PaneHoverPosition>,
+    /// Presentation-only terminal link cells under the pointer.
+    pub(crate) hovered_link: Option<crate::app::HoveredPaneLink>,
     // Notifications
     pub update_available: Option<String>,
     pub update_install_command: String,
@@ -1605,6 +1683,8 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// Optional right-edge plugin terminal attached to each workspace.
+    pub(crate) workspace_plugin_panes: std::collections::HashMap<String, WorkspacePluginPaneState>,
     /// Session-modal terminal popup. This is intentionally outside workspace layouts.
     pub(crate) popup_pane: Option<PopupPaneState>,
     /// Recent plugin action/event command executions.
@@ -1871,6 +1951,7 @@ impl AppState {
             keybind_help: KeybindHelpState::default(),
             navigator: NavigatorState::default(),
             copy_mode: None,
+            findr: None,
             workspace_scroll: 0,
             agent_panel_scroll: 0,
             tab_scroll: 0,
@@ -1886,6 +1967,8 @@ impl AppState {
                 tab_scroll_right_hit_area: Rect::default(),
                 new_tab_hit_area: Rect::default(),
                 terminal_area: Rect::default(),
+                workspace_plugin_pane_outer: Rect::default(),
+                workspace_plugin_pane_inner: Rect::default(),
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
@@ -1898,6 +1981,8 @@ impl AppState {
             selection: None,
             selection_autoscroll: None,
             context_menu: None,
+            hovered_pane_cell: None,
+            hovered_link: None,
             update_available: None,
             update_install_command: "herdr update".into(),
             latest_release_notes_available: false,
@@ -1991,6 +2076,7 @@ impl AppState {
             integration_install_messages: Vec::new(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
+            workspace_plugin_panes: std::collections::HashMap::new(),
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
@@ -2066,6 +2152,10 @@ impl AppState {
             assert!(
                 self.copy_mode.is_none(),
                 "empty app state must not keep copy mode"
+            );
+            assert!(
+                self.findr.is_none(),
+                "empty app state must not keep Findr state"
             );
             assert!(
                 self.rename_pane_target.is_none(),
@@ -2210,6 +2300,32 @@ impl AppState {
         }
         if let Some(focus) = &self.previous_pane_focus {
             assert_workspace_pane(&focus.workspace_id, focus.pane_id, "previous pane focus");
+        }
+        if let Some(findr) = &self.findr {
+            assert!(
+                pane_ids.contains(&findr.pane_id)
+                    || self
+                        .workspace_plugin_panes
+                        .values()
+                        .any(|pane| pane.pane_id == findr.pane_id),
+                "Findr references missing pane {:?}",
+                findr.pane_id
+            );
+            assert_eq!(self.mode, Mode::Findr, "Findr state requires Findr mode");
+            assert_eq!(
+                self.active
+                    .and_then(|ws_idx| self.focused_terminal_pane_id(ws_idx)),
+                Some(findr.pane_id),
+                "Findr must target the effective focused terminal pane"
+            );
+            assert!(
+                findr.query.chars().count() <= FINDR_MAX_QUERY_CHARS,
+                "Findr query exceeds limit"
+            );
+            assert!(
+                findr.matches.len() <= FINDR_MAX_MATCHES,
+                "Findr match limit exceeded"
+            );
         }
         if let Some(toast) = &self.toast {
             if let Some(target) = &toast.target {

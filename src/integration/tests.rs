@@ -49,6 +49,7 @@ fn agent_version_requirement_only_set_for_kimi() {
 
 #[test]
 fn enforce_agent_version_warns_when_binary_missing() {
+    let _lock = integration_env_lock();
     let requirement = AgentVersionRequirement {
         label: "kimi code",
         binary: "herdr-test-binary-that-does-not-exist",
@@ -65,6 +66,7 @@ fn enforce_agent_version_warns_when_binary_missing() {
 #[cfg(unix)]
 #[test]
 fn enforce_agent_version_rejects_old_version() {
+    let _lock = integration_env_lock();
     let requirement = AgentVersionRequirement {
         label: "kimi code",
         binary: "echo",
@@ -81,6 +83,7 @@ fn enforce_agent_version_rejects_old_version() {
 #[cfg(unix)]
 #[test]
 fn enforce_agent_version_accepts_current_version() {
+    let _lock = integration_env_lock();
     let requirement = AgentVersionRequirement {
         label: "kimi code",
         binary: "echo",
@@ -208,8 +211,7 @@ fn windows_availability_includes_native_integrations() {
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let _path = set_test_path(bin.as_os_str().to_owned());
 
     fs::write(bin.join("pi.cmd"), "@echo off\r\n").unwrap();
     fs::write(bin.join("omp.cmd"), "@echo off\r\n").unwrap();
@@ -231,11 +233,6 @@ fn windows_availability_includes_native_integrations() {
     assert!(integration_target_available(IntegrationTarget::Mastracode));
     assert!(integration_target_available(IntegrationTarget::Grok));
 
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -248,8 +245,7 @@ fn command_available_requires_executable_file_on_path() {
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let _path = set_test_path(bin.as_os_str().to_owned());
 
     let command = bin.join("claude");
     fs::write(&command, "#!/bin/sh\n").unwrap();
@@ -259,11 +255,6 @@ fn command_available_requires_executable_file_on_path() {
     fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(command_available("claude"));
 
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -274,8 +265,7 @@ fn command_available_finds_windows_command_shims_on_path() {
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let _path = set_test_path(bin.as_os_str().to_owned());
 
     fs::write(bin.join("claude.cmd"), "@echo off\r\n").unwrap();
     assert!(command_available("claude"));
@@ -285,11 +275,6 @@ fn command_available_finds_windows_command_shims_on_path() {
 
     assert!(!command_available("missing-agent"));
 
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -300,8 +285,7 @@ fn qodercli_availability_checks_windows_aliases() {
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let _path = set_test_path(bin.as_os_str().to_owned());
 
     fs::write(bin.join("qoder.cmd"), "@echo off\r\n").unwrap();
 
@@ -309,11 +293,6 @@ fn qodercli_availability_checks_windows_aliases() {
         crate::api::schema::IntegrationTarget::Qodercli
     ));
 
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -329,11 +308,10 @@ fn hermes_layout_makes_target_available() {
     let original_hermes_home = std::env::var_os(HERMES_HOME_ENV_VAR);
     let original_home = std::env::var_os("HOME");
     let original_local_app_data = std::env::var_os("LOCALAPPDATA");
-    let original_path = std::env::var_os("PATH");
     std::env::remove_var(HERMES_HOME_ENV_VAR);
     std::env::remove_var("HOME");
     std::env::set_var("LOCALAPPDATA", &local_app_data);
-    std::env::set_var("PATH", "");
+    let _path = set_test_path("");
 
     assert!(hermes_install_layout_available());
     assert!(integration_target_available(
@@ -355,11 +333,6 @@ fn hermes_layout_makes_target_available() {
     } else {
         std::env::remove_var("LOCALAPPDATA");
     }
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
-    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -376,9 +349,8 @@ fn codex_availability_finds_standalone_binary_under_codex_home() {
     fs::write(&binary, "").unwrap();
     make_executable(&binary).unwrap();
     let original_home = std::env::var_os("HOME");
-    let original_path = std::env::var_os("PATH");
     std::env::set_var("HOME", &home);
-    std::env::set_var("PATH", "");
+    let _path = set_test_path("");
 
     assert!(integration_target_available(
         crate::api::schema::IntegrationTarget::Codex
@@ -388,11 +360,6 @@ fn codex_availability_finds_standalone_binary_under_codex_home() {
         std::env::set_var("HOME", home);
     } else {
         std::env::remove_var("HOME");
-    }
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -410,9 +377,8 @@ fn integration_recommendations_mark_standalone_codex_available() {
     fs::write(&binary, "").unwrap();
     make_executable(&binary).unwrap();
     let original_home = std::env::var_os("HOME");
-    let original_path = std::env::var_os("PATH");
     std::env::set_var("HOME", &home);
-    std::env::set_var("PATH", "");
+    let _path = set_test_path("");
 
     let codex = integration_recommendations()
         .into_iter()
@@ -429,11 +395,6 @@ fn integration_recommendations_mark_standalone_codex_available() {
         std::env::set_var("HOME", home);
     } else {
         std::env::remove_var("HOME");
-    }
-    if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
-    } else {
-        std::env::remove_var("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -2763,6 +2724,7 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_start\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"agent_end\""));
     assert!(OMP_EXTENSION_ASSET.contains("pi.on(\"session_shutdown\""));
+    assert!(OMP_EXTENSION_ASSET.contains("pane.release_agent"));
     assert!(
         CLAUDE_HOOK_ASSET.contains("agent_session_id")
             || CLAUDE_HOOK_ASSET.contains("--agent-session-id")
@@ -2868,10 +2830,13 @@ fn bundled_integration_assets_report_session_refs() {
 }
 
 #[test]
-fn process_owned_integration_assets_do_not_report_release() {
+fn integration_asset_release_policy_keeps_omp_as_the_only_exception() {
+    assert!(
+        OMP_EXTENSION_ASSET.contains("pane.release_agent"),
+        "OMP reports remote lifecycle release because no local process detector exists"
+    );
     for (name, asset) in [
         ("pi", PI_EXTENSION_ASSET),
-        ("omp", OMP_EXTENSION_ASSET),
         ("mastracode", MASTRACODE_HOOK_ASSET),
         ("kimi", KIMI_HOOK_ASSET),
         ("kilo", KILO_PLUGIN_ASSET),
@@ -3037,11 +3002,14 @@ fn omp_ask_and_approval_events_report_blocked_state() {
         .find("deactivateBlocked();")
         .expect("approval resolution should unblock the pane");
 
-    let ask_handler = omp_handler("tool_execution_start");
-    ask_handler
-        .find("event?.toolName !== \"ask\"")
-        .expect("tool execution handler should only treat Ask as blocked");
-    ask_handler
+    let tool_start_handler = omp_handler("tool_execution_start");
+    tool_start_handler
+        .find("agentActive = true;")
+        .expect("tool execution should reassert working after continuation resumes");
+    tool_start_handler
+        .find("event?.toolName === \"ask\"")
+        .expect("tool execution should identify Ask for blocked state");
+    tool_start_handler
         .find("activateBlocked(askBlockedMessage(event.args));")
         .expect("Ask start should block the pane");
 

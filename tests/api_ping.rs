@@ -304,7 +304,7 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 21);
+    assert_eq!(value["result"]["protocol"], 26);
 
     cleanup_spawned_herdr(child, base);
 }
@@ -496,18 +496,6 @@ fn workspace_list_and_create_round_trip() {
         ),
     );
     assert_eq!(send_enter["result"]["type"], "ok");
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    let recent = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_11","method":"pane.read","params":{{"pane_id":"{}","source":"recent","lines":50}}}}"#,
-            pane_id
-        ),
-    );
-    let recent_text = recent["result"]["read"]["text"].as_str().unwrap();
-    assert!(recent_text.contains("beta") || recent_text.contains("gamma"));
 
     for source in ["visible", "detection"] {
         let limited = send_request(

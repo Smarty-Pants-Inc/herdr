@@ -698,6 +698,12 @@
           "description": "Enter keyboard copy mode for the focused pane."
         },
         {
+          "key": "keys.findr",
+          "type": "keybinding",
+          "default": "\"cmd+f\" on macOS; \"ctrl+alt+f\" elsewhere",
+          "description": "Open Findr to search text in the focused pane."
+        },
+        {
           "key": "keys.focus_pane_left",
           "type": "keybinding",
           "default": "\"prefix+h\"",
@@ -1083,10 +1089,11 @@
           "key": "ui.toast.delivery",
           "type": "enum",
           "default": "\"off\"",
-          "description": "Popup notification delivery. off disables popups, herdr shows in-app toasts, terminal asks the outer terminal for a desktop notification, system asks the OS notification service directly.",
+          "description": "Popup notification delivery. off disables popups, herdr shows in-app toasts, hybrid shows in-app toasts while the outer terminal is focused or its focus is unknown and asks the OS notification service when it is unfocused, terminal asks the outer terminal for a desktop notification, system asks the OS notification service directly.",
           "values": [
             "off",
             "herdr",
+            "hybrid",
             "terminal",
             "system"
           ]

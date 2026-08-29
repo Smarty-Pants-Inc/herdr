@@ -142,13 +142,14 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
                 &[
                     ("off", ToastDelivery::Off),
                     ("inside herdr", ToastDelivery::Herdr),
+                    ("system when unfocused", ToastDelivery::Hybrid),
                     ("via terminal", ToastDelivery::Terminal),
                     ("via system", ToastDelivery::System),
                 ],
                 app.toast_delivery(),
                 app.settings.list.selected,
                 p,
-                2,
+                1,
             );
         }
         SettingsSection::PaneLabels => {

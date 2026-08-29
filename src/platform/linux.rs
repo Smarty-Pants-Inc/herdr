@@ -20,6 +20,27 @@ pub(crate) use super::unix_common::{
     StatusCommandGuard,
 };
 
+pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || len != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return None;
+    }
+
+    // SAFETY: SO_PEERCRED populated the exact-size output buffer above.
+    let pid = unsafe { credentials.assume_init().pid };
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -350,6 +371,17 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+pub(super) fn process_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_parent_pid_from_stat(&stat)
+}
+
+fn process_parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(1)?.parse().ok()
+}
+
 fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_pgrp_and_comm_from_stat(&stat)
@@ -539,6 +571,14 @@ fn bytes_match_image_signature(extension: &str, bytes: &[u8]) -> bool {
 
 /// Show a native desktop notification through libnotify's command-line helper.
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    title: &str,
+    body: Option<&str>,
+    _action: Option<&super::DesktopNotificationAction>,
+) -> std::io::Result<bool> {
     show_desktop_notification_with_command(title, body, |program| Command::new(program))
 }
 

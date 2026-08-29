@@ -1,0 +1,375 @@
+name: Smarty Preview
+
+on:
+  push:
+    tags:
+      - 'smarty-preview-*'
+
+# Candidate code is an untrusted producer. It receives no environment secret,
+# OIDC permission, or write-capable GitHub permission.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  ZIG_VERSION: 0.15.2
+
+concurrency:
+  group: smarty-preview-producer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      build_id: ${{ steps.identity.outputs.build_id }}
+      parent: ${{ steps.identity.outputs.parent }}
+      source: ${{ steps.identity.outputs.source }}
+      omp: ${{ steps.identity.outputs.omp }}
+      built_at: ${{ steps.identity.outputs.built_at }}
+      artifact_attempt: ${{ github.run_attempt }}
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout exact candidate source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and write passive producer plan
+        id: identity
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          EVENT_REF_TYPE: ${{ github.ref_type }}
+          EVENT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib, io, json, os, re, subprocess, tarfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          def fail(message): raise SystemExit(message)
+          if os.environ["EVENT_NAME"] != "push" or os.environ["EVENT_REPOSITORY"] != "Smarty-Pants-Inc/herdr": fail("producer event/repository mismatch")
+          tag = os.environ["EVENT_REF_NAME"]
+          if os.environ["EVENT_REF_TYPE"] != "tag" or os.environ["EVENT_REF"] != f"refs/tags/{tag}": fail("producer ref is not an exact tag")
+          match = re.fullmatch(r"smarty-preview-(?P<day>\d{4}-\d{2}-\d{2})-p(?P<parent>[0-9a-f]{40})-r(?P<source>[0-9a-f]{40})-o(?P<omp>[0-9a-f]{40})", tag)
+          if match is None or match["source"] != os.environ["EVENT_SHA"]: fail("producer tag is not exact P/R/O at R")
+          raw = subprocess.check_output(["git", "show", "-s", "--format=%cI", os.environ["EVENT_SHA"]], text=True).strip()
+          built_at = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          if match["day"] != built_at[:10]: fail("producer tag day is not normalized source day")
+          descriptor = json.loads(Path(".github/smarty-omp-source.json").read_text(encoding="utf-8"))
+          if set(descriptor) != {"repository", "commit", "tree", "version", "build_id"} or descriptor["repository"] != "Smarty-Pants-Inc/oh-my-pi" or descriptor["commit"] != match["omp"]: fail("candidate OMP descriptor mismatch")
+          version = re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", Path("Cargo.toml").read_text(encoding="utf-8"))
+          protocol = re.search(r"(?m)^pub const PROTOCOL_VERSION: u32 = (\d+);", Path("src/protocol/wire.rs").read_text(encoding="utf-8"))
+          if version is None or protocol is None: fail("candidate source metadata missing")
+          build_id = f"{match['day']}-p{match['parent']}-r{match['source']}-o{match['omp']}"
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          source_total = 0
+          Path("source-archives").mkdir()
+          with tarfile.open("source-archives/herdr-source.tar", "w") as archive_file:
+              records = subprocess.check_output(["git", "ls-tree", "-r", "--full-tree", "-z", os.environ["EVENT_SHA"]])
+              for record in records.split(b"\0"):
+                  if not record:
+                      continue
+                  header, raw_name = record.split(b"\t", 1)
+                  mode, kind, object_id = header.split()
+                  if kind != b"blob":
+                      fail(f"unsupported non-blob source tree entry: {raw_name!r}")
+                  object_name = object_id.decode("ascii")
+                  size = int(subprocess.check_output(["git", "cat-file", "-s", object_name], text=True).strip())
+                  if size > max_file_bytes or source_total > max_total_bytes - size:
+                      fail(f"Herdr source exceeds the bounded archive size limit: {raw_name!r}")
+                  source_total += size
+                  payload = subprocess.check_output(["git", "cat-file", "blob", object_name])
+                  if len(payload) != size:
+                      fail(f"Git blob size changed: {raw_name!r}")
+                  info = tarfile.TarInfo(raw_name.decode("utf-8"))
+                  git_mode = int(mode, 8)
+                  info.mtime = 0
+                  if git_mode & 0o170000 == 0o120000:
+                      target = payload.decode("utf-8")
+                      if (not target or "\x00" in target or "\\" in target or target.startswith("/")
+                              or any(part in ("", ".") for part in target.split("/"))):
+                          fail(f"unsafe Git symlink target: {raw_name!r}")
+                      info.type = tarfile.SYMTYPE
+                      info.linkname = target
+                      info.mode = 0
+                      info.size = 0
+                      archive_file.addfile(info)
+                  else:
+                      info.mode = git_mode & 0o7777
+                      info.size = size
+                      archive_file.addfile(info, io.BytesIO(payload))
+          archive_path = Path("source-archives/herdr-source.tar")
+          digest = hashlib.sha256()
+          archive_length = 0
+          with archive_path.open("rb") as archive:
+              while chunk := archive.read(1024 * 1024):
+                  archive_length += len(chunk)
+                  if archive_length > max_total_bytes:
+                      fail("Herdr source archive exceeds the bounded size limit")
+                  digest.update(chunk)
+          Path("source-archives/omp-descriptor.json").write_bytes(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+          plan = {"schema": 1, "repository": os.environ["EVENT_REPOSITORY"], "workflow_name": "Smarty Preview", "workflow_path": ".github/workflows/smarty-preview.yml", "run_id": int(os.environ["RUN_ID"]), "run_attempt": int(os.environ["RUN_ATTEMPT"]), "tag": tag, "build_id": build_id, "parent": match["parent"], "source": match["source"], "omp": match["omp"], "built_at": built_at, "base_version": version[1], "protocol": int(protocol[1]), "legacy_day_binding": "literal-built_at-prefix", "source_archives": {"herdr-source.tar": {"length": archive_length, "sha256": digest.hexdigest()}}}
+          Path("producer-plan.json").write_bytes(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              for key in ("tag", "build_id", "parent", "source", "omp", "built_at"): output.write(f"{key}={plan[key]}\n")
+          PY
+      - name: Upload immutable producer plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: smarty-release-plan-${{ github.run_attempt }}
+          path: producer-plan.json
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload candidate source metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: smarty-candidate-sources-${{ github.run_attempt }}
+          path: source-archives
+          if-no-files-found: error
+          compression-level: 0
+
+  candidate-checks:
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download producer plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: smarty-release-plan-${{ needs.preflight.outputs.artifact_attempt }}
+          path: .
+      - name: Download candidate sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: smarty-candidate-sources-${{ needs.preflight.outputs.artifact_attempt }}
+          path: source-archives
+      - name: Check candidate source without privileged inputs
+        shell: bash
+        env:
+          RUST_TOOLCHAIN_VERSION: ${{ env.RUST_TOOLCHAIN_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir candidate-source
+          tar --extract --no-same-owner --no-same-permissions --file source-archives/herdr-source.tar --directory candidate-source
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          (cd candidate-source && cargo +"$RUST_TOOLCHAIN_VERSION" fmt --all -- --check)
+
+  build:
+    needs: [preflight, candidate-checks]
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: smarty-linux-16-core
+            target: x86_64-unknown-linux-musl
+            asset: herdr-linux-x86_64
+          - platform: linux-aarch64
+            os: smarty-linux-arm-16-core
+            target: aarch64-unknown-linux-musl
+            asset: herdr-linux-aarch64
+          - platform: macos-x86_64
+            os: smarty-macos-intel-12-core
+            target: x86_64-apple-darwin
+            asset: herdr-macos-x86_64
+          - platform: macos-aarch64
+            os: smarty-macos-arm-5-core
+            target: aarch64-apple-darwin
+            asset: herdr-macos-aarch64
+          - platform: windows-x86_64
+            os: smarty-windows-16-core
+            target: x86_64-pc-windows-msvc
+            asset: herdr-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+      RUST_TOOLCHAIN_VERSION: ${{ env.RUST_TOOLCHAIN_VERSION }}
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download candidate sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: smarty-candidate-sources-${{ needs.preflight.outputs.artifact_attempt }}
+          path: source-archives
+      - name: Unpack candidate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir candidate-source
+          tar --extract --no-same-owner --no-same-permissions --file source-archives/herdr-source.tar --directory candidate-source
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          workspaces: candidate-source
+          key: smarty-preview-${{ matrix.target }}
+      - name: Install Zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build candidate Herdr
+        working-directory: candidate-source
+        shell: bash
+        env:
+          HERDR_BUILD_CHANNEL: preview
+          HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+          HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.source }}
+          HERDR_BUILD_AUTO_UPDATE: 'true'
+        run: cargo +"$RUST_TOOLCHAIN_VERSION" build --release --locked --target "$TARGET"
+      - name: Package Windows candidate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = Get-Content -Raw -LiteralPath "candidate-source\packaging\windows\conpty.json" | ConvertFrom-Json
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          Invoke-WebRequest -Uri $metadata.package.url -OutFile $package -TimeoutSec 120
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $package).Hash.ToLowerInvariant()
+          if ($actual -cne [string]$metadata.package.sha256) { throw "ConPTY package digest mismatch" }
+          & (Resolve-Path "candidate-source\scripts\package_windows_conpty.ps1").Path `
+            -PackagePath $package `
+            -HerdrExe (Resolve-Path "candidate-source\target\$env:TARGET\release\herdr.exe").Path `
+            -StageDir (Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64") `
+            -OutputPath (Join-Path (Get-Location) $env:ASSET)
+      - name: Package non-Windows candidate
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cp "candidate-source/target/$TARGET/release/herdr" "$ASSET"
+      - name: Write candidate checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          path = Path(os.environ["ASSET"])
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          if path.stat().st_size > max_file_bytes:
+              raise SystemExit(f"candidate output exceeds the bounded size limit: {path.name}")
+          digest = hashlib.sha256()
+          total = 0
+          with path.open("rb") as payload:
+              while chunk := payload.read(1024 * 1024):
+                  total += len(chunk)
+                  if total > max_file_bytes:
+                      raise SystemExit(f"candidate output changed beyond the bounded size limit: {path.name}")
+                  digest.update(chunk)
+          if total != path.stat().st_size:
+              raise SystemExit(f"candidate output changed while hashing: {path.name}")
+          Path(f"{path}.sha256").write_text(f"{digest.hexdigest()}  {path.name}\n", encoding="ascii")
+          PY
+      - name: Upload raw candidate platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: candidate-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  candidate-handoff:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Download producer plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: smarty-release-plan-${{ needs.preflight.outputs.artifact_attempt }}
+          path: .
+      - name: Download candidate sources
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: smarty-candidate-sources-${{ needs.preflight.outputs.artifact_attempt }}
+          path: source-archives
+      - name: Download raw candidate platforms
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: candidate-*-${{ needs.preflight.outputs.artifact_attempt }}
+          path: candidate-artifacts
+          merge-multiple: true
+      - name: Validate passive handoff bytes
+        shell: bash
+        env:
+          PLAN_TAG: ${{ needs.preflight.outputs.tag }}
+          PLAN_SOURCE: ${{ needs.preflight.outputs.source }}
+        run: |
+          set -euo pipefail
+          python -I -S - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          plan = json.loads(Path("producer-plan.json").read_text(encoding="utf-8"))
+          if plan["tag"] != os.environ["PLAN_TAG"] or plan["source"] != os.environ["PLAN_SOURCE"]: raise SystemExit("plan output mismatch")
+          expected = {"herdr-linux-x86_64", "herdr-linux-x86_64.sha256", "herdr-linux-aarch64", "herdr-linux-aarch64.sha256", "herdr-macos-x86_64", "herdr-macos-x86_64.sha256", "herdr-macos-aarch64", "herdr-macos-aarch64.sha256", "herdr-windows-x86_64.zip", "herdr-windows-x86_64.zip.sha256"}
+          root = Path("candidate-artifacts")
+          paths = list(root.iterdir())
+          if {p.name for p in paths} != expected or any(p.is_symlink() or not p.is_file() for p in paths): raise SystemExit("candidate handoff file set mismatch")
+          files = {}
+          total_size = 0
+          for name in sorted(expected):
+              path = root / name
+              size = path.stat().st_size
+              if size > 4 * 1024 * 1024 * 1024 or total_size > 16 * 1024 * 1024 * 1024 - size:
+                  raise SystemExit(f"candidate handoff exceeds the bounded size limit: {name}")
+              total_size += size
+              digest = hashlib.sha256()
+              total = 0
+              with path.open("rb") as payload:
+                  while chunk := payload.read(1024 * 1024):
+                      total += len(chunk)
+                      if total > size:
+                          raise SystemExit(f"candidate handoff changed while hashing: {name}")
+                      digest.update(chunk)
+              if total != size:
+                  raise SystemExit(f"candidate handoff size changed while hashing: {name}")
+              files[name] = {"length": total, "sha256": digest.hexdigest()}
+          for name in expected:
+              if not name.endswith(".sha256") and (root / f"{name}.sha256").read_text(encoding="ascii").split() != [files[name]["sha256"], name]: raise SystemExit(f"checksum mismatch: {name}")
+          identity = {key: plan[key] for key in ("tag", "build_id", "parent", "source", "omp")}
+          Path("producer-handoff.json").write_bytes(json.dumps({"schema": 1, "identity": identity, "files": files}, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+          PY
+      - name: Upload exact passive producer handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: smarty-candidate-handoff-${{ needs.preflight.outputs.artifact_attempt }}
+          path: |
+            producer-handoff.json
+            candidate-artifacts
+          if-no-files-found: error
+          compression-level: 0

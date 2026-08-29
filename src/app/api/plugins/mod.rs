@@ -7,20 +7,21 @@ mod runtime;
 use super::responses::{encode_error, encode_success};
 use crate::api::schema::{
     InstalledPluginInfo, PluginActionInfo, PluginActionInvokeParams, PluginActionListParams,
-    PluginLinkParams, PluginListParams, PluginLogListParams, PluginManifestAction,
-    PluginManifestLinkHandler, PluginPaneCloseParams, PluginPaneFocusParams, PluginPaneInfo,
-    PluginPaneOpenParams, PluginPanePlacement, PluginSetEnabledParams, PluginUnlinkParams,
-    ResponseResult,
+    PluginInvocationContext, PluginLinkParams, PluginListParams, PluginLogListParams,
+    PluginManifestAction, PluginManifestLinkHandler, PluginPaneCloseParams, PluginPaneFocusParams,
+    PluginPaneInfo, PluginPaneOpenParams, PluginPanePlacement, PluginPaneScope, PluginPlatform,
+    PluginSetEnabledParams, PluginUnlinkParams, ResponseResult, ViewId,
 };
 use crate::app::App;
 pub(super) use manifest::normalize_plugin_id;
-use manifest::{
-    effective_platforms, ensure_platform_supported, normalize_action_id, normalize_plugin_source,
-};
+use manifest::{normalize_action_id, normalize_plugin_source};
 
 #[cfg(test)]
-use crate::api::schema::{PluginCommandStatus, PluginInvocationContext};
+use crate::api::schema::PluginCommandStatus;
+pub(crate) use env::{ensure_plugin_user_dirs, plugin_path_env};
 pub(crate) use manifest::load_plugin_manifest;
+pub(crate) use manifest::{effective_platforms, ensure_platform_supported};
+pub(crate) use panes::{ClientPrivatePluginPopupOrigin, ClientPrivatePluginPopupSpec};
 #[cfg(test)]
 use runtime::{read_capped_plugin_output, MAX_PLUGIN_COMMANDS_IN_FLIGHT};
 
@@ -36,7 +37,7 @@ impl App {
             .collect();
     }
 
-    fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
+    pub(crate) fn refresh_installed_plugins(&mut self) -> std::io::Result<()> {
         if self.no_session {
             return Ok(());
         }
@@ -194,19 +195,26 @@ impl App {
                 format!("plugin {} is disabled", plugin.plugin_id),
             );
         }
-        if let Err((code, message)) = ensure_platform_supported(
-            effective_platforms(&action.platforms, &plugin.platforms),
-            &format!("action '{}'", action.qualified_id()),
-        ) {
-            return encode_error(id, code, message);
+        let (context, execution_target) =
+            match self.merge_plugin_action_context(params.context, &id) {
+                Ok(context) => context,
+                Err((code, message)) => return encode_error(id, code, message),
+            };
+        if execution_target.is_local() {
+            if let Err((code, message)) = ensure_platform_supported(
+                effective_platforms(&action.platforms, &plugin.platforms),
+                &format!("action '{}'", action.qualified_id()),
+            ) {
+                return encode_error(id, code, message);
+            }
         }
-        let context = self.merge_plugin_context(params.context, &id);
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
             None,
             action.command.clone(),
             &context,
+            execution_target,
             None,
         ) {
             Ok(log) => log,
@@ -222,9 +230,58 @@ impl App {
         )
     }
 
+    fn merge_plugin_action_context(
+        &self,
+        provided: Option<PluginInvocationContext>,
+        correlation_id: &str,
+    ) -> Result<(PluginInvocationContext, crate::execution::ExecutionTarget), (&'static str, String)>
+    {
+        let Some(source_pane_id) = provided
+            .as_ref()
+            .and_then(|context| context.focused_pane_id.as_deref())
+        else {
+            let context = self.merge_plugin_context(provided, correlation_id);
+            let execution_target = match context.focused_pane_id.as_deref() {
+                Some(source_pane_id) => {
+                    self.plugin_context_and_execution_target_for_source_pane(
+                        source_pane_id,
+                        correlation_id,
+                    )
+                    .map(|(_, execution_target)| execution_target)
+                    .ok_or_else(|| ("pane_not_found", format!("pane {source_pane_id} not found")))?
+                }
+                None => crate::execution::ExecutionTarget::Local,
+            };
+            return Ok((context, execution_target));
+        };
+        let Some((mut context, execution_target)) = self
+            .plugin_context_and_execution_target_for_source_pane(source_pane_id, correlation_id)
+        else {
+            return Err(("pane_not_found", format!("pane {source_pane_id} not found")));
+        };
+        if let Some(provided) = provided {
+            context.selected_text = provided.selected_text.or(context.selected_text);
+            context.invocation_source = provided.invocation_source.or(context.invocation_source);
+            context.correlation_id = provided.correlation_id.or(context.correlation_id);
+            context.clicked_url = provided.clicked_url.or(context.clicked_url);
+            context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
+            context.view_id = provided.view_id.or(context.view_id);
+        }
+        Ok((context, execution_target))
+    }
+
+    #[cfg(test)]
     pub(crate) fn invoke_plugin_action_from_keybind(
         &mut self,
         action_id: String,
+    ) -> Result<(), String> {
+        self.invoke_plugin_action_from_keybind_for_view(action_id, None)
+    }
+
+    pub(crate) fn invoke_plugin_action_from_keybind_for_view(
+        &mut self,
+        action_id: String,
+        view_id: Option<&ViewId>,
     ) -> Result<(), String> {
         self.refresh_installed_plugins()
             .map_err(|err| format!("failed to load plugin registry: {err}"))?;
@@ -234,43 +291,101 @@ impl App {
         if !plugin.enabled {
             return Err(format!("plugin {} is disabled", plugin.plugin_id));
         }
-        ensure_platform_supported(
-            effective_platforms(&action.platforms, &plugin.platforms),
-            &action.qualified_id(),
-        )
-        .map_err(|(_, message)| message)?;
-        let mut context = self.current_plugin_context("keybinding");
+        let (mut context, execution_target) = self
+            .merge_plugin_action_context(None, "keybinding")
+            .map_err(|(_, message)| message)?;
         context.invocation_source = Some("keybinding".to_string());
+        context.view_id = view_id.cloned();
+        if execution_target.is_local() {
+            ensure_platform_supported(
+                effective_platforms(&action.platforms, &plugin.platforms),
+                &action.qualified_id(),
+            )
+            .map_err(|(_, message)| message)?;
+        }
         self.start_plugin_command(
             &plugin,
             Some(action.action_id),
             None,
             action.command,
             &context,
+            execution_target,
             None,
         )
         .map(|_| ())
         .map_err(|(_, message)| message)
     }
 
+    #[cfg(test)]
     pub(crate) fn invoke_plugin_link_handler_for_url(
         &mut self,
         url: &str,
         pane_id: crate::layout::PaneId,
     ) -> Result<bool, String> {
-        self.refresh_installed_plugins()
-            .map_err(|err| format!("failed to load plugin registry: {err}"))?;
-        let Some((plugin, handler)) = self.find_plugin_link_handler(url) else {
+        self.invoke_plugin_link_handler_for_url_for_view(url, pane_id, None)
+    }
+
+    pub(crate) fn invoke_plugin_link_handler_for_url_for_view(
+        &mut self,
+        url: &str,
+        pane_id: crate::layout::PaneId,
+        view_id: Option<&ViewId>,
+    ) -> Result<bool, String> {
+        let Some(ws_idx) = self.state.active else {
             return Ok(false);
         };
-        if ensure_platform_supported(
-            &effective_platforms(&handler.platforms, &plugin.platforms).clone(),
-            &handler.id,
+        self.invoke_plugin_link_handler_for_url_in_workspace(url, ws_idx, pane_id, view_id)
+    }
+
+    pub(crate) fn invoke_plugin_link_handler_for_url_from_source(
+        &mut self,
+        url: &str,
+        source_pane_id: &str,
+        view_id: &ViewId,
+    ) -> Result<bool, String> {
+        let Some((context, execution_target)) =
+            self.plugin_context_and_execution_target_for_source_pane(source_pane_id, "link_click")
+        else {
+            return Err(format!("pane {source_pane_id} not found"));
+        };
+        self.invoke_plugin_link_handler_for_url_with_context(
+            url,
+            context,
+            execution_target,
+            Some(view_id),
         )
-        .is_err()
-        {
+    }
+
+    fn invoke_plugin_link_handler_for_url_in_workspace(
+        &mut self,
+        url: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        view_id: Option<&ViewId>,
+    ) -> Result<bool, String> {
+        let execution_target = self
+            .execution_target_for_pane_in_workspace(ws_idx, pane_id)
+            .unwrap_or_default();
+        let context = self.plugin_context_for_pane(ws_idx, pane_id, "link_click");
+        self.invoke_plugin_link_handler_for_url_with_context(
+            url,
+            context,
+            execution_target,
+            view_id,
+        )
+    }
+    fn invoke_plugin_link_handler_for_url_with_context(
+        &mut self,
+        url: &str,
+        mut context: PluginInvocationContext,
+        execution_target: crate::execution::ExecutionTarget,
+        view_id: Option<&ViewId>,
+    ) -> Result<bool, String> {
+        self.refresh_installed_plugins()
+            .map_err(|err| format!("failed to load plugin registry: {err}"))?;
+        let Some((plugin, handler)) = self.find_plugin_link_handler(url, &execution_target) else {
             return Ok(false);
-        }
+        };
         let action = plugin
             .actions
             .iter()
@@ -282,24 +397,24 @@ impl App {
                     plugin.plugin_id, handler.id, handler.action
                 )
             })?;
-        ensure_platform_supported(
-            &effective_platforms(&action.platforms, &plugin.platforms).clone(),
-            &action.id,
-        )
-        .map_err(|(_, message)| message)?;
-        let Some(ws_idx) = self.state.active else {
-            return Ok(false);
-        };
-        let mut context = self.plugin_context_for_pane(ws_idx, pane_id, "link_click");
+        if execution_target.is_local() {
+            ensure_platform_supported(
+                &effective_platforms(&action.platforms, &plugin.platforms).clone(),
+                &action.id,
+            )
+            .map_err(|(_, message)| message)?;
+        }
         context.invocation_source = Some("link_click".to_string());
         context.clicked_url = Some(url.to_string());
         context.link_handler_id = Some(handler.id);
+        context.view_id = view_id.cloned();
         self.start_plugin_command(
             &plugin,
             Some(action.id),
             None,
             action.command,
             &context,
+            execution_target,
             None,
         )
         .map(|_| true)
@@ -333,7 +448,7 @@ impl App {
         encode_success(id, ResponseResult::PluginLogList { logs })
     }
 
-    pub(super) fn handle_plugin_pane_open(
+    pub(crate) fn handle_plugin_pane_open(
         &mut self,
         id: String,
         params: PluginPaneOpenParams,
@@ -341,6 +456,14 @@ impl App {
         if let Err(err) = self.refresh_installed_plugins() {
             return encode_error(id, "plugin_registry_load_failed", err.to_string());
         }
+        self.handle_plugin_pane_open_with_refreshed_registry(id, params)
+    }
+
+    pub(crate) fn handle_plugin_pane_open_with_refreshed_registry(
+        &mut self,
+        id: String,
+        params: PluginPaneOpenParams,
+    ) -> String {
         let Some(plugin_id) = normalize_plugin_id(&params.plugin_id) else {
             return invalid_plugin_id(id);
         };
@@ -376,20 +499,24 @@ impl App {
                 format!("plugin pane entrypoint '{entrypoint}' not found"),
             );
         };
-        if let Err((code, message)) = ensure_platform_supported(
-            effective_platforms(&pane.platforms, &plugin.platforms),
-            "plugin pane",
-        ) {
-            return encode_error(id, code, message);
+        if params.scope.unwrap_or(pane.scope) == PluginPaneScope::ClientPrivate {
+            return encode_error(
+                id,
+                "client_private_surface_unavailable",
+                "client-private plugin panes require a headless app client view",
+            );
         }
         let placement = params.placement.unwrap_or(pane.placement);
-        if placement != PluginPanePlacement::Popup
-            && (params.width.is_some() || params.height.is_some())
-        {
+        let invalid_size = match placement {
+            PluginPanePlacement::Popup => false,
+            PluginPanePlacement::WorkspaceRight => params.height.is_some(),
+            _ => params.width.is_some() || params.height.is_some(),
+        };
+        if invalid_size {
             return encode_error(
                 id,
                 "invalid_params",
-                "width and height are only supported when placement is popup",
+                "width is supported for popup and workspace_right placements; height is popup-only",
             );
         }
         if placement == PluginPanePlacement::Popup && self.state.mode != crate::app::Mode::Terminal
@@ -402,14 +529,20 @@ impl App {
         }
         match placement {
             PluginPanePlacement::Overlay | PluginPanePlacement::Popup => {
-                if params.workspace_id.is_some()
-                    || params.target_pane_id.is_some()
-                    || params.direction.is_some()
-                {
+                if params.workspace_id.is_some() || params.direction.is_some() {
                     return encode_error(
                         id,
                         "invalid_params",
-                        "overlay and popup plugin panes target the active pane",
+                        "overlay and popup plugin panes support target_pane_id but not workspace_id or direction",
+                    );
+                }
+            }
+            PluginPanePlacement::WorkspaceRight => {
+                if params.direction.is_some() {
+                    return encode_error(
+                        id,
+                        "invalid_params",
+                        "workspace_right plugin panes support workspace_id and target_pane_id but not direction",
                     );
                 }
             }
@@ -423,11 +556,11 @@ impl App {
                 }
             }
             PluginPanePlacement::Tab => {
-                if params.target_pane_id.is_some() || params.direction.is_some() {
+                if params.direction.is_some() {
                     return encode_error(
                         id,
                         "invalid_params",
-                        "tab plugin panes support workspace_id but not target_pane_id or direction",
+                        "tab plugin panes support workspace_id and target_pane_id but not direction",
                     );
                 }
             }
@@ -438,6 +571,9 @@ impl App {
                 self.open_plugin_overlay_pane(id, params, &plugin, pane)
             }
             PluginPanePlacement::Popup => self.open_plugin_popup_pane(id, params, &plugin, pane),
+            PluginPanePlacement::WorkspaceRight => {
+                self.open_plugin_workspace_right_pane(id, params, &plugin, pane)
+            }
             PluginPanePlacement::Split | PluginPanePlacement::Zoomed => {
                 self.open_plugin_split_pane(id, params, &plugin, pane, placement)
             }
@@ -450,6 +586,12 @@ impl App {
         id: String,
         params: PluginPaneFocusParams,
     ) -> String {
+        if let Some(plugin_pane) = self.focus_workspace_plugin_pane(&params.pane_id) {
+            return encode_success(
+                id,
+                ResponseResult::PluginWorkspacePaneFocused { plugin_pane },
+            );
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "plugin_pane_not_found", "plugin pane not found");
         };
@@ -481,6 +623,14 @@ impl App {
         id: String,
         params: PluginPaneCloseParams,
     ) -> String {
+        if self
+            .workspace_plugin_pane_info_for_public_id(&params.pane_id)
+            .is_some()
+        {
+            let pane_id = params.pane_id;
+            self.close_workspace_plugin_pane(&pane_id);
+            return encode_success(id, ResponseResult::PluginPaneClosed { pane_id });
+        }
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(id, "plugin_pane_not_found", "plugin pane not found");
         };
@@ -561,9 +711,25 @@ impl App {
         }
     }
 
+    fn link_handler_platform_supported_on_target(
+        platforms: &Option<Vec<PluginPlatform>>,
+        execution_target: &crate::execution::ExecutionTarget,
+        subject: &str,
+    ) -> bool {
+        if execution_target.is_local() {
+            return ensure_platform_supported(platforms, subject).is_ok();
+        }
+        // An SSH pane may run on either supported remote OS, so partial declarations
+        // cannot safely claim a link before remote command resolution.
+        platforms.as_ref().is_none_or(|platforms| {
+            platforms.contains(&PluginPlatform::Linux) && platforms.contains(&PluginPlatform::Macos)
+        })
+    }
+
     fn find_plugin_link_handler(
         &self,
         url: &str,
+        execution_target: &crate::execution::ExecutionTarget,
     ) -> Option<(InstalledPluginInfo, PluginManifestLinkHandler)> {
         let mut plugins = self
             .state
@@ -575,12 +741,11 @@ impl App {
         plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
         for plugin in plugins {
             for handler in &plugin.link_handlers {
-                if ensure_platform_supported(
-                    &effective_platforms(&handler.platforms, &plugin.platforms).clone(),
+                if !Self::link_handler_platform_supported_on_target(
+                    effective_platforms(&handler.platforms, &plugin.platforms),
+                    execution_target,
                     &handler.id,
-                )
-                .is_err()
-                {
+                ) {
                     continue;
                 }
                 let Some(action) = plugin
@@ -590,12 +755,11 @@ impl App {
                 else {
                     continue;
                 };
-                if ensure_platform_supported(
-                    &effective_platforms(&action.platforms, &plugin.platforms).clone(),
+                if !Self::link_handler_platform_supported_on_target(
+                    effective_platforms(&action.platforms, &plugin.platforms),
+                    execution_target,
                     &action.id,
-                )
-                .is_err()
-                {
+                ) {
                     continue;
                 }
                 let Ok(regex) = regex::Regex::new(&handler.pattern) else {
@@ -723,6 +887,377 @@ mod tests {
         )
     }
 
+    #[test]
+    fn plugin_action_context_inherits_focused_pane_execution_target() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("remote-plugin-target");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("primary").unwrap();
+
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (context, execution_target) = app
+            .merge_plugin_action_context(None, "target-test")
+            .unwrap();
+
+        assert_eq!(
+            context.focused_pane_id.as_deref(),
+            Some(public_pane_id.as_str())
+        );
+        assert_eq!(
+            execution_target,
+            crate::execution::ExecutionTarget::ssh("primary").unwrap()
+        );
+    }
+
+    #[test]
+    fn current_plugin_context_uses_focused_workspace_plugin_pane_locality() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-keybinding")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(80, 1, 38, 22);
+
+        let workspace_id = app.public_workspace_id(0);
+        let caller =
+            crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let target = crate::execution::ExecutionTarget::ssh("plugin-host").unwrap();
+        let cwd = std::path::PathBuf::from("/remote/plugin-root");
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), cwd.clone());
+        terminal.execution_target = target.clone();
+        app.state.terminals.insert(terminal_id.clone(), terminal);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        let context = app.current_plugin_context("keybinding");
+
+        assert_eq!(context.focused_pane_id.as_deref(), Some(caller.as_str()));
+        assert_eq!(context.workspace_cwd.as_deref(), cwd.to_str());
+        assert_eq!(context.focused_pane_cwd.as_deref(), cwd.to_str());
+        assert_eq!(app.plugin_command_execution_target(&context), target);
+    }
+
+    fn app_with_background_plugin_source() -> (App, String, String) {
+        let mut app = test_app();
+        let mut workspace = crate::workspace::Workspace::test_new("plugin-source");
+        let source_pane = workspace.tabs[0].root_pane;
+        let active_tab = workspace.test_add_tab(Some("active"));
+        workspace.switch_tab(active_tab);
+        let active_pane = workspace.tabs[active_tab].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let source_terminal = app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .cloned()
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&source_terminal).unwrap();
+        terminal.cwd = "/tmp/plugin-source".into();
+        terminal.execution_target = crate::execution::ExecutionTarget::ssh("caller").unwrap();
+
+        let source_pane_id = app.public_pane_id(0, source_pane).unwrap();
+        let active_pane_id = app.public_pane_id(0, active_pane).unwrap();
+        (app, source_pane_id, active_pane_id)
+    }
+
+    #[test]
+    fn plugin_action_context_rehydrates_the_caller_pane() {
+        let (app, caller_pane_id, active_pane_id) = app_with_background_plugin_source();
+        let source_workspace_id = app.public_workspace_id(0);
+        let source_tab_id = app.public_tab_id(0, 0).unwrap();
+        assert_eq!(
+            app.current_plugin_context("active")
+                .focused_pane_id
+                .as_deref(),
+            Some(active_pane_id.as_str())
+        );
+
+        let (context, execution_target) = app
+            .merge_plugin_action_context(
+                Some(PluginInvocationContext {
+                    workspace_id: Some("wrong-workspace".into()),
+                    workspace_label: Some("wrong workspace".into()),
+                    workspace_cwd: Some("/wrong-workspace".into()),
+                    worktree: None,
+                    tab_id: Some("wrong-tab".into()),
+                    tab_label: Some("wrong tab".into()),
+                    focused_pane_id: Some(caller_pane_id.clone()),
+                    focused_pane_cwd: Some("/wrong-pane".into()),
+                    focused_pane_agent: Some("wrong agent".into()),
+                    focused_pane_status: None,
+                    selected_text: None,
+                    invocation_source: Some("cli".into()),
+                    correlation_id: Some("caller-context".into()),
+                    clicked_url: None,
+                    link_handler_id: None,
+                    view_id: None,
+                }),
+                "invoke",
+            )
+            .unwrap();
+
+        assert_eq!(
+            context.workspace_id.as_deref(),
+            Some(source_workspace_id.as_str())
+        );
+        assert_eq!(context.tab_id.as_deref(), Some(source_tab_id.as_str()));
+        assert_eq!(
+            context.focused_pane_id.as_deref(),
+            Some(caller_pane_id.as_str())
+        );
+        assert_eq!(
+            context.focused_pane_cwd.as_deref(),
+            Some("/tmp/plugin-source")
+        );
+        assert_ne!(context.focused_pane_agent.as_deref(), Some("wrong agent"));
+        assert_eq!(context.invocation_source.as_deref(), Some("cli"));
+        assert_eq!(
+            execution_target,
+            crate::execution::ExecutionTarget::ssh("caller").unwrap()
+        );
+    }
+
+    #[test]
+    fn plugin_action_context_rejects_missing_caller_pane() {
+        let app = test_app();
+        let mut provided = app.current_plugin_context("missing-caller");
+        provided.focused_pane_id = Some("missing-pane".into());
+
+        let Err((code, message)) =
+            app.merge_plugin_action_context(Some(provided), "missing-caller")
+        else {
+            panic!("missing caller pane must not fall back to local execution");
+        };
+
+        assert_eq!(code, "pane_not_found");
+        assert_eq!(message, "pane missing-pane not found");
+    }
+
+    #[test]
+    fn remote_plugin_action_uses_caller_target_for_validation_and_startup() {
+        let (mut app, caller_pane_id, _) = app_with_background_plugin_source();
+        let root = unique_temp_path("remote-plugin-action-target");
+        let local_unsupported_platform = if cfg!(target_os = "linux") {
+            "macos"
+        } else if cfg!(target_os = "macos") {
+            "windows"
+        } else {
+            "linux"
+        };
+        write_manifest_content(
+            &root,
+            &format!(
+                r#"
+id = "example.remote-action"
+name = "Remote Action"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["{local_unsupported_platform}"]
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["remote-only"]
+"#
+            ),
+        );
+        link_manifest(&mut app, &root);
+        app.state.plugin_commands_in_flight = MAX_PLUGIN_COMMANDS_IN_FLIGHT;
+        let mut context = app.current_plugin_context("remote-action");
+        context.focused_pane_id = Some(caller_pane_id);
+
+        let response = app.handle_api_request(Request {
+            id: "remote-action".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.remote-action".into()),
+                action_id: "run".into(),
+                context: Some(context),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["error"]["code"], "plugin_command_limit_reached");
+        assert_eq!(
+            app.state.plugin_command_logs.last().map(|log| log.status),
+            Some(PluginCommandStatus::Failed)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_pane_source_context_uses_target_pane_locality() {
+        let (app, caller_pane_id, active_pane_id) = app_with_background_plugin_source();
+        let fallback_context = app.current_plugin_context("plugin-pane");
+        assert_eq!(
+            fallback_context.focused_pane_id.as_deref(),
+            Some(active_pane_id.as_str())
+        );
+
+        let (context, execution_target) = app
+            .plugin_pane_source_context(Some(&caller_pane_id), fallback_context)
+            .unwrap();
+
+        assert_eq!(
+            context.focused_pane_id.as_deref(),
+            Some(caller_pane_id.as_str())
+        );
+        assert_eq!(
+            context.focused_pane_cwd.as_deref(),
+            Some("/tmp/plugin-source")
+        );
+        assert_eq!(
+            execution_target,
+            crate::execution::ExecutionTarget::ssh("caller").unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_plugin_pseudo_caller_inherits_its_terminal_locality() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-caller")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let workspace_id = app.public_workspace_id(0);
+        let caller =
+            crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let target = crate::execution::ExecutionTarget::ssh("plugin-host").unwrap();
+        let cwd = std::path::PathBuf::from("/remote/plugin-root");
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), cwd.clone());
+        terminal.execution_target = target.clone();
+        app.state.terminals.insert(terminal_id.clone(), terminal);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        let mut provided = app.current_plugin_context("cli");
+        provided.focused_pane_id = Some(caller.clone());
+        let (action_context, action_target) = app
+            .merge_plugin_action_context(Some(provided), "action")
+            .unwrap();
+        let (pane_context, pane_target) = app
+            .plugin_pane_source_context(Some(&caller), app.current_plugin_context("pane"))
+            .unwrap();
+
+        for context in [action_context, pane_context] {
+            assert_eq!(context.focused_pane_id.as_deref(), Some(caller.as_str()));
+            assert_eq!(context.focused_pane_cwd.as_deref(), cwd.to_str());
+        }
+        assert_eq!(action_target, target);
+        assert_eq!(pane_target, target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_popup_link_from_remote_workspace_plugin_pseudo_source_keeps_locality() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("popup-link-source")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let workspace_id = app.public_workspace_id(0);
+        let source_pane_id =
+            crate::app::workspace_plugin_pane::public_workspace_plugin_pane_id(&workspace_id);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let target = crate::execution::ExecutionTarget::ssh("plugin-host").unwrap();
+        let cwd = std::path::PathBuf::from("/remote/plugin-root");
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), cwd.clone());
+        terminal.execution_target = target.clone();
+        app.state.terminals.insert(terminal_id.clone(), terminal);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        let root = unique_temp_path("remote-popup-link-source");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.remote-links"
+name = "Remote Links"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open link"
+command = ["remote-only"]
+
+[[link_handlers]]
+id = "remote-link"
+title = "Open remote link"
+pattern = "^https://example\\.com/"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        let (context, resolved_target) = app
+            .plugin_context_and_execution_target_for_source_pane(&source_pane_id, "link_click")
+            .unwrap();
+        assert_eq!(resolved_target, target);
+        assert_eq!(context.workspace_cwd.as_deref(), cwd.to_str());
+        assert_eq!(context.focused_pane_cwd.as_deref(), cwd.to_str());
+
+        app.state.plugin_commands_in_flight = MAX_PLUGIN_COMMANDS_IN_FLIGHT;
+        let view_id = ViewId::from_opaque("view-private").unwrap();
+        let error = app
+            .invoke_plugin_link_handler_for_url_from_source(
+                "https://example.com/issue/1",
+                &source_pane_id,
+                &view_id,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("maximum concurrent plugin commands reached"),
+            "remote pseudo source should reach the matching link action: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn response_result(response: &str) -> ResponseResult {
         serde_json::from_str::<SuccessResponse>(response)
             .expect("success response")
@@ -744,21 +1279,26 @@ mod tests {
             .to_string()
     }
 
-    /// Wait for non-empty contents at `path`. Shell `>` creates the file empty
-    /// before the command writes, so waiting on existence alone can read EOF.
+    /// Wait for at least `expected_lines` of non-empty contents at `path`.
+    /// Shell `>` creates the file empty before the command writes, and a
+    /// multi-line `printf` can expose partial output before it completes.
     /// `pump` advances any event loop the command depends on.
-    fn read_capture_when_ready(path: &std::path::Path, mut pump: impl FnMut()) -> String {
+    fn read_capture_when_ready(
+        path: &std::path::Path,
+        expected_lines: usize,
+        mut pump: impl FnMut(),
+    ) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             pump();
             if let Ok(contents) = std::fs::read_to_string(path) {
-                if !contents.is_empty() {
+                if !contents.is_empty() && contents.lines().count() >= expected_lines {
                     return contents;
                 }
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "plugin command did not write {} within deadline",
+                "plugin command did not write {expected_lines} line(s) to {} within deadline",
                 path.display()
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1352,6 +1892,8 @@ platforms = ["linux", "macos"]
                 plugin_id: "example.missing".into(),
                 entrypoint: "ui".into(),
                 placement: Some(PluginPanePlacement::Split),
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1379,6 +1921,8 @@ platforms = ["linux", "macos"]
                 plugin_id: "example.worktree-bootstrap".into(),
                 entrypoint: "board".into(),
                 placement: Some(PluginPanePlacement::Split),
+                scope: None,
+                view_id: None,
                 width: Some(crate::popup_size::PopupSize::Percent(80)),
                 height: None,
                 workspace_id: None,
@@ -1414,6 +1958,8 @@ platforms = ["linux", "macos"]
                     plugin_id: "example.worktree-bootstrap".into(),
                     entrypoint: "board".into(),
                     placement: Some(PluginPanePlacement::Popup),
+                    scope: None,
+                    view_id: None,
                     width: None,
                     height: None,
                     workspace_id: None,
@@ -1476,6 +2022,9 @@ platforms = ["linux", "macos"]
             width_px: 11,
             height_px: 22,
         };
+        app.state.palette.accent = ratatui::style::Color::Blue;
+        app.state.palette.sidebar_bg = ratatui::style::Color::Rgb(1, 2, 3);
+        app.state.palette.text = ratatui::style::Color::Reset;
         app.state.terminals.get_mut(&root_terminal).unwrap().cwd = "/tmp".into();
         let target_public_pane_id = app.public_pane_id(0, root_pane).unwrap();
 
@@ -1494,7 +2043,7 @@ platforms = ["linux", "macos"]
 [[panes]]
 id = "board"
 title = "Plugin Board"
-command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_ENTRYPOINT_ID\" \"$HERDR_WORKSPACE_ID\" \"$HERDR_PANE_ID\" \"$HERDR_BIN_PATH\" \"$HERDR_PLUGIN_CONTEXT_JSON\" \"${{HERDR_CELL_WIDTH_PX-unset}}\" \"${{HERDR_CELL_HEIGHT_PX-unset}}\" > {}"]
+command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_ENTRYPOINT_ID\" \"$HERDR_WORKSPACE_ID\" \"$HERDR_PANE_ID\" \"$HERDR_BIN_PATH\" \"$HERDR_PLUGIN_CONTEXT_JSON\" \"$HERDR_THEME_ACCENT\" \"$HERDR_THEME_SIDEBAR_BG\" \"$HERDR_THEME_TEXT\" \"${{HERDR_CELL_WIDTH_PX-unset}}\" \"${{HERDR_CELL_HEIGHT_PX-unset}}\" > {}"]
 "#,
                 capture.display()
             ),
@@ -1507,6 +2056,8 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
                 plugin_id: "example.pane".into(),
                 entrypoint: "board".into(),
                 placement: Some(PluginPanePlacement::Overlay),
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1528,6 +2079,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
                         "HERDR_BIN_PATH".to_string(),
                         "/tmp/spoofed-herdr".to_string(),
                     ),
+                    ("HERDR_THEME_SIDEBAR_BG".to_string(), "#ffffff".to_string()),
                 ]),
             }),
         });
@@ -1542,7 +2094,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
         };
         assert!(app.state.plugin_panes.contains_key(&opened_pane_id));
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 12, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(lines.next(), Some("example.pane"));
@@ -1568,6 +2120,9 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$PWD\" \
             context.focused_pane_id.as_deref(),
             Some(target_public_pane_id.as_str())
         );
+        assert_eq!(lines.next(), Some("blue"));
+        assert_eq!(lines.next(), Some("#010203"));
+        assert_eq!(lines.next(), Some("reset"));
         assert_eq!(lines.next(), Some("unset"));
         assert_eq!(lines.next(), Some("unset"));
 
@@ -1614,6 +2169,8 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
                 plugin_id: "example.path-env".into(),
                 entrypoint: "board".into(),
                 placement: Some(PluginPanePlacement::Overlay),
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1641,7 +2198,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
             panic!("expected plugin pane opened response: {open}");
         };
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_when_ready(&capture, 3, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(
@@ -1717,6 +2274,8 @@ command = ["sh", "-c", "sleep 1"]
                 plugin_id: "example.tab".into(),
                 entrypoint: "board".into(),
                 placement: None,
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1800,6 +2359,8 @@ command = ["sh", "-c", "sleep 1"]
                 plugin_id: "example.split".into(),
                 entrypoint: "board".into(),
                 placement: Some(PluginPanePlacement::Zoomed),
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1879,6 +2440,8 @@ command = ["sh", "-c", "sleep 1"]
                 plugin_id: "example.overlay".into(),
                 entrypoint: "board".into(),
                 placement: None,
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1964,6 +2527,8 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
                 plugin_id: "example.popup".into(),
                 entrypoint: "board".into(),
                 placement: None,
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -1976,7 +2541,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         });
         assert_eq!(response_result(&open), ResponseResult::Ok {});
         assert_eq!(
-            read_capture_when_ready(&env_capture, || {
+            read_capture_when_ready(&env_capture, 1, || {
                 app.drain_internal_events();
             }),
             "unset"
@@ -2013,9 +2578,158 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
         app.handle_internal_event(crate::events::AppEvent::PaneDied {
             pane_id: opened_pane_id,
+            child_pid: None,
         });
         assert!(app.state.popup_pane.is_none());
         assert!(event_hub.events_after(0).is_empty());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_pane_open_workspace_right_tracks_workspace_not_tab() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut first_workspace = crate::workspace::Workspace::test_new("plugin-right");
+        let second_tab = first_workspace.test_add_tab(Some("second"));
+        app.state.workspaces = vec![
+            first_workspace,
+            crate::workspace::Workspace::test_new("other"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+        let workspace_id = app.public_workspace_id(0);
+
+        let root = unique_temp_path("plugin-pane-workspace-right");
+        let env_capture = root.join("workspace-env.txt");
+        let manifest = format!(
+            r#"
+id = "example.workspace-right"
+name = "Workspace Right Plugin"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "explorer"
+title = "Explorer"
+placement = "workspace_right"
+width = 24
+command = ["sh", "-c", "printf %s \"$HERDR_WORKSPACE_ID|${{HERDR_TAB_ID-unset}}|$HERDR_PANE_ID\" > '{}'; sleep 30"]
+"#,
+            env_capture.display()
+        );
+        write_manifest_content(&root, &manifest);
+        link_manifest(&mut app, &root);
+
+        let open = app.handle_api_request(Request {
+            id: "pane-open-workspace-right".into(),
+            method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                plugin_id: "example.workspace-right".into(),
+                entrypoint: "explorer".into(),
+                placement: None,
+                scope: None,
+                view_id: None,
+                width: None,
+                height: None,
+                workspace_id: Some(workspace_id.clone()),
+                target_pane_id: None,
+                direction: None,
+                cwd: None,
+                focus: false,
+                env: std::collections::HashMap::new(),
+            }),
+        });
+        let ResponseResult::PluginWorkspacePaneOpened { plugin_pane } = response_result(&open)
+        else {
+            panic!("expected workspace plugin pane opened response: {open}");
+        };
+        assert_eq!(plugin_pane.workspace_id, workspace_id);
+        assert_eq!(
+            plugin_pane.pane_id,
+            format!("{}:plugin", plugin_pane.workspace_id)
+        );
+        assert!(!plugin_pane.focused);
+        assert_eq!(
+            read_capture_when_ready(&env_capture, 1, || {
+                app.drain_internal_events();
+            }),
+            format!("{}|unset|{}", plugin_pane.workspace_id, plugin_pane.pane_id)
+        );
+        assert_eq!(app.state.workspace_plugin_panes.len(), 1);
+        assert!(app.state.workspaces[0]
+            .tabs
+            .iter()
+            .all(|tab| tab.layout.pane_count() == 1));
+
+        assert!(app.state.workspace_plugin_panes[&workspace_id].collapsed);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 1);
+        assert!(app.state.view.workspace_plugin_pane_inner.is_empty());
+
+        let initially_focused = app
+            .focus_workspace_plugin_pane(&plugin_pane.pane_id)
+            .expect("workspace plugin pane");
+        assert!(initially_focused.focused);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        let terminal_width_with_plugin = app.state.view.terminal_area.width;
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 24);
+
+        assert!(app.state.switch_workspace_tab(0, second_tab));
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert_eq!(app.state.view.workspace_plugin_pane_outer.width, 24);
+        assert!(app
+            .state
+            .workspace_plugin_panes
+            .get(&plugin_pane.workspace_id)
+            .is_some_and(|pane| pane.focused));
+
+        app.state.switch_workspace(1);
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert!(app.state.view.workspace_plugin_pane_outer.is_empty());
+        assert!(app.state.view.terminal_area.width > terminal_width_with_plugin);
+
+        let focus = app.handle_api_request(Request {
+            id: "pane-focus-workspace-right".into(),
+            method: Method::PluginPaneFocus(PluginPaneFocusParams {
+                pane_id: plugin_pane.pane_id.clone(),
+            }),
+        });
+        let ResponseResult::PluginWorkspacePaneFocused {
+            plugin_pane: focused,
+        } = response_result(&focus)
+        else {
+            panic!("expected workspace plugin pane focused response: {focus}");
+        };
+        assert!(focused.focused);
+        assert_eq!(focused.pane_id, plugin_pane.pane_id);
+        assert_eq!(app.state.active, Some(0));
+
+        let close = app.handle_api_request(Request {
+            id: "pane-close-workspace-right".into(),
+            method: Method::PluginPaneClose(PluginPaneCloseParams {
+                pane_id: plugin_pane.pane_id.clone(),
+            }),
+        });
+        assert_eq!(
+            response_result(&close),
+            ResponseResult::PluginPaneClosed {
+                pane_id: plugin_pane.pane_id
+            }
+        );
+        assert!(app.state.workspace_plugin_panes.is_empty());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
@@ -2073,6 +2787,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
                     correlation_id: Some("external-correlation".into()),
                     clicked_url: None,
                     link_handler_id: None,
+                    view_id: None,
                 }),
             }),
         });
@@ -2154,6 +2869,8 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
                 plugin_id: "example.worktree-bootstrap".into(),
                 entrypoint: "board".into(),
                 placement: None,
+                scope: None,
+                view_id: None,
                 width: None,
                 height: None,
                 workspace_id: None,
@@ -2170,96 +2887,92 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
     #[test]
     fn non_cli_plugin_consumers_refresh_global_enabled_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
-        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-global-refresh");
-        std::env::set_var("XDG_CONFIG_HOME", &base);
         let root = base.join("plugin");
         write_manifest(&root);
         let plugin = load_plugin_manifest(&root.display().to_string(), false).unwrap();
-        crate::persist::plugin_registry::update(|plugins| {
-            plugins.retain(|entry| entry.plugin_id != plugin.plugin_id);
-            plugins.push(plugin.clone());
-        })
-        .unwrap();
+        crate::persist::plugin_registry::with_test_registry_path(base.join("plugins.json"), || {
+            crate::persist::plugin_registry::update(|plugins| {
+                plugins.retain(|entry| entry.plugin_id != plugin.plugin_id);
+                plugins.push(plugin.clone());
+            })
+            .unwrap();
 
-        let mut app = test_app();
-        app.no_session = false;
-        let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
-        let pane_id = workspace.tabs[0].root_pane;
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
+            let mut app = test_app();
+            app.no_session = false;
+            let workspace = crate::workspace::Workspace::test_new("plugin-refresh");
+            let pane_id = workspace.tabs[0].root_pane;
+            app.state.workspaces = vec![workspace];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
 
-        let make_stale = |app: &mut App| {
-            let mut stale = plugin.clone();
-            stale.enabled = true;
-            app.state
-                .installed_plugins
-                .insert(stale.plugin_id.clone(), stale);
-        };
+            let make_stale = |app: &mut App| {
+                let mut stale = plugin.clone();
+                stale.enabled = true;
+                app.state
+                    .installed_plugins
+                    .insert(stale.plugin_id.clone(), stale);
+            };
 
-        make_stale(&mut app);
-        assert!(app
-            .invoke_plugin_action_from_keybind("bootstrap".into())
-            .unwrap_err()
-            .contains("disabled"));
+            make_stale(&mut app);
+            assert!(app
+                .invoke_plugin_action_from_keybind("bootstrap".into())
+                .unwrap_err()
+                .contains("disabled"));
 
-        make_stale(&mut app);
-        assert!(!app
-            .invoke_plugin_link_handler_for_url(
-                "https://github.com/herdrdev/herdr/issues/1174",
-                pane_id,
-            )
-            .unwrap());
+            make_stale(&mut app);
+            assert!(!app
+                .invoke_plugin_link_handler_for_url(
+                    "https://github.com/herdrdev/herdr/issues/1174",
+                    pane_id,
+                )
+                .unwrap());
 
-        make_stale(&mut app);
-        let pane = app.handle_api_request(Request {
-            id: "pane-disabled".into(),
-            method: Method::PluginPaneOpen(PluginPaneOpenParams {
-                plugin_id: "example.worktree-bootstrap".into(),
-                entrypoint: "board".into(),
-                placement: Some(PluginPanePlacement::Overlay),
-                width: None,
-                height: None,
-                workspace_id: None,
-                target_pane_id: None,
-                direction: None,
-                cwd: None,
-                focus: true,
-                env: std::collections::HashMap::new(),
-            }),
-        });
-        let pane: serde_json::Value = serde_json::from_str(&pane).unwrap();
-        assert_eq!(pane["error"]["code"], "plugin_disabled");
+            make_stale(&mut app);
+            let pane = app.handle_api_request(Request {
+                id: "pane-disabled".into(),
+                method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                    plugin_id: "example.worktree-bootstrap".into(),
+                    entrypoint: "board".into(),
+                    placement: Some(PluginPanePlacement::Overlay),
+                    scope: None,
+                    view_id: None,
+                    width: None,
+                    height: None,
+                    workspace_id: None,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd: None,
+                    focus: true,
+                    env: std::collections::HashMap::new(),
+                }),
+            });
+            let pane: serde_json::Value = serde_json::from_str(&pane).unwrap();
+            assert_eq!(pane["error"]["code"], "plugin_disabled");
 
-        make_stale(&mut app);
-        let logs_before = app.state.plugin_command_logs.len();
-        let workspace = app.workspace_info(0);
-        app.run_plugin_event_hooks(&crate::api::schema::EventEnvelope {
-            event: crate::api::schema::EventKind::WorktreeCreated,
-            data: crate::api::schema::EventData::WorktreeCreated {
-                workspace: workspace.clone(),
-                worktree: crate::api::schema::WorktreeInfo {
-                    path: "/tmp/repo".into(),
-                    branch: Some("feature".into()),
-                    is_bare: false,
-                    is_detached: false,
-                    is_prunable: false,
-                    is_linked_worktree: true,
-                    open_workspace_id: Some(workspace.workspace_id),
-                    label: "feature".into(),
+            make_stale(&mut app);
+            let logs_before = app.state.plugin_command_logs.len();
+            let workspace = app.workspace_info(0);
+            app.run_plugin_event_hooks(&crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorktreeCreated,
+                data: crate::api::schema::EventData::WorktreeCreated {
+                    workspace: workspace.clone(),
+                    worktree: crate::api::schema::WorktreeInfo {
+                        path: "/tmp/repo".into(),
+                        branch: Some("feature".into()),
+                        is_bare: false,
+                        is_detached: false,
+                        is_prunable: false,
+                        is_linked_worktree: true,
+                        open_workspace_id: Some(workspace.workspace_id),
+                        label: "feature".into(),
+                    },
                 },
-            },
+            });
+            assert_eq!(app.state.plugin_command_logs.len(), logs_before);
         });
-        assert_eq!(app.state.plugin_command_logs.len(), logs_before);
-
         let _ = std::fs::remove_dir_all(&base);
-        match previous_config_home {
-            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[cfg(unix)]
@@ -2325,6 +3038,99 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_ACTION_ID\""]
         assert_eq!(finished.status, PluginCommandStatus::Succeeded);
         assert_eq!(finished.stdout.as_deref(), Some("run"));
         assert_eq!(finished.exit_code, Some(0));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_plugin_action_view_env_comes_only_from_context() {
+        struct RestoreViewId(Option<std::ffi::OsString>);
+        impl Drop for RestoreViewId {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("HERDR_VIEW_ID", value),
+                    None => std::env::remove_var("HERDR_VIEW_ID"),
+                }
+            }
+        }
+
+        let _env_lock = crate::integration::integration_env_lock();
+        let _restore = RestoreViewId(std::env::var_os("HERDR_VIEW_ID"));
+        std::env::set_var("HERDR_VIEW_ID", "ambient-view");
+
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-action-view-env");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.view-env"
+name = "View Env"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "read-view"
+title = "Read view"
+command = ["sh", "-c", "printf '%s' \"${HERDR_VIEW_ID-unset}\""]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.view-env"].clone();
+        let action = plugin.actions[0].clone();
+        let wait_for_stdout = |app: &mut App, log_id: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                app.drain_all_internal_events();
+                if let Some(entry) = app
+                    .state
+                    .plugin_command_logs
+                    .iter()
+                    .find(|entry| entry.log_id == log_id)
+                {
+                    if entry.status != PluginCommandStatus::Running {
+                        assert_eq!(entry.status, PluginCommandStatus::Succeeded);
+                        return entry.stdout.clone().unwrap_or_default();
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "plugin command did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let ownerless = app.current_plugin_context("ownerless");
+        assert!(ownerless.view_id.is_none());
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some(action.id.clone()),
+                None,
+                action.command.clone(),
+                &ownerless,
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        assert_eq!(wait_for_stdout(&mut app, &log.log_id), "unset");
+
+        let mut owned = ownerless;
+        owned.view_id = ViewId::from_opaque("view-private");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some(action.id),
+                None,
+                action.command,
+                &owned,
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        assert_eq!(wait_for_stdout(&mut app, &log.log_id), "view-private");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2467,7 +3273,7 @@ command = ["sh", "-c", "printf '%s:%s' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVEN
         app.run_plugin_startup_hooks();
 
         assert_eq!(
-            read_capture_when_ready(&capture, || {
+            read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
             }),
             "example.startup:startup"
@@ -2530,7 +3336,7 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         });
 
         let context: PluginInvocationContext =
-            serde_json::from_str(&read_capture_when_ready(&capture, || {
+            serde_json::from_str(&read_capture_when_ready(&capture, 1, || {
                 app.drain_all_internal_events();
             }))
             .unwrap();
@@ -2815,10 +3621,154 @@ action = "generic"
         link_manifest(&mut app, &root);
 
         let (_plugin, handler) = app
-            .find_plugin_link_handler("https://github.com/herdrdev/herdr/issues/398")
+            .find_plugin_link_handler(
+                "https://github.com/herdrdev/herdr/issues/398",
+                &crate::execution::ExecutionTarget::Local,
+            )
             .expect("handler should match");
         assert_eq!(handler.id, "z-specific");
         assert_eq!(handler.action, "specific");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ssh_link_handlers_skip_partial_platform_matches_in_manifest_order() {
+        let mut app = test_app();
+        let root = unique_temp_path("ssh-link-handler-platform-order");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.ssh-link-platforms"
+name = "SSH Link Platforms"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open link"
+command = ["true"]
+
+[[actions]]
+id = "macos-action"
+title = "Open on macOS"
+platforms = ["macos"]
+command = ["true"]
+
+[[link_handlers]]
+id = "first-linux-only"
+title = "First matching handler"
+pattern = "^https://example\\.com/"
+platforms = ["linux"]
+action = "open"
+
+[[link_handlers]]
+id = "second-macos-action"
+title = "Second matching handler"
+pattern = "^https://example\\.com/"
+action = "macos-action"
+
+[[link_handlers]]
+id = "third-windows-only"
+title = "Third matching handler"
+pattern = "^https://example\\.com/"
+platforms = ["windows"]
+action = "open"
+
+[[link_handlers]]
+id = "fourth-compatible"
+title = "Compatible handler"
+pattern = "^https://example\\.com/"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        let (_plugin, handler) = app
+            .find_plugin_link_handler(
+                "https://example.com/issue/398",
+                &crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target"),
+            )
+            .expect("compatible handler should match");
+        assert_eq!(handler.id, "fourth-compatible");
+        assert_eq!(handler.action, "open");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ssh_link_handler_platform_policy_allows_unrestricted_or_dual_supported_sets() {
+        let target = crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target");
+        assert!(App::link_handler_platform_supported_on_target(
+            &None,
+            &target,
+            "unrestricted"
+        ));
+        assert!(App::link_handler_platform_supported_on_target(
+            &Some(vec![PluginPlatform::Linux, PluginPlatform::Macos]),
+            &target,
+            "linux-and-macos",
+        ));
+        assert!(App::link_handler_platform_supported_on_target(
+            &Some(vec![
+                PluginPlatform::Linux,
+                PluginPlatform::Macos,
+                PluginPlatform::Windows,
+            ]),
+            &target,
+            "linux-macos-and-windows",
+        ));
+        for platforms in [
+            vec![PluginPlatform::Linux],
+            vec![PluginPlatform::Macos],
+            vec![PluginPlatform::Windows],
+            vec![PluginPlatform::Linux, PluginPlatform::Windows],
+            vec![PluginPlatform::Macos, PluginPlatform::Windows],
+        ] {
+            assert!(!App::link_handler_platform_supported_on_target(
+                &Some(platforms),
+                &target,
+                "partial",
+            ));
+        }
+    }
+
+    #[test]
+    fn ssh_link_handlers_do_not_claim_partial_platform_matches() {
+        let mut app = test_app();
+        let root = unique_temp_path("ssh-link-handler-platform-reject");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.ssh-link-platform-reject"
+name = "SSH Link Platform Reject"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux"]
+
+[[actions]]
+id = "open"
+title = "Open link"
+command = ["true"]
+
+[[link_handlers]]
+id = "linux-only"
+title = "Linux-only handler"
+pattern = "^https://example\\.com/"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        assert!(
+            app.find_plugin_link_handler(
+                "https://example.com/issue/398",
+                &crate::execution::ExecutionTarget::ssh("plugin-host").expect("SSH target"),
+            )
+            .is_none(),
+            "an SSH link handler without both supported remote platforms must not claim the URL"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3253,7 +4203,10 @@ command = ["sh", "-c", "echo ok"]
             },
         );
 
-        app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id });
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id,
+            child_pid: None,
+        });
 
         assert!(!app.state.plugin_panes.contains_key(&pane_id));
     }

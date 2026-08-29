@@ -57,20 +57,37 @@ impl App {
 
         let mut changes = TerminalTitleChanges::default();
         let mut publish = Vec::new();
-        for (ws_idx, pane_id, terminal_id, title) in observations {
-            let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
-                continue;
-            };
-            let change = terminal.set_terminal_title(title);
+        let previous_toast = self.state.toast.clone();
+        let mut pane_updates = Vec::new();
+        for (ws_idx, pane_id, _terminal_id, title) in observations {
+            let mut change = crate::terminal::state::TerminalTitleChange::default();
+            let update = self.state.update_terminal_state(pane_id, |terminal| {
+                let (title_change, mutation) = terminal.set_terminal_title(title);
+                change = title_change;
+                title_change.raw_changed.then_some(mutation)
+            });
             changes.raw_changed |= change.raw_changed;
             changes.stripped_changed |= change.stripped_changed;
             if change.stripped_changed {
                 publish.push((ws_idx, pane_id));
             }
+            if let Some(update) = update {
+                pane_updates.push(update);
+            }
         }
 
         for (ws_idx, pane_id) in publish {
             self.emit_pane_updated(ws_idx, pane_id);
+        }
+        for update in &pane_updates {
+            self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
+            self.emit_pane_state_update(update);
+        }
+        if !pane_updates.is_empty() {
+            self.emit_terminal_or_system_agent_notifications(&pane_updates);
+            self.sync_toast_deadline(previous_toast);
+            self.render_dirty.request_generic();
+            self.render_notify.notify_one();
         }
 
         changes
@@ -97,10 +114,17 @@ mod tests {
             .attached_terminal_id
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.detected_agent = Some(Agent::Claude);
-        terminal.state = AgentState::Working;
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            std::time::Instant::now(),
+        );
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
-        runtime.test_process_pty_bytes("\x1b]0;⠋ 修复🙂标题\x07".as_bytes());
+        runtime.test_process_pty_bytes("\x1b]0;π ⠋ 修复🙂标题\x07".as_bytes());
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         let sources = HashSet::from([pane_id]);
 
@@ -112,19 +136,25 @@ mod tests {
             }
         );
         let pane = app.pane_info(0, pane_id).unwrap();
-        assert_eq!(pane.terminal_title.as_deref(), Some("⠋ 修复🙂标题"));
-        assert_eq!(pane.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠋ 修复🙂标题"));
+        assert_eq!(
+            pane.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
         assert_eq!(pane.title, None);
         assert_eq!(pane.agent_status, crate::api::schema::AgentStatus::Working);
         assert_eq!(pane.revision, 1);
         let agent = app.collect_agent_infos().pop().unwrap();
-        assert_eq!(agent.terminal_title.as_deref(), Some("⠋ 修复🙂标题"));
-        assert_eq!(agent.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(agent.terminal_title.as_deref(), Some("π ⠋ 修复🙂标题"));
+        assert_eq!(
+            agent.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
 
         app.terminal_runtimes
             .get(&terminal_id)
             .unwrap()
-            .test_process_pty_bytes("\x1b]2;⠙ 修复🙂标题\x1b\\".as_bytes());
+            .test_process_pty_bytes("\x1b]2;π ⠙ 修复🙂标题\x1b\\".as_bytes());
         assert_eq!(
             app.sync_terminal_titles(&sources),
             TerminalTitleChanges {
@@ -133,8 +163,11 @@ mod tests {
             }
         );
         let pane = app.pane_info(0, pane_id).unwrap();
-        assert_eq!(pane.terminal_title.as_deref(), Some("⠙ 修复🙂标题"));
-        assert_eq!(pane.terminal_title_stripped.as_deref(), Some("修复🙂标题"));
+        assert_eq!(pane.terminal_title.as_deref(), Some("π ⠙ 修复🙂标题"));
+        assert_eq!(
+            pane.terminal_title_stripped.as_deref(),
+            Some("π 修复🙂标题")
+        );
         assert_eq!(pane.revision, 1);
         assert_eq!(pane_updated_events(&event_hub), 1);
 
@@ -155,6 +188,64 @@ mod tests {
         assert_eq!(pane.terminal_title_stripped, None);
         assert_eq!(pane.revision, 3);
         assert_eq!(pane_updated_events(&event_hub), 3);
+    }
+    #[tokio::test]
+    async fn omp_activity_title_overrides_stale_idle_lifecycle_report() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.workspaces = vec![Workspace::test_new("omp-title-activity")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Omp);
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path("/tmp/omp-title-activity.jsonl").unwrap();
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".into()),
+            )
+            .unwrap();
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Idle,
+                None,
+                Some(session_ref),
+                Some(2),
+            )
+            .unwrap();
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        runtime.test_process_pty_bytes(b"\x1b]0;\xcf\x80 \xe2\xa0\x8b active task\x07");
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let sources = HashSet::from([pane_id]);
+
+        app.sync_terminal_titles(&sources);
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Working);
+        assert_eq!(
+            app.pane_info(0, pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Working
+        );
+
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b]0;\xcf\x80 > active task\x07");
+        app.sync_terminal_titles(&sources);
+        assert_eq!(app.state.terminals[&terminal_id].state, AgentState::Idle);
+        assert_eq!(
+            app.pane_info(0, pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Done
+        );
+        assert_eq!(pane_status_events(&event_hub), 2);
     }
 
     #[tokio::test]
@@ -220,6 +311,16 @@ mod tests {
             .events_after(0)
             .iter()
             .filter(|(_, event)| event.event == crate::api::schema::EventKind::PaneUpdated)
+            .count()
+    }
+
+    fn pane_status_events(event_hub: &crate::api::EventHub) -> usize {
+        event_hub
+            .events_after(0)
+            .iter()
+            .filter(|(_, event)| {
+                event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+            })
             .count()
     }
 }

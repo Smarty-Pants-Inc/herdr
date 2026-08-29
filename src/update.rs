@@ -1,8 +1,8 @@
 //! Self-update mechanism.
 //!
 //! Checks the hosted herdr.dev update manifest for newer versions.
-//! Manual `herdr update` downloads and installs the binary.
-//! Background checks only surface availability and release notes.
+//! Manual `herdr update` and published preview clients download and install the binary.
+//! Background checks auto-install only for explicitly enabled direct preview builds.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
 //! JSON parsing uses serde_json (already in deps for persistence).
 
@@ -11,20 +11,50 @@ use std::env;
 use std::fs;
 #[cfg(not(windows))]
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 #[cfg(not(windows))]
 use std::io::{BufRead, BufReader, IsTerminal, Write};
+#[cfg(not(windows))]
+use std::os::fd::AsRawFd;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const SMARTY_PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+const UPSTREAM_PREVIEW_RELEASE_DOWNLOAD_URL: &str =
+    "https://github.com/herdrdev/herdr/releases/download";
+const SMARTY_PREVIEW_RELEASE_DOWNLOAD_URL: &str =
+    "https://github.com/Smarty-Pants-Inc/herdr/releases/download";
+const PREVIEW_RELEASE_DOWNLOAD_URL: &str = SMARTY_PREVIEW_RELEASE_DOWNLOAD_URL;
+const CANONICAL_PREVIEW_HERDR_ASSETS: &[(&str, &str)] = &[
+    ("linux-x86_64", "herdr-linux-x86_64"),
+    ("linux-aarch64", "herdr-linux-aarch64"),
+    ("macos-x86_64", "herdr-macos-x86_64"),
+    ("macos-aarch64", "herdr-macos-aarch64"),
+    ("windows-x86_64", "herdr-windows-x86_64.zip"),
+];
+const CANONICAL_PREVIEW_OMP_ASSETS: &[(&str, &str)] = &[
+    ("linux-x86_64", "omp-linux-x86_64"),
+    ("linux-aarch64", "omp-linux-aarch64"),
+    ("macos-x86_64", "omp-macos-x86_64"),
+    ("macos-aarch64", "omp-macos-aarch64"),
+];
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
@@ -33,6 +63,14 @@ const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
 const DEFAULT_FAKE_UPDATE_NOTES_VERSION: &str = "0.3.0";
+const OMP_BIN_ENV_VAR: &str = "OMP_BIN";
+pub(crate) const MANAGED_OMP_BIN_ENV_VAR: &str = "HERDR_MANAGED_OMP_BIN";
+pub(crate) const MANAGED_OMP_BUILD_ID_ENV_VAR: &str = "HERDR_MANAGED_OMP_BUILD_ID";
+pub(crate) const MANAGED_OMP_SHA256_ENV_VAR: &str = "HERDR_MANAGED_OMP_SHA256";
+pub(crate) const MANAGED_OMP_COMMIT_ENV_VAR: &str = "HERDR_MANAGED_OMP_COMMIT";
+pub(crate) const MANAGED_OMP_TREE_ENV_VAR: &str = "HERDR_MANAGED_OMP_TREE";
+pub(crate) const MANAGED_OMP_VERSION_ENV_VAR: &str = "HERDR_MANAGED_OMP_VERSION";
+pub(crate) const MANAGED_OMP_DISABLED_ENV_VAR: &str = "HERDR_MANAGED_OMP_DISABLED";
 #[cfg(not(windows))]
 const SERVER_STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
@@ -104,12 +142,28 @@ enum UpdateChannel {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewManifestContract {
+    UpstreamLegacy,
+    SmartyPaired,
+    Custom,
+}
+
+fn preview_manifest_contract(build_manifest_url: Option<&str>) -> PreviewManifestContract {
+    match build_manifest_url {
+        None => PreviewManifestContract::UpstreamLegacy,
+        Some(SMARTY_PREVIEW_UPDATE_MANIFEST_URL) => PreviewManifestContract::SmartyPaired,
+        Some(_) => PreviewManifestContract::Custom,
+    }
+}
+
 impl UpdateChannel {
     fn configured() -> Self {
-        match crate::config::Config::load().config.update.channel {
+        let configured = match crate::config::Config::load().config.update.channel {
             crate::config::UpdateChannelConfig::Stable => Self::Stable,
             crate::config::UpdateChannelConfig::Preview => Self::Preview,
-        }
+        };
+        update_channel_for_build_manifest(crate::build_info::update_manifest_url(), configured)
     }
 
     fn as_str(self) -> &'static str {
@@ -120,11 +174,25 @@ impl UpdateChannel {
     }
 }
 
-#[derive(Debug, Clone)]
+fn update_channel_for_build_manifest(
+    build_manifest_url: Option<&str>,
+    configured_channel: UpdateChannel,
+) -> UpdateChannel {
+    if build_manifest_url.is_some() {
+        UpdateChannel::Preview
+    } else {
+        configured_channel
+    }
+}
+
+fn preview_manifest_url(build_manifest_url: Option<&str>) -> &str {
+    build_manifest_url.unwrap_or(PREVIEW_UPDATE_MANIFEST_URL)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AssetRef {
     url: String,
     sha256: Option<String>,
-    #[cfg(windows)]
     format: Option<String>,
 }
 
@@ -138,28 +206,46 @@ impl<'de> Deserialize<'de> for AssetRef {
             serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
                 url: url.trim().to_string(),
                 sha256: None,
-                #[cfg(windows)]
                 format: None,
             }),
             serde_json::Value::Object(mut object) => {
-                let url = object
-                    .remove("url")
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
-                let sha256 = object
-                    .remove("sha256")
-                    .and_then(|value| value.as_str().map(str::to_string));
-                #[cfg(windows)]
-                let format = object
-                    .remove("format")
-                    .and_then(|value| value.as_str().map(str::to_string));
+                let url = match object.remove("url") {
+                    Some(serde_json::Value::String(value)) => value,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "asset object is missing string url",
+                        ));
+                    }
+                };
+                let sha256 = match object.remove("sha256") {
+                    None => None,
+                    Some(serde_json::Value::String(value)) => Some(value),
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "asset object sha256 must be a string",
+                        ));
+                    }
+                };
+                let format = match object.remove("format") {
+                    None => None,
+                    Some(serde_json::Value::String(value)) => Some(value),
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "asset object format must be a string",
+                        ));
+                    }
+                };
+                if !object.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "asset object has unexpected fields",
+                    ));
+                }
                 if url.trim().is_empty() {
                     return Err(serde::de::Error::custom("asset url must not be empty"));
                 }
                 Ok(Self {
                     url: url.trim().to_string(),
                     sha256: sha256.filter(|value| !value.trim().is_empty()),
-                    #[cfg(windows)]
                     format: format.filter(|value| !value.trim().is_empty()),
                 })
             }
@@ -170,7 +256,7 @@ impl<'de> Deserialize<'de> for AssetRef {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl AssetRef {
     fn package_format(&self) -> Result<String, String> {
         let format = self
@@ -228,27 +314,816 @@ struct ManifestReleaseMetadata {
     announcement: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Default)]
+enum CanonicalBuildId {
+    #[default]
+    Absent,
+    Present(Option<String>),
+}
+
+impl CanonicalBuildId {
+    #[cfg(windows)]
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+fn deserialize_canonical_build_id<'de, D>(deserializer: D) -> Result<CanonicalBuildId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(CanonicalBuildId::Present(Option::<String>::deserialize(
+        deserializer,
+    )?))
+}
+
 #[derive(Deserialize)]
 struct PreviewManifest {
+    schema_version: u32,
     channel: String,
     base_version: String,
     build_id: String,
+    #[serde(default, deserialize_with = "deserialize_canonical_build_id")]
+    canonical_build_id: CanonicalBuildId,
     commit: String,
     built_at: String,
     protocol: u32,
     notes: String,
     assets: BTreeMap<String, AssetRef>,
     #[serde(default)]
+    omp: Option<OmpCompanionMetadata>,
+    #[serde(default)]
     builds: BTreeMap<String, PreviewBuildMetadata>,
 }
 
-#[derive(Deserialize)]
+impl PreviewManifest {
+    fn bridge_build(&self) -> Result<Option<(&str, &PreviewBuildMetadata)>, String> {
+        let CanonicalBuildId::Present(canonical_build_id) = &self.canonical_build_id else {
+            return Ok(None);
+        };
+        if self.schema_version != 2 {
+            return Err("preview Phase A bridge schema_version must be 2".into());
+        }
+        let canonical_build_id = canonical_build_id
+            .as_deref()
+            .ok_or("preview manifest canonical_build_id must not be null")?;
+        let canonical_identity = parse_canonical_paired_build_id(canonical_build_id).ok_or(
+            "preview manifest canonical_build_id must be a full lowercase P/R/O build identity",
+        )?;
+        if self.build_id != windows_bootstrap_build_alias(canonical_build_id) {
+            return Err(
+                "preview manifest build_id does not match canonical bootstrap alias".into(),
+            );
+        }
+        let archived = self.builds.get(canonical_build_id).ok_or_else(|| {
+            format!("preview manifest has no retained canonical build {canonical_build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+        {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} metadata differs from top-level metadata"
+            ));
+        }
+        if canonical_identity.herdr_commit != archived.commit {
+            return Err(format!(
+                "preview manifest canonical build {canonical_build_id} Herdr commit does not match retained metadata"
+            ));
+        }
+        let top_omp = self.omp.as_ref().ok_or_else(|| {
+            format!(
+                "preview manifest canonical build {canonical_build_id} has no top-level OMP metadata"
+            )
+        })?;
+        let archived_omp = archived.omp.as_ref().ok_or_else(|| {
+            format!(
+                "preview manifest retained canonical build {canonical_build_id} has no OMP metadata"
+            )
+        })?;
+        if archived_omp != top_omp {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} OMP metadata differs from top-level metadata"
+            ));
+        }
+        if canonical_identity.omp_commit != archived_omp.commit {
+            return Err(format!(
+                "preview manifest canonical build {canonical_build_id} OMP commit does not match retained metadata"
+            ));
+        }
+        if self.assets != archived.assets {
+            return Err(format!(
+                "preview manifest retained canonical build {canonical_build_id} assets differ from top-level metadata"
+            ));
+        }
+        self.validate_smarty_retained_builds()?;
+        Ok(Some((canonical_build_id, archived)))
+    }
+
+    fn effective_build_id(&self) -> Result<&str, String> {
+        if let Some((canonical_build_id, _)) = self.bridge_build()? {
+            return Ok(canonical_build_id);
+        }
+        let build_id = self.build_id.trim();
+        let identity = parse_canonical_paired_build_id(build_id).ok_or_else(|| {
+            "preview manifest build_id must be a full lowercase P/R/O build identity".to_string()
+        })?;
+        if self.schema_version != 1 {
+            return Err("Smarty paired preview manifest schema_version must be 1".into());
+        }
+        validate_exact_preview_assets(
+            build_id,
+            &self.assets,
+            CANONICAL_PREVIEW_HERDR_ASSETS,
+            "Herdr",
+            false,
+        )?;
+        let omp = self.omp.as_ref().ok_or_else(|| {
+            format!("preview manifest build {build_id} has no paired OMP metadata")
+        })?;
+        validate_smarty_omp(build_id, omp, Some(identity.omp_commit))?;
+        self.validate_smarty_retained_builds()?;
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("preview manifest has no retained canonical build {build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp != self.omp
+        {
+            return Err(format!(
+                "preview manifest retained canonical build {build_id} metadata differs from top-level metadata"
+            ));
+        }
+        Ok(build_id)
+    }
+
+    fn validate_smarty_retained_builds(&self) -> Result<(), String> {
+        if self.builds.is_empty() {
+            return Err("preview manifest retained build history is empty".into());
+        }
+        for (build_id, build) in &self.builds {
+            validate_smarty_retained_preview_build(build_id, build)?;
+        }
+        Ok(())
+    }
+
+    fn upstream_legacy_build(&self) -> Result<(&str, &PreviewBuildMetadata), String> {
+        if self.schema_version != 1 {
+            return Err("upstream preview manifest schema_version must be 1".into());
+        }
+        if !matches!(self.canonical_build_id, CanonicalBuildId::Absent) {
+            return Err("upstream preview manifest cannot use the Smarty Phase A bridge".into());
+        }
+        let build_id = self.build_id.trim();
+        let identity = parse_legacy_preview_build_id(build_id)
+            .ok_or("upstream preview manifest build_id must use YYYY-MM-DD-<12 lowercase hex>")?;
+        if self.omp.is_some() {
+            return Err(
+                "upstream legacy preview current build must not claim paired OMP metadata".into(),
+            );
+        }
+        if self.builds.is_empty() {
+            return Err("upstream preview manifest retained build history is empty".into());
+        }
+        for (retained_id, retained) in &self.builds {
+            validate_upstream_retained_preview_build(retained_id, retained)?;
+        }
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("upstream preview manifest has no retained current build {build_id}")
+        })?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp.is_some()
+        {
+            return Err("upstream preview manifest top-level/current archive mismatch".into());
+        }
+        if !self.commit.starts_with(identity.commit_prefix) {
+            return Err(
+                "upstream preview manifest commit does not match its legacy build ID".into(),
+            );
+        }
+        Ok((build_id, archived))
+    }
+
+    fn custom_build(&self) -> Result<(&str, Option<&PreviewBuildMetadata>), String> {
+        if self.schema_version != 1 {
+            return Err("custom preview manifest schema_version must be 1".into());
+        }
+        if !matches!(self.canonical_build_id, CanonicalBuildId::Absent) {
+            return Err(
+                "Smarty Phase A bridge manifests require the exact Smarty manifest URL".into(),
+            );
+        }
+        let build_id = required_preview_string(&self.build_id, "custom preview manifest build_id")?;
+        validate_custom_preview_metadata(
+            build_id,
+            &self.base_version,
+            &self.commit,
+            &self.built_at,
+            self.protocol,
+            &self.assets,
+            self.omp.as_ref(),
+        )?;
+        if self.builds.is_empty() {
+            return Err("custom preview manifest retained build history is empty".into());
+        }
+        let archived = self.builds.get(build_id).ok_or_else(|| {
+            format!("custom preview manifest has no retained current build {build_id}")
+        })?;
+        validate_custom_retained_preview_build(build_id, archived)?;
+        if archived.base_version != self.base_version
+            || archived.commit != self.commit
+            || archived.built_at != self.built_at
+            || archived.protocol != self.protocol
+            || archived.assets != self.assets
+            || archived.omp != self.omp
+        {
+            return Err("custom preview manifest top-level/current archive mismatch".into());
+        }
+        Ok((build_id, Some(archived)))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 struct PreviewBuildMetadata {
     base_version: String,
     commit: String,
     built_at: String,
     protocol: u32,
+    #[serde(default)]
+    tag: Option<String>,
     assets: BTreeMap<String, AssetRef>,
+    #[serde(default)]
+    omp: Option<OmpCompanionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct OmpCompanionMetadata {
+    build_id: String,
+    commit: String,
+    tree: String,
+    version: String,
+    assets: BTreeMap<String, AssetRef>,
+}
+
+fn canonical_preview_asset_url(build_id: &str, asset_name: &str) -> String {
+    format!("{PREVIEW_RELEASE_DOWNLOAD_URL}/smarty-preview-{build_id}/{asset_name}")
+}
+
+fn upstream_preview_asset_url(build_id: &str, asset_name: &str) -> String {
+    format!("{UPSTREAM_PREVIEW_RELEASE_DOWNLOAD_URL}/preview-{build_id}/{asset_name}")
+}
+
+fn required_preview_string<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value || value.contains('\n') || value.contains('\r') {
+        return Err(format!("{label} must be a nonempty one-line string"));
+    }
+    Ok(value)
+}
+
+fn is_lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_preview_commit(value: &str, label: &str) -> Result<(), String> {
+    if !is_lowercase_hex(value, 40) {
+        return Err(format!(
+            "{label} must be a lowercase 40-character Git object ID"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_preview_sha256(value: Option<&str>, label: &str) -> Result<(), String> {
+    let value = value.ok_or_else(|| format!("{label} is missing a SHA-256 checksum"))?;
+    if !is_lowercase_hex(value, 64) {
+        return Err(format!("{label} has an invalid SHA-256 checksum"));
+    }
+    Ok(())
+}
+
+fn validate_preview_timestamp(value: &str, label: &str) -> Result<(), String> {
+    required_preview_string(value, label)?;
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.get(10) != Some(&b'T') {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    let time_end = if bytes.last() == Some(&b'Z') {
+        bytes.len() - 1
+    } else if bytes.len() >= 25
+        && matches!(bytes[bytes.len() - 6], b'+' | b'-')
+        && bytes[bytes.len() - 3] == b':'
+        && bytes[bytes.len() - 5..bytes.len() - 3]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 2..].iter().all(u8::is_ascii_digit)
+    {
+        bytes.len() - 6
+    } else {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    };
+    if time_end < 19
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+        || !bytes[17..19].iter().all(u8::is_ascii_digit)
+        || (time_end > 19
+            && (bytes[19] != b'.'
+                || time_end == 20
+                || !bytes[20..time_end].iter().all(u8::is_ascii_digit)))
+    {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    let hour = std::str::from_utf8(&bytes[11..13])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let minute = std::str::from_utf8(&bytes[14..16])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let second = std::str::from_utf8(&bytes[17..19])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok());
+    let date = std::str::from_utf8(&bytes[..10]).ok();
+    if date.is_none_or(|date| !valid_calendar_date(date))
+        || hour.is_none_or(|value| value > 23)
+        || minute.is_none_or(|value| value > 59)
+        || second.is_none_or(|value| value > 60)
+    {
+        return Err(format!(
+            "{label} must be an ISO-8601 timestamp with a timezone"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_preview_assets(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    expected_assets: &[(&str, &str)],
+    component: &str,
+    upstream: bool,
+) -> Result<(), String> {
+    if assets.len() != expected_assets.len()
+        || expected_assets
+            .iter()
+            .any(|(target, _)| !assets.contains_key(*target))
+    {
+        return Err(format!(
+            "preview manifest {component} asset allow-list is incomplete or unexpected"
+        ));
+    }
+    for &(target, asset_name) in expected_assets {
+        let asset = &assets[target];
+        let expected_url = if upstream {
+            upstream_preview_asset_url(build_id, asset_name)
+        } else {
+            canonical_preview_asset_url(build_id, asset_name)
+        };
+        if asset.url != expected_url {
+            return Err(format!(
+                "preview manifest {component} asset {target} URL does not bind the canonical release tag"
+            ));
+        }
+        validate_preview_sha256(
+            asset.sha256.as_deref(),
+            &format!("preview manifest {component} asset {target}"),
+        )?;
+        if asset_name.ends_with(".zip") {
+            if asset.format.as_deref() != Some("zip") {
+                return Err(format!(
+                    "preview manifest {component} asset {target} must use zip format"
+                ));
+            }
+        } else if asset.format.is_some() {
+            return Err(format!(
+                "preview manifest {component} asset {target} has unexpected format metadata"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_upstream_preview_assets(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+) -> Result<(), String> {
+    const MODERN_ZIP: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+        ("windows-x86_64", "herdr-windows-x86_64.zip"),
+    ];
+    const LEGACY_EXE: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+        ("windows-x86_64", "herdr-windows-x86_64.exe"),
+    ];
+    const UNIX_ONLY: &[(&str, &str)] = &[
+        ("linux-x86_64", "herdr-linux-x86_64"),
+        ("linux-aarch64", "herdr-linux-aarch64"),
+        ("macos-x86_64", "herdr-macos-x86_64"),
+        ("macos-aarch64", "herdr-macos-aarch64"),
+    ];
+
+    for shape in [MODERN_ZIP, LEGACY_EXE, UNIX_ONLY] {
+        if assets.len() != shape.len()
+            || shape
+                .iter()
+                .any(|(target, _)| !assets.contains_key(*target))
+        {
+            continue;
+        }
+        let mut matches = true;
+        for &(target, asset_name) in shape {
+            let asset = &assets[target];
+            let expected_format = asset_name.ends_with(".zip").then_some("zip");
+            if asset.url != upstream_preview_asset_url(build_id, asset_name)
+                || asset.format.as_deref() != expected_format
+            {
+                matches = false;
+                break;
+            }
+            validate_preview_sha256(
+                asset.sha256.as_deref(),
+                &format!("preview manifest upstream Herdr asset {target}"),
+            )?;
+        }
+        if matches {
+            return Ok(());
+        }
+    }
+    Err(
+        "upstream preview manifest Herdr asset shape is not an authenticated historical allow-list"
+            .into(),
+    )
+}
+
+#[cfg(unix)]
+fn validate_canonical_preview_asset_urls(
+    build_id: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    expected_assets: &[(&str, &str)],
+    component: &str,
+) -> Result<(), String> {
+    for &(target, asset_name) in expected_assets {
+        let Some(asset) = assets.get(target) else {
+            continue;
+        };
+        if asset.url != canonical_preview_asset_url(build_id, asset_name) {
+            return Err(format!(
+                "preview manifest {component} asset {target} URL does not bind the canonical release tag"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_custom_preview_assets(
+    assets: &BTreeMap<String, AssetRef>,
+    label: &str,
+) -> Result<(), String> {
+    if assets.is_empty() {
+        return Err(format!("{label} asset allow-list must not be empty"));
+    }
+    for (target, asset) in assets {
+        required_preview_string(&asset.url, &format!("{label} asset {target} URL"))?;
+        validate_preview_sha256(asset.sha256.as_deref(), &format!("{label} asset {target}"))?;
+        if asset
+            .format
+            .as_deref()
+            .is_some_and(|format| !matches!(format, "zip" | "exe"))
+        {
+            return Err(format!("{label} asset {target} has unsupported format"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_smarty_omp(
+    build_id: &str,
+    omp: &OmpCompanionMetadata,
+    expected_commit: Option<&str>,
+) -> Result<(), String> {
+    required_preview_string(&omp.build_id, "preview manifest OMP build_id")?;
+    required_preview_string(&omp.version, "preview manifest OMP version")?;
+    validate_preview_commit(&omp.commit, "preview manifest OMP commit")?;
+    validate_preview_commit(&omp.tree, "preview manifest OMP tree")?;
+    if expected_commit.is_some_and(|expected| omp.commit != expected) {
+        return Err(format!(
+            "preview manifest build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_exact_preview_assets(
+        build_id,
+        &omp.assets,
+        CANONICAL_PREVIEW_OMP_ASSETS,
+        "OMP",
+        false,
+    )
+}
+
+fn validate_smarty_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    required_preview_string(build_id, "preview manifest retained build ID")?;
+    if build.tag.as_deref() != Some(&format!("smarty-preview-{build_id}")) {
+        return Err(format!(
+            "preview manifest retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    if Version::parse(&build.base_version).is_none() {
+        return Err(format!(
+            "preview manifest retained build {build_id} has an invalid base_version"
+        ));
+    }
+    validate_preview_commit(
+        &build.commit,
+        &format!("preview manifest retained build {build_id} commit"),
+    )?;
+    let built_at_label = format!("preview manifest retained build {build_id} built_at");
+    validate_preview_timestamp(&build.built_at, &built_at_label)?;
+    let source_built_at = &build.built_at;
+    let source_day = &source_built_at[..10];
+    if build.protocol == 0 {
+        return Err(format!(
+            "preview manifest retained build {build_id} protocol must be positive"
+        ));
+    }
+    validate_exact_preview_assets(
+        build_id,
+        &build.assets,
+        CANONICAL_PREVIEW_HERDR_ASSETS,
+        "Herdr",
+        false,
+    )?;
+    if let Some(identity) = parse_canonical_paired_build_id(build_id) {
+        if build.commit != identity.herdr_commit {
+            return Err(format!(
+                "preview manifest build {build_id} Herdr commit does not match its P/R/O identity"
+            ));
+        }
+        if source_built_at.len() != 20
+            || !source_built_at.ends_with('Z')
+            || source_day != identity.day
+        {
+            return Err(format!(
+                "preview manifest retained build {build_id} built_at does not match its paired build date"
+            ));
+        }
+        let omp = build.omp.as_ref().ok_or_else(|| {
+            format!("preview manifest build {build_id} has no paired OMP metadata")
+        })?;
+        validate_smarty_omp(build_id, omp, Some(identity.omp_commit))?;
+        return Ok(());
+    }
+    let legacy = parse_legacy_preview_build_id(build_id).ok_or_else(|| {
+        format!(
+            "preview manifest retained build {build_id} must use a paired or legacy preview identity"
+        )
+    })?;
+    if !build.commit.starts_with(legacy.commit_prefix) {
+        return Err(format!(
+            "preview manifest retained build {build_id} commit does not match its legacy identity"
+        ));
+    }
+    if source_day != legacy.day {
+        return Err(format!(
+            "preview manifest retained build {build_id} built_at does not match its legacy build date"
+        ));
+    }
+    if let Some(omp) = build.omp.as_ref() {
+        validate_smarty_omp(build_id, omp, None)?;
+    }
+    Ok(())
+}
+
+fn validate_upstream_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    let identity = parse_legacy_preview_build_id(build_id).ok_or_else(|| {
+        format!("upstream preview retained build {build_id} must use YYYY-MM-DD-<12 lowercase hex>")
+    })?;
+    if build.tag.as_deref() != Some(&format!("preview-{build_id}")) {
+        return Err(format!(
+            "upstream preview retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    if Version::parse(&build.base_version).is_none() {
+        return Err(format!(
+            "upstream preview retained build {build_id} has an invalid base_version"
+        ));
+    }
+    validate_preview_commit(
+        &build.commit,
+        &format!("upstream preview retained build {build_id} commit"),
+    )?;
+    if !build.commit.starts_with(identity.commit_prefix) {
+        return Err(format!(
+            "upstream preview retained build {build_id} commit does not match its legacy identity"
+        ));
+    }
+    validate_preview_timestamp(
+        &build.built_at,
+        &format!("upstream preview retained build {build_id} built_at"),
+    )?;
+    if build.protocol == 0 {
+        return Err(format!(
+            "upstream preview retained build {build_id} protocol must be positive"
+        ));
+    }
+    if build.omp.is_some() {
+        return Err(format!(
+            "upstream preview retained build {build_id} must not claim paired OMP metadata"
+        ));
+    }
+    validate_upstream_preview_assets(build_id, &build.assets)
+}
+
+fn validate_custom_omp(
+    build_id: &str,
+    omp: &OmpCompanionMetadata,
+    expected_commit: Option<&str>,
+) -> Result<(), String> {
+    required_preview_string(&omp.build_id, "custom preview OMP build_id")?;
+    required_preview_string(&omp.version, "custom preview OMP version")?;
+    validate_preview_commit(&omp.commit, "custom preview OMP commit")?;
+    validate_preview_commit(&omp.tree, "custom preview OMP tree")?;
+    if expected_commit.is_some_and(|expected| omp.commit != expected) {
+        return Err(format!(
+            "custom preview build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_custom_preview_assets(&omp.assets, "custom preview OMP")
+}
+
+fn validate_custom_preview_metadata(
+    build_id: &str,
+    base_version: &str,
+    commit: &str,
+    built_at: &str,
+    protocol: u32,
+    assets: &BTreeMap<String, AssetRef>,
+    omp: Option<&OmpCompanionMetadata>,
+) -> Result<(), String> {
+    if Version::parse(base_version).is_none() {
+        return Err("custom preview manifest has an invalid base_version".into());
+    }
+    validate_preview_commit(commit, "custom preview manifest commit")?;
+    validate_preview_timestamp(built_at, "custom preview manifest built_at")?;
+    if protocol == 0 {
+        return Err("custom preview manifest protocol must be positive".into());
+    }
+    validate_custom_preview_assets(assets, "custom preview manifest")?;
+    let paired = parse_canonical_paired_build_id(build_id);
+    if let Some(identity) = paired.as_ref() {
+        if commit != identity.herdr_commit {
+            return Err("custom preview manifest commit does not match its P/R/O build ID".into());
+        }
+        if !built_at.starts_with(identity.day) {
+            return Err(
+                "custom preview manifest built_at does not match its paired build date".into(),
+            );
+        }
+    } else if let Some(identity) = parse_legacy_preview_build_id(build_id) {
+        if !commit.starts_with(identity.commit_prefix) {
+            return Err("custom preview manifest commit does not match its legacy build ID".into());
+        }
+        if !built_at.starts_with(identity.day) {
+            return Err(
+                "custom preview manifest built_at does not match its legacy build date".into(),
+            );
+        }
+    } else {
+        return Err(
+            "custom preview manifest build_id must use a paired or legacy preview identity".into(),
+        );
+    }
+    if let Some(omp) = omp {
+        validate_custom_omp(
+            build_id,
+            omp,
+            paired.as_ref().map(|identity| identity.omp_commit),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_custom_retained_preview_build(
+    build_id: &str,
+    build: &PreviewBuildMetadata,
+) -> Result<(), String> {
+    let tag = build
+        .tag
+        .as_deref()
+        .ok_or_else(|| format!("custom preview retained build {build_id} has no tag"))?;
+    required_preview_string(tag, "custom preview retained build tag")?;
+    if !tag.ends_with(build_id) {
+        return Err(format!(
+            "custom preview retained build {build_id} tag does not bind its build ID"
+        ));
+    }
+    validate_custom_preview_metadata(
+        build_id,
+        &build.base_version,
+        &build.commit,
+        &build.built_at,
+        build.protocol,
+        &build.assets,
+        build.omp.as_ref(),
+    )
+}
+
+#[cfg(unix)]
+fn validate_canonical_preview_build(
+    build_id: &str,
+    commit: &str,
+    assets: &BTreeMap<String, AssetRef>,
+    omp: Option<&OmpCompanionMetadata>,
+) -> Result<(), String> {
+    let identity = parse_canonical_paired_build_id(build_id).ok_or_else(|| {
+        format!("preview manifest build {build_id} must use a full lowercase P/R/O build identity")
+    })?;
+    if commit != identity.herdr_commit {
+        return Err(format!(
+            "preview manifest build {build_id} Herdr commit does not match its P/R/O identity"
+        ));
+    }
+    let omp =
+        omp.ok_or_else(|| format!("preview manifest build {build_id} has no paired OMP metadata"))?;
+    if omp.commit != identity.omp_commit {
+        return Err(format!(
+            "preview manifest build {build_id} OMP commit does not match its P/R/O identity"
+        ));
+    }
+    validate_canonical_preview_asset_urls(
+        build_id,
+        assets,
+        CANONICAL_PREVIEW_HERDR_ASSETS,
+        "Herdr",
+    )?;
+    validate_canonical_preview_asset_urls(
+        build_id,
+        &omp.assets,
+        CANONICAL_PREVIEW_OMP_ASSETS,
+        "OMP",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OmpBuildIdentity<'a> {
+    build_id: &'a str,
+    commit: &'a str,
+    tree: &'a str,
+    version: &'a str,
+}
+
+#[cfg(unix)]
+fn compiled_omp_identity() -> Result<Option<OmpBuildIdentity<'static>>, String> {
+    let identity = match (
+        crate::build_info::omp_build_id(),
+        crate::build_info::omp_commit(),
+        crate::build_info::omp_tree(),
+        crate::build_info::omp_version(),
+    ) {
+        (None, None, None, None) => return Ok(None),
+        (Some(build_id), Some(commit), Some(tree), Some(version)) => OmpBuildIdentity {
+            build_id,
+            commit,
+            tree,
+            version,
+        },
+        _ => return Err("paired Herdr build has incomplete compiled OMP identity".into()),
+    };
+    validate_omp_source_value("build_id", identity.build_id)?;
+    validate_omp_git_oid("commit", identity.commit)?;
+    validate_omp_git_oid("tree", identity.tree)?;
+    validate_omp_source_value("version", identity.version)?;
+    Ok(Some(identity))
 }
 
 #[derive(Deserialize)]
@@ -324,7 +1199,9 @@ fn fetch_update_manifest() -> Result<UpdateManifest, String> {
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(preview_manifest_url(
+        crate::build_info::update_manifest_url(),
+    ))
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -351,6 +1228,284 @@ where
 
     serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
+}
+
+#[cfg(all(test, unix))]
+fn preview_omp_metadata_for_build<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+) -> Result<&'a OmpCompanionMetadata, String> {
+    preview_omp_metadata_for_build_with_contract(
+        manifest,
+        herdr_build_id,
+        PreviewManifestContract::SmartyPaired,
+    )
+}
+
+#[cfg(unix)]
+fn preview_omp_metadata_for_build_with_contract<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    contract: PreviewManifestContract,
+) -> Result<&'a OmpCompanionMetadata, String> {
+    if parse_legacy_preview_build_id(herdr_build_id).is_some() {
+        return Err(format!(
+            "preview manifest legacy build {herdr_build_id} cannot provide a paired OMP companion"
+        ));
+    }
+    match contract {
+        PreviewManifestContract::UpstreamLegacy => {
+            Err("upstream legacy preview builds do not have a paired OMP companion".into())
+        }
+        PreviewManifestContract::SmartyPaired => {
+            if parse_canonical_paired_build_id(herdr_build_id).is_none() {
+                return Err(format!(
+                    "preview manifest build {herdr_build_id} is not a paired build"
+                ));
+            }
+            if manifest.builds.is_empty() {
+                if manifest.build_id != herdr_build_id {
+                    return Err(format!(
+                        "preview manifest has no retained build {herdr_build_id}"
+                    ));
+                }
+                let identity =
+                    parse_canonical_paired_build_id(herdr_build_id).ok_or_else(|| {
+                        format!("preview manifest build {herdr_build_id} is not a paired build")
+                    })?;
+                if manifest.commit != identity.herdr_commit {
+                    return Err(format!(
+                        "preview manifest build {herdr_build_id} identity does not bind Herdr metadata"
+                    ));
+                }
+                let omp = manifest.omp.as_ref().ok_or_else(|| {
+                    format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+                })?;
+                if omp.commit != identity.omp_commit {
+                    return Err(format!(
+                        "preview manifest build {herdr_build_id} OMP commit does not match its P/R/O identity"
+                    ));
+                }
+                return Ok(omp);
+            }
+            let canonical_build_id = manifest.effective_build_id()?;
+            if canonical_build_id == herdr_build_id {
+                let omp = if let Some((_, archived)) = manifest.bridge_build()? {
+                    archived.omp.as_ref()
+                } else {
+                    manifest.omp.as_ref()
+                };
+                return omp.ok_or_else(|| {
+                    format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+                });
+            }
+            let retained = manifest.builds.get(herdr_build_id).ok_or_else(|| {
+                format!("preview manifest has no retained build {herdr_build_id}")
+            })?;
+            validate_canonical_preview_build(
+                herdr_build_id,
+                &retained.commit,
+                &retained.assets,
+                retained.omp.as_ref(),
+            )?;
+            validate_smarty_retained_preview_build(herdr_build_id, retained)?;
+            retained.omp.as_ref().ok_or_else(|| {
+                format!("preview manifest build {herdr_build_id} has no paired OMP metadata")
+            })
+        }
+        PreviewManifestContract::Custom => {
+            Err("custom preview manifests cannot provide a managed paired OMP companion".into())
+        }
+    }
+}
+#[cfg(unix)]
+fn validate_omp_source_value(field: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains("REPLACE_WITH_") {
+        return Err(format!(
+            "paired OMP {field} is missing or still a replacement placeholder"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_omp_git_oid(field: &str, value: &str) -> Result<(), String> {
+    validate_omp_source_value(field, value)?;
+    if value.len() != 40 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(format!(
+            "paired OMP {field} must be a 40-character Git object ID"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn preview_omp_asset_for_build<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+) -> Result<(&'a OmpCompanionMetadata, &'a AssetRef, &'a str), String> {
+    preview_omp_asset_for_build_with_contract(
+        manifest,
+        herdr_build_id,
+        expected,
+        asset_key,
+        PreviewManifestContract::SmartyPaired,
+    )
+}
+
+#[cfg(unix)]
+fn preview_omp_asset_for_build_with_contract<'a>(
+    manifest: &'a PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+    contract: PreviewManifestContract,
+) -> Result<(&'a OmpCompanionMetadata, &'a AssetRef, &'a str), String> {
+    let omp = preview_omp_metadata_for_build_with_contract(manifest, herdr_build_id, contract)?;
+    validate_omp_source_value("build_id", &omp.build_id)?;
+    validate_omp_git_oid("commit", &omp.commit)?;
+    validate_omp_git_oid("tree", &omp.tree)?;
+    validate_omp_source_value("version", &omp.version)?;
+    if omp.build_id != expected.build_id
+        || omp.commit != expected.commit
+        || omp.tree != expected.tree
+        || omp.version != expected.version
+    {
+        return Err(format!(
+            "paired OMP identity mismatch: Herdr requires {}/{}/{}/{}",
+            expected.build_id, expected.commit, expected.tree, expected.version
+        ));
+    }
+    let asset = omp.assets.get(asset_key).ok_or_else(|| {
+        format!(
+            "paired OMP build {} has no asset for {asset_key}",
+            omp.build_id
+        )
+    })?;
+    if matches!(contract, PreviewManifestContract::SmartyPaired) {
+        let asset_name = CANONICAL_PREVIEW_OMP_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .ok_or_else(|| format!("paired OMP has unsupported asset target {asset_key}"))?;
+        if asset.url != canonical_preview_asset_url(herdr_build_id, asset_name) {
+            return Err(format!(
+                "preview manifest OMP asset {asset_key} URL does not bind the canonical release tag"
+            ));
+        }
+        if asset.format.is_some() {
+            return Err(format!(
+                "preview manifest OMP asset {asset_key} has unexpected format metadata"
+            ));
+        }
+    }
+    let checksum = asset
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|checksum| !checksum.is_empty())
+        .ok_or_else(|| format!("paired OMP asset {asset_key} is missing a SHA-256 checksum"))?;
+    if !is_lowercase_hex(checksum, 64) {
+        return Err(format!(
+            "paired OMP asset {asset_key} has an invalid SHA-256 checksum"
+        ));
+    }
+    Ok((omp, asset, checksum))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedOmpCompanion {
+    executable: PathBuf,
+    build_id: String,
+    sha256: String,
+    commit: String,
+    tree: String,
+    version: String,
+}
+
+impl ManagedOmpCompanion {
+    #[cfg(unix)]
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[cfg(unix)]
+    fn verify(&self) -> Result<(), String> {
+        validate_managed_omp(&self.executable, &self.sha256)
+    }
+
+    pub(crate) fn apply_to_command(&self, command: &mut Command) {
+        command
+            .env(MANAGED_OMP_BIN_ENV_VAR, &self.executable)
+            .env(MANAGED_OMP_BUILD_ID_ENV_VAR, &self.build_id)
+            .env(MANAGED_OMP_COMMIT_ENV_VAR, &self.commit)
+            .env(MANAGED_OMP_TREE_ENV_VAR, &self.tree)
+            .env(MANAGED_OMP_VERSION_ENV_VAR, &self.version)
+            .env(MANAGED_OMP_SHA256_ENV_VAR, &self.sha256)
+            .env_remove(MANAGED_OMP_DISABLED_ENV_VAR);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
+        env.extend([
+            (
+                MANAGED_OMP_BIN_ENV_VAR.to_string(),
+                self.executable.to_string_lossy().into_owned(),
+            ),
+            (
+                MANAGED_OMP_BUILD_ID_ENV_VAR.to_string(),
+                self.build_id.clone(),
+            ),
+            (MANAGED_OMP_COMMIT_ENV_VAR.to_string(), self.commit.clone()),
+            (MANAGED_OMP_TREE_ENV_VAR.to_string(), self.tree.clone()),
+            (
+                MANAGED_OMP_VERSION_ENV_VAR.to_string(),
+                self.version.clone(),
+            ),
+            (MANAGED_OMP_SHA256_ENV_VAR.to_string(), self.sha256.clone()),
+        ]);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OmpExecutable {
+    Explicit(PathBuf),
+    #[cfg(unix)]
+    Managed(ManagedOmpCompanion),
+}
+
+impl OmpExecutable {
+    pub(crate) fn executable(&self) -> &Path {
+        match self {
+            Self::Explicit(path) => path,
+            #[cfg(unix)]
+            Self::Managed(companion) => companion.executable(),
+        }
+    }
+
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            match self {
+                Self::Explicit(path) => validate_executable(path),
+                Self::Managed(companion) => companion.verify(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn append_launch_env(&self, env: &mut Vec<(String, String)>) {
+        if let Self::Managed(companion) = self {
+            companion.append_launch_env(env);
+        }
+    }
 }
 
 fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>) {
@@ -439,8 +1594,118 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
+pub(crate) fn windows_bootstrap_build_alias(canonical_build_id: &str) -> String {
+    format!(
+        "bootstrap-{:x}",
+        Sha256::digest(canonical_build_id.as_bytes())
+    )
+}
+
+struct CanonicalPairedBuildId<'a> {
+    day: &'a str,
+    herdr_commit: &'a str,
+    omp_commit: &'a str,
+}
+
+struct LegacyBuildId<'a> {
+    day: &'a str,
+    commit_prefix: &'a str,
+}
+
+fn valid_calendar_date(value: &str) -> bool {
+    if value.len() != 10
+        || value.as_bytes().get(4) != Some(&b'-')
+        || value.as_bytes().get(7) != Some(&b'-')
+        || !value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[0..4].parse::<u32>().ok();
+    let month = value[5..7].parse::<u32>().ok();
+    let day = value[8..10].parse::<u32>().ok();
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
+}
+
+fn parse_canonical_paired_build_id(value: &str) -> Option<CanonicalPairedBuildId<'_>> {
+    let (date, identities) = value.split_once("-p")?;
+    if !valid_calendar_date(date) {
+        return None;
+    }
+    let (parent, identities) = identities.split_once("-r")?;
+    let (herdr_commit, omp_commit) = identities.split_once("-o")?;
+    if !is_lowercase_hex(parent, 40)
+        || !is_lowercase_hex(herdr_commit, 40)
+        || !is_lowercase_hex(omp_commit, 40)
+    {
+        return None;
+    }
+    Some(CanonicalPairedBuildId {
+        day: date,
+        herdr_commit,
+        omp_commit,
+    })
+}
+
+fn parse_legacy_preview_build_id(value: &str) -> Option<LegacyBuildId<'_>> {
+    if value.len() != 23 || value.as_bytes().get(10) != Some(&b'-') {
+        return None;
+    }
+    let day = &value[..10];
+    let commit_prefix = &value[11..];
+    if !valid_calendar_date(day) || !is_lowercase_hex(commit_prefix, 12) {
+        return None;
+    }
+    Some(LegacyBuildId { day, commit_prefix })
+}
+
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
+) -> Result<Option<ReleaseInfo>, String> {
+    let contract = preview_manifest_contract(crate::build_info::update_manifest_url());
+    release_info_from_preview_manifest_with_contract(
+        manifest,
+        true,
+        crate::build_info::uses_preview_update_manifest(),
+        crate::build_info::build_id(),
+        contract,
+    )
+}
+#[cfg(test)]
+fn release_info_from_preview_manifest_for_build(
+    manifest: &PreviewManifest,
+    require_checksum: bool,
+    installed_is_preview: bool,
+    current_build_id: Option<&str>,
+) -> Result<Option<ReleaseInfo>, String> {
+    release_info_from_preview_manifest_with_contract(
+        manifest,
+        require_checksum,
+        installed_is_preview,
+        current_build_id,
+        PreviewManifestContract::SmartyPaired,
+    )
+}
+
+fn release_info_from_preview_manifest_with_contract(
+    manifest: &PreviewManifest,
+    require_checksum: bool,
+    installed_is_preview: bool,
+    current_build_id: Option<&str>,
+    contract: PreviewManifestContract,
 ) -> Result<Option<ReleaseInfo>, String> {
     if manifest.channel != "preview" {
         return Err(format!(
@@ -448,15 +1713,29 @@ fn release_info_from_preview_manifest(
             manifest.channel
         ));
     }
-    let build_id = manifest.build_id.trim();
-    if build_id.is_empty() {
-        return Err("preview manifest build_id is empty".into());
-    }
-    if crate::build_info::is_preview()
-        && crate::build_info::build_id().is_some_and(|current| current == build_id)
-    {
-        return Ok(None);
-    }
+
+    let (selected_build_id, retained_build) = match contract {
+        PreviewManifestContract::UpstreamLegacy => {
+            let (build_id, retained) = manifest.upstream_legacy_build()?;
+            (build_id, Some(retained))
+        }
+        PreviewManifestContract::SmartyPaired => match manifest.bridge_build()? {
+            Some((canonical_build_id, retained_build)) => {
+                (canonical_build_id, Some(retained_build))
+            }
+            None => {
+                let canonical_build_id = manifest.effective_build_id()?;
+                let retained_build = manifest.builds.get(canonical_build_id).ok_or_else(|| {
+                    format!("preview manifest has no retained canonical build {canonical_build_id}")
+                })?;
+                (canonical_build_id, Some(retained_build))
+            }
+        },
+        PreviewManifestContract::Custom => {
+            let (build_id, retained) = manifest.custom_build()?;
+            (build_id, retained)
+        }
+    };
 
     let version = Version::parse(&manifest.base_version).ok_or_else(|| {
         format!(
@@ -470,42 +1749,47 @@ fn release_info_from_preview_manifest(
     }
     let (os, arch) = platform_target();
     let asset_key = format!("{os}-{arch}");
-    if let Some(archived) = manifest.builds.get(build_id) {
-        if archived.base_version != manifest.base_version
-            || archived.commit != manifest.commit
-            || archived.built_at != manifest.built_at
-            || archived.protocol != manifest.protocol
-        {
-            tracing::warn!(
-                build_id,
-                "preview manifest archived build metadata differs from top-level metadata"
-            );
-        }
-    }
-    let asset = manifest
-        .assets
-        .get(&asset_key)
-        .or_else(|| {
-            manifest
-                .builds
-                .get(build_id)
-                .and_then(|build| build.assets.get(&asset_key))
-        })
+    let asset = retained_build
+        .and_then(|build| build.assets.get(&asset_key))
+        .or_else(|| manifest.assets.get(&asset_key))
         .ok_or_else(|| format!("no binary for {asset_key} in preview manifest"))?;
-    let download_url = asset.url.clone();
+    let sha256 = asset.sha256.clone();
+    if require_checksum || matches!(contract, PreviewManifestContract::SmartyPaired) {
+        validate_preview_sha256(
+            sha256.as_deref(),
+            &format!("preview manifest asset {asset_key}"),
+        )?;
+    }
+    #[cfg(windows)]
+    let package_format = asset.package_format()?;
+    #[cfg(windows)]
+    let needs_windows_storage_canonicalization = manifest.canonical_build_id.is_absent()
+        && windows_same_build_storage_needs_canonicalization(
+            &preview_display_version(&manifest.base_version, selected_build_id),
+            &package_format,
+            sha256.as_deref(),
+        );
+    #[cfg(not(windows))]
+    let needs_windows_storage_canonicalization = false;
+    if installed_is_preview
+        && current_build_id.is_some_and(|current| current == selected_build_id)
+        && !needs_windows_storage_canonicalization
+    {
+        return Ok(None);
+    }
 
     Ok(Some(ReleaseInfo {
-        identity: preview_display_version(&manifest.base_version, build_id),
+        identity: preview_display_version(&manifest.base_version, selected_build_id),
         version,
         channel: UpdateChannel::Preview,
-        build_id: Some(build_id.to_string()),
+        build_id: Some(selected_build_id.to_string()),
         commit: Some(manifest.commit.clone()),
         #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
-        download_url,
-        sha256: asset.sha256.clone(),
+        download_url: asset.url.clone(),
+        sha256,
         #[cfg(windows)]
-        package_format: asset.package_format()?,
+        package_format,
         notes_body,
     }))
 }
@@ -594,6 +1878,80 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(windows))]
+#[derive(Debug)]
+struct UpdateLock {
+    file: fs::File,
+}
+
+#[cfg(not(windows))]
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` owns a valid open descriptor for the lifetime of the lock.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_update_lock_at(current_exe: &Path, nonblocking: bool) -> Result<UpdateLock, String> {
+    let parent = current_exe.parent().ok_or("can't find binary directory")?;
+    let lock_path = parent.join(".herdr-update.lock");
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path).map_err(|error| {
+        format!(
+            "failed to open update lock {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "failed to inspect update lock {}: {error}",
+                lock_path.display()
+            )
+        })?;
+        let euid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.uid() != euid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "update lock is not a private current-user file: {}",
+                lock_path.display()
+            ));
+        }
+    }
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    // SAFETY: `file` owns a valid open descriptor and `operation` contains flock flags only.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err("another Herdr update is already running".into());
+        }
+        return Err(format!(
+            "failed to lock update path {}: {error}",
+            lock_path.display()
+        ));
+    }
+    Ok(UpdateLock { file })
+}
+
+#[cfg(not(windows))]
+fn acquire_update_lock(nonblocking: bool) -> Result<UpdateLock, String> {
+    let current_exe =
+        env::current_exe().map_err(|error| format!("can't find current binary: {error}"))?;
+    acquire_update_lock_at(&current_exe, nonblocking)
+}
+
+#[cfg(not(windows))]
+#[derive(Debug)]
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -611,30 +1969,51 @@ impl Drop for DownloadedUpdate {
 /// Download a release to a prepared executable temp file without touching the running server.
 #[cfg(not(windows))]
 fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
+    download_update_asset(&release.download_url, release.sha256.as_deref())
+}
+
+#[cfg(not(windows))]
+fn download_update_asset(
+    download_url: &str,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadedUpdate, String> {
     let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
+    download_update_asset_for_exe(current_exe, download_url, expected_sha256)
+}
 
+#[cfg(not(windows))]
+fn download_update_asset_for_exe(
+    current_exe: PathBuf,
+    download_url: &str,
+    expected_sha256: Option<&str>,
+) -> Result<DownloadedUpdate, String> {
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
-
-    // Check write permissions early
-    let test_path = parent.join(".herdr-write-test");
-    if let Err(e) = fs::write(&test_path, b"") {
-        let _ = fs::remove_file(&test_path);
-        return Err(format!(
-            "install directory not writable: {} ({}). Try running with appropriate permissions.",
-            parent.display(),
-            e
-        ));
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| format!("failed to create update temp name: {error}"))?;
+    let tmp_path = parent.join(format!(
+        ".herdr-update-{}-{:x}.tmp",
+        std::process::id(),
+        Sha256::digest(nonce)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let _ = fs::remove_file(&test_path);
-
-    // Unique temp file (avoids races with concurrent instances)
-    let tmp_path = parent.join(format!(".herdr-update-{}.tmp", std::process::id()));
-
+    options.open(&tmp_path).map_err(|error| {
+        format!(
+            "failed to create update temp file {}: {error}",
+            tmp_path.display()
+        )
+    })?;
     // Download the exact asset URL (pinned to the release we checked)
     let status = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--max-time", "120", "-o"])
         .arg(&tmp_path)
-        .arg(&release.download_url)
+        .arg(download_url)
         .status()
         .map_err(|e| format!("download failed: {e}"))?;
 
@@ -643,7 +2022,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
-    if let Some(expected) = &release.sha256 {
+    if let Some(expected) = expected_sha256 {
         if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
             let _ = fs::remove_file(&tmp_path);
             return Err(format!(
@@ -687,9 +2066,992 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
     Ok(())
 }
 
+#[cfg(unix)]
+fn private_managed_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    let was_missing = match fs::symlink_metadata(state_dir) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect managed state directory {}: {error}",
+                state_dir.display()
+            ));
+        }
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(state_dir).map_err(|error| {
+        format!(
+            "failed to create managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    if was_missing {
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed to make newly created managed state directory private {}: {error}",
+                state_dir.display()
+            )
+        })?;
+    }
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(state_dir)
+        .map_err(|error| {
+            format!(
+                "failed to open managed state directory without following links {}: {error}",
+                state_dir.display()
+            )
+        })?;
+    let opened = directory.metadata().map_err(|error| {
+        format!(
+            "failed to inspect managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let euid = unsafe { libc::geteuid() };
+    if !opened.is_dir() || opened.uid() != euid {
+        return Err(format!(
+            "managed state directory is not owned by the current user: {}",
+            state_dir.display()
+        ));
+    }
+    let opened_mode = opened.permissions().mode();
+    if opened_mode & 0o022 != 0 {
+        return Err(format!(
+            "managed state directory is group- or world-writable: {}",
+            state_dir.display()
+        ));
+    }
+    if opened_mode & 0o077 != 0 {
+        let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+        if result != 0 {
+            return Err(format!(
+                "failed to make managed state directory private {}: {}",
+                state_dir.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    }
+
+    let canonical = fs::canonicalize(state_dir).map_err(|error| {
+        format!(
+            "failed to canonicalize managed state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+        format!(
+            "failed to inspect canonical managed state directory {}: {error}",
+            canonical.display()
+        )
+    })?;
+    if opened.dev() != canonical_metadata.dev() || opened.ino() != canonical_metadata.ino() {
+        return Err(format!(
+            "managed state directory changed while it was being validated: {}",
+            state_dir.display()
+        ));
+    }
+
+    let mut current = PathBuf::new();
+    for component in canonical.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "failed to inspect managed state directory ancestor {}: {error}",
+                current.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "managed state directory ancestor is not a directory: {}",
+                current.display()
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if current == canonical {
+            if metadata.uid() != euid {
+                return Err(format!(
+                    "managed state directory is not owned by the current user: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 {
+                return Err(format!(
+                    "managed state directory is group- or world-writable: {}",
+                    current.display()
+                ));
+            }
+        } else {
+            if metadata.uid() != 0 && metadata.uid() != euid {
+                return Err(format!(
+                    "managed state directory has an untrusted owner on ancestor: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(format!(
+                    "managed state directory has an unsafe writable ancestor: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn private_managed_subdir(state_dir: &Path, components: &[&str]) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    let euid = unsafe { libc::geteuid() };
+    let mut current = state_dir.to_path_buf();
+    for component in components {
+        let next = current.join(component);
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        let created = match builder.create(&next) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create managed state subdirectory {}: {error}",
+                    next.display()
+                ));
+            }
+        };
+        if created {
+            fs::set_permissions(&next, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                format!(
+                    "failed to make newly created managed state subdirectory private {}: {error}",
+                    next.display()
+                )
+            })?;
+        }
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&next)
+            .map_err(|error| {
+                format!(
+                    "failed to open managed state subdirectory without following links {}: {error}",
+                    next.display()
+                )
+            })?;
+        let opened = directory.metadata().map_err(|error| {
+            format!(
+                "failed to inspect managed state subdirectory {}: {error}",
+                next.display()
+            )
+        })?;
+        if !opened.is_dir() || opened.uid() != euid || opened.permissions().mode() & 0o022 != 0 {
+            return Err(format!(
+                "managed state subdirectory is not private and current-user-owned: {}",
+                next.display()
+            ));
+        }
+        if opened.permissions().mode() & 0o077 != 0 {
+            let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+            if result != 0 {
+                return Err(format!(
+                    "failed to make managed state subdirectory private {}: {}",
+                    next.display(),
+                    io::Error::last_os_error()
+                ));
+            }
+        }
+        let canonical = fs::canonicalize(&next).map_err(|error| {
+            format!(
+                "failed to canonicalize managed state subdirectory {}: {error}",
+                next.display()
+            )
+        })?;
+        let canonical_metadata = fs::metadata(&canonical).map_err(|error| {
+            format!(
+                "failed to inspect canonical managed state subdirectory {}: {error}",
+                canonical.display()
+            )
+        })?;
+        if canonical.parent() != Some(current.as_path())
+            || opened.dev() != canonical_metadata.dev()
+            || opened.ino() != canonical_metadata.ino()
+        {
+            return Err(format!(
+                "managed state subdirectory changed while it was being validated: {}",
+                next.display()
+            ));
+        }
+        current = canonical;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn private_remote_client_build_dir(state_dir: &Path, build_id: &str) -> Result<PathBuf, String> {
+    let build_hash = format!("{:x}", Sha256::digest(build_id.as_bytes()));
+    private_managed_subdir(state_dir, &["remote", "clients", &build_hash])
+}
+
+#[cfg(all(test, unix))]
+fn remote_client_build_dir(state_dir: &Path, build_id: &str) -> PathBuf {
+    let build_hash = format!("{:x}", Sha256::digest(build_id.as_bytes()));
+    state_dir.join("remote").join("clients").join(build_hash)
+}
+
+#[cfg(all(test, unix))]
+fn remote_omp_executable_path(state_dir: &Path, build_id: &str) -> PathBuf {
+    remote_client_build_dir(state_dir, build_id).join("omp")
+}
+
+#[cfg(unix)]
+fn install_exact_asset_for_remote_build_at(
+    state_dir: &Path,
+    build_id: &str,
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    let state_dir = private_managed_state_dir(state_dir)?;
+    let client_exe = private_remote_client_build_dir(&state_dir, build_id)?.join("herdr");
+    let _lock = acquire_update_lock_at(&client_exe, true)?;
+    let update = download_update_asset_for_exe(client_exe, download_url, Some(expected_sha256))?;
+    let client_exe = update.current_exe.clone();
+    install_downloaded_update(update)?;
+    validate_private_managed_executable(&client_exe)?;
+    crate::checksum::verify_sha256(&client_exe, expected_sha256)
+        .map_err(|error| format!("installed remote Herdr checksum verification failed: {error}"))?;
+    Ok(client_exe)
+}
+
+#[cfg(unix)]
+fn validate_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "OMP executable path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("OMP executable {} is unavailable: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("OMP executable is not a file: {}", path.display()));
+    }
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "OMP executable is not executable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_managed_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "managed executable path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "managed executable {} is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    let euid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode();
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || (metadata.uid() != 0 && metadata.uid() != euid)
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
+        return Err(format!(
+            "managed executable is not a trusted regular executable: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_managed_omp(path: &Path, expected_sha256: &str) -> Result<(), String> {
+    validate_private_managed_executable(path)?;
+    crate::checksum::verify_sha256(path, expected_sha256)
+        .map_err(|error| format!("OMP companion checksum verification failed: {error}"))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedReleaseMetadata {
+    #[serde(rename = "assetUrl")]
+    asset_url: String,
+    #[serde(rename = "buildId")]
+    build_id: String,
+    commit: String,
+    omp: SealedOmpMetadata,
+    platform: String,
+    protocol: u32,
+    schema: u32,
+    sha256: String,
+    version: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedOmpMetadata {
+    #[serde(rename = "assetUrl")]
+    asset_url: String,
+    #[serde(rename = "buildId")]
+    build_id: String,
+    commit: String,
+    platform: String,
+    sha256: String,
+    tree: String,
+    version: String,
+}
+
+#[cfg(unix)]
+struct SealedPairExpectation<'a> {
+    herdr_build_id: &'a str,
+    herdr_commit: &'a str,
+    herdr_platform: String,
+    herdr_version: String,
+    omp: OmpBuildIdentity<'a>,
+    omp_platform: String,
+}
+
+#[cfg(unix)]
+fn validate_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(format!("{label} must be a 64-character SHA-256 digest"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_value(label: &str, value: &str) -> Result<(), String> {
+    validate_omp_source_value(label, value)?;
+    if value.contains('\r') || value.contains('\n') {
+        return Err(format!("{label} must be one line"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_member(path: &Path, label: &str, directory: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("sealed OMP release {label} is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        }
+    {
+        return Err(format!("sealed OMP release {label} must not be a symlink"));
+    }
+    if metadata.permissions().mode() & 0o222 != 0 {
+        return Err(format!("sealed OMP release {label} is writable"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_sealed_release_ancestry(release_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let euid = unsafe { libc::geteuid() };
+    let mut current = PathBuf::new();
+    for component in release_dir.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "failed to inspect sealed OMP release ancestor {}: {error}",
+                current.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "sealed OMP release ancestor is not a directory: {}",
+                current.display()
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if current == release_dir {
+            if metadata.uid() != euid {
+                return Err(format!(
+                    "sealed OMP release directory is not owned by the current user: {}",
+                    current.display()
+                ));
+            }
+        } else {
+            if metadata.uid() != 0 && metadata.uid() != euid {
+                return Err(format!(
+                    "sealed OMP release has an untrusted owner on ancestor: {}",
+                    current.display()
+                ));
+            }
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Err(format!(
+                    "sealed OMP release has an unsafe writable ancestor: {}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sealed_member_present(path: &Path, label: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "sealed OMP release {label} is unavailable: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn sealed_sibling_omp_companion(
+    current_exe: &Path,
+    expected: &SealedPairExpectation<'_>,
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    let current_exe = fs::canonicalize(current_exe)
+        .map_err(|error| format!("failed to canonicalize running Herdr executable: {error}"))?;
+    let Some(release_dir) = current_exe.parent() else {
+        return Ok(None);
+    };
+    let herdr = release_dir.join("herdr");
+    let omp = release_dir.join("omp");
+    let metadata = release_dir.join("release.json");
+    let has_metadata = sealed_member_present(&metadata, "release metadata")?;
+    if !has_metadata {
+        return Ok(None);
+    }
+    if !sealed_member_present(&omp, "OMP executable")? {
+        return Err("sealed OMP release is incomplete".into());
+    }
+    validate_sealed_member(release_dir, "directory", true)?;
+    validate_sealed_release_ancestry(release_dir)?;
+    validate_sealed_member(&herdr, "Herdr executable", false)?;
+    validate_sealed_member(&omp, "OMP executable", false)?;
+    validate_sealed_member(&metadata, "release metadata", false)?;
+    if fs::canonicalize(&herdr).map_err(|error| error.to_string())? != current_exe {
+        return Err(
+            "sealed OMP release Herdr executable does not match the running Herdr binary".into(),
+        );
+    }
+    let metadata: SealedReleaseMetadata = serde_json::from_slice(
+        &fs::read(&metadata)
+            .map_err(|error| format!("failed to read sealed OMP release metadata: {error}"))?,
+    )
+    .map_err(|error| format!("invalid sealed OMP release metadata: {error}"))?;
+    if metadata.schema != 2 {
+        return Err("sealed OMP release metadata has an unsupported schema".into());
+    }
+    validate_sealed_value("sealed Herdr asset URL", &metadata.asset_url)?;
+    validate_sealed_value("sealed Herdr build ID", &metadata.build_id)?;
+    validate_omp_git_oid("sealed Herdr commit", &metadata.commit)?;
+    validate_sealed_value("sealed Herdr platform", &metadata.platform)?;
+    validate_sha256("sealed Herdr SHA-256", &metadata.sha256)?;
+    validate_sealed_value("sealed Herdr version", &metadata.version)?;
+    validate_sealed_value("sealed OMP asset URL", &metadata.omp.asset_url)?;
+    validate_sealed_value("sealed OMP build ID", &metadata.omp.build_id)?;
+    validate_omp_git_oid("sealed OMP commit", &metadata.omp.commit)?;
+    validate_sealed_value("sealed OMP platform", &metadata.omp.platform)?;
+    validate_sha256("sealed OMP SHA-256", &metadata.omp.sha256)?;
+    validate_omp_git_oid("sealed OMP tree", &metadata.omp.tree)?;
+    validate_sealed_value("sealed OMP version", &metadata.omp.version)?;
+    if metadata.build_id != expected.herdr_build_id
+        || metadata.commit != expected.herdr_commit
+        || metadata.platform != expected.herdr_platform
+        || metadata.protocol != crate::protocol::PROTOCOL_VERSION
+        || metadata.version != expected.herdr_version
+    {
+        return Err("sealed OMP release metadata does not match this Herdr build".into());
+    }
+    if metadata.omp.build_id != expected.omp.build_id
+        || metadata.omp.commit != expected.omp.commit
+        || metadata.omp.tree != expected.omp.tree
+        || metadata.omp.version != expected.omp.version
+        || metadata.omp.platform != expected.omp_platform
+    {
+        return Err("sealed OMP release metadata does not match this Herdr OMP companion".into());
+    }
+    validate_executable(&herdr)?;
+    crate::checksum::verify_sha256(&herdr, &metadata.sha256)
+        .map_err(|error| format!("sealed Herdr checksum verification failed: {error}"))?;
+    validate_managed_omp(&omp, &metadata.omp.sha256)?;
+    Ok(Some(ManagedOmpCompanion {
+        executable: omp,
+        build_id: metadata.omp.build_id,
+        commit: metadata.omp.commit,
+        tree: metadata.omp.tree,
+        version: metadata.omp.version,
+        sha256: metadata.omp.sha256,
+    }))
+}
+
+#[cfg(unix)]
+fn install_exact_omp_asset_for_remote_build_at(
+    state_dir: &Path,
+    herdr_build_id: &str,
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<PathBuf, String> {
+    let state_dir = private_managed_state_dir(state_dir)?;
+    let omp_exe = private_remote_client_build_dir(&state_dir, herdr_build_id)?.join("omp");
+    if validate_managed_omp(&omp_exe, expected_sha256).is_ok() {
+        return Ok(omp_exe);
+    }
+
+    let _lock = acquire_update_lock_at(&omp_exe, false)?;
+    if validate_managed_omp(&omp_exe, expected_sha256).is_ok() {
+        return Ok(omp_exe);
+    }
+    let update =
+        download_update_asset_for_exe(omp_exe.clone(), download_url, Some(expected_sha256))?;
+    install_downloaded_update(update)?;
+    validate_managed_omp(&omp_exe, expected_sha256)?;
+    Ok(omp_exe)
+}
+
+#[cfg(all(test, unix))]
+fn install_omp_companion_from_manifest_at(
+    state_dir: &Path,
+    manifest: &PreviewManifest,
+    herdr_build_id: &str,
+    expected: OmpBuildIdentity<'_>,
+    asset_key: &str,
+) -> Result<ManagedOmpCompanion, String> {
+    let (omp, asset, checksum) =
+        preview_omp_asset_for_build(manifest, herdr_build_id, expected, asset_key)?;
+    let executable = install_exact_omp_asset_for_remote_build_at(
+        state_dir,
+        herdr_build_id,
+        &asset.url,
+        checksum,
+    )?;
+    Ok(ManagedOmpCompanion {
+        executable,
+        build_id: omp.build_id.clone(),
+        commit: omp.commit.clone(),
+        tree: omp.tree.clone(),
+        version: omp.version.clone(),
+        sha256: checksum.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn current_sealed_pair_expectation(
+    omp: OmpBuildIdentity<'static>,
+    omp_platform: &str,
+) -> Result<SealedPairExpectation<'static>, String> {
+    let herdr_build_id =
+        crate::build_info::build_id().ok_or("paired Herdr build has no immutable build ID")?;
+    let herdr_commit =
+        crate::build_info::commit().ok_or("paired Herdr build has no immutable source commit")?;
+    validate_sealed_value("compiled Herdr build ID", herdr_build_id)?;
+    validate_omp_git_oid("compiled Herdr commit", herdr_commit)?;
+    let (os, arch) = platform_target();
+    Ok(SealedPairExpectation {
+        herdr_build_id,
+        herdr_commit,
+        herdr_platform: format!("{os}-{arch}"),
+        herdr_version: format!("herdr {}", crate::build_info::version()),
+        omp,
+        omp_platform: omp_platform.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn load_current_omp_companion() -> Result<Option<ManagedOmpCompanion>, String> {
+    let Some(omp) = compiled_omp_identity()? else {
+        return Ok(None);
+    };
+    let Some(omp_platform) = omp_platform_target() else {
+        return Ok(None);
+    };
+    let expected = current_sealed_pair_expectation(omp, &omp_platform)?;
+    if let Ok(current_exe) = env::current_exe() {
+        match sealed_sibling_omp_companion(&current_exe, &expected) {
+            Ok(Some(companion)) => return Ok(Some(companion)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if crate::build_info::update_manifest_url().is_none() {
+        return Err("paired Herdr build has no build-authored preview manifest URL".into());
+    }
+    let manifest = fetch_preview_manifest()?;
+    if manifest.channel != "preview" {
+        return Err(format!(
+            "paired Herdr build manifest has unexpected channel {}",
+            manifest.channel
+        ));
+    }
+    let (omp_metadata, asset, checksum) = preview_omp_asset_for_build_with_contract(
+        &manifest,
+        expected.herdr_build_id,
+        expected.omp,
+        &omp_platform,
+        preview_manifest_contract(crate::build_info::update_manifest_url()),
+    )?;
+    let executable = install_exact_omp_asset_for_remote_build_at(
+        &crate::config::state_dir(),
+        expected.herdr_build_id,
+        &asset.url,
+        checksum,
+    )?;
+    Ok(Some(ManagedOmpCompanion {
+        executable,
+        build_id: omp_metadata.build_id.clone(),
+        commit: omp_metadata.commit.clone(),
+        tree: omp_metadata.tree.clone(),
+        version: omp_metadata.version.clone(),
+        sha256: checksum.to_string(),
+    }))
+}
+
+#[cfg(unix)]
+pub(crate) fn managed_omp_companion_for_current_build(
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    load_current_omp_companion()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn managed_omp_companion_for_current_build(
+) -> Result<Option<ManagedOmpCompanion>, String> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn explicit_omp_executable() -> Result<Option<PathBuf>, String> {
+    let Some(path) = env::var_os(OMP_BIN_ENV_VAR).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    validate_executable(&path)?;
+    Ok(Some(path))
+}
+
+#[cfg(unix)]
+fn server_private_omp_fallback_executable() -> Result<OmpExecutable, String> {
+    let Some(path) = env::var_os("PATH") else {
+        return Err(
+            "server-private OMP fallback executable `omp` is unavailable because PATH is unset"
+                .into(),
+        );
+    };
+    for directory in env::split_paths(&path) {
+        let Ok(candidate) = fs::canonicalize(directory.join("omp")) else {
+            continue;
+        };
+        if validate_executable(&candidate).is_ok() {
+            return Ok(OmpExecutable::Explicit(candidate));
+        }
+    }
+    Err("server-private OMP fallback executable `omp` is unavailable on PATH".into())
+}
+
+#[cfg(unix)]
+fn managed_omp_companion_from_env() -> Result<Option<ManagedOmpCompanion>, String> {
+    let path = env::var_os(MANAGED_OMP_BIN_ENV_VAR);
+    let build_id = env::var(MANAGED_OMP_BUILD_ID_ENV_VAR).ok();
+    let commit = env::var(MANAGED_OMP_COMMIT_ENV_VAR).ok();
+    let tree = env::var(MANAGED_OMP_TREE_ENV_VAR).ok();
+    let version = env::var(MANAGED_OMP_VERSION_ENV_VAR).ok();
+    let sha256 = env::var(MANAGED_OMP_SHA256_ENV_VAR).ok();
+    if path.is_none()
+        && build_id.is_none()
+        && commit.is_none()
+        && tree.is_none()
+        && version.is_none()
+        && sha256.is_none()
+    {
+        return Ok(None);
+    }
+    let path = path
+        .map(PathBuf::from)
+        .ok_or("managed OMP launch environment is missing its executable path")?;
+    let build_id = build_id.ok_or("managed OMP launch environment is missing its build ID")?;
+    let commit = commit.ok_or("managed OMP launch environment is missing its commit")?;
+    let tree = tree.ok_or("managed OMP launch environment is missing its tree")?;
+    let version = version.ok_or("managed OMP launch environment is missing its version")?;
+    let sha256 = sha256.ok_or("managed OMP launch environment is missing its checksum")?;
+    let expected = compiled_omp_identity()?
+        .ok_or("unpaired Herdr build cannot accept a managed OMP companion")?;
+    if build_id != expected.build_id
+        || commit != expected.commit
+        || tree != expected.tree
+        || version != expected.version
+    {
+        return Err(format!(
+            "managed OMP identity mismatch: Herdr requires {}/{}/{}/{}",
+            expected.build_id, expected.commit, expected.tree, expected.version
+        ));
+    }
+    validate_managed_omp(&path, &sha256)?;
+    Ok(Some(ManagedOmpCompanion {
+        executable: path,
+        build_id,
+        commit,
+        tree,
+        version,
+        sha256,
+    }))
+}
+
+#[cfg(unix)]
+pub(crate) fn native_omp_executable() -> Result<OmpExecutable, String> {
+    if let Some(path) = explicit_omp_executable()? {
+        return Ok(OmpExecutable::Explicit(path));
+    }
+    if env::var_os(MANAGED_OMP_DISABLED_ENV_VAR).is_some() {
+        return Err("managed OMP companion is disabled for this client attach".into());
+    }
+    if omp_platform_target().is_none() {
+        return Err("managed OMP companion is unavailable for this platform".into());
+    }
+    if let Some(companion) = managed_omp_companion_from_env()? {
+        return Ok(OmpExecutable::Managed(companion));
+    }
+    managed_omp_companion_for_current_build()?
+        .map(OmpExecutable::Managed)
+        .ok_or_else(|| "this Herdr build has no paired OMP companion".into())
+}
+
+#[cfg(unix)]
+pub(crate) fn server_private_omp_executable() -> Result<OmpExecutable, String> {
+    if let Some(path) = explicit_omp_executable()? {
+        return Ok(OmpExecutable::Explicit(path));
+    }
+    if compiled_omp_identity()?.is_some() {
+        if omp_platform_target().is_none() {
+            return Err(
+                "paired Herdr build has no managed OMP companion for this server platform".into(),
+            );
+        }
+        return managed_omp_companion_for_current_build()?
+            .map(OmpExecutable::Managed)
+            .ok_or_else(|| "paired Herdr build has no managed OMP companion".into());
+    }
+    #[cfg(test)]
+    if let Ok(executable) = env::current_exe() {
+        return Ok(OmpExecutable::Explicit(executable));
+    }
+    server_private_omp_fallback_executable()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn server_private_omp_executable() -> Result<OmpExecutable, String> {
+    Ok(OmpExecutable::Explicit(
+        env::var_os(OMP_BIN_ENV_VAR)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("omp")),
+    ))
+}
+
+#[cfg(unix)]
+fn reexec_command<I>(current_exe: &Path, args: I) -> Command
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut command = Command::new(current_exe);
+    command.args(args);
+    command
+}
+
+#[cfg(unix)]
+pub(crate) fn install_exact_asset_and_reexec(
+    build_id: &str,
+    download_url: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let client_exe = install_exact_asset_for_remote_build_at(
+        &crate::config::state_dir(),
+        build_id,
+        download_url,
+        expected_sha256,
+    )?;
+
+    let mut command = reexec_command(&client_exe, env::args_os().skip(1));
+    Err(format!(
+        "installed the remote server build but failed to restart Herdr: {}",
+        command.exec()
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn install_exact_asset_and_reexec(
+    _build_id: &str,
+    _download_url: &str,
+    _expected_sha256: &str,
+) -> Result<(), String> {
+    Err("automatic remote server build alignment is not yet supported on Windows".into())
+}
+
+#[cfg(any(windows, test))]
+const WINDOWS_RELEASE_METADATA_FILE: &str = ".herdr-release.json";
+#[cfg(any(windows, test))]
+const WINDOWS_RELEASE_TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+
+#[cfg(any(windows, test))]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsReleaseIdentityMetadata {
+    schema_version: u32,
+    version_identity: String,
+    target_triple: String,
+    format: String,
+    sha256: String,
+}
+
+#[cfg(any(windows, test))]
+fn windows_release_metadata_matches(
+    path: &Path,
+    version_identity: &str,
+    package_format: &str,
+    expected_sha256: Option<&str>,
+) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            serde_json::from_str::<WindowsReleaseIdentityMetadata>(
+                contents.strip_prefix('\u{feff}').unwrap_or(&contents),
+            )
+            .ok()
+        })
+        .is_some_and(|metadata| {
+            matches!(package_format, "zip" | "exe")
+                && expected_sha256.is_some_and(|expected| metadata.sha256 == expected)
+                && metadata.schema_version == 1
+                && metadata.version_identity == version_identity
+                && metadata.target_triple == WINDOWS_RELEASE_TARGET_TRIPLE
+                && metadata.format == package_format
+        })
+}
+
+#[cfg(any(windows, test))]
+fn windows_same_build_storage_needs_canonicalization_at_with_sha(
+    current_exe: &Path,
+    standalone_root: &Path,
+    version_identity: &str,
+    package_format: &str,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let current_link = standalone_root.join("current").join("herdr.exe");
+    let releases_dir = standalone_root.join("releases");
+    let (Ok(current_exe), Ok(releases_dir)) = (
+        fs::canonicalize(current_exe),
+        fs::canonicalize(releases_dir),
+    ) else {
+        return false;
+    };
+    if !current_exe.starts_with(&releases_dir) {
+        return false;
+    }
+    let Ok(current_link) = fs::canonicalize(current_link) else {
+        return true;
+    };
+    if current_exe != current_link {
+        return true;
+    }
+    let Some(release_dir) = current_exe.parent() else {
+        return false;
+    };
+    !windows_release_metadata_matches(
+        &release_dir.join(WINDOWS_RELEASE_METADATA_FILE),
+        version_identity,
+        package_format,
+        expected_sha256,
+    )
+}
+
+#[cfg(windows)]
+fn windows_same_build_storage_needs_canonicalization(
+    version_identity: &str,
+    package_format: &str,
+    expected_sha256: Option<&str>,
+) -> bool {
+    let herdr_home = env::var_os("HERDR_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".herdr")));
+    let (Some(herdr_home), Ok(current_exe)) = (herdr_home, env::current_exe()) else {
+        return false;
+    };
+    windows_same_build_storage_needs_canonicalization_at_with_sha(
+        &current_exe,
+        &herdr_home.join("packages").join("standalone"),
+        version_identity,
+        package_format,
+        expected_sha256,
+    )
+}
+
+#[cfg(test)]
+fn windows_same_build_storage_needs_canonicalization_at(
+    current_exe: &Path,
+    standalone_root: &Path,
+    version_identity: &str,
+    package_format: &str,
+) -> bool {
+    windows_same_build_storage_needs_canonicalization_at_with_sha(
+        current_exe,
+        standalone_root,
+        version_identity,
+        package_format,
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn windows_installed_herdr_exe_path_from_env(
+    install_dir: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let install_dir = match install_dir.filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        Some(install_dir) => PathBuf::from(install_dir),
+        None => PathBuf::from(
+            local_app_data.ok_or("LOCALAPPDATA is not set; cannot locate Herdr install")?,
+        )
+        .join("Programs")
+        .join("Herdr")
+        .join("bin"),
+    };
+    Ok(install_dir.join("herdr.exe"))
+}
+
+#[cfg(windows)]
+fn windows_installed_herdr_exe_path() -> Result<PathBuf, String> {
+    windows_installed_herdr_exe_path_from_env(
+        env::var_os("HERDR_INSTALL_DIR").as_deref(),
+        env::var_os("LOCALAPPDATA").as_deref(),
+    )
+}
+
 #[cfg(windows)]
 const WINDOWS_INSTALLER: &str = include_str!("../website/install.ps1");
-
 #[cfg(windows)]
 struct DownloadedWindowsUpdate {
     package_path: PathBuf,
@@ -734,6 +3096,38 @@ fn download_windows_update(release: &ReleaseInfo) -> Result<DownloadedWindowsUpd
     Ok(update)
 }
 
+#[cfg(any(windows, test))]
+fn windows_installer_command(
+    installer_path: &Path,
+    channel: &str,
+    package_path: &Path,
+    package_format: &str,
+    package_identity: &str,
+    package_sha256: &str,
+) -> Command {
+    let mut command = Command::new("powershell");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(installer_path)
+        .args(["-Channel", channel, "-LocalPackagePath"])
+        .arg(package_path)
+        .args([
+            "-LocalPackageFormat",
+            package_format,
+            "-LocalPackageIdentity",
+            package_identity,
+            "-LocalPackageSha256",
+            package_sha256,
+        ])
+        // Drop any inherited PSModulePath. When herdr is launched from
+        // PowerShell 7, its Core module paths come first and Windows
+        // PowerShell 5.1 (this `powershell`) fails to autoload cmdlets like
+        // Get-FileHash. Removing it lets 5.1 compute its own default path.
+        // See PowerShell/PowerShell#8635.
+        .env_remove("PSModulePath");
+    command
+}
+
 #[cfg(windows)]
 fn install_windows_update_with_installer(
     release: &ReleaseInfo,
@@ -743,50 +3137,22 @@ fn install_windows_update_with_installer(
         .sha256
         .as_deref()
         .ok_or("Windows update asset is missing a SHA-256 checksum")?;
-    let mut command = Command::new("powershell");
-    command
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&update.installer_path)
-        .args(["-Channel", release.channel.as_str(), "-LocalPackagePath"])
-        .arg(&update.package_path)
-        .args([
-            "-LocalPackageFormat",
-            &release.package_format,
-            "-LocalPackageIdentity",
-            release.label(),
-            "-LocalPackageSha256",
-            expected_sha256,
-        ])
-        // Drop any inherited PSModulePath. When herdr is launched from
-        // PowerShell 7, its Core module paths come first and Windows
-        // PowerShell 5.1 (this `powershell`) fails to autoload cmdlets like
-        // Get-FileHash. Removing it lets 5.1 compute its own default path.
-        // See PowerShell/PowerShell#8635.
-        .env_remove("PSModulePath");
-    let status = command
-        .status()
-        .map_err(|err| format!("failed to run Windows installer: {err}"))?;
+    let status = windows_installer_command(
+        &update.installer_path,
+        release.channel.as_str(),
+        &update.package_path,
+        &release.package_format,
+        release.label(),
+        expected_sha256,
+    )
+    .status()
+    .map_err(|err| format!("failed to run Windows installer: {err}"))?;
 
     if !status.success() {
         return Err(format!("Windows installer failed with status {status}"));
     }
 
     Ok(())
-}
-
-#[cfg(windows)]
-fn windows_installed_herdr_exe_path() -> Result<PathBuf, String> {
-    if let Some(install_dir) = env::var_os("HERDR_INSTALL_DIR").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(install_dir).join("herdr.exe"));
-    }
-
-    let local_app_data = env::var_os("LOCALAPPDATA")
-        .ok_or("LOCALAPPDATA is not set; cannot locate Herdr install")?;
-    Ok(PathBuf::from(local_app_data)
-        .join("Programs")
-        .join("Herdr")
-        .join("bin")
-        .join("herdr.exe"))
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +3287,14 @@ struct RunningSessionUpdateOutcome {
     attach_command: Option<String>,
     server_version: Option<String>,
     outcome: RunningServerUpdateOutcome,
+}
+
+#[cfg(not(windows))]
+fn automatic_handoff_completed(outcomes: &[RunningSessionUpdateOutcome]) -> bool {
+    !outcomes.is_empty()
+        && outcomes
+            .iter()
+            .all(|outcome| outcome.outcome == RunningServerUpdateOutcome::LiveHandoffComplete)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1091,6 +3465,7 @@ fn target_client_protocol_server_is_running() -> Result<bool, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SelfUpdateOptions {
     pub(crate) live_handoff: bool,
+    automatic: bool,
 }
 
 pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOptions, String> {
@@ -1098,6 +3473,7 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
     for arg in args {
         match arg.as_str() {
             "--handoff" => options.live_handoff = true,
+            "--automatic" => options.automatic = true,
             "--help" | "-h" => {
                 return Err("usage: herdr update [--handoff]".to_string());
             }
@@ -1163,7 +3539,22 @@ fn confirm_running_server_update_action(
     options: SelfUpdateOptions,
 ) -> Result<Vec<RunningServerUpdateDecision>, String> {
     if plans.is_empty() {
-        return Ok(Vec::new());
+        return if options.automatic {
+            Err("automatic update could not find the running Herdr server".to_string())
+        } else {
+            Ok(Vec::new())
+        };
+    }
+
+    if options.automatic
+        && plans
+            .iter()
+            .any(|plan| !server_supports_live_handoff(&plan.server))
+    {
+        return Err(
+            "automatic update requires live handoff support from every running Herdr server; run `herdr update` manually"
+                .to_string(),
+        );
     }
 
     print_running_session_update_summary(&plans, release, options);
@@ -2107,6 +4498,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     if running_inside_herdr() {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
+    #[cfg(not(windows))]
+    let _update_lock = acquire_update_lock(options.live_handoff)?;
 
     eprintln!("checking {} channel for updates...", channel.as_str());
 
@@ -2183,6 +4576,12 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         print_outdated_integration_notice_with_updated_binary(&updated_exe);
 
         print_running_session_update_outcomes(&server_update_outcomes, &release);
+        if options.automatic && !automatic_handoff_completed(&server_update_outcomes) {
+            return Err(
+                "automatic update installed the new binary, but live handoff did not complete for every running Herdr server"
+                    .to_string(),
+            );
+        }
     }
 
     Ok(release.version)
@@ -2198,7 +4597,67 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
     }
 }
 
-/// Background update check: only surface availability and release notes.
+#[cfg(not(windows))]
+fn client_auto_update_allowed(
+    build_enabled: bool,
+    channel: UpdateChannel,
+    install_command: &str,
+) -> bool {
+    build_enabled && channel == UpdateChannel::Preview && install_command == HERDR_UPDATE_COMMAND
+}
+
+#[cfg(not(windows))]
+fn client_auto_update_command(current_exe: &Path) -> Command {
+    let mut command = crate::noninteractive_process::command(current_exe);
+    command
+        .args(["update", "--handoff", "--automatic"])
+        .env_remove(crate::HERDR_ENV_VAR)
+        .stdin(Stdio::null());
+    command
+}
+
+#[cfg(not(windows))]
+fn client_auto_update_result(current_exe: &Path) -> Option<String> {
+    match client_auto_update_command(current_exe).output() {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Some(if stderr.is_empty() {
+                format!("updater exited with {}", output.status)
+            } else {
+                stderr
+            })
+        }
+        Err(error) => Some(format!("failed to start updater: {error}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_client_auto_update(
+    events: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    version: String,
+) {
+    let error = match env::current_exe() {
+        Ok(current_exe) => client_auto_update_result(&current_exe),
+        Err(error) => Some(format!("can't find current binary: {error}")),
+    };
+
+    let Some(error) = error else {
+        return;
+    };
+    if error.contains("another Herdr update is already running") {
+        tracing::info!("another client owns the current Herdr update");
+        return;
+    }
+
+    tracing::warn!(%error, "client-owned update failed; offering manual retry");
+    let _ = events.blocking_send(crate::events::AppEvent::UpdateReady {
+        version,
+        install_command: update_install_command().to_string(),
+    });
+}
+
+/// Background update check and published-preview auto-install entrypoint.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
     crate::logging::update_check_started();
@@ -2264,6 +4723,20 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
 
     if let Err(e) = crate::release_notes::save_pending(release.label(), &release.notes_body) {
         tracing::warn!("failed to save pending release notes: {e}");
+    }
+
+    #[cfg(not(windows))]
+    if client_auto_update_allowed(
+        crate::build_info::client_auto_update_enabled(),
+        release.channel,
+        update_install_command(),
+    ) {
+        tracing::info!(
+            "auto-update check: {} available, starting client-owned install",
+            release.label()
+        );
+        run_client_auto_update(events, release.label().to_string());
+        return;
     }
 
     tracing::info!(
@@ -2350,6 +4823,176 @@ fn platform_target() -> (&'static str, &'static str) {
 
     (os, arch)
 }
+#[cfg(unix)]
+fn omp_asset_key_for_target(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        ("macos", "x86_64") => Some("macos-x86_64".into()),
+        ("macos", "aarch64") => Some("macos-aarch64".into()),
+        ("linux", "x86_64") => Some("linux-x86_64".into()),
+        ("linux", "aarch64") => Some("linux-aarch64".into()),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxHostLibc {
+    Glibc,
+    Musl,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn omp_asset_key_for_linux_host(arch: &str, libc: LinuxHostLibc) -> Option<String> {
+    match libc {
+        LinuxHostLibc::Glibc => omp_asset_key_for_target("linux", arch),
+        LinuxHostLibc::Musl => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_from_getconf_gnu_libc_version(output: &[u8]) -> Option<LinuxHostLibc> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("musl") {
+        return Some(LinuxHostLibc::Musl);
+    }
+    output
+        .trim_start()
+        .starts_with("glibc ")
+        .then_some(LinuxHostLibc::Glibc)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_from_ldd_version(output: &[u8]) -> Option<LinuxHostLibc> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("musl") {
+        return Some(LinuxHostLibc::Musl);
+    }
+    (output.contains("glibc") || output.contains("gnu libc") || output.contains("gnu c library"))
+        .then_some(LinuxHostLibc::Glibc)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn linux_host_libc_with_probes(
+    getconf: impl FnOnce() -> Option<Vec<u8>>,
+    ldd: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<LinuxHostLibc> {
+    getconf()
+        .as_deref()
+        .and_then(linux_host_libc_from_getconf_gnu_libc_version)
+        .or_else(|| ldd().as_deref().and_then(linux_host_libc_from_ldd_version))
+}
+
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
+const LIBC_PROBE_OUTPUT_LIMIT: usize = 8 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_limited_libc_probe_output<R>(mut reader: R) -> std::sync::mpsc::Receiver<Option<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::with_capacity(LIBC_PROBE_OUTPUT_LIMIT / 2);
+        let mut buffer = [0_u8; 1024];
+        let result = loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(_) => break None,
+            };
+            if read == 0 {
+                break Some(output);
+            }
+            if output.len().saturating_add(read) > LIBC_PROBE_OUTPUT_LIMIT / 2 {
+                break None;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+#[cfg(target_os = "linux")]
+fn linux_libc_probe_output(command: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let stdout = read_limited_libc_probe_output(stdout);
+    let stderr = read_limited_libc_probe_output(stderr);
+    let deadline = Instant::now() + LIBC_PROBE_TIMEOUT;
+    let completed = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Err(_) => break false,
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break false;
+                }
+                std::thread::sleep((deadline - now).min(LIBC_PROBE_POLL_INTERVAL));
+            }
+        }
+    };
+    if !completed {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let mut output = stdout
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()??;
+    let stderr = stderr
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()??;
+    output.extend_from_slice(&stderr);
+    Some(output)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_getconf_gnu_libc_version_output() -> Option<Vec<u8>> {
+    linux_libc_probe_output("/usr/bin/getconf", &["GNU_LIBC_VERSION"])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_ldd_version_output() -> Option<Vec<u8>> {
+    linux_libc_probe_output("/usr/bin/ldd", &["--version"])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_host_libc() -> Option<LinuxHostLibc> {
+    static HOST_LIBC: LazyLock<Option<LinuxHostLibc>> = LazyLock::new(|| {
+        linux_host_libc_with_probes(
+            linux_getconf_gnu_libc_version_output,
+            linux_ldd_version_output,
+        )
+    });
+    *HOST_LIBC
+}
+
+#[cfg(target_os = "linux")]
+fn omp_platform_target() -> Option<String> {
+    let (_, arch) = platform_target();
+    linux_host_libc().and_then(|libc| omp_asset_key_for_linux_host(arch, libc))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn omp_platform_target() -> Option<String> {
+    let (os, arch) = platform_target();
+    omp_asset_key_for_target(os, arch)
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2357,7 +5000,10 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(all(test, unix))]
 mod tests {
+
     use super::*;
+    #[cfg(unix)]
+    use sha2::{Digest, Sha256};
     use std::os::unix::net::UnixListener;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -2371,6 +5017,22 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    struct UmaskGuard(libc::mode_t);
+
+    impl UmaskGuard {
+        fn set(mode: libc::mode_t) -> Self {
+            Self(unsafe { libc::umask(mode) })
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2380,6 +5042,359 @@ mod tests {
             "/tmp/hu-{name}-{}-{nanos}.sock",
             std::process::id()
         ))
+    }
+    fn unique_test_dir(name: &str) -> PathBuf {
+        unique_test_socket_path(name).with_extension("dir")
+    }
+
+    const TEST_PAIRED_OMP_HERDR_BUILD_ID: &str = concat!(
+        "2026-08-19-pdddddddddddddddddddddddddddddddddddddddd-",
+        "rcccccccccccccccccccccccccccccccccccccccc-",
+        "oaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+
+    fn paired_omp_manifest_value(checksum: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "schema_version": 1,
+            "channel": "preview",
+            "base_version": "0.8.0",
+            "build_id": TEST_PAIRED_OMP_HERDR_BUILD_ID,
+            "commit": "c".repeat(40),
+            "built_at": "2026-08-19T00:00:00Z",
+            "protocol": 77,
+            "notes": "paired build",
+            "assets": {},
+            "omp": {
+                "build_id": "omp-build",
+                "commit": "a".repeat(40),
+                "tree": "b".repeat(40),
+                "version": "17.3.7",
+                "assets": {
+                    "macos-aarch64": {
+                        "url": canonical_preview_asset_url(
+                            TEST_PAIRED_OMP_HERDR_BUILD_ID,
+                            "omp-macos-aarch64",
+                        ),
+                    }
+                }
+            }
+        });
+        if let Some(checksum) = checksum {
+            value["omp"]["assets"]["macos-aarch64"]["sha256"] =
+                serde_json::Value::String(checksum.into());
+        }
+        value
+    }
+
+    fn exact_herdr_assets_value(build_id: &str, smarty: bool) -> serde_json::Value {
+        let mut assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_HERDR_ASSETS {
+            let url = if smarty {
+                canonical_preview_asset_url(build_id, asset_name)
+            } else {
+                upstream_preview_asset_url(build_id, asset_name)
+            };
+            let mut asset = serde_json::json!({
+                "url": url,
+                "sha256": "d".repeat(64),
+            });
+            if target == "windows-x86_64" {
+                asset["format"] = serde_json::json!("zip");
+            }
+            assets.insert(target.into(), asset);
+        }
+        serde_json::Value::Object(assets)
+    }
+
+    fn upstream_legacy_manifest_value() -> (String, serde_json::Value) {
+        let build_id = "2026-08-19-eeeeeeeeeeee".to_string();
+        let commit = "e".repeat(40);
+        let assets = exact_herdr_assets_value(&build_id, false);
+        let retained = serde_json::json!({
+            "base_version": "9.9.9",
+            "commit": commit,
+            "built_at": "2026-08-19T03:00:00Z",
+            "protocol": 77,
+            "tag": format!("preview-{build_id}"),
+            "assets": assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(build_id.clone(), retained);
+        (
+            build_id.clone(),
+            serde_json::json!({
+                "schema_version": 1,
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": build_id,
+                "commit": "e".repeat(40),
+                "built_at": "2026-08-19T03:00:00Z",
+                "protocol": 77,
+                "notes": "### Fixed\n- Upstream preview",
+                "assets": exact_herdr_assets_value("2026-08-19-eeeeeeeeeeee", false),
+                "builds": builds,
+            }),
+        )
+    }
+
+    fn smarty_legacy_retained_value(build_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "base_version": "9.9.8",
+            "commit": "e".repeat(40),
+            "built_at": "2026-08-19T03:00:00Z",
+            "protocol": 76,
+            "tag": format!("smarty-preview-{build_id}"),
+            "assets": exact_herdr_assets_value(build_id, true),
+        })
+    }
+
+    fn custom_legacy_manifest_value() -> (String, serde_json::Value) {
+        let build_id = "2026-08-18-ffffffffffff".to_string();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let mut assets = serde_json::Map::new();
+        assets.insert(
+            asset_key,
+            serde_json::json!({
+                "url": "https://downloads.example.test/herdr-custom",
+                "sha256": "f".repeat(64),
+            }),
+        );
+        let assets = serde_json::Value::Object(assets);
+        let retained = serde_json::json!({
+            "base_version": "9.9.7",
+            "commit": "f".repeat(40),
+            "built_at": "2026-08-18T03:00:00Z",
+            "protocol": 75,
+            "tag": format!("fork-preview-{build_id}"),
+            "assets": assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(build_id.clone(), retained);
+        (
+            build_id.clone(),
+            serde_json::json!({
+                "schema_version": 1,
+                "channel": "preview",
+                "base_version": "9.9.7",
+                "build_id": build_id,
+                "commit": "f".repeat(40),
+                "built_at": "2026-08-18T03:00:00Z",
+                "protocol": 75,
+                "notes": "### Fixed\n- Custom preview",
+                "assets": assets,
+                "builds": builds,
+            }),
+        )
+    }
+    fn bridge_manifest_value() -> (String, serde_json::Value) {
+        let canonical_build_id = concat!(
+            "2026-08-22-paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-",
+            "rbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-",
+            "occcccccccccccccccccccccccccccccccccccccc"
+        )
+        .to_string();
+        let mut retained_assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_HERDR_ASSETS {
+            let sha256 = if target == "windows-x86_64" {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            };
+            let mut asset = serde_json::json!({
+                "url": canonical_preview_asset_url(&canonical_build_id, asset_name),
+                "sha256": sha256,
+            });
+            if target == "windows-x86_64" {
+                asset["format"] = serde_json::json!("zip");
+            }
+            retained_assets.insert(target.into(), asset);
+        }
+        let mut omp_assets = serde_json::Map::new();
+        for &(target, asset_name) in CANONICAL_PREVIEW_OMP_ASSETS {
+            omp_assets.insert(
+                target.into(),
+                serde_json::json!({
+                    "url": canonical_preview_asset_url(&canonical_build_id, asset_name),
+                    "sha256": "c".repeat(64),
+                }),
+            );
+        }
+        let omp = serde_json::json!({
+            "build_id": "omp-build",
+            "commit": "c".repeat(40),
+            "tree": "b".repeat(40),
+            "version": "17.3.7",
+            "assets": omp_assets,
+        });
+        let mut builds = serde_json::Map::new();
+        builds.insert(
+            canonical_build_id.clone(),
+            serde_json::json!({
+                "base_version": "9.9.9",
+                "commit": "b".repeat(40),
+                "built_at": "2026-08-22T03:00:00Z",
+                "protocol": 77,
+                "tag": format!("smarty-preview-{canonical_build_id}"),
+                "assets": retained_assets.clone(),
+                "omp": omp.clone(),
+            }),
+        );
+        (
+            canonical_build_id.clone(),
+            serde_json::json!({
+                "schema_version": 2,
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": windows_bootstrap_build_alias(&canonical_build_id),
+                "canonical_build_id": canonical_build_id,
+                "commit": "b".repeat(40),
+                "built_at": "2026-08-22T03:00:00Z",
+                "protocol": 77,
+                "notes": "### Fixed\n- One",
+                "assets": retained_assets,
+                "omp": omp,
+                "builds": builds,
+            }),
+        )
+    }
+
+    fn canonical_manifest_value() -> (String, serde_json::Value) {
+        let (canonical_build_id, mut manifest) = bridge_manifest_value();
+        let retained = manifest["builds"][canonical_build_id.as_str()].clone();
+        manifest
+            .as_object_mut()
+            .expect("preview manifest")
+            .remove("canonical_build_id");
+        manifest["schema_version"] = serde_json::json!(1);
+        manifest["build_id"] = serde_json::json!(canonical_build_id);
+        manifest["assets"] = retained["assets"].clone();
+        manifest["omp"] = retained["omp"].clone();
+        (canonical_build_id, manifest)
+    }
+
+    fn bridge_release_error(value: serde_json::Value, canonical_build_id: &str) -> String {
+        let manifest: PreviewManifest = serde_json::from_value(value).expect("bridge manifest");
+        release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some(canonical_build_id),
+        )
+        .expect_err("tampered bridge must fail before same-build return")
+    }
+
+    fn bridge_omp_asset_error(value: serde_json::Value, canonical_build_id: &str) -> String {
+        let manifest: PreviewManifest = serde_json::from_value(value).expect("bridge manifest");
+        let commit = "c".repeat(40);
+        let tree = "b".repeat(40);
+        preview_omp_asset_for_build(
+            &manifest,
+            canonical_build_id,
+            OmpBuildIdentity {
+                build_id: "omp-build",
+                commit: &commit,
+                tree: &tree,
+                version: "17.3.7",
+            },
+            "macos-aarch64",
+        )
+        .expect_err("tampered bridge must fail before OMP download")
+    }
+
+    fn test_omp_identity() -> OmpBuildIdentity<'static> {
+        OmpBuildIdentity {
+            build_id: "omp-build",
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            tree: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            version: "17.3.7",
+        }
+    }
+
+    fn sealed_pair_expectation() -> SealedPairExpectation<'static> {
+        SealedPairExpectation {
+            herdr_build_id: "herdr-build",
+            herdr_commit: "cccccccccccccccccccccccccccccccccccccccc",
+            herdr_platform: "macos-aarch64".into(),
+            herdr_version: "herdr 0.8.0".into(),
+            omp: test_omp_identity(),
+            omp_platform: "macos-aarch64".into(),
+        }
+    }
+
+    fn sealed_pair_metadata(herdr: &Path, omp: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "assetUrl": "https://example.invalid/herdr",
+            "buildId": "herdr-build",
+            "commit": "cccccccccccccccccccccccccccccccccccccccc",
+            "omp": {
+                "assetUrl": "https://example.invalid/omp",
+                "buildId": "omp-build",
+                "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "platform": "macos-aarch64",
+                "sha256": format!("{:x}", Sha256::digest(fs::read(omp).unwrap())),
+                "tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "version": "17.3.7",
+            },
+            "platform": "macos-aarch64",
+            "protocol": crate::protocol::PROTOCOL_VERSION,
+            "schema": 2,
+            "sha256": format!("{:x}", Sha256::digest(fs::read(herdr).unwrap())),
+            "version": "herdr 0.8.0",
+        })
+    }
+
+    fn seal_pair(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(dir.join("herdr"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(dir.join("omp"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(dir.join("release.json"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn unseal_pair(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("herdr"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("omp"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("release.json"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn write_sealed_pair_metadata(dir: &Path, metadata: &serde_json::Value) {
+        unseal_pair(dir);
+        fs::write(
+            dir.join("release.json"),
+            serde_json::to_vec(metadata).unwrap(),
+        )
+        .unwrap();
+        seal_pair(dir);
+    }
+
+    fn create_sealed_pair_at(dir: PathBuf) -> (PathBuf, PathBuf, PathBuf) {
+        fs::create_dir(&dir).unwrap();
+        let herdr = dir.join("herdr");
+        let omp = dir.join("omp");
+        fs::write(&herdr, b"#!/bin/sh\necho herdr\n").unwrap();
+        fs::write(&omp, b"#!/bin/sh\necho omp\n").unwrap();
+        let metadata = sealed_pair_metadata(&herdr, &omp);
+        fs::write(
+            dir.join("release.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        seal_pair(&dir);
+        (dir, herdr, omp)
+    }
+
+    fn create_sealed_pair(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        create_sealed_pair_at(unique_test_dir(name))
+    }
+
+    fn remove_sealed_pair(dir: &Path) {
+        unseal_pair(dir);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn spawn_accept_loop(path: &Path) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
@@ -2753,22 +5768,890 @@ mod tests {
         assert!(!running_inside_herdr_env(Some("0")));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_requires_enabled_direct_preview_build() {
+        assert!(client_auto_update_allowed(
+            true,
+            UpdateChannel::Preview,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            false,
+            UpdateChannel::Preview,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            true,
+            UpdateChannel::Stable,
+            HERDR_UPDATE_COMMAND
+        ));
+        assert!(!client_auto_update_allowed(
+            true,
+            UpdateChannel::Preview,
+            HOMEBREW_UPDATE_COMMAND
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_child_reenters_outside_herdr() {
+        let command = client_auto_update_command(Path::new("/tmp/herdr"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["update", "--handoff", "--automatic"]);
+        assert!(command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(crate::HERDR_ENV_VAR) && value.is_none()
+        }));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn client_auto_update_runs_child_and_captures_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("client-auto-update-child");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+        fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$1\" = update ] && [ \"$2\" = --handoff ] && [ \"$3\" = --automatic ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(client_auto_update_result(&executable), None);
+
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho checksum mismatch >&2\nexit 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client_auto_update_result(&executable).as_deref(),
+            Some("checksum mismatch")
+        );
+
+        fs::remove_file(executable).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_state_root_is_private_and_rejects_symlinks_and_unsafe_ancestors() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = unique_test_dir("managed-state-root");
+        fs::create_dir(&dir).unwrap();
+        let real = dir.join("real-state");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            private_managed_state_dir(&real).unwrap(),
+            real.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let alias = dir.join("state-link");
+        symlink(&real, &alias).unwrap();
+        assert!(private_managed_state_dir(&alias)
+            .unwrap_err()
+            .contains("without following links"));
+
+        let unsafe_parent = dir.join("unsafe-parent");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let unsafe_state = unsafe_parent.join("state");
+        fs::create_dir(&unsafe_state).unwrap();
+        fs::set_permissions(&unsafe_state, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_managed_state_dir(&unsafe_state)
+            .unwrap_err()
+            .contains("unsafe writable ancestor"));
+
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let escaped = dir.join("escaped");
+        fs::create_dir(&escaped).unwrap();
+        let remote_link = real.join("remote");
+        symlink(&escaped, &remote_link).unwrap();
+        assert!(
+            private_remote_client_build_dir(&real.canonicalize().unwrap(), "build")
+                .unwrap_err()
+                .contains("without following links")
+        );
+        fs::remove_file(&remote_link).unwrap();
+
+        let build_dir =
+            private_remote_client_build_dir(&real.canonicalize().unwrap(), "build").unwrap();
+        let escaped_lock = escaped.join("lock");
+        fs::write(&escaped_lock, b"").unwrap();
+        symlink(&escaped_lock, build_dir.join(".herdr-update.lock")).unwrap();
+        assert!(acquire_update_lock_at(&build_dir.join("omp"), true)
+            .unwrap_err()
+            .contains("failed to open update lock"));
+        fs::remove_file(build_dir.join(".herdr-update.lock")).unwrap();
+
+        let escaped_omp = escaped.join("omp");
+        fs::write(&escaped_omp, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&escaped_omp, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&escaped_omp, build_dir.join("omp")).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(fs::read(&escaped_omp).unwrap()));
+        assert!(validate_managed_omp(&build_dir.join("omp"), &checksum)
+            .unwrap_err()
+            .contains("trusted regular executable"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newly_created_managed_state_directories_are_exactly_private_for_any_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD_ENV: &str = "HERDR_TEST_MANAGED_STATE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::tests::newly_created_managed_state_directories_are_exactly_private_for_any_umask",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let dir = unique_test_dir("managed-state-umask");
+        fs::create_dir(&dir).unwrap();
+        let state = dir.join("state");
+        let umask = UmaskGuard::set(0o777);
+
+        let state = private_managed_state_dir(&state).unwrap();
+        let build = private_remote_client_build_dir(&state, "build").unwrap();
+        for path in [
+            state.clone(),
+            state.join("remote"),
+            state.join("remote").join("clients"),
+            build,
+        ] {
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                path.display()
+            );
+        }
+
+        drop(umask);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_asset_install_uses_build_scoped_client_without_replacing_launcher() {
+        let dir = unique_test_dir("exact-asset");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("server-build");
+        let launcher = dir.join("managed").join("herdr");
+        let state_dir = dir.join("state");
+        let asset = b"exact server build";
+        fs::create_dir(launcher.parent().unwrap()).unwrap();
+        fs::write(&source, asset).unwrap();
+        fs::write(&launcher, b"parent-managed launcher").unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let download_url = format!("file://{}", source.display());
+        let client_exe = install_exact_asset_for_remote_build_at(
+            &state_dir,
+            "server-build",
+            &download_url,
+            &checksum,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&launcher).unwrap(), b"parent-managed launcher");
+        assert_eq!(fs::read(&client_exe).unwrap(), asset);
+        assert!(client_exe.starts_with(
+            state_dir
+                .canonicalize()
+                .unwrap()
+                .join("remote")
+                .join("clients")
+        ));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn paired_omp_manifest_requires_build_identity_and_asset_checksum() {
+        let value = paired_omp_manifest_value(Some(&"c".repeat(64)));
+        let manifest: PreviewManifest = serde_json::from_value(value.clone()).unwrap();
+        let (omp, _, checksum) = preview_omp_asset_for_build(
+            &manifest,
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+        assert_eq!(omp.build_id, "omp-build");
+        assert_eq!(checksum, "c".repeat(64));
+
+        let mut missing_build_id = value;
+        missing_build_id["omp"]
+            .as_object_mut()
+            .unwrap()
+            .remove("build_id");
+        assert!(serde_json::from_value::<PreviewManifest>(missing_build_id).is_err());
+
+        let missing_checksum: PreviewManifest =
+            serde_json::from_value(paired_omp_manifest_value(None)).unwrap();
+        let error = preview_omp_asset_for_build(
+            &missing_checksum,
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap_err();
+        assert!(error.contains("missing a SHA-256 checksum"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_uses_canonical_build_for_current_omp_lookup() {
+        let (canonical_build_id, value) = bridge_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let omp = preview_omp_metadata_for_build(&manifest, &canonical_build_id).unwrap();
+        assert_eq!(omp.build_id, "omp-build");
+    }
+
+    #[test]
+    fn sealed_sibling_pair_resolves_without_manifest_network() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-offline");
+
+        let companion = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .unwrap()
+            .expect("sealed sibling pair");
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+        companion.verify().unwrap();
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_lookup_uses_canonical_running_executable_directory() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-canonical-exe");
+        let alias_dir = unique_test_dir("sealed-omp-canonical-alias");
+        fs::create_dir(&alias_dir).unwrap();
+        let alias = alias_dir.join("herdr");
+        symlink(&herdr, &alias).unwrap();
+
+        let companion = sealed_sibling_omp_companion(&alias, &sealed_pair_expectation())
+            .unwrap()
+            .expect("canonical sealed sibling pair");
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+
+        fs::remove_file(alias).unwrap();
+        fs::remove_dir(alias_dir).unwrap();
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_rejects_unsafe_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unsafe_parent = unique_test_dir("sealed-omp-unsafe-ancestor");
+        fs::create_dir(&unsafe_parent).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let moved = unsafe_parent.join("release");
+        create_sealed_pair_at(moved.clone());
+
+        let error = sealed_sibling_omp_companion(&moved.join("herdr"), &sealed_pair_expectation())
+            .expect_err("writable ancestor must fail closed");
+        assert!(error.contains("unsafe writable ancestor"), "{error}");
+
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_sealed_pair(&moved);
+        fs::remove_dir(unsafe_parent).unwrap();
+    }
+
+    #[test]
+    fn malformed_sealed_sibling_metadata_does_not_fall_back() {
+        let (dir, herdr, _omp) = create_sealed_pair("sealed-omp-malformed");
+        write_sealed_pair_metadata(&dir, &serde_json::json!({ "schema": 2 }));
+
+        let error = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .expect_err("malformed adjacent metadata must fail closed");
+        assert!(
+            error.contains("invalid sealed OMP release metadata"),
+            "{error}"
+        );
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_rejects_mismatched_compiled_omp_identity() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-identity");
+        let mut metadata = sealed_pair_metadata(&herdr, &omp);
+        metadata["omp"]["commit"] = serde_json::Value::String("d".repeat(40));
+        write_sealed_pair_metadata(&dir, &metadata);
+
+        let error = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .expect_err("wrong OMP identity must fail closed");
+        assert!(
+            error.contains("does not match this Herdr OMP companion"),
+            "{error}"
+        );
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn sealed_sibling_resolution_retries_after_repair_and_rejects_later_corruption() {
+        let (dir, herdr, omp) = create_sealed_pair("sealed-omp-retry");
+        let mut invalid = sealed_pair_metadata(&herdr, &omp);
+        invalid["omp"]["sha256"] = serde_json::Value::String("0".repeat(64));
+        write_sealed_pair_metadata(&dir, &invalid);
+        assert!(sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation()).is_err());
+
+        write_sealed_pair_metadata(&dir, &sealed_pair_metadata(&herdr, &omp));
+        let companion = sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+            .unwrap()
+            .expect("repaired sealed pair");
+        companion.verify().unwrap();
+
+        unseal_pair(&dir);
+        fs::write(&omp, b"corrupt after verification").unwrap();
+        seal_pair(&dir);
+        assert!(sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation()).is_err());
+
+        remove_sealed_pair(&dir);
+    }
+
+    #[test]
+    fn unsealed_cached_omp_falls_back_to_manifest_cache_validation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("unsealed-cached-omp");
+        let state_dir = dir.join("state");
+        let cache_dir = remote_client_build_dir(&state_dir, TEST_PAIRED_OMP_HERDR_BUILD_ID);
+        let herdr = cache_dir.join("herdr");
+        let omp = cache_dir.join("omp");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(&herdr, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&omp, asset).unwrap();
+        fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&omp, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            sealed_sibling_omp_companion(&herdr, &sealed_pair_expectation())
+                .unwrap()
+                .is_none()
+        );
+
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let manifest: PreviewManifest =
+            serde_json::from_value(paired_omp_manifest_value(Some(&checksum))).unwrap();
+        let companion = install_omp_companion_from_manifest_at(
+            &state_dir,
+            &manifest,
+            TEST_PAIRED_OMP_HERDR_BUILD_ID,
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .unwrap();
+
+        assert_eq!(companion.executable(), omp.canonicalize().unwrap());
+        companion.verify().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_omp_install_is_build_scoped_and_repairs_invalid_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_test_dir("managed-omp");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("omp-source");
+        let state_dir = dir.join("state");
+        let asset = b"#!/bin/sh\nexit 0\n";
+        fs::write(&source, asset).unwrap();
+        let checksum = format!("{:x}", Sha256::digest(asset));
+        let asset_url = format!("file://{}", source.display());
+        let executable = install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &asset_url,
+            &checksum,
+        )
+        .unwrap();
+        assert_eq!(
+            executable,
+            remote_omp_executable_path(&state_dir.canonicalize().unwrap(), "herdr-build")
+        );
+        assert_eq!(fs::read(&executable).unwrap(), asset);
+
+        fs::write(&executable, b"corrupt").unwrap();
+        install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &asset_url,
+            &checksum,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), asset);
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        install_exact_omp_asset_for_remote_build_at(
+            &state_dir,
+            "herdr-build",
+            &asset_url,
+            &checksum,
+        )
+        .unwrap();
+        assert_ne!(
+            fs::metadata(&executable).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_asset_download_rejects_checksum_mismatch_before_local_replacement() {
+        let dir = unique_test_dir("exact-asset-bad-checksum");
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("server-build");
+        let current_exe = dir.join("herdr");
+        fs::write(&source, b"wrong server build").unwrap();
+        fs::write(&current_exe, b"old client build").unwrap();
+        let download_url = format!("file://{}", source.display());
+
+        let error = download_update_asset_for_exe(
+            current_exe.clone(),
+            &download_url,
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("checksum verification failed"), "{error}");
+        assert_eq!(fs::read(&current_exe).unwrap(), b"old client build");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exact_asset_reexec_command_preserves_argv_without_execing() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            std::ffi::OsString::from("attach"),
+            std::ffi::OsString::from("--remote"),
+            std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()),
+        ];
+        let command = reexec_command(Path::new("/tmp/exact-herdr"), args.clone());
+
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/tmp/exact-herdr")
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            args.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn managed_windows_same_build_storage_binds_identity_and_selected_package_format() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-same-build");
+        let standalone_root = dir.join("packages").join("standalone");
+        let release_dir = standalone_root.join("releases").join("legacy-bootstrap");
+        let current_link = standalone_root.join("current");
+        let current_exe = release_dir.join("herdr.exe");
+        let version_identity = "0.8.2-preview.canonical-build";
+        let metadata_json = |format: &str, sha256: &str| {
+            serde_json::json!({
+                "schema_version": 1,
+                "version_identity": version_identity,
+                "target_triple": WINDOWS_RELEASE_TARGET_TRIPLE,
+                "format": format,
+                "sha256": sha256,
+            })
+            .to_string()
+        };
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&current_exe, b"herdr").unwrap();
+        symlink(&release_dir, &current_link).unwrap();
+
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let metadata = release_dir.join(WINDOWS_RELEASE_METADATA_FILE);
+        fs::write(
+            &metadata,
+            format!(
+                "\u{feff}{}",
+                metadata_json(
+                    "zip",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+            ),
+        )
+        .unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(
+            &metadata,
+            metadata_json(
+                "zip",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(
+            &metadata,
+            format!(
+                "\u{feff}\u{feff}{}",
+                metadata_json(
+                    "zip",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+            ),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::write(
+            &metadata,
+            metadata_json(
+                "exe",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        )
+        .unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "exe",
+        ));
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "msi",
+        ));
+
+        fs::write(
+            &metadata,
+            serde_json::json!({
+                "schema_version": 1,
+                "version_identity": version_identity,
+                "target_triple": WINDOWS_RELEASE_TARGET_TRIPLE,
+                "format": "zip",
+                "unexpected": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let custom_exe = dir.join("custom").join("herdr.exe");
+        fs::create_dir_all(custom_exe.parent().unwrap()).unwrap();
+        fs::write(&custom_exe, b"herdr").unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &custom_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_windows_same_build_storage_retries_after_partial_junction_switch() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-same-build-retry");
+        let standalone_root = dir.join("packages").join("standalone");
+        let releases_dir = standalone_root.join("releases");
+        let release_dir = releases_dir.join("active-release");
+        let current_link = standalone_root.join("current");
+        let current_exe = release_dir.join("herdr.exe");
+        let version_identity = "0.8.2-preview.canonical-build";
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&current_exe, b"herdr").unwrap();
+
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let divergent_release = releases_dir.join("divergent-release");
+        fs::create_dir(&divergent_release).unwrap();
+        fs::write(divergent_release.join("herdr.exe"), b"herdr").unwrap();
+        symlink(&divergent_release, &current_link).unwrap();
+        assert!(windows_same_build_storage_needs_canonicalization_at(
+            &current_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        let unmanaged_exe = dir.join("outside").join("herdr.exe");
+        fs::create_dir_all(unmanaged_exe.parent().unwrap()).unwrap();
+        fs::write(&unmanaged_exe, b"herdr").unwrap();
+        assert!(!windows_same_build_storage_needs_canonicalization_at(
+            &unmanaged_exe,
+            &standalone_root,
+            version_identity,
+            "zip",
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_update_uses_default_visible_junction_not_internal_storage() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_test_dir("windows-default-install-dir");
+        let standalone_root = dir.join("home/packages/standalone");
+        let release_dir = standalone_root.join("releases/release");
+        let current_dir = standalone_root.join("current");
+        let local_app_data = dir.join("local-app-data");
+        let visible_bin_dir = local_app_data.join("Programs/Herdr/bin");
+        let release_exe = release_dir.join("herdr.exe");
+        let current_exe = current_dir.join("herdr.exe");
+
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::write(&release_exe, b"herdr").unwrap();
+        symlink(&release_dir, &current_dir).unwrap();
+        fs::create_dir_all(visible_bin_dir.parent().unwrap()).unwrap();
+        symlink(&release_dir, &visible_bin_dir).unwrap();
+
+        let visible_exe =
+            windows_installed_herdr_exe_path_from_env(None, Some(local_app_data.as_os_str()))
+                .unwrap();
+        assert_eq!(visible_exe, visible_bin_dir.join("herdr.exe"));
+        assert_eq!(
+            fs::canonicalize(&visible_exe).unwrap(),
+            fs::canonicalize(&release_exe).unwrap(),
+        );
+        for internal_exe in [&current_exe, &release_exe] {
+            assert!(internal_exe.exists());
+            assert_ne!(visible_exe, *internal_exe);
+            assert_ne!(visible_exe.parent(), internal_exe.parent());
+        }
+
+        let command = windows_installer_command(
+            &dir.join("install.ps1"),
+            "preview",
+            &dir.join("update.zip"),
+            "zip",
+            "0.8.2-preview.build",
+            &"a".repeat(64),
+        );
+        assert!(!command
+            .get_args()
+            .any(|argument| argument == std::ffi::OsStr::new("-InstallDir")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_update_preserves_explicit_herdr_install_dir_contract() {
+        let dir = unique_test_dir("windows-explicit-install-dir");
+        let custom_install_dir = dir.join("custom-herdr");
+        let local_app_data = dir.join("local-app-data");
+        fs::create_dir(&dir).unwrap();
+
+        assert_eq!(
+            windows_installed_herdr_exe_path_from_env(
+                Some(custom_install_dir.as_os_str()),
+                Some(local_app_data.as_os_str()),
+            )
+            .unwrap(),
+            custom_install_dir.join("herdr.exe")
+        );
+        assert_eq!(
+            windows_installed_herdr_exe_path_from_env(
+                Some(std::ffi::OsStr::new("   ")),
+                Some(local_app_data.as_os_str()),
+            )
+            .unwrap(),
+            local_app_data.join("Programs/Herdr/bin/herdr.exe")
+        );
+        let command = windows_installer_command(
+            &dir.join("install.ps1"),
+            "preview",
+            &dir.join("update.zip"),
+            "zip",
+            "0.8.2-preview.build",
+            &"a".repeat(64),
+        );
+        assert!(!command
+            .get_envs()
+            .any(|(name, _)| name == std::ffi::OsStr::new("HERDR_INSTALL_DIR")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_selected_package_format_supports_legacy_exe_and_zip() {
+        let legacy_exe = AssetRef {
+            url: "https://example.com/herdr.exe".into(),
+            sha256: None,
+            format: None,
+        };
+        let zip = AssetRef {
+            url: "https://example.com/herdr.zip".into(),
+            sha256: None,
+            format: None,
+        };
+        let declared_exe = AssetRef {
+            url: "https://example.com/herdr.zip".into(),
+            sha256: None,
+            format: Some("exe".into()),
+        };
+
+        assert_eq!(legacy_exe.package_format().as_deref(), Ok("exe"));
+        assert_eq!(zip.package_format().as_deref(), Ok("zip"));
+        assert_eq!(declared_exe.package_format().as_deref(), Ok("exe"));
+    }
+
+    #[test]
+    fn update_lock_serializes_installation() {
+        let dir = unique_test_dir("update-lock");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+
+        let first = acquire_update_lock_at(&executable, true).unwrap();
+        let error = acquire_update_lock_at(&executable, true).unwrap_err();
+        assert_eq!(error, "another Herdr update is already running");
+        drop(first);
+        acquire_update_lock_at(&executable, true).unwrap();
+
+        fs::remove_file(dir.join(".herdr-update.lock")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn blocking_update_lock_waits_for_existing_installer() {
+        let dir = unique_test_dir("blocking-update-lock");
+        fs::create_dir(&dir).unwrap();
+        let executable = dir.join("herdr");
+        let first = acquire_update_lock_at(&executable, true).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiting_executable = executable.clone();
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = acquire_update_lock_at(&waiting_executable, false).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+
+        fs::remove_file(dir.join(".herdr-update.lock")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn self_update_args_gate_live_handoff() {
         assert_eq!(
             parse_self_update_args(&[]).unwrap(),
             SelfUpdateOptions {
-                live_handoff: false
+                live_handoff: false,
+                automatic: false,
             }
         );
         assert_eq!(
             parse_self_update_args(&["--handoff".to_string()]).unwrap(),
-            SelfUpdateOptions { live_handoff: true }
+            SelfUpdateOptions {
+                live_handoff: true,
+                automatic: false,
+            }
+        );
+        assert_eq!(
+            parse_self_update_args(&["--handoff".to_string(), "--automatic".to_string()]).unwrap(),
+            SelfUpdateOptions {
+                live_handoff: true,
+                automatic: true,
+            }
         );
         assert_eq!(
             parse_self_update_args(&["--unknown".to_string()]).unwrap_err(),
             "unknown update option: --unknown"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn automatic_update_requires_a_complete_live_handoff() {
+        let outcome = |outcome| RunningSessionUpdateOutcome {
+            session_label: "default".to_string(),
+            target_noun: "session",
+            stop_command: "herdr server stop".to_string(),
+            attach_command: Some("herdr".to_string()),
+            server_version: Some("0.8.0-preview.old".to_string()),
+            outcome,
+        };
+
+        assert!(!automatic_handoff_completed(&[]));
+        assert!(automatic_handoff_completed(&[outcome(
+            RunningServerUpdateOutcome::LiveHandoffComplete
+        )]));
+        assert!(!automatic_handoff_completed(&[outcome(
+            RunningServerUpdateOutcome::RestartDeferred
+        )]));
     }
 
     #[test]
@@ -2801,6 +6684,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2857,7 +6741,9 @@ mod tests {
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
                     detached_server_daemon: true,
+                    omp_maintenance: true,
                 }),
+                build: None,
             },
         };
 
@@ -2866,6 +6752,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                automatic: false,
             },
         )
         .unwrap();
@@ -3043,6 +6930,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: None,
+            build: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -3074,6 +6962,7 @@ mod tests {
             &release,
             SelfUpdateOptions {
                 live_handoff: false,
+                automatic: false,
             },
         )
         .unwrap();
@@ -3289,6 +7178,69 @@ mod tests {
         let (os, arch) = platform_target();
         assert!(os == "linux" || os == "macos", "os: {os}");
         assert!(arch == "x86_64" || arch == "aarch64", "arch: {arch}");
+    }
+
+    #[test]
+    fn linux_getconf_accepts_gnu_pair_when_ldd_is_unavailable() {
+        let glibc = linux_host_libc_with_probes(|| Some(b"glibc 2.39\n".to_vec()), || None);
+
+        assert_eq!(glibc, Some(LinuxHostLibc::Glibc));
+        assert_eq!(
+            glibc
+                .and_then(|libc| omp_asset_key_for_linux_host("x86_64", libc))
+                .as_deref(),
+            Some("linux-x86_64")
+        );
+    }
+
+    #[test]
+    fn linux_libc_probe_falls_back_to_ldd_and_fails_closed_for_musl() {
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || Some(b"unknown getconf output\n".to_vec()),
+                || Some(b"ldd (Debian GLIBC 2.39-1) 2.39\n".to_vec()),
+            ),
+            Some(LinuxHostLibc::Glibc)
+        );
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || Some(b"musl libc\n".to_vec()),
+                || panic!("musl getconf output must not fall back to ldd"),
+            ),
+            Some(LinuxHostLibc::Musl)
+        );
+        assert_eq!(
+            linux_host_libc_with_probes(
+                || None,
+                || Some(b"musl libc\nldd (GNU libc) 2.39\n".to_vec()),
+            ),
+            Some(LinuxHostLibc::Musl)
+        );
+        assert_eq!(linux_host_libc_with_probes(|| None, || None), None);
+    }
+
+    #[test]
+    fn omp_platform_selection_reuses_manifest_keys_and_keeps_libc_gate_local() {
+        assert_eq!(
+            omp_asset_key_for_target("linux", "x86_64").as_deref(),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            omp_asset_key_for_target("linux", "aarch64").as_deref(),
+            Some("linux-aarch64")
+        );
+        assert_eq!(
+            omp_asset_key_for_linux_host("x86_64", LinuxHostLibc::Glibc).as_deref(),
+            Some("linux-x86_64")
+        );
+        assert_eq!(
+            omp_asset_key_for_linux_host("aarch64", LinuxHostLibc::Musl),
+            None
+        );
+        assert_eq!(
+            omp_asset_key_for_target("macos", "aarch64").as_deref(),
+            Some("macos-aarch64")
+        );
     }
 
     #[test]
@@ -3512,50 +7464,711 @@ mod tests {
     }
 
     #[test]
-    fn preview_manifest_reports_update_when_build_id_differs() {
+    fn build_manifest_forces_preview_channel_and_preserves_defaults_without_one() {
+        const FORK_MANIFEST: &str = "https://example.com/fork-preview.json";
+
+        assert_eq!(
+            update_channel_for_build_manifest(Some(FORK_MANIFEST), UpdateChannel::Stable),
+            UpdateChannel::Preview
+        );
+        assert_eq!(preview_manifest_url(Some(FORK_MANIFEST)), FORK_MANIFEST);
+        assert_eq!(
+            update_channel_for_build_manifest(None, UpdateChannel::Stable),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            update_channel_for_build_manifest(None, UpdateChannel::Preview),
+            UpdateChannel::Preview
+        );
+        assert_eq!(preview_manifest_url(None), PREVIEW_UPDATE_MANIFEST_URL);
+    }
+    #[test]
+    fn preview_manifest_contract_is_bound_to_the_compiled_manifest_url() {
+        const FORK_MANIFEST: &str = "https://example.com/fork-preview.json";
+        assert_eq!(
+            preview_manifest_contract(None),
+            PreviewManifestContract::UpstreamLegacy
+        );
+        assert_eq!(
+            preview_manifest_contract(Some(SMARTY_PREVIEW_UPDATE_MANIFEST_URL)),
+            PreviewManifestContract::SmartyPaired
+        );
+        assert_eq!(
+            preview_manifest_contract(Some(FORK_MANIFEST)),
+            PreviewManifestContract::Custom
+        );
+    }
+
+    #[test]
+    fn upstream_default_preview_accepts_exact_legacy_current_build() {
+        let (build_id, value) = upstream_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::UpstreamLegacy,
+        )
+        .unwrap()
+        .expect("upstream preview update");
+
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
-        let json = format!(
-            r####"{{
-                "channel": "preview",
-                "base_version": "9.9.9",
-                "build_id": "2026-06-02-abcdef123456",
-                "commit": "abcdef1234567890",
-                "built_at": "2026-06-02T03:00:00Z",
-                "protocol": 77,
-                "notes": "### Fixed\n- One",
-                "assets": {{
-                    "{asset_key}": {{
-                        "url": "https://example.com/herdr-linux-x86_64",
-                        "sha256": "deadbeef"
-                    }}
-                }},
-                "builds": {{
-                    "2026-06-02-abcdef123456": {{
-                        "base_version": "9.9.9",
-                        "commit": "abcdef1234567890",
-                        "built_at": "2026-06-02T03:00:00Z",
-                        "protocol": 77,
-                        "assets": {{
-                            "{asset_key}": {{
-                                "url": "https://example.com/herdr-linux_x86_64",
-                                "sha256": "deadbeef"
-                            }}
-                        }}
-                    }}
-                }}
-            }}"####
+        let asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset");
+        assert_eq!(release.build_id.as_deref(), Some(build_id.as_str()));
+        assert_eq!(
+            release.download_url,
+            upstream_preview_asset_url(&build_id, asset_name)
         );
-        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(release.sha256.as_deref(), Some("d".repeat(64).as_str()));
+    }
 
-        let release = release_info_from_preview_manifest(&manifest)
-            .unwrap()
-            .expect("preview update");
+    #[test]
+    fn smarty_paired_current_accepts_exact_legacy_retained_history() {
+        let (current_build_id, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        value["builds"].as_object_mut().expect("builds").insert(
+            legacy_build_id.into(),
+            smarty_legacy_retained_value(legacy_build_id),
+        );
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
 
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap()
+        .expect("paired preview update");
+        assert_eq!(release.build_id.as_deref(), Some(current_build_id.as_str()));
+
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            legacy_build_id,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy build"), "{error}");
+    }
+
+    #[test]
+    fn smarty_paired_current_accepts_legacy_literal_date_across_utc_midnight() {
+        let (current_build_id, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut legacy = smarty_legacy_retained_value(legacy_build_id);
+        legacy["built_at"] = serde_json::json!("2026-08-19T23:30:00-04:00");
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), legacy);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap()
+        .expect("paired preview update");
+        assert_eq!(release.build_id.as_deref(), Some(current_build_id.as_str()));
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_literal_date_mismatch_and_invalid_timestamp_date() {
+        for built_at in ["2026-08-08T23:30:00-04:00", "2026-02-30T23:30:00-04:00"] {
+            let (_, mut value) = canonical_manifest_value();
+            let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+            let mut legacy = smarty_legacy_retained_value(legacy_build_id);
+            legacy["built_at"] = serde_json::json!(built_at);
+            value["builds"]
+                .as_object_mut()
+                .expect("builds")
+                .insert(legacy_build_id.into(), legacy);
+            let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+            let error = release_info_from_preview_manifest_with_contract(
+                &manifest,
+                true,
+                false,
+                None,
+                PreviewManifestContract::SmartyPaired,
+            )
+            .unwrap_err();
+            if built_at.starts_with("2026-02-30") {
+                assert!(error.contains("ISO-8601 timestamp"), "{error}");
+            } else {
+                assert!(error.contains("legacy build date"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_malformed_ids_and_commit_prefix_mismatch() {
+        for build_id in [
+            "2026-02-30-eeeeeeeeeeee",
+            "2026-08-19-EEEEEEEEEEEE",
+            "2026-08-19-eeeeeeeeeee",
+        ] {
+            let (_, mut value) = canonical_manifest_value();
+            value["builds"]
+                .as_object_mut()
+                .expect("builds")
+                .insert(build_id.into(), smarty_legacy_retained_value(build_id));
+            let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+            let error = release_info_from_preview_manifest_with_contract(
+                &manifest,
+                true,
+                false,
+                None,
+                PreviewManifestContract::SmartyPaired,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("paired or legacy preview identity"),
+                "{error}"
+            );
+        }
+
+        let (_, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut retained = smarty_legacy_retained_value(legacy_build_id);
+        retained["commit"] = serde_json::json!("f".repeat(40));
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy identity"), "{error}");
+    }
+
+    #[test]
+    fn smarty_legacy_history_rejects_coordinated_attacker_url_and_sha() {
+        let (_, mut value) = canonical_manifest_value();
+        let legacy_build_id = "2026-08-19-eeeeeeeeeeee";
+        let mut retained = smarty_legacy_retained_value(legacy_build_id);
+        retained["assets"]["linux-x86_64"]["url"] =
+            serde_json::json!("https://attacker.invalid/herdr-linux-x86_64");
+        retained["assets"]["linux-x86_64"]["sha256"] = serde_json::json!("a".repeat(64));
+        value["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(legacy_build_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn legacy_current_never_downgrades_the_smarty_paired_contract() {
+        let (legacy_build_id, value) = upstream_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            &legacy_build_id,
+            PreviewManifestContract::SmartyPaired,
+        )
+        .unwrap_err();
+        assert!(error.contains("legacy build"), "{error}");
+    }
+
+    #[test]
+    fn custom_preview_keeps_its_url_trust_boundary_without_smarty_or_omp_semantics() {
+        let (build_id, value) = custom_legacy_manifest_value();
+        let manifest: PreviewManifest = serde_json::from_value(value.clone()).unwrap();
+        let release = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap()
+        .expect("custom preview update");
+        assert_eq!(release.build_id.as_deref(), Some(build_id.as_str()));
+        assert_eq!(
+            release.download_url,
+            "https://downloads.example.test/herdr-custom"
+        );
+        let error = preview_omp_metadata_for_build_with_contract(
+            &manifest,
+            &build_id,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot provide"), "{error}");
+
+        let mut malformed = value;
+        let retained = malformed["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .remove(&build_id)
+            .expect("current archive");
+        let malformed_id = "malformed-current";
+        malformed["build_id"] = serde_json::json!(malformed_id);
+        malformed["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(malformed_id.into(), retained);
+        let manifest: PreviewManifest = serde_json::from_value(malformed).unwrap();
+        let error = release_info_from_preview_manifest_with_contract(
+            &manifest,
+            true,
+            false,
+            None,
+            PreviewManifestContract::Custom,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("paired or legacy preview identity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn build_scoped_preview_manifest_rejects_missing_or_invalid_asset_checksum() {
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let (_, value) = canonical_manifest_value();
+
+        for (checksum, expected_error) in [
+            (None, "missing a SHA-256 checksum"),
+            (Some("deadbeef"), "invalid SHA-256 checksum"),
+        ] {
+            let mut candidate = value.clone();
+            let asset = candidate["assets"][&asset_key]
+                .as_object_mut()
+                .expect("platform asset");
+            match checksum {
+                Some(checksum) => asset["sha256"] = serde_json::json!(checksum),
+                None => {
+                    asset.remove("sha256");
+                }
+            }
+            let manifest: PreviewManifest = serde_json::from_value(candidate).unwrap();
+
+            let error = release_info_from_preview_manifest_for_build(&manifest, true, false, None)
+                .unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+        }
+    }
+
+    #[test]
+    fn canonical_preview_manifest_reports_update_when_build_id_differs() {
+        let (canonical_build_id, value) = canonical_manifest_value();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            false,
+            Some("previous-build"),
+        )
+        .unwrap()
+        .expect("preview update");
+
+        let expected_asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset name");
+        let expected_sha256 = if asset_key == "windows-x86_64" {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
         assert_eq!(release.channel, UpdateChannel::Preview);
-        assert_eq!(release.identity, "9.9.9-preview.2026-06-02-abcdef123456");
+        assert_eq!(
+            release.identity,
+            format!("9.9.9-preview.{canonical_build_id}")
+        );
         assert_eq!(release.target_protocol, Some(77));
-        assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            release.download_url,
+            canonical_preview_asset_url(&canonical_build_id, expected_asset_name)
+        );
+        assert_eq!(release.sha256.as_deref(), Some(expected_sha256.as_str()));
+    }
+
+    #[test]
+    fn bridge_manifest_uses_canonical_identity_without_update_loop() {
+        let (canonical_build_id, value) = bridge_manifest_value();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let manifest: PreviewManifest = serde_json::from_value(value).unwrap();
+
+        let release = release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some("previous-build"),
+        )
+        .unwrap()
+        .expect("bridge update");
+        assert_eq!(
+            release.identity,
+            format!("9.9.9-preview.{canonical_build_id}")
+        );
+        assert_eq!(
+            release.build_id.as_deref(),
+            Some(canonical_build_id.as_str())
+        );
+        let expected_asset_name = CANONICAL_PREVIEW_HERDR_ASSETS
+            .iter()
+            .find_map(|&(target, name)| (target == asset_key).then_some(name))
+            .expect("platform asset name");
+        let expected_download_url =
+            canonical_preview_asset_url(&canonical_build_id, expected_asset_name);
+        let expected_sha256 = if asset_key == "windows-x86_64" {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
+        assert_eq!(release.download_url, expected_download_url);
+        assert_eq!(release.sha256.as_deref(), Some(expected_sha256.as_str()));
+        assert!(release_info_from_preview_manifest_for_build(
+            &manifest,
+            false,
+            true,
+            Some(&canonical_build_id),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            windows_bootstrap_build_alias("abc"),
+            "bootstrap-ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_coordinated_attacker_asset_aliases() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+        let attacker_url = "https://attacker.invalid/herdr-windows-x86_64.zip";
+        let attacker_sha256 = "d".repeat(64);
+        let mut herdr = bridge.clone();
+        herdr["assets"]["windows-x86_64"]["url"] = serde_json::json!(attacker_url);
+        herdr["assets"]["windows-x86_64"]["sha256"] = serde_json::json!(attacker_sha256);
+        let retained = herdr["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&canonical_build_id)
+            .expect("canonical retained build");
+        retained["assets"]["windows-x86_64"]["url"] = serde_json::json!(attacker_url);
+        retained["assets"]["windows-x86_64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let error = bridge_release_error(herdr, &canonical_build_id);
+        assert!(error.contains("canonical release tag"), "{error}");
+
+        let mut omp = bridge;
+        omp["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        omp["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let retained = omp["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&canonical_build_id)
+            .expect("canonical retained build");
+        retained["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        retained["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+        let error = bridge_omp_asset_error(omp, &canonical_build_id);
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn retained_paired_omp_asset_rejects_attacker_url_before_download() {
+        let (_current_build_id, mut bridge) = bridge_manifest_value();
+        let retained_build_id = format!(
+            "2026-08-21-p{}-r{}-o{}",
+            "d".repeat(40),
+            "e".repeat(40),
+            "a".repeat(40),
+        );
+        assert!(parse_canonical_paired_build_id(&retained_build_id).is_some());
+        let canonical_retained = bridge["builds"]
+            .as_object()
+            .expect("builds")
+            .values()
+            .next()
+            .expect("canonical retained build")
+            .clone();
+        let mut retained_value = canonical_retained;
+        retained_value["commit"] = serde_json::json!("e".repeat(40));
+        retained_value["built_at"] = serde_json::json!("2026-08-21T03:00:00Z");
+        retained_value["tag"] = serde_json::json!(format!("smarty-preview-{retained_build_id}"));
+        retained_value["omp"]["commit"] = serde_json::json!("a".repeat(40));
+        retained_value["omp"]["assets"]["macos-aarch64"]["url"] = serde_json::json!(
+            canonical_preview_asset_url(&retained_build_id, "omp-macos-aarch64")
+        );
+        bridge["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .insert(retained_build_id.clone(), retained_value);
+        let retained = bridge["builds"]
+            .as_object_mut()
+            .expect("builds")
+            .get_mut(&retained_build_id)
+            .expect("retained build");
+        retained["omp"]["assets"]["macos-aarch64"]["url"] =
+            serde_json::json!("https://attacker.invalid/omp-macos-aarch64");
+        retained["omp"]["assets"]["macos-aarch64"]["sha256"] = serde_json::json!("d".repeat(64));
+
+        let manifest: PreviewManifest = serde_json::from_value(bridge).expect("preview manifest");
+        let error = preview_omp_asset_for_build(
+            &manifest,
+            &retained_build_id,
+            test_omp_identity(),
+            "macos-aarch64",
+        )
+        .expect_err("attacker-hosted retained OMP asset must fail before download");
+        assert!(error.contains("canonical release tag"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_unbound_or_invalid_canonical_identity_before_same_build_return() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut wrong_alias = bridge.clone();
+        wrong_alias["build_id"] = serde_json::json!(windows_bootstrap_build_alias("other-build"));
+        assert!(bridge_release_error(wrong_alias, &canonical_build_id).contains("bootstrap alias"));
+
+        let invalid_identity = "not-a-paired-build";
+        let mut malformed_identity = bridge.clone();
+        malformed_identity["canonical_build_id"] = serde_json::json!(invalid_identity);
+        malformed_identity["build_id"] =
+            serde_json::json!(windows_bootstrap_build_alias(invalid_identity));
+        assert!(
+            bridge_release_error(malformed_identity, &canonical_build_id)
+                .contains("full lowercase P/R/O")
+        );
+
+        let uppercase_identity = format!(
+            "2026-08-22-p{}-r{}-o{}",
+            "A".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40),
+        );
+        let mut uppercase_identity_value = bridge.clone();
+        uppercase_identity_value["canonical_build_id"] = serde_json::json!(uppercase_identity);
+        uppercase_identity_value["build_id"] =
+            serde_json::json!(windows_bootstrap_build_alias(&uppercase_identity));
+        assert!(
+            bridge_release_error(uppercase_identity_value, &canonical_build_id)
+                .contains("full lowercase P/R/O")
+        );
+
+        let mut null_identity = bridge;
+        null_identity["canonical_build_id"] = serde_json::Value::Null;
+        assert!(
+            bridge_release_error(null_identity, &canonical_build_id).contains("must not be null")
+        );
+    }
+
+    #[test]
+    fn bridge_manifest_binds_canonical_retained_commits_before_same_build_return() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut different_herdr_commit = bridge.clone();
+        let replacement_herdr_commit = "d".repeat(40);
+        different_herdr_commit["commit"] =
+            serde_json::Value::String(replacement_herdr_commit.clone());
+        different_herdr_commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["commit"] = serde_json::Value::String(replacement_herdr_commit);
+        assert!(
+            bridge_release_error(different_herdr_commit, &canonical_build_id)
+                .contains("Herdr commit does not match retained metadata")
+        );
+
+        let mut different_omp_commit = bridge;
+        let replacement_omp_commit = "d".repeat(40);
+        different_omp_commit["omp"]["commit"] =
+            serde_json::Value::String(replacement_omp_commit.clone());
+        different_omp_commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["omp"]["commit"] = serde_json::Value::String(replacement_omp_commit);
+        assert!(
+            bridge_release_error(different_omp_commit, &canonical_build_id)
+                .contains("OMP commit does not match retained metadata")
+        );
+    }
+
+    #[test]
+    fn preview_manifest_rejects_downgrade_to_generic_asset_parser() {
+        let (canonical_build_id, mut stripped_bridge) = bridge_manifest_value();
+        let attacker_url = "https://attacker.invalid/herdr-preview";
+        let attacker_sha256 = "d".repeat(64);
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+
+        stripped_bridge["assets"] =
+            stripped_bridge["builds"][canonical_build_id.as_str()]["assets"].clone();
+        stripped_bridge["build_id"] = serde_json::json!("legacy-preview-build");
+        stripped_bridge
+            .as_object_mut()
+            .expect("bridge manifest")
+            .remove("canonical_build_id");
+        stripped_bridge["assets"][&asset_key]["url"] = serde_json::json!(attacker_url);
+        stripped_bridge["assets"][&asset_key]["sha256"] =
+            serde_json::json!(attacker_sha256.clone());
+        let stripped_manifest: PreviewManifest =
+            serde_json::from_value(stripped_bridge).expect("stripped preview manifest");
+        let error =
+            release_info_from_preview_manifest_for_build(&stripped_manifest, false, false, None)
+                .expect_err("stripped bridge must not reach generic preview asset parsing");
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+
+        let (_, mut noncanonical) = canonical_manifest_value();
+        noncanonical["build_id"] = serde_json::json!("2026-08-22-abcdef123456");
+        noncanonical["assets"][&asset_key]["url"] = serde_json::json!(attacker_url);
+        noncanonical["assets"][&asset_key]["sha256"] = serde_json::json!(attacker_sha256);
+        let noncanonical_manifest: PreviewManifest =
+            serde_json::from_value(noncanonical).expect("noncanonical preview manifest");
+        let error = release_info_from_preview_manifest_for_build(
+            &noncanonical_manifest,
+            false,
+            false,
+            None,
+        )
+        .expect_err("noncanonical preview build ID must be rejected");
+        assert!(error.contains("full lowercase P/R/O"), "{error}");
+    }
+
+    #[test]
+    fn bridge_manifest_rejects_tampered_retained_metadata_and_assets() {
+        let (canonical_build_id, bridge) = bridge_manifest_value();
+
+        let mut missing_retained_build = bridge.clone();
+        missing_retained_build["builds"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&canonical_build_id);
+        assert!(
+            bridge_release_error(missing_retained_build, &canonical_build_id)
+                .contains("no retained canonical build")
+        );
+
+        let mut base_version = bridge.clone();
+        base_version["base_version"] = serde_json::json!("9.9.8");
+        assert!(
+            bridge_release_error(base_version, &canonical_build_id).contains("metadata differs")
+        );
+
+        let mut commit = bridge.clone();
+        commit["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["commit"] = serde_json::json!("other-commit");
+        assert!(bridge_release_error(commit, &canonical_build_id).contains("metadata differs"));
+
+        let mut built_at = bridge.clone();
+        built_at["built_at"] = serde_json::json!("2026-08-23T03:00:00Z");
+        assert!(bridge_release_error(built_at, &canonical_build_id).contains("metadata differs"));
+
+        let mut protocol = bridge.clone();
+        protocol["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["protocol"] = serde_json::json!(78);
+        assert!(bridge_release_error(protocol, &canonical_build_id).contains("metadata differs"));
+
+        let mut missing_top_omp = bridge.clone();
+        missing_top_omp.as_object_mut().unwrap().remove("omp");
+        assert!(bridge_release_error(missing_top_omp, &canonical_build_id)
+            .contains("no top-level OMP metadata"));
+
+        let mut missing_retained_omp = bridge.clone();
+        missing_retained_omp["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("omp");
+        assert!(
+            bridge_release_error(missing_retained_omp, &canonical_build_id)
+                .contains("has no OMP metadata")
+        );
+
+        let mut omp = bridge.clone();
+        omp["omp"]["version"] = serde_json::json!("different-omp");
+        assert!(bridge_release_error(omp, &canonical_build_id).contains("OMP metadata differs"));
+
+        let mut extra_top_level_asset = bridge.clone();
+        extra_top_level_asset["assets"]["unexpected"] = serde_json::json!({
+            "url": "https://example.com/unbound-linux",
+            "sha256": "d".repeat(64),
+        });
+        assert!(
+            bridge_release_error(extra_top_level_asset, &canonical_build_id)
+                .contains("assets differ")
+        );
+
+        let mut windows_url = bridge.clone();
+        windows_url["assets"]["windows-x86_64"]["url"] =
+            serde_json::json!("https://example.com/other-windows.zip");
+        assert!(bridge_release_error(windows_url, &canonical_build_id).contains("assets differ"));
+
+        let mut windows_sha = bridge.clone();
+        windows_sha["assets"]["windows-x86_64"]["sha256"] = serde_json::json!("d".repeat(64));
+        assert!(bridge_release_error(windows_sha, &canonical_build_id).contains("assets differ"));
+
+        let mut windows_format = bridge.clone();
+        windows_format["assets"]["windows-x86_64"]["format"] = serde_json::json!("exe");
+        assert!(bridge_release_error(windows_format, &canonical_build_id).contains("assets differ"));
+
+        let mut missing_windows = bridge;
+        missing_windows["builds"]
+            .as_object_mut()
+            .unwrap()
+            .get_mut(&canonical_build_id)
+            .unwrap()["assets"]
+            .as_object_mut()
+            .unwrap()
+            .remove("windows-x86_64");
+        assert!(
+            bridge_release_error(missing_windows, &canonical_build_id).contains("assets differ")
+        );
     }
 
     #[test]

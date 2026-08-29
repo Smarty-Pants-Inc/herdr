@@ -225,10 +225,13 @@ but changing `herdr-plugin.toml` after the install preview aborts install. Build
 failures show the plugin id, build index, working directory, command, exit
 status or spawn error, and capped stdout/stderr without interpreting tool output.
 
-Build commands are plain argv commands too, but they do not receive runtime
-plugin context or Herdr socket env. Plugin authors should document required
-system tools such as `cargo`, `npm`, `bun`, or `lua`; Herdr reports build
-failures but does not install missing toolchains.
+Build commands are plain argv commands too. Herdr scrubs runtime context such as
+`HERDR_BIN_PATH`, socket and session variables, pane/workspace/view identity,
+and all `HERDR_PLUGIN_*` variables, then injects only `HERDR_BUILD_BIN_PATH` as
+the validated absolute path to the Herdr executable running the install.
+Runtime plugin commands never receive `HERDR_BUILD_BIN_PATH`. Plugin authors
+should document required system tools such as `cargo`, `npm`, `bun`, or `lua`;
+Herdr reports build failures but does not install missing toolchains.
 
 ## Startup hooks
 
@@ -250,13 +253,22 @@ users can review code that will run automatically.
 
 ## Commands and environment
 
-Runtime commands run with the plugin directory as their working directory. Herdr
-injects `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV=1`,
+User-invoked plugin actions, panes, and link handlers follow the source pane's
+execution target. Per-pane SSH execution targets are Unix-only; whole-server
+`herdr --remote` remains available on Windows clients connecting to supported
+Linux and macOS hosts. For an SSH target, the Herdr server uses its local
+manifest for routing, while the same plugin id and entrypoint must be installed
+or linked on the target host. The remote Herdr resolves the target-local
+executable, platform, plugin root, config directory, and state directory;
+Herdr does not copy plugin packages between hosts. Startup and event hooks
+remain local to the Herdr server.
+
+Runtime commands receive `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV=1`,
 `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
 `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_CONTEXT_JSON`, and any available
-`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`. Action commands also
-receive `HERDR_PLUGIN_ACTION_ID`; startup and event hooks receive
-`HERDR_PLUGIN_EVENT` (`startup` for startup hooks), event hooks additionally
+`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`, and `HERDR_VIEW_ID`.
+Action commands also receive `HERDR_PLUGIN_ACTION_ID`; startup and event hooks
+receive `HERDR_PLUGIN_EVENT` (`startup` for startup hooks), event hooks also
 receive `HERDR_PLUGIN_EVENT_JSON`, and pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
 
@@ -270,9 +282,12 @@ but it does not validate, sync, or delete their contents. The plugin owns the
 file format and lifecycle.
 
 `HERDR_PLUGIN_CONTEXT_JSON` can include workspace, tab, focused pane, worktree,
-agent, selected text, clicked URL, and link handler fields when they are
-available for that invocation. Shell plugins can read the individual env vars
-for common ids, or parse the context JSON for the full shape.
+agent, selected text, clicked URL, link handler, and client view fields when
+they are available for that invocation. `HERDR_VIEW_ID` is an opaque,
+connection-lifetime routing value for a full app client. It is not a user
+identity or permission token, is absent from server-originated work, and changes
+after reconnect. Shell plugins can read individual env vars for common fields
+or parse the context JSON for the full shape.
 
 Use `HERDR_BIN_PATH` when a plugin needs to call Herdr portably from Node,
 PowerShell, Bash, or another runtime. The raw socket transport behind
@@ -286,16 +301,18 @@ while Windows clients connect to a named pipe. CLI calls through
 
 Manifest pane `placement` defaults to `overlay`, which opens a temporary zoomed
 overlay over the active pane and restores the previous focus and zoom when it
-closes. A `plugin.pane.open` request can override the manifest placement with
-`overlay`, `popup`, `split`, `tab`, or `zoomed`.
+closes. Manifest `scope` defaults to `shared`. A `plugin.pane.open` request can
+override placement with `overlay`, `popup`, `workspace_right`, `split`, `tab`,
+or `zoomed`, and can override scope with `shared` or `client_private`
+(`--scope client-private` in the CLI).
 
-`placement = "popup"` opens a session-modal terminal popup without changing the
-tiled layout. It accepts optional `width` and `height` fields in the manifest or
-open request; omit them for the default half-size popup, use numbers for outer
-terminal-cell dimensions, or use strings like `"80%"` for a percentage of the
-terminal area. It receives all terminal input, including Escape, and closes
-when the command exits or a `popup.close` request is sent. Dimensions smaller
-than the popup minimum are clamped.
+With shared scope, `placement = "popup"` opens a session-modal terminal popup
+without changing the tiled layout. It accepts optional `width` and `height`
+fields in the manifest or open request; omit them for the default half-size
+popup, use numbers for outer terminal-cell dimensions, or use strings like
+`"80%"` for a percentage of the terminal area. It receives all terminal input,
+including Escape, and closes when the command exits or a `popup.close` request
+is sent. Dimensions smaller than the popup minimum are clamped.
 
 Declare the placement directly on a plugin pane entrypoint when the pane should
 always be transient:
@@ -311,17 +328,76 @@ height = 20
 command = ["sh", "picker.sh"]
 ```
 
-Split, tab, zoomed, and overlay plugin panes are normal Herdr panes after they
-open. Plugins can call standard pane APIs such as `pane.move`, `pane.swap`,
+`placement = "workspace_right"` opens one terminal pane on a workspace's right
+edge, outside its tab split tree. Tab switches retain the pane; workspace
+switches restore the pane and its focus state independently for each workspace.
+Its content aligns with the workspace tab surface while its separator and
+bottom-left collapse control span the workspace height. Drag the left separator
+to resize it. The control collapses the pane to one column without stopping the
+process and never changes focus. Opening with `focus = false` starts collapsed;
+focusing the pane expands it. It accepts `width` but not `height`, using 30% when
+omitted.
+
+```toml
+[[panes]]
+id = "explorer"
+title = "Explorer"
+placement = "workspace_right"
+width = 32
+command = ["herdr-edit", "--explorer"]
+```
+
+The process receives `HERDR_WORKSPACE_ID` and a stable `HERDR_PANE_ID` of the
+form `<workspace_id>:plugin`, but no `HERDR_TAB_ID`. The pane is runtime-scoped:
+it closes with its workspace, its process, or `plugin.pane.close`, and is not
+restored from session snapshots. `plugin.pane.focus` switches to its workspace
+and focuses it. A different plugin entrypoint cannot replace an occupied
+workspace slot without closing the current pane first.
+
+Pane commands receive the active palette as protected `HERDR_THEME_*`
+environment variables. Values are `#rrggbb`, `reset`, a Ratatui named color such
+as `blue` or `lightblue`, or `indexed:N`.
+
+Split, tab, zoomed, and overlay plugin panes are normal shared Herdr panes after
+they open. Plugins can call standard pane APIs such as `pane.move`, `pane.swap`,
 `pane.resize`, and `pane.zoom` through the socket or CLI; Herdr keeps plugin
 pane ownership attached to the underlying pane when it moves across tabs or
-workspaces. A popup is a singleton session resource rather than a Herdr pane:
-it has no pane ID, does not change plugin focus context, emits no pane lifecycle
-events, and does not participate in pane, layout, persistence, or agent APIs.
-Its process does not receive `HERDR_PANE_ID`; the underlying tiled pane remains
-available through `HERDR_PLUGIN_CONTEXT_JSON`.
-Opening a popup returns `ui_busy` while Settings, Copy mode, or another Herdr
-modal is active, and `plugin.pane.open` returns an `ok` result after launch.
+workspaces. Workspace-right panes support plugin focus and close operations but
+remain outside general pane, layout, persistence, and agent APIs.
+
+A shared popup is a singleton session resource. It has no pane ID or pane
+lifecycle events; its process does not receive `HERDR_PANE_ID`, and the
+underlying tiled pane remains available through `HERDR_PLUGIN_CONTEXT_JSON`.
+Opening a shared popup returns `ui_busy` while Settings, Copy mode, or another
+Herdr modal is active. `popup.close` closes the shared popup, and
+`plugin.pane.open` returns an `ok` result after launch.
+
+For an independent popup owned by one connected app client, declare
+client-private scope. This scope is valid only with popup placement:
+
+```toml
+[[panes]]
+id = "browser"
+title = "Browser"
+placement = "popup"
+scope = "client_private"
+command = ["herdr-browser"]
+```
+
+A client-private popup belongs to one connected full app client, and each client
+may own one independent runtime. Its rendering, cursor, hyperlinks, input, and
+terminal size are visible only to that client. A successful new private popup
+replaces that client's old one; a failed launch leaves the old popup running.
+The private popup closes when its command exits or its client disconnects, and
+must be reopened after reconnect because the client gets a new view ID. It is
+connection-scoped and is not snapshotted, restored, or handed off.
+
+Both popup scopes have no public pane ID, do not change shared plugin focus
+context, emit no shared pane lifecycle events, and do not participate in pane,
+layout, persistence, or agent APIs. Their processes do not receive
+`HERDR_PANE_ID`; the underlying tiled source pane remains available through
+`HERDR_PLUGIN_CONTEXT_JSON`. A private popup exits through its own command,
+disconnect, or successful replacement.
 
 On Windows, build commands, action commands, and event commands resolve common
 `PATHEXT` shims such as `npm.cmd`, `bun.cmd`, and `pnpm.cmd` when the bare
@@ -342,17 +418,20 @@ description = "apply layout"
 
 ## Link handlers
 
-Use `[[link_handlers]]` to route modified clicks on matching terminal URLs to a
-plugin action instead of opening the URL in the browser. The modified-click
-modifier is Control on every platform, including macOS, because captured
-terminal mouse reports do not expose Command/Super separately from a plain
-click. `pattern` is a Rust regular expression matched against the clicked URL,
-and `action` must
+Use `[[link_handlers]]` to route a plain left click on a matching terminal URL
+to a plugin action instead of opening the URL in the browser. `pattern` is a
+Rust regular expression matched against the clicked URL, and `action` must
 name an action declared by the same plugin. Link handler actions receive
 `invocation_source = "link_click"`, `clicked_url`, and `link_handler_id` in
 `HERDR_PLUGIN_CONTEXT_JSON`; shell plugins can also read
 `HERDR_PLUGIN_CLICKED_URL` and `HERDR_PLUGIN_LINK_HANDLER_ID`. Handlers are
 checked in manifest order inside each plugin.
+
+When a link click originates from a full app client, Herdr also preserves that
+client's `view_id`. A handler can therefore open a client-private popup without
+guessing which simultaneous client clicked the link. File and `artifact://`
+URLs are passed to matching handlers unchanged; only safe HTTP(S) URLs use the
+platform opener when no handler accepts them.
 
 ## Storage
 

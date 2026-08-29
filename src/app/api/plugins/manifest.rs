@@ -1,7 +1,7 @@
 use crate::api::schema::{
     InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
     PluginManifestLinkHandler, PluginManifestPane, PluginManifestStartup, PluginPanePlacement,
-    PluginPlatform, PluginSourceInfo, PluginSourceKind,
+    PluginPaneScope, PluginPlatform, PluginSourceInfo, PluginSourceKind,
 };
 use crate::popup_size::PopupSize;
 
@@ -78,6 +78,8 @@ struct RawPluginManifestPane {
     platforms: Option<Vec<RawPlatform>>,
     #[serde(default)]
     placement: PluginPanePlacement,
+    #[serde(default)]
+    scope: PluginPaneScope,
     #[serde(default)]
     width: Option<PopupSize>,
     #[serde(default)]
@@ -422,12 +424,23 @@ fn normalize_manifest_pane(
         .filter(|description| !description.is_empty());
     let platforms = normalize_platforms(pane.platforms)?;
     let command = normalize_command(pane.command)?;
-    if pane.placement != PluginPanePlacement::Popup
-        && (pane.width.is_some() || pane.height.is_some())
-    {
+    let invalid_size = match pane.placement {
+        PluginPanePlacement::Popup => false,
+        PluginPanePlacement::WorkspaceRight => pane.height.is_some(),
+        _ => pane.width.is_some() || pane.height.is_some(),
+    };
+    if invalid_size {
         return Err((
             "invalid_plugin_pane_size",
-            "pane width and height are only supported when placement is popup".to_string(),
+            "pane width is supported for popup and workspace_right placements; height is popup-only"
+                .to_string(),
+        ));
+    }
+    if pane.scope == PluginPaneScope::ClientPrivate && pane.placement != PluginPanePlacement::Popup
+    {
+        return Err((
+            "invalid_plugin_pane_scope",
+            "client-private panes require popup placement".to_string(),
         ));
     }
     Ok(PluginManifestPane {
@@ -436,6 +449,7 @@ fn normalize_manifest_pane(
         description,
         platforms,
         placement: pane.placement,
+        scope: pane.scope,
         width: pane.width,
         height: pane.height,
         command,
@@ -520,7 +534,7 @@ fn current_platform() -> PluginPlatform {
 /// Resolve the effective platforms for an action or event: use the item's own
 /// platforms if declared, otherwise inherit from the plugin-level platforms.
 /// Returns a reference to whichever `Option<Vec<PluginPlatform>>` applies.
-pub(super) fn effective_platforms<'a>(
+pub(crate) fn effective_platforms<'a>(
     item_platforms: &'a Option<Vec<PluginPlatform>>,
     plugin_platforms: &'a Option<Vec<PluginPlatform>>,
 ) -> &'a Option<Vec<PluginPlatform>> {
@@ -531,7 +545,7 @@ pub(super) fn effective_platforms<'a>(
     }
 }
 
-pub(super) fn ensure_platform_supported(
+pub(crate) fn ensure_platform_supported(
     platforms: &Option<Vec<PluginPlatform>>,
     subject: &str,
 ) -> Result<(), (&'static str, String)> {

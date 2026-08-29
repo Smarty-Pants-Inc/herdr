@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(unix)]
-const HANDOFF_VERSION: u32 = 1;
+const LEGACY_HANDOFF_VERSION: u32 = 1;
+#[cfg(unix)]
+const HANDOFF_VERSION: u32 = 2;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -44,6 +46,10 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Host-wide OMP admission lease validated by the importing server.
+    /// Absent from manifests written before the maintenance gate existed.
+    #[serde(default)]
+    pub omp_maintenance: Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>,
 }
 
 #[cfg(unix)]
@@ -238,12 +244,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     let manifest_line = read_line_unbuffered(&mut stream)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
-    if manifest.version != HANDOFF_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported handoff version {}",
-            manifest.version
-        )));
-    }
+    validate_manifest_compatibility(&manifest)?;
     if manifest
         .expected_protocol
         .is_some_and(|protocol| protocol != crate::protocol::PROTOCOL_VERSION)
@@ -273,6 +274,20 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
         fds,
         stream,
     })
+}
+
+#[cfg(unix)]
+fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()> {
+    match manifest.version {
+        HANDOFF_VERSION => Ok(()),
+        LEGACY_HANDOFF_VERSION if manifest.omp_maintenance.is_none() => Ok(()),
+        LEGACY_HANDOFF_VERSION => Err(io::Error::other(
+            "legacy handoff manifests cannot carry OMP maintenance state",
+        )),
+        version => Err(io::Error::other(format!(
+            "unsupported handoff version {version}"
+        ))),
+    }
 }
 
 #[cfg(unix)]
@@ -310,6 +325,7 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    omp_maintenance: Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -320,6 +336,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        omp_maintenance,
     }
 }
 
@@ -496,29 +513,77 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
     }
 
     #[test]
-    fn a_manifest_written_before_the_title_field_still_loads() {
+    fn a_manifest_written_before_optional_handoff_fields_still_loads() {
         let manifest = manifest_for(
             empty_snapshot(),
             Vec::new(),
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
-        value
+        let object = value
             .as_object_mut()
-            .expect("manifest should be a json object")
-            .remove("api_window_title");
+            .expect("manifest should be a json object");
+        object.insert("version".into(), LEGACY_HANDOFF_VERSION.into());
+        object.remove("api_window_title");
+        object.remove("omp_maintenance");
 
         let older: HandoffManifest =
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+        assert!(older.omp_maintenance.is_none());
+        validate_manifest_compatibility(&older).expect("legacy new-import handoff is safe");
+    }
+
+    #[test]
+    fn a_handoff_carries_an_armed_omp_maintenance_permit() {
+        let maintenance = crate::server::omp_maintenance::OmpMaintenanceHandoffState {
+            owner_hash: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+            permit: Some(crate::api::schema::ServerOmpMaintenancePermit {
+                session: "proof".into(),
+                pane_id: "w1:p1".into(),
+            }),
+        };
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(maintenance.clone()),
+        );
+
+        assert_eq!(manifest.omp_maintenance, Some(maintenance));
+    }
+
+    #[test]
+    fn legacy_handoff_version_cannot_claim_maintenance_capability() {
+        let mut manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(crate::server::omp_maintenance::OmpMaintenanceHandoffState {
+                owner_hash: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+                permit: None,
+            }),
+        );
+        manifest.version = LEGACY_HANDOFF_VERSION;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot carry OMP maintenance state"));
     }
 }
