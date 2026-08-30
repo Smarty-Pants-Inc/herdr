@@ -230,7 +230,12 @@ impl PaneLaunchEnv {
         self
     }
     pub(crate) fn remote_env_with_removals(&self) -> (Vec<(String, String)>, Vec<String>) {
-        (self.remote_env(), self.remove.clone())
+        let mut remove = crate::integration::HERDR_OMP_BRIDGE_ENV_VARS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<Vec<_>>();
+        remove.extend(self.remove.clone());
+        (self.remote_env(), remove)
     }
     pub(crate) fn remote_env(&self) -> Vec<(String, String)> {
         let mut env = self.extra.clone();
@@ -265,6 +270,12 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         cmd.env_remove(key);
     }
     cmd.env_remove("HERDR_VIEW_ID");
+    // Bridge capabilities belong to the Herdr server launching this pane, not to
+    // any parent pane or remote client. Trusted launch extras and this server's
+    // pane-scoped host credentials are applied below.
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        cmd.env_remove(key);
+    }
     for key in &launch_env.remove {
         cmd.env_remove(key);
     }
@@ -316,37 +327,51 @@ type PreparedPanePty = (
     Option<crate::execution::RemoteExecReadyNonce>,
 );
 
-fn prepare_pane_pty_command<Local, Remote>(
+fn prepare_pane_pty_command<Local>(
     cwd: &Path,
     execution_target: &crate::execution::ExecutionTarget,
     launch_env: &PaneLaunchEnv,
     local: Local,
-    remote: Remote,
+    ssh_command: crate::execution::RemoteCommand,
+    provider_command: crate::execution::RemoteCommand,
 ) -> std::io::Result<PreparedPanePty>
 where
     Local: FnOnce() -> std::io::Result<CommandBuilder>,
-    Remote: FnOnce() -> crate::execution::RemoteCommand,
 {
-    if execution_target.is_local() {
-        let mut cmd = local()?;
-        cmd.cwd(cwd);
-        apply_pane_terminal_env(&mut cmd);
-        apply_pane_launch_env(&mut cmd, launch_env);
-        Ok((cmd, None, None))
-    } else {
-        let (env, remove_env) = launch_env.remote_env_with_removals();
-        let prepared = crate::execution::ssh_pty_command_with_removals(
-            execution_target,
-            cwd,
-            remote(),
-            env,
-            remove_env,
-        )?;
-        Ok((
-            prepared.command,
-            Some(prepared.request_channel),
-            Some(prepared.ready_nonce),
-        ))
+    match execution_target {
+        crate::execution::ExecutionTarget::Local => {
+            let mut cmd = local()?;
+            cmd.cwd(cwd);
+            apply_pane_terminal_env(&mut cmd);
+            apply_pane_launch_env(&mut cmd, launch_env);
+            Ok((cmd, None, None))
+        }
+        crate::execution::ExecutionTarget::Ssh { .. } => {
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::ssh_pty_command_with_removals(
+                execution_target,
+                cwd,
+                ssh_command,
+                env,
+                remove_env,
+            )?;
+            Ok((
+                prepared.command,
+                Some(prepared.request_channel),
+                Some(prepared.ready_nonce),
+            ))
+        }
+        crate::execution::ExecutionTarget::Extension { .. } => {
+            let (env, remove_env) = launch_env.remote_env_with_removals();
+            let prepared = crate::execution::execution_provider_pty_command_with_removals(
+                execution_target,
+                cwd,
+                provider_command,
+                env,
+                remove_env,
+            )?;
+            Ok((prepared.command, None, Some(prepared.ready_nonce)))
+        }
     }
 }
 
@@ -883,6 +908,131 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+struct ManagedAgentHintState<'a> {
+    agent_presence: &'a mut AgentDetectionPresence,
+    state: &'a mut AgentState,
+    last_visible_idle: &'a mut bool,
+    last_foreground_pgid: &'a mut Option<u32>,
+    has_process_probe: &'a mut bool,
+    acquisition_started_at: &'a mut Option<std::time::Instant>,
+    last_content_change_at: &'a mut Option<std::time::Instant>,
+    pending_foreground_shell_clear: &'a mut bool,
+    pending_restore_probe: &'a mut bool,
+    foreground_shell_exit_reported: &'a mut bool,
+    last_visible_blocker: &'a mut bool,
+    last_visible_working: &'a mut bool,
+    last_visible_signal_refresh: &'a mut Option<std::time::Instant>,
+    last_detection_text: &'a mut String,
+    last_screen_scan_detection_content_seq: &'a mut Option<u64>,
+    agent_startup_grace_until: &'a mut Option<std::time::Instant>,
+    pending_idle: &'a mut PendingIdleConfirmation,
+    last_managed_agent_hint: &'a mut Option<Agent>,
+}
+
+impl ManagedAgentHintState<'_> {
+    fn reset_for_agent_switch(&mut self, agent: Agent, now: std::time::Instant) {
+        *self.agent_presence = AgentDetectionPresence::from_agent(Some(agent));
+        *self.state = AgentState::Unknown;
+        *self.last_visible_idle = false;
+        *self.last_foreground_pgid = None;
+        *self.has_process_probe = false;
+        *self.acquisition_started_at = None;
+        *self.last_content_change_at = None;
+        *self.pending_foreground_shell_clear = false;
+        *self.pending_restore_probe = false;
+        *self.foreground_shell_exit_reported = false;
+        *self.last_visible_blocker = false;
+        *self.last_visible_working = false;
+        *self.last_visible_signal_refresh = None;
+        self.last_detection_text.clear();
+        *self.last_screen_scan_detection_content_seq = None;
+        *self.agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
+        self.pending_idle.clear();
+    }
+}
+
+enum ManagedAgentHintOutcome {
+    Continue {
+        suppressed_agent: Option<Agent>,
+        hinted_agent: Option<Agent>,
+        agent_changed: bool,
+    },
+    ResetRequested,
+}
+
+struct ManagedAgentHintContext<'a> {
+    pane_id: PaneId,
+    terminal: &'a PaneTerminal,
+    state_events: &'a mpsc::Sender<AppEvent>,
+    pending_release: &'a Mutex<Option<PendingAgentRelease>>,
+    managed_agent_hint: &'a Mutex<Option<Agent>>,
+    detect_reset: &'a Notify,
+}
+
+impl ManagedAgentHintContext<'_> {
+    async fn apply(
+        &self,
+        now: std::time::Instant,
+        mut detection: ManagedAgentHintState<'_>,
+    ) -> ManagedAgentHintOutcome {
+        let mut suppressed_agent = active_pending_release(self.pending_release, now);
+        let hinted_agent = self.managed_agent_hint.lock().ok().and_then(|hint| *hint);
+        if let (Some(suppressed), Some(hinted)) = (suppressed_agent, hinted_agent) {
+            if hinted != suppressed {
+                if let Ok(mut pending_release) = self.pending_release.lock() {
+                    *pending_release = None;
+                }
+                suppressed_agent = None;
+            }
+        }
+
+        let mut agent_changed = false;
+        if let Some(hinted_agent) = hinted_agent {
+            if Some(hinted_agent) != suppressed_agent
+                && detection.agent_presence.current_agent() != Some(hinted_agent)
+            {
+                detection.reset_for_agent_switch(hinted_agent, now);
+                self.terminal.clear_agent_osc_state();
+                publish_agent_process_detected_event(
+                    self.state_events.clone(),
+                    self.pane_id,
+                    hinted_agent,
+                    now,
+                )
+                .await;
+                agent_changed = true;
+            }
+        }
+
+        if detection.last_managed_agent_hint.is_some()
+            && hinted_agent.is_none()
+            && suppressed_agent.is_none()
+        {
+            publish_state_changed_event(
+                self.state_events.clone(),
+                self.pane_id,
+                None,
+                AgentState::Unknown,
+                false,
+                false,
+                false,
+                now,
+            )
+            .await;
+            *detection.last_managed_agent_hint = hinted_agent;
+            self.detect_reset.notify_one();
+            return ManagedAgentHintOutcome::ResetRequested;
+        }
+
+        *detection.last_managed_agent_hint = hinted_agent;
+        ManagedAgentHintOutcome::Continue {
+            suppressed_agent,
+            hinted_agent,
+            agent_changed,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -890,6 +1040,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    managed_agent_hint: Arc<Mutex<Option<Agent>>>,
     state_events: mpsc::Sender<AppEvent>,
     initial_agent: Option<Agent>,
     initial_state: AgentState,
@@ -902,6 +1053,7 @@ fn spawn_basic_detection_task(
     let detect_reset = detect_reset_notify.clone();
     let pending_release = Arc::new(Mutex::new(None));
     let pending_release_for_task = pending_release.clone();
+    let managed_agent_hint_for_task = managed_agent_hint;
 
     let handle = tokio::spawn(async move {
         let mut agent_presence = AgentDetectionPresence::from_agent(initial_agent);
@@ -923,6 +1075,7 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let mut last_managed_agent_hint = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -956,7 +1109,48 @@ fn spawn_basic_detection_task(
             }
 
             let now = std::time::Instant::now();
-            let suppressed_agent = active_pending_release(&pending_release_for_task, now);
+            let (suppressed_agent, hinted_agent, mut agent_changed) =
+                match (ManagedAgentHintContext {
+                    pane_id,
+                    terminal: &terminal,
+                    state_events: &state_events,
+                    pending_release: &pending_release_for_task,
+                    managed_agent_hint: &managed_agent_hint_for_task,
+                    detect_reset: &detect_reset,
+                })
+                .apply(
+                    now,
+                    ManagedAgentHintState {
+                        agent_presence: &mut agent_presence,
+                        state: &mut state,
+                        last_visible_idle: &mut last_visible_idle,
+                        last_foreground_pgid: &mut last_foreground_pgid,
+                        has_process_probe: &mut has_process_probe,
+                        acquisition_started_at: &mut acquisition_started_at,
+                        last_content_change_at: &mut last_content_change_at,
+                        pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+                        pending_restore_probe: &mut pending_restore_probe,
+                        foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+                        last_visible_blocker: &mut last_visible_blocker,
+                        last_visible_working: &mut last_visible_working,
+                        last_visible_signal_refresh: &mut last_visible_signal_refresh,
+                        last_detection_text: &mut last_detection_text,
+                        last_screen_scan_detection_content_seq:
+                            &mut last_screen_scan_detection_content_seq,
+                        agent_startup_grace_until: &mut agent_startup_grace_until,
+                        pending_idle: &mut pending_idle,
+                        last_managed_agent_hint: &mut last_managed_agent_hint,
+                    },
+                )
+                .await
+                {
+                    ManagedAgentHintOutcome::Continue {
+                        suppressed_agent,
+                        hinted_agent,
+                        agent_changed,
+                    } => (suppressed_agent, hinted_agent, agent_changed),
+                    ManagedAgentHintOutcome::ResetRequested => continue,
+                };
             if suppressed_agent.is_none() && release_was_active {
                 has_process_probe = false;
                 acquisition_started_at = None;
@@ -964,7 +1158,6 @@ fn spawn_basic_detection_task(
             }
             release_was_active = suppressed_agent.is_some();
             let pid = child_pid.load(Ordering::Acquire);
-            let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
@@ -973,7 +1166,7 @@ fn spawn_basic_detection_task(
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
-            let should_check_process = pid > 0 && {
+            let should_check_process = hinted_agent.is_none() && pid > 0 && {
                 let process_probe_input = ProcessProbeInput {
                     current_agent: agent,
                     suppressed_agent,
@@ -1296,6 +1489,7 @@ pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
+    input_written: Arc<AtomicBool>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -1311,6 +1505,7 @@ pub struct PaneRuntime {
     emit_pane_died_on_reader_exit: Arc<AtomicBool>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    managed_agent_hint: Arc<Mutex<Option<Agent>>>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
@@ -2063,6 +2258,10 @@ impl PaneRuntime {
     pub fn remote_execution_ready(&self) -> bool {
         self.remote_execution_ready.load(Ordering::Acquire)
     }
+
+    pub fn input_written(&self) -> bool {
+        self.input_written.load(Ordering::Acquire)
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn set_remote_execution_ready_for_test(&self, ready: bool) {
         self.remote_execution_ready.store(ready, Ordering::Release);
@@ -2083,6 +2282,7 @@ impl PaneRuntime {
             cell_width_px,
             cell_height_px,
             remote_execution_ready: self.remote_execution_ready.load(Ordering::Acquire),
+            input_written: self.input_written.load(Ordering::Acquire),
             remote_hostname: self
                 .remote_hostname
                 .lock()
@@ -2219,7 +2419,8 @@ impl PaneRuntime {
             execution_target,
             launch_env,
             || pane_shell_command_builder(shell_config),
-            || crate::execution::RemoteCommand::Shell,
+            crate::execution::RemoteCommand::Shell,
+            crate::execution::RemoteCommand::Shell,
         )?;
         Self::spawn_command_builder(
             pane_id,
@@ -2267,7 +2468,10 @@ impl PaneRuntime {
             execution_target,
             launch_env,
             || Ok(crate::platform::pane_custom_command_pty_builder(command)),
-            || crate::execution::RemoteCommand::ShellCommand {
+            crate::execution::RemoteCommand::ShellCommand {
+                command: command.to_string(),
+            },
+            crate::execution::RemoteCommand::ShellCommand {
                 command: command.to_string(),
             },
         )?;
@@ -2347,7 +2551,10 @@ impl PaneRuntime {
             execution_target,
             launch_env,
             || pane_argv_command_builder(argv),
-            || crate::execution::RemoteCommand::Argv {
+            crate::execution::RemoteCommand::Argv {
+                argv: argv.to_vec(),
+            },
+            crate::execution::RemoteCommand::Argv {
                 argv: argv.to_vec(),
             },
         )?;
@@ -2394,11 +2601,14 @@ impl PaneRuntime {
             execution_target,
             launch_env,
             || pane_argv_command_builder(local_argv),
-            || crate::execution::RemoteCommand::Plugin {
+            crate::execution::RemoteCommand::Plugin {
                 plugin_id: plugin_id.to_string(),
                 target: crate::plugin_command::PluginCommandTarget::Pane {
                     entrypoint: entrypoint.to_string(),
                 },
+            },
+            crate::execution::RemoteCommand::Argv {
+                argv: local_argv.to_vec(),
             },
         )?;
         Self::spawn_command_builder(
@@ -2441,6 +2651,7 @@ impl PaneRuntime {
             cell_width_px,
             cell_height_px,
             remote_execution_ready: handoff_remote_execution_ready,
+            input_written: handoff_input_written,
             remote_hostname: handoff_remote_hostname,
             remote_exec_ready_filter,
             keyboard_protocol_flags,
@@ -2490,6 +2701,7 @@ impl PaneRuntime {
         terminal.seed_remote_exec_ready_filter(remote_exec_ready_filter);
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
+        let input_written = Arc::new(AtomicBool::new(handoff_input_written));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -2583,12 +2795,18 @@ impl PaneRuntime {
 
         let full_lifecycle_authority_active =
             Arc::new(AtomicBool::new(initial_lifecycle_authority_active));
+        let managed_agent_hint = Arc::new(Mutex::new(
+            (!execution_target.is_local())
+                .then_some(initial_agent)
+                .flatten(),
+        ));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            managed_agent_hint.clone(),
             events,
             initial_agent,
             initial_agent_state,
@@ -2598,6 +2816,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_written,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2611,6 +2830,7 @@ impl PaneRuntime {
             emit_pane_died_on_reader_exit,
             detection_content_seq,
             full_lifecycle_authority_active,
+            managed_agent_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
@@ -2672,6 +2892,7 @@ impl PaneRuntime {
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let remote_execution_ready = Arc::new(AtomicBool::new(execution_target.is_local()));
+        let input_written = Arc::new(AtomicBool::new(false));
         let remote_hostname = Arc::new(Mutex::new(None));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -2874,6 +3095,7 @@ impl PaneRuntime {
             });
         }
 
+        let managed_agent_hint = Arc::new(Mutex::new(None));
         // --- Detection task ---
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
@@ -2896,6 +3118,7 @@ impl PaneRuntime {
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
             let pending_release_for_task = pending_release.clone();
+            let managed_agent_hint_for_task = managed_agent_hint.clone();
 
             let handle = tokio::spawn(async move {
                 let mut agent_presence =
@@ -2920,6 +3143,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                let mut last_managed_agent_hint = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2962,7 +3186,48 @@ impl PaneRuntime {
                     }
 
                     let now = Instant::now();
-                    let suppressed_agent = active_pending_release(&pending_release_for_task, now);
+                    let (suppressed_agent, hinted_agent, mut agent_changed) =
+                        match (ManagedAgentHintContext {
+                            pane_id,
+                            terminal: &terminal,
+                            state_events: &state_events,
+                            pending_release: &pending_release_for_task,
+                            managed_agent_hint: &managed_agent_hint_for_task,
+                            detect_reset: &detect_reset,
+                        })
+                        .apply(
+                            now,
+                            ManagedAgentHintState {
+                                agent_presence: &mut agent_presence,
+                                state: &mut state,
+                                last_visible_idle: &mut last_visible_idle,
+                                last_foreground_pgid: &mut last_foreground_pgid,
+                                has_process_probe: &mut has_process_probe,
+                                acquisition_started_at: &mut acquisition_started_at,
+                                last_content_change_at: &mut last_content_change_at,
+                                pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+                                pending_restore_probe: &mut pending_restore_probe,
+                                foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+                                last_visible_blocker: &mut last_visible_blocker,
+                                last_visible_working: &mut last_visible_working,
+                                last_visible_signal_refresh: &mut last_visible_signal_refresh,
+                                last_detection_text: &mut last_detection_text,
+                                last_screen_scan_detection_content_seq:
+                                    &mut last_screen_scan_detection_content_seq,
+                                agent_startup_grace_until: &mut agent_startup_grace_until,
+                                pending_idle: &mut pending_idle,
+                                last_managed_agent_hint: &mut last_managed_agent_hint,
+                            },
+                        )
+                        .await
+                        {
+                            ManagedAgentHintOutcome::Continue {
+                                suppressed_agent,
+                                hinted_agent,
+                                agent_changed,
+                            } => (suppressed_agent, hinted_agent, agent_changed),
+                            ManagedAgentHintOutcome::ResetRequested => continue,
+                        };
                     if suppressed_agent.is_none() && release_was_active {
                         has_process_probe = false;
                         acquisition_started_at = None;
@@ -3013,7 +3278,7 @@ impl PaneRuntime {
                     }
                     let process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
-                    let should_check_process = pid > 0 && {
+                    let should_check_process = hinted_agent.is_none() && pid > 0 && {
                         let process_probe_input = ProcessProbeInput {
                             foreground_pgid,
                             ..process_probe_input
@@ -3024,7 +3289,6 @@ impl PaneRuntime {
                         ) && should_probe_foreground_job(process_probe_input)
                     };
 
-                    let mut agent_changed = false;
                     if should_check_process {
                         last_process_check = now;
                         let had_process_probe = has_process_probe;
@@ -3275,6 +3539,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_written,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -3290,6 +3555,7 @@ impl PaneRuntime {
             emit_pane_died_on_reader_exit,
             detection_content_seq,
             full_lifecycle_authority_active,
+            managed_agent_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
@@ -3304,11 +3570,32 @@ impl PaneRuntime {
                 until: std::time::Instant::now() + RELEASE_REACQUIRE_SUPPRESSION,
             });
         }
+        if let Ok(mut hint) = self.managed_agent_hint.lock() {
+            *hint = None;
+        }
         self.detect_reset_notify.notify_one();
     }
 
     pub fn reset_agent_detection(&self) {
         self.detect_reset_notify.notify_one();
+    }
+
+    pub fn set_managed_agent_hint(&self, agent: Option<Agent>) {
+        let changed = self.managed_agent_hint.lock().is_ok_and(|mut hint| {
+            if *hint == agent {
+                return false;
+            }
+            *hint = agent;
+            true
+        });
+        if changed {
+            self.detect_reset_notify.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_agent_hint_for_test(&self) -> Option<Agent> {
+        self.managed_agent_hint.lock().ok().and_then(|hint| *hint)
     }
 
     #[cfg(test)]
@@ -3608,14 +3895,23 @@ impl PaneRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.io.send_bytes(bytes).await
+        let result = self.io.send_bytes(bytes).await;
+        if result.is_ok() {
+            self.input_written.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        let result = self.io.try_send_bytes(bytes);
+        if result.is_ok() {
+            self.input_written.store(true, Ordering::Release);
+        }
+        result
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        self.input_written.store(true, Ordering::Release);
         self.io.send_bytes_after(bytes, delay);
     }
 
@@ -3847,6 +4143,7 @@ impl PaneRuntime {
                     sender: tx,
                     resize_tx,
                 },
+                input_written: Arc::new(AtomicBool::new(false)),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
@@ -3862,6 +4159,7 @@ impl PaneRuntime {
                 emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+                managed_agent_hint: Arc::new(Mutex::new(None)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
@@ -3890,6 +4188,7 @@ mod tests {
             cell_width_px: 0,
             cell_height_px: 0,
             remote_execution_ready,
+            input_written: false,
             remote_hostname: remote_hostname.map(str::to_owned),
             remote_exec_ready_filter: RemoteExecReadyFilter::default(),
             pending_agent_resume_plan: None,
@@ -3961,6 +4260,89 @@ mod tests {
         .unwrap();
         runtime.set_handoff_reader_paused(false);
         (runtime, event_rx, child)
+    }
+
+    #[test]
+    fn managed_agent_switch_resets_process_probe_state() {
+        let now = std::time::Instant::now();
+        let mut agent_presence = AgentDetectionPresence::from_agent(Some(Agent::Omp));
+        let mut state = AgentState::Working;
+        let mut last_visible_idle = true;
+        let mut last_foreground_pgid = Some(42);
+        let mut has_process_probe = true;
+        let mut acquisition_started_at = Some(now);
+        let mut last_content_change_at = Some(now);
+        let mut pending_foreground_shell_clear = true;
+        let mut pending_restore_probe = true;
+        let mut foreground_shell_exit_reported = true;
+        let mut last_visible_blocker = true;
+        let mut last_visible_working = true;
+        let mut last_visible_signal_refresh = Some(now);
+        let mut last_detection_text = "stale".to_string();
+        let mut last_screen_scan_detection_content_seq = Some(7);
+        let mut agent_startup_grace_until = None;
+        let mut pending_idle = PendingIdleConfirmation::default();
+        let mut last_managed_agent_hint = Some(Agent::Omp);
+
+        ManagedAgentHintState {
+            agent_presence: &mut agent_presence,
+            state: &mut state,
+            last_visible_idle: &mut last_visible_idle,
+            last_foreground_pgid: &mut last_foreground_pgid,
+            has_process_probe: &mut has_process_probe,
+            acquisition_started_at: &mut acquisition_started_at,
+            last_content_change_at: &mut last_content_change_at,
+            pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
+            pending_restore_probe: &mut pending_restore_probe,
+            foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
+            last_visible_blocker: &mut last_visible_blocker,
+            last_visible_working: &mut last_visible_working,
+            last_visible_signal_refresh: &mut last_visible_signal_refresh,
+            last_detection_text: &mut last_detection_text,
+            last_screen_scan_detection_content_seq: &mut last_screen_scan_detection_content_seq,
+            agent_startup_grace_until: &mut agent_startup_grace_until,
+            pending_idle: &mut pending_idle,
+            last_managed_agent_hint: &mut last_managed_agent_hint,
+        }
+        .reset_for_agent_switch(Agent::Codex, now);
+
+        assert_eq!(agent_presence.current_agent(), Some(Agent::Codex));
+        assert_eq!(last_foreground_pgid, None);
+        assert!(!has_process_probe);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_detection_adopts_managed_agent_switch() {
+        let mut handoff = handoff_test_state(0, true, Some("build-alias"));
+        handoff.agent_state = Some(
+            serde_json::from_value(serde_json::json!({
+                "agent": "omp",
+                "state": "idle",
+                "seen": true
+            }))
+            .unwrap(),
+        );
+        let (runtime, mut events, mut child) = import_handoff_state_with_output("", handoff);
+
+        runtime.set_managed_agent_hint(Some(Agent::Codex));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match events.recv().await {
+                    Some(AppEvent::AgentProcessDetected {
+                        agent: Agent::Codex,
+                        ..
+                    }) => break,
+                    Some(_) => {}
+                    None => panic!("handoff event channel closed before managed-agent switch"),
+                }
+            }
+        })
+        .await
+        .expect("handoff detection should use the shared managed-agent transition");
+
+        assert_eq!(runtime.managed_agent_hint_for_test(), Some(Agent::Codex));
+        child.wait().unwrap();
     }
 
     #[test]
@@ -4077,7 +4459,16 @@ mod tests {
             .without_env("BUN_OPTIONS")
             .remote_env_with_removals();
 
-        assert_eq!(remove_env, vec!["BUN_OPTIONS"]);
+        assert_eq!(
+            remove_env,
+            [
+                "HERDR_OMP_BRIDGE",
+                "HERDR_OMP_BRIDGE_TOKEN",
+                "HERDR_OMP_GUEST_BRIDGE_TOKEN",
+                "BUN_OPTIONS",
+            ]
+            .map(String::from)
+        );
     }
 
     #[test]
@@ -4148,6 +4539,9 @@ mod tests {
             .with_omp_bridge(Some(bridge.clone()))
             .with_identity("w1".into(), "w1:t1".into(), "w1:p1".into());
         let mut cmd = CommandBuilder::new("shell");
+        cmd.env("HERDR_OMP_BRIDGE", "stale-address");
+        cmd.env("HERDR_OMP_BRIDGE_TOKEN", "stale-host-token");
+        cmd.env("HERDR_OMP_GUEST_BRIDGE_TOKEN", "stale-guest-token");
 
         apply_pane_launch_env(&mut cmd, &launch);
         assert_eq!(
@@ -4177,6 +4571,7 @@ mod tests {
             .unwrap();
         assert!(bridge.validates("w1:p1", token));
         assert!(!bridge.validates("w1:p2", token));
+        assert_eq!(cmd.get_env("HERDR_OMP_GUEST_BRIDGE_TOKEN"), None);
     }
 
     #[test]
@@ -4792,6 +5187,18 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn handoff_runtime_state_preserves_written_input() {
+        let (runtime, _input) = PaneRuntime::test_with_channel(80, 24);
+        assert!(!runtime.input_written());
+
+        runtime.try_send_bytes(Bytes::from_static(b"x")).unwrap();
+
+        assert!(runtime.input_written());
+        assert!(runtime.handoff_runtime_state(12).input_written);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn handoff_runtime_state_captures_remote_execution_confirmation() {
         let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
         runtime
@@ -5112,6 +5519,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -5127,6 +5535,7 @@ mod tests {
             emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            managed_agent_hint: Arc::new(Mutex::new(None)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
@@ -5151,6 +5560,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -5166,6 +5576,7 @@ mod tests {
             emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
+            managed_agent_hint: Arc::new(Mutex::new(None)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
@@ -5926,6 +6337,113 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_agent_hint_drives_screen_detection_without_local_process_identity() {
+        let (events, mut event_rx) = mpsc::channel(8);
+        let pane_id = PaneId::from_raw(41);
+        let runtime = PaneRuntime::spawn_shell_command_on(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            &crate::execution::ExecutionTarget::Local,
+            "printf '\\033]0;omp\\007'; sleep 6",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Enabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        runtime.set_managed_agent_hint(Some(Agent::Omp));
+
+        let mut process_detected = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AppEvent::AgentProcessDetected {
+                        pane_id: delivered_pane,
+                        agent: Agent::Omp,
+                        ..
+                    }) if delivered_pane == pane_id => process_detected = true,
+                    Some(AppEvent::StateChanged {
+                        pane_id: delivered_pane,
+                        agent: Some(Agent::Omp),
+                        state: AgentState::Idle,
+                        ..
+                    }) if delivered_pane == pane_id && process_detected => break,
+                    Some(_) => {}
+                    None => panic!("event channel closed before idle detection"),
+                }
+            }
+        })
+        .await
+        .expect("managed agent hint should drive screen detection");
+        runtime.set_managed_agent_hint(None);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AppEvent::StateChanged {
+                        pane_id: delivered_pane,
+                        agent: None,
+                        state: AgentState::Unknown,
+                        visible_blocker: false,
+                        visible_working: false,
+                        process_exited: false,
+                        ..
+                    }) if delivered_pane == pane_id => break,
+                    Some(_) => {}
+                    None => panic!("event channel closed before managed-agent clear"),
+                }
+            }
+        })
+        .await
+        .expect("clearing a managed agent hint should clear detected agent state");
+        runtime.set_managed_agent_hint(Some(Agent::Omp));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AppEvent::AgentProcessDetected {
+                        pane_id: delivered_pane,
+                        agent: Agent::Omp,
+                        ..
+                    }) if delivered_pane == pane_id => break,
+                    Some(_) => {}
+                    None => panic!("event channel closed before managed-agent reacquisition"),
+                }
+            }
+        })
+        .await
+        .expect("managed agent hint should reacquire the remote agent");
+
+        runtime.begin_graceful_release(Agent::Omp);
+        runtime.set_managed_agent_hint(Some(Agent::Omp));
+        let redetected = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(AppEvent::AgentProcessDetected {
+                        pane_id: delivered_pane,
+                        agent: Agent::Omp,
+                        ..
+                    }) if delivered_pane == pane_id => break,
+                    Some(_) => {}
+                    None => panic!("event channel closed during graceful release"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            redetected.is_err(),
+            "graceful release must suppress a stale managed-agent hint"
+        );
+
+        runtime.shutdown();
     }
 
     #[cfg(unix)]

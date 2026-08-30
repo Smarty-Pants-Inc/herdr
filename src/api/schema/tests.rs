@@ -1077,6 +1077,7 @@ fn plugin_link_list_unlink_round_trip() {
             command: vec!["bun".into(), "install".into()],
         }],
         startup: vec![],
+        execution_providers: vec![],
         actions: vec![PluginManifestAction {
             id: "bootstrap".into(),
             title: "Bootstrap worktree".into(),

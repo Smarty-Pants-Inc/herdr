@@ -12,6 +12,168 @@ const PLUGIN_COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
 
+const PLUGIN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const PLUGIN_COMMAND_TERMINATION_ATTEMPTS: usize = 40;
+
+pub(crate) struct PluginCommandRuntime {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PluginCommandRuntime {
+    fn new(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            cancelled,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for PluginCommandRuntime {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn spawn_plugin_command(
+    mut command: std::process::Command,
+) -> std::io::Result<(std::process::Child, crate::platform::ProcessTreeGuard)> {
+    crate::platform::configure_process_tree_command(&mut command);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    match crate::platform::ProcessTreeGuard::new_std(&child) {
+        Ok(process_tree) => Ok((child, process_tree)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_plugin_child_termination(
+    mut poll: impl FnMut() -> std::io::Result<bool>,
+    mut wait: impl FnMut(),
+) -> std::io::Result<()> {
+    for attempt in 0..PLUGIN_COMMAND_TERMINATION_ATTEMPTS {
+        match poll() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+        if attempt + 1 < PLUGIN_COMMAND_TERMINATION_ATTEMPTS {
+            wait();
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out reaping terminated plugin command",
+    ))
+}
+
+type PluginReaperItem = (std::process::Child, crate::platform::ProcessTreeGuard);
+
+static PLUGIN_REAPER: std::sync::LazyLock<std::sync::mpsc::Sender<PluginReaperItem>> =
+    std::sync::LazyLock::new(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<PluginReaperItem>();
+        if let Err(error) = std::thread::Builder::new()
+            .name("herdr-plugin-reaper".to_owned())
+            .spawn(move || {
+                for (mut child, mut process_tree) in receiver {
+                    let pid = child.id();
+                    process_tree.terminate();
+                    let _ = child.kill();
+                    if let Err(error) = child.wait() {
+                        tracing::warn!(pid, err = %error, "background plugin command reaper failed");
+                    }
+                }
+            })
+        {
+            tracing::warn!(err = %error, "failed to start background plugin command reaper");
+        }
+        sender
+    });
+
+fn plugin_reaper_sender() -> &'static std::sync::mpsc::Sender<PluginReaperItem> {
+    &PLUGIN_REAPER
+}
+
+fn handoff_plugin_child_to_reaper(
+    child: std::process::Child,
+    process_tree: crate::platform::ProcessTreeGuard,
+) -> Result<(), PluginReaperItem> {
+    plugin_reaper_sender()
+        .send((child, process_tree))
+        .map_err(|error| error.0)
+}
+
+fn terminate_plugin_child(
+    mut child: std::process::Child,
+    mut process_tree: crate::platform::ProcessTreeGuard,
+) -> bool {
+    process_tree.terminate();
+    let result = wait_for_plugin_child_termination(
+        || match child.try_wait()? {
+            Some(_) => Ok(true),
+            None => {
+                let _ = child.kill();
+                Ok(false)
+            }
+        },
+        || std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
+    );
+    if result.is_ok() {
+        return true;
+    }
+
+    let pid = child.id();
+    tracing::warn!(pid, err = %result.unwrap_err(), "plugin command reaping exceeded the shutdown deadline; continuing in background");
+    if let Err((mut child, mut process_tree)) = handoff_plugin_child_to_reaper(child, process_tree)
+    {
+        tracing::warn!(
+            pid,
+            "background plugin command reaper unavailable; reaping synchronously"
+        );
+        process_tree.terminate();
+        let _ = child.kill();
+        if let Err(error) = child.wait() {
+            tracing::warn!(pid, err = %error, "synchronous plugin command reaper failed");
+        }
+        return true;
+    }
+    false
+}
+
+fn publish_plugin_command_finished(
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut event: crate::events::AppEvent,
+) {
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                event = returned;
+                std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
+}
+
 impl App {
     pub(super) fn start_plugin_command(
         &mut self,
@@ -123,46 +285,71 @@ impl App {
         let plugin_id = plugin.plugin_id.clone();
         let link_handler_id = context.link_handler_id.clone();
         let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let (child, remote_request_channel) = if let Some((program, args)) = local_command {
-                let mut command =
-                    crate::plugin_command::command_for_argv_in_dir(&program, &args, &plugin_root);
-                command.env_remove("HERDR_VIEW_ID");
-                apply_plugin_runtime_env(&mut command, env);
-                (
-                    command
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn(),
-                    None,
-                )
-            } else {
-                let action_id = action_id_for_launch.expect("remote plugin action requires id");
-                match crate::execution::ssh_process_command(
-                    &execution_target,
-                    std::path::Path::new(""),
-                    crate::execution::RemoteCommand::Plugin {
-                        plugin_id,
-                        target: crate::plugin_command::PluginCommandTarget::Action {
-                            action_id,
-                            link_handler_id,
-                        },
-                    },
-                    env,
-                ) {
-                    Ok(mut prepared) => (
-                        prepared
-                            .command
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn(),
-                        Some(prepared.request_channel),
+        let runtime_log_id = log_id.clone();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            let (child, remote_request_channel) = match execution_target {
+                crate::execution::ExecutionTarget::Local => match local_command {
+                    Some((program, args)) => {
+                        let mut command = crate::plugin_command::command_for_argv_in_dir(
+                            &program,
+                            &args,
+                            &plugin_root,
+                        );
+                        command.env_remove("HERDR_VIEW_ID");
+                        apply_plugin_runtime_env(&mut command, env);
+                        (spawn_plugin_command(command), None)
+                    }
+                    None => (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "local plugin command is missing",
+                        )),
+                        None,
                     ),
-                    Err(err) => (Err(err), None),
+                },
+                crate::execution::ExecutionTarget::Ssh { .. } => match action_id_for_launch {
+                    Some(action_id) => match crate::execution::ssh_process_command(
+                        &execution_target,
+                        std::path::Path::new(""),
+                        crate::execution::RemoteCommand::Plugin {
+                            plugin_id,
+                            target: crate::plugin_command::PluginCommandTarget::Action {
+                                action_id,
+                                link_handler_id,
+                            },
+                        },
+                        env,
+                    ) {
+                        Ok(prepared) => (
+                            spawn_plugin_command(prepared.command),
+                            Some(prepared.request_channel),
+                        ),
+                        Err(err) => (Err(err), None),
+                    },
+                    None => (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "remote SSH plugin action id is missing",
+                        )),
+                        None,
+                    ),
+                },
+                crate::execution::ExecutionTarget::Extension { .. } => {
+                    match crate::execution::execution_provider_process_command(
+                        &execution_target,
+                        std::path::Path::new(""),
+                        crate::execution::RemoteCommand::Argv { argv: command },
+                        env,
+                    ) {
+                        Ok(prepared) => (spawn_plugin_command(prepared.command), None),
+                        Err(err) => (Err(err), None),
+                    }
                 }
             };
             let finished = match child {
-                Ok(mut child) => {
+                Ok((mut child, process_tree)) => {
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let stdout_reader = stdout.map(|stdout| {
@@ -175,63 +362,86 @@ impl App {
                             read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
                         })
                     });
-                    let status = {
+                    let mut child_and_tree = Some((child, process_tree));
+                    let mut remote_request_channel = remote_request_channel;
+                    #[cfg(unix)]
+                    let mut request_delivered = remote_request_channel.is_none();
+                    let (status, readers_can_join) = loop {
+                        if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                            if let Some(channel) = remote_request_channel.take() {
+                                channel.cancel();
+                            }
+                            let (child, process_tree) = child_and_tree.take().unwrap();
+                            let reaped = terminate_plugin_child(child, process_tree);
+                            break (
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "plugin command cancelled",
+                                )),
+                                reaped,
+                            );
+                        }
                         #[cfg(unix)]
-                        {
-                            if let Some(channel) = remote_request_channel {
-                                loop {
-                                    match channel.delivery_status() {
-                                        crate::execution::RemoteRequestDelivery::Delivered => {
-                                            break child.wait()
-                                        }
-                                        crate::execution::RemoteRequestDelivery::Failed(err) => {
-                                            let _ = child.kill();
-                                            let _ = child.wait();
-                                            break Err(std::io::Error::other(err));
-                                        }
-                                        crate::execution::RemoteRequestDelivery::Pending => {}
-                                    }
-                                    match child.try_wait() {
-                                        Ok(Some(status)) => break Ok(status),
-                                        Ok(None) => {
-                                            std::thread::sleep(std::time::Duration::from_millis(25))
-                                        }
-                                        Err(err) => break Err(err),
-                                    }
+                        if !request_delivered {
+                            match remote_request_channel
+                                .as_ref()
+                                .expect("pending request channel")
+                                .delivery_status()
+                            {
+                                crate::execution::RemoteRequestDelivery::Delivered => {
+                                    request_delivered = true;
                                 }
-                            } else {
-                                child.wait()
+                                crate::execution::RemoteRequestDelivery::Failed(err) => {
+                                    if let Some(channel) = remote_request_channel.take() {
+                                        channel.cancel();
+                                    }
+                                    let (child, process_tree) = child_and_tree.take().unwrap();
+                                    let reaped = terminate_plugin_child(child, process_tree);
+                                    break (Err(std::io::Error::other(err)), reaped);
+                                }
+                                crate::execution::RemoteRequestDelivery::Pending => {}
                             }
                         }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = remote_request_channel;
-                            child.wait()
+                        let (child, process_tree) = child_and_tree.as_mut().unwrap();
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                process_tree.terminate();
+                                break (Ok(status), true);
+                            }
+                            Ok(None) => std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
+                            Err(err) => {
+                                if let Some(channel) = remote_request_channel.take() {
+                                    channel.cancel();
+                                }
+                                let (child, process_tree) = child_and_tree.take().unwrap();
+                                let reaped = terminate_plugin_child(child, process_tree);
+                                break (Err(err), reaped);
+                            }
                         }
                     };
+                    let stdout = readers_can_join
+                        .then(|| stdout_reader.and_then(|reader| reader.join().ok()))
+                        .flatten()
+                        .unwrap_or_default();
+                    let stderr = readers_can_join
+                        .then(|| stderr_reader.and_then(|reader| reader.join().ok()))
+                        .flatten()
+                        .unwrap_or_default();
                     match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
                             exit_code: status.code(),
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
+                            stdout,
+                            stderr,
                             error: None,
                         },
                         Err(err) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
                             exit_code: None,
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
+                            stdout,
+                            stderr,
                             error: Some(err.to_string()),
                         },
                     }
@@ -250,9 +460,16 @@ impl App {
                     }
                 }
             };
-            let _ = event_tx.blocking_send(finished);
+            publish_plugin_command_finished(&event_tx, worker_cancelled.as_ref(), finished);
         });
+        self.plugin_command_runtimes
+            .insert(runtime_log_id, PluginCommandRuntime::new(cancelled, worker));
         Ok(log)
+    }
+
+    pub(crate) fn shutdown_plugin_commands(&mut self) {
+        self.plugin_command_runtimes.clear();
+        self.state.plugin_commands_in_flight = 0;
     }
 
     pub(super) fn plugin_command_execution_target(
@@ -409,6 +626,24 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_child_wait_bounds_repeated_interrupted_errors() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = wait_for_plugin_child_termination(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            },
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(attempts, PLUGIN_COMMAND_TERMINATION_ATTEMPTS);
+        assert_eq!(waits, PLUGIN_COMMAND_TERMINATION_ATTEMPTS - 1);
+    }
 
     #[test]
     fn plugin_runtime_env_does_not_expose_build_manager_path() {

@@ -1042,6 +1042,126 @@ async fn hidden_small_direct_frame_preserves_owned_inline_fallback() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn native_composition_large_sibling_frame_uploads_then_replays_placement() {
+    let (mut server, client_rx, native_pane) = retained_test_server(b"native composition");
+    let sibling_pane =
+        server.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+    server.app.state.workspaces[0].tabs[0]
+        .layout
+        .focus_pane(native_pane);
+    server.app.state.ensure_test_terminals();
+    let native_number = server.app.state.workspaces[0]
+        .public_pane_number(native_pane)
+        .unwrap();
+    let sibling_number = server.app.state.workspaces[0]
+        .public_pane_number(sibling_pane)
+        .unwrap();
+    let workspace_id = &server.app.state.workspaces[0].id;
+    let native_public_pane_id =
+        crate::workspace::public_pane_id_for_number(workspace_id, native_number);
+    let sibling_public_pane_id =
+        crate::workspace::public_pane_id_for_number(workspace_id, sibling_number);
+    enable_graphics_and_render(&mut server, &client_rx);
+    server.clients.get_mut(&1).unwrap().direct_graphics = true;
+    server.clients.get_mut(&1).unwrap().omp_renderer_target = Some(OmpRendererTargetState {
+        launch_id: 1,
+        authority_revision: 1,
+        route: Some(crate::protocol::OmpRendererRoute {
+            pane_id: native_public_pane_id,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        }),
+        bound: true,
+        ready: true,
+        prefix: crate::protocol::OmpRendererPrefix {
+            code: crate::protocol::ClientKeyCode::Char('b'),
+            modifiers: 0,
+        },
+        surface_active: true,
+        input_authority_acked: true,
+    });
+    assert!(server.direct_graphics_available());
+    set_stream_owner(&mut server, sibling_pane, "browser");
+
+    let image_width = 2_048;
+    let image_height = 2_049;
+    let expected_len = u64::from(image_width) * u64::from(image_height) * 4;
+    assert!(expected_len > api::schema::PANE_GRAPHICS_STREAM_MAX_BYTES as u64);
+    let path = sparse_direct_frame(
+        &server,
+        "native-sibling-large-frame.rgba",
+        image_width,
+        image_height,
+    );
+    let (message, response_rx) = direct_stream_message(
+        "native-sibling",
+        &sibling_public_pane_id,
+        "browser",
+        path,
+        image_width,
+        image_height,
+    );
+
+    assert_eq!(
+        server.handle_pane_graphics_stream_frame(message),
+        RenderImpact::None
+    );
+    let (transfer_id, image_id) = match read_server_message(
+        client_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native sibling direct upload"),
+    ) {
+        ServerMessage::GraphicsFile {
+            transfer_id,
+            image_id,
+            control,
+            leading,
+            expected_len: sent_len,
+            ..
+        } => {
+            assert_eq!(sent_len, expected_len);
+            assert!(leading.is_empty());
+            assert!(control.starts_with("a=t,"), "{control}");
+            assert!(!control.contains("p="), "{control}");
+            (transfer_id, image_id)
+        }
+        other => panic!("expected native sibling graphics file, got {other:?}"),
+    };
+    assert!(response_rx.try_recv().is_err());
+
+    server.start_direct_graphics_response(1, transfer_id, image_id);
+    assert!(server.complete_direct_graphics(1, transfer_id, image_id, true));
+    assert!(serde_json::from_str::<api::schema::SuccessResponse>(
+        &response_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+    )
+    .is_ok());
+    let layer = server.app.pane_graphics.slots[&graphics_key(sibling_pane)]
+        .layer
+        .as_ref()
+        .unwrap();
+    assert_eq!(layer.resident_client(), Some(1));
+
+    assert_eq!(
+        server.render_retained_graphics_update_and_stream(),
+        RetainedGraphicsOutcome::Sent
+    );
+    match read_server_message(
+        client_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native sibling placement replay"),
+    ) {
+        ServerMessage::Graphics { bytes } => {
+            let graphics = String::from_utf8_lossy(&bytes);
+            assert!(graphics.contains("a=p,"), "{graphics:?}");
+            assert!(graphics.contains(&format!("i={image_id}")), "{graphics:?}");
+            assert!(!graphics.contains("a=t,"), "{graphics:?}");
+        }
+        other => panic!("expected retained sibling graphics, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn direct_frame_during_internal_redraw_uploads_without_placement() {
     let (mut server, client_rx, pane_id) = retained_test_server(b"active");
     enable_graphics_and_render(&mut server, &client_rx);
@@ -1301,6 +1421,7 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
             .trust_pane_layer(key, slot.host_image_id, slot.layer.as_ref().unwrap());
     }
     let unrelated_render = HeadlessServer::frame_server_message(&ServerMessage::Frame(FrameData {
+        omp_renderer: None,
         cells: Vec::new(),
         width: 0,
         height: 0,

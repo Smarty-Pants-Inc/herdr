@@ -476,8 +476,19 @@ pub(crate) enum ServerEvent {
         data: Vec<u8>,
         geometry: crate::input::mouse::HostGeometry,
     },
+    /// Pixel input accepted by the client under an exact server-owned renderer frame.
+    ServerOwnedInputPixels {
+        client_id: u64,
+        data: Vec<u8>,
+        geometry: crate::input::mouse::HostGeometry,
+    },
     /// A client sent structured input events.
     ClientInputEvents {
+        client_id: u64,
+        events: Vec<crate::protocol::ClientInputEvent>,
+    },
+    /// Structured input accepted by the client under an exact server-owned renderer frame.
+    ServerOwnedInputEvents {
         client_id: u64,
         events: Vec<crate::protocol::ClientInputEvent>,
     },
@@ -531,6 +542,13 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// The App displayed the first frame for an exact client-local renderer launch.
     OmpRendererReady { client_id: u64, launch_id: u64 },
+    /// The App received one exact active renderer authority and matching frame.
+    OmpRendererAuthorityAck {
+        client_id: u64,
+        launch_id: u64,
+        authority_revision: u64,
+        frame_nonce: [u8; 16],
+    },
     /// A background managed OMP companion resolution completed for the server-private fallback.
     OmpPrivateCompanionResolved {
         result: Result<crate::update::OmpExecutable, String>,
@@ -1169,6 +1187,47 @@ fn client_read_loop(
                     geometry,
                 }
             }
+            ClientMessage::ServerOwnedInputPixels {
+                data,
+                cols,
+                rows,
+                width_px,
+                height_px,
+            } => {
+                let Some(geometry) =
+                    crate::input::mouse::HostGeometry::new(cols, rows, width_px, height_px)
+                else {
+                    warn!(
+                        client_id,
+                        cols,
+                        rows,
+                        width_px,
+                        height_px,
+                        "invalid server-owned pixel mouse geometry from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                };
+                if data.len() > MAX_PIXEL_MOUSE_PAYLOAD
+                    || crate::input::mouse::parse_report(&data).is_none()
+                {
+                    warn!(
+                        client_id,
+                        size = data.len(),
+                        max = MAX_PIXEL_MOUSE_PAYLOAD,
+                        "invalid server-owned pixel mouse report from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ServerOwnedInputPixels {
+                    client_id,
+                    data,
+                    geometry,
+                }
+            }
             ClientMessage::InputEvents { events } => match input_event_limit(&events) {
                 InputEventLimit::WithinLimits => {
                     ServerEvent::ClientInputEvents { client_id, events }
@@ -1202,6 +1261,45 @@ fn client_read_loop(
                         size,
                         max = MAX_INPUT_PAYLOAD,
                         "oversized structured input payload from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+            },
+            ClientMessage::ServerOwnedInputEvents { events } => match input_event_limit(&events) {
+                InputEventLimit::WithinLimits => {
+                    ServerEvent::ServerOwnedInputEvents { client_id, events }
+                }
+                InputEventLimit::TooManyEvents => {
+                    warn!(
+                        client_id,
+                        count = events.len(),
+                        "oversized server-owned input event batch from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                InputEventLimit::PasteTooLarge { size } => {
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized server-owned structured paste from client, rejecting"
+                    );
+                    ServerEvent::ClientPasteRejected {
+                        client_id,
+                        size,
+                        max: MAX_INPUT_PAYLOAD,
+                    }
+                }
+                InputEventLimit::InputPayloadTooLarge { size } => {
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized server-owned structured input payload from client, closing"
                     );
                     let _ = server_event_tx
                         .blocking_send(ServerEvent::ClientDisconnected { client_id });
@@ -1365,6 +1463,16 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
+            ClientMessage::OmpRendererAuthorityAck {
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            } => ServerEvent::OmpRendererAuthorityAck {
+                client_id,
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            },
             ClientMessage::ActivateOmpLink {
                 launch_id,
                 request_id,
@@ -1512,6 +1620,24 @@ mod tests {
                 client_id: 7,
                 launch_id: 9,
             }
+        ));
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::OmpRendererAuthorityAck {
+                launch_id: 9,
+                authority_revision: 4,
+                frame_nonce: [7; 16],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "OMP renderer authority ack event"),
+            ServerEvent::OmpRendererAuthorityAck {
+                client_id: 7,
+                launch_id: 9,
+                authority_revision: 4,
+                frame_nonce,
+            } if frame_nonce == [7; 16]
         ));
         drop(client_stream);
         handle.join().unwrap().unwrap();

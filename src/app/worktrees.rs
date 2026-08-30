@@ -1790,6 +1790,7 @@ mod tests {
                 platforms: None,
                 build: Vec::new(),
                 startup: Vec::new(),
+                execution_providers: Vec::new(),
                 actions: Vec::new(),
                 events: vec![crate::api::schema::PluginManifestEventHook {
                     on: "worktree.created".into(),

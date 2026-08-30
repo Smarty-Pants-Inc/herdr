@@ -163,19 +163,23 @@ back to its pane menu. Right-clicking the pane frame always opens Herdr's menu.
 `pane.split` accepts the same optional `right_click` value for the newly created
 pane.
 
-`pane.split` also accepts an optional `execution_target`: `{"kind":"local"}`
-or, on Unix, `{"kind":"ssh","host":"HOST"}`. When it is omitted, the new
-pane inherits the source pane's target. An explicit `target_pane_id` supplies
-both the insertion point and the source target/cwd. Managed workspace-right
-plugin `caller_pane_id` locality applies only to a workspace-selected split
-without an explicit target pane. A same-target split follows the source cwd; a
-cross-target local split uses the configured `terminal.new_cwd`, while a
-cross-target SSH split starts in the remote user's home. Explicit `cwd`
-overrides either default.
+`pane.split` also accepts an optional `execution_target`:
+`{"kind":"local"}`, on Unix `{"kind":"ssh","host":"HOST"}`, or
+`{"kind":"extension","scheme":"SCHEME","target":"TARGET"}` for a
+plugin-declared execution provider. When it is omitted, the new pane inherits
+the source pane's target. An explicit `target_pane_id` supplies both the
+insertion point and the source target/cwd. Managed workspace-right plugin
+`caller_pane_id` locality applies only to a workspace-selected split without an
+explicit target pane. A same-target split follows the source cwd; a cross-target
+local split uses the configured `terminal.new_cwd`, while a cross-target remote
+split uses the target provider's default cwd. Explicit `cwd` overrides either
+default.
 
-Per-pane SSH execution targets are Unix-only. This does not affect whole-server
-`herdr --remote`, which remains available on Windows clients connecting to
-supported Linux and macOS hosts.
+Per-pane SSH and extension targets require a Unix Herdr server. Extension
+targets also require exactly one enabled, compatible installed plugin that
+declares the requested scheme and supports the server platform. This does not
+affect whole-server `herdr --remote`, which remains available on Windows clients
+connecting to supported Linux and macOS hosts.
 
 `PaneInfo` includes `scroll` when terminal scroll metrics are available:
 
@@ -189,9 +193,9 @@ supported Linux and macOS hosts.
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
 
-Every `PaneInfo` includes its `execution_target`, so clients can keep local and
-SSH-backed panes distinct without inferring locality from paths or process
-metadata.
+Every `PaneInfo` includes its `execution_target`, so clients can keep local,
+SSH-backed, and extension-backed panes distinct without inferring locality from
+paths or process metadata.
 
 ### Experimental pane graphics
 
@@ -272,8 +276,10 @@ export the tab containing that pane.
 The response includes `workspace_id`, `tab_id`, `zoomed`, `focused_pane_id`, and
 `root`. `root` is a BSP tree of `pane` and `split` nodes. Pane nodes can include
 `pane_id`, `label`, `cwd`, argv `command`, and `execution_target`. The target is
-`{"kind":"local"}` by default or, on Unix, `{"kind":"ssh","host":"HOST"}`.
-Split nodes use `direction` (`right` or `down`), `ratio`, `first`, and `second`.
+`{"kind":"local"}` by default, `{"kind":"ssh","host":"HOST"}` for built-in
+SSH, or `{"kind":"extension","scheme":"SCHEME","target":"TARGET"}` for an
+installed execution provider. Split nodes use `direction` (`right` or `down`),
+`ratio`, `first`, and `second`.
 
 `layout.apply` creates a fresh tab from a declarative tree. If `tab_id` is
 provided, Herdr creates the replacement tab first and then closes the old tab.

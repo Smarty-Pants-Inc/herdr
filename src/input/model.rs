@@ -173,6 +173,29 @@ impl TerminalKey {
         }
     }
 
+    pub(crate) fn reports_event_types(&self) -> bool {
+        if self.has_physical_identity() {
+            return true;
+        }
+        let Some(bytes) = self.vt_bytes() else {
+            return false;
+        };
+        let Some(parameters) = bytes
+            .strip_prefix(b"\x1b[")
+            .and_then(|bytes| bytes.get(..bytes.len().saturating_sub(1)))
+        else {
+            return false;
+        };
+        parameters
+            .split(|byte| *byte == b';')
+            .nth(1)
+            .and_then(|field| {
+                let colon = field.iter().rposition(|byte| *byte == b':')?;
+                field.get(colon + 1..)
+            })
+            .is_some_and(|event| matches!(event, b"1" | b"2" | b"3"))
+    }
+
     pub(crate) fn has_physical_identity(&self) -> bool {
         matches!(
             self.source,
@@ -393,6 +416,19 @@ mod tests {
         assert_eq!(release.repeat_count, 1);
         assert_eq!(regrouped_release.generated_text, None);
         assert_eq!(regrouped_release.repeat_count, 1);
+    }
+
+    #[test]
+    fn release_event_reporting_requires_physical_or_explicit_vt_event_types() {
+        let legacy = TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"x".to_vec());
+        let kitty_legacy = TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1u".to_vec());
+        let kitty_events = TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+        assert!(!legacy.reports_event_types());
+        assert!(!kitty_legacy.reports_event_types());
+        assert!(kitty_events.reports_event_types());
     }
 
     #[test]
