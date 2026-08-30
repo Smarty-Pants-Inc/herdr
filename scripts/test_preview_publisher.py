@@ -689,6 +689,8 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('--draft --verify-tag', source)
         self.assertLess(source.index("resolve_release\n          if [ -f release-missing ]"), source.index('gh release create "$TAG"'))
         self.assertIn('check_tag\n            gh release create "$TAG"', source)
+        self.assertIn('gh api "repos/$REPOSITORY/releases/$release_id" > "$1"', source)
+        self.assertNotIn('gh api "repos/$REPOSITORY/releases/tags/$TAG"', source)
 
     def test_workflow_replaces_only_mismatched_draft_assets(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
