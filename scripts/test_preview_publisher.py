@@ -62,6 +62,97 @@ def load_workflow(path: Path) -> dict[str, object]:
 class TrustedCliTests(unittest.TestCase):
     def test_cli_parser_builds(self) -> None:
         self.assertIn("validate-sources", trusted.build_parser().format_help())
+        self.assertIn("validate-existing-release", trusted.build_parser().format_help())
+        self.assertIn("validate-existing-release-metadata", trusted.build_parser().format_help())
+        self.assertIn("validate-pair-attestation", trusted.build_parser().format_help())
+
+
+class TrustedPairAttestationTests(unittest.TestCase):
+    commit = "1" * 40
+
+    def _report(self, subject: Path) -> list[dict[str, object]]:
+        record = trusted.file_record(subject)
+        invocation = f"https://github.com/{trusted.REPOSITORY}/actions/runs/42/attempts/1"
+        return [{
+            "verificationResult": {
+                "verifiedIdentity": {"runnerEnvironment": "github-hosted"},
+                "signature": {"certificate": {
+                    "subjectAlternativeName": trusted.PUBLISH_CERT_IDENTITY,
+                    "issuer": "https://token.actions.githubusercontent.com",
+                    "githubWorkflowTrigger": "workflow_run",
+                    "githubWorkflowSHA": self.commit,
+                    "githubWorkflowName": trusted.PUBLISH_WORKFLOW_NAME,
+                    "githubWorkflowRepository": trusted.REPOSITORY,
+                    "githubWorkflowRef": trusted.PUBLISH_SOURCE_REF,
+                    "buildSignerURI": trusted.PUBLISH_CERT_IDENTITY,
+                    "buildSignerDigest": self.commit,
+                    "runnerEnvironment": "github-hosted",
+                    "sourceRepositoryURI": f"https://github.com/{trusted.REPOSITORY}",
+                    "sourceRepositoryDigest": self.commit,
+                    "sourceRepositoryRef": trusted.PUBLISH_SOURCE_REF,
+                    "buildConfigURI": trusted.PUBLISH_CERT_IDENTITY,
+                    "buildConfigDigest": self.commit,
+                    "buildTrigger": "workflow_run",
+                    "runInvocationURI": invocation,
+                }},
+                "statement": {
+                    "_type": "https://in-toto.io/Statement/v1",
+                    "subject": [{"name": subject.name, "digest": {"sha256": record["sha256"]}}],
+                    "predicateType": "https://slsa.dev/provenance/v1",
+                    "predicate": {
+                        "buildDefinition": {
+                            "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+                            "externalParameters": {"workflow": {
+                                "path": trusted.PUBLISH_WORKFLOW_PATH,
+                                "ref": trusted.PUBLISH_SOURCE_REF,
+                                "repository": f"https://github.com/{trusted.REPOSITORY}",
+                            }},
+                            "internalParameters": {"github": {"runner_environment": "github-hosted"}},
+                            "resolvedDependencies": [{
+                                "uri": trusted.PUBLISH_SOURCE_URI,
+                                "digest": {"gitCommit": self.commit},
+                            }],
+                        },
+                        "runDetails": {
+                            "builder": {"id": trusted.PUBLISH_CERT_IDENTITY},
+                            "metadata": {
+                                "invocationId": invocation,
+                            },
+                        },
+                    },
+                },
+            },
+        }]
+
+    def test_validator_extracts_attested_publisher_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            subject = Path(directory) / "smarty-pair.json"
+            subject.write_bytes(b"attested pair")
+            result = trusted.validate_pair_attestation(self._report(subject), subject)
+            self.assertEqual(result["publisher_commit"], self.commit)
+            self.assertEqual(result["subject"], {"name": subject.name, **trusted.file_record(subject)})
+
+    def test_validator_rejects_subject_or_publisher_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            subject = Path(directory) / "smarty-pair.json"
+            subject.write_bytes(b"attested pair")
+            report = self._report(subject)
+            report[0]["verificationResult"]["statement"]["subject"][0]["digest"]["sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "subject mismatch"):
+                trusted.validate_pair_attestation(report, subject)
+            report = self._report(subject)
+            dependency = report[0]["verificationResult"]["statement"]["predicate"]["buildDefinition"]["resolvedDependencies"][0]
+            dependency["uri"] = "git+https://github.com/example/repo@refs/heads/master"
+            with self.assertRaisesRegex(ValueError, "source URI mismatch"):
+                trusted.validate_pair_attestation(report, subject)
+            report = self._report(subject)
+            report[0]["verificationResult"]["statement"]["predicate"]["buildDefinition"]["resolvedDependencies"][0]["digest"]["gitCommit"] = "2" * 40
+            with self.assertRaisesRegex(ValueError, "does not match its certificate"):
+                trusted.validate_pair_attestation(report, subject)
+            report = self._report(subject)
+            report[0]["verificationResult"]["signature"]["certificate"]["subjectAlternativeName"] += "-evil"
+            with self.assertRaisesRegex(ValueError, "certificate subjectAlternativeName mismatch"):
+                trusted.validate_pair_attestation(report, subject)
 
 
 class TrustedArtifactDownloadTests(unittest.TestCase):
@@ -609,6 +700,118 @@ class TrustedSealTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pair manifest does not bind sealed source identity"):
                 trusted.seal_release(assets, identity, Path(directory) / "sealed-bad")
 
+
+class TrustedExistingReleaseTests(unittest.TestCase):
+    parent = "1" * 40
+    source = "2" * 40
+    omp = "3" * 40
+
+    def _fixture(
+        self, root: Path,
+    ) -> tuple[
+        Path, dict[str, str], dict[str, object], list[dict[str, object]], dict[str, object],
+    ]:
+        tag = f"smarty-preview-2026-08-22-p{self.parent}-r{self.source}-o{self.omp}"
+        identity = {
+            "tag": tag,
+            "build_id": tag.removeprefix("smarty-preview-"),
+            "built_at": "2026-08-22T00:00:00Z",
+            "parent": self.parent,
+            "source": self.source,
+            "omp": self.omp,
+        }
+        asset_dir = root / "assets"
+        asset_dir.mkdir()
+        for name in trusted.FULL_RELEASE_ASSETS:
+            (asset_dir / name).write_bytes(f"published:{name}".encode())
+        release_id = 42
+        release = {
+            "id": release_id,
+            "tag_name": tag,
+            "name": tag,
+            "body": "Trusted paired preview release",
+            "draft": False,
+            "prerelease": True,
+            "immutable": True,
+            "url": f"https://api.github.com/repos/{trusted.REPOSITORY}/releases/{release_id}",
+            "html_url": f"https://github.com/{trusted.REPOSITORY}/releases/tag/{tag}",
+            "assets_url": f"https://api.github.com/repos/{trusted.REPOSITORY}/releases/{release_id}/assets",
+        }
+        api_assets = []
+        for asset_id, name in enumerate(sorted(trusted.FULL_RELEASE_ASSETS), start=100):
+            record = trusted.file_record(asset_dir / name)
+            api_assets.append({
+                "id": asset_id,
+                "name": name,
+                "state": "uploaded",
+                "size": record["length"],
+                "digest": f"sha256:{record['sha256']}",
+                "url": f"https://api.github.com/repos/{trusted.REPOSITORY}/releases/assets/{asset_id}",
+                "browser_download_url": f"https://github.com/{trusted.REPOSITORY}/releases/download/{tag}/{name}",
+            })
+        tag_object = {"ref": f"refs/tags/{tag}", "object": {"type": "commit", "sha": self.source}}
+        return asset_dir, identity, release, api_assets, tag_object
+
+    def test_validator_accepts_remote_bytes_without_fresh_digest_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            asset_dir, identity, release, api_assets, tag_object = self._fixture(Path(directory))
+            metadata = trusted.validate_existing_release_metadata(release, api_assets, identity)
+            self.assertEqual(metadata["assets"]["smarty-pair.json"]["id"], next(
+                item["id"] for item in api_assets if item["name"] == "smarty-pair.json"
+            ))
+            result = trusted.validate_existing_release(release, api_assets, tag_object, identity, asset_dir)
+            expected_identity = trusted.paired_identity(
+                identity["tag"], source_sha=self.source, built_at=identity["built_at"],
+            )
+            self.assertEqual(result["identity"], {**expected_identity, "built_at": identity["built_at"]})
+            self.assertEqual(
+                result["files"]["herdr-windows-x86_64.zip"],
+                trusted.file_record(asset_dir / "herdr-windows-x86_64.zip"),
+            )
+            fresh_digest = "f" * 64
+            self.assertNotEqual(result["files"]["herdr-windows-x86_64.zip"]["sha256"], fresh_digest)
+
+    def test_validator_rejects_release_or_tag_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            asset_dir, identity, release, api_assets, tag_object = self._fixture(Path(directory))
+            for field, value in (("body", "other"), ("draft", True), ("prerelease", False), ("immutable", False)):
+                candidate = dict(release)
+                candidate[field] = value
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    trusted.validate_existing_release(candidate, api_assets, tag_object, identity, asset_dir)
+            moved_tag = json.loads(json.dumps(tag_object))
+            moved_tag["object"]["sha"] = "4" * 40
+            with self.assertRaisesRegex(ValueError, "lightweight ref directly at R"):
+                trusted.validate_existing_release(release, api_assets, moved_tag, identity, asset_dir)
+
+    def test_validator_rejects_inventory_metadata_and_byte_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            asset_dir, identity, release, api_assets, tag_object = self._fixture(Path(directory))
+            cases = []
+            cases.append(("missing", api_assets[1:]))
+            cases.append(("duplicate", [*api_assets, dict(api_assets[0])]))
+            bad_digest = json.loads(json.dumps(api_assets))
+            bad_digest[0]["digest"] = f"sha256:{'f' * 64}"
+            cases.append(("digest", bad_digest))
+            bad_size = json.loads(json.dumps(api_assets))
+            bad_size[0]["size"] += 1
+            cases.append(("size", bad_size))
+            for label, candidate in cases:
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    trusted.validate_existing_release(release, candidate, tag_object, identity, asset_dir)
+            target = asset_dir / trusted.FULL_RELEASE_ASSETS[0]
+            target.unlink()
+            target.symlink_to(asset_dir / trusted.FULL_RELEASE_ASSETS[1])
+            with self.assertRaisesRegex(ValueError, "37-file allow-list"):
+                trusted.validate_existing_release(release, api_assets, tag_object, identity, asset_dir)
+
+    def test_validator_enforces_aggregate_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            asset_dir, identity, release, api_assets, tag_object = self._fixture(Path(directory))
+            with mock.patch.object(trusted, "MAX_TOTAL_DOWNLOAD_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "aggregate size"):
+                    trusted.validate_existing_release_metadata(release, api_assets, identity)
+
 class TrustedWorkflowTests(unittest.TestCase):
     workflow = Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview-publish.yml"
 
@@ -694,6 +897,83 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"', source)
         self.assertIn('raise SystemExit(f"release asset metadata mismatch: {name}")', source)
         self.assertLess(source.index("done < delete-list"), source.index("done < upload-list"))
+
+    def test_workflow_reuses_only_verified_immutable_release_bytes(self) -> None:
+        workflow = load_workflow(self.workflow)
+        jobs = workflow["jobs"]
+        attest_steps = jobs["attest-and-seal"]["steps"]
+        by_name = {step["name"]: step for step in attest_steps}
+        reuse = by_name["Reuse verified immutable release bytes"]
+        run = reuse["run"]
+        reuse_index = next(
+            index for index, step in enumerate(attest_steps)
+            if step["name"] == "Reuse verified immutable release bytes"
+        )
+        attest_index = next(
+            index for index, step in enumerate(attest_steps)
+            if str(step.get("uses", "")).startswith("actions/attest@")
+        )
+        self.assertLess(reuse_index, attest_index)
+        self.assertEqual(reuse["if"], "steps.existing.outputs.reuse == 'true'")
+        self.assertEqual(reuse["env"]["CERT_IDENTITY"], trusted.PUBLISH_CERT_IDENTITY)
+        self.assertEqual(reuse["env"]["SOURCE_REF"], trusted.PUBLISH_SOURCE_REF)
+        self.assertLess(
+            run.index("gh attestation verify immutable-assets/smarty-pair.json"),
+            run.index("verify-attested-pair"),
+        )
+        self.assertLess(run.index("validate-pair-attestation"), run.index("verify-attested-pair"))
+        self.assertLess(
+            run.index("validate-existing-release-metadata"),
+            run.index("Accept: application/octet-stream"),
+        )
+        for text in (
+            "validate-existing-release",
+            "validate-existing-release-metadata",
+            "Accept: application/octet-stream",
+            "releases/assets/$asset_id",
+            "verify-attested-pair",
+            "gh attestation verify",
+            '--bundle "immutable-assets/$bundle"',
+            '--repo "$REPOSITORY"',
+            '--cert-identity "$CERT_IDENTITY"',
+            '--source-ref "$SOURCE_REF"',
+            "--predicate-type https://slsa.dev/provenance/v1",
+            "--deny-self-hosted-runners",
+            "--format json > existing-pair-attestation.json",
+            "validate-pair-attestation",
+            "Accept: application/vnd.github.raw+json",
+            "?ref=$attested_publisher",
+            "--trusted-verifier attested-trusted-verifier.py",
+            "--asset-dir immutable-assets --identity existing-identity.json --output-dir final-seal",
+            "mv immutable-assets release-assets",
+        ):
+            self.assertIn(text, run)
+        self.assertNotIn("--signer-workflow", run)
+        self.assertNotIn("gh release download", run)
+        self.assertEqual(run.count("smarty-pair.provenance.sigstore.json"), 1)
+        for forbidden in ("gh release create", "gh release upload", "gh release edit", "--method DELETE"):
+            self.assertNotIn(forbidden, run)
+        fresh_steps = (
+            "Write platform and SBOM subject lists",
+            "Attest Linux x86_64 release subjects",
+            "Save Linux x86_64 provenance bundle",
+            "Attest Linux aarch64 release subjects",
+            "Save Linux aarch64 provenance bundle",
+            "Attest macOS x86_64 release subjects",
+            "Save macOS x86_64 provenance bundle",
+            "Attest macOS aarch64 release subjects",
+            "Save macOS aarch64 provenance bundle",
+            "Attest Windows x86_64 release subject",
+            "Save Windows x86_64 provenance bundle",
+            "Attest SPDX release subjects",
+            "Save SPDX provenance bundle",
+            "Build and verify canonical paired manifest",
+            "Attest paired manifest",
+            "Save paired provenance bundle and seal release",
+        )
+        for name in fresh_steps:
+            self.assertEqual(by_name[name]["if"], "steps.existing.outputs.reuse != 'true'", name)
+        self.assertNotIn("if", by_name["Upload final immutable release bytes and seal"])
 
 
 if __name__ == "__main__":
