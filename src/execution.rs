@@ -121,6 +121,9 @@ pub enum ExecutionTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Osc7Authority {
     accepted: Vec<String>,
+    // Provider target syntax is opaque. Without its optional ready hostname,
+    // host-qualified OSC 7 is equivalent to an accepted authorityless report.
+    allow_unknown_remote: bool,
 }
 
 impl Osc7Authority {
@@ -129,6 +132,7 @@ impl Osc7Authority {
             return true;
         };
         authority.eq_ignore_ascii_case("localhost")
+            || (self.allow_unknown_remote && remote_hostname.is_none())
             || remote_hostname.is_some_and(|host| authority.eq_ignore_ascii_case(host))
             || self
                 .accepted
@@ -168,6 +172,7 @@ impl ExecutionTarget {
         local_hostname: Option<String>,
         effective_ssh_hostname: Option<String>,
     ) -> Osc7Authority {
+        let allow_unknown_remote = matches!(self, Self::Extension { .. });
         let mut accepted = Vec::with_capacity(2);
         match self {
             Self::Local => accepted.extend(local_hostname),
@@ -179,7 +184,10 @@ impl ExecutionTarget {
             }
             Self::Extension { .. } => {}
         }
-        Osc7Authority { accepted }
+        Osc7Authority {
+            accepted,
+            allow_unknown_remote,
+        }
     }
 }
 
@@ -1287,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn osc7_authority_uses_only_precomputed_and_runtime_hostnames() {
+    fn osc7_authority_handles_known_and_opaque_provider_hostnames() {
         let local =
             ExecutionTarget::Local.osc7_authority_with(Some("local-node".to_string()), None);
         assert!(local.accepts(Some("LOCAL-NODE"), None));
@@ -1303,6 +1311,13 @@ mod tests {
         assert!(remote.accepts(Some("localhost"), Some("actual-node")));
         assert!(!remote.accepts(Some("deploy@build-alias"), None));
         assert!(!remote.accepts(Some("other-node"), None));
+
+        let extension = ExecutionTarget::extension("runtime", "dev2")
+            .unwrap()
+            .osc7_authority_with(None, None);
+        assert!(extension.accepts(Some("actual-node"), None));
+        assert!(extension.accepts(Some("ACTUAL-NODE"), Some("actual-node")));
+        assert!(!extension.accepts(Some("other-node"), Some("actual-node")));
     }
 
     #[test]
