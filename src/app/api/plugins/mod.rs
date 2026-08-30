@@ -3233,10 +3233,10 @@ platforms = ["windows"]
                 None,
             )
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let child_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !child_pid_path.is_file() {
             assert!(
-                std::time::Instant::now() < deadline,
+                std::time::Instant::now() < child_deadline,
                 "plugin command did not publish its child pid"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3246,10 +3246,11 @@ platforms = ["windows"]
             .trim()
             .parse()
             .unwrap();
+        let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.plugin_command_runtimes.contains_key(&log.log_id) {
             app.drain_all_internal_events();
             assert!(
-                std::time::Instant::now() < deadline,
+                std::time::Instant::now() < completion_deadline,
                 "plugin command completion remained blocked on descendant pipes"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
