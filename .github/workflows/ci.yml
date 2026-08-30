@@ -257,7 +257,7 @@ jobs:
 
   smarty-ci:
     name: smarty-ci
-    if: ${{ always() }}
+    if: ${{ always() && !cancelled() }}
     needs: [conventional-commits, check, windows-conpty-package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
