@@ -1301,6 +1301,7 @@ fn omp_replacement_preserves_other_pane_transfer_and_retires_target_direct_layer
             .trust_pane_layer(key, slot.host_image_id, slot.layer.as_ref().unwrap());
     }
     let unrelated_render = HeadlessServer::frame_server_message(&ServerMessage::Frame(FrameData {
+        omp_renderer: None,
         cells: Vec::new(),
         width: 0,
         height: 0,

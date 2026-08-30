@@ -36,11 +36,46 @@ pub(crate) enum DeferredRender {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OmpRendererTargetState {
     pub(crate) launch_id: u64,
+    pub(crate) authority_revision: u64,
     pub(crate) route: Option<crate::protocol::OmpRendererRoute>,
     pub(crate) bound: bool,
     pub(crate) ready: bool,
     pub(crate) prefix: crate::protocol::OmpRendererPrefix,
     pub(crate) surface_active: bool,
+    /// Whether the client acknowledged this exact active authority and projection.
+    pub(crate) input_authority_acked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeOmpServerGesture {
+    pub(crate) buttons: HashSet<crossterm::event::MouseButton>,
+    pub(crate) launch_id: u64,
+    pub(crate) authority_revision: u64,
+    pub(crate) sgr_pixels: bool,
+}
+
+impl NativeOmpServerGesture {
+    pub(crate) fn new(
+        button: crossterm::event::MouseButton,
+        launch_id: u64,
+        authority_revision: u64,
+        sgr_pixels: bool,
+    ) -> Self {
+        Self {
+            buttons: HashSet::from([button]),
+            launch_id,
+            authority_revision,
+            sgr_pixels,
+        }
+    }
+
+    pub(crate) fn press(&mut self, button: crossterm::event::MouseButton) {
+        self.buttons.insert(button);
+    }
+
+    pub(crate) fn release(&mut self, button: crossterm::event::MouseButton) -> bool {
+        self.buttons.remove(&button) && self.buttons.is_empty()
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublicPaneFocusTarget {
@@ -758,6 +793,12 @@ pub(crate) struct ClientConnection {
     pub(crate) host_mouse_capture_active: Option<bool>,
     /// Last SGR pixel provenance mode sent to this client.
     pub(crate) host_sgr_pixels_active: Option<bool>,
+    /// Outside-started gesture retained by the server with its exact native authority.
+    pub(crate) native_omp_server_mouse_gesture: Option<NativeOmpServerGesture>,
+    /// Frame-only capability expected in the next authority acknowledgement.
+    pub(crate) omp_renderer_frame_nonce: Option<[u8; 16]>,
+    /// Projected pane paired with the current frame nonce.
+    pub(crate) omp_renderer_frame_pane: Option<crate::protocol::OmpRendererPane>,
     /// Last Kitty report-all mode sent to this client's host terminal.
     pub(crate) host_keyboard_report_all_active: Option<bool>,
     /// Temporary files staged from this client's local clipboard image pastes.
@@ -856,6 +897,9 @@ impl ClientConnection {
             host_mouse_capture_active: None,
             host_sgr_pixels_active: None,
             host_keyboard_report_all_active: None,
+            native_omp_server_mouse_gesture: None,
+            omp_renderer_frame_nonce: None,
+            omp_renderer_frame_pane: None,
             staged_clipboard_files: Vec::new(),
             writer,
         }
