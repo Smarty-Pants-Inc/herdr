@@ -3998,6 +3998,7 @@ fn resize_report_required(
 ) -> bool {
     signalled || new_size != last_size
 }
+#[cfg(any(unix, test))]
 fn resize_host_geometry_report_required(
     current: Option<crate::input::mouse::HostGeometry>,
     last: Option<crate::input::mouse::HostGeometry>,
@@ -4043,6 +4044,8 @@ fn resize_poll_loop(
             reported_cell_size,
             Some((last_size.2, last_size.3)),
         );
+        #[cfg(not(unix))]
+        let _ = &host_geometry;
         #[cfg(unix)]
         let geometry_changed =
             resize_host_geometry_report_required(host_geometry, last_host_geometry);
