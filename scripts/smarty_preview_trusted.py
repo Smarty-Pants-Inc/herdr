@@ -29,6 +29,13 @@ WORKFLOW_NAME = "Smarty Preview"
 WORKFLOW_PATH = ".github/workflows/smarty-preview.yml"
 PUBLISH_WORKFLOW_NAME = "Smarty Preview Trusted Publisher"
 PUBLISH_WORKFLOW_PATH = ".github/workflows/smarty-preview-publish.yml"
+PUBLISH_SOURCE_REF = "refs/heads/master"
+PUBLISH_WORKFLOW_URL = f"https://github.com/{REPOSITORY}/{PUBLISH_WORKFLOW_PATH}"
+PUBLISH_CERT_IDENTITY = f"{PUBLISH_WORKFLOW_URL}@{PUBLISH_SOURCE_REF}"
+PUBLISH_SOURCE_URI = f"git+https://github.com/{REPOSITORY}@{PUBLISH_SOURCE_REF}"
+PUBLISH_INVOCATION = re.compile(
+    rf"https://github\.com/{re.escape(REPOSITORY)}/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*"
+)
 PARENT_REPOSITORY = "Smarty-Pants-Inc/smarty-dev"
 OMP_REPOSITORY = "Smarty-Pants-Inc/oh-my-pi"
 HEX40 = re.compile(r"[0-9a-f]{40}")
@@ -208,6 +215,209 @@ def file_record(path: Path) -> dict[str, int | str]:
     if total != size:
         _fail(f"file changed while hashing: {path}")
     return {"length": total, "sha256": digest.hexdigest()}
+
+
+def validate_pair_attestation(report: Any, subject: Path) -> dict[str, Any]:
+    if not isinstance(report, list) or len(report) != 1:
+        _fail("pair attestation verification must contain exactly one result")
+    result = _mapping(_mapping(report[0], "pair attestation result").get("verificationResult"),
+                      "pair attestation verification result")
+    identity = _mapping(result.get("verifiedIdentity"), "pair attestation verified identity")
+    if identity.get("runnerEnvironment") != "github-hosted":
+        _fail("pair attestation was not produced by a GitHub-hosted runner")
+    signature = _mapping(result.get("signature"), "pair attestation signature")
+    certificate = _mapping(signature.get("certificate"), "pair attestation certificate")
+    expected_certificate = {
+        "subjectAlternativeName": PUBLISH_CERT_IDENTITY,
+        "issuer": "https://token.actions.githubusercontent.com",
+        "githubWorkflowTrigger": "workflow_run",
+        "githubWorkflowName": PUBLISH_WORKFLOW_NAME,
+        "githubWorkflowRepository": REPOSITORY,
+        "githubWorkflowRef": PUBLISH_SOURCE_REF,
+        "buildSignerURI": PUBLISH_CERT_IDENTITY,
+        "runnerEnvironment": "github-hosted",
+        "sourceRepositoryURI": f"https://github.com/{REPOSITORY}",
+        "sourceRepositoryRef": PUBLISH_SOURCE_REF,
+        "buildConfigURI": PUBLISH_CERT_IDENTITY,
+        "buildTrigger": "workflow_run",
+    }
+    for key, expected in expected_certificate.items():
+        if certificate.get(key) != expected:
+            _fail(f"pair attestation certificate {key} mismatch")
+    certificate_commits = {
+        _hex(certificate.get(key), f"pair attestation certificate {key}")
+        for key in ("githubWorkflowSHA", "buildSignerDigest", "sourceRepositoryDigest", "buildConfigDigest")
+    }
+    if len(certificate_commits) != 1:
+        _fail("pair attestation certificate publisher commits disagree")
+    publisher_commit = certificate_commits.pop()
+    certificate_invocation = _scalar(
+        certificate.get("runInvocationURI"), "pair attestation certificate invocation ID",
+    )
+    if PUBLISH_INVOCATION.fullmatch(certificate_invocation) is None:
+        _fail("pair attestation certificate invocation ID mismatch")
+
+    statement = _mapping(result.get("statement"), "pair attestation statement")
+    if statement.get("_type") != "https://in-toto.io/Statement/v1":
+        _fail("pair attestation statement type mismatch")
+    subjects = statement.get("subject")
+    if not isinstance(subjects, list) or len(subjects) != 1:
+        _fail("pair attestation must contain exactly one subject")
+    expected_subject = file_record(subject)
+    actual_subject = _mapping(subjects[0], "pair attestation subject")
+    if actual_subject.get("name") != subject.name or actual_subject.get("digest") != {
+        "sha256": expected_subject["sha256"],
+    }:
+        _fail("pair attestation subject mismatch")
+    if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
+        _fail("pair attestation predicate type mismatch")
+
+    predicate = _mapping(statement.get("predicate"), "pair attestation predicate")
+    build = _mapping(predicate.get("buildDefinition"), "pair attestation build definition")
+    if build.get("buildType") != "https://actions.github.io/buildtypes/workflow/v1":
+        _fail("pair attestation build type mismatch")
+    parameters = _mapping(build.get("externalParameters"), "pair attestation external parameters")
+    if parameters.get("workflow") != {
+        "path": PUBLISH_WORKFLOW_PATH,
+        "ref": PUBLISH_SOURCE_REF,
+        "repository": f"https://github.com/{REPOSITORY}",
+    }:
+        _fail("pair attestation workflow identity mismatch")
+    internal = _mapping(build.get("internalParameters"), "pair attestation internal parameters")
+    github = _mapping(internal.get("github"), "pair attestation GitHub parameters")
+    if github.get("runner_environment") != "github-hosted":
+        _fail("pair attestation internal runner environment mismatch")
+
+    dependencies = build.get("resolvedDependencies")
+    if not isinstance(dependencies, list) or len(dependencies) != 1:
+        _fail("pair attestation must resolve exactly one publisher source")
+    dependency = _mapping(dependencies[0], "pair attestation publisher source")
+    if dependency.get("uri") != PUBLISH_SOURCE_URI:
+        _fail("pair attestation publisher source URI mismatch")
+    digest = _mapping(dependency.get("digest"), "pair attestation publisher source digest")
+    dependency_commit = _hex(digest.get("gitCommit"), "pair attestation publisher commit")
+    if dependency_commit != publisher_commit:
+        _fail("pair attestation publisher commit does not match its certificate")
+
+    details = _mapping(predicate.get("runDetails"), "pair attestation run details")
+    builder = _mapping(details.get("builder"), "pair attestation builder")
+    if builder.get("id") != PUBLISH_CERT_IDENTITY:
+        _fail("pair attestation builder mismatch")
+    metadata = _mapping(details.get("metadata"), "pair attestation run metadata")
+    invocation = _scalar(metadata.get("invocationId"), "pair attestation invocation ID")
+    if PUBLISH_INVOCATION.fullmatch(invocation) is None:
+        _fail("pair attestation invocation ID mismatch")
+    if invocation != certificate_invocation:
+        _fail("pair attestation invocation does not match its certificate")
+    return {
+        "schema": 1,
+        "publisher_commit": publisher_commit,
+        "source": {"uri": PUBLISH_SOURCE_URI, "ref": PUBLISH_SOURCE_REF},
+        "workflow": PUBLISH_WORKFLOW_URL,
+        "invocation": invocation,
+        "subject": {"name": subject.name, **expected_subject},
+    }
+
+
+def validate_existing_release_metadata(
+    release: dict[str, Any], assets: list[Any], identity: dict[str, Any],
+) -> dict[str, Any]:
+    identity = _mapping(identity, "existing release identity")
+    tag = _scalar(identity.get("tag"), "existing release tag")
+    source = _hex(identity.get("source"), "existing release source")
+    built_at = normalize_built_at(_scalar(identity.get("built_at"), "existing release built_at"))
+    parsed = paired_identity(tag, source_sha=source, built_at=built_at)
+    full_identity = {**parsed, "built_at": built_at}
+    for key in ("tag", "build_id", "built_at", "parent", "source", "omp"):
+        if identity.get(key) != full_identity[key]:
+            _fail(f"existing release {key} mismatch")
+
+    release = _mapping(release, "existing release")
+    release_id = _positive_int(release.get("id"), "existing release ID")
+    expected_release = {
+        "tag_name": tag,
+        "name": tag,
+        "body": "Trusted paired preview release",
+        "draft": False,
+        "prerelease": True,
+        "immutable": True,
+        "url": f"https://api.github.com/repos/{REPOSITORY}/releases/{release_id}",
+        "html_url": f"https://github.com/{REPOSITORY}/releases/tag/{tag}",
+        "assets_url": f"https://api.github.com/repos/{REPOSITORY}/releases/{release_id}/assets",
+    }
+    for key, expected in expected_release.items():
+        if release.get(key) != expected:
+            _fail(f"existing release {key} mismatch")
+
+    if not isinstance(assets, list):
+        _fail("existing release assets must be an array")
+    records: dict[str, dict[str, int | str]] = {}
+    total = 0
+    for raw_item in assets:
+        item = _mapping(raw_item, "existing release asset")
+        asset_id = _positive_int(item.get("id"), "existing release asset ID")
+        name = _scalar(item.get("name"), "existing release asset name")
+        if name in records or name not in FULL_RELEASE_ASSETS:
+            _fail("existing release contains an unexpected or duplicate asset")
+        if item.get("state") != "uploaded":
+            _fail(f"existing release asset is not uploaded: {name}")
+        size = _positive_int(item.get("size"), f"existing release asset size: {name}")
+        if size > MAX_FILE_BYTES:
+            _fail(f"existing release asset exceeds the per-file size limit: {name}")
+        digest = _scalar(item.get("digest"), f"existing release asset digest: {name}")
+        if not digest.startswith("sha256:"):
+            _fail(f"existing release asset digest algorithm mismatch: {name}")
+        sha256 = _hex(digest.removeprefix("sha256:"), f"existing release asset digest: {name}", HEX64)
+        if item.get("url") != f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{asset_id}":
+            _fail(f"existing release asset API URL mismatch: {name}")
+        if item.get("browser_download_url") != f"https://github.com/{REPOSITORY}/releases/download/{tag}/{name}":
+            _fail(f"existing release asset download URL mismatch: {name}")
+        if total > MAX_TOTAL_DOWNLOAD_BYTES - size:
+            _fail("existing release exceeds the aggregate size limit")
+        total += size
+        records[name] = {"id": asset_id, "length": size, "sha256": sha256}
+    if set(records) != set(FULL_RELEASE_ASSETS):
+        _fail("existing release asset inventory is incomplete")
+
+    return {
+        "schema": 1,
+        "repository": REPOSITORY,
+        "release": {"id": release_id, "tag": tag, "url": expected_release["html_url"]},
+        "identity": full_identity,
+        "assets": {name: records[name] for name in sorted(records)},
+    }
+
+
+def validate_existing_release(
+    release: dict[str, Any], assets: list[Any], tag_object: dict[str, Any],
+    identity: dict[str, Any], asset_dir: Path,
+) -> dict[str, Any]:
+    metadata = validate_existing_release_metadata(release, assets, identity)
+    tag_record = validate_tag_object(
+        tag_object, metadata["identity"]["tag"], metadata["identity"]["source"],
+    )
+    if not asset_dir.is_dir() or asset_dir.is_symlink():
+        _fail("existing release asset directory is missing")
+    paths = list(asset_dir.iterdir())
+    if {path.name for path in paths} != set(FULL_RELEASE_ASSETS) or any(
+        path.is_symlink() or not path.is_file() for path in paths
+    ):
+        _fail("existing release assets do not match the exact 37-file allow-list")
+
+    files: dict[str, dict[str, int | str]] = {}
+    for name, expected in metadata["assets"].items():
+        actual = file_record(asset_dir / name)
+        if actual != {"length": expected["length"], "sha256": expected["sha256"]}:
+            _fail(f"existing release asset bytes mismatch: {name}")
+        files[name] = actual
+    return {
+        "schema": metadata["schema"],
+        "repository": metadata["repository"],
+        "release": metadata["release"],
+        "identity": metadata["identity"],
+        "tag": tag_record,
+        "files": files,
+    }
 
 
 def _artifact_names(attempt: int) -> tuple[str, ...]:
@@ -1034,6 +1244,25 @@ def cmd_validate_tag(args: argparse.Namespace) -> int:
     return _write_output(args.output, validate_tag_object(_load(args.tag_json), args.tag, args.source_sha))
 
 
+def cmd_validate_existing_release_metadata(args: argparse.Namespace) -> int:
+    result = validate_existing_release_metadata(
+        _load(args.release_json), _load(args.assets_json), _load(args.identity),
+    )
+    return _write_output(args.output, result)
+
+
+def cmd_validate_existing_release(args: argparse.Namespace) -> int:
+    result = validate_existing_release(
+        _load(args.release_json), _load(args.assets_json), _load(args.tag_json),
+        _load(args.identity), Path(args.asset_dir),
+    )
+    return _write_output(args.output, result)
+
+def cmd_validate_pair_attestation(args: argparse.Namespace) -> int:
+    result = validate_pair_attestation(_load(args.verification_json), Path(args.subject))
+    return _write_output(args.output, result)
+
+
 def cmd_validate_run(args: argparse.Namespace) -> int:
     publisher = {
         "workflow": _load(args.publisher_workflow_json),
@@ -1109,6 +1338,28 @@ def build_parser() -> argparse.ArgumentParser:
     tag.add_argument("--source-sha", required=True)
     tag.add_argument("--output", required=True)
     tag.set_defaults(func=cmd_validate_tag)
+
+    metadata = sub.add_parser("validate-existing-release-metadata")
+    metadata.add_argument("--release-json", required=True)
+    metadata.add_argument("--assets-json", required=True)
+    metadata.add_argument("--identity", required=True)
+    metadata.add_argument("--output", required=True)
+    metadata.set_defaults(func=cmd_validate_existing_release_metadata)
+
+    existing = sub.add_parser("validate-existing-release")
+    existing.add_argument("--release-json", required=True)
+    existing.add_argument("--assets-json", required=True)
+    existing.add_argument("--tag-json", required=True)
+    existing.add_argument("--identity", required=True)
+    existing.add_argument("--asset-dir", required=True)
+    existing.add_argument("--output", required=True)
+    existing.set_defaults(func=cmd_validate_existing_release)
+
+    attestation = sub.add_parser("validate-pair-attestation")
+    attestation.add_argument("--verification-json", required=True)
+    attestation.add_argument("--subject", required=True)
+    attestation.add_argument("--output", required=True)
+    attestation.set_defaults(func=cmd_validate_pair_attestation)
 
     run = sub.add_parser("validate-run")
     run.add_argument("--run-json", required=True)
