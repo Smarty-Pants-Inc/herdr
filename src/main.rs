@@ -64,6 +64,7 @@ mod client;
 mod config;
 mod detect;
 mod events;
+mod execution;
 mod ghostty;
 mod handoff_runtime;
 mod input;
@@ -100,6 +101,7 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod web_url;
 mod workspace;
 mod worktree;
 
@@ -183,7 +185,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # alt+..., cmd/super, and punctuation-with-modifiers may depend on your terminal/tmux setup.
 # prefix = "ctrl+b"
 
-# Prefix-mode actions
+# Prefix-mode actions (Findr is the direct terminal-mode exception below)
 # help = "prefix+?"
 # settings = "prefix+s"
 # detach = "prefix+q"
@@ -214,6 +216,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_tab = "prefix+shift+x"
 # rename_pane = "prefix+shift+p"
 # edit_scrollback = "prefix+e"
+# Direct terminal-mode action: macOS default; ctrl+alt+f elsewhere
+# findr = "cmd+f"
 # focus_pane_left = "prefix+h"
 # focus_pane_down = "prefix+j"
 # focus_pane_up = "prefix+k"
@@ -565,6 +569,21 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
 
+    if args.get(1).map(String::as_str) == Some("remote-exec") {
+        let Some(request_socket) = args.get(2) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote-exec requires a request socket",
+            ));
+        };
+        if request_socket == "--protocol" {
+            println!("{}", execution::REMOTE_EXEC_PROTOCOL);
+            return Ok(());
+        }
+        let code = execution::run_remote_exec(request_socket)?;
+        std::process::exit(code);
+    }
+
     match cli::maybe_run(&args) {
         Ok(cli::CommandOutcome::Handled(code)) => std::process::exit(code),
         Ok(cli::CommandOutcome::NotCli) => {}
@@ -587,6 +606,58 @@ fn main() -> io::Result<()> {
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
+    }
+
+    // Hidden POC mode: attach one local OMP renderer to a logical pane route.
+    if args.get(1).map(|s| s.as_str()) == Some("__omp-pane") {
+        let (Some(pane_id), Some(omp_session_id)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: herdr __omp-pane <pane-id> <omp-session-id> [generation] [--app-client-id <client-id>]");
+            std::process::exit(2);
+        };
+        let mut index = 4;
+        let route_generation = if args.get(index).map(String::as_str) == Some("--app-client-id") {
+            1
+        } else {
+            match args.get(index) {
+                Some(value) => match value.parse::<u64>() {
+                    Ok(1) => {
+                        index += 1;
+                        1
+                    }
+                    Ok(_) => {
+                        eprintln!("error: OMP route generation is server-owned; only generation 1 is valid in this POC");
+                        std::process::exit(2);
+                    }
+                    Err(_) => {
+                        eprintln!("error: OMP route generation must be an unsigned integer");
+                        std::process::exit(2);
+                    }
+                },
+                None => 1,
+            }
+        };
+        let target_app_client_id = match args.get(index).map(String::as_str) {
+            Some("--app-client-id") => {
+                match args.get(index + 1).and_then(|value| value.parse().ok()) {
+                    Some(client_id) if args.len() == index + 2 => Some(client_id),
+                    _ => {
+                        eprintln!("error: --app-client-id requires exactly one unsigned integer");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Some(_) => {
+                eprintln!("usage: herdr __omp-pane <pane-id> <omp-session-id> [generation] [--app-client-id <client-id>]");
+                std::process::exit(2);
+            }
+            None => None,
+        };
+        return client::run_omp_pane(
+            pane_id.clone(),
+            omp_session_id.clone(),
+            route_generation,
+            target_app_client_id,
+        );
     }
 
     // Hidden client mode: connect to an existing server's client socket.
@@ -636,6 +707,7 @@ fn main() -> io::Result<()> {
         println!("       herdr server stop");
         println!("       herdr server reload-config");
         println!("       herdr api <subcommand> ...");
+        println!("       herdr build-info --json");
         println!("       herdr completion <shell>");
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");

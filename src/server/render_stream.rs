@@ -9,6 +9,25 @@ use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
 use crate::terminal::TerminalRuntimeRegistry;
 
+pub(crate) fn identity_ui_state(
+    identity: Option<&crate::server::clients::AppIdentity>,
+) -> crate::ui::IdentityUiState {
+    let Some(identity) = identity else {
+        return crate::ui::IdentityUiState::default();
+    };
+    crate::ui::IdentityUiState {
+        committed_name: identity
+            .committed
+            .as_ref()
+            .map(|committed| committed.name.clone()),
+        editor_open: identity.editor.open,
+        draft: identity.editor.draft.clone(),
+        cursor: identity.editor.cursor,
+        saving: identity.pending.is_some(),
+        error: identity.editor.error.clone(),
+    }
+}
+
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
@@ -308,7 +327,27 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some();
+    render_virtual_with_runtime_registry_and_identity_and_private_surface(
+        app_state,
+        terminal_runtimes,
+        area,
+        resize_panes,
+        cell_size,
+        &crate::ui::IdentityUiState::default(),
+        None,
+    )
+}
+
+pub(crate) fn render_virtual_with_runtime_registry_and_identity_and_private_surface(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
@@ -319,18 +358,66 @@ pub(crate) fn render_virtual_with_runtime_registry(
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || (!popup_visible
             && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+    render_precomputed_virtual_inner(
+        app_state,
+        terminal_runtimes,
+        area,
+        suppress_focused_terminal_cursor,
+        identity,
+        private_surface,
+    )
+}
 
+pub(crate) fn render_precomputed_virtual_with_runtime_registry_and_private_surface(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    pre_compute_suppresses_focused_terminal_cursor: bool,
+    identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
+    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
+        || (!popup_visible
+            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+    render_precomputed_virtual_inner(
+        app_state,
+        terminal_runtimes,
+        area,
+        suppress_focused_terminal_cursor,
+        identity,
+        private_surface,
+    )
+}
+
+fn render_precomputed_virtual_inner(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    suppress_focused_terminal_cursor: bool,
+    identity: &crate::ui::IdentityUiState,
+    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
     terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            crate::ui::render_with_runtime_registry_and_identity(
+                app_state,
+                terminal_runtimes,
+                frame,
+                identity,
+            );
         })
         .expect("render to TestBackend should never fail");
 
     let buffer = terminal.backend().buffer().clone();
-    let cursor = if popup_visible {
+    let cursor = if let Some(surface) = private_surface {
+        surface.cursor(app_state.view.terminal_area)
+    } else if identity.editor_open {
+        terminal.backend().rendered_cursor()
+    } else if app_state.popup_pane.is_some() {
         popup_terminal_cursor(app_state, terminal_runtimes)
     } else if suppress_focused_terminal_cursor {
         None
@@ -343,6 +430,30 @@ pub(crate) fn render_virtual_with_runtime_registry(
     };
 
     (buffer, cursor)
+}
+
+pub(crate) fn overlay_private_surface(
+    buffer: &mut ratatui::buffer::Buffer,
+    surface: &crate::server::private_surface::PrivateSurface,
+    palette: &crate::app::state::Palette,
+    area: Rect,
+) {
+    let Some(outer) = surface.outer_rect(area) else {
+        return;
+    };
+    let backend = CursorTrackingBackend::new(buffer.area.right(), buffer.area.bottom());
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    terminal
+        .draw(|frame| surface.render(frame, palette, area))
+        .expect("render to TestBackend should never fail");
+    let overlay = terminal.backend().buffer();
+    let x_end = outer.right().min(buffer.area.right());
+    let y_end = outer.bottom().min(buffer.area.bottom());
+    for y in outer.y.max(buffer.area.y)..y_end {
+        for x in outer.x.max(buffer.area.x)..x_end {
+            buffer[(x, y)] = overlay[(x, y)].clone();
+        }
+    }
 }
 
 fn popup_terminal_cursor(
@@ -409,7 +520,27 @@ pub(crate) fn focused_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> Option<CursorState> {
-    crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
+    workspace_plugin_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
+        crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
+    })
+}
+
+fn workspace_plugin_terminal_cursor(
+    app_state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> Option<CursorState> {
+    let (_, pane) = app_state.focused_workspace_plugin_pane()?;
+    let runtime = terminal_runtimes.get(&pane.terminal_id)?;
+    if runtime.synchronized_output_active() {
+        return None;
+    }
+    let cursor = runtime.cursor_state(app_state.view.workspace_plugin_pane_inner, true)?;
+    Some(CursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+        shape: cursor.shape,
+    })
 }
 
 fn focused_terminal_owns_host_cursor(
@@ -418,6 +549,9 @@ fn focused_terminal_owns_host_cursor(
 ) -> bool {
     if app_state.mode != Mode::Terminal {
         return false;
+    }
+    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
+        return terminal_runtimes.get(&pane.terminal_id).is_some();
     }
 
     let Some(ws_idx) = app_state.active else {
@@ -440,12 +574,17 @@ fn focused_terminal_owns_host_cursor(
         .is_some()
 }
 
-fn focused_terminal_suppresses_host_cursor(
+pub(crate) fn focused_terminal_suppresses_host_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> bool {
     if app_state.mode != Mode::Terminal {
         return false;
+    }
+    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
+        return terminal_runtimes
+            .get(&pane.terminal_id)
+            .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active);
     }
 
     let Some(ws_idx) = app_state.active else {

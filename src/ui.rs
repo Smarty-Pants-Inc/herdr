@@ -23,13 +23,15 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
+    render_confirm_close_overlay, render_identity_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
+pub(crate) use self::menus::findr_scrollback_toggle_rect;
 use self::menus::{
-    render_context_menu, render_copy_mode_overlay, render_global_launcher_menu,
-    render_navigate_overlay, render_prefix_overlay, render_resize_overlay,
+    render_context_menu, render_copy_mode_overlay, render_findr_overlay,
+    render_global_launcher_menu, render_navigate_overlay, render_prefix_overlay,
+    render_resize_overlay, render_workspace_plugin_overlay,
 };
 use self::mobile::{
     compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
@@ -39,8 +41,13 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
-pub(crate) use self::panes::popup_pane_rects;
-use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
+pub(crate) use self::panes::{
+    popup_pane_rects, render_popup_runtime, workspace_plugin_pane_toggle_rect,
+};
+use self::panes::{
+    render_empty, render_popup_pane, render_workspace_plugin_pane, resize_popup_pane,
+    resize_workspace_plugin_pane,
+};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -54,7 +61,7 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 #[cfg(test)]
 pub(crate) use self::sidebar::workspace_drop_indicator_row;
-use self::sidebar::{render_sidebar, render_sidebar_collapsed};
+use self::sidebar::{identity_header_rect, render_sidebar_collapsed, render_sidebar_with_identity};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
@@ -65,7 +72,8 @@ pub(crate) use self::tab_surface::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect, identity_modal_button_rects,
+        identity_modal_inner_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -102,6 +110,17 @@ pub(crate) use self::{
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
+
+/// Immutable per-client identity data projected into the shared UI render.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdentityUiState {
+    pub(crate) committed_name: Option<String>,
+    pub(crate) editor_open: bool,
+    pub(crate) draft: String,
+    pub(crate) cursor: usize,
+    pub(crate) saving: bool,
+    pub(crate) error: Option<String>,
+}
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
@@ -174,10 +193,11 @@ fn resize_background_tab_panes_to_area(
 fn resize_background_tab_panes_for_desktop(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
-    main_area: Rect,
+    content_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+        let (main_area, _, _) = desktop_workspace_areas(app, ws, content_area);
         let (_, terminal_area) = desktop_tab_bar_and_terminal_area(app, ws, main_area);
         for (tab_idx, tab) in ws.tabs.iter().enumerate() {
             if app.active == Some(ws_idx) && tab_idx == ws.active_tab_index() {
@@ -186,6 +206,37 @@ fn resize_background_tab_panes_for_desktop(
             resize_tab_surface(app, terminal_runtimes, tab, terminal_area, cell_size);
         }
     }
+}
+
+fn desktop_workspace_areas(
+    app: &AppState,
+    workspace: &crate::workspace::Workspace,
+    content_area: Rect,
+) -> (Rect, Rect, Rect) {
+    let Some(pane) = app.workspace_plugin_panes.get(&workspace.id) else {
+        return (content_area, Rect::default(), Rect::default());
+    };
+    let Some(width) = crate::app::workspace_plugin_pane::resolved_workspace_plugin_pane_width(
+        pane.width,
+        content_area.width,
+        app.sidebar_min_width,
+    ) else {
+        return (content_area, Rect::default(), Rect::default());
+    };
+    if pane.collapsed {
+        let [main_area, outer] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(content_area);
+        return (main_area, outer, Rect::default());
+    }
+    let [main_area, outer] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(width)]).areas(content_area);
+    let inner = Rect::new(
+        outer.x.saturating_add(1),
+        outer.y,
+        outer.width.saturating_sub(1),
+        outer.height,
+    );
+    (main_area, outer, inner)
 }
 
 fn desktop_tab_bar_and_terminal_area(
@@ -234,14 +285,23 @@ fn compute_view_internal(
             .clamp(app.sidebar_min_width, app.sidebar_max_width)
     };
 
-    let [sidebar_area, main_area] =
+    let [sidebar_area, content_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
 
+    let (main_area, workspace_plugin_pane_outer, mut workspace_plugin_pane_inner) = app
+        .active
+        .and_then(|i| app.workspaces.get(i))
+        .map(|ws| desktop_workspace_areas(app, ws, content_area))
+        .unwrap_or((content_area, Rect::default(), Rect::default()));
     let (tab_bar_rect, terminal_area) = app
         .active
         .and_then(|i| app.workspaces.get(i))
         .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, main_area))
         .unwrap_or((Rect::default(), main_area));
+    if !workspace_plugin_pane_inner.is_empty() && !tab_bar_rect.is_empty() {
+        workspace_plugin_pane_inner.y = terminal_area.y;
+        workspace_plugin_pane_inner.height = terminal_area.height;
+    }
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
@@ -277,7 +337,7 @@ fn compute_view_internal(
     app.tab_scroll = tab_bar_view.scroll;
 
     let TabSurfaceLayout {
-        pane_infos,
+        mut pane_infos,
         split_borders,
     } = compute_tab_surface(
         app,
@@ -286,8 +346,24 @@ fn compute_view_internal(
         resize_panes,
         cell_size,
     );
+    if app
+        .active
+        .and_then(|ws_idx| app.workspaces.get(ws_idx))
+        .and_then(|workspace| app.workspace_plugin_panes.get(&workspace.id))
+        .is_some_and(|pane| pane.focused && !workspace_plugin_pane_inner.is_empty())
+    {
+        for pane in &mut pane_infos {
+            pane.is_focused = false;
+        }
+    }
     if resize_panes {
-        resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
+        resize_background_tab_panes_for_desktop(app, terminal_runtimes, content_area, cell_size);
+        resize_workspace_plugin_pane(
+            app,
+            terminal_runtimes,
+            workspace_plugin_pane_inner,
+            cell_size,
+        );
         resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
     }
 
@@ -314,6 +390,8 @@ fn compute_view_internal(
         tab_scroll_right_hit_area: tab_bar_view.scroll_right_hit_area,
         new_tab_hit_area: tab_bar_view.new_tab_hit_area,
         terminal_area,
+        workspace_plugin_pane_outer,
+        workspace_plugin_pane_inner,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
@@ -321,6 +399,24 @@ fn compute_view_internal(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    if resize_panes {
+        app.reconcile_focus_lifecycle();
+    }
+    clear_hovered_link_if_stale(app);
+}
+
+fn clear_hovered_link_if_stale(app: &mut AppState) {
+    let current =
+        app.hovered_pane_cell.as_ref().is_some_and(|position| {
+            app.mode == Mode::Terminal
+                && app.view.pane_infos.iter().any(|info| {
+                    info.id == position.pane_id && info.inner_rect == position.inner_rect
+                })
+        });
+    if app.hovered_pane_cell.is_some() && !current {
+        app.hovered_pane_cell = None;
+        app.hovered_link = None;
+    }
 }
 
 fn compute_mobile_view(
@@ -377,6 +473,8 @@ fn compute_mobile_view(
         tab_scroll_right_hit_area: Rect::default(),
         new_tab_hit_area: Rect::default(),
         terminal_area,
+        workspace_plugin_pane_outer: Rect::default(),
+        workspace_plugin_pane_inner: Rect::default(),
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
@@ -384,6 +482,10 @@ fn compute_mobile_view(
         split_borders,
     };
     app.sync_copy_mode_search_geometry();
+    if resize_panes {
+        app.reconcile_focus_lifecycle();
+    }
+    clear_hovered_link_if_stale(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.
@@ -398,10 +500,24 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
+    render_with_runtime_registry_and_identity(
+        app,
+        terminal_runtimes,
+        frame,
+        &IdentityUiState::default(),
+    );
+}
+
+pub(crate) fn render_with_runtime_registry_and_identity(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    identity: &IdentityUiState,
+) {
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    render_navigation_chrome(app, terminal_runtimes, frame);
+    render_navigation_chrome(app, terminal_runtimes, frame, identity);
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
@@ -414,6 +530,7 @@ pub fn render_with_runtime_registry(
     } else {
         render_empty(app, frame, terminal_area);
     }
+    render_workspace_plugin_pane(app, terminal_runtimes, frame);
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
@@ -428,43 +545,85 @@ pub fn render_with_runtime_registry(
         terminal_area
     };
 
-    match app.mode {
-        Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
-        Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
-        Mode::ProductAnnouncement => render_product_announcement_overlay(app, frame, frame.area()),
-        Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
-            render_mobile_panel(app, terminal_runtimes, frame, frame.area())
+    if identity.editor_open {
+        render_identity_overlay(app, frame, frame.area(), identity);
+    } else {
+        match app.mode {
+            Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
+            Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
+            Mode::ProductAnnouncement => {
+                render_product_announcement_overlay(app, frame, frame.area())
+            }
+            Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
+                render_mobile_panel(app, terminal_runtimes, frame, frame.area())
+            }
+            Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
+            Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
+            Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
+            Mode::Findr => render_findr_overlay(app, frame, mode_bar_area),
+            Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
+            Mode::ConfirmClose => {
+                render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
+            }
+            Mode::ContextMenu => {
+                render_context_menu(app, frame);
+            }
+            Mode::Settings => render_settings_overlay(app, frame, frame.area()),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                render_rename_overlay(app, frame, frame.area())
+            }
+            Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
+            Mode::OpenExistingWorktree => {
+                render_open_existing_worktree_overlay(app, frame, frame.area())
+            }
+            Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
+            Mode::GlobalMenu => render_global_launcher_menu(app, frame),
+            Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
+            Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+            Mode::Terminal if app.focused_workspace_plugin_pane().is_some() => {
+                let outer = app.view.workspace_plugin_pane_outer;
+                let width = outer
+                    .x
+                    .saturating_add(outer.width)
+                    .saturating_sub(mode_bar_area.x);
+                render_workspace_plugin_overlay(
+                    app,
+                    frame,
+                    Rect::new(
+                        mode_bar_area.x,
+                        mode_bar_area.y,
+                        width,
+                        mode_bar_area.height,
+                    ),
+                )
+            }
+            Mode::Terminal => {}
         }
-        Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
-        Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
-        Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
-        Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
-        Mode::ConfirmClose => {
-            render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
-        }
-        Mode::ContextMenu => {
-            render_context_menu(app, frame);
-        }
-        Mode::Settings => render_settings_overlay(app, frame, frame.area()),
-        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-            render_rename_overlay(app, frame, frame.area())
-        }
-        Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
-        Mode::OpenExistingWorktree => {
-            render_open_existing_worktree_overlay(app, frame, frame.area())
-        }
-        Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
-        Mode::GlobalMenu => render_global_launcher_menu(app, frame),
-        Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
-        Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
-        Mode::Terminal => {}
     }
+}
+
+pub(crate) fn identity_name_hit_rect(
+    app: &AppState,
+    client_area: Rect,
+    identity: &IdentityUiState,
+) -> Rect {
+    if is_mobile_width(client_area, app.mobile_width_threshold) || app.sidebar_collapsed {
+        return Rect::default();
+    }
+    let sidebar_width = app
+        .sidebar_width
+        .clamp(app.sidebar_min_width, app.sidebar_max_width);
+    let [sidebar, _] = Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(1)])
+        .areas(client_area);
+    let (spaces, _) = expanded_sidebar_sections(sidebar, app.sidebar_section_split);
+    identity_header_rect(spaces, identity)
 }
 
 fn render_navigation_chrome(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
+    identity: &IdentityUiState,
 ) {
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
@@ -472,7 +631,13 @@ fn render_navigation_chrome(
         if app.sidebar_collapsed {
             render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
         } else {
-            render_sidebar(app, terminal_runtimes, frame, app.view.sidebar_rect);
+            render_sidebar_with_identity(
+                app,
+                terminal_runtimes,
+                frame,
+                app.view.sidebar_rect,
+                identity,
+            );
         }
     }
 }
@@ -1427,6 +1592,25 @@ mod tests {
     }
 
     #[test]
+    fn workspace_plugin_overlay_renders_host_shortcuts() {
+        let app = crate::app::state::AppState::test_new();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 4);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4))
+            .expect("test terminal");
+
+        terminal
+            .draw(|frame| render_workspace_plugin_overlay(&app, frame, area))
+            .expect("draw explorer overlay");
+
+        let rendered = buffer_row_text(terminal.backend().buffer(), area, 3);
+        assert!(rendered.contains("EXPLORER"));
+        assert!(rendered.contains("ctrl+b back"));
+        assert!(rendered.contains("↑↓/jk move"));
+        assert!(rendered.contains("←→/hl tree"));
+        assert!(rendered.contains("enter open"));
+    }
+
+    #[test]
     fn keybind_help_shows_unset_for_optional_actions() {
         let app = crate::app::state::AppState::test_new();
         let groups = keybind_help_groups(&app);
@@ -1557,5 +1741,186 @@ switch_workspace = "ctrl+1..9"
 
         assert_eq!(switch_tab_key, "prefix+1..9 / alt+1..9");
         assert_eq!(switch_workspace_key, "ctrl+1..9");
+    }
+    #[test]
+    fn workspace_plugin_pane_uses_sidebar_minimum_and_collapses_to_one_cell() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_min_width = 18;
+        let workspace = Workspace::test_new("plugin-layout");
+        let workspace_id = workspace.id.clone();
+        app.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(8)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+        let content = Rect::new(0, 0, 100, 20);
+
+        let (main, outer, inner) = desktop_workspace_areas(&app, &workspace, content);
+        assert_eq!(main, Rect::new(0, 0, 82, 20));
+        assert_eq!(outer, Rect::new(82, 0, 18, 20));
+        assert_eq!(inner, Rect::new(83, 0, 17, 20));
+
+        app.workspace_plugin_panes
+            .get_mut(&workspace.id)
+            .unwrap()
+            .collapsed = true;
+        let (main, outer, inner) = desktop_workspace_areas(&app, &workspace, content);
+        assert_eq!(main, Rect::new(0, 0, 99, 20));
+        assert_eq!(outer, Rect::new(99, 0, 1, 20));
+        assert!(inner.is_empty());
+    }
+    #[test]
+    fn workspace_plugin_content_aligns_with_the_tab_surface() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.hide_tab_bar_when_single_tab = false;
+        let workspace = Workspace::test_new("plugin-alignment");
+        let workspace_id = workspace.id.clone();
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.selected = 0;
+        app.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        assert_eq!(app.view.workspace_plugin_pane_outer.height, 20);
+        assert_eq!(app.view.workspace_plugin_pane_inner.y, 1);
+        assert_eq!(app.view.workspace_plugin_pane_inner.height, 19);
+
+        app.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+        assert_eq!(app.view.workspace_plugin_pane_inner.y, 0);
+        assert_eq!(app.view.workspace_plugin_pane_inner.height, 19);
+    }
+    #[test]
+    fn identity_name_hit_rect_uses_client_area_not_shared_view() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mobile_width_threshold = 60;
+        app.sidebar_width = 26;
+        app.sidebar_min_width = 18;
+        app.sidebar_max_width = 36;
+        app.view.layout = ViewLayout::Mobile;
+        app.view.sidebar_rect = Rect::default();
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..IdentityUiState::default()
+        };
+
+        let hit = identity_name_hit_rect(&app, Rect::new(0, 0, 100, 24), &identity);
+        assert_eq!(hit, Rect::new(20, 0, 5, 1));
+        assert_eq!(
+            identity_name_hit_rect(&app, Rect::new(0, 0, 40, 24), &identity),
+            Rect::default()
+        );
+    }
+
+    #[test]
+    fn identity_name_hit_rect_disappears_when_sidebar_is_collapsed_or_name_is_unset() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mobile_width_threshold = 60;
+        let area = Rect::new(0, 0, 100, 24);
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            ..IdentityUiState::default()
+        };
+
+        app.sidebar_collapsed = true;
+        assert_eq!(
+            identity_name_hit_rect(&app, area, &identity),
+            Rect::default()
+        );
+        app.sidebar_collapsed = false;
+        assert_eq!(
+            identity_name_hit_rect(&app, area, &IdentityUiState::default()),
+            Rect::default()
+        );
+    }
+    #[test]
+    fn identity_editor_renders_client_draft_and_modal_actions() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        let area = Rect::new(0, 0, 80, 20);
+        compute_view(&mut app, area);
+        let identity = IdentityUiState {
+            committed_name: Some("alice".into()),
+            editor_open: true,
+            draft: "alice two".into(),
+            cursor: 5,
+            saving: false,
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_identity(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    &identity,
+                )
+            })
+            .unwrap();
+        let screen = (0..area.height)
+            .map(|row| buffer_row_text(terminal.backend().buffer(), area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("display name"), "{screen}");
+        assert!(screen.contains("labels your shared prompts"), "{screen}");
+        assert!(screen.contains("alice two"), "{screen}");
+        assert!(screen.contains("↵ save"), "{screen}");
+        assert!(screen.contains("esc cancel"), "{screen}");
+    }
+
+    #[test]
+    fn first_launch_identity_modal_omits_cancel_and_shows_saving_state() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces.clear();
+        app.active = None;
+        let area = Rect::new(0, 0, 80, 20);
+        compute_view(&mut app, area);
+        let identity = IdentityUiState {
+            committed_name: None,
+            editor_open: true,
+            draft: "alice".into(),
+            cursor: 5,
+            saving: true,
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_identity(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    frame,
+                    &identity,
+                )
+            })
+            .unwrap();
+        let screen = (0..area.height)
+            .map(|row| buffer_row_text(terminal.backend().buffer(), area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("saving…"), "{screen}");
+        assert!(!screen.contains("esc cancel"), "{screen}");
     }
 }

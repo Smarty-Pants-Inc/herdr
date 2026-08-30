@@ -14,6 +14,7 @@ from unittest import mock
 
 import scripts.smarty_preview_trusted as trusted
 
+
 STRICT_YAML_TO_JSON = r'''
 require "json"
 require "psych"
@@ -148,7 +149,6 @@ class TrustedWorkflowRegistrationTests(unittest.TestCase):
             publisher["on"],
             {"workflow_run": {"workflows": ["Smarty Preview"], "types": ["completed"]}},
         )
-
 
 class TrustedSourceTests(unittest.TestCase):
     parent = "1" * 40
@@ -539,36 +539,38 @@ class TrustedWorkflowTests(unittest.TestCase):
     def test_workflow_uses_exact_source_handoff_and_isolates_build(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
         self.assertNotIn("eval(", source)
+        self.assertNotIn("omp-source.tar", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
         self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
         self.assertIn("extract-producer-artifacts --root artifact-zips --output producer --identity identity.json", source)
         self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
         self.assertIn("token: ${{ github.token }}", source)
-        self.assertIn('Path("trusted-source-record.json")', source)
+        self.assertIn('json.dumps(record["omp"]', source)
         trusted_source = source.split("\n  trusted-source:", 1)[1].split("\n  trusted-build:", 1)[0]
         trusted_build = source.split("\n  trusted-build:", 1)[1].split("\n  trusted-omp-build:", 1)[0]
         omp_build = source.split("\n  trusted-omp-build:", 1)[1].split("\n  trusted-assemble:", 1)[0]
-        trusted_assemble = source.split("\n  trusted-assemble:", 1)[1].split("\n  attest-and-seal:", 1)[0]
+        assemble = source.split("\n  trusted-assemble:", 1)[1].split("\n  attest-and-seal:", 1)[0]
         attest = source.split("\n  attest-and-seal:", 1)[1].split("\n  publish-release:", 1)[0]
         self.assertIn("needs: [validate-seal]", trusted_source)
-        self.assertIn("needs: [validate-seal, trusted-source]", trusted_build)
+        self.assertNotIn("trusted-build", trusted_source)
         self.assertIn("fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'", trusted_source)
         self.assertIn('git -C parent-source merge-base --is-ancestor "$PARENT" refs/remotes/origin/main', trusted_source)
-        for label in ("ubuntu-22.04", "ubuntu-24.04-arm", "macos-15-intel", "macos-14", "windows-latest"):
-            self.assertIn(f"os: {label}", source)
-        self.assertNotRegex(source, r"os: smarty-(?:linux|macos|windows)")
-        self.assertIn("mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29", trusted_build)
-        self.assertIn("version: ${{ env.ZIG_VERSION }}", trusted_build)
-        self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
+        self.assertNotIn("tarfile.open", trusted_source)
+        self.assertIn("runs-on: ${{ matrix.os }}", omp_build)
         self.assertIn("Build trusted Herdr source", trusted_build)
+        self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
         self.assertNotIn("publisher-source", trusted_build)
-        self.assertIn("Download validated OMP source record", omp_build)
-        self.assertIn("repository: Smarty-Pants-Inc/oh-my-pi", omp_build)
-        self.assertIn("private OMP checkout differs from validated source record", omp_build)
+        self.assertIn("Download validated OMP identity handoff", omp_build)
+        for job in (omp_build, assemble, attest):
+            self.assertIn("Checkout exact private OMP source", job)
+            self.assertIn("ref: ${{ needs.trusted-source.outputs.omp_commit }}", job)
+            self.assertEqual(job.count("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}"), 1)
+            self.assertIn('git -C omp-source rev-parse HEAD^{commit}', job)
+            self.assertIn('git -C omp-source rev-parse HEAD^{tree}', job)
+            self.assertIn('git -C omp-source status --porcelain=v1 --untracked-files=all', job)
+        self.assertNotIn("extract-tar", omp_build)
         self.assertIn("trusted-tools/smarty_preview_trusted.py", omp_build)
-        self.assertIn("publisher-source/scripts/smarty_preview_release.py", source)
-        self.assertNotIn("publisher-source/scripts/preview.py", source)
         self.assertNotIn("Checkout exact Herdr source", omp_build)
         self.assertNotIn("HERDR_BUILD_OMP", omp_build)
         self.assertIn('(cd omp-source && bun scripts/ci-release-build-binaries.ts --targets "$OMP_TARGET")', omp_build)
@@ -578,15 +580,12 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('cp "omp-source/packages/coding-agent/binaries/omp-$OMP_TARGET" "release-assets/omp-$PLATFORM"', omp_build)
         self.assertIn('test "$(release-assets/omp-$PLATFORM __build-id)" = "$OMP_BUILD_ID"', omp_build)
         self.assertNotIn('bun build omp-source/packages/coding-agent/src/cli.ts --compile --outfile "release-assets/omp-$PLATFORM"', omp_build)
-        for public_handoff in (trusted_source, omp_build, trusted_assemble):
+        for public_handoff in (trusted_source, omp_build, assemble, attest):
             self.assertNotIn("omp-source.tar", public_handoff)
-        self.assertIn("source-archives/herdr-source.tar", trusted_assemble)
-        self.assertIn('Path("validation/producer-record.json")', trusted_assemble)
-        self.assertNotIn('Path("validation/producer/producer-record.json")', trusted_assemble)
-        self.assertIn("git -C omp-source archive --format=tar", attest)
-        self.assertIn("validate-git-archive --archive source-archives/omp-source.tar", attest)
-        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json", trusted_assemble)
-        self.assertEqual(source.count("omp-source.tar"), 2)
+        self.assertIn("source-archives/herdr-source.tar", assemble)
+        self.assertIn('Path("validation/producer-record.json")', assemble)
+        self.assertNotIn('Path("validation/producer/producer-record.json")', assemble)
+        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json", assemble)
 
     def test_workflow_pins_executing_revision_and_publisher_attempt(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
@@ -608,6 +607,20 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('raise SystemExit(f"release asset metadata mismatch: {name}")', source)
         self.assertLess(source.index("done < delete-list"), source.index("done < upload-list"))
 
+    def test_draft_release_download_uses_auth_stripping_redirects(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        publish = source.split("\n  publish-release:", 1)[1]
+        self.assertIn("Checkout trusted publisher source", publish)
+        self.assertIn(
+            "ref: ${{ needs.validate-seal.outputs.publisher_commit }}", publish
+        )
+        self.assertIn("path: publisher-source", publish)
+        self.assertIn(
+            "from smarty_preview_trusted import _HttpsArtifactRedirectHandler", publish
+        )
+        self.assertIn("build_opener(_HttpsArtifactRedirectHandler())", publish)
+        self.assertIn("with opener.open(request, timeout=120)", publish)
+        self.assertNotIn("with urlopen(request", publish)
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ use crate::pty::fd;
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CHILD_EXIT_FINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -81,6 +82,7 @@ enum PtyIoControlCommand {
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
     ReleaseAfterCommit(std_mpsc::Sender<std::io::Result<()>>),
+    FinishAfterChildExit,
     Shutdown,
 }
 
@@ -328,6 +330,23 @@ impl PtyIoActorHandle {
         })?
     }
 
+    pub(crate) fn finish_after_child_exit(&self) {
+        {
+            let mut user_writes = self
+                .user_writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            user_writes.accepting = false;
+        }
+        if self
+            .control_tx
+            .send(PtyIoControlCommand::FinishAfterChildExit)
+            .is_ok()
+        {
+            self.wake_actor();
+        }
+    }
+
     pub(crate) fn shutdown(&self) {
         {
             let mut user_writes = self
@@ -397,6 +416,7 @@ impl PtyIoActor {
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
+            final_drain_deadline: None,
         };
         std::thread::Builder::new()
             .name(format!("herdr-pty-{}", config.pane_id))
@@ -429,6 +449,7 @@ struct PtyIoActorRunner {
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
+    final_drain_deadline: Option<Instant>,
 }
 
 impl PtyIoActorRunner {
@@ -452,16 +473,32 @@ impl PtyIoActorRunner {
                 self.flush_pending_writes_once();
             }
 
+            if self
+                .final_drain_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                if self.state == ActorState::Running {
+                    let _ = self.read_once();
+                }
+                break;
+            }
+
             if let Some(poll_observer) = &self.poll_observer {
                 let _ = poll_observer.send(());
             }
 
+            let poll_timeout_ms =
+                self.final_drain_deadline
+                    .map_or(ACTOR_IDLE_POLL_MS, |deadline| {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        remaining.as_millis().clamp(1, ACTOR_IDLE_POLL_MS as u128) as i32
+                    });
             match fd::poll_pty_and_wake(
                 self.file.as_raw_fd(),
                 self.wake_read_fd.as_raw_fd(),
                 self.state == ActorState::Running,
                 !self.pending_writes.is_empty(),
-                ACTOR_IDLE_POLL_MS,
+                poll_timeout_ms,
             ) {
                 Ok(readiness) => {
                     if readiness.wake_ready {
@@ -590,6 +627,10 @@ impl PtyIoActorRunner {
                 self.pending_writes.clear();
                 let _ = reply.send(Ok(()));
                 return true;
+            }
+            PtyIoControlCommand::FinishAfterChildExit => {
+                self.final_drain_deadline
+                    .get_or_insert_with(|| Instant::now() + CHILD_EXIT_FINAL_DRAIN_TIMEOUT);
             }
             PtyIoControlCommand::Shutdown => return true,
         }
@@ -885,6 +926,7 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            final_drain_deadline: None,
         };
         (runner, peer)
     }
@@ -1217,6 +1259,7 @@ mod tests {
             }),
             on_reader_exit: None,
             poll_observer: None,
+            final_drain_deadline: None,
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1437,6 +1480,7 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            final_drain_deadline: None,
         };
 
         runner.begin_handoff().expect("handoff drains queued write");

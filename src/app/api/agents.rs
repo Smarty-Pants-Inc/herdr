@@ -332,6 +332,70 @@ mod tests {
         app
     }
 
+    #[test]
+    fn agent_start_rejects_remote_panes_explicitly() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "reviewer".into(),
+                kind: "codex".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: Vec::new(),
+                timeout_ms: None,
+                allow_cross_pane: false,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_start_unsupported_execution_target");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_start_uses_the_exact_local_omp_companion() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                name: "omp-worker".into(),
+                kind: "omp".into(),
+                pane_id: app.public_pane_id(0, pane_id).unwrap(),
+                args: vec!["--resume=session".into()],
+                timeout_ms: Some(4_000),
+                allow_cross_pane: false,
+            },
+        );
+        let success: SuccessResponse =
+            serde_json::from_str(&response).unwrap_or_else(|err| panic!("{err}: {response}"));
+        let ResponseResult::AgentStarted { argv, .. } = success.result else {
+            panic!("expected agent_started response");
+        };
+        let expected = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(argv[0], expected);
+        let submitted = String::from_utf8(input.try_recv().unwrap().to_vec()).unwrap();
+        assert!(submitted.contains(&expected));
+        assert!(submitted.contains("--resume=session"));
+    }
+
     #[tokio::test]
     async fn agent_prompt_sends_text_then_delays_enter() {
         let mut app = app_with_agent();
@@ -357,6 +421,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -388,6 +453,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -409,6 +475,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -435,6 +502,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
 
@@ -474,6 +542,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -513,6 +582,7 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -524,6 +594,7 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
+                allow_cross_pane: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
@@ -558,6 +629,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

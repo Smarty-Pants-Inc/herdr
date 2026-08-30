@@ -21,14 +21,6 @@ use crate::{
     terminal::TerminalRuntimeRegistry,
 };
 
-#[cfg(test)]
-pub(crate) fn terminal_direct_navigation_action(
-    state: &AppState,
-    key: TerminalKey,
-) -> Option<NavigateAction> {
-    action_for_key(state, key, BindingDispatch::Direct)
-}
-
 pub(crate) fn terminal_direct_non_indexed_navigation_action(
     state: &AppState,
     key: &TerminalKey,
@@ -58,6 +50,14 @@ impl App {
     }
 
     pub(crate) fn handle_prefix_key(&mut self, raw_key: TerminalKey) {
+        self.handle_prefix_key_for_view(raw_key, None);
+    }
+
+    pub(crate) fn handle_prefix_key_for_view(
+        &mut self,
+        raw_key: TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key = raw_key.as_key_event();
         self.state.update_dismissed = true;
 
@@ -84,7 +84,7 @@ impl App {
             Some(PrefixBindingMatch::Action(action)) => self.execute_prefix_key_action(action),
             Some(PrefixBindingMatch::Command(binding)) => {
                 self.cancel_copy_mode_if_active();
-                self.launch_custom_command(binding, ActionContext::Prefix);
+                self.launch_custom_command_for_view(binding, ActionContext::Prefix, view_id);
             }
             None => leave_command_mode(&mut self.state),
         }
@@ -112,6 +112,14 @@ impl App {
     }
 
     pub(crate) fn handle_navigate_key(&mut self, raw_key: TerminalKey) {
+        self.handle_navigate_key_for_view(raw_key, None);
+    }
+
+    pub(crate) fn handle_navigate_key_for_view(
+        &mut self,
+        raw_key: TerminalKey,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) {
         let key = raw_key.as_key_event();
         self.state.update_dismissed = true;
 
@@ -157,7 +165,7 @@ impl App {
         }
 
         if let Some(binding) = command_for_key(&self.state, &raw_key, BindingDispatch::Prefix) {
-            self.launch_custom_command(binding, ActionContext::Navigate);
+            self.launch_custom_command_for_view(binding, ActionContext::Navigate, view_id);
             return;
         }
 
@@ -376,6 +384,7 @@ impl App {
                 }
             }
             NavigateAction::EditScrollback => {}
+            NavigateAction::Findr => self.open_findr(),
             NavigateAction::CopyMode => self.state.enter_copy_mode(&self.terminal_runtimes),
             NavigateAction::Zoom => {
                 self.zoom_focused_pane_via_api();
@@ -600,9 +609,11 @@ impl App {
             crate::api::schema::PaneSplitParams {
                 workspace_id: None,
                 target_pane_id: None,
+                caller_pane_id: None,
                 direction,
                 ratio: None,
                 cwd: None,
+                execution_target: None,
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
@@ -817,21 +828,26 @@ impl App {
         true
     }
 
-    pub(super) fn launch_custom_command(
+    pub(super) fn launch_custom_command_for_view(
         &mut self,
         binding: crate::config::CustomCommandKeybind,
         context: ActionContext,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) {
         let previous_mode = self.state.mode;
         let previous_toast = self.state.toast.clone();
         let result = match binding.action {
-            crate::config::CustomCommandAction::Shell => self.spawn_custom_command(&binding),
+            crate::config::CustomCommandAction::Shell => {
+                self.spawn_custom_command(&binding, view_id)
+            }
             crate::config::CustomCommandAction::Pane => {
                 self.spawn_pane_command(&binding.command, Vec::new())
             }
-            crate::config::CustomCommandAction::Popup => self.spawn_custom_popup_command(&binding),
+            crate::config::CustomCommandAction::Popup => {
+                self.spawn_custom_popup_command(&binding, view_id)
+            }
             crate::config::CustomCommandAction::PluginAction => self
-                .invoke_plugin_action_from_keybind(binding.command.clone())
+                .invoke_plugin_action_from_keybind_for_view(binding.command.clone(), view_id)
                 .map_err(std::io::Error::other),
         };
         match result {
@@ -853,11 +869,12 @@ impl App {
     fn spawn_custom_popup_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> io::Result<()> {
         self.spawn_popup_shell_command(
             &binding.command,
             None,
-            self.custom_command_env().0,
+            self.custom_command_env_for_view(view_id).0,
             crate::app::popup::PopupGeometry {
                 width: binding.width,
                 height: binding.height,
@@ -866,10 +883,20 @@ impl App {
     }
 
     pub(crate) fn custom_command_env(&self) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
+        self.custom_command_env_for_view(None)
+    }
+
+    fn custom_command_env_for_view(
+        &self,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> (Vec<(String, String)>, Option<std::path::PathBuf>) {
         let mut env = vec![(
             crate::api::SOCKET_PATH_ENV_VAR.to_string(),
             crate::api::socket_path().display().to_string(),
         )];
+        if let Some(view_id) = view_id {
+            env.push(("HERDR_VIEW_ID".to_string(), view_id.to_string()));
+        }
         if let Ok(current_exe) = std::env::current_exe() {
             env.push((
                 "HERDR_BIN_PATH".to_string(),
@@ -912,13 +939,14 @@ impl App {
     fn spawn_custom_command(
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
+        view_id: Option<&crate::api::schema::ViewId>,
     ) -> std::io::Result<()> {
         let mut command = crate::platform::detached_custom_command_process(&binding.command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let (env, cwd) = self.custom_command_env();
+        let (env, cwd) = self.custom_command_env_for_view(view_id);
         command.envs(env);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -1011,6 +1039,10 @@ impl App {
         };
         let previous_focus_target = self.state.current_pane_focus_target();
         let (rows, cols) = self.state.estimate_pane_size();
+        let cwd = Some(
+            self.focused_pane_cwd_in_workspace(ws_idx)
+                .unwrap_or_else(|| self.resolve_new_terminal_cwd(None)),
+        );
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
         let (env, _) = self.custom_command_env();
@@ -1025,18 +1057,12 @@ impl App {
             .focused_pane_id()
             .ok_or_else(|| std::io::Error::other("no focused pane"))?;
         let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
-        let cwd = ws.active_tab().and_then(|tab| {
-            tab.cwd_for_pane(
-                previous_focus,
-                &self.state.terminals,
-                &self.terminal_runtimes,
-            )
-        });
         let new_pane = ws.split_focused_command(
             Direction::Horizontal,
             new_rows,
             new_cols,
             cwd,
+            &crate::execution::ExecutionTarget::Local,
             command,
             env,
             self.state.pane_scrollback_limit_bytes,
@@ -1085,6 +1111,47 @@ impl App {
         extra_env: Vec<(String, String)>,
         temp_files: Vec<std::path::PathBuf>,
     ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        self.spawn_overlay_command(
+            argv,
+            cwd,
+            &crate::execution::ExecutionTarget::Local,
+            None,
+            extra_env,
+            temp_files,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_overlay_plugin_command(
+        &mut self,
+        plugin_id: &str,
+        entrypoint: &str,
+        local_argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
+        self.spawn_overlay_command(
+            local_argv,
+            cwd,
+            execution_target,
+            Some((plugin_id, entrypoint)),
+            extra_env,
+            temp_files,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_overlay_command(
+        &mut self,
+        local_argv: &[String],
+        cwd: Option<std::path::PathBuf>,
+        execution_target: &crate::execution::ExecutionTarget,
+        plugin: Option<(&str, &str)>,
+        extra_env: Vec<(String, String)>,
+        temp_files: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<(usize, crate::workspace::NewPane)> {
         let Some(ws_idx) = self.state.active else {
             return Err(std::io::Error::other("no active workspace"));
         };
@@ -1101,15 +1168,15 @@ impl App {
         let previous_focus = ws
             .focused_pane_id()
             .ok_or_else(|| std::io::Error::other("no focused pane"))?;
-        let cwd = cwd.or_else(|| {
-            ws.active_tab().and_then(|tab| {
-                tab.cwd_for_pane(
-                    previous_focus,
-                    &self.state.terminals,
-                    &self.terminal_runtimes,
-                )
+        let cwd = cwd
+            .or_else(|| {
+                self.launch_cwd_for_pane_in_workspace_on(ws_idx, previous_focus, execution_target)
             })
-        });
+            .or_else(|| {
+                execution_target
+                    .is_local()
+                    .then(|| self.resolve_new_terminal_cwd(None))
+            });
 
         let (tab_idx, new_pane, workspace_id) = {
             let ws = self
@@ -1118,19 +1185,38 @@ impl App {
                 .get_mut(ws_idx)
                 .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
             let previous_zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
-            let result = ws.split_pane_argv_command(
-                previous_focus,
-                Direction::Horizontal,
-                new_rows,
-                new_cols,
-                cwd,
-                argv,
-                extra_env,
-                self.state.pane_scrollback_limit_bytes,
-                self.state.host_terminal_theme,
-                self.state.host_terminal_appearance,
-                true,
-            );
+            let result = if let Some((plugin_id, entrypoint)) = plugin {
+                ws.split_pane_plugin_command(
+                    previous_focus,
+                    Direction::Horizontal,
+                    new_rows,
+                    new_cols,
+                    cwd,
+                    execution_target,
+                    plugin_id,
+                    entrypoint,
+                    local_argv,
+                    extra_env,
+                    self.state.pane_scrollback_limit_bytes,
+                    self.state.host_terminal_theme,
+                    self.state.host_terminal_appearance,
+                    true,
+                )
+            } else {
+                ws.split_pane_argv_command(
+                    previous_focus,
+                    Direction::Horizontal,
+                    new_rows,
+                    new_cols,
+                    cwd,
+                    local_argv,
+                    extra_env,
+                    self.state.pane_scrollback_limit_bytes,
+                    self.state.host_terminal_theme,
+                    self.state.host_terminal_appearance,
+                    true,
+                )
+            };
             let (tab_idx, new_pane) = match result {
                 Some(Ok(result)) => result,
                 Some(Err(err)) => return Err(err),
@@ -1438,6 +1524,7 @@ pub(crate) enum NavigateAction {
     SplitHorizontal,
     ClosePane,
     EditScrollback,
+    Findr,
     CopyMode,
     Zoom,
     EnterResizeMode,
@@ -1574,6 +1661,7 @@ fn non_indexed_action_for_key(
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
+        (&kb.findr, NavigateAction::Findr),
         (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
@@ -1828,6 +1916,7 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::EditScrollback => {}
+        NavigateAction::Findr => state.open_findr(),
         NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
@@ -1911,7 +2000,7 @@ fn workspace_can_start_worktree_action(
         return false;
     }
     let git_space = ws.git_space().cloned().or_else(|| {
-        ws.resolved_identity_cwd_from(&state.terminals, terminal_runtimes)
+        ws.local_git_identity_cwd_from(&state.terminals, terminal_runtimes)
             .as_deref()
             .and_then(crate::workspace::git_space_metadata)
     });
@@ -2677,12 +2766,57 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.next_agent = crate::config::ActionKeybinds::direct("alt+a");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::NextAgent));
+    }
+
+    #[test]
+    fn direct_and_prefix_findr_bindings_map_to_findr_action() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+findr = ["ctrl+alt+f", "prefix+f"]
+"#,
+        )
+        .unwrap();
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds = config.keybinds();
+
+        assert_eq!(
+            terminal_direct_non_indexed_navigation_action(
+                &state,
+                &TerminalKey::new(
+                    KeyCode::Char('f'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
+            ),
+            Some(NavigateAction::Findr)
+        );
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty()),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::Findr)
+        );
+    }
+
+    #[test]
+    fn findr_action_opens_findr() {
+        let mut state = state_with_workspaces(&["test"]);
+
+        execute_navigate_action(&mut state, NavigateAction::Findr);
+
+        assert_eq!(state.mode, Mode::Findr);
+        assert_eq!(
+            state.findr.as_ref().map(|findr| findr.pane_id),
+            state.workspaces[0].focused_pane_id()
+        );
     }
 
     #[test]
@@ -2690,9 +2824,9 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.focus_pane_left = crate::config::ActionKeybinds::direct("alt+left");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Left, KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Left, KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::FocusPaneLeft));
@@ -2703,9 +2837,9 @@ navigate_pane_right = "ctrl+l"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.swap_pane_right = crate::config::ActionKeybinds::direct("alt+shift+l");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT | KeyModifiers::SHIFT),
         );
 
         assert_eq!(action, Some(NavigateAction::SwapPaneRight));
@@ -2717,9 +2851,9 @@ navigate_pane_right = "ctrl+l"
         state.keybinds.resize_pane_right =
             crate::config::ActionKeybinds::direct("ctrl+shift+alt+right");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(
+            &TerminalKey::new(
                 KeyCode::Right,
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
             ),
@@ -2754,9 +2888,9 @@ resize_pane_left = "prefix+shift+left"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.move_tab_next = crate::config::ActionKeybinds::direct("alt+shift+right");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            &TerminalKey::new(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT),
         );
 
         assert_eq!(action, Some(NavigateAction::MoveTabNext));
@@ -2832,9 +2966,9 @@ resize_pane_left = "prefix+shift+left"
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.last_pane = crate::config::ActionKeybinds::direct("alt+l");
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_non_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT),
+            &TerminalKey::new(KeyCode::Char('l'), KeyModifiers::ALT),
         );
 
         assert_eq!(action, Some(NavigateAction::LastPane));
@@ -2956,9 +3090,9 @@ last_pane = "prefix+tab"
         let config: Config = toml::from_str("[keys]\nswitch_tab = \"ctrl+3\"\n").unwrap();
         state.keybinds.switch_tab = config.keybinds().switch_tab;
 
-        let action = terminal_direct_navigation_action(
+        let action = terminal_direct_indexed_navigation_action(
             &state,
-            TerminalKey::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            &TerminalKey::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
         );
 
         assert_eq!(action, Some(NavigateAction::SwitchTab(2)));
@@ -3123,6 +3257,46 @@ command = "printf literal > '{}'"
         ))
         .await;
         app.handle_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::empty()))
+            .await;
+
+        assert_eq!(wait_for_file(&output_path), "literal");
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.mode, Mode::Terminal);
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_literal_symbol_custom_command_runs_before_shifted_indexed_alias() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Terminal;
+
+        let output_path = unique_temp_path("direct-literal-symbol-custom-command");
+        let config: Config = toml::from_str(&format!(
+            r#"
+[keys]
+switch_workspace = "ctrl+shift+1..9"
+
+[[keys.command]]
+key = "ctrl+!"
+command = "printf literal > '{}'"
+"#,
+            output_path.display()
+        ))
+        .unwrap();
+        app.state.keybinds = config.keybinds();
+
+        app.handle_key(TerminalKey::new(KeyCode::Char('!'), KeyModifiers::CONTROL))
             .await;
 
         assert_eq!(wait_for_file(&output_path), "literal");
@@ -3582,6 +3756,58 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(app.state.workspaces.len(), 2);
     }
 
+    #[test]
+    fn custom_command_env_carries_the_invoking_view() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let view_id = crate::api::schema::ViewId::from_opaque("view-test").unwrap();
+
+        let (env, _) = app.custom_command_env_for_view(Some(&view_id));
+
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "HERDR_VIEW_ID" && value == "view-test"));
+        assert!(!app
+            .custom_command_env()
+            .0
+            .iter()
+            .any(|(key, _)| key == "HERDR_VIEW_ID"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn popup_custom_command_uses_invoking_view_environment() {
+        let mut app = app_with_test_workspaces(&["popup-view"]);
+        app.state.mode = Mode::Terminal;
+        let output_path = unique_temp_path("popup-custom-command-view");
+        let binding = crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::direct("ctrl+alt+g"),
+            label: "ctrl+alt+g".into(),
+            command: format!(
+                "printf '%s' \"$HERDR_VIEW_ID\" > '{}'",
+                output_path.display()
+            ),
+            action: crate::config::CustomCommandAction::Popup,
+            description: None,
+            width: None,
+            height: None,
+        };
+        let view_id = crate::api::schema::ViewId::from_opaque("popup-view").unwrap();
+
+        app.launch_custom_command_for_view(binding, ActionContext::Direct, Some(&view_id));
+
+        assert!(app.state.popup_pane.is_some());
+        assert_eq!(wait_for_file(&output_path), "popup-view");
+        assert!(app.close_popup_pane());
+        let _ = std::fs::remove_file(output_path);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn custom_command_runs_from_prefix_key_in_navigate_mode() {
@@ -3658,6 +3884,44 @@ navigate_pane_down = "ctrl+j"
 
         let _ = std::fs::remove_file(output_path);
         let _ = std::fs::remove_file(release_path);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_argv_overlay_from_ssh_uses_local_fallback_cwd() {
+        let mut app = app_with_test_workspaces(&["remote-overlay"]);
+        app.state.mode = Mode::Terminal;
+        let fallback_cwd = unique_temp_path("local-overlay-fallback");
+        std::fs::create_dir_all(&fallback_cwd).expect("create local fallback cwd");
+        app.state.new_terminal_cwd =
+            crate::config::NewTerminalCwdConfig::Path(fallback_cwd.display().to_string());
+        let source_pane = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused source pane");
+        let source_terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(source_pane)
+            .expect("source terminal")
+            .clone();
+        let source_terminal = app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source terminal state");
+        source_terminal.cwd = "/remote/worktree".into();
+        source_terminal.execution_target =
+            crate::execution::ExecutionTarget::ssh("build.example").expect("SSH target");
+        let argv = vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()];
+
+        let (_, overlay) = app
+            .spawn_overlay_argv_command(&argv, None, Vec::new(), Vec::new())
+            .expect("open local argv overlay");
+
+        assert_eq!(
+            overlay.terminal.execution_target,
+            crate::execution::ExecutionTarget::Local
+        );
+        assert_eq!(overlay.terminal.cwd, fallback_cwd);
+        overlay.runtime.shutdown();
+        let _ = std::fs::remove_dir_all(fallback_cwd);
     }
 
     #[cfg(unix)]

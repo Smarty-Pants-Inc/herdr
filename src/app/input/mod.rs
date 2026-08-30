@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tracing::warn;
 
-use crate::app::PaneClickState;
+use crate::app::{LinkClickState, PaneClickState};
 use crate::input::TerminalKey;
 #[cfg(test)]
 use ratatui::layout::Direction;
@@ -26,18 +26,9 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
-fn modified_url_click_modifier() -> KeyModifiers {
-    KeyModifiers::CONTROL
-}
-
-#[cfg(test)]
-#[test]
-fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
-    assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
-}
-
 mod clipboard;
 mod copy_mode;
+mod findr;
 mod lease;
 mod modal;
 mod mouse;
@@ -79,6 +70,7 @@ impl App {
         &mut self,
         key: TerminalKey,
     ) -> Option<super::TerminalInputTarget> {
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             return self.handle_terminal_key(key).await;
         }
@@ -91,15 +83,19 @@ impl App {
         }
 
         match self.state.mode {
-            Mode::Terminal => return self.handle_terminal_key(key).await,
+            Mode::Terminal => {
+                let target = self.handle_terminal_key(key).await;
+                return target;
+            }
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
+            Mode::Findr => self.handle_findr_key(key),
             _ => match self.state.mode {
                 Mode::Onboarding => self.handle_onboarding_key(key_event),
                 Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
                 Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
+                Mode::Prefix | Mode::Navigate | Mode::Copy | Mode::Findr => unreachable!(),
                 Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                     self.handle_rename_key_via_api(key_event)
                 }
@@ -108,9 +104,7 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ContextMenu => {
-                    self.handle_context_menu_key_via_api(key_event);
-                }
+                Mode::ContextMenu => self.handle_context_menu_key_via_api(key_event),
                 Mode::Settings => self.handle_settings_key(key_event),
                 Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
                 Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key),
@@ -127,6 +121,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
@@ -143,6 +138,10 @@ impl App {
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(runtime) = self
                 .state
@@ -157,6 +156,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.send_bytes(Bytes::from(text)).await;
@@ -173,6 +173,10 @@ impl App {
         self.state.clear_selection();
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.send_bytes(Bytes::from(text)).await;
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(runtime) = self
                 .state
@@ -184,6 +188,7 @@ impl App {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
                 let _ = runtime.send_paste(text).await;
@@ -197,6 +202,10 @@ impl App {
             return;
         }
 
+        if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            let _ = runtime.send_paste(text).await;
+            return;
+        }
         if let Some(ws_idx) = self.state.active {
             if let Some(rt) = self
                 .state
@@ -255,6 +264,11 @@ impl App {
                 prompt
                     .query
                     .extend(text.chars().filter(|ch| !ch.is_control()));
+                true
+            }
+            Mode::Findr => {
+                self.state.insert_findr_text(&self.terminal_runtimes, text);
+                self.reset_findr_scan_deadline();
                 true
             }
             _ => false,
@@ -326,38 +340,67 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        self.handle_mouse_from_input_source(super::LOCAL_INPUT_SOURCE, mouse);
+    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.handle_mouse_from_input_source(super::LOCAL_INPUT_SOURCE, mouse)
     }
 
     pub(super) fn handle_mouse_from_input_source(
         &mut self,
         source_id: super::InputSourceId,
         mouse: MouseEvent,
-    ) {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.pending_url_click_sources.remove(&source_id);
-            }
-            MouseEventKind::Drag(MouseButton::Left)
-                if self.pending_url_click_sources.contains(&source_id) =>
-            {
-                return;
-            }
-            MouseEventKind::Up(MouseButton::Left)
-                if self.pending_url_click_sources.remove(&source_id) =>
-            {
-                return;
-            }
-            _ => {}
+    ) -> bool {
+        self.handle_mouse_from_input_source_for_view(source_id, None, mouse)
+    }
+
+    pub(super) fn handle_mouse_from_input_source_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        mouse: MouseEvent,
+    ) -> bool {
+        let hover_changed = self.update_hovered_pane_link(mouse)
+            || (matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ) && self.clear_hovered_pane_link());
+        if self.suppress_pending_url_click_mouse(source_id, mouse.kind) {
+            return hover_changed;
         }
 
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
-            return;
+            return hover_changed;
+        }
+        if self.state.mode == Mode::Findr {
+            let scan_may_change = matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            );
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.state.workspace_presses.remove(&source_id);
+                self.state.tab_presses.remove(&source_id);
+                self.state.drag = None;
+                self.state.clear_selection();
+                self.selection_autoscroll_deadline = None;
+            }
+            let _ = self
+                .state
+                .handle_mouse(&mut self.terminal_runtimes, source_id, mouse);
+            if scan_may_change {
+                self.reset_findr_scan_deadline();
+            }
+            return hover_changed;
+        }
+        if self.handle_workspace_plugin_mouse(mouse) {
+            return hover_changed;
         }
         if self.handle_overlay_mouse(mouse) {
-            return;
+            return hover_changed;
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -376,12 +419,12 @@ impl App {
                 self.state.sidebar_width_auto = false;
                 self.state.mark_session_dirty();
                 self.state.drag = None;
-                return;
+                return hover_changed;
             }
         }
 
-        if self.handle_modified_url_click(source_id, mouse) {
-            return;
+        if self.handle_url_click_for_view(source_id, view_id, mouse) {
+            return hover_changed;
         }
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
@@ -477,6 +520,7 @@ impl App {
             self.selection_autoscroll_deadline =
                 Some(std::time::Instant::now() + super::SELECTION_AUTOSCROLL_INTERVAL);
         }
+        hover_changed
     }
 
     fn handle_popup_mouse(&mut self, mouse: MouseEvent) {
@@ -562,23 +606,160 @@ impl App {
         self.focus_pane_internal_via_api(ws_idx, pane_id);
     }
 
-    fn handle_modified_url_click(
+    pub(crate) fn suppress_pending_url_click_mouse(
         &mut self,
         source_id: super::InputSourceId,
-        mouse: MouseEvent,
+        kind: MouseEventKind,
     ) -> bool {
-        self.handle_modified_url_click_with(source_id, mouse, crate::platform::open_url)
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.pending_url_click_sources.remove(&source_id);
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.pending_url_click_sources.contains(&source_id)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.pending_url_click_sources.remove(&source_id)
+            }
+            _ => false,
+        }
     }
 
-    fn handle_modified_url_click_with(
+    pub(crate) fn activate_link_click(
         &mut self,
         source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> bool {
+        self.pending_url_click_sources.insert(source_id);
+        if self.activate_link_once(source_id, pane_id, url, view_id) {
+            true
+        } else {
+            self.pending_url_click_sources.remove(&source_id);
+            false
+        }
+    }
+
+    pub(crate) fn activate_link_once(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> bool {
+        self.activate_link_once_with_key(source_id, pane_id.raw().to_string(), url, |app, url| {
+            app.activate_resolved_link(source_id, pane_id, url, view_id)
+        })
+    }
+
+    pub(crate) fn activate_link_once_from_source_with_fallback(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_pane_id: &str,
+        url: String,
+        view_id: &crate::api::schema::ViewId,
+        fallback: impl FnOnce(String) -> bool,
+    ) -> bool {
+        self.activate_link_once_with_key(source_id, source_pane_id.to_owned(), url, |app, url| {
+            app.activate_resolved_link_with(
+                url,
+                move |app, url| {
+                    app.invoke_plugin_link_handler_for_url_from_source(url, source_pane_id, view_id)
+                },
+                move |_, url| fallback(url),
+            )
+        })
+    }
+
+    fn activate_link_once_with_key(
+        &mut self,
+        source_id: super::InputSourceId,
+        source_key: String,
+        url: String,
+        activate: impl FnOnce(&mut Self, String) -> bool,
+    ) -> bool {
+        let at = std::time::Instant::now();
+        if self
+            .last_link_click
+            .as_ref()
+            .is_some_and(|last| last.is_duplicate_for(source_id, &source_key, &url, at))
+        {
+            if let Some(last) = self.last_link_click.as_mut() {
+                last.at = at;
+            }
+            return true;
+        }
+        self.last_link_click = None;
+        if activate(self, url.clone()) {
+            self.last_link_click = Some(LinkClickState {
+                source_id,
+                source_key,
+                url,
+                at,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn activate_resolved_link(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        url: String,
+        view_id: Option<&crate::api::schema::ViewId>,
+    ) -> bool {
+        self.activate_resolved_link_with(
+            url,
+            move |app, url| app.invoke_plugin_link_handler_for_url_for_view(url, pane_id, view_id),
+            move |app, url| app.queue_open_url(source_id, url),
+        )
+    }
+
+    fn activate_resolved_link_with(
+        &mut self,
+        url: String,
+        invoke_plugin_handler: impl FnOnce(&mut Self, &str) -> Result<bool, String>,
+        fallback: impl FnOnce(&mut Self, String) -> bool,
+    ) -> bool {
+        self.last_pane_click = None;
+        let Some(url) = crate::app::actions::safe_osc8_url(&url).map(str::to_owned) else {
+            return false;
+        };
+        match invoke_plugin_handler(self, &url) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+            }
+        }
+        let Some(url) = crate::web_url::safe_web_url(&url).map(str::to_owned) else {
+            return false;
+        };
+        fallback(self, url)
+    }
+
+    fn queue_open_url(&mut self, source_id: super::InputSourceId, url: String) -> bool {
+        let result = self
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl { url, source_id });
+        if result.is_err() {
+            tracing::warn!("failed to queue pane URL opening");
+        }
+        result.is_ok()
+    }
+
+    fn handle_url_click_for_view(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         mouse: MouseEvent,
-        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
     ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            || !mouse.modifiers.contains(modified_url_click_modifier())
         {
             return false;
         }
@@ -588,37 +769,105 @@ impl App {
         };
         let viewport_row = mouse.row.saturating_sub(info.inner_rect.y);
         let col = mouse.column.saturating_sub(info.inner_rect.x);
-        let Some(url) =
-            self.state
-                .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
-        else {
+        let Some(link) = self.state.resolved_link_at_pane_cell(
+            &self.terminal_runtimes,
+            info.id,
+            viewport_row,
+            col,
+        ) else {
             return false;
         };
 
-        let plugin_handled = match self.invoke_plugin_link_handler_for_url(&url, info.id) {
-            Ok(handled) => handled,
-            Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
-                false
-            }
+        self.activate_link_click(source_id, info.id, link.url, view_id)
+    }
+
+    fn update_hovered_pane_link(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Moved) {
+            return false;
+        }
+        if self.state.mode != Mode::Terminal {
+            return self.clear_hovered_pane_link();
+        }
+        let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
+            return self.clear_hovered_pane_link();
         };
-        if !plugin_handled && crate::app::actions::safe_web_url(&url).is_none() {
+        if mouse.column < info.inner_rect.x
+            || mouse.column >= info.inner_rect.x.saturating_add(info.inner_rect.width)
+            || mouse.row < info.inner_rect.y
+            || mouse.row >= info.inner_rect.y.saturating_add(info.inner_rect.height)
+        {
+            return self.clear_hovered_pane_link();
+        }
+
+        let position = crate::app::PaneHoverPosition {
+            pane_id: info.id,
+            inner_rect: info.inner_rect,
+            viewport_row: mouse.row.saturating_sub(info.inner_rect.y),
+            col: mouse.column.saturating_sub(info.inner_rect.x),
+        };
+        if self.state.hovered_pane_cell == Some(position) {
+            return false;
+        }
+        self.state.hovered_pane_cell = Some(position);
+        if self.state.hovered_link.as_ref().is_some_and(|link| {
+            link.pane_id == info.id
+                && link.inner_rect == info.inner_rect
+                && link.cells.contains(&(mouse.column, mouse.row))
+        }) {
             return false;
         }
 
-        self.last_pane_click = None;
-        self.pending_url_click_sources.insert(source_id);
-        if plugin_handled {
-            return true;
+        let hovered_link = self
+            .state
+            .resolved_link_at_pane_cell(
+                &self.terminal_runtimes,
+                info.id,
+                position.viewport_row,
+                position.col,
+            )
+            .map(|link| link.hover);
+        let changed = self.state.hovered_link != hovered_link;
+        self.state.hovered_link = hovered_link;
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
         }
-        match open_url(&url) {
-            Ok(Some(child)) => self.detached_process_children.push(child),
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
-            }
+        changed
+    }
+
+    pub(crate) fn clear_hovered_pane_link(&mut self) -> bool {
+        self.state.hovered_pane_cell = None;
+        let changed = self.state.hovered_link.take().is_some();
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
         }
-        true
+        changed
+    }
+
+    pub(crate) fn refresh_hovered_link_for_panes(
+        &mut self,
+        pty_sources: &std::collections::HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let Some(position) = self.state.hovered_pane_cell else {
+            return false;
+        };
+        if !pty_sources.contains(&position.pane_id) || self.state.mode != Mode::Terminal {
+            return false;
+        }
+        let hovered_link = self
+            .state
+            .resolved_link_at_pane_cell(
+                &self.terminal_runtimes,
+                position.pane_id,
+                position.viewport_row,
+                position.col,
+            )
+            .map(|link| link.hover);
+        let changed = self.state.hovered_link != hovered_link;
+        self.state.hovered_link = hovered_link;
+        if changed {
+            self.hover_generation = self.hover_generation.wrapping_add(1);
+        }
+        changed
     }
 
     fn handle_pane_double_click(&mut self, mouse: MouseEvent) -> bool {
@@ -746,6 +995,7 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             .copy_mode
             .as_ref()
             .is_some_and(|copy_mode| copy_mode.search.prompt.is_some()),
+        Mode::Findr => true,
         _ => false,
     }
 }
@@ -943,6 +1193,35 @@ mod tests {
         )
     }
 
+    #[test]
+    fn full_open_url_queue_rejects_safe_link_without_consuming_it() {
+        let mut app = test_app();
+        for _ in 0..crate::app::APP_EVENT_CHANNEL_CAPACITY {
+            app.event_tx
+                .try_send(crate::events::AppEvent::OpenUrl {
+                    url: "https://example.com/fill".into(),
+                    source_id: 0,
+                })
+                .expect("fill OpenUrl queue");
+        }
+        assert!(app
+            .event_tx
+            .try_send(crate::events::AppEvent::OpenUrl {
+                url: "https://example.com/overflow".into(),
+                source_id: 0,
+            })
+            .is_err());
+
+        let source_id = 41;
+        assert!(!app.activate_link_click(
+            source_id,
+            crate::layout::PaneId::alloc(),
+            "https://example.com/click".into(),
+            None,
+        ));
+        assert!(!app.pending_url_click_sources.contains(&source_id));
+    }
+
     #[tokio::test]
     async fn paste_routes_to_rename_modal_input() {
         let mut app = test_app();
@@ -1047,5 +1326,170 @@ mod tests {
 
         state.mode = Mode::ConfirmClose;
         assert!(!modal_paste_target_active(&state));
+    }
+    #[test]
+    fn workspace_plugin_toggle_collapses_and_expands_without_focusing() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-toggle");
+        let workspace_id = workspace.id.clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 0, 25, 20);
+
+        assert!(app.handle_workspace_plugin_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            80,
+            19,
+        )));
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert!(pane.collapsed);
+        assert!(!pane.focused);
+
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(105, 0, 1, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::default();
+        assert!(app.handle_workspace_plugin_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            105,
+            19,
+        )));
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert!(!pane.collapsed);
+        assert!(!pane.focused);
+    }
+    #[test]
+    fn findr_mouse_over_plugin_stays_modal_and_does_not_forward() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-findr-mouse");
+        let workspace_id = workspace.id.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id,
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 1, 25, 19);
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        app.state.mode = Mode::Findr;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 82, 5));
+
+        assert_eq!(app.state.mode, Mode::Findr);
+        assert_eq!(
+            app.state.findr.as_ref().map(|findr| findr.pane_id),
+            Some(pane_id)
+        );
+    }
+
+    #[test]
+    fn findr_mouse_scroll_reschedules_incomplete_scan() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("findr-scroll-deadline");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.complete = false;
+        app.state.findr = Some(findr);
+        app.state.mode = Mode::Findr;
+        app.findr_scan_deadline = None;
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1));
+
+        assert!(app.findr_scan_deadline.is_some());
+    }
+
+    #[test]
+    fn findr_left_release_cancels_inherited_mouse_gesture() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("findr-release");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        app.state.mode = Mode::Findr;
+        app.state.drag = Some(crate::app::state::DragState {
+            target: crate::app::state::DragTarget::SidebarDivider,
+        });
+        app.state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        app.state.selection_autoscroll = Some(crate::app::state::SelectionAutoscroll {
+            direction: crate::app::state::SelectionAutoscrollDirection::Down,
+            last_mouse_screen_col: 0,
+            last_mouse_screen_row: 0,
+            inner_rect: ratatui::layout::Rect::new(0, 0, 1, 1),
+        });
+        app.selection_autoscroll_deadline = Some(std::time::Instant::now());
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 1));
+
+        assert!(app.state.drag.is_none());
+        assert!(app.state.selection.is_none());
+        assert!(app.state.selection_autoscroll.is_none());
+        assert!(app.selection_autoscroll_deadline.is_none());
+    }
+
+    #[test]
+    fn workspace_plugin_separator_drag_resizes_without_closing() {
+        let mut app = app_for_mouse_test();
+        let workspace = crate::workspace::Workspace::test_new("plugin-resize");
+        let workspace_id = workspace.id.clone();
+        let pane_id = crate::layout::PaneId::alloc();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id,
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.workspace_plugin_pane_outer = ratatui::layout::Rect::new(80, 0, 26, 20);
+        app.state.view.workspace_plugin_pane_inner = ratatui::layout::Rect::new(81, 1, 25, 19);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 80, 5));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(crate::app::state::DragTarget::WorkspacePluginDivider { .. })
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 5));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 70, 5));
+
+        let pane = app.state.workspace_plugin_panes.get(&workspace_id).unwrap();
+        assert_eq!(pane.pane_id, pane_id);
+        assert_eq!(pane.width, Some(crate::popup_size::PopupSize::Cells(36)));
+        assert!(app.state.drag.is_none());
     }
 }

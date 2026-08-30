@@ -1,0 +1,29 @@
+id = "omp"
+version = "2026.08.29.1"
+min_engine_version = 2
+updated_at = "2026-08-29T00:00:00Z"
+aliases = ["herdr:omp"]
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 1100
+region = "osc_title"
+visible_blocker = true
+regex = ['^π !(?: |$)']
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1050
+region = "osc_title"
+visible_working = true
+regex = ['^π [:⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)']
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+regex = ['^π(?: >(?: |$)|:(?: |$)|$)']

@@ -1,3 +1,4 @@
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) fn display_width(text: &str) -> usize {
@@ -54,17 +55,21 @@ fn take_prefix_width(text: &str, max_width: usize) -> String {
 }
 
 fn take_suffix_width(text: &str, max_width: usize) -> String {
-    let mut output = Vec::new();
+    tail_within_width(text, max_width).to_string()
+}
+
+pub(crate) fn tail_within_width(text: &str, max_width: usize) -> &str {
+    let mut start = text.len();
     let mut width = 0usize;
-    for ch in text.chars().rev() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_width > max_width {
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let grapheme_width = grapheme.width();
+        if width + grapheme_width > max_width {
             break;
         }
-        output.push(ch);
-        width += ch_width;
+        start = index;
+        width += grapheme_width;
     }
-    output.into_iter().rev().collect()
+    &text[start..]
 }
 
 #[cfg(test)]
@@ -85,5 +90,11 @@ mod tests {
 
         assert!(text.contains('…'));
         assert!(display_width(&text) <= 12);
+    }
+
+    #[test]
+    fn tail_within_width_keeps_graphemes_intact() {
+        assert_eq!(tail_within_width("xe\u{301}", 1), "e\u{301}");
+        assert_eq!(tail_within_width("x👩‍💻", 2), "👩‍💻");
     }
 }

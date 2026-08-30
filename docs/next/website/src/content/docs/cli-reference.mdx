@@ -177,7 +177,7 @@ herdr pane resize --direction left|right|up|down [--amount FLOAT] [--pane ID|--c
 herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]
 herdr pane rename <pane_id> <label>|--clear
 herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane
-herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]
+herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace WORKSPACE] [--ratio FLOAT] [--cwd PATH] [--target local|ssh:HOST] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]
 herdr pane swap --direction left|right|up|down [--pane ID|--current]
 herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
@@ -188,9 +188,35 @@ herdr pane close <pane_id>
 
 For pane commands that accept `--current`, Herdr uses the calling pane's
 `HERDR_PANE_ID` when the command runs inside a Herdr pane. For `pane split`,
-an explicit pane id or `--pane ID` splits that pane, `--current` splits the
-calling pane, and an omitted target keeps using the UI-focused pane.
-The split response exposes the new pane ID as `.result.pane.pane_id`.
+an explicit pane id, `--pane ID`, or `--current` uses that selected pane for
+both insertion and inherited execution target/cwd. With no pane selector,
+Herdr uses the UI-focused pane. The split response exposes the new pane ID as
+`.result.pane.pane_id`.
+
+`--workspace` selects that workspace's focused tiled pane as the insertion point.
+When a managed workspace-right plugin invokes a workspace-selected split without
+an explicit pane selector, the new pane may inherit the plugin caller's execution
+target and cwd while still splitting the workspace's focused tiled pane.
+
+Per-pane SSH execution targets are Unix-only. This is separate from whole-server
+`herdr --remote`, which remains available on Windows clients connecting to
+supported Linux and macOS hosts.
+
+Without `--target`, a split inherits the source pane's execution target. Use
+`--target local` to force local execution or `--target ssh:HOST` to run the new
+terminal on a trusted SSH host while keeping it in the current Herdr UI. A
+same-target split follows the source cwd. A cross-target local split uses the
+configured `terminal.new_cwd`; a cross-target SSH split starts in the remote
+user's home. An explicit `--cwd` overrides either default. Prepare a matching
+remote Herdr first by running `herdr --remote HOST`; per-pane launches never
+install or replace remote software. See [Persistence and remote access](/docs/persistence-remote/).
+
+Per-pane launches use non-interactive OpenSSH with bounded connection and request-delivery timeouts, so authentication must already be available through keys or `ssh-agent`.
+
+`pane get` and `pane list` report each pane's `execution_target`. Remote cwd
+reports come from the remote terminal and are not checked against the server's
+filesystem. `pane process-info` is local-only; remote panes return
+`pane_process_info_unsupported` rather than local process facts.
 
 `pane input --right-click pane` forwards unmodified right-click gestures to a
 mouse-reporting pane application. `herdr` restores the default pane menu.
@@ -307,7 +333,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 Agent targets are either a unique live agent name or the pane ID that currently hosts the agent. Terminal IDs and bare agent-kind labels are not agent targets. Agents started through `agent start` require a name; manually launched agents remain unnamed and use their pane ID.
 
-`agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `maki`, and `muse`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
+`agent start` activates an existing available shell pane: the pane's interactive shell must own the foreground, with no foreground command, editor, or agent running. `agent start` currently supports local panes only; targeting an SSH-backed pane returns `agent_start_unsupported_execution_target`. Topology must be created separately. Names are unique among live agents and must match `[a-z][a-z0-9_-]{0,31}`. The kind selects Herdr's canonical interactive executable, while arguments after `--` are passed to that executable. Supported kinds are `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `qwen`, `maki`, and `muse`. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Temporary detection uncertainty does not clear it.
 
 A successful start returns only after the expected agent owns the same terminal and is ready for interactive input. If detection reports `blocked` during startup, the command returns `agent_not_ready` immediately. The name remains available for `agent read` and `agent send-keys`, and becomes ready for prompts after detection reports `idle`. The default startup timeout is 30000 milliseconds; explicit values must be greater than 3000 and no more than 300000.
 
@@ -454,23 +480,41 @@ herdr plugin log list [--plugin ID] [--limit N]
 Managed terminal panes:
 
 ```bash
-herdr plugin pane open --plugin ID --entrypoint ID [--placement overlay|popup|split|tab|zoomed] [--width SIZE] [--height SIZE] [--workspace ID] [--target-pane PANE] [--direction right|down] [--cwd PATH] [--env KEY=VALUE] [--focus|--no-focus]
+herdr plugin pane open --plugin ID --entrypoint ID [--placement overlay|popup|workspace-right|split|tab|zoomed] [--scope shared|client-private] [--width SIZE] [--height SIZE] [--workspace ID] [--target-pane PANE] [--direction right|down] [--cwd PATH] [--env KEY=VALUE] [--focus|--no-focus]
 herdr plugin pane focus <pane_id>
 herdr plugin pane close <pane_id>
 ```
 
 `plugin pane open` requires the plugin to be linked, enabled, and compatible
-with the current platform. It starts a manifest-declared `[[panes]]` command as
-a Herdr-managed terminal pane. The manifest default is `overlay`, which opens a
-temporary zoomed overlay over the active pane. It can also open as a split, a
-new tab, a zoomed pane, or a session-modal `popup` that does not change the tab
-layout. `--width` and `--height` set the outer popup dimensions in terminal
-cells or percentages such as `80%`; omitted dimensions default to half the
-terminal size, and values smaller than the popup minimum are clamped. A popup
-is not a Herdr pane, does not export `HERDR_PANE_ID`, and does not participate
-in pane or agent APIs. Native non-terminal plugin panes are outside plugin v1.
+with the effective execution target. It starts a manifest-declared `[[panes]]`
+command as a Herdr-managed terminal surface. The manifest placement default is
+`overlay`, which opens a temporary zoomed overlay over the active pane. It can
+also open as a split, a new tab, a zoomed pane, a session-modal `popup`, or a
+`workspace-right` pane. Scope defaults to `shared`; `--scope` overrides the
+manifest. `client-private` is valid only with popup placement and uses the
+calling plugin environment's `HERDR_VIEW_ID` to route the popup to its owning
+connected app client.
 
-`--env KEY=VALUE` can be repeated on process-launching commands. It applies to the newly launched process only. Herdr-managed variables such as `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_ENTRYPOINT_ID`, and `HERDR_PLUGIN_CONTEXT_JSON` stay authoritative when they conflict with caller-provided env.
+A `workspace-right` pane occupies the active workspace's right edge outside the
+tab split tree. Each workspace can own one; tab switches retain it, and
+workspace switches restore that workspace's visibility and focus. `--no-focus`
+starts it as a collapsed one-column strip; focusing expands it. The collapse
+control itself never changes focus. `--width` sets its outer width in terminal
+cells or as a percentage such as `30%`, with a default of 30%. It exports
+`HERDR_WORKSPACE_ID` and `HERDR_PANE_ID` but not `HERDR_TAB_ID`. The pane is
+runtime-scoped rather than snapshot-persisted and closes with its workspace, its
+process, or `plugin pane close`.
+
+For `popup`, `--width` and `--height` set the outer dimensions in terminal
+cells or percentages such as `80%`; omitted dimensions default to half the
+terminal size, and values smaller than the popup minimum are clamped. A shared
+popup is a singleton session resource. A client-private popup belongs to one
+connected app client, which can own one independent popup runtime. Both popup
+scopes have no public pane ID, do not export `HERDR_PANE_ID`, and do not
+participate in pane or agent APIs. Native non-terminal plugin panes are outside
+plugin v1.
+
+`--env KEY=VALUE` can be repeated on process-launching commands. It applies to the newly launched process only. Herdr-managed variables such as `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`, `HERDR_VIEW_ID`, `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_ENTRYPOINT_ID`, and `HERDR_PLUGIN_CONTEXT_JSON` stay authoritative when they conflict with caller-provided env.
 
 ## Read sources
 
