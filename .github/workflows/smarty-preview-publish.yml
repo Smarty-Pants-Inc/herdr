@@ -1191,7 +1191,7 @@ jobs:
           PY
           }
           refresh_release() {
-            gh api "repos/$REPOSITORY/releases/tags/$TAG" > "$1"
+            gh api "repos/$REPOSITORY/releases/$release_id" > "$1"
             fetch_assets "$1" "$1.assets"
             merge_assets "$1" "$1.assets"
           }
