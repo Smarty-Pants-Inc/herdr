@@ -29,6 +29,7 @@ WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview.yml"
 )
 CI_WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
+PR_GATE_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/pr-gate.yml"
 INSTALLER_PATH = Path(__file__).resolve().parents[1] / "website/install.ps1"
 
 
@@ -37,6 +38,9 @@ def workflow_source() -> str:
 
 def ci_workflow_source() -> str:
     return CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+def pr_gate_source() -> str:
+    return PR_GATE_PATH.read_text(encoding="utf-8")
 
 
 def workflow_jobs(source: str) -> dict[str, str]:
@@ -76,23 +80,42 @@ def workflow_steps(job: str) -> dict[str, str]:
 
 
 class CiWorkflowTests(unittest.TestCase):
-    def test_title_gate_rechecks_edits_and_exempts_only_mergify_queue_prs(self):
+    def test_title_and_concurrency_guards_exempt_only_mergify_queue_prs(self):
         source = ci_workflow_source()
         self.assertIn("types: [opened, synchronize, reopened, edited]", source)
         title_step = workflow_steps(workflow_jobs(source)["conventional-commits"])[
             "Validate PR title"
         ]
-        self.assertIn("github.actor != 'mergify[bot]'", title_step)
+        self.assertIn("github.event.pull_request.user.id != 37929162", title_step)
         self.assertIn(
-            "startsWith(github.head_ref, 'mergify/merge-queue/') == false",
+            "startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false",
             title_step,
         )
+        self.assertIn("github.event.pull_request.user.id == 37929162", source)
+        self.assertIn(
+            "startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') && github.run_id",
+            source,
+        )
+        self.assertIn("cancel-in-progress: ${{ github.event_name != 'pull_request'", source)
         self.assertFalse(
             conventional_commits.valid_subject(
                 "merge queue: checking main (abc1234) and #1 together"
             )
         )
 
+
+
+class PrGateWorkflowTests(unittest.TestCase):
+    def test_mergify_queue_exemption_requires_bot_id_prefix_and_allowed_base(self):
+        source = pr_gate_source()
+        self.assertIn("const MERGIFY_BOT_USER_ID = 37929162;", source)
+        self.assertIn(
+            "const MERGIFY_QUEUE_BASES = new Set(['master', 'smarty-preview-source']);",
+            source,
+        )
+        self.assertIn("pr.user.id === MERGIFY_BOT_USER_ID", source)
+        self.assertIn("pr.head.ref.startsWith('mergify/merge-queue/')", source)
+        self.assertIn("MERGIFY_QUEUE_BASES.has(pr.base.ref)", source)
 
 class PreviewNotesTests(unittest.TestCase):
     def test_humanize_groups_conventional_subjects(self):

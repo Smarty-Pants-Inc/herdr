@@ -15,8 +15,8 @@ env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.id == 37929162 && startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false }}
 
 jobs:
   conventional-commits:
@@ -34,7 +34,7 @@ jobs:
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
       - name: Validate PR title
-        if: ${{ github.event_name == 'pull_request' && (github.actor != 'mergify[bot]' || startsWith(github.head_ref, 'mergify/merge-queue/') == false) }}
+        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"

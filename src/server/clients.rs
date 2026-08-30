@@ -795,6 +795,8 @@ pub(crate) struct ClientConnection {
     pub(crate) host_sgr_pixels_active: Option<bool>,
     /// Outside-started gesture retained by the server with its exact native authority.
     pub(crate) native_omp_server_mouse_gesture: Option<NativeOmpServerGesture>,
+    /// Release-aware keys that began in a server-owned overlay.
+    pub(crate) native_omp_server_keys: HashSet<crate::input::KeyIdentity>,
     /// Frame-only capability expected in the next authority acknowledgement.
     pub(crate) omp_renderer_frame_nonce: Option<[u8; 16]>,
     /// Projected pane paired with the current frame nonce.
@@ -898,6 +900,7 @@ impl ClientConnection {
             host_sgr_pixels_active: None,
             host_keyboard_report_all_active: None,
             native_omp_server_mouse_gesture: None,
+            native_omp_server_keys: HashSet::new(),
             omp_renderer_frame_nonce: None,
             omp_renderer_frame_pane: None,
             staged_clipboard_files: Vec::new(),

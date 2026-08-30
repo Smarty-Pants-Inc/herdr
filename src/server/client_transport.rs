@@ -476,8 +476,19 @@ pub(crate) enum ServerEvent {
         data: Vec<u8>,
         geometry: crate::input::mouse::HostGeometry,
     },
+    /// Pixel input accepted by the client under an exact server-owned renderer frame.
+    ServerOwnedInputPixels {
+        client_id: u64,
+        data: Vec<u8>,
+        geometry: crate::input::mouse::HostGeometry,
+    },
     /// A client sent structured input events.
     ClientInputEvents {
+        client_id: u64,
+        events: Vec<crate::protocol::ClientInputEvent>,
+    },
+    /// Structured input accepted by the client under an exact server-owned renderer frame.
+    ServerOwnedInputEvents {
         client_id: u64,
         events: Vec<crate::protocol::ClientInputEvent>,
     },
@@ -1176,6 +1187,47 @@ fn client_read_loop(
                     geometry,
                 }
             }
+            ClientMessage::ServerOwnedInputPixels {
+                data,
+                cols,
+                rows,
+                width_px,
+                height_px,
+            } => {
+                let Some(geometry) =
+                    crate::input::mouse::HostGeometry::new(cols, rows, width_px, height_px)
+                else {
+                    warn!(
+                        client_id,
+                        cols,
+                        rows,
+                        width_px,
+                        height_px,
+                        "invalid server-owned pixel mouse geometry from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                };
+                if data.len() > MAX_PIXEL_MOUSE_PAYLOAD
+                    || crate::input::mouse::parse_report(&data).is_none()
+                {
+                    warn!(
+                        client_id,
+                        size = data.len(),
+                        max = MAX_PIXEL_MOUSE_PAYLOAD,
+                        "invalid server-owned pixel mouse report from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                ServerEvent::ServerOwnedInputPixels {
+                    client_id,
+                    data,
+                    geometry,
+                }
+            }
             ClientMessage::InputEvents { events } => match input_event_limit(&events) {
                 InputEventLimit::WithinLimits => {
                     ServerEvent::ClientInputEvents { client_id, events }
@@ -1209,6 +1261,45 @@ fn client_read_loop(
                         size,
                         max = MAX_INPUT_PAYLOAD,
                         "oversized structured input payload from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+            },
+            ClientMessage::ServerOwnedInputEvents { events } => match input_event_limit(&events) {
+                InputEventLimit::WithinLimits => {
+                    ServerEvent::ServerOwnedInputEvents { client_id, events }
+                }
+                InputEventLimit::TooManyEvents => {
+                    warn!(
+                        client_id,
+                        count = events.len(),
+                        "oversized server-owned input event batch from client, closing"
+                    );
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                    break;
+                }
+                InputEventLimit::PasteTooLarge { size } => {
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized server-owned structured paste from client, rejecting"
+                    );
+                    ServerEvent::ClientPasteRejected {
+                        client_id,
+                        size,
+                        max: MAX_INPUT_PAYLOAD,
+                    }
+                }
+                InputEventLimit::InputPayloadTooLarge { size } => {
+                    warn!(
+                        client_id,
+                        size,
+                        max = MAX_INPUT_PAYLOAD,
+                        "oversized server-owned structured input payload from client, closing"
                     );
                     let _ = server_event_tx
                         .blocking_send(ServerEvent::ClientDisconnected { client_id });

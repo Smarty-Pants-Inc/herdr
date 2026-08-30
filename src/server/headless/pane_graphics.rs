@@ -50,12 +50,7 @@ impl HeadlessServer {
         let direct_client = self
             .direct_graphics_available()
             .then_some(self.foreground_client_id)
-            .flatten()
-            .filter(|&client_id| {
-                !direct_key
-                    .as_ref()
-                    .is_some_and(|key| self.native_omp_surface_active_for_pane(client_id, key.0))
-            });
+            .flatten();
         let gate_busy = self
             .app
             .pane_graphics
@@ -99,6 +94,7 @@ impl HeadlessServer {
                             self.app.state.view.tab_surface(),
                             client.cell_size,
                             !internal_changed
+                                && !self.native_omp_surface_active(client_id)
                                 && self
                                     .replaced_omp_pane_info(client_id)
                                     .is_none_or(|info| info.id != key.0),
@@ -109,7 +105,7 @@ impl HeadlessServer {
                     let Some(command) = command else {
                         if self.install_inline_fallback(&key) {
                             if msg.respond_to.send(response).is_err() {
-                                self.retire_direct_gate(&key);
+                                self.retire_direct_gate_with_notification(&key);
                             }
                             return if internal_changed {
                                 RenderImpact::Full
@@ -117,7 +113,7 @@ impl HeadlessServer {
                                 RenderImpact::Graphics
                             };
                         }
-                        self.retire_direct_gate(&key);
+                        self.retire_direct_gate_with_notification(&key);
                         return if internal_changed {
                             RenderImpact::Full
                         } else {
@@ -183,7 +179,7 @@ impl HeadlessServer {
         let response_failed = msg.respond_to.send(response).is_err();
         if succeeded && response_failed {
             if let Some(key) = direct_key {
-                self.retire_direct_gate(&key);
+                self.retire_direct_gate_with_notification(&key);
             }
         }
         if internal_changed {
@@ -258,7 +254,7 @@ impl HeadlessServer {
         {
             return true;
         }
-        self.retire_direct_gate(key);
+        self.retire_direct_gate_with_notification(key);
         false
     }
 
@@ -266,6 +262,24 @@ impl HeadlessServer {
         if self.app.pane_graphics.slots.remove(key).is_some() {
             self.app.pane_graphics.mark_changed();
         }
+    }
+
+    fn retire_direct_gate_with_notification(&mut self, key: &crate::app::pane_graphics::Key) {
+        let retirement = self.app.pane_graphics.slots.get(key).and_then(|slot| {
+            slot.direct_gate
+                .as_ref()
+                .map(|gate| (gate.client_id, gate.transfer_id, slot.host_image_id))
+        });
+        if let Some((client_id, transfer_id, image_id)) = retirement {
+            self.send_to_client(
+                client_id,
+                ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id,
+                    image_id,
+                },
+            );
+        }
+        self.retire_direct_gate(key);
     }
 
     pub(super) fn start_direct_graphics_response(
@@ -320,7 +334,7 @@ impl HeadlessServer {
             .iter()
             .any(|workspace| workspace.pane_state(key.0).is_some());
         if !pane_is_live {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             return false;
         }
         if success {
@@ -355,6 +369,13 @@ impl HeadlessServer {
                     .trust_pane_layer(&key, host_image_id, layer);
             }
             if gate.respond_to.send(gate.success_response).is_err() {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    },
+                );
                 self.retire_direct_gate(&key);
                 return true;
             }
@@ -366,7 +387,7 @@ impl HeadlessServer {
         }
         self.app.direct_graphics_available = false;
         if !self.install_inline_fallback(&key) {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             self.retire_all_direct_graphics();
             return true;
         }
@@ -381,10 +402,17 @@ impl HeadlessServer {
             .filter(|slot| slot.stream_is_active())
             .and_then(|slot| slot.direct_gate.take());
         let Some(gate) = gate else {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             return true;
         };
         if gate.respond_to.send(gate.success_response).is_err() {
+            self.send_to_client(
+                client_id,
+                ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id,
+                    image_id,
+                },
+            );
             self.retire_direct_gate(&key);
             return true;
         }
@@ -443,7 +471,7 @@ impl HeadlessServer {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in keys {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
         }
     }
 
@@ -625,7 +653,9 @@ impl HeadlessServer {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
             }
-            let excluded_graphics_pane = self.replaced_omp_pane_info(client_id).map(|info| info.id);
+            let excluded_graphics_pane = self
+                .graphics_excluded_omp_pane_info(client_id)
+                .map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 crate::render_prof::event("retained_graphics_fallback.client_missing");
                 return RetainedGraphicsOutcome::Fallback;
