@@ -4547,7 +4547,6 @@ impl HeadlessServer {
                     && target.bound
                     && target.ready
                     && target.surface_active
-                    && target.input_authority_acked
             })
         else {
             return false;
@@ -4561,12 +4560,7 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .and_then(|client| client.omp_renderer_target.clone())
-            .filter(|target| {
-                target.bound
-                    && target.ready
-                    && target.surface_active
-                    && target.input_authority_acked
-            })
+            .filter(|target| target.bound && target.ready && target.surface_active)
         else {
             return false;
         };
@@ -12634,8 +12628,72 @@ mod tests {
         assert!(
             server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
                 client_id: 1,
+                events: vec![
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Left,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                ],
+            })
+        );
+        let explicit_right_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(explicit_right_revision, server_owned_events_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                explicit_right_revision,
+                false,
+            ))
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle,
+                    )),
+                ],
+            })
+        );
+        let explicit_middle_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(explicit_middle_revision, explicit_right_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                explicit_middle_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), explicit_middle_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
                 events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
-                    crate::protocol::ClientMouseButton::Left,
+                    crate::protocol::ClientMouseButton::Middle,
                 ))],
             })
         );
@@ -12645,7 +12703,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .authority_revision;
-        assert_ne!(server_owned_pixels_revision, server_owned_events_revision);
+        assert_ne!(server_owned_pixels_revision, explicit_middle_revision);
         assert_eq!(
             acknowledge_current(&mut server),
             server_owned_pixels_revision
@@ -12689,10 +12747,46 @@ mod tests {
                     server_mouse(crate::protocol::ClientMouseKind::Down(
                         crate::protocol::ClientMouseButton::Left,
                     )),
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Left,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                ],
+            })
+        );
+        let focus_pending_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(focus_pending_revision, focus_loss_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        assert!(!server.clients[&1].native_omp_server_keys.is_empty());
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                focus_pending_revision,
+                false,
+            ))
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
                     crate::protocol::ClientInputEvent::FocusLost,
                     crate::protocol::ClientInputEvent::FocusGained,
                     server_mouse(crate::protocol::ClientMouseKind::Down(
-                        crate::protocol::ClientMouseButton::Right,
+                        crate::protocol::ClientMouseButton::Middle,
                     )),
                 ],
             })
@@ -12703,11 +12797,11 @@ mod tests {
             .as_ref()
             .unwrap()
             .authority_revision;
-        assert_ne!(focus_suffix_revision, focus_loss_revision);
+        assert_ne!(focus_suffix_revision, focus_pending_revision);
         assert_eq!(
             server.clients[&1].native_omp_server_mouse_gesture,
             Some(NativeOmpServerGesture::new(
-                MouseButton::Right,
+                MouseButton::Middle,
                 launch_id,
                 focus_suffix_revision,
                 false,
@@ -12718,7 +12812,7 @@ mod tests {
             server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
                 client_id: 1,
                 events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
-                    crate::protocol::ClientMouseButton::Right,
+                    crate::protocol::ClientMouseButton::Middle,
                 ))],
             })
         );
@@ -12895,14 +12989,63 @@ mod tests {
                 .unwrap()
                 .input_authority_acked
         );
-        assert_eq!(acknowledge_current(&mut server), ordinary_followon_revision);
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                server_mouse(crate::protocol::ClientMouseKind::Up(
+                    crate::protocol::ClientMouseButton::Right,
+                )),
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Middle,
+                )),
+            ],
+        }));
+        let ordinary_middle_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(ordinary_middle_revision, ordinary_followon_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                ordinary_middle_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), ordinary_middle_revision);
         assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
             client_id: 1,
             events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
-                crate::protocol::ClientMouseButton::Right,
+                crate::protocol::ClientMouseButton::Middle,
             ))],
         }));
         assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let current_unacked_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(current_unacked_revision, ordinary_middle_revision);
+        assert!(!server.reoffer_native_omp_input_authority(
+            1,
+            NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                ordinary_middle_revision,
+                false,
+            ),
+        ));
+        assert_eq!(
+            server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .authority_revision,
+            current_unacked_revision
+        );
 
         let third_revision = acknowledge_current(&mut server);
         let (_, consumed, authority_changed) = server.partition_native_omp_input(
