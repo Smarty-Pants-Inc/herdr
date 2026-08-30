@@ -392,6 +392,73 @@ class TrustedArchiveTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 trusted._safe_tar(linked, "fixture")
 
+    def test_producer_and_native_git_archive_modes_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "repository"
+            repository.mkdir()
+            subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+            (repository / "regular").write_text("regular\n", encoding="utf-8")
+            executable = repository / "executable"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=repository, check=True)
+            link_blob = subprocess.check_output(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=repository,
+                input=b"regular",
+            ).decode("ascii").strip()
+            subprocess.run(
+                ["git", "update-index", "--add", "--cacheinfo", f"120000,{link_blob},link"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            archive_path = root / "source.tar"
+            subprocess.run(
+                ["git", "archive", "--format=tar", "--output", str(archive_path), "HEAD"],
+                cwd=repository,
+                check=True,
+            )
+            with tarfile.open(archive_path) as archive:
+                self.assertEqual(archive.getmember("regular").mode, 0o664)
+                self.assertEqual(archive.getmember("executable").mode, 0o775)
+                link = archive.getmember("link")
+                self.assertTrue(link.issym())
+                self.assertEqual(link.mode, 0o777)
+                self.assertEqual(link.linkname, "regular")
+            trusted.validate_git_archive(archive_path, repository)
+            producer_archive = root / "producer.tar"
+            with tarfile.open(producer_archive, "w") as archive:
+                for name, payload, mode in (
+                    ("regular", b"regular\n", 0o644),
+                    ("executable", b"#!/bin/sh\n", 0o755),
+                ):
+                    info = tarfile.TarInfo(name)
+                    info.mode = mode
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+                link = tarfile.TarInfo("link")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "regular"
+                link.mode = 0
+                archive.addfile(link)
+            trusted.validate_git_archive(producer_archive, repository)
+
     def test_tar_extraction_writes_only_regular_members(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

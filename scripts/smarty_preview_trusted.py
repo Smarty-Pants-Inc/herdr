@@ -714,18 +714,21 @@ def validate_git_archive(archive_path: Path, repository: Path) -> None:
             if git_type == 0o120000:
                 if not member.issym():
                     _fail(f"Herdr source archive does not preserve Git symlink semantics: {path}")
-                expected_permissions = 0
+                expected_permissions = {0, 0o777}
                 source = io.BytesIO(member.linkname.encode("utf-8"))
                 expected_size = len(member.linkname.encode("utf-8"))
             else:
                 if not member.isfile():
                     _fail(f"Herdr source archive does not preserve Git regular-file semantics: {path}")
-                expected_permissions = git_mode & 0o7777
+                expected_permissions = {
+                    git_mode & 0o7777,
+                    0o775 if git_mode & 0o111 else 0o664,
+                }
                 source = bundle.extractfile(member)
                 if source is None:
                     _fail(f"Herdr source archive member cannot be read: {path}")
                 expected_size = member.size
-            if (member.mode & 0o7777) != expected_permissions:
+            if (member.mode & 0o7777) not in expected_permissions:
                 _fail(f"Herdr source archive mode differs from the Git tree: {path}")
             process = subprocess.Popen(
                 ["git", "-C", str(repository), "cat-file", "blob", object_id],
