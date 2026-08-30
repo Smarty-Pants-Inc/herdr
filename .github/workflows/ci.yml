@@ -15,8 +15,8 @@ env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.head_ref, 'mergify/merge-queue/') }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ startsWith(github.head_ref, 'mergify/merge-queue/') && github.run_id || 'latest' }}
+  cancel-in-progress: true
 
 jobs:
   conventional-commits:
