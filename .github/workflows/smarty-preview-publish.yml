@@ -984,7 +984,180 @@ jobs:
           test "$(git -C omp-source rev-parse HEAD^{commit})" = "$OMP_COMMIT"
           test "$(git -C omp-source rev-parse HEAD^{tree})" = "$OMP_TREE"
           test -z "$(git -C omp-source status --porcelain=v1 --untracked-files=all)"
+          python -I -S - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          record = json.loads(Path("metadata/source-validation.json").read_text(encoding="utf-8"))["omp"]
+          commit = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD"], text=True).strip()
+          tree = subprocess.check_output(["git", "-C", "omp-source", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          if commit != record["commit"] or tree != record["tree"]:
+              raise SystemExit("private OMP checkout differs from validated source record")
+          PY
+          mkdir -p source-archives
+          git -C omp-source archive --format=tar --output "$GITHUB_WORKSPACE/source-archives/omp-source.tar" HEAD
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive --archive source-archives/omp-source.tar --repository omp-source
+      - name: Resolve existing exact release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: Smarty-Pants-Inc/herdr
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api graphql \
+            -f query='query($tag: String!) { repository(owner: "Smarty-Pants-Inc", name: "herdr") { release(tagName: $tag) { databaseId } } }' \
+            -f tag="$TAG" > existing-release-lookup.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path("existing-release-lookup.json").read_text(encoding="utf-8")).get("data", {}).get("repository", {}).get("release")
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          if release is None:
+              output.write_text("reuse=false\n", encoding="ascii")
+              raise SystemExit(0)
+          if not isinstance(release, dict):
+              raise SystemExit("existing release lookup response is invalid")
+          release_id = release.get("databaseId")
+          if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id < 1:
+              raise SystemExit("existing release lookup ID is invalid")
+          Path("existing-release-id").write_text(f"{release_id}\n", encoding="ascii")
+          PY
+          if [ ! -f existing-release-id ]; then
+            exit 0
+          fi
+          release_id="$(cat existing-release-id)"
+          gh api "repos/$REPOSITORY/releases/$release_id" > existing-release.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path("existing-release.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != os.environ["TAG"]:
+              raise SystemExit("existing release tag mismatch")
+          draft = release.get("draft")
+          immutable = release.get("immutable")
+          if draft is True and immutable is not True:
+              reuse = "false"
+          elif draft is False and immutable is True:
+              reuse = "true"
+          else:
+              raise SystemExit("existing release is neither a mutable draft nor immutable publication")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="ascii") as output:
+              output.write(f"reuse={reuse}\n")
+          PY
+      - name: Reuse verified immutable release bytes
+        if: steps.existing.outputs.reuse == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: Smarty-Pants-Inc/herdr
+          TAG: ${{ needs.validate-seal.outputs.tag }}
+          BUILT_AT: ${{ needs.validate-seal.outputs.built_at }}
+          PARENT: ${{ needs.validate-seal.outputs.parent }}
+          SOURCE: ${{ needs.validate-seal.outputs.source }}
+          OMP: ${{ needs.validate-seal.outputs.omp }}
+          CERT_IDENTITY: https://github.com/Smarty-Pants-Inc/herdr/.github/workflows/smarty-preview-publish.yml@refs/heads/master
+          SOURCE_REF: refs/heads/master
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_id="$(cat existing-release-id)"
+          python -I -S - "$release_id" <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          release_id = sys.argv[1]
+          values = []
+          for page in range(1, 17):
+              raw = subprocess.check_output([
+                  "gh", "api", f"repos/{os.environ['REPOSITORY']}/releases/{release_id}/assets?per_page=100&page={page}"
+              ], text=True)
+              page_values = json.loads(raw)
+              if not isinstance(page_values, list):
+                  raise SystemExit("existing release asset page is invalid")
+              values.extend(page_values)
+              if len(page_values) < 100:
+                  break
+          else:
+              raise SystemExit("existing release asset pagination exceeds the bounded page limit")
+          Path("existing-release-assets.json").write_text(json.dumps(values, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > existing-tag.json
+          python -I -S - <<'PY'
+          import json, os
+          from pathlib import Path
+          identity = {key.lower(): os.environ[key] for key in ("TAG", "BUILT_AT", "PARENT", "SOURCE", "OMP")}
+          identity["build_id"] = identity["tag"].removeprefix("smarty-preview-")
+          Path("existing-identity.json").write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+          python publisher-source/scripts/smarty_preview_trusted.py validate-existing-release-metadata \
+            --release-json existing-release.json --assets-json existing-release-assets.json \
+            --identity existing-identity.json --output existing-release-metadata.json
+          rm -rf immutable-assets
+          mkdir immutable-assets
+          python -I -S - <<'PY' > existing-release-downloads
+          import json
+          from pathlib import Path
+          assets = json.loads(Path("existing-release-metadata.json").read_text(encoding="utf-8"))["assets"]
+          for name, record in assets.items():
+              print(f"{record['id']}\t{name}")
+          PY
+          while IFS=$'\t' read -r asset_id name; do
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$REPOSITORY/releases/assets/$asset_id" > "immutable-assets/$name"
+          done < existing-release-downloads
+          python publisher-source/scripts/smarty_preview_trusted.py validate-existing-release \
+            --release-json existing-release.json --assets-json existing-release-assets.json \
+            --tag-json existing-tag.json --identity existing-identity.json \
+            --asset-dir immutable-assets --output existing-release-record.json
+          gh attestation verify immutable-assets/smarty-pair.json \
+            --bundle immutable-assets/smarty-pair.provenance.sigstore.json --repo "$REPOSITORY" \
+            --cert-identity "$CERT_IDENTITY" --source-ref "$SOURCE_REF" \
+            --predicate-type https://slsa.dev/provenance/v1 --deny-self-hosted-runners \
+            --format json > existing-pair-attestation.json
+          python publisher-source/scripts/smarty_preview_trusted.py validate-pair-attestation \
+            --verification-json existing-pair-attestation.json --subject immutable-assets/smarty-pair.json \
+            --output existing-pair-attestation-record.json
+          attested_publisher="$(python -I -S -c 'import json; print(json.load(open("existing-pair-attestation-record.json"))["publisher_commit"])')"
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$REPOSITORY/contents/scripts/smarty_preview_trusted.py?ref=$attested_publisher" \
+            > attested-trusted-verifier.py
+          BUILD_ID="${TAG#smarty-preview-}"
+          PARENT_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["parent"])')"
+          SOURCE_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["source"])')"
+          OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["omp"])')"
+          python publisher-source/scripts/smarty_preview_release.py verify-attested-pair \
+            --asset-dir immutable-assets --expected-parent "$PARENT" --expected-source "$SOURCE" --expected-omp "$OMP" \
+            --expected-parent-tree "$PARENT_TREE" --expected-source-tree "$SOURCE_TREE" --expected-omp-tree "$OMP_TREE" \
+            --expected-tag "$TAG" --expected-build-id "$BUILD_ID" --herdr-root herdr-source --omp-root omp-source \
+            --trusted-verifier attested-trusted-verifier.py --source-archive-dir source-archives
+          while read -r bundle subject; do
+            gh attestation verify "immutable-assets/$subject" \
+              --bundle "immutable-assets/$bundle" --repo "$REPOSITORY" \
+              --cert-identity "$CERT_IDENTITY" --source-ref "$SOURCE_REF" \
+              --predicate-type https://slsa.dev/provenance/v1 --deny-self-hosted-runners >/dev/null
+          done <<'EOF'
+          smarty-provenance-linux-x86_64.sigstore.json herdr-linux-x86_64
+          smarty-provenance-linux-x86_64.sigstore.json omp-linux-x86_64
+          smarty-provenance-linux-x86_64.sigstore.json pi_natives.linux-x64-baseline.node
+          smarty-provenance-linux-x86_64.sigstore.json pi_natives.linux-x64-modern.node
+          smarty-provenance-linux-aarch64.sigstore.json herdr-linux-aarch64
+          smarty-provenance-linux-aarch64.sigstore.json omp-linux-aarch64
+          smarty-provenance-linux-aarch64.sigstore.json pi_natives.linux-arm64.node
+          smarty-provenance-macos-x86_64.sigstore.json herdr-macos-x86_64
+          smarty-provenance-macos-x86_64.sigstore.json omp-macos-x86_64
+          smarty-provenance-macos-x86_64.sigstore.json pi_natives.darwin-x64-baseline.node
+          smarty-provenance-macos-aarch64.sigstore.json herdr-macos-aarch64
+          smarty-provenance-macos-aarch64.sigstore.json omp-macos-aarch64
+          smarty-provenance-macos-aarch64.sigstore.json pi_natives.darwin-arm64.node
+          smarty-provenance-windows-x86_64.sigstore.json herdr-windows-x86_64.zip
+          smarty-pair.spdx.sigstore.json smarty-pair.spdx.json
+          EOF
+          rm -rf final-seal
+          python publisher-source/scripts/smarty_preview_trusted.py seal \
+            --asset-dir immutable-assets --identity existing-identity.json --output-dir final-seal
+          rm -rf release-assets
+          mv immutable-assets release-assets
       - name: Write platform and SBOM subject lists
+        if: steps.existing.outputs.reuse != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -1032,66 +1205,79 @@ jobs:
           )
           PY
       - name: Attest Linux x86_64 release subjects
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_linux_x86_64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/linux-x86_64.sha256
           show-summary: false
       - name: Save Linux x86_64 provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_linux_x86_64.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-linux-x86_64.sigstore.json
       - name: Attest Linux aarch64 release subjects
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_linux_aarch64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/linux-aarch64.sha256
           show-summary: false
       - name: Save Linux aarch64 provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_linux_aarch64.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-linux-aarch64.sigstore.json
       - name: Attest macOS x86_64 release subjects
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_macos_x86_64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/macos-x86_64.sha256
           show-summary: false
       - name: Save macOS x86_64 provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_macos_x86_64.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-macos-x86_64.sigstore.json
       - name: Attest macOS aarch64 release subjects
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_macos_aarch64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/macos-aarch64.sha256
           show-summary: false
       - name: Save macOS aarch64 provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_macos_aarch64.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-macos-aarch64.sigstore.json
       - name: Attest Windows x86_64 release subject
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_windows_x86_64
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/windows-x86_64.sha256
           show-summary: false
       - name: Save Windows x86_64 provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_windows_x86_64.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-provenance-windows-x86_64.sigstore.json
       - name: Attest SPDX release subjects
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_spdx
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: attest-subjects/spdx.sha256
           show-summary: false
       - name: Save SPDX provenance bundle
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_spdx.outputs.bundle-path }}
         run: test -s "$BUNDLE_PATH" && cp "$BUNDLE_PATH" release-assets/smarty-pair.spdx.sigstore.json
       - name: Build and verify canonical paired manifest
+        if: steps.existing.outputs.reuse != 'true'
         shell: bash
         env:
           TAG: ${{ needs.validate-seal.outputs.tag }}
@@ -1129,12 +1315,14 @@ jobs:
             --source-archive-dir source-archives --omp-bazel-graph metadata/omp-bazel-graph.json \
             --cargo-metadata-dir metadata/cargo-metadata --bun-version 1.4.0 --zig-version 0.15.2
       - name: Attest paired manifest
+        if: steps.existing.outputs.reuse != 'true'
         id: attest_pair
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: release-assets/smarty-pair.json
           show-summary: false
       - name: Save paired provenance bundle and seal release
+        if: steps.existing.outputs.reuse != 'true'
         env:
           BUNDLE_PATH: ${{ steps.attest_pair.outputs.bundle-path }}
           TAG: ${{ needs.validate-seal.outputs.tag }}
