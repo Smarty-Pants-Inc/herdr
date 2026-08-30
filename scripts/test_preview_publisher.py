@@ -402,6 +402,8 @@ class TrustedArchiveTests(unittest.TestCase):
             executable = repository / "executable"
             executable.write_text("#!/bin/sh\n", encoding="utf-8")
             executable.chmod(0o755)
+            (repository / ".gitattributes").write_text("*.cmd text eol=crlf\n", encoding="utf-8")
+            (repository / "windows.cmd").write_text("line\n", encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=repository, check=True)
             link_blob = subprocess.check_output(
                 ["git", "hash-object", "-w", "--stdin"],
@@ -437,16 +439,23 @@ class TrustedArchiveTests(unittest.TestCase):
             with tarfile.open(archive_path) as archive:
                 self.assertEqual(archive.getmember("regular").mode, 0o664)
                 self.assertEqual(archive.getmember("executable").mode, 0o775)
+                windows = archive.extractfile("windows.cmd")
+                self.assertIsNotNone(windows)
+                assert windows is not None
+                self.assertEqual(windows.read(), b"line\r\n")
                 link = archive.getmember("link")
                 self.assertTrue(link.issym())
                 self.assertEqual(link.mode, 0o777)
                 self.assertEqual(link.linkname, "regular")
+            (repository / ".gitattributes").write_text("*.cmd text eol=lf\n", encoding="utf-8")
             trusted.validate_git_archive(archive_path, repository)
             producer_archive = root / "producer.tar"
             with tarfile.open(producer_archive, "w") as archive:
                 for name, payload, mode in (
+                    (".gitattributes", b"*.cmd text eol=crlf\n", 0o644),
                     ("regular", b"regular\n", 0o644),
                     ("executable", b"#!/bin/sh\n", 0o755),
+                    ("windows.cmd", b"line\n", 0o644),
                 ):
                     info = tarfile.TarInfo(name)
                     info.mode = mode
