@@ -38,7 +38,6 @@ def workflow_source() -> str:
 
 def ci_workflow_source() -> str:
     return CI_WORKFLOW_PATH.read_text(encoding="utf-8")
-
 def pr_gate_source() -> str:
     return PR_GATE_PATH.read_text(encoding="utf-8")
 
@@ -104,7 +103,6 @@ class CiWorkflowTests(unittest.TestCase):
         )
 
 
-
 class PrGateWorkflowTests(unittest.TestCase):
     def test_mergify_queue_exemption_requires_bot_id_prefix_and_allowed_base(self):
         source = pr_gate_source()
@@ -116,6 +114,7 @@ class PrGateWorkflowTests(unittest.TestCase):
         self.assertIn("pr.user.id === MERGIFY_BOT_USER_ID", source)
         self.assertIn("pr.head.ref.startsWith('mergify/merge-queue/')", source)
         self.assertIn("MERGIFY_QUEUE_BASES.has(pr.base.ref)", source)
+
 
 class PreviewNotesTests(unittest.TestCase):
     def test_humanize_groups_conventional_subjects(self):
