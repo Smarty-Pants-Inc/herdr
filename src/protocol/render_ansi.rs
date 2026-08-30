@@ -678,7 +678,6 @@ fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a s
     let index = cell.hyperlink? as usize;
     frame.hyperlinks.get(index).map(String::as_str)
 }
-#[cfg(test)]
 pub(crate) fn frame_has_hyperlink_at(frame: &FrameData, column: u16, row: u16) -> bool {
     if column >= frame.width || row >= frame.height {
         return false;
