@@ -33,8 +33,8 @@ use super::{
         maybe_filter_primary_screen_scrollback_clear, parse_reported_cwd,
         restore_host_terminal_theme_if_needed, write_host_terminal_theme_selective,
         AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
-        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker, PendingOmpReplyAnchor,
-        RemoteExecReady, RemoteExecReadyFilter, ReportedCwd,
+        DefaultColorQuery, DefaultColorTrackedEvent, OmpReplyGenerationToken, OscDebugTracker,
+        PendingOmpReplyAnchor, RemoteExecReady, RemoteExecReadyFilter, ReportedCwd,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -731,6 +731,20 @@ impl PaneTerminal {
     /// Clears retained OSC title/progress evidence on foreground agent change.
     pub fn clear_agent_osc_state(&self) {
         self.ghostty.clear_agent_osc_state()
+    }
+
+    pub fn omp_reply_generation(&self) -> OmpReplyGenerationToken {
+        self.ghostty.omp_reply_generation()
+    }
+
+    /// Advances `expected`; only a marker from a confirmed replacement may survive.
+    pub fn reset_omp_reply_state_if_current(
+        &self,
+        expected: OmpReplyGenerationToken,
+        preserve_newer_replacement_marker: bool,
+    ) -> OmpReplyGenerationToken {
+        self.ghostty
+            .reset_omp_reply_state_if_current(expected, preserve_newer_replacement_marker)
     }
 
     pub fn keyboard_protocol(
@@ -1567,6 +1581,33 @@ impl GhosttyPaneTerminal {
         if let Ok(mut core) = self.core.lock() {
             core.agent_osc_state.clear_retained();
         }
+    }
+
+    pub fn omp_reply_generation(&self) -> OmpReplyGenerationToken {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.omp_reply_generation())
+            .unwrap_or_default()
+    }
+
+    /// Serializes a process-boundary reset with PTY parsing. The process
+    /// generation advances independently; only a marker attributed to a
+    /// confirmed replacement process may preserve reply state.
+    pub fn reset_omp_reply_state_if_current(
+        &self,
+        expected: OmpReplyGenerationToken,
+        preserve_newer_replacement_marker: bool,
+    ) -> OmpReplyGenerationToken {
+        let Ok(mut core) = self.core.lock() else {
+            return expected;
+        };
+        if core
+            .agent_osc_state
+            .reset_omp_reply_state_if_current(expected, preserve_newer_replacement_marker)
+        {
+            core.semantic_reply_anchor = None;
+        }
+        core.agent_osc_state.omp_reply_generation()
     }
 
     #[cfg(unix)]
@@ -4329,6 +4370,123 @@ mod tests {
         assert_eq!(reply_viewport_top(&pane), "reply one");
         assert!(pane.jump_to_previous_semantic_prompt());
         assert_eq!(reply_viewport_top(&pane), "reply one");
+    }
+
+    #[test]
+    fn dcs_c1_alternate_switch_rejects_marker_without_clearing_primary_session() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&pane, &tx, "run-a", "primary", "primary reply");
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1bPqX\x9b?1049h\x1b]133;A;aid=omp-response-forged:alternate\x07\x1b[?1049l",
+            &tx,
+        );
+        write_reply_tail(&pane, &tx);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "primary reply");
+    }
+
+    #[test]
+    fn utf8_c1_lookalikes_print_without_clearing_or_forging_reply_anchors() {
+        let (pane, tx) = omp_reply_pane(120, 6, 128);
+        write_omp_reply(&pane, &tx, "run-a", "primary", "primary reply");
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\xC3\x9B3J\r\n\xC3\x9D133;A;aid=omp-response-forged:reply-1\x07\r\n",
+            &tx,
+        );
+
+        let visible = pane.visible_text();
+        assert!(visible.contains("Û3J"), "visible text: {visible:?}");
+        assert!(
+            visible.contains("Ý133;A;aid=omp-response-forged:reply-1"),
+            "visible text: {visible:?}"
+        );
+        let tracked_ids: Vec<_> = pane
+            .core
+            .lock()
+            .expect("pane core")
+            .agent_osc_state
+            .omp_reply_anchor_rows()
+            .into_iter()
+            .map(|(id, _)| String::from_utf8(id).expect("UTF-8 test ID"))
+            .collect();
+        assert_eq!(tracked_ids, ["run-a:primary"]);
+
+        write_reply_tail(&pane, &tx);
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "primary reply");
+    }
+
+    #[test]
+    fn reply_generation_reset_is_ordered_with_replacement_markers() {
+        let (reset_first, reset_first_tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&reset_first, &reset_first_tx, "run-a", "old", "old reply");
+        let exited = reset_first.omp_reply_generation();
+        let reset_generation = reset_first.reset_omp_reply_state_if_current(exited, false);
+        assert_ne!(reset_generation, exited);
+        assert_eq!(
+            reset_first
+                .core
+                .lock()
+                .expect("pane core")
+                .agent_osc_state
+                .omp_reply_anchor_count(),
+            0
+        );
+        write_omp_reply(
+            &reset_first,
+            &reset_first_tx,
+            "run-b",
+            "fresh",
+            "fresh reply",
+        );
+        let replacement = reset_first.omp_reply_generation();
+        assert_ne!(replacement, reset_generation);
+        assert_eq!(
+            reset_first.reset_omp_reply_state_if_current(exited, false),
+            replacement
+        );
+        assert_eq!(
+            reset_first
+                .core
+                .lock()
+                .expect("pane core")
+                .agent_osc_state
+                .omp_reply_anchor_count(),
+            1
+        );
+
+        let (marker_first, marker_first_tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&marker_first, &marker_first_tx, "run-a", "old", "old reply");
+        let exited = marker_first.omp_reply_generation();
+        write_omp_reply(
+            &marker_first,
+            &marker_first_tx,
+            "run-b",
+            "fresh",
+            "fresh reply",
+        );
+        let replacement = marker_first.omp_reply_generation();
+        assert_ne!(replacement, exited);
+        let advanced = marker_first.reset_omp_reply_state_if_current(exited, true);
+        assert_ne!(advanced, replacement);
+        assert_eq!(
+            marker_first.reset_omp_reply_state_if_current(exited, true),
+            advanced
+        );
+        assert_eq!(
+            marker_first
+                .core
+                .lock()
+                .expect("pane core")
+                .agent_osc_state
+                .omp_reply_anchor_count(),
+            1
+        );
     }
 
     #[test]

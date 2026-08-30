@@ -276,6 +276,7 @@ impl LocalTarget {
 pub(super) struct ClientOmpRenderer {
     omp_executable: Option<crate::update::OmpExecutable>,
     scrollback_limit_bytes: usize,
+    mouse_scroll_lines: usize,
     latest_launch_id: u64,
     attempted_launches: HashSet<u64>,
     target: Option<LocalTarget>,
@@ -306,10 +307,12 @@ impl ClientOmpRenderer {
     pub(super) fn new(
         omp_executable: Option<crate::update::OmpExecutable>,
         scrollback_limit_bytes: usize,
+        mouse_scroll_lines: usize,
     ) -> Self {
         Self {
             omp_executable,
             scrollback_limit_bytes,
+            mouse_scroll_lines: mouse_scroll_lines.max(1),
             latest_launch_id: 0,
             attempted_launches: HashSet::new(),
             target: None,
@@ -794,8 +797,8 @@ impl ClientOmpRenderer {
                 }
                 continue;
             }
-            let (navigated, sent) = self.route_local_event(event);
-            if navigated {
+            let (needs_render, sent) = self.route_local_event(event);
+            if needs_render {
                 self.needs_render = true;
                 self.refresh_hovered_link();
                 continue;
@@ -821,6 +824,7 @@ impl ClientOmpRenderer {
         messages
     }
 
+    /// Returns `(needs_render, sent)` for local input handling.
     fn route_local_event(&mut self, event: crate::raw_input::RawInputEvent) -> (bool, bool) {
         let key = match &event {
             crate::raw_input::RawInputEvent::Key(key) => Some(key),
@@ -844,6 +848,13 @@ impl ClientOmpRenderer {
             return (true, true);
         }
 
+        let wheel = matches!(
+            &event,
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp | MouseEventKind::ScrollDown,
+                ..
+            })
+        );
         if let Some(key) = key {
             self.clear_omp_reply_navigation_forwarded_key(key);
         }
@@ -851,8 +862,8 @@ impl ClientOmpRenderer {
             .target
             .as_ref()
             .and_then(|target| target.runtime.as_ref())
-            .is_some_and(|runtime| forward_local_event(runtime, event));
-        (false, sent)
+            .is_some_and(|runtime| forward_local_event(runtime, event, self.mouse_scroll_lines));
+        (wheel && sent, sent)
     }
 
     pub(super) fn route_pixel_input(
@@ -939,12 +950,28 @@ impl ClientOmpRenderer {
                 return Some(message);
             }
         }
+        let wheel = local_mouse.as_ref().is_some_and(|mouse| {
+            matches!(
+                mouse.mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        });
         let sent = self.target.as_ref().and_then(|target| {
             let runtime = target.runtime.as_ref()?;
-            Some(forward_local_pixel_mouse(runtime, local_mouse?))
+            Some(forward_local_pixel_mouse(
+                runtime,
+                local_mouse?,
+                self.mouse_scroll_lines,
+            ))
         });
         match sent {
-            Some(true) => None,
+            Some(true) => {
+                if wheel {
+                    self.needs_render = true;
+                    self.refresh_hovered_link();
+                }
+                None
+            }
             None => Some(pixel_input_message(data, geometry)),
             Some(false) => {
                 self.begin_local_forward_fallback();
@@ -1100,17 +1127,17 @@ impl ClientOmpRenderer {
                     .push(ClientMessage::InputEvents { events });
             }
             LinkInput::Events { events, generation } => {
-                let mut navigated = false;
+                let mut needs_render = false;
                 let mut failed_at = None;
                 for (index, event) in events.iter().enumerate() {
-                    let (did_navigate, sent) = self.route_local_event(event.to_raw_input_event());
-                    navigated |= did_navigate;
+                    let (did_render, sent) = self.route_local_event(event.to_raw_input_event());
+                    needs_render |= did_render;
                     if !sent {
                         failed_at = Some(index);
                         break;
                     }
                 }
-                if navigated {
+                if needs_render {
                     self.needs_render = true;
                     self.refresh_hovered_link();
                 }
@@ -1133,6 +1160,8 @@ impl ClientOmpRenderer {
                 );
             }
             LinkInput::Pixels { inputs, generation } => {
+                let mouse_scroll_lines = self.mouse_scroll_lines;
+                let mut needs_render = false;
                 let failed_at = self
                     .target
                     .as_ref()
@@ -1147,12 +1176,25 @@ impl ClientOmpRenderer {
                             .iter()
                             .enumerate()
                             .find_map(|(index, (data, geometry))| {
-                                let sent = decode_local_pixel_mouse(data, *geometry, size)
-                                    .is_some_and(|mouse| forward_local_pixel_mouse(runtime, mouse));
+                                let Some(mouse) = decode_local_pixel_mouse(data, *geometry, size)
+                                else {
+                                    return Some(index);
+                                };
+                                let wheel = matches!(
+                                    mouse.mouse.kind,
+                                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                                );
+                                let sent =
+                                    forward_local_pixel_mouse(runtime, mouse, mouse_scroll_lines);
+                                needs_render |= wheel && sent;
                                 (!sent).then_some(index)
                             })
                     })
                     .or_else(|| runtime_missing.then_some(0));
+                if needs_render {
+                    self.needs_render = true;
+                    self.refresh_hovered_link();
+                }
                 if let Some(index) = failed_at {
                     self.begin_local_forward_fallback();
                     for (data, geometry) in inputs.into_iter().skip(index) {
@@ -1479,15 +1521,59 @@ fn encode_local_mouse(
     modifiers: crossterm::event::KeyModifiers,
 ) -> Option<Vec<u8>> {
     match kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            runtime.encode_mouse_wheel(kind, position, modifiers)
-        }
         MouseEventKind::Moved => runtime.encode_mouse_motion(kind, position, modifiers),
         MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
             runtime.encode_mouse_button(kind, position, modifiers)
         }
-        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => None,
     }
+}
+
+fn forward_local_wheel(
+    runtime: &TerminalRuntime,
+    kind: MouseEventKind,
+    position: crate::input::mouse::Position,
+    modifiers: crossterm::event::KeyModifiers,
+    mouse_scroll_lines: usize,
+) -> bool {
+    match runtime.wheel_routing() {
+        Some(crate::pane::WheelRouting::MouseReport) => {
+            let Some(bytes) = runtime.encode_mouse_wheel(kind, position, modifiers) else {
+                return scroll_local_wheel(runtime, kind, mouse_scroll_lines);
+            };
+            if runtime.try_send_bytes(Bytes::from(bytes)).is_ok() {
+                runtime.scroll_reset();
+                true
+            } else {
+                scroll_local_wheel(runtime, kind, mouse_scroll_lines)
+            }
+        }
+        Some(crate::pane::WheelRouting::AlternateScroll) => {
+            runtime.scroll_reset();
+            runtime
+                .encode_alternate_scroll(kind)
+                .is_none_or(|bytes| runtime.try_send_bytes(Bytes::from(bytes)).is_ok())
+        }
+        Some(crate::pane::WheelRouting::HostScroll) | None => {
+            scroll_local_wheel(runtime, kind, mouse_scroll_lines)
+        }
+    }
+}
+
+fn scroll_local_wheel(
+    runtime: &TerminalRuntime,
+    kind: MouseEventKind,
+    mouse_scroll_lines: usize,
+) -> bool {
+    match kind {
+        MouseEventKind::ScrollUp => runtime.scroll_up(mouse_scroll_lines.max(1)),
+        MouseEventKind::ScrollDown => runtime.scroll_down(mouse_scroll_lines.max(1)),
+        _ => return false,
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -1566,7 +1652,23 @@ fn decode_local_pixel_mouse(
     })
 }
 
-fn forward_local_pixel_mouse(runtime: &TerminalRuntime, mouse: LocalPixelMouse) -> bool {
+fn forward_local_pixel_mouse(
+    runtime: &TerminalRuntime,
+    mouse: LocalPixelMouse,
+    mouse_scroll_lines: usize,
+) -> bool {
+    if matches!(
+        mouse.mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        return forward_local_wheel(
+            runtime,
+            mouse.mouse.kind,
+            mouse.position,
+            mouse.mouse.modifiers,
+            mouse_scroll_lines,
+        );
+    }
     let bytes = encode_local_mouse(
         runtime,
         mouse.mouse.kind,
@@ -1592,7 +1694,11 @@ fn try_navigate_local_omp_reply(
     runtime.try_navigate_omp_reply_repeated(true, key)
 }
 
-fn forward_local_event(runtime: &TerminalRuntime, event: crate::raw_input::RawInputEvent) -> bool {
+fn forward_local_event(
+    runtime: &TerminalRuntime,
+    event: crate::raw_input::RawInputEvent,
+    mouse_scroll_lines: usize,
+) -> bool {
     let bytes = match event {
         crate::raw_input::RawInputEvent::Key(key) => {
             if key.kind != crossterm::event::KeyEventKind::Release {
@@ -1610,9 +1716,25 @@ fn forward_local_event(runtime: &TerminalRuntime, event: crate::raw_input::RawIn
         crate::raw_input::RawInputEvent::OuterFocusGained => {
             return forward_local_focus_event(runtime, crate::ghostty::FocusEvent::Gained)
         }
-
         crate::raw_input::RawInputEvent::OuterFocusLost => {
             return forward_local_focus_event(runtime, crate::ghostty::FocusEvent::Lost)
+        }
+        crate::raw_input::RawInputEvent::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            return forward_local_wheel(
+                runtime,
+                mouse.kind,
+                crate::input::mouse::Position::Cell {
+                    column: mouse.column,
+                    row: mouse.row,
+                },
+                mouse.modifiers,
+                mouse_scroll_lines,
+            );
         }
         crate::raw_input::RawInputEvent::Mouse(mouse) => encode_local_mouse(
             runtime,
@@ -1651,6 +1773,7 @@ between two\r\n\
 \x1b]133;A;aid=omp-response-client-run:reply-3\x07reply three\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
 tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     const LOCAL_OMP_SCROLLBACK_LIMIT_BYTES: usize = 128 * 1024;
+    const LOCAL_OMP_MOUSE_SCROLL_LINES: usize = 3;
 
     fn long_omp_reply_scrollback() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1712,6 +1835,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         let mut renderer = ClientOmpRenderer::new(
             Some(test_omp_executable()),
             LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+            LOCAL_OMP_MOUSE_SCROLL_LINES,
         );
         renderer.latest_launch_id = 1;
         renderer.attempted_launches.insert(1);
@@ -1778,8 +1902,11 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             |_| {},
         )
         .expect("resolved test executable");
-        let mut renderer =
-            ClientOmpRenderer::new(Some(executable), LOCAL_OMP_SCROLLBACK_LIMIT_BYTES);
+        let mut renderer = ClientOmpRenderer::new(
+            Some(executable),
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+            LOCAL_OMP_MOUSE_SCROLL_LINES,
+        );
 
         renderer.apply_target(1, 2, None, false, false, test_prefix(), (80, 24, 0, 0), 0);
 
@@ -1795,7 +1922,11 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
 
     #[test]
     fn target_handling_ignores_native_target_without_pre_resolved_executable() {
-        let mut renderer = ClientOmpRenderer::new(None, LOCAL_OMP_SCROLLBACK_LIMIT_BYTES);
+        let mut renderer = ClientOmpRenderer::new(
+            None,
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+            LOCAL_OMP_MOUSE_SCROLL_LINES,
+        );
         renderer.apply_target(
             1,
             2,
@@ -1921,6 +2052,32 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             .lines()
             .next()
             .is_some_and(|line| line.trim_end().starts_with("reply one")));
+        assert!(renderer
+            .next_frame(now + Duration::from_millis(1), (40, 4))
+            .is_some());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_xterm_option_up_moves_viewport_and_requests_frame() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let now = Instant::now();
+
+        assert!(renderer
+            .route_input(crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[1;3A"))
+            .is_empty());
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply three")));
         assert!(renderer
             .next_frame(now + Duration::from_millis(1), (40, 4))
             .is_some());
@@ -2596,6 +2753,113 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
         assert!(renderer.route_pixel_input(data, geometry, 0).is_none());
         assert_eq!(input.try_recv().unwrap().as_ref(), b"\x1b[<35;161;121M");
+    }
+
+    #[tokio::test]
+    async fn local_omp_cell_wheel_host_scrolls_and_requests_frame() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        let transcript = (0..20)
+            .map(|line| format!("line {line:02}\r\n"))
+            .collect::<String>();
+        runtime.test_process_pty_bytes(transcript.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let now = Instant::now();
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })])
+            .is_empty());
+        assert_eq!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            LOCAL_OMP_MOUSE_SCROLL_LINES
+        );
+        assert!(renderer
+            .next_frame(now + Duration::from_millis(1), (40, 4))
+            .is_some());
+        assert!(input.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn local_omp_mouse_report_wheel_send_failure_host_scrolls_and_requests_frame() {
+        let (runtime, input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        let transcript = (0..20)
+            .map(|line| format!("line {line:02}\r\n"))
+            .collect::<String>();
+        runtime.test_process_pty_bytes(transcript.as_bytes());
+        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::MouseReport)
+        );
+        drop(input);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let now = Instant::now();
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })])
+            .is_empty());
+        assert_eq!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            LOCAL_OMP_MOUSE_SCROLL_LINES
+        );
+        assert!(renderer
+            .next_frame(now + Duration::from_millis(1), (40, 4))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn local_omp_pixel_wheel_host_scrolls_and_requests_frame() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 12, 16 * 1024, &[], 8);
+        runtime.resize(12, 40, 10, 20);
+        let transcript = (0..40)
+            .map(|line| format!("line {line:02}\r\n"))
+            .collect::<String>();
+        runtime.test_process_pty_bytes(transcript.as_bytes());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.target.as_mut().expect("local target").size = (40, 12, 10, 20);
+        let now = Instant::now();
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+
+        assert!(renderer
+            .route_pixel_input(b"\x1b[<64;321;241M".to_vec(), geometry, 0)
+            .is_none());
+        assert_eq!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            LOCAL_OMP_MOUSE_SCROLL_LINES
+        );
+        assert!(renderer
+            .next_frame(now + Duration::from_millis(1), (40, 12))
+            .is_some());
+        assert!(input.try_recv().is_err());
     }
 
     #[tokio::test]

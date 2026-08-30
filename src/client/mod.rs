@@ -1917,6 +1917,7 @@ async fn run_client_loop(
         omp_renderer: omp_renderer::ClientOmpRenderer::new(
             config.omp_executable,
             config.omp_scrollback_limit_bytes,
+            config.mouse_scroll_lines,
         ),
     };
     debug!(?negotiated_encoding, "client render encoding active");

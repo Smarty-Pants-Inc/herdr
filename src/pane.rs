@@ -44,7 +44,7 @@ use self::agent_detection::{
 };
 #[cfg(unix)]
 pub(crate) use self::osc::RemoteExecReadyFilter;
-use self::osc::ReportedCwd;
+use self::osc::{OmpReplyGenerationToken, ReportedCwd};
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -581,6 +581,45 @@ fn clear_osc_evidence_for_agent_transition(terminal: &PaneTerminal, previous_age
     }
 }
 
+/// Reset in terminal-core order for a confirmed shell exit or a direct
+/// foreground agent replacement whose intermediate shell escaped polling.
+fn reset_omp_reply_generation_for_foreground_probe(
+    terminal: &PaneTerminal,
+    generation: &mut OmpReplyGenerationToken,
+    action: ForegroundShellAgentAction,
+    previous_agent: Option<Agent>,
+    new_agent: Option<Agent>,
+    had_process_probe: bool,
+    previous_process_group_id: Option<u32>,
+    tracked_process_group_id: Option<u32>,
+) -> bool {
+    let confirmed_replacement_process =
+        confirmed_foreground_group_replacement(tracked_process_group_id, previous_process_group_id);
+    let direct_replacement = action == ForegroundShellAgentAction::ObserveProbe
+        && had_process_probe
+        && confirmed_replacement_process
+        && previous_agent.is_some()
+        && new_agent.is_some();
+    if action != ForegroundShellAgentAction::ReportProcessExit && !direct_replacement {
+        return false;
+    }
+    *generation = terminal.reset_omp_reply_state_if_current(*generation, direct_replacement);
+    true
+}
+
+/// Accepts marker bytes already parsed for the same kernel-observed process.
+/// `observed` must be captured before the fresh foreground-group observation.
+fn acknowledge_omp_reply_generation_for_unchanged_foreground(
+    generation: &mut OmpReplyGenerationToken,
+    observed: OmpReplyGenerationToken,
+    foreground_pgid: Option<u32>,
+    last_foreground_pgid: Option<u32>,
+) {
+    if unchanged_foreground_group(foreground_pgid, last_foreground_pgid) {
+        *generation = observed;
+    }
+}
+
 fn apply_foreground_shell_agent_action(
     agent_presence: &mut AgentDetectionPresence,
     action: ForegroundShellAgentAction,
@@ -634,14 +673,39 @@ fn foreground_group_changed(
         && (foreground_pgid.is_some() || last_foreground_pgid.is_some())
 }
 
-// Only kernel-observed foreground groups drive change detection. Remembering an
-// inferred group would look like a change on every tick while the kernel stays silent.
+fn unchanged_foreground_group(
+    foreground_pgid: Option<u32>,
+    last_foreground_pgid: Option<u32>,
+) -> bool {
+    foreground_pgid.is_some() && foreground_pgid == last_foreground_pgid
+}
+
+fn confirmed_foreground_group_replacement(
+    foreground_pgid: Option<u32>,
+    last_foreground_pgid: Option<u32>,
+) -> bool {
+    matches!(
+        (last_foreground_pgid, foreground_pgid),
+        (Some(previous), Some(current)) if previous != current
+    )
+}
+
+// The second direct read is authoritative when the process group switches while
+// a full probe is being assembled. Inferred child groups never reach this helper.
 fn process_group_for_change_tracking(
     observed_foreground_pgid: Option<u32>,
-    probed_process_group_id: Option<u32>,
+    probed_foreground_pgid: Option<u32>,
 ) -> Option<u32> {
-    observed_foreground_pgid?;
-    probed_process_group_id.or(observed_foreground_pgid)
+    probed_foreground_pgid.or(observed_foreground_pgid)
+}
+
+fn foreground_group_transition_after_probe(
+    observed_process_group_id: Option<u32>,
+    previous_process_group_id: Option<u32>,
+) -> (Option<u32>, bool) {
+    let tracked_process_group_id = observed_process_group_id.or(previous_process_group_id);
+    let changed = foreground_group_changed(tracked_process_group_id, previous_process_group_id);
+    (tracked_process_group_id, changed)
 }
 
 fn should_skip_process_probe_for_lifecycle_authority(
@@ -752,7 +816,7 @@ fn sync_content_change_acquisition(
 
 #[derive(Debug, Clone)]
 struct ProcessProbeResult {
-    process_group_id: Option<u32>,
+    tracked_process_group_id: Option<u32>,
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
@@ -793,11 +857,12 @@ fn identify_process_group_leader_in_job(
 fn process_probe_result(
     job: &crate::platform::ForegroundJob,
     pid: u32,
+    tracked_process_group_id: Option<u32>,
     agent: Agent,
     process_name: String,
 ) -> ProcessProbeResult {
     ProcessProbeResult {
-        process_group_id: Some(job.process_group_id),
+        tracked_process_group_id,
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
@@ -807,12 +872,14 @@ fn process_probe_result(
 fn hinted_process_probe_result(
     job: &crate::platform::ForegroundJob,
     pid: u32,
+    tracked_process_group_id: Option<u32>,
     read_hint: impl Fn(u32) -> Option<Agent>,
 ) -> Option<ProcessProbeResult> {
     let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
     Some(process_probe_result(
         job,
         pid,
+        tracked_process_group_id,
         agent,
         crate::detect::agent_label(agent).to_string(),
     ))
@@ -820,17 +887,19 @@ fn hinted_process_probe_result(
 
 fn probe_foreground_process_from_jobs(
     pid: u32,
-    foreground_pgid: Option<u32>,
+    tracked_process_group_id: Option<u32>,
     leader_job: Option<crate::platform::ForegroundJob>,
     foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
 ) -> ProcessProbeResult {
     if let Some(job) = leader_job.as_ref() {
-        if let Some(hinted) = hinted_process_probe_result(job, pid, read_hint) {
+        if let Some(hinted) =
+            hinted_process_probe_result(job, pid, tracked_process_group_id, read_hint)
+        {
             return hinted;
         }
         if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+            return process_probe_result(job, pid, tracked_process_group_id, agent, process_name);
         }
     }
 
@@ -840,17 +909,19 @@ fn probe_foreground_process_from_jobs(
             return process_probe_result(
                 job,
                 pid,
+                tracked_process_group_id,
                 agent,
                 crate::detect::agent_label(agent).to_string(),
             );
         }
         if let Some((agent, process_name)) = identify_process_group_leader_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+            return process_probe_result(job, pid, tracked_process_group_id, agent, process_name);
         }
         if let Some(agent) = agent_hint_for_non_leader_foreground_job_members(job, read_hint) {
             return process_probe_result(
                 job,
                 pid,
+                tracked_process_group_id,
                 agent,
                 crate::detect::agent_label(agent).to_string(),
             );
@@ -858,7 +929,7 @@ fn probe_foreground_process_from_jobs(
 
         let identified = crate::detect::identify_agent_in_job(job);
         return ProcessProbeResult {
-            process_group_id: Some(job.process_group_id),
+            tracked_process_group_id,
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
@@ -866,7 +937,7 @@ fn probe_foreground_process_from_jobs(
     }
 
     ProcessProbeResult {
-        process_group_id: foreground_pgid,
+        tracked_process_group_id,
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
@@ -874,10 +945,14 @@ fn probe_foreground_process_from_jobs(
 }
 
 fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+    let tracked_process_group_id = process_group_for_change_tracking(
+        foreground_pgid,
+        crate::detect::foreground_process_group_id(pid),
+    );
     probe_foreground_process_from_jobs(
         pid,
-        foreground_pgid,
-        foreground_pgid.and_then(crate::detect::foreground_group_leader_job),
+        tracked_process_group_id,
+        tracked_process_group_id.and_then(crate::detect::foreground_group_leader_job),
         || crate::detect::foreground_job(pid),
         crate::platform::process_agent_hint,
     )
@@ -923,6 +998,7 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let mut omp_reply_generation = terminal.omp_reply_generation();
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -952,6 +1028,7 @@ fn spawn_basic_detection_task(
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
+                    omp_reply_generation = terminal.omp_reply_generation();
                 }
             }
 
@@ -968,10 +1045,11 @@ fn spawn_basic_detection_task(
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
+            let observed_omp_reply_generation = (pid > 0).then(|| terminal.omp_reply_generation());
             let foreground_pgid = (pid > 0)
                 .then(|| crate::detect::foreground_process_group_id(pid))
                 .flatten();
-            let process_group_changed =
+            let mut process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
             let should_check_process = pid > 0 && {
                 let process_probe_input = ProcessProbeInput {
@@ -996,10 +1074,23 @@ fn spawn_basic_detection_task(
                 last_process_check = now;
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
+                let previous_process_group_id = last_foreground_pgid;
                 let probe = probe_foreground_process(pid, foreground_pgid);
-                let process_group_id = probe.process_group_id;
-                let tracked_process_group_id =
-                    process_group_for_change_tracking(foreground_pgid, process_group_id);
+                let observed_process_group_id = probe.tracked_process_group_id;
+                let (tracked_process_group_id, authoritative_group_changed) =
+                    foreground_group_transition_after_probe(
+                        observed_process_group_id,
+                        previous_process_group_id,
+                    );
+                process_group_changed = authoritative_group_changed;
+                if let Some(observed) = observed_omp_reply_generation {
+                    acknowledge_omp_reply_generation_for_unchanged_foreground(
+                        &mut omp_reply_generation,
+                        observed,
+                        observed_process_group_id,
+                        previous_process_group_id,
+                    );
+                }
                 let foreground_is_pane_shell = probe.foreground_is_pane_shell;
                 let mut new_agent = probe.agent;
                 if let Some(suppressed_agent) = suppressed_agent {
@@ -1015,6 +1106,16 @@ fn spawn_basic_detection_task(
                     new_agent,
                     foreground_is_pane_shell,
                     foreground_shell_exit_reported,
+                );
+                reset_omp_reply_generation_for_foreground_probe(
+                    &terminal,
+                    &mut omp_reply_generation,
+                    foreground_action,
+                    previous_agent,
+                    new_agent,
+                    had_process_probe,
+                    previous_process_group_id,
+                    observed_process_group_id,
                 );
                 let changed = apply_foreground_shell_agent_action(
                     &mut agent_presence,
@@ -1066,6 +1167,13 @@ fn spawn_basic_detection_task(
                         }
                     }
                 }
+            } else if let Some(observed) = observed_omp_reply_generation {
+                acknowledge_omp_reply_generation_for_unchanged_foreground(
+                    &mut omp_reply_generation,
+                    observed,
+                    foreground_pgid,
+                    last_foreground_pgid,
+                );
             }
 
             let process_exited = pending_foreground_shell_clear
@@ -2920,6 +3028,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                let mut omp_reply_generation = terminal.omp_reply_generation();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2958,6 +3067,7 @@ impl PaneRuntime {
                             last_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
+                            omp_reply_generation = terminal.omp_reply_generation();
                         }
                     }
 
@@ -3000,6 +3110,8 @@ impl PaneRuntime {
                     );
                     #[cfg(not(windows))]
                     let foreground_observation_due = true;
+                    let observed_omp_reply_generation = (pid > 0 && foreground_observation_due)
+                        .then(|| terminal.omp_reply_generation());
                     let foreground_pgid = match (pid, foreground_observation_due) {
                         (0, _) => None,
                         (_, true) => detect::foreground_process_group_id(pid),
@@ -3011,7 +3123,7 @@ impl PaneRuntime {
                             last_content_seq.is_some() && last_content_seq != Some(content_seq);
                         last_observation = (now, (!retry).then_some(content_seq));
                     }
-                    let process_group_changed =
+                    let mut process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
                     let should_check_process = pid > 0 && {
                         let process_probe_input = ProcessProbeInput {
@@ -3030,13 +3142,24 @@ impl PaneRuntime {
                         let had_process_probe = has_process_probe;
                         has_process_probe = true;
                         if pid > 0 {
+                            let previous_process_group_id = last_foreground_pgid;
                             let probe = probe_foreground_process(pid, foreground_pgid);
                             let process_name = probe.process_name;
-                            let process_group_id = probe.process_group_id;
-                            let tracked_process_group_id = process_group_for_change_tracking(
-                                foreground_pgid,
-                                process_group_id,
-                            );
+                            let observed_process_group_id = probe.tracked_process_group_id;
+                            let (tracked_process_group_id, authoritative_group_changed) =
+                                foreground_group_transition_after_probe(
+                                    observed_process_group_id,
+                                    previous_process_group_id,
+                                );
+                            process_group_changed = authoritative_group_changed;
+                            if let Some(observed) = observed_omp_reply_generation {
+                                acknowledge_omp_reply_generation_for_unchanged_foreground(
+                                    &mut omp_reply_generation,
+                                    observed,
+                                    observed_process_group_id,
+                                    previous_process_group_id,
+                                );
+                            }
                             let foreground_is_pane_shell = probe.foreground_is_pane_shell;
                             let mut new_agent = probe.agent;
 
@@ -3056,6 +3179,16 @@ impl PaneRuntime {
                                 new_agent,
                                 foreground_is_pane_shell,
                                 foreground_shell_exit_reported,
+                            );
+                            reset_omp_reply_generation_for_foreground_probe(
+                                &terminal,
+                                &mut omp_reply_generation,
+                                foreground_action,
+                                previous_agent,
+                                new_agent,
+                                had_process_probe,
+                                previous_process_group_id,
+                                observed_process_group_id,
                             );
                             let changed = apply_foreground_shell_agent_action(
                                 &mut agent_presence,
@@ -3117,7 +3250,7 @@ impl PaneRuntime {
                                         previous_agent = ?previous_agent,
                                         ?agent,
                                         process = %process_name,
-                                        pgid = ?process_group_id,
+                                        pgid = ?tracked_process_group_id,
                                         "agent changed"
                                     );
                                 } else {
@@ -3125,13 +3258,20 @@ impl PaneRuntime {
                                         pane = pane_id.raw(),
                                         previous_agent = ?previous_agent,
                                         ?agent,
-                                        pgid = ?process_group_id,
+                                        pgid = ?tracked_process_group_id,
                                         "agent changed"
                                     );
                                 }
                                 agent_changed = true;
                             }
                         }
+                    } else if let Some(observed) = observed_omp_reply_generation {
+                        acknowledge_omp_reply_generation_for_unchanged_foreground(
+                            &mut omp_reply_generation,
+                            observed,
+                            foreground_pgid,
+                            last_foreground_pgid,
+                        );
                     }
 
                     let pid = child_pid.load(Ordering::Acquire);
@@ -5251,6 +5391,144 @@ mod tests {
         assert_eq!(runtime.agent_osc_progress(), "");
     }
 
+    #[tokio::test]
+    async fn direct_replacement_resets_old_generation_without_late_reset_erasing_new_markers() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 4, 16 * 1024, b"");
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-a:old\x07old reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
+        );
+        let option_up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(runtime.try_navigate_omp_reply(true, &option_up));
+
+        runtime.scroll_reset();
+        let exited_generation = runtime.terminal.omp_reply_generation();
+        let mut detector_generation = exited_generation;
+        runtime.test_process_pty_bytes(b"\x1b]133;A;aid=omp-response-run-a:unfinished");
+        assert!(reset_omp_reply_generation_for_foreground_probe(
+            &runtime.terminal,
+            &mut detector_generation,
+            ForegroundShellAgentAction::ObserveProbe,
+            Some(Agent::Omp),
+            Some(Agent::Omp),
+            true,
+            Some(41),
+            Some(42),
+        ));
+        assert_ne!(detector_generation, exited_generation);
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
+
+        // The replacement's first ESC must not finish the old process's partial OSC.
+        runtime.test_process_pty_bytes(b"\x1b]2;replacement\x07");
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-b:new\x07new reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail five\r\ntail six\r\ntail seven\r\ntail eight\r\n",
+        );
+        let replacement_generation = runtime.terminal.omp_reply_generation();
+        assert_ne!(replacement_generation, detector_generation);
+
+        // A stale detector callback from the exited generation is a no-op.
+        assert_eq!(
+            runtime
+                .terminal
+                .reset_omp_reply_state_if_current(exited_generation, false),
+            replacement_generation
+        );
+        assert!(runtime.try_navigate_omp_reply(true, &option_up));
+        assert!(runtime
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("new reply")));
+    }
+
+    #[tokio::test]
+    async fn same_process_session_marker_after_snapshot_does_not_suppress_exit_reset() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 4, 16 * 1024, b"");
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-a:old\x07old reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+        );
+        let mut detector_generation = runtime.terminal.omp_reply_generation();
+
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-b:current\x07current reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+\x1b]133;A;aid=omp-response-run-b:leaked",
+        );
+        let marker_generation = runtime.terminal.omp_reply_generation();
+        assert_ne!(marker_generation, detector_generation);
+
+        assert!(reset_omp_reply_generation_for_foreground_probe(
+            &runtime.terminal,
+            &mut detector_generation,
+            ForegroundShellAgentAction::ReportProcessExit,
+            Some(Agent::Omp),
+            None,
+            true,
+            Some(41),
+            Some(7),
+        ));
+        assert_ne!(detector_generation, marker_generation);
+
+        // Completing the old process's partial marker after exit must not revive it.
+        runtime.test_process_pty_bytes(
+            b"\x07leaked reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
+        );
+        let option_up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
+    }
+
+    #[tokio::test]
+    async fn marker_first_direct_replacement_without_old_aid_keeps_new_anchor() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 4, 16 * 1024, b"");
+        runtime.test_process_pty_bytes(b"old OMP output without a reply marker\r\n");
+        let exited_generation = runtime.terminal.omp_reply_generation();
+        let mut detector_generation = exited_generation;
+
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-b:new\x07new reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
+        );
+        let replacement_generation = runtime.terminal.omp_reply_generation();
+        assert_ne!(replacement_generation, exited_generation);
+
+        assert!(reset_omp_reply_generation_for_foreground_probe(
+            &runtime.terminal,
+            &mut detector_generation,
+            ForegroundShellAgentAction::ObserveProbe,
+            Some(Agent::Omp),
+            Some(Agent::Omp),
+            true,
+            Some(41),
+            Some(42),
+        ));
+        assert_ne!(detector_generation, replacement_generation);
+        assert_eq!(
+            runtime
+                .terminal
+                .reset_omp_reply_state_if_current(exited_generation, false),
+            detector_generation
+        );
+
+        let option_up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(runtime.try_navigate_omp_reply(true, &option_up));
+        assert!(runtime
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("new reply")));
+    }
+
     #[test]
     fn reported_process_exit_clears_before_unknown_foreground_probe() {
         assert_eq!(
@@ -5524,7 +5802,8 @@ mod tests {
 
     #[test]
     fn inferred_group_does_not_trigger_a_probe_on_every_tick() {
-        let tracked = process_group_for_change_tracking(None, Some(300));
+        // An inferred identity job is deliberately not supplied as a direct read.
+        let tracked = process_group_for_change_tracking(None, None);
         assert_eq!(tracked, None);
         assert!(!should_probe_foreground_job(ProcessProbeInput {
             current_agent: Some(Agent::Claude),
@@ -5533,6 +5812,49 @@ mod tests {
             elapsed_since_process_check: std::time::Duration::from_millis(300),
             ..process_probe_input()
         }));
+    }
+
+    #[test]
+    fn fresh_probe_group_wins_when_process_switches_between_reads() {
+        let previous_process_group_id = Some(42);
+        let observed_process_group_id =
+            process_group_for_change_tracking(previous_process_group_id, Some(43));
+        let (tracked_process_group_id, changed) = foreground_group_transition_after_probe(
+            observed_process_group_id,
+            previous_process_group_id,
+        );
+
+        assert_eq!(tracked_process_group_id, Some(43));
+        assert!(changed);
+        assert!(confirmed_foreground_group_replacement(
+            observed_process_group_id,
+            previous_process_group_id,
+        ));
+        assert!(!unchanged_foreground_group(
+            observed_process_group_id,
+            previous_process_group_id,
+        ));
+    }
+
+    #[test]
+    fn fresh_probe_group_recovers_transient_first_read_for_same_process() {
+        let previous_process_group_id = Some(42);
+        let observed_process_group_id = process_group_for_change_tracking(None, Some(42));
+        let (tracked_process_group_id, changed) = foreground_group_transition_after_probe(
+            observed_process_group_id,
+            previous_process_group_id,
+        );
+
+        assert_eq!(tracked_process_group_id, Some(42));
+        assert!(!changed);
+        assert!(!confirmed_foreground_group_replacement(
+            observed_process_group_id,
+            previous_process_group_id,
+        ));
+        assert!(unchanged_foreground_group(
+            observed_process_group_id,
+            previous_process_group_id,
+        ));
     }
 
     #[test]

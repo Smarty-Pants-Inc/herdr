@@ -5089,6 +5089,41 @@ impl HeadlessServer {
         crate::app::actions::safe_osc8_url(&link.uri).map(str::to_owned)
     }
 
+    fn forward_private_omp_wheel(
+        guest: &PrivateOmpGuest,
+        runtime: &crate::terminal::TerminalRuntime,
+        kind: MouseEventKind,
+        position: crate::input::mouse::Position,
+        modifiers: KeyModifiers,
+        mouse_scroll_lines: usize,
+    ) {
+        let scroll_locally = || match kind {
+            MouseEventKind::ScrollUp => runtime.scroll_up(mouse_scroll_lines.max(1)),
+            MouseEventKind::ScrollDown => runtime.scroll_down(mouse_scroll_lines.max(1)),
+            _ => {}
+        };
+        match runtime.wheel_routing() {
+            Some(crate::pane::WheelRouting::MouseReport) => {
+                let Some(bytes) = runtime.encode_mouse_wheel(kind, position, modifiers) else {
+                    scroll_locally();
+                    return;
+                };
+                if guest.input(Bytes::from(bytes)).is_ok() {
+                    runtime.scroll_reset();
+                } else {
+                    scroll_locally();
+                }
+            }
+            Some(crate::pane::WheelRouting::AlternateScroll) => {
+                runtime.scroll_reset();
+                if let Some(bytes) = runtime.encode_alternate_scroll(kind) {
+                    let _ = guest.input(Bytes::from(bytes));
+                }
+            }
+            Some(crate::pane::WheelRouting::HostScroll) | None => scroll_locally(),
+        }
+    }
+
     fn partition_private_omp_input(
         &mut self,
         client_id: u64,
@@ -5102,6 +5137,7 @@ impl HeadlessServer {
         };
         let keyboard_target = info.is_focused;
         let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
+        let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
         let view_id = self
             .clients
             .get(&client_id)
@@ -5205,22 +5241,36 @@ impl HeadlessServer {
                         continue;
                     }
                     let position = crate::input::mouse::Position::Cell { column, row };
-                    let bytes = match mouse.kind {
-                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                            runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) {
+                        Self::forward_private_omp_wheel(
+                            guest,
+                            runtime,
+                            mouse.kind,
+                            position,
+                            mouse.modifiers,
+                            mouse_scroll_lines,
+                        );
+                    } else {
+                        let bytes = match mouse.kind {
+                            MouseEventKind::Moved => {
+                                runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
+                            }
+                            MouseEventKind::Down(_)
+                            | MouseEventKind::Up(_)
+                            | MouseEventKind::Drag(_) => {
+                                runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
+                            }
+                            MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown => None,
+                        };
+                        if let Some(bytes) = bytes {
+                            let _ = guest.input(Bytes::from(bytes));
                         }
-                        MouseEventKind::Moved => {
-                            runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
-                        }
-                        MouseEventKind::Down(_)
-                        | MouseEventKind::Up(_)
-                        | MouseEventKind::Drag(_) => {
-                            runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
-                        }
-                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
-                    };
-                    if let Some(bytes) = bytes {
-                        let _ = guest.input(Bytes::from(bytes));
                     }
                     consumed = true;
                 }
@@ -5246,6 +5296,7 @@ impl HeadlessServer {
             .clients
             .get(&client_id)
             .and_then(|client| client.view_id.clone());
+        let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
         let Some(guest) = self
             .clients
             .get(&client_id)
@@ -5297,20 +5348,34 @@ impl HeadlessServer {
                 host.pane_position(info.inner_rect, width_px, height_px)
             })
             .unwrap_or(fallback);
-        let bytes = match mouse.kind {
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            Self::forward_private_omp_wheel(
+                guest,
+                runtime,
+                mouse.kind,
+                position,
+                mouse.modifiers,
+                mouse_scroll_lines,
+            );
+        } else {
+            let bytes = match mouse.kind {
+                MouseEventKind::Moved => {
+                    runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
+                }
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                    runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
+                }
+                MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown => None,
+            };
+            if let Some(bytes) = bytes {
+                let _ = guest.input(Bytes::from(bytes));
             }
-            MouseEventKind::Moved => {
-                runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
-            }
-            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-                runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
-            }
-            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
-        };
-        if let Some(bytes) = bytes {
-            let _ = guest.input(Bytes::from(bytes));
         }
         true
     }
@@ -9125,6 +9190,74 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
             .get_mut(&1)
             .expect("App client")
             .private_omp_guest = Some(guest);
+        server.compute_client_navigation_view(1);
+        let info = server.private_omp_pane_info(1).expect("private OMP pane");
+        let expected_scroll = server.app.state.mouse_scroll_lines.max(1);
+        server.clients.get_mut(&1).expect("App client").render_state =
+            crate::server::render_stream::ClientRenderState::Semantic {
+                last_frame: Some(FrameData {
+                    cells: Vec::new(),
+                    width: 0,
+                    height: 0,
+                    cursor: None,
+                    hyperlinks: Vec::new(),
+                    graphics: Vec::new(),
+                }),
+            };
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: info.inner_rect.x,
+                    row: info.inner_rect.y,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        ));
+        let client = server.clients.get(&1).expect("App client");
+        let crate::server::render_stream::ClientRenderState::Semantic { last_frame } =
+            &client.render_state
+        else {
+            panic!("semantic client");
+        };
+        assert!(
+            last_frame.is_none(),
+            "private wheel must request a semantic redraw"
+        );
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .runtime()
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            expected_scroll
+        );
+        assert!(guest.test_input_is_empty());
+        guest.runtime().scroll_reset();
+
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let cell = (info.inner_rect.x, info.inner_rect.y);
+        let host = crate::input::mouse::HostPixels {
+            x: u32::from(cell.0) * 10 + 1,
+            y: u32::from(cell.1) * 20 + 1,
+            geometry,
+        };
+        assert!(server.route_private_omp_pixel_input(1, b"\x1b[<64;1;1M", host, cell));
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .runtime()
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            expected_scroll
+        );
+        assert!(guest.test_input_is_empty());
+        guest.runtime().scroll_reset();
 
         let option_up = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
         let (remaining, consumed) = server.partition_private_omp_input(
