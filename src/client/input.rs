@@ -1010,11 +1010,14 @@ mod tests {
             .unwrap();
         let (input_state, _wake) =
             HostInputState::with_input_fd(true, true, reader.as_raw_fd()).unwrap();
-        input_state
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .geometry = Some(old_geometry);
+        {
+            let mut boundary = input_state
+                .event_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            boundary.geometry = Some(old_geometry);
+            input_state.capture_input_boundary(&mut boundary).unwrap();
+        }
         let input_state = Arc::new(input_state);
         let applied_before_resize = input_state.load();
         let (event_tx, mut event_rx) = mpsc::channel(2);
