@@ -294,10 +294,20 @@ impl PaneTerminal {
         self.ghostty.set_scroll_offset_from_bottom(lines);
     }
 
+    pub fn try_navigate_omp_reply(
+        &self,
+        recognized_omp: bool,
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        self.ghostty.try_navigate_omp_reply(recognized_omp, key)
+    }
+
+    #[allow(dead_code)]
     pub fn jump_to_previous_semantic_prompt(&self) -> bool {
         self.ghostty.jump_to_previous_semantic_prompt()
     }
 
+    #[allow(dead_code)]
     pub fn jump_to_next_semantic_prompt(&self) -> bool {
         self.ghostty.jump_to_next_semantic_prompt()
     }
@@ -721,10 +731,6 @@ impl PaneTerminal {
     /// Clears retained OSC title/progress evidence on foreground agent change.
     pub fn clear_agent_osc_state(&self) {
         self.ghostty.clear_agent_osc_state()
-    }
-
-    pub fn clear_omp_reply_anchors(&self) {
-        self.ghostty.clear_omp_reply_anchors()
     }
 
     pub fn keyboard_protocol(
@@ -1563,12 +1569,6 @@ impl GhosttyPaneTerminal {
         }
     }
 
-    pub fn clear_omp_reply_anchors(&self) {
-        if let Ok(mut core) = self.core.lock() {
-            core.agent_osc_state.clear_omp_reply_anchors();
-            core.semantic_reply_anchor = None;
-        }
-    }
     #[cfg(unix)]
     fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
         self.core
@@ -2070,15 +2070,39 @@ impl GhosttyPaneTerminal {
         }
     }
 
+    pub fn try_navigate_omp_reply(
+        &self,
+        recognized_omp: bool,
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        if !recognized_omp
+            || key.modifiers != crossterm::event::KeyModifiers::ALT
+            || !matches!(
+                key.kind,
+                crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+            )
+        {
+            return false;
+        }
+        let previous = match key.code {
+            crossterm::event::KeyCode::Up => true,
+            crossterm::event::KeyCode::Down => false,
+            _ => return false,
+        };
+        self.jump_to_semantic_prompt_repeated(previous, usize::from(key.repeat_count.max(1)))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn jump_to_previous_semantic_prompt(&self) -> bool {
-        self.jump_to_semantic_prompt(true)
+        self.jump_to_semantic_prompt_repeated(true, 1)
     }
 
+    #[allow(dead_code)]
     pub fn jump_to_next_semantic_prompt(&self) -> bool {
-        self.jump_to_semantic_prompt(false)
+        self.jump_to_semantic_prompt_repeated(false, 1)
     }
 
-    fn jump_to_semantic_prompt(&self, previous: bool) -> bool {
+    fn jump_to_semantic_prompt_repeated(&self, previous: bool, repeat_count: usize) -> bool {
         let Ok(mut core) = self.core.lock() else {
             return false;
         };
@@ -2112,18 +2136,21 @@ impl GhosttyPaneTerminal {
         }
 
         let at_bottom = scrollbar.offset.saturating_add(scrollbar.len) >= total_rows;
-        let target_index = match selected_index {
-            Some(index) if previous => index.checked_sub(1),
-            Some(index) => (index + 1 < reply_rows.len()).then_some(index + 1),
+        let initial_index = match selected_index {
+            Some(index) => index,
             None if previous => {
                 let end = if at_bottom {
                     total_rows
                 } else {
                     scrollbar.offset.saturating_add(1).min(total_rows)
                 };
-                (0..reply_rows.len())
+                let Some(index) = (0..reply_rows.len())
                     .rev()
                     .find(|index| reply_rows[*index].1 < end)
+                else {
+                    return true;
+                };
+                index
             }
             None => {
                 let start = if at_bottom {
@@ -2131,11 +2158,25 @@ impl GhosttyPaneTerminal {
                 } else {
                     scrollbar.offset.saturating_add(1).min(total_rows)
                 };
-                (0..reply_rows.len()).find(|index| reply_rows[*index].1 >= start)
+                let Some(index) = (0..reply_rows.len()).find(|index| reply_rows[*index].1 >= start)
+                else {
+                    return true;
+                };
+                index
             }
         };
-        let Some(target_index) = target_index else {
-            return true;
+        let steps = repeat_count.max(1);
+        let moves = if selected_index.is_some() {
+            steps
+        } else {
+            steps - 1
+        };
+        let target_index = if previous {
+            initial_index.saturating_sub(moves)
+        } else {
+            initial_index
+                .saturating_add(moves)
+                .min(reply_rows.len() - 1)
         };
         let (anchor_id, row) = &reply_rows[target_index];
         let max_offset = total_rows.saturating_sub(scrollbar.len);
@@ -4178,6 +4219,94 @@ mod tests {
             assert!(pane.jump_to_previous_semantic_prompt());
             assert_eq!(reply_viewport_top(&pane), format!("reply {index:03}"));
         }
+    }
+
+    #[test]
+    fn omp_reply_anchor_rebinds_a_repeated_aid_without_reordering_replies() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]133;A;aid=omp-response-run-a:stable\x07first stable\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+\x1b]133;A;aid=omp-response-run-a:other\x07other reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+\x1b]133;A;aid=omp-response-run-a:stable\x07latest stable\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+            &tx,
+        );
+        write_reply_tail(&pane, &tx);
+
+        let tracked_ids: Vec<_> = pane
+            .core
+            .lock()
+            .expect("pane core")
+            .agent_osc_state
+            .omp_reply_anchor_rows()
+            .into_iter()
+            .map(|(id, _)| String::from_utf8(id).expect("UTF-8 test ID"))
+            .collect();
+        assert_eq!(tracked_ids, ["run-a:stable", "run-a:other"]);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "other reply");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "latest stable");
+    }
+
+    #[test]
+    fn omp_reply_anchor_prunes_stale_unique_aid_behind_rebound_stable_aid() {
+        let (pane, tx) = omp_reply_pane(1_000, 4, 128);
+        write_omp_reply(&pane, &tx, "run-a", "stable", "first stable");
+        write_omp_reply(&pane, &tx, "run-a", "other", "older unique");
+        for index in 0..512 {
+            write_omp_reply(
+                &pane,
+                &tx,
+                "run-a",
+                "stable",
+                &format!("latest stable {index}"),
+            );
+        }
+
+        let mut core = pane.core.lock().expect("pane core");
+        let scrollbar = core.terminal.scrollbar().expect("scrollbar");
+        assert_eq!(
+            core.agent_osc_state.omp_reply_anchor_count(),
+            1,
+            "scrollbar={scrollbar:?}"
+        );
+        let tracked_ids: Vec<_> = core
+            .agent_osc_state
+            .omp_reply_anchor_rows()
+            .into_iter()
+            .map(|(id, _)| String::from_utf8(id).expect("UTF-8 test ID"))
+            .collect();
+        assert_eq!(tracked_ids, ["run-a:stable"]);
+    }
+
+    #[test]
+    fn omp_reply_navigation_clamps_grouped_repeat_count_in_one_pass() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&pane, &tx, "run-a", "one", "reply one");
+        write_omp_reply(&pane, &tx, "run-a", "two", "reply two");
+        write_omp_reply(&pane, &tx, "run-a", "three", "reply three");
+        write_reply_tail(&pane, &tx);
+
+        let up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        )
+        .with_repeat_count(u16::MAX);
+        assert!(pane.try_navigate_omp_reply(true, &up));
+        assert_eq!(reply_viewport_top(&pane), "reply one");
+        assert!(pane.try_navigate_omp_reply(true, &up));
+        assert_eq!(reply_viewport_top(&pane), "reply one");
+
+        let down = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::ALT,
+        )
+        .with_repeat_count(u16::MAX);
+        assert!(pane.try_navigate_omp_reply(true, &down));
+        assert_eq!(reply_viewport_top(&pane), "reply three");
     }
 
     #[test]

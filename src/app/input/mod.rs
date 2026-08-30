@@ -66,27 +66,50 @@ use super::App;
 // ---------------------------------------------------------------------------
 
 impl App {
+    #[cfg(test)]
     pub(super) async fn handle_key(
         &mut self,
         key: TerminalKey,
     ) -> Option<super::TerminalInputTarget> {
+        self.handle_key_with_terminal_outcome(key).await.target
+    }
+
+    pub(super) async fn handle_key_with_repeat_outcome(
+        &mut self,
+        key: TerminalKey,
+    ) -> (Option<super::TerminalInputTarget>, bool) {
+        let outcome = self.handle_key_with_terminal_outcome(key).await;
+        (outcome.target, outcome.handled_omp_reply_navigation)
+    }
+
+    pub(super) fn handle_terminal_key_headless_with_repeat_outcome(
+        &mut self,
+        source_id: super::InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        key: TerminalKey,
+    ) -> (Option<super::TerminalInputTarget>, bool) {
+        let outcome = self.handle_terminal_key_headless_from_view_outcome(source_id, view_id, key);
+        (outcome.target, outcome.handled_omp_reply_navigation)
+    }
+
+    async fn handle_key_with_terminal_outcome(
+        &mut self,
+        key: TerminalKey,
+    ) -> terminal::TerminalKeyHandling {
         self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
-            return self.handle_terminal_key(key).await;
+            return self.handle_terminal_key_with_outcome(key).await;
         }
         let key_event = key.as_key_event();
         if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
             if let Some(text) = crate::platform::read_clipboard_text() {
                 self.paste_into_active_text_input(&text);
             }
-            return None;
+            return terminal::TerminalKeyHandling::default();
         }
 
         match self.state.mode {
-            Mode::Terminal => {
-                let target = self.handle_terminal_key(key).await;
-                return target;
-            }
+            Mode::Terminal => return self.handle_terminal_key_with_outcome(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
@@ -114,7 +137,7 @@ impl App {
                 Mode::Terminal => unreachable!(),
             },
         }
-        None
+        terminal::TerminalKeyHandling::default()
     }
 
     pub(crate) fn handle_text_commit_headless(&mut self, text: &str) {

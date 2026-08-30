@@ -80,6 +80,7 @@ pub(crate) struct PrivateOmpGuest {
     runtime_pane_id: PaneId,
     attachment_epoch: AtomicU64,
     controller: AtomicBool,
+    omp_reply_navigation_presses: Mutex<Vec<crate::input::KeyIdentity>>,
     runtime: Option<TerminalRuntime>,
     _listener: Arc<TcpListener>,
     guest: Arc<Mutex<Option<TcpStream>>>,
@@ -144,6 +145,7 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
+            omp_reply_navigation_presses: Mutex::new(Vec::new()),
             runtime: Some(runtime),
             _listener: listener,
             guest,
@@ -180,6 +182,7 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
+            omp_reply_navigation_presses: Mutex::new(Vec::new()),
             runtime: Some(runtime),
             _listener: listener,
             guest: Arc::new(Mutex::new(None)),
@@ -222,6 +225,61 @@ impl PrivateOmpGuest {
         }
     }
 
+    pub(crate) fn remember_omp_reply_navigation_press(&self, key: &crate::input::TerminalKey) {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return;
+        }
+        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
+            return;
+        };
+        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
+            if !presses.contains(&identity) {
+                presses.push(identity);
+            }
+        }
+    }
+
+    pub(crate) fn consume_omp_reply_navigation_release(
+        &self,
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        if key.kind != crossterm::event::KeyEventKind::Release {
+            return false;
+        }
+        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
+            return false;
+        };
+        let Ok(mut presses) = self.omp_reply_navigation_presses.lock() else {
+            return false;
+        };
+        let Some(index) = presses.iter().position(|tracked| *tracked == identity) else {
+            return false;
+        };
+        presses.swap_remove(index);
+        true
+    }
+
+    pub(crate) fn clear_omp_reply_navigation_forwarded_key(&self, key: &crate::input::TerminalKey) {
+        if !matches!(
+            key.kind,
+            crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+        ) {
+            return;
+        }
+        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
+            return;
+        };
+        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
+            presses.retain(|tracked| *tracked != identity);
+        }
+    }
+
+    pub(crate) fn clear_omp_reply_navigation_presses(&self) {
+        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
+            presses.clear();
+        }
+    }
+
     pub(crate) fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         if let Some(runtime) = &self.runtime {
             runtime.resize(rows, cols, cell_width_px, cell_height_px);
@@ -253,6 +311,11 @@ impl PrivateOmpGuest {
         self._test_input
             .as_mut()
             .is_none_or(|input| input.try_recv().is_err())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_take_input(&mut self) -> Option<Bytes> {
+        self._test_input.as_mut()?.try_recv().ok()
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.

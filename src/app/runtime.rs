@@ -137,11 +137,16 @@ impl App {
                 repetitions,
                 tracked,
             } => {
-                let key = key
-                    .with_kind(crossterm::event::KeyEventKind::Repeat)
-                    .with_repeat_count(1);
+                let grouped_repeat = key.kind == crossterm::event::KeyEventKind::Repeat;
+                let key = key.with_kind(crossterm::event::KeyEventKind::Repeat);
+                let repeated_key = key.clone().with_repeat_count(1);
                 let mut forwarded_target = None;
-                for _ in 0..repetitions {
+                for repeat_index in 0..repetitions {
+                    let key = if grouped_repeat && repeat_index == 0 {
+                        key.clone()
+                    } else {
+                        repeated_key.clone()
+                    };
                     if let Some(target) = &forwarded_target {
                         if !self
                             .forward_terminal_key_to_target(target, key.clone())
@@ -161,7 +166,12 @@ impl App {
                     ) {
                         break;
                     }
-                    if let Some(target) = self.handle_key(key.clone()).await {
+                    let (target, handled_omp_reply_navigation) =
+                        self.handle_key_with_repeat_outcome(key.clone()).await;
+                    if handled_omp_reply_navigation {
+                        break;
+                    }
+                    if let Some(target) = target {
                         if tracked {
                             self.input_leases.insert_forwarded(
                                 lease_key,
@@ -169,6 +179,9 @@ impl App {
                                 key.clone(),
                             );
                             forwarded_target = Some(target);
+                        }
+                        if grouped_repeat && repeat_index == 0 {
+                            break;
                         }
                     }
                 }
@@ -190,14 +203,14 @@ impl App {
                 match key.kind {
                     crossterm::event::KeyEventKind::Press => {
                         let initial_context = self.terminal_input_context();
-                        let target = if matches!(
+                        let (target, handled_omp_reply_navigation) = if matches!(
                             initial_context,
                             Some(super::TerminalInputContext::Findr(_))
                         ) {
                             self.handle_findr_key(key.clone());
-                            None
+                            (None, false)
                         } else {
-                            self.handle_key(key.clone()).await
+                            self.handle_key_with_repeat_outcome(key.clone()).await
                         };
                         let resulting_context = self.terminal_input_context();
                         let plan = self.input_leases.complete_press(
@@ -206,6 +219,7 @@ impl App {
                             initial_context.as_ref(),
                             resulting_context.as_ref(),
                             target,
+                            handled_omp_reply_navigation,
                         );
                         self.execute_repeat_plan(lease_key, key, plan).await;
                         true

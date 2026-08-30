@@ -669,20 +669,23 @@ struct PrimaryScreenEscapeTracker {
     state: PrimaryScreenEscapeState,
 }
 
+const PRIMARY_SCREEN_ESCAPE_MAX_CSI_BYTES: usize = 32;
+
 #[derive(Debug, Default)]
 enum PrimaryScreenEscapeState {
     #[default]
     Ground,
     Escape,
-    Csi(Vec<u8>),
+    Csi {
+        params: [u8; PRIMARY_SCREEN_ESCAPE_MAX_CSI_BYTES],
+        len: usize,
+    },
     CsiDiscard,
     String,
     StringEscape,
 }
 
 impl PrimaryScreenEscapeTracker {
-    const MAX_CSI_BYTES: usize = 32;
-
     fn set_alternate_screen(&mut self, alternate_screen: bool) {
         self.alternate_screen = alternate_screen;
     }
@@ -700,23 +703,30 @@ impl PrimaryScreenEscapeTracker {
                 }
             }
             PrimaryScreenEscapeState::Escape => match byte {
-                b'[' => self.state = PrimaryScreenEscapeState::Csi(Vec::new()),
+                b'[' => {
+                    self.state = PrimaryScreenEscapeState::Csi {
+                        params: [0; PRIMARY_SCREEN_ESCAPE_MAX_CSI_BYTES],
+                        len: 0,
+                    };
+                }
                 b']' | b'P' | b'_' | b'^' | b'X' => {
                     self.state = PrimaryScreenEscapeState::String;
                 }
                 0x1b => {}
                 _ => self.state = PrimaryScreenEscapeState::Ground,
             },
-            PrimaryScreenEscapeState::Csi(params) => {
+            PrimaryScreenEscapeState::Csi { params, len } => {
                 if byte == 0x1b {
                     self.state = PrimaryScreenEscapeState::Escape;
                 } else if (0x40..=0x7e).contains(&byte) {
-                    let params = std::mem::take(params);
+                    let clear =
+                        apply_primary_screen_csi(&params[..*len], byte, &mut self.alternate_screen);
                     self.state = PrimaryScreenEscapeState::Ground;
-                    return apply_primary_screen_csi(&params, byte, &mut self.alternate_screen);
+                    return clear;
                 } else if (0x20..=0x3f).contains(&byte) {
-                    if params.len() < Self::MAX_CSI_BYTES {
-                        params.push(byte);
+                    if *len < params.len() {
+                        params[*len] = byte;
+                        *len += 1;
                     } else {
                         self.state = PrimaryScreenEscapeState::CsiDiscard;
                     }
@@ -844,13 +854,11 @@ impl AgentOscStateTracker {
             &mut self.omp_reply_anchors,
         );
         let mut observation = AgentOscObservation::default();
-        let mut queued_anchor_ids: Vec<Vec<u8>> = Vec::new();
 
         for (index, &byte) in bytes.iter().enumerate() {
             if primary_screen_escapes.observe(byte) {
                 omp_reply_anchors.clear();
                 observation.reply_anchor_events.clear();
-                queued_anchor_ids.clear();
                 observation.reset_reply_selection = true;
             }
             collector.observe_byte(byte, &mut |body| {
@@ -879,21 +887,15 @@ impl AgentOscStateTracker {
                             omp_reply_anchors.clear();
                             *omp_reply_session = Some(aid.session.to_vec());
                             observation.reply_anchor_events.clear();
-                            queued_anchor_ids.clear();
                             observation.reset_reply_selection = true;
                         }
-                        if !omp_reply_anchors
-                            .iter()
-                            .any(|anchor| anchor.id.as_slice() == aid.id)
-                            && !queued_anchor_ids.iter().any(|id| id.as_slice() == aid.id)
-                        {
-                            let anchor_id = aid.id.to_vec();
-                            queued_anchor_ids.push(anchor_id.clone());
-                            observation.reply_anchor_events.push(PendingOmpReplyAnchor {
-                                end_offset: index + 1,
-                                anchor_id,
-                            });
-                        }
+                        observation.reply_anchor_events.push(PendingOmpReplyAnchor {
+                            // Registration occurs after this terminating byte has
+                            // reached Ghostty, so an OSC 133 A tracks its fresh
+                            // prompt row instead of the preceding row.
+                            end_offset: index + 1,
+                            anchor_id: aid.id.to_vec(),
+                        });
                     }
                     _ => {}
                 }
@@ -909,20 +911,21 @@ impl AgentOscStateTracker {
     ) {
         self.drop_pruned_omp_reply_anchors();
 
-        if self
-            .omp_reply_anchors
-            .iter()
-            .any(|anchor| anchor.id == event.anchor_id)
-        {
-            return;
-        }
         let Ok(Some(row)) = terminal.track_active_primary_prompt_row() else {
             return;
         };
-        self.omp_reply_anchors.push_back(OmpReplyAnchor {
-            id: event.anchor_id,
-            row,
-        });
+        if let Some(anchor) = self
+            .omp_reply_anchors
+            .iter_mut()
+            .find(|anchor| anchor.id == event.anchor_id)
+        {
+            anchor.row = row;
+        } else {
+            self.omp_reply_anchors.push_back(OmpReplyAnchor {
+                id: event.anchor_id,
+                row,
+            });
+        }
     }
 
     pub(super) fn omp_reply_anchor_rows(&mut self) -> Vec<(Vec<u8>, usize)> {
@@ -967,18 +970,17 @@ impl AgentOscStateTracker {
         self.omp_reply_anchors.clear();
     }
 
+    #[cfg(test)]
+    pub(super) fn omp_reply_anchor_count(&self) -> usize {
+        self.omp_reply_anchors.len()
+    }
+
     fn drop_pruned_omp_reply_anchors(&mut self) {
-        // Page-list pruning is chronological, so checking and removing from
-        // the head keeps ordinary PTY writes constant-time. A terminal can
-        // also recycle a visible row without making its pin garbage; require
-        // its original prompt semantic to remain intact in that case.
-        while self
-            .omp_reply_anchors
-            .front()
-            .is_some_and(|anchor| !anchor.row.has_value() || !anchor.row.is_primary_prompt())
-        {
-            self.omp_reply_anchors.pop_front();
-        }
+        // Rebinding a stable AID keeps its logical deque position while moving
+        // its row forward, so invalid older anchors can follow a valid front.
+        // Retain preserves that navigation order while pruning every stale pin.
+        self.omp_reply_anchors
+            .retain(|anchor| anchor.row.has_value() && anchor.row.is_primary_prompt());
     }
 
     /// Drops the retained title and progress so a new foreground agent cannot
@@ -1654,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_osc_queues_unique_safe_reply_aids_by_process_session() {
+    fn agent_osc_queues_each_safe_reply_aid_by_process_session() {
         let mut tracker = AgentOscStateTracker::default();
 
         let first = tracker.observe(
@@ -1668,7 +1670,11 @@ mod tests {
                 .iter()
                 .map(|event| event.anchor_id.as_slice())
                 .collect::<Vec<_>>(),
-            vec![b"run-a:reply-1".as_slice(), b"run-a:reply-2".as_slice()]
+            vec![
+                b"run-a:reply-1".as_slice(),
+                b"run-a:reply-1".as_slice(),
+                b"run-a:reply-2".as_slice(),
+            ]
         );
 
         let replacement = tracker.observe(b"\x1b]133;A;aid=omp-response-run-b:reply-1\x07");
@@ -1717,6 +1723,22 @@ mod tests {
             .observe(b"\x1b]133;A;aid=omp-response-run-a:reply/unsafe\x07")
             .reply_anchor_events
             .is_empty());
+    }
+
+    #[test]
+    fn primary_screen_escape_tracker_caps_csi_and_keeps_split_ed3() {
+        let mut tracker = PrimaryScreenEscapeTracker::default();
+        assert!(!tracker.observe(0x1b));
+        assert!(!tracker.observe(b'['));
+        for _ in 0..=PRIMARY_SCREEN_ESCAPE_MAX_CSI_BYTES {
+            assert!(!tracker.observe(b'3'));
+        }
+        assert!(!tracker.observe(b'J'));
+
+        assert!(!tracker.observe(0x1b));
+        assert!(!tracker.observe(b'['));
+        assert!(!tracker.observe(b'3'));
+        assert!(tracker.observe(b'J'));
     }
 
     #[test]

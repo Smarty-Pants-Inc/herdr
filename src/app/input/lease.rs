@@ -79,6 +79,7 @@ impl InputLeaseTable {
         initial_context: Option<&TerminalInputContext>,
         resulting_context: Option<&TerminalInputContext>,
         target: Option<TerminalInputTarget>,
+        repeats_already_handled: bool,
     ) -> RepeatPlan {
         if key.generated_text.is_some() && !key.has_physical_identity() {
             return RepeatPlan::Ignore;
@@ -98,7 +99,7 @@ impl InputLeaseTable {
         }
         match self.leases.get(&lease_key) {
             Some(InputLease::Consumed(ConsumedInputLease::ReprocessRepeats(context)))
-                if key.repeat_count > 1 =>
+                if key.repeat_count > 1 && !repeats_already_handled =>
             {
                 RepeatPlan::Reprocess {
                     context: context.clone(),
@@ -368,6 +369,7 @@ mod tests {
                 Some(&context),
                 Some(&context),
                 Some(forwarded_target.clone()),
+                false,
             ),
             RepeatPlan::Ignore
         ));
@@ -391,11 +393,68 @@ mod tests {
         let mut leases = InputLeaseTable::default();
 
         assert!(matches!(
-            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None),
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, false),
             RepeatPlan::Reprocess {
                 context: TerminalInputContext::Pane,
                 repetitions: 2,
                 tracked: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn later_grouped_physical_key_down_keeps_its_repeat_count() {
+        let first = physical_generated_slash(1);
+        let lease_key = InputLeaseKey::new(7, &first);
+        let context = TerminalInputContext::Pane;
+        let mut leases = InputLeaseTable::default();
+
+        assert!(matches!(
+            leases.complete_press(
+                lease_key,
+                &first,
+                Some(&context),
+                Some(&context),
+                None,
+                true,
+            ),
+            RepeatPlan::Ignore
+        ));
+
+        let later = leases.normalize_press(&lease_key, physical_generated_slash(u16::MAX));
+        assert_eq!(later.kind, crossterm::event::KeyEventKind::Repeat);
+        assert_eq!(later.repeat_count, u16::MAX);
+        assert!(matches!(
+            leases.plan_repeat(lease_key, &later, Some(&context)),
+            RepeatPlan::Reprocess {
+                repetitions: u16::MAX,
+                tracked: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn handled_grouped_press_skips_replay_but_keeps_its_repeat_lease() {
+        let key = physical_generated_slash(3);
+        let lease_key = InputLeaseKey::new(7, &key);
+        let context = TerminalInputContext::Pane;
+        let mut leases = InputLeaseTable::default();
+
+        assert!(matches!(
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, true),
+            RepeatPlan::Ignore
+        ));
+        assert!(leases.contains(&lease_key));
+
+        let repeated = leases.normalize_press(&lease_key, key.with_repeat_count(1));
+        assert_eq!(repeated.kind, crossterm::event::KeyEventKind::Repeat);
+        assert!(matches!(
+            leases.plan_repeat(lease_key, &repeated, Some(&context)),
+            RepeatPlan::Reprocess {
+                repetitions: 1,
+                tracked: true,
+                ..
             }
         ));
     }
@@ -415,7 +474,8 @@ mod tests {
                 &key,
                 Some(&context),
                 Some(&context),
-                Some(target())
+                Some(target()),
+                false,
             ),
             RepeatPlan::Ignore
         ));
@@ -431,7 +491,8 @@ mod tests {
         leases.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
 
         let key = leases.normalize_press(&lease_key, key);
-        let plan = leases.complete_press(lease_key, &key, Some(&context), Some(&context), None);
+        let plan =
+            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, false);
 
         assert!(matches!(
             plan,

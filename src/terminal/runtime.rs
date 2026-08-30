@@ -400,21 +400,36 @@ impl TerminalRuntime {
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         self.0.set_scroll_offset_from_bottom(lines);
     }
-    /// Expands a grouped host key record for routes that bypass App's input
-    /// leases. The normal App route already replays grouped repeats itself.
+
+    #[allow(dead_code)]
+    pub fn jump_to_previous_semantic_prompt(&self) -> bool {
+        self.0.jump_to_previous_semantic_prompt()
+    }
+
+    #[allow(dead_code)]
+    pub fn jump_to_next_semantic_prompt(&self) -> bool {
+        self.0.jump_to_next_semantic_prompt()
+    }
+
+    /// Identifies the arrow key that owns a consumed reply-navigation press.
+    /// Modifiers are deliberately excluded because Windows can report Alt's
+    /// release before the arrow's release.
+    pub(crate) fn omp_reply_navigation_key_identity(
+        key: &crate::input::TerminalKey,
+    ) -> Option<crate::input::KeyIdentity> {
+        matches!(
+            key.code,
+            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
+        )
+        .then(|| key.identity())
+    }
+    /// Handles grouped OMP reply navigation in one locked, clamped terminal pass.
     pub fn try_navigate_omp_reply_repeated(
         &self,
         recognized_omp: bool,
         key: &crate::input::TerminalKey,
     ) -> bool {
-        let mut handled = false;
-        for _ in 0..usize::from(key.repeat_count.max(1)) {
-            if !self.try_navigate_omp_reply(recognized_omp, key) {
-                return handled;
-            }
-            handled = true;
-        }
-        handled
+        self.try_navigate_omp_reply(recognized_omp, key)
     }
 
     /// Handles the exact OMP reply-navigation chord when this runtime belongs
@@ -425,26 +440,7 @@ impl TerminalRuntime {
         recognized_omp: bool,
         key: &crate::input::TerminalKey,
     ) -> bool {
-        recognized_omp
-            && key.modifiers == crossterm::event::KeyModifiers::ALT
-            && matches!(
-                key.kind,
-                crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-            )
-            && !self.alternate_screen_active()
-            && match key.code {
-                crossterm::event::KeyCode::Up => self.jump_to_previous_semantic_prompt(),
-                crossterm::event::KeyCode::Down => self.jump_to_next_semantic_prompt(),
-                _ => false,
-            }
-    }
-
-    pub fn jump_to_previous_semantic_prompt(&self) -> bool {
-        self.0.jump_to_previous_semantic_prompt()
-    }
-
-    pub fn jump_to_next_semantic_prompt(&self) -> bool {
-        self.0.jump_to_next_semantic_prompt()
+        self.0.try_navigate_omp_reply(recognized_omp, key)
     }
 
     pub fn scroll_metrics(&self) -> Option<crate::pane::ScrollMetrics> {

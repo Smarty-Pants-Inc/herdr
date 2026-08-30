@@ -1804,11 +1804,16 @@ impl App {
                 repetitions,
                 tracked,
             } => {
-                let key = key
-                    .with_kind(crossterm::event::KeyEventKind::Repeat)
-                    .with_repeat_count(1);
+                let grouped_repeat = key.kind == crossterm::event::KeyEventKind::Repeat;
+                let key = key.with_kind(crossterm::event::KeyEventKind::Repeat);
+                let repeated_key = key.clone().with_repeat_count(1);
                 let mut forwarded_target = None;
-                for _ in 0..repetitions {
+                for repeat_index in 0..repetitions {
+                    let key = if grouped_repeat && repeat_index == 0 {
+                        key.clone()
+                    } else {
+                        repeated_key.clone()
+                    };
                     if let Some(target) = &forwarded_target {
                         if !self.forward_terminal_key_to_target_headless(target, key.clone()) {
                             self.input_leases.remove(&lease_key);
@@ -1825,12 +1830,20 @@ impl App {
                     ) {
                         break;
                     }
-                    let target = if matches!(context, TerminalInputContext::Findr(_)) {
-                        self.handle_findr_key(key.clone());
-                        None
-                    } else {
-                        self.handle_terminal_key_headless_from_view(source_id, view_id, key.clone())
-                    };
+                    let (target, handled_omp_reply_navigation) =
+                        if matches!(context, TerminalInputContext::Findr(_)) {
+                            self.handle_findr_key(key.clone());
+                            (None, false)
+                        } else {
+                            self.handle_terminal_key_headless_with_repeat_outcome(
+                                source_id,
+                                view_id,
+                                key.clone(),
+                            )
+                        };
+                    if handled_omp_reply_navigation {
+                        break;
+                    }
                     if let Some(target) = target {
                         if tracked {
                             self.input_leases.insert_forwarded(
@@ -1839,6 +1852,9 @@ impl App {
                                 key.clone(),
                             );
                             forwarded_target = Some(target);
+                        }
+                        if grouped_repeat && repeat_index == 0 {
+                            break;
                         }
                     }
                 }
@@ -1927,14 +1943,14 @@ impl App {
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
                             let initial_context = self.terminal_input_context();
-                            let target = if matches!(
+                            let (target, handled_omp_reply_navigation) = if matches!(
                                 initial_context,
                                 Some(TerminalInputContext::Findr(_))
                             ) {
                                 self.handle_findr_key(key.clone());
-                                None
+                                (None, false)
                             } else if initial_context.is_some() {
-                                self.handle_terminal_key_headless_from_view(
+                                self.handle_terminal_key_headless_with_repeat_outcome(
                                     source_id,
                                     view_id,
                                     key.clone(),
@@ -1944,7 +1960,7 @@ impl App {
                                     key.clone(),
                                     view_id,
                                 );
-                                None
+                                (None, false)
                             };
                             event_forwarded = target.is_some();
                             let resulting_context = self.terminal_input_context();
@@ -1954,6 +1970,7 @@ impl App {
                                 initial_context.as_ref(),
                                 resulting_context.as_ref(),
                                 target,
+                                handled_omp_reply_navigation,
                             );
                             self.execute_repeat_plan_headless(
                                 source_id, view_id, lease_key, key, plan,

@@ -12,6 +12,12 @@ struct PreparedPaneInput {
     bytes: Bytes,
 }
 
+#[derive(Default)]
+pub(super) struct TerminalKeyHandling {
+    pub(super) target: Option<TerminalInputTarget>,
+    pub(super) handled_omp_reply_navigation: bool,
+}
+
 enum PreparedPopupInput {
     NotOpen,
     Consumed,
@@ -43,30 +49,58 @@ impl App {
         self.handle_terminal_key_headless_from_view(source_id, None, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_terminal_key_headless_from_view(
         &mut self,
         source_id: InputSourceId,
         view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
+        self.handle_terminal_key_headless_from_view_outcome(source_id, view_id, key)
+            .target
+    }
+
+    pub(super) fn handle_terminal_key_headless_from_view_outcome(
+        &mut self,
+        source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        key: TerminalKey,
+    ) -> TerminalKeyHandling {
         self.clear_hovered_pane_link();
         match self.prepare_popup_key_forward(key.clone()) {
             PreparedPopupInput::NotOpen => {}
-            PreparedPopupInput::Consumed => return None,
+            PreparedPopupInput::Consumed => return TerminalKeyHandling::default(),
             PreparedPopupInput::Bytes { target, bytes } => {
                 let Some(runtime) = self.popup_runtime() else {
                     self.close_popup_pane();
-                    return None;
+                    return TerminalKeyHandling::default();
                 };
-                return runtime.try_send_bytes(bytes).is_ok().then_some(target);
+                return TerminalKeyHandling {
+                    target: runtime.try_send_bytes(bytes).is_ok().then_some(target),
+                    ..Default::default()
+                };
             }
         }
 
-        let input = self.prepare_terminal_key_forward(source_id, view_id, key)?;
+        let mut handled_omp_reply_navigation = false;
+        let Some(input) = self.prepare_terminal_key_forward(
+            source_id,
+            view_id,
+            key,
+            &mut handled_omp_reply_navigation,
+        ) else {
+            return TerminalKeyHandling {
+                target: None,
+                handled_omp_reply_navigation,
+            };
+        };
         let sent = self
             .terminal_input_runtime(&input.target)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
-        sent.then_some(input.target)
+        TerminalKeyHandling {
+            target: sent.then_some(input.target),
+            handled_omp_reply_navigation,
+        }
     }
 
     fn prepare_terminal_key_forward(
@@ -74,6 +108,7 @@ impl App {
         source_id: InputSourceId,
         view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
+        handled_omp_reply_navigation: &mut bool,
     ) -> Option<PreparedPaneInput> {
         let key_event = key.as_key_event();
         if self.try_copy_retained_selection(source_id, key.clone()) {
@@ -190,7 +225,8 @@ impl App {
                     .is_some_and(|terminal| {
                         terminal.effective_known_agent() == Some(crate::detect::Agent::Omp)
                     });
-            if rt.try_navigate_omp_reply(recognized_omp, &key) {
+            if rt.try_navigate_omp_reply_repeated(recognized_omp, &key) {
+                *handled_omp_reply_navigation = true;
                 debug!(
                     code = ?key_event.code,
                     "intercepted OMP semantic reply navigation"
@@ -430,29 +466,54 @@ impl App {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn handle_terminal_key(
         &mut self,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
+        self.handle_terminal_key_with_outcome(key).await.target
+    }
+
+    pub(super) async fn handle_terminal_key_with_outcome(
+        &mut self,
+        key: TerminalKey,
+    ) -> TerminalKeyHandling {
         match self.prepare_popup_key_forward(key.clone()) {
             PreparedPopupInput::NotOpen => {}
-            PreparedPopupInput::Consumed => return None,
+            PreparedPopupInput::Consumed => return TerminalKeyHandling::default(),
             PreparedPopupInput::Bytes { target, bytes } => {
                 let Some(runtime) = self.popup_runtime() else {
                     self.close_popup_pane();
-                    return None;
+                    return TerminalKeyHandling::default();
                 };
-                return runtime.send_bytes(bytes).await.is_ok().then_some(target);
+                return TerminalKeyHandling {
+                    target: runtime.send_bytes(bytes).await.is_ok().then_some(target),
+                    ..Default::default()
+                };
             }
         }
 
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, None, key)?;
+        let mut handled_omp_reply_navigation = false;
+        let Some(input) = self.prepare_terminal_key_forward(
+            crate::app::LOCAL_INPUT_SOURCE,
+            None,
+            key,
+            &mut handled_omp_reply_navigation,
+        ) else {
+            return TerminalKeyHandling {
+                target: None,
+                handled_omp_reply_navigation,
+            };
+        };
         let sent = if let Some(runtime) = self.terminal_input_runtime(&input.target) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
             false
         };
-        sent.then_some(input.target)
+        TerminalKeyHandling {
+            target: sent.then_some(input.target),
+            handled_omp_reply_navigation,
+        }
     }
 }
 
@@ -2317,6 +2378,86 @@ mod tests {
         )
     }
 
+    fn physical_option_up(repeat_count: u16) -> TerminalKey {
+        TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count,
+                virtual_key_code: 0x26,
+                virtual_scan_code: 0x48,
+                unicode: 0,
+                control_key_state: 0x0002,
+            },
+        )
+    }
+
+    fn physical_bare_up_release() -> TerminalKey {
+        TerminalKey::new(KeyCode::Up, KeyModifiers::empty())
+            .with_kind(KeyEventKind::Release)
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down: false,
+                repeat_count: 1,
+                virtual_key_code: 0x26,
+                virtual_scan_code: 0x48,
+                unicode: 0,
+                control_key_state: 0,
+            })
+    }
+    fn physical_escape(repeat_count: u16) -> TerminalKey {
+        TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count,
+                virtual_key_code: 0x1b,
+                virtual_scan_code: 0x01,
+                unicode: 0x1b,
+                control_key_state: 0,
+            },
+        )
+    }
+
+    fn app_with_focused_workspace_plugin_and_tiled_input(
+    ) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+        let mut app = app_for_mouse_test();
+        let workspace = Workspace::test_new("plugin-repeat-input");
+        let workspace_id = workspace.id.clone();
+        let tiled_pane_id = workspace.tabs[0].root_pane;
+        let tiled_terminal_id = workspace
+            .terminal_id(tiled_pane_id)
+            .expect("tiled terminal")
+            .clone();
+        let (tiled_runtime, tiled_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(tiled_terminal_id, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let (plugin_runtime, _plugin_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(40, 24);
+        app.terminal_runtimes
+            .insert(plugin_terminal_id.clone(), plugin_runtime);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.repeat".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 38, 22);
+        (app, tiled_input)
+    }
+
     #[tokio::test]
     async fn page_up_scrolls_plain_shell_pane() {
         let (mut app, pane_id, pane_info) = app_with_plain_scrollback(64);
@@ -2545,6 +2686,68 @@ mod tests {
         assert_eq!(first_repeat, second_repeat);
         assert_ne!(second_repeat, release);
         assert!(second_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+    #[tokio::test]
+    async fn later_grouped_physical_escape_repeat_forwards_exact_count_after_plugin_unfocus_headless(
+    ) {
+        let (mut app, mut input_rx) = app_with_focused_workspace_plugin_and_tiled_input();
+        let escape = physical_escape(1);
+
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(escape.clone()),
+                crate::raw_input::RawInputEvent::Key(physical_escape(3)),
+            ],
+            false,
+        );
+
+        assert!(app
+            .state
+            .workspace_plugin_panes
+            .values()
+            .all(|pane| !pane.focused));
+        assert_eq!(
+            input_rx.try_recv().expect("three forwarded Escape repeats"),
+            Bytes::from_static(b"\x1b\x1b\x1b")
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                escape.with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_grouped_physical_escape_repeat_forwards_exact_count_after_plugin_unfocus_runtime(
+    ) {
+        let (mut app, mut input_rx) = app_with_focused_workspace_plugin_and_tiled_input();
+        let escape = physical_escape(1);
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(escape.clone()))
+            .await;
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(physical_escape(3)))
+            .await;
+
+        assert!(app
+            .state
+            .workspace_plugin_panes
+            .values()
+            .all(|pane| !pane.focused));
+        assert_eq!(
+            input_rx.try_recv().expect("three forwarded Escape repeats"),
+            Bytes::from_static(b"\x1b\x1b\x1b")
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(
+            escape.with_kind(KeyEventKind::Release),
+        ))
+        .await;
         assert!(app.input_leases.is_empty());
     }
 
@@ -2906,6 +3109,70 @@ tail a\r\ntail b\r\ntail c\r\ntail d\r\ntail e\r\n";
             ],
             false,
         );
+
+        assert_eq!(visible_top_line(&app, pane_id), "reply one");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_option_up_clamps_max_repeat_without_reprocessing() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let option_up =
+            TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_repeat_count(u16::MAX);
+
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(option_up.clone()),
+                crate::raw_input::RawInputEvent::Key(
+                    option_up
+                        .with_repeat_count(1)
+                        .with_kind(KeyEventKind::Release),
+                ),
+            ],
+            false,
+        );
+
+        assert_eq!(visible_top_line(&app, pane_id), "reply one");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_grouped_windows_option_up_bare_release_clears_lease_in_headless_route() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let press = physical_option_up(1);
+
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(press.clone()),
+                crate::raw_input::RawInputEvent::Key(physical_option_up(u16::MAX)),
+                crate::raw_input::RawInputEvent::Key(physical_bare_up_release()),
+            ],
+            false,
+        );
+
+        assert_eq!(visible_top_line(&app, pane_id), "reply one");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_grouped_windows_option_up_bare_release_clears_lease_in_runtime_route() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let press = physical_option_up(1);
+
+        for key in [
+            press.clone(),
+            physical_option_up(u16::MAX),
+            physical_bare_up_release(),
+        ] {
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+                .await;
+        }
 
         assert_eq!(visible_top_line(&app, pane_id), "reply one");
         assert!(input_rx.try_recv().is_err());
