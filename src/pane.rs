@@ -4679,6 +4679,23 @@ mod tests {
     }
 
     #[test]
+    fn reported_cwd_accepts_provider_authority_without_ready_hostname() {
+        let cwd = std::path::PathBuf::from("/remote/repo");
+        let target = crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        let authority = target.osc7_authority_with(None, None);
+
+        assert_eq!(
+            usable_terminal_reported_cwd(
+                (cwd.clone(), Some("actual-node".into())),
+                &target,
+                &authority,
+                None,
+            ),
+            Some(cwd)
+        );
+    }
+
+    #[test]
     fn reported_cwd_validation_accepts_local_and_direct_remote_authorities() {
         let local_cwd = std::env::current_dir().unwrap();
         let local = crate::execution::ExecutionTarget::Local;
