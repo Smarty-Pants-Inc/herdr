@@ -1195,6 +1195,42 @@ jobs:
             fetch_assets "$1" "$1.assets"
             merge_assets "$1" "$1.assets"
           }
+          check_tag() {
+            gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref-current.json
+            python -I -S - "$SOURCE" "$TAG" <<'PY'
+          import json, sys
+          from pathlib import Path
+          source, tag = sys.argv[1:]
+          tag_ref = json.loads(Path("tag-ref-current.json").read_text(encoding="utf-8"))
+          if tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
+              raise SystemExit("tag moved before release mutation")
+          PY
+          }
+          resolve_release() {
+            rm -f release-id release-missing
+            gh api graphql \
+              -f query='query($tag: String!) { repository(owner: "Smarty-Pants-Inc", name: "herdr") { release(tagName: $tag) { databaseId } } }' \
+              -f tag="$TAG" > release-lookup.json
+            python -I -S - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path("release-lookup.json").read_text(encoding="utf-8"))
+          release = payload.get("data", {}).get("repository", {}).get("release")
+          if release is None:
+              Path("release-missing").write_text("missing\n", encoding="ascii")
+          elif not isinstance(release, dict):
+              raise SystemExit("release lookup response is invalid")
+          else:
+              release_id = release.get("databaseId")
+              if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id < 1:
+                  raise SystemExit("release lookup ID is invalid")
+              Path("release-id").write_text(f"{release_id}\n", encoding="ascii")
+          PY
+            if [ -f release-id ]; then
+              release_id="$(cat release-id)"
+              gh api "repos/$REPOSITORY/releases/$release_id" > release.json
+            fi
+          }
           test -s final-seal/sealed-handoff.json
           python -I -S - <<'PY'
           import hashlib, json
@@ -1229,42 +1265,14 @@ jobs:
           if state.get("enabled") is not True:
               raise SystemExit("immutable releases are not enabled")
           PY
-          gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref-before.json
-          python -I -S - "$SOURCE" "$TAG" <<'PY'
-          import json, sys
-          from pathlib import Path
-          source, tag = sys.argv[1:]
-          tag_ref = json.loads(Path("tag-ref-before.json").read_text(encoding="utf-8"))
-          if tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
-              raise SystemExit("tag does not bind the exact trusted source before release mutation")
-          PY
-          set +e
-          gh api --include "repos/$REPOSITORY/releases/tags/$TAG" > release-response.txt
-          api_status=$?
-          set -e
-          python -I -S - "$api_status" <<'PY'
-          import json, sys
-          from pathlib import Path
-          status = int(sys.argv[1])
-          raw = Path("release-response.txt").read_bytes()
-          header_end = raw.find(b"\r\n\r\n")
-          if header_end < 0:
-              raise SystemExit("release lookup did not return an HTTP response")
-          first_line = raw.splitlines()[0].decode("ascii", "strict").split()
-          if len(first_line) < 2 or not first_line[0].startswith("HTTP/"):
-              raise SystemExit("release lookup response status is invalid")
-          code = int(first_line[1])
-          if code == 200 and status == 0:
-              Path("release.json").write_bytes(raw[header_end + 4:])
-          elif code == 404 and status != 0:
-              Path("release-missing").write_text("404\n", encoding="ascii")
-          else:
-              raise SystemExit(f"release lookup failed with HTTP {code}")
-          PY
+          check_tag
+          resolve_release
           if [ -f release-missing ]; then
+            check_tag
             gh release create "$TAG" --repo "$REPOSITORY" --title "$TAG" --notes "Trusted paired preview release" --prerelease --draft --verify-tag
-            gh api "repos/$REPOSITORY/releases/tags/$TAG" > release.json
+            resolve_release
           fi
+          test -s release.json
           fetch_assets release.json release-assets.json
           python -I -S - <<'PY'
           import json, os
@@ -1312,17 +1320,6 @@ jobs:
               Path("delete-list").write_text("", encoding="ascii")
               Path("upload-list").write_text("", encoding="utf-8")
           PY
-          check_tag() {
-            gh api "repos/$REPOSITORY/git/ref/tags/$TAG" > tag-ref-current.json
-            python -I -S - "$SOURCE" "$TAG" <<'PY'
-          import json, sys
-          from pathlib import Path
-          source, tag = sys.argv[1:]
-          tag_ref = json.loads(Path("tag-ref-current.json").read_text(encoding="utf-8"))
-          if tag_ref.get("ref") != f"refs/tags/{tag}" or tag_ref.get("object", {}).get("type") != "commit" or tag_ref.get("object", {}).get("sha") != source:
-              raise SystemExit("tag moved before release mutation")
-          PY
-          }
           if [ "$(cat release-mutation)" = publish ]; then
             while IFS= read -r asset_id; do
               [ -n "$asset_id" ] || continue
