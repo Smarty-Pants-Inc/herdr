@@ -13,6 +13,7 @@ pub(super) const MAX_PLUGIN_COMMANDS_IN_FLIGHT: usize = 32;
 const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
 
 const PLUGIN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const PLUGIN_COMMAND_TERMINATION_ATTEMPTS: usize = 40;
 
 pub(crate) struct PluginCommandRuntime {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -59,21 +60,98 @@ fn spawn_plugin_command(
     }
 }
 
-fn terminate_plugin_child(
-    child: &mut std::process::Child,
-    process_tree: &mut crate::platform::ProcessTreeGuard,
-) {
-    process_tree.terminate();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                let _ = child.kill();
-            }
-            Err(_) => {}
+fn wait_for_plugin_child_termination(
+    mut poll: impl FnMut() -> std::io::Result<bool>,
+    mut wait: impl FnMut(),
+) -> std::io::Result<()> {
+    for attempt in 0..PLUGIN_COMMAND_TERMINATION_ATTEMPTS {
+        match poll() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
-        std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL);
+        if attempt + 1 < PLUGIN_COMMAND_TERMINATION_ATTEMPTS {
+            wait();
+        }
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out reaping terminated plugin command",
+    ))
+}
+
+type PluginReaperItem = (std::process::Child, crate::platform::ProcessTreeGuard);
+
+static PLUGIN_REAPER: std::sync::LazyLock<std::sync::mpsc::Sender<PluginReaperItem>> =
+    std::sync::LazyLock::new(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<PluginReaperItem>();
+        if let Err(error) = std::thread::Builder::new()
+            .name("herdr-plugin-reaper".to_owned())
+            .spawn(move || {
+                for (mut child, mut process_tree) in receiver {
+                    let pid = child.id();
+                    process_tree.terminate();
+                    let _ = child.kill();
+                    if let Err(error) = child.wait() {
+                        tracing::warn!(pid, err = %error, "background plugin command reaper failed");
+                    }
+                }
+            })
+        {
+            tracing::warn!(err = %error, "failed to start background plugin command reaper");
+        }
+        sender
+    });
+
+fn plugin_reaper_sender() -> &'static std::sync::mpsc::Sender<PluginReaperItem> {
+    &PLUGIN_REAPER
+}
+
+fn handoff_plugin_child_to_reaper(
+    child: std::process::Child,
+    process_tree: crate::platform::ProcessTreeGuard,
+) -> Result<(), PluginReaperItem> {
+    plugin_reaper_sender()
+        .send((child, process_tree))
+        .map_err(|error| error.0)
+}
+
+fn terminate_plugin_child(
+    mut child: std::process::Child,
+    mut process_tree: crate::platform::ProcessTreeGuard,
+) -> bool {
+    process_tree.terminate();
+    let result = wait_for_plugin_child_termination(
+        || match child.try_wait()? {
+            Some(_) => Ok(true),
+            None => {
+                let _ = child.kill();
+                Ok(false)
+            }
+        },
+        || std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
+    );
+    if result.is_ok() {
+        return true;
+    }
+
+    let pid = child.id();
+    tracing::warn!(pid, err = %result.unwrap_err(), "plugin command reaping exceeded the shutdown deadline; continuing in background");
+    if let Err((mut child, mut process_tree)) = handoff_plugin_child_to_reaper(child, process_tree)
+    {
+        tracing::warn!(
+            pid,
+            "background plugin command reaper unavailable; reaping synchronously"
+        );
+        process_tree.terminate();
+        let _ = child.kill();
+        if let Err(error) = child.wait() {
+            tracing::warn!(pid, err = %error, "synchronous plugin command reaper failed");
+        }
+        return true;
+    }
+    false
 }
 
 fn publish_plugin_command_finished(
@@ -271,7 +349,7 @@ impl App {
                 }
             };
             let finished = match child {
-                Ok((mut child, mut process_tree)) => {
+                Ok((mut child, process_tree)) => {
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let stdout_reader = stdout.map(|stdout| {
@@ -284,19 +362,24 @@ impl App {
                             read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
                         })
                     });
+                    let mut child_and_tree = Some((child, process_tree));
                     let mut remote_request_channel = remote_request_channel;
                     #[cfg(unix)]
                     let mut request_delivered = remote_request_channel.is_none();
-                    let status = loop {
+                    let (status, readers_can_join) = loop {
                         if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
                             if let Some(channel) = remote_request_channel.take() {
                                 channel.cancel();
                             }
-                            terminate_plugin_child(&mut child, &mut process_tree);
-                            break Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "plugin command cancelled",
-                            ));
+                            let (child, process_tree) = child_and_tree.take().unwrap();
+                            let reaped = terminate_plugin_child(child, process_tree);
+                            break (
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "plugin command cancelled",
+                                )),
+                                reaped,
+                            );
                         }
                         #[cfg(unix)]
                         if !request_delivered {
@@ -312,50 +395,53 @@ impl App {
                                     if let Some(channel) = remote_request_channel.take() {
                                         channel.cancel();
                                     }
-                                    terminate_plugin_child(&mut child, &mut process_tree);
-                                    break Err(std::io::Error::other(err));
+                                    let (child, process_tree) = child_and_tree.take().unwrap();
+                                    let reaped = terminate_plugin_child(child, process_tree);
+                                    break (Err(std::io::Error::other(err)), reaped);
                                 }
                                 crate::execution::RemoteRequestDelivery::Pending => {}
                             }
                         }
+                        let (child, process_tree) = child_and_tree.as_mut().unwrap();
                         match child.try_wait() {
                             Ok(Some(status)) => {
                                 process_tree.terminate();
-                                break Ok(status);
+                                break (Ok(status), true);
                             }
                             Ok(None) => std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
                             Err(err) => {
                                 if let Some(channel) = remote_request_channel.take() {
                                     channel.cancel();
                                 }
-                                terminate_plugin_child(&mut child, &mut process_tree);
-                                break Err(err);
+                                let (child, process_tree) = child_and_tree.take().unwrap();
+                                let reaped = terminate_plugin_child(child, process_tree);
+                                break (Err(err), reaped);
                             }
                         }
                     };
+                    let stdout = readers_can_join
+                        .then(|| stdout_reader.and_then(|reader| reader.join().ok()))
+                        .flatten()
+                        .unwrap_or_default();
+                    let stderr = readers_can_join
+                        .then(|| stderr_reader.and_then(|reader| reader.join().ok()))
+                        .flatten()
+                        .unwrap_or_default();
                     match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
                             exit_code: status.code(),
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
+                            stdout,
+                            stderr,
                             error: None,
                         },
                         Err(err) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
                             finished_unix_ms: current_unix_ms(),
                             exit_code: None,
-                            stdout: stdout_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
-                            stderr: stderr_reader
-                                .and_then(|reader| reader.join().ok())
-                                .unwrap_or_default(),
+                            stdout,
+                            stderr,
                             error: Some(err.to_string()),
                         },
                     }
@@ -540,6 +626,24 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_child_wait_bounds_repeated_interrupted_errors() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = wait_for_plugin_child_termination(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            },
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(attempts, PLUGIN_COMMAND_TERMINATION_ATTEMPTS);
+        assert_eq!(waits, PLUGIN_COMMAND_TERMINATION_ATTEMPTS - 1);
+    }
 
     #[test]
     fn plugin_runtime_env_does_not_expose_build_manager_path() {

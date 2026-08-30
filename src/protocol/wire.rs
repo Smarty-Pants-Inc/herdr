@@ -97,6 +97,9 @@ pub struct OmpRendererFrame {
     pub frame_nonce: [u8; 16],
     pub pane: Option<OmpRendererPane>,
     pub focused: bool,
+    /// True while server-owned UI overlaps or supersedes the native pane.
+    #[serde(default)]
+    pub server_owned_overlay: bool,
     pub surface_active: bool,
 }
 
@@ -767,6 +770,16 @@ pub enum ClientMessage {
         launch_id: u64,
         authority_revision: u64,
         frame_nonce: [u8; 16],
+    },
+    /// Structured input accepted under an exact server-owned renderer frame.
+    ServerOwnedInputEvents { events: Vec<ClientInputEvent> },
+    /// Pixel input accepted under an exact server-owned renderer frame.
+    ServerOwnedInputPixels {
+        data: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
     },
 }
 
@@ -1512,6 +1525,20 @@ mod tests {
             21
         );
         assert_eq!(
+            tag(&ClientMessage::ServerOwnedInputEvents { events: Vec::new() }),
+            22
+        );
+        assert_eq!(
+            tag(&ClientMessage::ServerOwnedInputPixels {
+                data: b"\x1b[<0;1;1M".to_vec(),
+                cols: 80,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            }),
+            23
+        );
+        assert_eq!(
             tag(&ServerMessage::OmpPane {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
@@ -1925,6 +1952,29 @@ mod tests {
             }),
             9
         );
+    }
+
+    #[test]
+    fn server_owned_input_roundtrip() {
+        for message in [
+            ClientMessage::ServerOwnedInputEvents {
+                events: vec![ClientInputEvent::TextCommit("accepted".to_owned())],
+            },
+            ClientMessage::ServerOwnedInputPixels {
+                data: b"\x1b[<0;21;31M".to_vec(),
+                cols: 80,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            },
+        ] {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            let (decoded, consumed): (ClientMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(decoded, message);
+            assert_eq!(consumed, encoded.len());
+        }
     }
 
     #[test]

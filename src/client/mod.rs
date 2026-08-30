@@ -132,12 +132,24 @@ impl HostInputSnapshot {
 struct HostInputSegment {
     bytes: usize,
     snapshot: HostInputSnapshot,
+    geometry: Option<crate::input::mouse::HostGeometry>,
 }
 
 #[cfg(unix)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HostInputBoundary {
     segments: VecDeque<HostInputSegment>,
+    geometry: Option<crate::input::mouse::HostGeometry>,
+}
+
+#[cfg(unix)]
+impl Default for HostInputBoundary {
+    fn default() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            geometry: crate::input::mouse::HostGeometry::current(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -180,6 +192,13 @@ impl HostInputState {
             stable: true,
         }
     }
+    fn load_context(&self) -> (HostInputSnapshot, Option<crate::input::mouse::HostGeometry>) {
+        let boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.load(), boundary.geometry)
+    }
 
     fn assigned_input_bytes(boundary: &HostInputBoundary) -> usize {
         boundary.segments.iter().map(|segment| segment.bytes).sum()
@@ -189,6 +208,7 @@ impl HostInputState {
         boundary: &mut HostInputBoundary,
         bytes: usize,
         snapshot: HostInputSnapshot,
+        geometry: Option<crate::input::mouse::HostGeometry>,
     ) {
         if bytes == 0 {
             return;
@@ -196,13 +216,15 @@ impl HostInputState {
         if let Some(last) = boundary
             .segments
             .back_mut()
-            .filter(|last| last.snapshot == snapshot)
+            .filter(|last| last.snapshot == snapshot && last.geometry == geometry)
         {
             last.bytes = last.bytes.saturating_add(bytes);
         } else {
-            boundary
-                .segments
-                .push_back(HostInputSegment { bytes, snapshot });
+            boundary.segments.push_back(HostInputSegment {
+                bytes,
+                snapshot,
+                geometry,
+            });
         }
     }
 
@@ -213,7 +235,8 @@ impl HostInputState {
             .transpose()?
             .unwrap_or(0);
         let unassigned = pending.saturating_sub(Self::assigned_input_bytes(boundary));
-        Self::push_input_segment(boundary, unassigned, self.load());
+        let geometry = boundary.geometry;
+        Self::push_input_segment(boundary, unassigned, self.load(), geometry);
         Ok(())
     }
 
@@ -229,9 +252,14 @@ impl HostInputState {
         &self,
         boundary: &mut HostInputBoundary,
         scratch: &mut [u8],
-    ) -> io::Result<(usize, HostInputSnapshot)> {
+    ) -> io::Result<(
+        usize,
+        HostInputSnapshot,
+        Option<crate::input::mouse::HostGeometry>,
+    )> {
         let segment = boundary.segments.front().copied();
         let input_state = segment.map_or_else(|| self.load(), |segment| segment.snapshot);
+        let assigned_geometry = segment.map(|segment| segment.geometry);
         let limit = segment.map_or(scratch.len(), |segment| segment.bytes.min(scratch.len()));
         let input_fd = self.input_fd.ok_or_else(|| {
             io::Error::new(io::ErrorKind::Unsupported, "stdin reader is not configured")
@@ -247,11 +275,22 @@ impl HostInputState {
                 boundary.segments.pop_front();
             }
         }
-        Ok((read, input_state))
+        let geometry = match assigned_geometry {
+            Some(geometry) => geometry,
+            None => crate::input::mouse::HostGeometry::current(),
+        };
+        Ok((read, input_state, geometry))
     }
 
     #[cfg(test)]
-    fn read_input(&self, scratch: &mut [u8]) -> io::Result<(usize, HostInputSnapshot)> {
+    fn read_input(
+        &self,
+        scratch: &mut [u8],
+    ) -> io::Result<(
+        usize,
+        HostInputSnapshot,
+        Option<crate::input::mouse::HostGeometry>,
+    )> {
         let mut boundary = self
             .event_order
             .lock()
@@ -263,16 +302,20 @@ impl HostInputState {
         &self,
         event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
         scratch: &mut [u8],
-        build: impl FnOnce(&[u8], HostInputSnapshot) -> Option<ClientLoopEvent>,
+        build: impl FnOnce(
+            &[u8],
+            HostInputSnapshot,
+            Option<crate::input::mouse::HostGeometry>,
+        ) -> Option<ClientLoopEvent>,
     ) -> io::Result<usize> {
         let permit = Self::reserve_event_slot(event_tx)?;
         let mut boundary = self
             .event_order
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (read, input_state) = self.read_input_locked(&mut boundary, scratch)?;
+        let (read, input_state, geometry) = self.read_input_locked(&mut boundary, scratch)?;
         if read > 0 {
-            if let Some(event) = build(&scratch[..read], input_state) {
+            if let Some(event) = build(&scratch[..read], input_state, geometry) {
                 permit.send(event);
             }
         }
@@ -313,10 +356,12 @@ impl HostInputState {
             .transpose()?
             .unwrap_or(0);
         let during_apply = pending.saturating_sub(Self::assigned_input_bytes(&boundary));
+        let geometry = boundary.geometry;
         Self::push_input_segment(
             &mut boundary,
             during_apply,
             previous.continued_with(snapshot),
+            geometry,
         );
         self.packed.store(snapshot.packed, Ordering::Release);
         self.wake_input_reader()?;
@@ -360,6 +405,7 @@ impl HostInputState {
         &self,
         event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
         new_size: (u16, u16, u32, u32),
+        host_geometry: Option<crate::input::mouse::HostGeometry>,
     ) -> io::Result<()> {
         let permit = Self::reserve_event_slot(event_tx)?;
         let mut boundary = self
@@ -368,8 +414,14 @@ impl HostInputState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.capture_input_boundary(&mut boundary)?;
         let generation = self.advance_generation().generation();
+        boundary.geometry = host_geometry;
         permit.send(ClientLoopEvent::Resize(
-            new_size.0, new_size.1, new_size.2, new_size.3, generation,
+            new_size.0,
+            new_size.1,
+            new_size.2,
+            new_size.3,
+            generation,
+            host_geometry,
         ));
         self.wake_input_reader()
     }
@@ -385,6 +437,28 @@ fn mouse_input_is_current(
     input.stable
         && input.generation() == applied_generation
         && (!require_capture || current.capture_active())
+}
+
+#[cfg(unix)]
+fn pixel_input_is_current(
+    input: HostInputSnapshot,
+    current: HostInputSnapshot,
+    applied_generation: u64,
+    input_geometry: crate::input::mouse::HostGeometry,
+    applied_geometry: Option<crate::input::mouse::HostGeometry>,
+) -> bool {
+    mouse_input_is_current(input, current, applied_generation, true)
+        && applied_geometry == Some(input_geometry)
+}
+#[cfg(unix)]
+fn apply_resize_input_boundary(
+    applied_generation: &mut u64,
+    applied_geometry: &mut Option<crate::input::mouse::HostGeometry>,
+    resize_generation: u64,
+    resize_geometry: Option<crate::input::mouse::HostGeometry>,
+) {
+    *applied_generation = (*applied_generation).max(resize_generation);
+    *applied_geometry = resize_geometry;
 }
 
 impl MousePointerState {
@@ -1532,7 +1606,14 @@ enum ClientLoopEvent {
     #[cfg(windows)]
     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
     /// Terminal resize detected.
-    Resize(u16, u16, u32, u32, u64),
+    Resize(
+        u16,
+        u16,
+        u32,
+        u32,
+        u64,
+        Option<crate::input::mouse::HostGeometry>,
+    ),
     /// Server message received.
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
@@ -2376,13 +2457,26 @@ async fn run_client_loop(
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
     #[cfg(unix)]
+    let initial_host_geometry = crate::input::mouse::HostGeometry::current()
+        .filter(|geometry| geometry.cols == cols && geometry.rows == rows);
+    #[cfg(unix)]
     let (host_input_state, stdin_input_wake) =
         HostInputState::with_input_fd(state.mouse_capture_active, false, io::stdin().as_raw_fd())
             .map_err(ClientError::ConnectionFailed)?;
     #[cfg(unix)]
+    {
+        host_input_state
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .geometry = initial_host_geometry;
+    }
+    #[cfg(unix)]
     let host_input_state = Arc::new(host_input_state);
     #[cfg(unix)]
     let mut applied_host_input_generation = host_input_state.load().generation();
+    #[cfg(unix)]
+    let mut applied_host_geometry = initial_host_geometry;
 
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -2608,9 +2702,6 @@ async fn run_client_loop(
                     }
                     (data, Some(events))
                 };
-                if let Some(events) = parsed_events.as_deref() {
-                    state.omp_renderer.observe_outer_focus(events);
-                }
                 if state.omp_renderer.owns_input() {
                     for message in state.omp_renderer.route_input_at_generation(
                         parsed_events.unwrap_or_default(),
@@ -2629,6 +2720,9 @@ async fn run_client_loop(
                     )?;
                     let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     continue;
+                }
+                if let Some(events) = parsed_events.as_deref() {
+                    state.omp_renderer.observe_outer_focus(events);
                 }
                 if should_bridge_clipboard_image_paste(
                     &data,
@@ -2654,6 +2748,11 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
+                state.omp_renderer.complete_direct_graphics(
+                    response.transfer_id,
+                    response.image_id,
+                    response.success,
+                );
                 let message = ClientMessage::GraphicsTransmissionResult {
                     transfer_id: response.transfer_id,
                     image_id: response.image_id,
@@ -2666,11 +2765,12 @@ async fn run_client_loop(
             #[cfg(unix)]
             ClientLoopEvent::PixelMouse(data, geometry, input_state) => {
                 let current_input_state = host_input_state.load();
-                if !mouse_input_is_current(
+                if !pixel_input_is_current(
                     input_state,
                     current_input_state,
                     applied_host_input_generation,
-                    true,
+                    geometry,
+                    applied_host_geometry,
                 ) || !current_input_state.sgr_pixels_active()
                 {
                     continue;
@@ -2741,14 +2841,19 @@ async fn run_client_loop(
                 cell_width_px,
                 cell_height_px,
                 resize_generation,
+                host_geometry,
             ) => {
                 #[cfg(unix)]
                 {
-                    applied_host_input_generation =
-                        applied_host_input_generation.max(resize_generation);
+                    apply_resize_input_boundary(
+                        &mut applied_host_input_generation,
+                        &mut applied_host_geometry,
+                        resize_generation,
+                        host_geometry,
+                    );
                 }
                 #[cfg(windows)]
-                let _ = resize_generation;
+                let _ = (resize_generation, host_geometry);
                 state.reported_size = (new_cols, new_rows);
                 state.reported_cell_size_px = (cell_width_px, cell_height_px);
                 state.mouse_pointer.set_cell(None);
@@ -2756,11 +2861,9 @@ async fn run_client_loop(
                 state.request_repaint();
                 #[cfg(unix)]
                 {
-                    let host_geometry = crate::input::mouse::HostGeometry::current()
-                        .filter(|geometry| geometry.cols == new_cols && geometry.rows == new_rows);
                     state.omp_renderer.resize(
                         (new_cols, new_rows, cell_width_px, cell_height_px),
-                        host_geometry,
+                        applied_host_geometry,
                         applied_host_input_generation,
                     );
                     display_pending_omp_surface(
@@ -2937,6 +3040,20 @@ async fn run_client_loop(
                                 .direct_graphics_response
                                 .lock()
                                 .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
+                        if valid {
+                            state.omp_renderer.stage_direct_graphics(
+                                transfer_id,
+                                image_id,
+                                leading.clone(),
+                                control.clone(),
+                                (
+                                    state.reported_size.0,
+                                    state.reported_size.1,
+                                    state.reported_cell_size_px.0,
+                                    state.reported_cell_size_px.1,
+                                ),
+                            );
+                        }
                         let sent = if valid {
                             let mut command = Vec::new();
                             crate::kitty_graphics::encode_kitty_regular_file(
@@ -2976,6 +3093,11 @@ async fn run_client_loop(
                                     matcher.cancel(transfer_id);
                                 }
                             }
+                            state.omp_renderer.complete_direct_graphics(
+                                transfer_id,
+                                image_id,
+                                false,
+                            );
                             let result = ClientMessage::GraphicsTransmissionResult {
                                 transfer_id,
                                 image_id,
@@ -2998,6 +3120,19 @@ async fn run_client_loop(
                         state.retired_direct_graphics = Some((transfer_id, image_id));
                         if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                             matcher.retire(transfer_id);
+                        }
+                        state
+                            .omp_renderer
+                            .retire_direct_graphics(transfer_id, image_id);
+                        let mut cleanup = Vec::new();
+                        crate::kitty_graphics::encode_delete_image(&mut cleanup, image_id);
+                        let mut stdout = io::stdout();
+                        if stdout
+                            .write_all(&cleanup)
+                            .and_then(|()| stdout.flush())
+                            .is_ok()
+                        {
+                            record_received_kitty_graphics(&cleanup);
                         }
                     }
                     #[cfg(not(unix))]
@@ -3787,15 +3922,53 @@ fn current_terminal_geometry(
     kitty_graphics_enabled: bool,
     reported_cell_size: &AtomicU64,
     last_cell_size: Option<(u32, u32)>,
-) -> (u16, u16, u32, u32) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0);
-    }
-    let (cell_width_px, cell_height_px) = ioctl_cell_size().unwrap_or_else(|| {
-        cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size)
-    });
-    (cols, rows, cell_width_px, cell_height_px)
+) -> (
+    (u16, u16, u32, u32),
+    Option<crate::input::mouse::HostGeometry>,
+) {
+    #[cfg(unix)]
+    let (cols, rows, host_geometry, ioctl_cell_size) = match crossterm::terminal::window_size() {
+        Ok(size) => {
+            let cell_size =
+                (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then(
+                    || {
+                        (
+                            (u32::from(size.width) / u32::from(size.columns)).max(1),
+                            (u32::from(size.height) / u32::from(size.rows)).max(1),
+                        )
+                    },
+                );
+            (
+                size.columns,
+                size.rows,
+                crate::input::mouse::HostGeometry::new(
+                    size.columns,
+                    size.rows,
+                    u32::from(size.width),
+                    u32::from(size.height),
+                ),
+                cell_size,
+            )
+        }
+        Err(_) => {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            (cols, rows, None, None)
+        }
+    };
+    #[cfg(not(unix))]
+    let (cols, rows, host_geometry, ioctl_cell_size) = {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let host_geometry: Option<crate::input::mouse::HostGeometry> = None;
+        (cols, rows, host_geometry, None)
+    };
+    let (cell_width_px, cell_height_px) = if kitty_graphics_enabled {
+        ioctl_cell_size.unwrap_or_else(|| {
+            cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size)
+        })
+    } else {
+        (0, 0)
+    };
+    ((cols, rows, cell_width_px, cell_height_px), host_geometry)
 }
 
 /// Reads terminal geometry before the handshake. Direct graphics is eligible
@@ -3825,10 +3998,16 @@ fn resize_report_required(
 ) -> bool {
     signalled || new_size != last_size
 }
+fn resize_host_geometry_report_required(
+    current: Option<crate::input::mouse::HostGeometry>,
+    last: Option<crate::input::mouse::HostGeometry>,
+) -> bool {
+    current.is_some() && current != last
+}
 
 #[cfg(windows)]
 fn resize_event(new_size: (u16, u16, u32, u32)) -> ClientLoopEvent {
-    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0)
+    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0, None)
 }
 
 /// Watches the terminal size and sends resize events when it changes.
@@ -3854,22 +4033,33 @@ fn resize_poll_loop(
         initial_cell_width,
         initial_cell_height,
     );
+    #[cfg(unix)]
+    let mut last_host_geometry = host_input_state.load_context().1;
     while !should_quit.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
         let signalled = crate::platform::take_terminal_resize_signal();
-        let new_size = current_terminal_geometry(
+        let (new_size, host_geometry) = current_terminal_geometry(
             kitty_graphics_enabled,
             reported_cell_size,
             Some((last_size.2, last_size.3)),
         );
-        if resize_report_required(signalled, new_size, last_size) {
-            last_size = new_size;
+        #[cfg(unix)]
+        let geometry_changed =
+            resize_host_geometry_report_required(host_geometry, last_host_geometry);
+        #[cfg(not(unix))]
+        let geometry_changed = false;
+        if resize_report_required(signalled, new_size, last_size) || geometry_changed {
             #[cfg(unix)]
-            let send_result = host_input_state.send_resize(&resize_tx, new_size);
+            let send_result = host_input_state.send_resize(&resize_tx, new_size, host_geometry);
             #[cfg(windows)]
             let send_result = resize_tx.blocking_send(resize_event(new_size));
             if send_result.is_err() {
                 break; // Main loop gone.
+            }
+            last_size = new_size;
+            #[cfg(unix)]
+            {
+                last_host_geometry = host_geometry;
             }
         }
     }
@@ -3985,6 +4175,42 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pixel_mouse_requires_the_exact_applied_host_geometry() {
+        let snapshot = HostInputSnapshot::from_parts(7, true, true);
+        let applied = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let observed = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
+
+        assert!(!pixel_input_is_current(
+            snapshot,
+            snapshot,
+            7,
+            observed,
+            Some(applied),
+        ));
+        assert!(pixel_input_is_current(
+            snapshot,
+            snapshot,
+            7,
+            observed,
+            Some(observed),
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resize_geometry_applies_after_a_newer_mouse_mode_generation() {
+        let old = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let resized = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
+        let mut generation = 2;
+        let mut geometry = Some(old);
+
+        apply_resize_input_boundary(&mut generation, &mut geometry, 1, Some(resized));
+
+        assert_eq!(generation, 2);
+        assert_eq!(geometry, Some(resized));
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -3999,19 +4225,35 @@ mod tests {
         assert!(resize_report_required(false, (120, 40, 9, 18), size));
     }
 
+    #[test]
+    fn resize_geometry_reports_only_new_usable_samples() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        assert!(!resize_host_geometry_report_required(None, Some(geometry)));
+        assert!(!resize_host_geometry_report_required(None, None));
+        assert!(resize_host_geometry_report_required(Some(geometry), None));
+        assert!(!resize_host_geometry_report_required(
+            Some(geometry),
+            Some(geometry)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn resize_event_advances_generation_before_dispatch() {
         let input_state = HostInputState::new(true, true);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let geometry = crate::input::mouse::HostGeometry::new(120, 40, 1200, 800).unwrap();
         input_state
-            .send_resize(&tx, (120, 40, 8, 16))
+            .send_resize(&tx, (120, 40, 8, 16), Some(geometry))
             .expect("resize dispatch");
         assert_eq!(input_state.load().generation(), 1);
-        let ClientLoopEvent::Resize(120, 40, 8, 16, generation) = rx.try_recv().unwrap() else {
+        let ClientLoopEvent::Resize(120, 40, 8, 16, generation, sent_geometry) =
+            rx.try_recv().unwrap()
+        else {
             panic!("expected resize event");
         };
         assert_eq!(generation, 1);
+        assert_eq!(sent_geometry, Some(geometry));
     }
 
     #[cfg(unix)]
@@ -4019,7 +4261,9 @@ mod tests {
     fn resize_is_enqueued_before_new_generation_input() {
         let input_state = HostInputState::new(true, true);
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        input_state.send_resize(&tx, (120, 40, 8, 16)).unwrap();
+        input_state
+            .send_resize(&tx, (120, 40, 8, 16), None)
+            .unwrap();
         let snapshot = input_state.load();
         input_state
             .send_event(

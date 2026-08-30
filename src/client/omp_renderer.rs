@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -295,6 +295,13 @@ impl LocalTarget {
     }
 }
 
+struct PendingDirectGraphics {
+    image_id: u32,
+    leading: Vec<u8>,
+    control: String,
+    size: (u16, u16, u32, u32),
+}
+
 #[derive(Default)]
 pub(super) struct ClientOmpRenderer {
     latest_authority_revision: u64,
@@ -309,6 +316,11 @@ pub(super) struct ClientOmpRenderer {
     handoff_frame: Option<FrameData>,
     local_selected: bool,
     server_owned_input: bool,
+    pending_direct_graphics: HashMap<u64, PendingDirectGraphics>,
+    server_owned_frame: bool,
+    server_overlay_keys: HashMap<crate::input::KeyIdentity, crate::input::TerminalKey>,
+    local_keys: HashMap<crate::input::KeyIdentity, crate::input::TerminalKey>,
+    server_overlay_forced_input: bool,
     next_link_request_id: u64,
     pending_link_click: bool,
     pending_link_request_id: Option<u64>,
@@ -355,6 +367,11 @@ impl ClientOmpRenderer {
             handoff_frame: None,
             local_selected: false,
             server_owned_input: false,
+            pending_direct_graphics: HashMap::new(),
+            server_owned_frame: false,
+            server_overlay_keys: HashMap::new(),
+            local_keys: HashMap::new(),
+            server_overlay_forced_input: false,
             next_link_request_id: 1,
             pending_link_click: false,
             pending_link_request_id: None,
@@ -493,6 +510,7 @@ impl ClientOmpRenderer {
                 if matching_projection.is_some()
                     && self.awaiting_promotion
                         == Some(PromotionBarrier::Frame(offer.authority_revision))
+                    && !self.server_owned_frame
                 {
                     self.resolve_promotion(false, current_input_generation);
                 }
@@ -540,6 +558,7 @@ impl ClientOmpRenderer {
         target.bound = offer.bound && !target.failed;
         target.surface_active = offer.surface_active
             && projection.is_some_and(|projection| projection.surface_active)
+            && !self.server_owned_frame
             && !target.failed;
         target.promoted = target.ready_reported && target.bound;
         target.prefix = offer.prefix;
@@ -551,6 +570,8 @@ impl ClientOmpRenderer {
                 && target.ready_reported
                 && target.bound
                 && self.mouse_gesture_local != Some(false)
+                && !self.server_owned_frame
+                && !self.server_owned_input
         }) {
             confirm_promotion = Some((
                 target.surface_active
@@ -612,13 +633,34 @@ impl ClientOmpRenderer {
         cell_size_px: (u32, u32),
         current_input_generation: u64,
     ) -> Option<SurfaceFrame> {
-        let projection = frame.omp_renderer.filter(|projection| {
+        let raw_projection = frame.omp_renderer;
+        let authority_projection = raw_projection.filter(|projection| {
             self.offer.as_ref().is_some_and(|offer| {
-                offer.launch_id == projection.launch_id
-                    && offer.authority_revision == projection.authority_revision
-                    && projection.pane.is_none_or(valid_pane)
+                projection.launch_id == offer.launch_id
+                    && projection.authority_revision == offer.authority_revision
             })
         });
+        let rejected_projection = raw_projection.is_some() && authority_projection.is_none();
+        if rejected_projection {
+            return None;
+        }
+        let server_owned_frame = authority_projection.is_some_and(|projection| {
+            projection.server_owned_overlay
+                || !projection.surface_active
+                || projection.pane.is_none_or(|pane| !valid_pane(pane))
+        });
+        let projection =
+            authority_projection.filter(|projection| projection.pane.is_none_or(valid_pane));
+        let entering_server_owned_frame = server_owned_frame && !self.server_owned_frame;
+        self.server_owned_frame = server_owned_frame;
+        if entering_server_owned_frame {
+            self.finish_local_mouse_gesture();
+            self.release_pending_link_inputs_to_server(current_input_generation);
+            self.release_deferred_to_server(current_input_generation);
+        }
+        if !self.server_owned_frame {
+            self.release_overlay_input_if_idle(current_input_generation);
+        }
         self.projection = projection;
         let replay_size = (frame.width, frame.height, cell_size_px.0, cell_size_px.1);
         let replay_graphics = self.update_graphics_replay(&frame.graphics, replay_size);
@@ -643,6 +685,70 @@ impl ClientOmpRenderer {
         let replay_graphics = self.update_graphics_replay(bytes, size);
         if let Some(frame) = self.cached_server_frame.as_mut() {
             frame.graphics = replay_graphics;
+        }
+    }
+
+    pub(super) fn stage_direct_graphics(
+        &mut self,
+        transfer_id: u64,
+        image_id: u32,
+        leading: Vec<u8>,
+        control: String,
+        size: (u16, u16, u32, u32),
+    ) {
+        self.pending_direct_graphics.insert(
+            transfer_id,
+            PendingDirectGraphics {
+                image_id,
+                leading,
+                control,
+                size,
+            },
+        );
+    }
+
+    pub(super) fn complete_direct_graphics(
+        &mut self,
+        transfer_id: u64,
+        image_id: u32,
+        success: bool,
+    ) {
+        let Some(pending) = self.pending_direct_graphics.remove(&transfer_id) else {
+            return;
+        };
+        if !success || pending.image_id != image_id {
+            return;
+        }
+        if self.kitty_placement_replay.is_none() {
+            self.kitty_placement_replay =
+                crate::kitty_graphics::KittyPlacementReplay::new(pending.size);
+        }
+        let replay = self.kitty_placement_replay.as_mut().and_then(|replay| {
+            replay.register_external_file(
+                image_id,
+                &pending.leading,
+                &pending.control,
+                pending.size,
+            )
+        });
+        self.apply_graphics_replay(replay);
+    }
+
+    pub(super) fn retire_direct_graphics(&mut self, transfer_id: u64, image_id: u32) {
+        self.pending_direct_graphics.remove(&transfer_id);
+        let replay = self
+            .kitty_placement_replay
+            .as_mut()
+            .and_then(|replay| replay.retire_external_file(image_id));
+        self.apply_graphics_replay(replay);
+    }
+
+    fn apply_graphics_replay(&mut self, replay: Option<Vec<u8>>) {
+        if replay.is_none() {
+            self.kitty_placement_replay = None;
+        }
+        if let Some(frame) = self.cached_server_frame.as_mut() {
+            frame.graphics = replay.unwrap_or_default();
         }
     }
 
@@ -671,7 +777,9 @@ impl ClientOmpRenderer {
                 && target.first_damage
                 && target.surface_active
                 && self.projection.is_some_and(|projection| {
-                    projection.surface_active && projection.pane.is_some_and(valid_pane)
+                    projection.surface_active
+                        && !projection.server_owned_overlay
+                        && projection.pane.is_some_and(valid_pane)
                 })
                 && !self.server_owned_input
                 && self.awaiting_promotion.is_none()
@@ -693,6 +801,12 @@ impl ClientOmpRenderer {
 
     fn composed_or_base_frame(&self, base: &FrameData) -> FrameData {
         let base = strip_renderer_metadata(base.clone());
+        if self
+            .projection
+            .is_some_and(|projection| projection.server_owned_overlay)
+        {
+            return base;
+        }
         if !self.local_selected {
             return base;
         }
@@ -727,6 +841,7 @@ impl ClientOmpRenderer {
         self.projection.is_some_and(|projection| {
             projection.focused
                 && projection.surface_active
+                && !projection.server_owned_overlay
                 && projection.pane.is_some_and(valid_pane)
         })
     }
@@ -793,7 +908,14 @@ impl ClientOmpRenderer {
         for event in events {
             match event {
                 crate::raw_input::RawInputEvent::OuterFocusGained => self.outer_focused = true,
-                crate::raw_input::RawInputEvent::OuterFocusLost => self.outer_focused = false,
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    let releases = self.finish_input_leases_on_focus_lost();
+                    if !releases.is_empty() {
+                        self.outbound_messages
+                            .push(ClientMessage::ServerOwnedInputEvents { events: releases });
+                    }
+                    self.outer_focused = false;
+                }
                 _ => continue,
             }
             self.sync_effective_focus();
@@ -801,7 +923,8 @@ impl ClientOmpRenderer {
     }
 
     pub(super) fn owns_input(&self) -> bool {
-        self.local_selected
+        self.server_owned_frame
+            || self.local_selected
             || self.server_owned_input
             || self.awaiting_fallback
             || self.awaiting_promotion.is_some()
@@ -932,9 +1055,9 @@ impl ClientOmpRenderer {
         self.server_mouse_modifiers = 0;
     }
 
-    fn finish_server_mouse_gesture(&mut self) {
+    fn take_server_mouse_gesture_releases(&mut self) -> Vec<ClientInputEvent> {
         if self.mouse_gesture_local != Some(false) {
-            return;
+            return Vec::new();
         }
         let buttons = std::mem::take(&mut self.server_mouse_buttons);
         let position = self
@@ -950,9 +1073,9 @@ impl ClientOmpRenderer {
         self.clear_server_mouse_position();
         self.end_mouse_gesture();
         let Some((column, row)) = position else {
-            return;
+            return Vec::new();
         };
-        let events = buttons
+        buttons
             .into_iter()
             .map(|button| ClientInputEvent::Mouse {
                 kind: ClientMouseKind::Up(ClientMouseButton::from_crossterm(button)),
@@ -960,10 +1083,14 @@ impl ClientOmpRenderer {
                 row,
                 modifiers,
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn finish_server_mouse_gesture(&mut self) {
+        let events = self.take_server_mouse_gesture_releases();
         if !events.is_empty() {
             self.outbound_messages
-                .push(ClientMessage::InputEvents { events });
+                .push(ClientMessage::ServerOwnedInputEvents { events });
         }
     }
 
@@ -1271,6 +1398,13 @@ impl ClientOmpRenderer {
                 crate::raw_input::RawInputEvent::OuterFocusGained
                     | crate::raw_input::RawInputEvent::OuterFocusLost
             );
+            let focus_routes_server =
+                matches!(&event, crate::raw_input::RawInputEvent::OuterFocusLost).then(|| {
+                    self.server_owned_frame
+                        || self.server_owned_input
+                        || !self.local_selected
+                        || !self.projection_focused()
+                });
             let host_mouse_cell = match &event {
                 crate::raw_input::RawInputEvent::Mouse(mouse) => Some((mouse.column, mouse.row)),
                 _ => None,
@@ -1294,8 +1428,69 @@ impl ClientOmpRenderer {
                 self.outer_focused = true;
                 self.sync_effective_focus();
             } else if matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost) {
+                server_batch.extend(self.finish_input_leases_on_focus_lost());
                 self.outer_focused = false;
                 self.sync_effective_focus();
+            }
+            if let crate::raw_input::RawInputEvent::Key(key) = &event {
+                let identity = key.identity();
+                if self.local_keys.contains_key(&identity) {
+                    let released = key.kind == KeyEventKind::Release;
+                    let sent = self
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.runtime.as_ref())
+                        .is_some_and(|runtime| {
+                            forward_local_event(
+                                runtime,
+                                crate::raw_input::RawInputEvent::Key(key.clone()),
+                            )
+                        });
+                    if released || !sent {
+                        self.local_keys.remove(&identity);
+                    }
+                    if !sent {
+                        self.begin_local_forward_fallback();
+                        if let Some(event) = protocol_event {
+                            deferred_events.push(event);
+                        }
+                    }
+                    continue;
+                }
+            }
+            if self.server_owned_frame {
+                match &event {
+                    crate::raw_input::RawInputEvent::Key(key) => {
+                        self.track_overlay_server_key(key);
+                    }
+                    crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                            self.begin_overlay_server_input();
+                            self.begin_mouse_gesture(mouse, false);
+                        }
+                        if self.mouse_gesture_local == Some(false) {
+                            self.record_server_mouse_cell(mouse);
+                        }
+                        if let MouseEventKind::Up(button) = mouse.kind {
+                            self.release_mouse_button(button);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(event) = protocol_event {
+                    server_batch.push(event);
+                }
+                continue;
+            }
+            if let crate::raw_input::RawInputEvent::Key(key) = &event {
+                if self.server_overlay_keys.contains_key(&key.identity()) {
+                    self.track_overlay_server_key(key);
+                    if let Some(event) = protocol_event {
+                        server_batch.push(event);
+                    }
+                    self.release_overlay_input_if_idle(input_generation);
+                    continue;
+                }
             }
             if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
                 match mouse.kind {
@@ -1364,12 +1559,12 @@ impl ClientOmpRenderer {
                     self.refresh_selection(false);
                     self.sync_effective_focus();
                     if !server_batch.is_empty() {
-                        messages.push(ClientMessage::InputEvents {
+                        messages.push(ClientMessage::ServerOwnedInputEvents {
                             events: std::mem::take(&mut server_batch),
                         });
                     }
                     if let Some(event) = protocol_event {
-                        messages.push(ClientMessage::InputEvents {
+                        messages.push(ClientMessage::ServerOwnedInputEvents {
                             events: vec![event],
                         });
                     }
@@ -1385,7 +1580,7 @@ impl ClientOmpRenderer {
                         if let Some(message) = self.link_activation_message(column, row, request_id)
                         {
                             if !server_batch.is_empty() {
-                                messages.push(ClientMessage::InputEvents {
+                                messages.push(ClientMessage::ServerOwnedInputEvents {
                                     events: std::mem::take(&mut server_batch),
                                 });
                             }
@@ -1419,12 +1614,12 @@ impl ClientOmpRenderer {
                     }));
             if prefix {
                 if !server_batch.is_empty() {
-                    messages.push(ClientMessage::InputEvents {
+                    messages.push(ClientMessage::ServerOwnedInputEvents {
                         events: std::mem::take(&mut server_batch),
                     });
                 }
                 if let Some(event) = protocol_event {
-                    messages.push(ClientMessage::InputEvents {
+                    messages.push(ClientMessage::ServerOwnedInputEvents {
                         events: vec![event],
                     });
                 }
@@ -1435,7 +1630,9 @@ impl ClientOmpRenderer {
                 self.force_repaint = true;
                 continue;
             }
-            if self.server_owned_input || !self.local_selected || !targets_local {
+            if focus_routes_server
+                .unwrap_or(self.server_owned_input || !self.local_selected || !targets_local)
+            {
                 if let Some(event) = protocol_event {
                     server_batch.push(event);
                 }
@@ -1473,6 +1670,12 @@ impl ClientOmpRenderer {
             });
             let local_mouse_position = local_mouse_cell
                 .map(|(column, row)| crate::input::mouse::Position::Cell { column, row });
+            let local_key_lifecycle = match &event {
+                crate::raw_input::RawInputEvent::Key(key) if key.reports_event_types() => {
+                    Some((key.identity(), key.kind, key.clone()))
+                }
+                _ => None,
+            };
             let local_event = if is_outer_focus {
                 None
             } else {
@@ -1493,6 +1696,18 @@ impl ClientOmpRenderer {
                     self.local_mouse_position = Some(position);
                 }
             }
+            if sent {
+                if let Some((identity, kind, key)) = local_key_lifecycle {
+                    match kind {
+                        KeyEventKind::Press | KeyEventKind::Repeat => {
+                            self.local_keys.insert(identity, key);
+                        }
+                        KeyEventKind::Release => {
+                            self.local_keys.remove(&identity);
+                        }
+                    }
+                }
+            }
             if !sent {
                 self.begin_local_forward_fallback();
                 if let Some(event) = protocol_event {
@@ -1504,7 +1719,7 @@ impl ClientOmpRenderer {
             }
         }
         if !server_batch.is_empty() {
-            messages.push(ClientMessage::InputEvents {
+            messages.push(ClientMessage::ServerOwnedInputEvents {
                 events: server_batch,
             });
         }
@@ -1516,6 +1731,7 @@ impl ClientOmpRenderer {
         }
         if server_gesture_ended {
             self.settle_server_gesture(input_generation);
+            self.release_overlay_input_if_idle(input_generation);
         }
         messages
     }
@@ -1551,7 +1767,7 @@ impl ClientOmpRenderer {
                     .collect()
             })
             .unwrap_or_default();
-        ClientMessage::InputEvents { events }
+        ClientMessage::ServerOwnedInputEvents { events }
     }
 
     fn route_pixel_input_inner(
@@ -1571,6 +1787,22 @@ impl ClientOmpRenderer {
                 self.pointer_pixels = Some(crate::input::mouse::HostPixels { x, y, geometry });
                 self.remap_pointer_pixels();
             }
+        }
+        if self.server_owned_frame {
+            if matches!(mouse_kind, Some(MouseEventKind::Down(_))) {
+                if let Some(mouse) = decode_pixel_mouse(&data) {
+                    self.begin_overlay_server_input();
+                    self.begin_mouse_gesture(&mouse, false);
+                }
+            }
+            if self.mouse_gesture_local == Some(false) {
+                self.record_server_mouse_pixels(&data, geometry);
+            }
+            let message = self.server_pixel_input_message(data, geometry);
+            if let Some(button) = released_mouse_button {
+                self.release_mouse_button(button);
+            }
+            return Some(message);
         }
         let mut local_mouse = self.current_projection_pane().and_then(|pane| {
             self.target
@@ -1664,6 +1896,7 @@ impl ClientOmpRenderer {
                     self.release_mouse_button(button);
                     if releases_server_button && self.mouse_gesture_local != Some(false) {
                         self.settle_server_gesture(input_generation);
+                        self.release_overlay_input_if_idle(input_generation);
                     }
                 }
             }
@@ -1874,7 +2107,7 @@ impl ClientOmpRenderer {
                 generation: _,
             } if !replay_locally => {
                 self.outbound_messages
-                    .push(ClientMessage::InputEvents { events });
+                    .push(ClientMessage::ServerOwnedInputEvents { events });
             }
             LinkInput::Events { events, generation } => {
                 let mut last_local_mouse_position = None;
@@ -2108,6 +2341,100 @@ impl ClientOmpRenderer {
         self.queued_link_inputs.clear();
     }
 
+    fn release_pending_link_inputs_to_server(&mut self, current_input_generation: u64) {
+        let mut inputs = Vec::with_capacity(self.queued_link_inputs.len() + 1);
+        if let Some(input) = self.pending_link_input.take() {
+            inputs.push(input);
+        }
+        inputs.extend(std::mem::take(&mut self.queued_link_inputs));
+        self.clear_pending_link_activation();
+        for input in inputs {
+            self.defer_link_input(input);
+        }
+        self.release_deferred_to_server(current_input_generation);
+    }
+
+    fn begin_overlay_server_input(&mut self) {
+        if !self.server_owned_input {
+            self.server_overlay_forced_input = true;
+            self.server_owned_input = true;
+        }
+    }
+
+    fn track_overlay_server_key(&mut self, key: &crate::input::TerminalKey) {
+        if !key.reports_event_types() {
+            return;
+        }
+        match key.kind {
+            KeyEventKind::Press | KeyEventKind::Repeat => {
+                self.begin_overlay_server_input();
+                self.server_overlay_keys.insert(key.identity(), key.clone());
+            }
+            KeyEventKind::Release => {
+                self.server_overlay_keys.remove(&key.identity());
+            }
+        }
+    }
+
+    fn finish_local_key_leases(&mut self) {
+        let keys = std::mem::take(&mut self.local_keys);
+        let Some(runtime) = self
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+        else {
+            return;
+        };
+        let mut failed = false;
+        for key in keys.into_values() {
+            failed |= !forward_local_event(
+                runtime,
+                crate::raw_input::RawInputEvent::Key(key.with_kind(KeyEventKind::Release)),
+            );
+        }
+        if failed {
+            self.begin_local_forward_fallback();
+        }
+    }
+
+    fn finish_overlay_server_key_leases(&mut self) -> Vec<ClientInputEvent> {
+        std::mem::take(&mut self.server_overlay_keys)
+            .into_values()
+            .filter_map(|key| {
+                client_event_from_raw(&crate::raw_input::RawInputEvent::Key(
+                    key.with_kind(KeyEventKind::Release),
+                ))
+            })
+            .collect()
+    }
+
+    fn finish_input_leases_on_focus_lost(&mut self) -> Vec<ClientInputEvent> {
+        self.finish_local_key_leases();
+        self.finish_local_mouse_gesture();
+        let mut releases = self.finish_overlay_server_key_leases();
+        releases.extend(self.take_server_mouse_gesture_releases());
+        self.server_overlay_forced_input = false;
+        self.server_owned_input = false;
+        releases
+    }
+
+    fn release_overlay_input_if_idle(&mut self, current_input_generation: u64) {
+        if self.server_owned_frame
+            || self.mouse_gesture_local == Some(false)
+            || !self.server_overlay_keys.is_empty()
+            || !self.server_overlay_forced_input
+        {
+            return;
+        }
+        self.server_overlay_forced_input = false;
+        self.server_owned_input = false;
+        if let Some(size) = self.target.as_ref().map(|target| target.size) {
+            self.sync_target_to_projection(size, current_input_generation);
+        }
+        self.refresh_selection(false);
+        self.sync_effective_focus();
+    }
+
     fn settle_local_gesture_before_stale_deferred_prune(&mut self, current_generation: u64) {
         let stale_mouse = self.deferred_messages.iter().any(|message| match message {
             DeferredMessage::InputEvents { events, generation } => {
@@ -2136,7 +2463,7 @@ impl ClientOmpRenderer {
             }
             let message = match message {
                 DeferredMessage::InputEvents { events, .. } => {
-                    ClientMessage::InputEvents { events }
+                    ClientMessage::ServerOwnedInputEvents { events }
                 }
                 DeferredMessage::InputPixels { data, geometry, .. } => {
                     self.server_pixel_input_message(data, geometry)
@@ -2201,6 +2528,7 @@ impl ClientOmpRenderer {
     }
 
     fn stop_target(&mut self, preserve_server_gesture: bool) {
+        self.finish_local_key_leases();
         self.finish_local_mouse_gesture();
         let server_gesture = preserve_server_gesture && self.mouse_gesture_local == Some(false);
         if let Some(mut target) = self.target.take() {
@@ -2286,7 +2614,7 @@ fn pixel_input_message(
     data: Vec<u8>,
     geometry: crate::input::mouse::HostGeometry,
 ) -> ClientMessage {
-    ClientMessage::InputPixels {
+    ClientMessage::ServerOwnedInputPixels {
         data,
         cols: geometry.cols,
         rows: geometry.rows,
@@ -2607,6 +2935,7 @@ mod tests {
             frame_nonce: [1; 16],
             pane: Some(pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         let buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, cols, rows));
@@ -2645,6 +2974,7 @@ mod tests {
             frame_nonce: [authority_revision as u8; 16],
             pane: Some(pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         renderer.sync_target_to_projection(size, 0);
@@ -2696,6 +3026,7 @@ mod tests {
                 frame_nonce: [1; 16],
                 pane: None,
                 focused: true,
+                server_owned_overlay: false,
                 surface_active: true,
             }),
         };
@@ -2748,6 +3079,374 @@ mod tests {
 
         let unfocused = compose_local_pane(base.clone(), local, pane, false).unwrap();
         assert_eq!(unfocused.cursor, base.cursor);
+    }
+
+    #[tokio::test]
+    async fn server_owned_overlay_suspends_local_composition_and_input_until_clear() {
+        let (runtime, mut local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006hLR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })])
+            .is_empty());
+        assert!(local_input.try_recv().is_ok());
+        assert_eq!(renderer.mouse_gesture_local, Some(true));
+        let pane = OmpRendererPane {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 1,
+            scrollback_limit_bytes: 1024,
+        };
+        let mut frame = FrameData {
+            cells: vec![test_cell("S", None); 8],
+            width: 4,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+            omp_renderer: Some(OmpRendererFrame {
+                launch_id: 1,
+                authority_revision: 1,
+                frame_nonce: [1; 16],
+                pane: Some(pane),
+                focused: true,
+                server_owned_overlay: true,
+                surface_active: true,
+            }),
+        };
+
+        let overlay = renderer
+            .cache_server_frame(frame.clone(), (10, 20), 0)
+            .expect("server overlay frame");
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[<0;1;1m");
+        assert_eq!(renderer.mouse_gesture_local, None);
+        assert_eq!(overlay.frame.cells[5].symbol, "S");
+        assert_eq!(overlay.frame.cells[6].symbol, "S");
+        assert!(!renderer.local_selected);
+        assert!(renderer.owns_input());
+        assert!(matches!(
+            renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                    crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
+                )])
+                .as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { .. }]
+        ));
+        let geometry = crate::input::mouse::HostGeometry::new(4, 2, 40, 40).unwrap();
+        assert!(matches!(
+            renderer.route_pixel_input(b"\x1b[<0;16;31M".to_vec(), geometry, 0),
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
+        ));
+        assert!(local_input.try_recv().is_err());
+
+        frame.omp_renderer.as_mut().unwrap().server_owned_overlay = false;
+        let resumed = renderer
+            .cache_server_frame(frame.clone(), (10, 20), 0)
+            .expect("resumed server frame while pixel gesture is held");
+        assert!(!renderer.local_selected);
+        assert_eq!(resumed.frame.cells[5].symbol, "S");
+        assert!(matches!(
+            renderer.route_pixel_input(b"\x1b[<0;16;31m".to_vec(), geometry, 0),
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
+        ));
+        assert!(renderer.local_selected);
+        let composed = renderer
+            .cache_server_frame(frame.clone(), (10, 20), 0)
+            .expect("resumed local frame");
+        assert_eq!(composed.frame.cells[5].symbol, "L");
+        assert_eq!(composed.frame.cells[6].symbol, "R");
+
+        renderer.server_owned_input = true;
+        let server_mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        renderer.begin_mouse_gesture(&server_mouse, false);
+        renderer.record_server_mouse_cell(&server_mouse);
+        frame.omp_renderer.as_mut().unwrap().server_owned_overlay = true;
+        renderer.cache_server_frame(frame, (10, 20), 0);
+        assert!(renderer.server_owned_input);
+        assert_eq!(renderer.mouse_gesture_local, Some(false));
+        assert!(renderer.take_outbound_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn overlay_key_release_stays_server_owned_after_overlay_clears() {
+        let (runtime, mut local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let pane = renderer.projection.unwrap().pane.unwrap();
+        let mut frame = FrameData {
+            cells: vec![test_cell("S", None); 2],
+            width: 2,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+            omp_renderer: Some(OmpRendererFrame {
+                launch_id: 1,
+                authority_revision: 1,
+                frame_nonce: [1; 16],
+                pane: Some(pane),
+                focused: true,
+                server_owned_overlay: true,
+                surface_active: true,
+            }),
+        };
+        renderer.cache_server_frame(frame.clone(), (10, 20), 0);
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+        assert!(matches!(
+            renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(press.clone())])
+                .as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { .. }]
+        ));
+        assert!(renderer.server_overlay_keys.contains_key(&press.identity()));
+
+        frame.omp_renderer.as_mut().unwrap().server_owned_overlay = false;
+        renderer.cache_server_frame(frame.clone(), (10, 20), 0);
+        assert!(!renderer.local_selected);
+        let release = press.with_kind(KeyEventKind::Release);
+        assert!(matches!(
+            renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(release)])
+                .as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { .. }]
+        ));
+        assert!(renderer.server_overlay_keys.is_empty());
+        assert!(renderer.local_selected);
+        assert!(local_input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_release_aware_key_stays_local_until_release_across_overlay() {
+        let (runtime, mut local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let pane = renderer.projection.unwrap().pane.unwrap();
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(press.clone())])
+            .is_empty());
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"x");
+        assert!(renderer.local_keys.contains_key(&press.identity()));
+
+        let overlay = FrameData {
+            cells: vec![test_cell("S", None); 2],
+            width: 2,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+            omp_renderer: Some(OmpRendererFrame {
+                launch_id: 1,
+                authority_revision: 1,
+                frame_nonce: [1; 16],
+                pane: Some(pane),
+                focused: true,
+                server_owned_overlay: true,
+                surface_active: true,
+            }),
+        };
+        renderer.cache_server_frame(overlay, (10, 20), 0);
+
+        let repeat = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_kind(KeyEventKind::Repeat)
+            .with_vt_bytes(b"\x1b[120;1:2u".to_vec());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(repeat)])
+            .is_empty());
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"x");
+
+        let release = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_kind(KeyEventKind::Release)
+            .with_vt_bytes(b"\x1b[120;1:3u".to_vec());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(release)])
+            .is_empty());
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[120;1:3u");
+        assert!(renderer.local_keys.is_empty());
+
+        assert!(matches!(
+            renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                    crate::input::TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty())
+                )])
+                .as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn focus_loss_releases_local_key_lease_before_target_blur() {
+        let (runtime, mut local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(press.clone())])
+            .is_empty());
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"x");
+        assert!(renderer.local_keys.contains_key(&press.identity()));
+
+        renderer.observe_outer_focus(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
+
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[120;1:3u");
+        assert!(renderer.local_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn focus_loss_retires_server_overlay_key_lease() {
+        let (runtime, _local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let pane = renderer.projection.unwrap().pane.unwrap();
+        let mut frame = renderer.cached_server_frame.clone().unwrap();
+        frame.omp_renderer = Some(OmpRendererFrame {
+            launch_id: 1,
+            authority_revision: 1,
+            frame_nonce: [1; 16],
+            pane: Some(pane),
+            focused: true,
+            server_owned_overlay: true,
+            surface_active: true,
+        });
+        renderer.cache_server_frame(frame, (10, 20), 0);
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+        assert!(matches!(
+            renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(press.clone())])
+                .as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { .. }]
+        ));
+
+        renderer.observe_outer_focus(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
+
+        assert!(renderer.server_overlay_keys.is_empty());
+        assert!(!renderer.server_overlay_forced_input);
+        assert!(!renderer.server_owned_input);
+        assert!(matches!(
+            renderer.take_outbound_messages().as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key { kind: ClientKeyKind::Release, .. }])
+        ));
+    }
+
+    #[tokio::test]
+    async fn focus_loss_finishes_local_leases_in_batch_order() {
+        let (runtime, mut local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h\x1b[>3uLR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+
+        assert!(renderer
+            .route_input(vec![
+                crate::raw_input::RawInputEvent::Key(press),
+                crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                crate::raw_input::RawInputEvent::OuterFocusLost,
+            ])
+            .is_empty());
+
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"x");
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[<0;1;1M");
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[120;1:3u");
+        assert_eq!(local_input.try_recv().unwrap().as_ref(), b"\x1b[<0;1;1m");
+        assert!(local_input.try_recv().is_err());
+        assert!(renderer.local_keys.is_empty());
+        assert!(renderer.local_mouse_buttons.is_empty());
+        assert_eq!(renderer.mouse_gesture_local, None);
+        assert!(!renderer.outer_focused);
+    }
+
+    #[tokio::test]
+    async fn focus_loss_finishes_server_overlay_leases_in_batch_order() {
+        let (runtime, _local_input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let pane = renderer.projection.unwrap().pane.unwrap();
+        let mut frame = renderer.cached_server_frame.clone().unwrap();
+        frame.omp_renderer = Some(OmpRendererFrame {
+            launch_id: 1,
+            authority_revision: 1,
+            frame_nonce: [1; 16],
+            pane: Some(pane),
+            focused: true,
+            server_owned_overlay: true,
+            surface_active: true,
+        });
+        renderer.cache_server_frame(frame, (10, 20), 0);
+        let _ = renderer.take_outbound_messages();
+        let press = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[120;1:1u".to_vec());
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(press),
+            crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            }),
+            crate::raw_input::RawInputEvent::OuterFocusLost,
+        ]);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::ServerOwnedInputEvents { events }]
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ClientInputEvent::Key { kind: ClientKeyKind::Press, .. },
+                        ClientInputEvent::Mouse { kind: ClientMouseKind::Down(_), .. },
+                        ClientInputEvent::Key { kind: ClientKeyKind::Release, .. },
+                        ClientInputEvent::Mouse { kind: ClientMouseKind::Up(_), .. },
+                        ClientInputEvent::FocusLost,
+                    ]
+                )
+        ));
+        assert!(renderer.server_overlay_keys.is_empty());
+        assert!(renderer.server_mouse_buttons.is_empty());
+        assert_eq!(renderer.mouse_gesture_local, None);
+        assert!(!renderer.server_overlay_forced_input);
+        assert!(!renderer.server_owned_input);
+        assert!(!renderer.outer_focused);
+        assert!(renderer.take_outbound_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn projectionless_frame_does_not_claim_client_local_input_bridges() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(2, 1);
+        runtime.test_process_pty_bytes(b"LR");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let mut frame = renderer.cached_server_frame.clone().unwrap();
+        frame.omp_renderer = None;
+
+        assert!(renderer.cache_server_frame(frame, (10, 20), 0).is_some());
+        assert!(!renderer.server_owned_frame);
+        assert!(!renderer.local_selected);
+        assert!(!renderer.owns_input());
     }
 
     #[test]
@@ -2918,8 +3617,8 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                ClientMessage::InputEvents { events: prefix },
-                ClientMessage::InputEvents { events: command }
+                ClientMessage::ServerOwnedInputEvents { events: prefix },
+                ClientMessage::ServerOwnedInputEvents { events: command }
             ] if prefix.len() == 1 && command.len() == 1
         ));
         assert!(renderer.server_owned_input);
@@ -3338,7 +4037,7 @@ mod tests {
 
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<35;11;1M".to_vec(), geometry, 0),
-            Some(ClientMessage::InputPixels { .. })
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
         ));
         assert!(renderer.pointer_pixels.is_some());
         assert_eq!(renderer.pointer_cell, None);
@@ -3363,7 +4062,7 @@ mod tests {
         assert!(decode_pixel_mouse(&report).is_none());
         assert!(matches!(
             renderer.route_pixel_input(report, geometry, 0),
-            Some(ClientMessage::InputPixels { .. })
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
         ));
         assert_eq!(renderer.pointer_cell, Some((2, 0)));
     }
@@ -3752,13 +4451,13 @@ mod tests {
             renderer
                 .route_input(vec![mouse(MouseEventKind::Down(MouseButton::Left))])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
         assert!(matches!(
             renderer
                 .route_input(vec![mouse(MouseEventKind::Up(MouseButton::Left))])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
         renderer.server_owned_input = false;
 
@@ -3772,11 +4471,11 @@ mod tests {
         renderer.server_owned_input = true;
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<0;11;1M".to_vec(), geometry, 0),
-            Some(ClientMessage::InputPixels { .. })
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
         ));
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<0;11;1m".to_vec(), geometry, 0),
-            Some(ClientMessage::InputPixels { .. })
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
         ));
         let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(
@@ -3806,7 +4505,7 @@ mod tests {
         );
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<0;11;1m".to_vec(), geometry, 0),
-            Some(ClientMessage::InputPixels { .. })
+            Some(ClientMessage::ServerOwnedInputPixels { .. })
         ));
         assert!(
             input.try_recv().is_err(),
@@ -3865,7 +4564,7 @@ mod tests {
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
     }
 
@@ -3910,7 +4609,7 @@ mod tests {
         renderer.apply_target(1, 2, 2, Some(route), false, true, prefix, (80, 24, 0, 0), 0);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
 
         assert!(renderer.next_frame(Instant::now(), (80, 24)).is_some());
@@ -3921,7 +4620,7 @@ mod tests {
                     crate::input::TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()),
                 )])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
     }
 
@@ -3955,7 +4654,7 @@ mod tests {
         renderer.apply_target(1, 2, 2, Some(route), false, true, prefix, (80, 24, 0, 0), 0);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }]
+            [ClientMessage::ServerOwnedInputEvents { events }]
                 if matches!(events.as_slice(), [ClientInputEvent::FocusGained])
         ));
     }
@@ -4076,6 +4775,7 @@ mod tests {
             frame_nonce: [1; 16],
             pane: renderer.target.as_ref().map(|target| target.pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         renderer.cache_server_frame(same_revision, (10, 20), 0);
@@ -4109,6 +4809,7 @@ mod tests {
             frame_nonce: [1; 16],
             pane: renderer.target.as_ref().map(|target| target.pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: false,
         });
         renderer.cache_server_frame(stale, (10, 20), 0);
@@ -4225,6 +4926,7 @@ mod tests {
             frame_nonce: [2; 16],
             pane: Some(pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         let frame = roundtrip_server_message(crate::protocol::ServerMessage::Frame(frame));
@@ -4246,7 +4948,7 @@ mod tests {
         ));
         assert!(matches!(
             roundtrip_client_message(outbound.remove(0)),
-            ClientMessage::InputEvents { events }
+            ClientMessage::ServerOwnedInputEvents { events }
                 if matches!(events.as_slice(), [ClientInputEvent::Mouse {
                     column: 60,
                     row: 0,
@@ -4338,9 +5040,9 @@ mod tests {
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
             [
-                ClientMessage::InputEvents { events: first },
-                ClientMessage::InputEvents { events: second },
-                ClientMessage::InputEvents { events: third },
+                ClientMessage::ServerOwnedInputEvents { events: first },
+                ClientMessage::ServerOwnedInputEvents { events: second },
+                ClientMessage::ServerOwnedInputEvents { events: third },
             ] if matches!(first.as_slice(), [
                 ClientInputEvent::Key { code: ClientKeyCode::Char('x'), .. }
             ]) && matches!(second.as_slice(), [
@@ -4370,7 +5072,7 @@ mod tests {
 
         assert!(matches!(
             renderer.route_pixel_input(b"\x1b[<0;601;1M".to_vec(), geometry, 0),
-            Some(ClientMessage::InputEvents { events })
+            Some(ClientMessage::ServerOwnedInputEvents { events })
                 if matches!(events.as_slice(), [ClientInputEvent::Mouse { column: 60, row: 0, .. }])
         ));
     }
@@ -4631,6 +5333,7 @@ mod tests {
                 frame_nonce: [1; 16],
                 pane: Some(pane),
                 focused: true,
+                server_owned_overlay: false,
                 surface_active: true,
             }),
         };
@@ -4692,7 +5395,7 @@ mod tests {
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }]
+            [ClientMessage::ServerOwnedInputEvents { events }]
                 if matches!(events.as_slice(), [ClientInputEvent::Mouse {
                     column: 32,
                     row: 12,
@@ -4792,7 +5495,7 @@ mod tests {
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }]
+            [ClientMessage::ServerOwnedInputEvents { events }]
                 if matches!(events.as_slice(), [
                     ClientInputEvent::Key { code: ClientKeyCode::Char('x'), .. },
                     ClientInputEvent::Mouse { column: 60, row: 0, .. },
@@ -4917,6 +5620,7 @@ mod tests {
             frame_nonce: [1; 16],
             pane: renderer.target.as_ref().map(|target| target.pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         renderer.sync_target_to_projection((80, 24, 10, 20), 0);
@@ -4979,8 +5683,8 @@ mod tests {
         assert!(matches!(
             server.as_slice(),
             [
-                ClientMessage::InputEvents { events: click },
-                ClientMessage::InputEvents { events: key }
+                ClientMessage::ServerOwnedInputEvents { events: click },
+                ClientMessage::ServerOwnedInputEvents { events: key }
             ] if click.len() == 1 && key.len() == 1
         ));
         assert!(input.try_recv().is_err());
@@ -4988,7 +5692,7 @@ mod tests {
             renderer
                 .route_input(vec![mouse(MouseEventKind::Up(MouseButton::Left), 60)])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
         assert_eq!(renderer.mouse_gesture_local, None);
 
@@ -5035,7 +5739,7 @@ mod tests {
                     modifiers: KeyModifiers::empty(),
                 })])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
         assert_eq!(renderer.mouse_gesture_local, Some(false));
         assert_eq!(renderer.local_mouse_mode(), (true, true));
@@ -5082,8 +5786,8 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                ClientMessage::InputEvents { events: down },
-                ClientMessage::InputEvents { events: tail },
+                ClientMessage::ServerOwnedInputEvents { events: down },
+                ClientMessage::ServerOwnedInputEvents { events: tail },
             ] if down.len() == 1 && matches!(tail.as_slice(), [
                 ClientInputEvent::Mouse { kind: ClientMouseKind::Up(_), .. },
                 ClientInputEvent::Key { code: ClientKeyCode::Char('x'), .. },
@@ -5149,6 +5853,7 @@ mod tests {
             frame_nonce: [2; 16],
             pane: Some(pane),
             focused: true,
+            server_owned_overlay: false,
             surface_active: true,
         });
         renderer.sync_target_to_projection((80, 1, 10, 20), 1);
@@ -5303,7 +6008,7 @@ mod tests {
                     modifiers: KeyModifiers::empty(),
                 })])
                 .as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::ServerOwnedInputEvents { events }] if events.len() == 1
         ));
     }
 
@@ -5557,7 +6262,7 @@ mod tests {
 
         assert!(matches!(
             renderer.route_input_at_generation(vec![down], 0).as_slice(),
-            [ClientMessage::InputEvents { events }]
+            [ClientMessage::ServerOwnedInputEvents { events }]
                 if matches!(events.as_slice(), [ClientInputEvent::Mouse {
                     kind: ClientMouseKind::Down(ClientMouseButton::Left),
                     column: 60,
@@ -5573,7 +6278,7 @@ mod tests {
 
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }]
+            [ClientMessage::ServerOwnedInputEvents { events }]
                 if matches!(events.as_slice(), [ClientInputEvent::Mouse {
                     kind: ClientMouseKind::Up(ClientMouseButton::Left),
                     column: 60,

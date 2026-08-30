@@ -104,14 +104,14 @@ fn unix_stdin_reader_loop(
                 .ok()
                 .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher));
             if let Some(data) = released {
-                let input_state = direct_pending_state
+                let (input_state, geometry) = direct_pending_state
                     .take()
-                    .unwrap_or_else(|| host_input_state.load());
+                    .unwrap_or_else(|| host_input_state.load_context());
                 let mut events = Vec::new();
                 frame_input(
                     &data,
                     input_state,
-                    None,
+                    geometry,
                     &mut framer,
                     &mut pending_input_state,
                     &mut last_geometry,
@@ -125,12 +125,14 @@ fn unix_stdin_reader_loop(
                 {
                     return;
                 }
+                let (current_input_state, current_geometry) = host_input_state.load_context();
                 if let Some(events) = flush_framer_after_idle(
                     &mut framer,
                     &mut pending_input_state,
                     &mut last_geometry,
                     &mut pending_palette,
-                    input_state,
+                    current_input_state,
+                    current_geometry,
                     |timeout_ms| poll_read_ready(stdin_fd, timeout_ms),
                 ) {
                     if !events.is_empty()
@@ -156,10 +158,10 @@ fn unix_stdin_reader_loop(
         if !readiness.pty_read_ready {
             continue;
         }
-        let read =
-            host_input_state.read_input_and_send(&event_tx, &mut scratch, |bytes, input_state| {
-                let observed_geometry = crate::input::mouse::HostGeometry::current();
-                let _ = input_geometry(&mut last_geometry, input_state, observed_geometry);
+        let read = host_input_state.read_input_and_send(
+            &event_tx,
+            &mut scratch,
+            |bytes, input_state, observed_geometry| {
                 let mut events = Vec::new();
                 let filtered = filter_direct_input(
                     bytes,
@@ -173,19 +175,20 @@ fn unix_stdin_reader_loop(
                             .into_iter()
                             .map(ClientLoopEvent::DirectGraphicsResponse),
                     );
-                    let filter_pending_state = direct_pending_state.unwrap_or(input_state);
+                    let current_context = (input_state, observed_geometry);
+                    let filter_pending_context = direct_pending_state.unwrap_or(current_context);
                     direct_pending_state =
                         direct_filter.has_pending().then_some(if pending_uses_old {
-                            filter_pending_state
+                            filter_pending_context
                         } else {
-                            input_state
+                            current_context
                         });
                     for chunk in raw_chunks {
                         if chunk.pending_bytes > 0 {
                             frame_input(
                                 &chunk.data[..chunk.pending_bytes],
-                                filter_pending_state,
-                                None,
+                                filter_pending_context.0,
+                                filter_pending_context.1,
                                 &mut framer,
                                 &mut pending_input_state,
                                 &mut last_geometry,
@@ -219,16 +222,19 @@ fn unix_stdin_reader_loop(
                     );
                 }
                 (!events.is_empty()).then_some(ClientLoopEvent::OrderedInput(events))
-            });
+            },
+        );
         match read {
             Ok(0) => break,
             Ok(_) => {
+                let (current_input_state, current_geometry) = host_input_state.load_context();
                 if let Some(events) = flush_framer_after_idle(
                     &mut framer,
                     &mut pending_input_state,
                     &mut last_geometry,
                     &mut pending_palette,
-                    host_input_state.load(),
+                    current_input_state,
+                    current_geometry,
                     |timeout_ms| poll_read_ready(stdin_fd, timeout_ms),
                 ) {
                     if !events.is_empty()
@@ -278,31 +284,35 @@ fn filter_direct_input(
 }
 
 #[cfg(unix)]
+type HostInputContext = (HostInputSnapshot, Option<crate::input::mouse::HostGeometry>);
+
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn frame_input(
     bytes: &[u8],
     input_state: HostInputSnapshot,
     observed_geometry: Option<crate::input::mouse::HostGeometry>,
     framer: &mut crate::raw_input::RawInputByteFramer,
-    pending_input_state: &mut Option<HostInputSnapshot>,
+    pending_input_state: &mut Option<HostInputContext>,
     last_geometry: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
     pending_palette: &mut Vec<Vec<u8>>,
     events: &mut Vec<ClientLoopEvent>,
 ) {
+    let geometry = input_geometry(last_geometry, input_state, observed_geometry);
     let mut offset = 0;
-    if let Some(pending_state) = *pending_input_state {
+    if let Some((pending_state, pending_geometry)) = *pending_input_state {
         let continued_state = pending_state.continued_with(input_state);
-        if continued_state != input_state {
+        let continued_geometry = (pending_geometry == geometry).then_some(geometry).flatten();
+        if continued_state != input_state || continued_geometry != geometry {
             while offset < bytes.len() && framer.has_pending_input() {
                 let chunks = framer.push(&bytes[offset..offset + 1]);
                 offset += 1;
                 let emitted = !chunks.is_empty();
-                let geometry = input_geometry(last_geometry, continued_state, None);
                 append_unix_input_chunks(
                     chunks,
                     pending_palette,
                     continued_state,
-                    geometry,
+                    continued_geometry,
                     events,
                 );
                 if emitted {
@@ -310,18 +320,21 @@ fn frame_input(
                 }
             }
             if framer.has_pending_input() && offset == bytes.len() {
-                *pending_input_state = Some(continued_state);
+                *pending_input_state = Some((continued_state, continued_geometry));
                 return;
             }
-            *pending_input_state = framer.has_pending_input().then_some(input_state);
+            *pending_input_state = framer
+                .has_pending_input()
+                .then_some((input_state, geometry));
             if offset == bytes.len() {
                 return;
             }
         }
     }
     let chunks = framer.push(&bytes[offset..]);
-    *pending_input_state = framer.has_pending_input().then_some(input_state);
-    let geometry = input_geometry(last_geometry, input_state, observed_geometry);
+    *pending_input_state = framer
+        .has_pending_input()
+        .then_some((input_state, geometry));
     append_unix_input_chunks(chunks, pending_palette, input_state, geometry, events);
 }
 
@@ -418,17 +431,20 @@ fn idle_flush_timeout_ms(
 #[cfg(unix)]
 fn flush_framer_after_idle(
     framer: &mut crate::raw_input::RawInputByteFramer,
-    pending_input_state: &mut Option<HostInputSnapshot>,
+    pending_input_state: &mut Option<HostInputContext>,
     last_geometry: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
     pending_palette: &mut Vec<Vec<u8>>,
     current_input_state: HostInputSnapshot,
+    current_geometry: Option<crate::input::mouse::HostGeometry>,
     mut wait_for_input: impl FnMut(i32) -> Option<bool>,
 ) -> Option<Vec<ClientLoopEvent>> {
     if !framer.has_pending_input() && pending_palette.is_empty() {
         return None;
     }
 
-    let input_state = (*pending_input_state).unwrap_or(current_input_state);
+    let current_geometry = input_geometry(last_geometry, current_input_state, current_geometry);
+    let (input_state, geometry) =
+        (*pending_input_state).unwrap_or((current_input_state, current_geometry));
     let timeout_ms = idle_flush_timeout_ms(framer, input_state.capture_active());
     if wait_for_input(timeout_ms) != Some(false) {
         return None;
@@ -437,8 +453,9 @@ fn flush_framer_after_idle(
     let had_pending = framer.has_pending_input();
     let chunks = framer.flush_timeout();
     let held_escape = had_pending && chunks.is_empty();
-    *pending_input_state = framer.has_pending_input().then_some(input_state);
-    let geometry = input_geometry(last_geometry, input_state, None);
+    *pending_input_state = framer
+        .has_pending_input()
+        .then_some((input_state, geometry));
     let mut events = Vec::new();
     append_unix_input_chunks(chunks, pending_palette, input_state, geometry, &mut events);
     flush_unix_palette_input(pending_palette, input_state, &mut events);
@@ -446,10 +463,12 @@ fn flush_framer_after_idle(
     if held_escape
         && wait_for_input(crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS) == Some(false)
     {
-        let input_state = (*pending_input_state).unwrap_or(current_input_state);
+        let (input_state, geometry) =
+            (*pending_input_state).unwrap_or((current_input_state, current_geometry));
         let chunks = framer.flush_timeout();
-        *pending_input_state = framer.has_pending_input().then_some(input_state);
-        let geometry = input_geometry(last_geometry, input_state, None);
+        *pending_input_state = framer
+            .has_pending_input()
+            .then_some((input_state, geometry));
         append_unix_input_chunks(chunks, pending_palette, input_state, geometry, &mut events);
     }
 
@@ -759,7 +778,7 @@ mod tests {
         let mut captured = None;
         while data.len() < len {
             let mut scratch = vec![0; len - data.len()];
-            let (read, snapshot) = state.read_input(&mut scratch).unwrap();
+            let (read, snapshot, _) = state.read_input(&mut scratch).unwrap();
             assert!(read > 0);
             if let Some(captured) = captured {
                 assert_eq!(snapshot, captured);
@@ -853,7 +872,7 @@ mod tests {
         writer.write_all(stale).unwrap();
 
         let (tx, mut rx) = mpsc::channel(2);
-        input_state.send_resize(&tx, (80, 24, 8, 16)).unwrap();
+        input_state.send_resize(&tx, (80, 24, 8, 16), None).unwrap();
         let current = input_state.load();
         writer.write_all(fresh).unwrap();
 
@@ -869,7 +888,8 @@ mod tests {
         assert_eq!(fresh_data, fresh);
         assert_eq!(fresh_snapshot, current);
 
-        let ClientLoopEvent::Resize(_, _, _, _, applied_generation) = rx.try_recv().unwrap() else {
+        let ClientLoopEvent::Resize(_, _, _, _, applied_generation, _) = rx.try_recv().unwrap()
+        else {
             panic!("expected resize event");
         };
         assert!(!super::super::mouse_input_is_current(
@@ -982,13 +1002,21 @@ mod tests {
 
         let down = b"\x1b[<0;4;4M";
         let up = b"\x1b[<0;4;4m";
+        let old_geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let new_geometry = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer
             .write_all(&[down.as_slice(), up.as_slice()].concat())
             .unwrap();
         let (input_state, _wake) =
-            HostInputState::with_input_fd(true, false, reader.as_raw_fd()).unwrap();
+            HostInputState::with_input_fd(true, true, reader.as_raw_fd()).unwrap();
+        input_state
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .geometry = Some(old_geometry);
         let input_state = Arc::new(input_state);
+        let applied_before_resize = input_state.load();
         let (event_tx, mut event_rx) = mpsc::channel(2);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -997,21 +1025,35 @@ mod tests {
         let reader_tx = event_tx.clone();
         let reader_thread = std::thread::spawn(move || {
             let mut scratch = [0; 64];
-            reader_state.read_input_and_send(&reader_tx, &mut scratch, |bytes, snapshot| {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                Some(ClientLoopEvent::OrderedInput(vec![
-                    ClientLoopEvent::StdinInput(bytes[..down.len()].to_vec(), snapshot),
-                    ClientLoopEvent::StdinInput(bytes[down.len()..].to_vec(), snapshot),
-                ]))
-            })
+            reader_state.read_input_and_send(
+                &reader_tx,
+                &mut scratch,
+                |bytes, snapshot, geometry| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let geometry = geometry.expect("captured host geometry");
+                    Some(ClientLoopEvent::OrderedInput(vec![
+                        ClientLoopEvent::PixelMouse(
+                            bytes[..down.len()].to_vec(),
+                            geometry,
+                            snapshot,
+                        ),
+                        ClientLoopEvent::PixelMouse(
+                            bytes[down.len()..].to_vec(),
+                            geometry,
+                            snapshot,
+                        ),
+                    ]))
+                },
+            )
         });
         entered_rx.recv().unwrap();
 
         let resize_state = input_state.clone();
         let resize_tx = event_tx.clone();
-        let resize_thread =
-            std::thread::spawn(move || resize_state.send_resize(&resize_tx, (120, 40, 8, 16)));
+        let resize_thread = std::thread::spawn(move || {
+            resize_state.send_resize(&resize_tx, (80, 24, 10, 20), Some(new_geometry))
+        });
         release_tx.send(()).unwrap();
         assert_eq!(
             reader_thread.join().unwrap().unwrap(),
@@ -1024,12 +1066,41 @@ mod tests {
         };
         assert!(matches!(
             events.as_slice(),
-            [ClientLoopEvent::StdinInput(first, _), ClientLoopEvent::StdinInput(second, _)]
-                if first == down && second == up
+            [ClientLoopEvent::PixelMouse(first, first_geometry, first_snapshot), ClientLoopEvent::PixelMouse(second, second_geometry, second_snapshot)]
+                if first == down
+                    && second == up
+                    && *first_geometry == old_geometry
+                    && *second_geometry == old_geometry
+                    && *first_snapshot == applied_before_resize
+                    && *second_snapshot == applied_before_resize
         ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(ClientLoopEvent::Resize(..))
+        assert!(super::super::pixel_input_is_current(
+            applied_before_resize,
+            input_state.load(),
+            applied_before_resize.generation(),
+            old_geometry,
+            Some(old_geometry),
+        ));
+
+        let ClientLoopEvent::Resize(_, _, _, _, applied_generation, applied_geometry) =
+            event_rx.try_recv().unwrap()
+        else {
+            panic!("resize must follow the stdin batch");
+        };
+        assert!(!super::super::pixel_input_is_current(
+            applied_before_resize,
+            input_state.load(),
+            applied_generation,
+            old_geometry,
+            applied_geometry,
+        ));
+        let current = input_state.load();
+        assert!(super::super::pixel_input_is_current(
+            current,
+            current,
+            applied_generation,
+            new_geometry,
+            applied_geometry,
         ));
     }
 
@@ -1112,7 +1183,7 @@ mod tests {
             &mut initial_events,
         );
         assert!(initial_events.is_empty());
-        assert_eq!(pending_input_state, Some(snapshot));
+        assert_eq!(pending_input_state, Some((snapshot, None)));
 
         let mut timeouts = Vec::new();
         let events = flush_framer_after_idle(
@@ -1121,6 +1192,7 @@ mod tests {
             &mut last_geometry,
             &mut pending_palette,
             snapshot,
+            None,
             |timeout_ms| {
                 timeouts.push(timeout_ms);
                 Some(false)

@@ -554,6 +554,7 @@ struct OmpRendererFrameWire {
     frame_nonce: [u8; 16],
     pane: Option<OmpRendererPaneWire>,
     focused: bool,
+    server_owned_overlay: bool,
     surface_active: bool,
 }
 
