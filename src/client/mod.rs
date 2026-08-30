@@ -2091,6 +2091,30 @@ async fn run_client_loop(
                     }
                     (data, Some(events))
                 };
+                if !state.omp_renderer.owns_surface_input() {
+                    if should_bridge_clipboard_image_paste(
+                        &data,
+                        is_remote_client,
+                        state.remote_image_paste_key,
+                    ) {
+                        if let Some(image) = crate::platform::read_clipboard_image() {
+                            write_remote_image_to_server(
+                                &mut write_stream,
+                                image,
+                                "clipboard paste",
+                            )?;
+                            continue;
+                        }
+                        info!(
+                            "clipboard image paste trigger received, but local clipboard has no image"
+                        );
+                    }
+                    if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client)
+                    {
+                        write_remote_image_to_server(&mut write_stream, image, "file drop")?;
+                        continue;
+                    }
+                }
                 if state.omp_renderer.owns_input() {
                     for message in state
                         .omp_renderer
@@ -2103,22 +2127,8 @@ async fn run_client_loop(
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                     continue;
                 }
-                if should_bridge_clipboard_image_paste(
-                    &data,
-                    is_remote_client,
-                    state.remote_image_paste_key,
-                ) {
-                    if let Some(image) = crate::platform::read_clipboard_image() {
-                        write_remote_image_to_server(&mut write_stream, image, "clipboard paste")?;
-                        continue;
-                    }
-                    info!(
-                        "clipboard image paste trigger received, but local clipboard has no image"
-                    );
-                }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
-                    write_remote_image_to_server(&mut write_stream, image, "file drop")?;
-                    continue;
+                if let Some(events) = parsed_events.as_deref() {
+                    state.omp_renderer.observe_server_input(events);
                 }
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {

@@ -26,8 +26,16 @@ pub(crate) struct ForwardedInputLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConsumedInputLease {
+    OmpReplyNavigation(TerminalInputContext),
     ReprocessRepeats(TerminalInputContext),
     SuppressRepeats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ConsumedRepeatPolicy {
+    #[default]
+    StableContext,
+    ResultingContext,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +51,7 @@ pub(crate) enum RepeatPlan {
         repetitions: u16,
         tracked: bool,
     },
+    OmpReplyNavigation(TerminalInputContext),
     Ignore,
 }
 
@@ -78,8 +87,9 @@ impl InputLeaseTable {
         key: &TerminalKey,
         initial_context: Option<&TerminalInputContext>,
         resulting_context: Option<&TerminalInputContext>,
+        consumed_repeat_policy: ConsumedRepeatPolicy,
         target: Option<TerminalInputTarget>,
-        repeats_already_handled: bool,
+        handled_omp_reply_navigation: bool,
     ) -> RepeatPlan {
         if key.generated_text.is_some() && !key.has_physical_identity() {
             return RepeatPlan::Ignore;
@@ -89,17 +99,31 @@ impl InputLeaseTable {
             return RepeatPlan::Ignore;
         }
         if !self.leases.contains_key(&lease_key) {
-            let disposition = match (initial_context, resulting_context) {
-                (Some(initial), Some(resulting)) if initial == resulting => {
-                    ConsumedInputLease::ReprocessRepeats(initial.clone())
+            let disposition = if handled_omp_reply_navigation {
+                match (initial_context, resulting_context) {
+                    (Some(initial), Some(resulting)) if initial == resulting => {
+                        ConsumedInputLease::OmpReplyNavigation(initial.clone())
+                    }
+                    _ => ConsumedInputLease::SuppressRepeats,
                 }
-                _ => ConsumedInputLease::SuppressRepeats,
+            } else {
+                match (consumed_repeat_policy, initial_context, resulting_context) {
+                    (ConsumedRepeatPolicy::ResultingContext, _, Some(resulting)) => {
+                        ConsumedInputLease::ReprocessRepeats(resulting.clone())
+                    }
+                    (ConsumedRepeatPolicy::StableContext, Some(initial), Some(resulting))
+                        if initial == resulting =>
+                    {
+                        ConsumedInputLease::ReprocessRepeats(initial.clone())
+                    }
+                    _ => ConsumedInputLease::SuppressRepeats,
+                }
             };
             self.insert_consumed(lease_key, disposition);
         }
         match self.leases.get(&lease_key) {
             Some(InputLease::Consumed(ConsumedInputLease::ReprocessRepeats(context)))
-                if key.repeat_count > 1 && !repeats_already_handled =>
+                if key.repeat_count > 1 && !handled_omp_reply_navigation =>
             {
                 RepeatPlan::Reprocess {
                     context: context.clone(),
@@ -120,6 +144,15 @@ impl InputLeaseTable {
         match self.leases.get(&lease_key) {
             Some(InputLease::Forwarded(lease)) => {
                 return RepeatPlan::Forwarded(lease.target.clone());
+            }
+            Some(InputLease::Consumed(ConsumedInputLease::OmpReplyNavigation(context)))
+                if current_context == Some(context) =>
+            {
+                return RepeatPlan::OmpReplyNavigation(context.clone());
+            }
+            Some(InputLease::Consumed(ConsumedInputLease::OmpReplyNavigation(_))) => {
+                self.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
+                return RepeatPlan::Ignore;
             }
             Some(InputLease::Consumed(ConsumedInputLease::ReprocessRepeats(context)))
                 if current_context == Some(context) =>
@@ -173,6 +206,18 @@ impl InputLeaseTable {
     #[cfg(test)]
     pub(crate) fn contains(&self, key: &InputLeaseKey) -> bool {
         self.leases.contains_key(key)
+    }
+
+    pub(crate) fn owns_existing_lifecycle(
+        &mut self,
+        lease_key: &InputLeaseKey,
+        key: &TerminalKey,
+    ) -> bool {
+        if key.kind == crossterm::event::KeyEventKind::Press && !key.has_physical_identity() {
+            self.leases.remove(lease_key);
+            return false;
+        }
+        self.leases.contains_key(lease_key)
     }
 
     pub(crate) fn insert_forwarded(
@@ -256,6 +301,10 @@ mod tests {
         TerminalInputTarget {
             terminal_id: crate::terminal::TerminalId::alloc(),
         }
+    }
+
+    fn pane_context() -> TerminalInputContext {
+        TerminalInputContext::Pane(crate::terminal::TerminalId::alloc())
     }
 
     fn physical_generated_slash(repeat_count: u16) -> TerminalKey {
@@ -354,7 +403,7 @@ mod tests {
     fn physical_generated_text_keeps_native_repeat_lifecycle() {
         let key = physical_generated_slash(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
+        let context = pane_context();
         let forwarded_target = target();
         let mut leases = InputLeaseTable::default();
 
@@ -368,6 +417,7 @@ mod tests {
                 &key,
                 Some(&context),
                 Some(&context),
+                ConsumedRepeatPolicy::StableContext,
                 Some(forwarded_target.clone()),
                 false,
             ),
@@ -389,13 +439,21 @@ mod tests {
     fn consumed_grouped_physical_generated_text_reprocesses_repeats() {
         let key = physical_generated_slash(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
+        let context = pane_context();
         let mut leases = InputLeaseTable::default();
 
         assert!(matches!(
-            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, false),
+            leases.complete_press(
+                lease_key,
+                &key,
+                Some(&context),
+                Some(&context),
+                ConsumedRepeatPolicy::StableContext,
+                None,
+                false,
+            ),
             RepeatPlan::Reprocess {
-                context: TerminalInputContext::Pane,
+                context: TerminalInputContext::Pane(_),
                 repetitions: 2,
                 tracked: true,
             }
@@ -403,10 +461,42 @@ mod tests {
     }
 
     #[test]
-    fn later_grouped_physical_key_down_keeps_its_repeat_count() {
-        let first = physical_generated_slash(1);
+    fn consumed_repeat_is_suppressed_after_pane_terminal_replacement() {
+        let key = physical_generated_slash(1);
+        let lease_key = InputLeaseKey::new(7, &key);
+        let original = pane_context();
+        let replacement = pane_context();
+        let mut leases = InputLeaseTable::default();
+
+        assert!(matches!(
+            leases.complete_press(
+                lease_key,
+                &key,
+                Some(&original),
+                Some(&original),
+                ConsumedRepeatPolicy::StableContext,
+                None,
+                false
+            ),
+            RepeatPlan::Ignore
+        ));
+        let repeated = leases.normalize_press(&lease_key, key.with_repeat_count(1));
+        assert_eq!(repeated.kind, crossterm::event::KeyEventKind::Repeat);
+        assert!(matches!(
+            leases.plan_repeat(lease_key, &repeated, Some(&replacement)),
+            RepeatPlan::Ignore
+        ));
+        assert!(matches!(
+            leases.plan_repeat(lease_key, &repeated, Some(&replacement)),
+            RepeatPlan::Ignore
+        ));
+    }
+
+    #[test]
+    fn handled_physical_press_uses_owned_omp_navigation_repeat_plan() {
+        let first = physical_generated_slash(3);
         let lease_key = InputLeaseKey::new(7, &first);
-        let context = TerminalInputContext::Pane;
+        let context = pane_context();
         let mut leases = InputLeaseTable::default();
 
         assert!(matches!(
@@ -415,47 +505,20 @@ mod tests {
                 &first,
                 Some(&context),
                 Some(&context),
+                ConsumedRepeatPolicy::StableContext,
                 None,
                 true,
             ),
             RepeatPlan::Ignore
         ));
-
-        let later = leases.normalize_press(&lease_key, physical_generated_slash(u16::MAX));
-        assert_eq!(later.kind, crossterm::event::KeyEventKind::Repeat);
-        assert_eq!(later.repeat_count, u16::MAX);
-        assert!(matches!(
-            leases.plan_repeat(lease_key, &later, Some(&context)),
-            RepeatPlan::Reprocess {
-                repetitions: u16::MAX,
-                tracked: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn handled_grouped_press_skips_replay_but_keeps_its_repeat_lease() {
-        let key = physical_generated_slash(3);
-        let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
-        let mut leases = InputLeaseTable::default();
-
-        assert!(matches!(
-            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, true),
-            RepeatPlan::Ignore
-        ));
         assert!(leases.contains(&lease_key));
 
-        let repeated = leases.normalize_press(&lease_key, key.with_repeat_count(1));
+        let repeated = leases.normalize_press(&lease_key, physical_generated_slash(u16::MAX));
         assert_eq!(repeated.kind, crossterm::event::KeyEventKind::Repeat);
+        assert_eq!(repeated.repeat_count, u16::MAX);
         assert!(matches!(
             leases.plan_repeat(lease_key, &repeated, Some(&context)),
-            RepeatPlan::Reprocess {
-                repetitions: 1,
-                tracked: true,
-                ..
-            }
+            RepeatPlan::OmpReplyNavigation(TerminalInputContext::Pane(_))
         ));
     }
 
@@ -465,7 +528,7 @@ mod tests {
             .with_generated_text(Some("/".to_owned()))
             .with_repeat_count(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
+        let context = pane_context();
         let mut leases = InputLeaseTable::default();
 
         assert!(matches!(
@@ -474,6 +537,7 @@ mod tests {
                 &key,
                 Some(&context),
                 Some(&context),
+                ConsumedRepeatPolicy::StableContext,
                 Some(target()),
                 false,
             ),
@@ -486,18 +550,24 @@ mod tests {
     fn new_semantic_press_recomputes_consumed_repeat_disposition() {
         let key = TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()).with_repeat_count(3);
         let lease_key = InputLeaseKey::new(7, &key);
-        let context = TerminalInputContext::Pane;
+        let context = pane_context();
         let mut leases = InputLeaseTable::default();
         leases.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
 
         let key = leases.normalize_press(&lease_key, key);
-        let plan =
-            leases.complete_press(lease_key, &key, Some(&context), Some(&context), None, false);
-
+        let plan = leases.complete_press(
+            lease_key,
+            &key,
+            Some(&context),
+            Some(&context),
+            ConsumedRepeatPolicy::StableContext,
+            None,
+            false,
+        );
         assert!(matches!(
             plan,
             RepeatPlan::Reprocess {
-                context: TerminalInputContext::Pane,
+                context: TerminalInputContext::Pane(_),
                 repetitions: 2,
                 tracked: true,
             }

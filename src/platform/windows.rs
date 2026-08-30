@@ -1077,7 +1077,7 @@ fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
     }
 
     if let Some(selected) = select_topmost_agent_chain_candidate(&candidates, snapshot) {
-        return Some(foreground_job_from_entry(selected));
+        return Some(foreground_job_from_entry_tree(selected, snapshot));
     }
     if !candidates.is_empty() || !shell_is_git_bash(shell) {
         return Some(foreground_job_from_entry(shell));
@@ -1099,7 +1099,11 @@ fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
         .collect();
     let selected =
         select_topmost_agent_chain_candidate(&matching_candidates, snapshot).unwrap_or(shell);
-    Some(foreground_job_from_entry(selected))
+    Some(if selected.pid == shell.pid {
+        foreground_job_from_entry(selected)
+    } else {
+        foreground_job_from_entry_tree(selected, snapshot)
+    })
 }
 
 #[cfg(test)]
@@ -1122,6 +1126,19 @@ fn foreground_job_from_entry(entry: &WindowsProcessEntry) -> ForegroundJob {
     ForegroundJob {
         process_group_id: entry.pid,
         processes: vec![foreground_process_from_entry(entry)],
+    }
+}
+
+fn foreground_job_from_entry_tree(
+    entry: &WindowsProcessEntry,
+    snapshot: &ProcessSnapshot,
+) -> ForegroundJob {
+    ForegroundJob {
+        process_group_id: entry.pid,
+        processes: std::iter::once(entry)
+            .chain(descendant_entries(entry.pid, snapshot))
+            .map(foreground_process_from_entry)
+            .collect(),
     }
 }
 
@@ -3538,12 +3555,20 @@ mod tests {
                     "C:\\Users\\herdr\\AppData\\Roaming\\npm\\codex.cmd --model gpt-5",
                 ],
             ),
+            test_entry(30, 20, "bun.exe", &["bun.exe", "worker.js"]),
         ];
 
         let job = super::select_pane_foreground_job(10, &entries).unwrap();
 
         assert_eq!(job.process_group_id, 20);
         assert_eq!(job.processes[0].name, "cmd.exe");
+        assert_eq!(
+            job.processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
     }
 
     #[test]

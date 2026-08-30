@@ -592,6 +592,7 @@ fn reset_omp_reply_generation_for_foreground_probe(
     had_process_probe: bool,
     previous_process_group_id: Option<u32>,
     tracked_process_group_id: Option<u32>,
+    tracked_process_ids: &[u32],
 ) -> bool {
     let confirmed_replacement_process =
         confirmed_foreground_group_replacement(tracked_process_group_id, previous_process_group_id);
@@ -603,7 +604,8 @@ fn reset_omp_reply_generation_for_foreground_probe(
     if action != ForegroundShellAgentAction::ReportProcessExit && !direct_replacement {
         return false;
     }
-    *generation = terminal.reset_omp_reply_state_if_current(*generation, direct_replacement);
+    let replacement_process_ids = direct_replacement.then_some(tracked_process_ids);
+    *generation = terminal.reset_omp_reply_state_if_current(*generation, replacement_process_ids);
     true
 }
 
@@ -817,6 +819,7 @@ fn sync_content_change_acquisition(
 #[derive(Debug, Clone)]
 struct ProcessProbeResult {
     tracked_process_group_id: Option<u32>,
+    tracked_process_ids: Vec<u32>,
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
@@ -863,26 +866,11 @@ fn process_probe_result(
 ) -> ProcessProbeResult {
     ProcessProbeResult {
         tracked_process_group_id,
+        tracked_process_ids: job.processes.iter().map(|process| process.pid).collect(),
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
     }
-}
-
-fn hinted_process_probe_result(
-    job: &crate::platform::ForegroundJob,
-    pid: u32,
-    tracked_process_group_id: Option<u32>,
-    read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<ProcessProbeResult> {
-    let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
-    Some(process_probe_result(
-        job,
-        pid,
-        tracked_process_group_id,
-        agent,
-        crate::detect::agent_label(agent).to_string(),
-    ))
 }
 
 fn probe_foreground_process_from_jobs(
@@ -892,18 +880,32 @@ fn probe_foreground_process_from_jobs(
     foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
 ) -> ProcessProbeResult {
+    let foreground_job = foreground_job();
     if let Some(job) = leader_job.as_ref() {
-        if let Some(hinted) =
-            hinted_process_probe_result(job, pid, tracked_process_group_id, read_hint)
-        {
-            return hinted;
+        let membership_job = foreground_job
+            .as_ref()
+            .filter(|foreground| foreground.process_group_id == job.process_group_id)
+            .unwrap_or(job);
+        if let Some(agent) = agent_hint_for_foreground_job_members(job, read_hint) {
+            return process_probe_result(
+                membership_job,
+                pid,
+                tracked_process_group_id,
+                agent,
+                crate::detect::agent_label(agent).to_string(),
+            );
         }
         if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
-            return process_probe_result(job, pid, tracked_process_group_id, agent, process_name);
+            return process_probe_result(
+                membership_job,
+                pid,
+                tracked_process_group_id,
+                agent,
+                process_name,
+            );
         }
     }
 
-    let foreground_job = foreground_job();
     if let Some(job) = foreground_job.as_ref() {
         if let Some(agent) = read_hint(job.process_group_id) {
             return process_probe_result(
@@ -930,6 +932,7 @@ fn probe_foreground_process_from_jobs(
         let identified = crate::detect::identify_agent_in_job(job);
         return ProcessProbeResult {
             tracked_process_group_id,
+            tracked_process_ids: job.processes.iter().map(|process| process.pid).collect(),
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
@@ -938,6 +941,7 @@ fn probe_foreground_process_from_jobs(
 
     ProcessProbeResult {
         tracked_process_group_id,
+        tracked_process_ids: Vec::new(),
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
@@ -1116,6 +1120,7 @@ fn spawn_basic_detection_task(
                     had_process_probe,
                     previous_process_group_id,
                     observed_process_group_id,
+                    &probe.tracked_process_ids,
                 );
                 let changed = apply_foreground_shell_agent_action(
                     &mut agent_presence,
@@ -3193,6 +3198,7 @@ impl PaneRuntime {
                                 had_process_probe,
                                 previous_process_group_id,
                                 observed_process_group_id,
+                                &probe.tracked_process_ids,
                             );
                             let changed = apply_foreground_shell_agent_action(
                                 &mut agent_presence,
@@ -3442,6 +3448,7 @@ impl PaneRuntime {
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
+        self.terminal.reset_omp_reply_state();
         if let Ok(mut pending_release) = self.pending_release.lock() {
             *pending_release = Some(PendingAgentRelease {
                 agent,
@@ -5421,6 +5428,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
             true,
             Some(41),
             Some(42),
+            &[42],
         ));
         assert_ne!(detector_generation, exited_generation);
         assert!(!runtime.try_navigate_omp_reply(true, &option_up));
@@ -5439,7 +5447,7 @@ tail five\r\ntail six\r\ntail seven\r\ntail eight\r\n",
         assert_eq!(
             runtime
                 .terminal
-                .reset_omp_reply_state_if_current(exited_generation, false),
+                .reset_omp_reply_state_if_current(exited_generation, None),
             replacement_generation
         );
         assert!(runtime.try_navigate_omp_reply(true, &option_up));
@@ -5448,6 +5456,37 @@ tail five\r\ntail six\r\ntail seven\r\ntail eight\r\n",
             .lines()
             .next()
             .is_some_and(|line| line.trim_end().starts_with("new reply")));
+    }
+
+    #[tokio::test]
+    async fn graceful_omp_release_resets_reply_state_before_reacquisition() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 4, 16 * 1024, b"");
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-a:old\x07old reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n\
+\x1b]133;A;aid=omp-response-run-a:unfinished",
+        );
+        let option_up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(runtime.try_navigate_omp_reply(true, &option_up));
+        let before_release = runtime.terminal.omp_reply_generation();
+
+        runtime.begin_graceful_release(Agent::Omp);
+
+        assert_ne!(runtime.terminal.omp_reply_generation(), before_release);
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
+        runtime.test_process_pty_bytes(
+            b"\x07leaked old reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n",
+        );
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
+
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-run-b:new\x07new reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail five\r\ntail six\r\ntail seven\r\ntail eight\r\n",
+        );
+        assert!(runtime.try_navigate_omp_reply(true, &option_up));
     }
 
     #[tokio::test]
@@ -5474,6 +5513,7 @@ tail five\r\ntail six\r\ntail seven\r\ntail eight\r\n",
             true,
             Some(41),
             Some(7),
+            &[],
         ));
         assert_ne!(detector_generation, marker_generation);
 
@@ -5497,7 +5537,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let mut detector_generation = exited_generation;
 
         runtime.test_process_pty_bytes(
-            b"\x1b]133;A;aid=omp-response-run-b:new\x07new reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+            b"\x1b]133;A;aid=omp-response-42-run-b:new\x07new reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
 tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         );
         let replacement_generation = runtime.terminal.omp_reply_generation();
@@ -5512,12 +5552,13 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
             true,
             Some(41),
             Some(42),
+            &[42],
         ));
         assert_ne!(detector_generation, replacement_generation);
         assert_eq!(
             runtime
                 .terminal
-                .reset_omp_reply_state_if_current(exited_generation, false),
+                .reset_omp_reply_state_if_current(exited_generation, None),
             detector_generation
         );
 
@@ -5531,6 +5572,36 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
             .lines()
             .next()
             .is_some_and(|line| line.trim_end().starts_with("new reply")));
+    }
+
+    #[tokio::test]
+    async fn direct_replacement_discards_marker_owned_by_exited_process() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 4, 16 * 1024, b"");
+        runtime.test_process_pty_bytes(b"old OMP output without a reply marker\r\n");
+        let exited_generation = runtime.terminal.omp_reply_generation();
+        let mut detector_generation = exited_generation;
+
+        runtime.test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-41-run-a:late\x07late old reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
+        );
+        assert!(reset_omp_reply_generation_for_foreground_probe(
+            &runtime.terminal,
+            &mut detector_generation,
+            ForegroundShellAgentAction::ObserveProbe,
+            Some(Agent::Omp),
+            Some(Agent::Omp),
+            true,
+            Some(41),
+            Some(42),
+            &[42],
+        ));
+
+        let option_up = crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert!(!runtime.try_navigate_omp_reply(true, &option_up));
     }
 
     #[test]
@@ -5594,21 +5665,29 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
 
     #[test]
     fn foreground_agent_hint_wins_over_process_name_detection() {
-        let job = crate::platform::ForegroundJob {
+        let leader_job = crate::platform::ForegroundJob {
             process_group_id: 99,
             processes: vec![foreground_process(99, "codex")],
+        };
+        let full_job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(99, "codex"),
+                foreground_process(100, "omp"),
+            ],
         };
 
         let result = probe_foreground_process_from_jobs(
             42,
             Some(99),
-            Some(job),
-            || None,
+            Some(leader_job),
+            || Some(full_job),
             |pid| (pid == 99).then_some(Agent::Claude),
         );
 
         assert_eq!(result.agent, Some(Agent::Claude));
         assert_eq!(result.process_name.as_deref(), Some("claude"));
+        assert_eq!(result.tracked_process_ids, [99, 100]);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use crate::layout::PaneId;
 use crate::pane::{AgentDetection, PaneLaunchEnv};
 use crate::render_signal::RenderSignal;
 use crate::server::omp_route::OmpRouteKey;
-use crate::terminal::TerminalRuntime;
+use crate::terminal::{OmpReplyNavigationPresses, OmpReplyNavigationRoute, TerminalRuntime};
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
 
 /// Maximum bytes in one guest NDJSON record, including its newline.
@@ -80,7 +80,7 @@ pub(crate) struct PrivateOmpGuest {
     runtime_pane_id: PaneId,
     attachment_epoch: AtomicU64,
     controller: AtomicBool,
-    omp_reply_navigation_presses: Mutex<Vec<crate::input::KeyIdentity>>,
+    omp_reply_navigation_presses: Mutex<OmpReplyNavigationPresses>,
     runtime: Option<TerminalRuntime>,
     _listener: Arc<TcpListener>,
     guest: Arc<Mutex<Option<TcpStream>>>,
@@ -151,7 +151,7 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
-            omp_reply_navigation_presses: Mutex::new(Vec::new()),
+            omp_reply_navigation_presses: Mutex::new(OmpReplyNavigationPresses::default()),
             runtime: Some(runtime),
             _listener: listener,
             guest,
@@ -188,7 +188,7 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
-            omp_reply_navigation_presses: Mutex::new(Vec::new()),
+            omp_reply_navigation_presses: Mutex::new(OmpReplyNavigationPresses::default()),
             runtime: Some(runtime),
             _listener: listener,
             guest: Arc::new(Mutex::new(None)),
@@ -231,53 +231,30 @@ impl PrivateOmpGuest {
         }
     }
 
-    pub(crate) fn remember_omp_reply_navigation_press(&self, key: &crate::input::TerminalKey) {
-        if key.kind != crossterm::event::KeyEventKind::Press {
-            return;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return;
-        };
-        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
-            if !presses.contains(&identity) {
-                presses.push(identity);
-            }
-        }
-    }
-
-    pub(crate) fn consume_omp_reply_navigation_release(
+    pub(crate) fn route_omp_reply_navigation(
         &self,
         key: &crate::input::TerminalKey,
-    ) -> bool {
-        if key.kind != crossterm::event::KeyEventKind::Release {
-            return false;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return false;
-        };
+        navigate: impl FnOnce() -> bool,
+    ) -> OmpReplyNavigationRoute {
         let Ok(mut presses) = self.omp_reply_navigation_presses.lock() else {
-            return false;
+            return OmpReplyNavigationRoute::Forwarded;
         };
-        let Some(index) = presses.iter().position(|tracked| *tracked == identity) else {
-            return false;
-        };
-        presses.swap_remove(index);
-        true
+        presses.route(key, navigate)
     }
 
-    pub(crate) fn clear_omp_reply_navigation_forwarded_key(&self, key: &crate::input::TerminalKey) {
-        if !matches!(
-            key.kind,
-            crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-        ) {
-            return;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return;
-        };
-        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
-            presses.retain(|tracked| *tracked != identity);
-        }
+    pub(crate) fn route_existing_omp_reply_navigation(
+        &self,
+        key: &crate::input::TerminalKey,
+    ) -> Option<OmpReplyNavigationRoute> {
+        self.omp_reply_navigation_presses
+            .lock()
+            .ok()
+            .and_then(|mut presses| presses.route_existing(key))
+    }
+    pub(crate) fn has_forwarded_omp_reply_navigation(&self) -> bool {
+        self.omp_reply_navigation_presses
+            .lock()
+            .is_ok_and(|presses| presses.has_forwarded())
     }
 
     pub(crate) fn clear_omp_reply_navigation_presses(&self) {

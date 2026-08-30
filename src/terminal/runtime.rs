@@ -16,6 +16,125 @@ use crate::layout::PaneId;
 /// type instead of the pane module's implementation detail.
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OmpReplyNavigationRoute {
+    Consumed { navigated: bool },
+    Forwarded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OmpReplyNavigationDisposition {
+    Consumed,
+    Forwarded,
+}
+
+#[derive(Default)]
+pub(crate) struct OmpReplyNavigationPresses(
+    Vec<(crate::input::KeyIdentity, OmpReplyNavigationDisposition)>,
+);
+
+impl OmpReplyNavigationPresses {
+    pub(crate) fn route(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        navigate: impl FnOnce() -> bool,
+    ) -> OmpReplyNavigationRoute {
+        if let Some(disposition) = self.existing_disposition(key) {
+            return match disposition {
+                OmpReplyNavigationDisposition::Consumed => {
+                    let navigated =
+                        key.kind != crossterm::event::KeyEventKind::Release && navigate();
+                    OmpReplyNavigationRoute::Consumed { navigated }
+                }
+                OmpReplyNavigationDisposition::Forwarded => OmpReplyNavigationRoute::Forwarded,
+            };
+        }
+
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return OmpReplyNavigationRoute::Forwarded;
+        }
+        let navigated = navigate();
+        if let Some(identity) = reply_navigation_key_identity(key) {
+            let disposition = if navigated {
+                OmpReplyNavigationDisposition::Consumed
+            } else {
+                OmpReplyNavigationDisposition::Forwarded
+            };
+            self.0.push((identity, disposition));
+        }
+        if navigated {
+            OmpReplyNavigationRoute::Consumed { navigated: true }
+        } else {
+            OmpReplyNavigationRoute::Forwarded
+        }
+    }
+
+    pub(crate) fn route_existing(
+        &mut self,
+        key: &crate::input::TerminalKey,
+    ) -> Option<OmpReplyNavigationRoute> {
+        self.existing_disposition(key)
+            .map(|disposition| match disposition {
+                OmpReplyNavigationDisposition::Consumed => {
+                    OmpReplyNavigationRoute::Consumed { navigated: false }
+                }
+                OmpReplyNavigationDisposition::Forwarded => OmpReplyNavigationRoute::Forwarded,
+            })
+    }
+
+    fn existing_disposition(
+        &mut self,
+        key: &crate::input::TerminalKey,
+    ) -> Option<OmpReplyNavigationDisposition> {
+        let identity = reply_navigation_key_identity(key)?;
+        if key.kind == crossterm::event::KeyEventKind::Press && !key.has_physical_identity() {
+            self.0.retain(|(tracked, _)| *tracked != identity);
+            return None;
+        }
+        let index = self
+            .0
+            .iter()
+            .position(|(tracked, _)| *tracked == identity)?;
+        let disposition = self.0[index].1;
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            self.0.swap_remove(index);
+        }
+        Some(disposition)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+    pub(crate) fn has_forwarded(&self) -> bool {
+        self.0
+            .iter()
+            .any(|(_, disposition)| *disposition == OmpReplyNavigationDisposition::Forwarded)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Identifies the arrow key that owns a consumed reply-navigation press.
+/// Modifiers are deliberately excluded because Windows can report Alt's
+/// release before the arrow's release.
+fn reply_navigation_key_identity(
+    key: &crate::input::TerminalKey,
+) -> Option<crate::input::KeyIdentity> {
+    matches!(
+        key.code,
+        crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
+    )
+    .then(|| key.identity())
+}
+
 impl TerminalRuntime {
     pub fn shutdown(self) {
         self.0.shutdown();
@@ -415,18 +534,6 @@ impl TerminalRuntime {
         self.0.jump_to_next_semantic_prompt()
     }
 
-    /// Identifies the arrow key that owns a consumed reply-navigation press.
-    /// Modifiers are deliberately excluded because Windows can report Alt's
-    /// release before the arrow's release.
-    pub(crate) fn omp_reply_navigation_key_identity(
-        key: &crate::input::TerminalKey,
-    ) -> Option<crate::input::KeyIdentity> {
-        matches!(
-            key.code,
-            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Down
-        )
-        .then(|| key.identity())
-    }
     /// Handles grouped OMP reply navigation in one locked, clamped terminal pass.
     pub fn try_navigate_omp_reply_repeated(
         &self,

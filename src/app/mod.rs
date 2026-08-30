@@ -270,7 +270,7 @@ pub(crate) struct TerminalInputTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalInputContext {
-    Pane,
+    Pane(crate::terminal::TerminalId),
     Popup(crate::terminal::TerminalId),
     Findr(crate::layout::PaneId),
 }
@@ -1749,7 +1749,14 @@ impl App {
                 .as_ref()
                 .map(|findr| TerminalInputContext::Findr(findr.pane_id))
         } else if self.state.mode == Mode::Terminal {
-            Some(TerminalInputContext::Pane)
+            if let Some((_, pane)) = self.state.focused_workspace_plugin_pane() {
+                return Some(TerminalInputContext::Pane(pane.terminal_id.clone()));
+            }
+            let workspace = self.state.workspaces.get(self.state.active?)?;
+            let pane_id = workspace.focused_pane_id()?;
+            Some(TerminalInputContext::Pane(
+                workspace.terminal_id(pane_id)?.clone(),
+            ))
         } else {
             None
         }
@@ -1830,10 +1837,10 @@ impl App {
                     ) {
                         break;
                     }
-                    let (target, handled_omp_reply_navigation) =
+                    let (target, handled_omp_reply_navigation, _) =
                         if matches!(context, TerminalInputContext::Findr(_)) {
                             self.handle_findr_key(key.clone());
-                            (None, false)
+                            (None, false, input::ConsumedRepeatPolicy::StableContext)
                         } else {
                             self.handle_terminal_key_headless_with_repeat_outcome(
                                 source_id,
@@ -1857,6 +1864,24 @@ impl App {
                             break;
                         }
                     }
+                }
+                false
+            }
+            input::RepeatPlan::OmpReplyNavigation(context) => {
+                let current_context = self.terminal_input_context();
+                if !self.input_leases.reprocess_allowed(
+                    lease_key,
+                    &context,
+                    current_context.as_ref(),
+                    true,
+                ) {
+                    return false;
+                }
+                if let TerminalInputContext::Pane(terminal_id) = context {
+                    self.try_navigate_omp_reply_for_target(
+                        &TerminalInputTarget { terminal_id },
+                        &key,
+                    );
                 }
                 false
             }
@@ -1903,6 +1928,15 @@ impl App {
         true
     }
 
+    pub(crate) fn input_source_owns_existing_key(
+        &mut self,
+        source_id: InputSourceId,
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        self.input_leases
+            .owns_existing_lifecycle(&input::InputLeaseKey::new(source_id, key), key)
+    }
+
     #[cfg(test)]
     pub(crate) fn route_client_events(
         &mut self,
@@ -1943,12 +1977,12 @@ impl App {
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
                             let initial_context = self.terminal_input_context();
-                            let (target, handled_omp_reply_navigation) = if matches!(
+                            let (target, handled_omp_reply_navigation, consumed_repeat_policy) = if matches!(
                                 initial_context,
                                 Some(TerminalInputContext::Findr(_))
                             ) {
                                 self.handle_findr_key(key.clone());
-                                (None, false)
+                                (None, false, input::ConsumedRepeatPolicy::StableContext)
                             } else if initial_context.is_some() {
                                 self.handle_terminal_key_headless_with_repeat_outcome(
                                     source_id,
@@ -1960,7 +1994,7 @@ impl App {
                                     key.clone(),
                                     view_id,
                                 );
-                                (None, false)
+                                (None, false, input::ConsumedRepeatPolicy::StableContext)
                             };
                             event_forwarded = target.is_some();
                             let resulting_context = self.terminal_input_context();
@@ -1969,6 +2003,7 @@ impl App {
                                 &key,
                                 initial_context.as_ref(),
                                 resulting_context.as_ref(),
+                                consumed_repeat_policy,
                                 target,
                                 handled_omp_reply_navigation,
                             );

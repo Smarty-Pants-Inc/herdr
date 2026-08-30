@@ -166,7 +166,7 @@ impl App {
                     ) {
                         break;
                     }
-                    let (target, handled_omp_reply_navigation) =
+                    let (target, handled_omp_reply_navigation, _) =
                         self.handle_key_with_repeat_outcome(key.clone()).await;
                     if handled_omp_reply_navigation {
                         break;
@@ -187,6 +187,24 @@ impl App {
                 }
                 true
             }
+            super::input::RepeatPlan::OmpReplyNavigation(context) => {
+                let current_context = self.terminal_input_context();
+                if !self.input_leases.reprocess_allowed(
+                    lease_key,
+                    &context,
+                    current_context.as_ref(),
+                    true,
+                ) {
+                    return false;
+                }
+                let super::TerminalInputContext::Pane(terminal_id) = context else {
+                    return false;
+                };
+                self.try_navigate_omp_reply_for_target(
+                    &super::TerminalInputTarget { terminal_id },
+                    &key,
+                )
+            }
             super::input::RepeatPlan::Ignore => false,
         }
     }
@@ -203,12 +221,16 @@ impl App {
                 match key.kind {
                     crossterm::event::KeyEventKind::Press => {
                         let initial_context = self.terminal_input_context();
-                        let (target, handled_omp_reply_navigation) = if matches!(
+                        let (target, handled_omp_reply_navigation, consumed_repeat_policy) = if matches!(
                             initial_context,
                             Some(super::TerminalInputContext::Findr(_))
                         ) {
                             self.handle_findr_key(key.clone());
-                            (None, false)
+                            (
+                                None,
+                                false,
+                                super::input::ConsumedRepeatPolicy::StableContext,
+                            )
                         } else {
                             self.handle_key_with_repeat_outcome(key.clone()).await
                         };
@@ -218,6 +240,7 @@ impl App {
                             &key,
                             initial_context.as_ref(),
                             resulting_context.as_ref(),
+                            consumed_repeat_policy,
                             target,
                             handled_omp_reply_navigation,
                         );

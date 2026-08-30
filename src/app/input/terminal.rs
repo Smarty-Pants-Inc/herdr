@@ -16,6 +16,7 @@ struct PreparedPaneInput {
 pub(super) struct TerminalKeyHandling {
     pub(super) target: Option<TerminalInputTarget>,
     pub(super) handled_omp_reply_navigation: bool,
+    pub(super) consumed_repeat_policy: super::ConsumedRepeatPolicy,
 }
 
 enum PreparedPopupInput {
@@ -83,15 +84,18 @@ impl App {
         }
 
         let mut handled_omp_reply_navigation = false;
+        let mut consumed_repeat_policy = super::ConsumedRepeatPolicy::default();
         let Some(input) = self.prepare_terminal_key_forward(
             source_id,
             view_id,
             key,
             &mut handled_omp_reply_navigation,
+            &mut consumed_repeat_policy,
         ) else {
             return TerminalKeyHandling {
                 target: None,
                 handled_omp_reply_navigation,
+                consumed_repeat_policy,
             };
         };
         let sent = self
@@ -100,6 +104,7 @@ impl App {
         TerminalKeyHandling {
             target: sent.then_some(input.target),
             handled_omp_reply_navigation,
+            consumed_repeat_policy,
         }
     }
 
@@ -109,6 +114,7 @@ impl App {
         view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
         handled_omp_reply_navigation: &mut bool,
+        consumed_repeat_policy: &mut super::ConsumedRepeatPolicy,
     ) -> Option<PreparedPaneInput> {
         let key_event = key.as_key_event();
         if self.try_copy_retained_selection(source_id, key.clone()) {
@@ -180,6 +186,7 @@ impl App {
             if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
                 let workspace_id = workspace_id.to_string();
                 self.state.unfocus_workspace_plugin_pane(&workspace_id);
+                *consumed_repeat_policy = super::ConsumedRepeatPolicy::ResultingContext;
                 self.state.mode = Mode::Terminal;
                 return None;
             }
@@ -218,14 +225,7 @@ impl App {
         let target = TerminalInputTarget { terminal_id };
         let rt = self.terminal_input_runtime(&target)?;
         if let Some(pane_id) = pane_id {
-            let recognized_omp =
-                self.state
-                    .terminals
-                    .get(&target.terminal_id)
-                    .is_some_and(|terminal| {
-                        terminal.effective_known_agent() == Some(crate::detect::Agent::Omp)
-                    });
-            if rt.try_navigate_omp_reply_repeated(recognized_omp, &key) {
+            if self.try_navigate_omp_reply_for_target(&target, &key) {
                 *handled_omp_reply_navigation = true;
                 debug!(
                     code = ?key_event.code,
@@ -326,6 +326,22 @@ impl App {
             target,
             bytes: Bytes::from(bytes),
         })
+    }
+
+    pub(crate) fn try_navigate_omp_reply_for_target(
+        &self,
+        target: &TerminalInputTarget,
+        key: &TerminalKey,
+    ) -> bool {
+        let recognized_omp =
+            self.state
+                .terminals
+                .get(&target.terminal_id)
+                .is_some_and(|terminal| {
+                    terminal.effective_known_agent() == Some(crate::detect::Agent::Omp)
+                });
+        self.terminal_input_runtime(target)
+            .is_some_and(|runtime| runtime.try_navigate_omp_reply_repeated(recognized_omp, key))
     }
 
     fn prepare_popup_key_forward(&mut self, key: TerminalKey) -> PreparedPopupInput {
@@ -494,15 +510,18 @@ impl App {
         }
 
         let mut handled_omp_reply_navigation = false;
+        let mut consumed_repeat_policy = super::ConsumedRepeatPolicy::default();
         let Some(input) = self.prepare_terminal_key_forward(
             crate::app::LOCAL_INPUT_SOURCE,
             None,
             key,
             &mut handled_omp_reply_navigation,
+            &mut consumed_repeat_policy,
         ) else {
             return TerminalKeyHandling {
                 target: None,
                 handled_omp_reply_navigation,
+                consumed_repeat_policy,
             };
         };
         let sent = if let Some(runtime) = self.terminal_input_runtime(&input.target) {
@@ -513,6 +532,7 @@ impl App {
         TerminalKeyHandling {
             target: sent.then_some(input.target),
             handled_omp_reply_navigation,
+            consumed_repeat_policy,
         }
     }
 }
@@ -2621,7 +2641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumed_repeat_that_becomes_forwarded_acquires_pane_ownership() {
+    async fn consumed_repeat_does_not_cross_to_a_different_terminal() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let first_pane = ws.tabs[0].root_pane;
@@ -2680,11 +2700,6 @@ mod tests {
             false,
         );
 
-        let first_repeat = second_rx.try_recv().expect("first forwarded repeat");
-        let second_repeat = second_rx.try_recv().expect("owned repeat");
-        let release = second_rx.try_recv().expect("owned release");
-        assert_eq!(first_repeat, second_repeat);
-        assert_ne!(second_repeat, release);
         assert!(second_rx.try_recv().is_err());
         assert!(app.input_leases.is_empty());
     }
@@ -3216,6 +3231,56 @@ tail a\r\ntail b\r\ntail c\r\ntail d\r\ntail e\r\n";
         }
 
         assert_eq!(visible_top_line(&app, pane_id), "reply one");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumed_windows_option_up_repeat_stays_consumed_in_headless_route() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let press = physical_option_up(1);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(press.clone())],
+            false,
+        );
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"\x1b[?1049h\x1b[>3u");
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(press.with_kind(KeyEventKind::Repeat)),
+                crate::raw_input::RawInputEvent::Key(physical_bare_up_release()),
+            ],
+            false,
+        );
+
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consumed_windows_option_up_repeat_stays_consumed_in_runtime_route() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let press = physical_option_up(1);
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(press.clone()))
+            .await;
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"\x1b[?1049h\x1b[>3u");
+        for key in [
+            press.with_kind(KeyEventKind::Repeat),
+            physical_bare_up_release(),
+        ] {
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+                .await;
+        }
+
         assert!(input_rx.try_recv().is_err());
         assert!(app.input_leases.is_empty());
     }

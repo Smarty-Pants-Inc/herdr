@@ -15,13 +15,14 @@ use crate::protocol::{
     RenderEncoding, MAX_LINK_URL_LENGTH,
 };
 use crate::render_signal::RenderSignal;
-use crate::terminal::TerminalRuntime;
+use crate::terminal::{OmpReplyNavigationPresses, OmpReplyNavigationRoute, TerminalRuntime};
 
 pub(super) const OMP_RENDERER_LAUNCH_ID_ENV: &str = "HERDR_OMP_RENDERER_LAUNCH_ID";
 
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_DAMAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_QUEUED_LINK_INPUTS: usize = 256;
+const MAX_TRACKED_SERVER_PRESSES: usize = 256;
 pub(super) fn capabilities(
     encoding: RenderEncoding,
     app_surface: bool,
@@ -169,6 +170,7 @@ impl LocalTarget {
             render_notify,
             render_dirty.clone(),
         )?;
+        runtime.set_preserve_primary_scrollback(true);
         runtime.resize(rows.max(1), cols.max(1), cell_width_px, cell_height_px);
         Ok(Self {
             launch_id,
@@ -284,7 +286,9 @@ pub(super) struct ClientOmpRenderer {
     handoff_frame: Option<FrameData>,
     local_selected: bool,
     server_owned_input: bool,
-    omp_reply_navigation_presses: Vec<crate::input::KeyIdentity>,
+    omp_reply_navigation_presses: OmpReplyNavigationPresses,
+    server_forwarded_presses: Vec<crate::input::KeyIdentity>,
+    server_forwarded_overflow: bool,
     next_link_request_id: u64,
     pending_link_click: bool,
     pending_link_request_id: Option<u64>,
@@ -320,7 +324,9 @@ impl ClientOmpRenderer {
             handoff_frame: None,
             local_selected: false,
             server_owned_input: false,
-            omp_reply_navigation_presses: Vec::new(),
+            omp_reply_navigation_presses: OmpReplyNavigationPresses::default(),
+            server_forwarded_presses: Vec::new(),
+            server_forwarded_overflow: false,
             next_link_request_id: 1,
             pending_link_click: false,
             pending_link_request_id: None,
@@ -399,12 +405,20 @@ impl ClientOmpRenderer {
             self.cached_server_frame = None;
             self.release_deferred_messages(current_input_generation);
         }
+        let loses_binding = self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.bound && !bound);
         if self.local_selected
-            && self.target.as_ref().is_some_and(|target| {
-                (target.surface_active && !surface_active) || (target.bound && !bound)
-            })
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|target| (target.surface_active && !surface_active) || loses_binding)
         {
             self.prepare_surface_handoff();
+        }
+        if loses_binding {
+            self.clear_omp_reply_navigation_presses();
         }
         let mut confirm_promotion = None;
         let Some(target) = self
@@ -440,7 +454,8 @@ impl ClientOmpRenderer {
                     && target.first_damage
                     && target.runtime.is_some()
                     && !target.failed
-                    && !self.server_owned_input,
+                    && !self.server_owned_input
+                    && !self.server_forwarded_overflow,
             );
         }
         target.resize(size);
@@ -499,15 +514,87 @@ impl ClientOmpRenderer {
         self.needs_render = true;
     }
 
-    pub(super) fn owns_input(&self) -> bool {
+    pub(super) fn observe_server_input(&mut self, events: &[crate::raw_input::RawInputEvent]) {
+        for event in events {
+            if matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost) {
+                self.server_forwarded_presses.clear();
+                self.server_forwarded_overflow = false;
+                continue;
+            }
+            let crate::raw_input::RawInputEvent::Key(key) = event else {
+                continue;
+            };
+            if !key.has_physical_identity() {
+                continue;
+            }
+            let identity = key.identity();
+            match key.kind {
+                KeyEventKind::Press => {
+                    if self.server_forwarded_presses.contains(&identity) {
+                        continue;
+                    }
+                    if self.server_forwarded_presses.len() < MAX_TRACKED_SERVER_PRESSES {
+                        self.server_forwarded_presses.push(identity);
+                    } else {
+                        // A malicious physical-key stream cannot grow state without bound.
+                        // Keep all input server-routed until focus loss safely resets it.
+                        self.server_forwarded_overflow = true;
+                    }
+                }
+                KeyEventKind::Release => {
+                    self.server_forwarded_presses
+                        .retain(|pressed| *pressed != identity);
+                }
+                KeyEventKind::Repeat => {}
+            }
+        }
+    }
+
+    fn route_existing_server_input(&mut self, key: &crate::input::TerminalKey) -> bool {
+        if !key.has_physical_identity() || key.kind == KeyEventKind::Press {
+            return false;
+        }
+        if self.server_forwarded_overflow {
+            return true;
+        }
+        let identity = key.identity();
+        let Some(index) = self
+            .server_forwarded_presses
+            .iter()
+            .position(|pressed| *pressed == identity)
+        else {
+            return false;
+        };
+        if key.kind == KeyEventKind::Release {
+            self.server_forwarded_presses.swap_remove(index);
+        }
+        true
+    }
+
+    fn queue_server_message(&mut self, message: ClientMessage) {
+        if let ClientMessage::InputEvents { events } = &message {
+            let events = events
+                .iter()
+                .map(ClientInputEvent::to_raw_input_event)
+                .collect::<Vec<_>>();
+            self.observe_server_input(&events);
+        }
+        self.outbound_messages.push(message);
+    }
+
+    pub(super) fn owns_surface_input(&self) -> bool {
         self.local_selected
             || self.server_owned_input
+            || self.server_forwarded_overflow
             || self.awaiting_fallback
             || self.awaiting_promotion
     }
 
+    pub(super) fn owns_input(&self) -> bool {
+        self.owns_surface_input() || !self.omp_reply_navigation_presses.is_empty()
+    }
+
     fn prepare_surface_handoff(&mut self) {
-        self.clear_omp_reply_navigation_presses();
         if !self.local_selected {
             return;
         }
@@ -537,7 +624,7 @@ impl ClientOmpRenderer {
         column: u16,
         row: u16,
     ) -> Option<crate::app::actions::ResolvedTerminalLink> {
-        if !self.local_selected || self.server_owned_input {
+        if !self.local_selected || self.server_owned_input || self.server_forwarded_overflow {
             return None;
         }
         let target = self.target.as_ref()?;
@@ -587,7 +674,7 @@ impl ClientOmpRenderer {
         if self.suppress_link_affordance {
             return Some(false);
         }
-        if !self.local_selected || self.server_owned_input {
+        if !self.local_selected || self.server_owned_input || self.server_forwarded_overflow {
             return None;
         }
         Some(
@@ -690,10 +777,15 @@ impl ClientOmpRenderer {
         let mut server_batch = Vec::new();
         let mut deferred_events = Vec::new();
         for event in events {
-            if matches!(&event, crate::raw_input::RawInputEvent::OuterFocusLost) {
-                self.clear_omp_reply_navigation_presses();
-            }
             let protocol_event = client_event_from_raw(&event);
+            if matches!(&event, crate::raw_input::RawInputEvent::Key(key)
+                if self.route_existing_server_input(key))
+            {
+                if let Some(event) = protocol_event {
+                    server_batch.push(event);
+                }
+                continue;
+            }
             if observe_pointer {
                 match &event {
                     crate::raw_input::RawInputEvent::Mouse(mouse) => {
@@ -741,7 +833,34 @@ impl ClientOmpRenderer {
                 }
                 continue;
             }
-            if self.local_selected && !self.server_owned_input {
+            if matches!(&event, crate::raw_input::RawInputEvent::OuterFocusLost) {
+                let forward_server_focus_loss = !self.server_forwarded_presses.is_empty()
+                    || self.server_forwarded_overflow
+                    || self.server_owned_input
+                    || !self.local_selected;
+                let forward_local_focus_loss = (self.local_selected && !self.server_owned_input)
+                    || self.omp_reply_navigation_presses.has_forwarded();
+                self.clear_omp_reply_navigation_presses();
+                self.server_forwarded_presses.clear();
+                self.server_forwarded_overflow = false;
+                self.observe_pointer_cell(None);
+                if forward_local_focus_loss {
+                    let _ = self
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.runtime.as_ref())
+                        .is_some_and(|runtime| {
+                            forward_local_focus_event(runtime, crate::ghostty::FocusEvent::Lost)
+                        });
+                }
+                if forward_server_focus_loss {
+                    if let Some(event) = protocol_event {
+                        server_batch.push(event);
+                    }
+                }
+                continue;
+            }
+            if self.local_selected && !self.server_owned_input && !self.server_forwarded_overflow {
                 if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
                     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                         let request_id = self.allocate_link_request_id();
@@ -773,6 +892,7 @@ impl ClientOmpRenderer {
                         crate::config::terminal_key_matches_combo(key, target.prefix.key_combo())
                     }));
             if prefix {
+                self.observe_server_input(std::slice::from_ref(&event));
                 if !server_batch.is_empty() {
                     messages.push(ClientMessage::InputEvents {
                         events: std::mem::take(&mut server_batch),
@@ -791,7 +911,28 @@ impl ClientOmpRenderer {
                 self.force_repaint = true;
                 continue;
             }
-            if self.server_owned_input || !self.local_selected {
+            if self.server_owned_input || self.server_forwarded_overflow || !self.local_selected {
+                let owned_route = match &event {
+                    crate::raw_input::RawInputEvent::Key(key) => {
+                        self.omp_reply_navigation_presses.route_existing(key)
+                    }
+                    _ => None,
+                };
+                if let Some(outcome) = owned_route {
+                    if outcome == OmpReplyNavigationRoute::Forwarded {
+                        let _ = self
+                            .target
+                            .as_ref()
+                            .and_then(|target| target.runtime.as_ref())
+                            .is_some_and(|runtime| {
+                                forward_local_event(runtime, event, self.mouse_scroll_lines)
+                            });
+                    }
+                    continue;
+                }
+            }
+            if self.server_owned_input || self.server_forwarded_overflow || !self.local_selected {
+                self.observe_server_input(std::slice::from_ref(&event));
                 if let Some(event) = protocol_event {
                     server_batch.push(event);
                 }
@@ -831,21 +972,16 @@ impl ClientOmpRenderer {
             _ => None,
         };
         if let Some(key) = key {
-            if self.consume_omp_reply_navigation_release(key) {
-                return (false, true);
+            let target = &self.target;
+            let outcome = self.omp_reply_navigation_presses.route(key, || {
+                target
+                    .as_ref()
+                    .and_then(|target| target.runtime.as_ref())
+                    .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event))
+            });
+            if let OmpReplyNavigationRoute::Consumed { navigated } = outcome {
+                return (navigated, true);
             }
-        }
-
-        let navigated = self
-            .target
-            .as_ref()
-            .and_then(|target| target.runtime.as_ref())
-            .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event));
-        if navigated {
-            if let Some(key) = key {
-                self.remember_omp_reply_navigation_press(key);
-            }
-            return (true, true);
         }
 
         let wheel = matches!(
@@ -855,15 +991,20 @@ impl ClientOmpRenderer {
                 ..
             })
         );
-        if let Some(key) = key {
-            self.clear_omp_reply_navigation_forwarded_key(key);
-        }
+        let resets_viewport = match &event {
+            crate::raw_input::RawInputEvent::Key(key) => {
+                key.kind != crossterm::event::KeyEventKind::Release
+            }
+            crate::raw_input::RawInputEvent::Text(_)
+            | crate::raw_input::RawInputEvent::Paste(_) => true,
+            _ => false,
+        };
         let sent = self
             .target
             .as_ref()
             .and_then(|target| target.runtime.as_ref())
             .is_some_and(|runtime| forward_local_event(runtime, event, self.mouse_scroll_lines));
-        (wheel && sent, sent)
+        ((wheel || resets_viewport) && sent, sent)
     }
 
     pub(super) fn route_pixel_input(
@@ -928,7 +1069,7 @@ impl ClientOmpRenderer {
             });
             return None;
         }
-        if self.server_owned_input || !self.local_selected {
+        if self.server_owned_input || self.server_forwarded_overflow || !self.local_selected {
             return Some(pixel_input_message(data, geometry));
         }
         if let Some(local_mouse) = self
@@ -1010,6 +1151,13 @@ impl ClientOmpRenderer {
                 self.cached_server_frame = None;
             }
         }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| target.failed || !target.bound || target.runtime.is_none())
+        {
+            self.clear_omp_reply_navigation_presses();
+        }
         let should_select = self.target.as_ref().is_some_and(|target| {
             !target.failed
                 && target.runtime.is_some()
@@ -1017,6 +1165,7 @@ impl ClientOmpRenderer {
                 && target.surface_active
                 && target.first_damage
                 && !self.server_owned_input
+                && !self.server_forwarded_overflow
         });
         let selection_changed = should_select != self.local_selected;
         if selection_changed {
@@ -1112,7 +1261,8 @@ impl ClientOmpRenderer {
             return;
         }
 
-        let replay_locally = self.local_selected && !self.server_owned_input;
+        let replay_locally =
+            self.local_selected && !self.server_owned_input && !self.server_forwarded_overflow;
         let runtime_missing = self
             .target
             .as_ref()
@@ -1123,8 +1273,7 @@ impl ClientOmpRenderer {
                 events,
                 generation: _,
             } if !replay_locally => {
-                self.outbound_messages
-                    .push(ClientMessage::InputEvents { events });
+                self.queue_server_message(ClientMessage::InputEvents { events });
             }
             LinkInput::Events { events, generation } => {
                 let mut needs_render = false;
@@ -1320,6 +1469,7 @@ impl ClientOmpRenderer {
 
     fn begin_local_forward_fallback(&mut self) {
         self.prepare_surface_handoff();
+        self.clear_omp_reply_navigation_presses();
         if let Some(target) = self.target.as_mut() {
             target.fail();
         }
@@ -1348,11 +1498,13 @@ impl ClientOmpRenderer {
         self.awaiting_promotion = false;
         if !local_active {
             let deferred = std::mem::take(&mut self.deferred_messages);
-            self.outbound_messages.extend(
-                deferred
-                    .into_iter()
-                    .filter_map(|message| message.into_client_message(current_input_generation)),
-            );
+            let messages = deferred
+                .into_iter()
+                .filter_map(|message| message.into_client_message(current_input_generation))
+                .collect::<Vec<_>>();
+            for message in messages {
+                self.queue_server_message(message);
+            }
             return;
         }
         let deferred = std::mem::take(&mut self.deferred_messages);
@@ -1381,11 +1533,13 @@ impl ClientOmpRenderer {
             self.awaiting_fallback = false;
             self.awaiting_promotion = false;
             let deferred = std::mem::take(&mut self.deferred_messages);
-            self.outbound_messages.extend(
-                deferred
-                    .into_iter()
-                    .filter_map(|message| message.into_client_message(current_input_generation)),
-            );
+            let messages = deferred
+                .into_iter()
+                .filter_map(|message| message.into_client_message(current_input_generation))
+                .collect::<Vec<_>>();
+            for message in messages {
+                self.queue_server_message(message);
+            }
         }
     }
 
@@ -1398,47 +1552,6 @@ impl ClientOmpRenderer {
         self.effects.clear();
     }
 
-    fn remember_omp_reply_navigation_press(&mut self, key: &crate::input::TerminalKey) {
-        if key.kind != KeyEventKind::Press {
-            return;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return;
-        };
-        if !self.omp_reply_navigation_presses.contains(&identity) {
-            self.omp_reply_navigation_presses.push(identity);
-        }
-    }
-
-    fn consume_omp_reply_navigation_release(&mut self, key: &crate::input::TerminalKey) -> bool {
-        if key.kind != KeyEventKind::Release {
-            return false;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return false;
-        };
-        let Some(index) = self
-            .omp_reply_navigation_presses
-            .iter()
-            .position(|tracked| *tracked == identity)
-        else {
-            return false;
-        };
-        self.omp_reply_navigation_presses.swap_remove(index);
-        true
-    }
-
-    fn clear_omp_reply_navigation_forwarded_key(&mut self, key: &crate::input::TerminalKey) {
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return;
-        }
-        let Some(identity) = TerminalRuntime::omp_reply_navigation_key_identity(key) else {
-            return;
-        };
-        self.omp_reply_navigation_presses
-            .retain(|tracked| *tracked != identity);
-    }
-
     fn clear_omp_reply_navigation_presses(&mut self) {
         self.omp_reply_navigation_presses.clear();
     }
@@ -1447,7 +1560,7 @@ impl ClientOmpRenderer {
         if let Some(mut target) = self.target.take() {
             target.stop();
         }
-        if self.local_selected || self.server_owned_input {
+        if self.local_selected || self.server_owned_input || self.server_forwarded_overflow {
             self.force_repaint = true;
         }
         self.local_selected = false;
@@ -1478,6 +1591,19 @@ impl Drop for ClientOmpRenderer {
     }
 }
 
+fn client_key_source(key: &crate::input::TerminalKey) -> ClientKeySource {
+    if let Some(bytes) = key.vt_bytes() {
+        return ClientKeySource::Vt {
+            bytes: bytes.to_vec(),
+        };
+    }
+    #[cfg(any(windows, test))]
+    if let Some(record) = key.windows_record() {
+        return ClientKeySource::WindowsConsole { record };
+    }
+    ClientKeySource::Synthesized
+}
+
 fn client_event_from_raw(event: &crate::raw_input::RawInputEvent) -> Option<ClientInputEvent> {
     match event {
         crate::raw_input::RawInputEvent::Key(key) => Some(ClientInputEvent::Key {
@@ -1486,11 +1612,7 @@ fn client_event_from_raw(event: &crate::raw_input::RawInputEvent) -> Option<Clie
             kind: ClientKeyKind::from_crossterm(key.kind),
             repeat_count: key.repeat_count,
             generated_text: key.generated_text.clone(),
-            source: key
-                .vt_bytes()
-                .map_or(ClientKeySource::Synthesized, |bytes| ClientKeySource::Vt {
-                    bytes: bytes.to_vec(),
-                }),
+            source: client_key_source(key),
         }),
         crate::raw_input::RawInputEvent::Text(text) => {
             Some(ClientInputEvent::TextCommit(text.as_str().to_owned()))
@@ -1741,6 +1863,7 @@ fn forward_local_event(
             mouse.kind,
             crate::input::mouse::Position::Cell {
                 column: mouse.column,
+
                 row: mouse.row,
             },
             mouse.modifiers,
@@ -1764,6 +1887,19 @@ mod tests {
             code: ClientKeyCode::Char('b'),
             modifiers: KeyModifiers::CONTROL.bits(),
         }
+    }
+
+    fn physical_j(kind: KeyEventKind, key_down: bool) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
+            .with_kind(kind)
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down,
+                repeat_count: 1,
+                virtual_key_code: 0x4a,
+                virtual_scan_code: 0x24,
+                unicode: if key_down { u16::from(b'j') } else { 0 },
+                control_key_state: 0,
+            })
     }
 
     const OMP_REPLY_SCROLLBACK: &[u8] = b"\x1b]133;A;aid=omp-response-client-run:reply-1\x07reply one\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
@@ -1865,6 +2001,27 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             fallback_confirmed: false,
         });
         (renderer, events_tx, pane_id)
+    }
+
+    fn deactivate_renderer_surface(renderer: &mut ClientOmpRenderer) {
+        let target = renderer.target.as_ref().expect("local target");
+        let target_app_client_id = target.target_app_client_id;
+        let route = target.route.clone();
+        let prefix = target.prefix.clone();
+        let size = target.size;
+        renderer.apply_target(
+            1,
+            target_app_client_id,
+            Some(route),
+            true,
+            false,
+            prefix,
+            size,
+            0,
+        );
+        let _ = renderer.next_frame(Instant::now(), (size.0, size.1));
+        assert!(!renderer.local_selected);
+        assert!(renderer.owns_input());
     }
 
     #[test]
@@ -2003,7 +2160,9 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             &[],
             8,
         );
+        runtime.set_preserve_primary_scrollback(true);
         runtime.test_process_pty_bytes(&long_omp_reply_scrollback());
+        runtime.test_process_pty_bytes(b"\x1b[3J\x1b[2J");
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
         assert_eq!(
             renderer.scrollback_limit_bytes,
@@ -2059,13 +2218,30 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn local_omp_xterm_option_up_moves_viewport_and_requests_frame() {
+    async fn local_omp_xterm_presses_recompute_navigation_and_forwarding() {
         let (runtime, mut input) =
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
         runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
         let now = Instant::now();
 
+        assert!(renderer
+            .route_input(crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[A"))
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("plain Up forwards"),
+            Bytes::from_static(b"\x1b[A")
+        );
+        assert!(renderer
+            .route_input(crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[1;3A"))
+            .is_empty());
+        assert!(renderer
+            .route_input(crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[1;4A"))
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("Shift-Option-Up forwards"),
+            Bytes::from_static(b"\x1b[1;4A")
+        );
         assert!(renderer
             .route_input(crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[1;3A"))
             .is_empty());
@@ -2172,7 +2348,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn local_omp_forwarded_repeat_clears_consumed_reply_navigation_ownership() {
+    async fn local_omp_consumed_repeat_stays_consumed_when_navigation_becomes_unavailable() {
         let (runtime, mut input) =
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
         runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
@@ -2191,13 +2367,299 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             .and_then(|target| target.runtime.as_ref())
             .expect("local runtime")
             .test_process_pty_bytes(b"\x1b[?1049h\x1b[>3u");
+        deactivate_renderer_surface(&mut renderer);
 
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
                 option_up.clone().with_kind(KeyEventKind::Repeat),
             )])
             .is_empty());
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert!(input.try_recv().is_err());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.with_kind(KeyEventKind::Release),
+            )])
+            .is_empty());
         assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_activation_keeps_existing_server_key_lifecycle_on_server() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let option_up = physical_option_up();
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(option_up.clone())]);
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(option_up.clone().with_kind(KeyEventKind::Repeat)),
+            crate::raw_input::RawInputEvent::Key(physical_bare_up_release()),
+        ]);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
+                    ]
+                )
+        ));
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_inactive_forwarded_press_stays_server_owned_after_reactivation() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up(),
+            )])
+            .is_empty());
+        deactivate_renderer_surface(&mut renderer);
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            physical_j(KeyEventKind::Press, true),
+        )]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    ..
+                }])
+        ));
+        assert_eq!(renderer.server_forwarded_presses.len(), 1);
+
+        renderer.local_selected = true;
+        renderer
+            .target
+            .as_mut()
+            .expect("local target")
+            .surface_active = true;
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true)),
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
+                    ]
+                )
+        ));
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_focus_loss_reaches_local_surface_and_server_key_owner() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(physical_j(
+            KeyEventKind::Press,
+            true,
+        ))]);
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert_eq!(
+            input.try_recv().expect("local focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
+        assert!(renderer.server_forwarded_presses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_omp_defers_focus_loss_behind_older_promotion_input() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(40, 4);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.local_selected = false;
+        renderer.awaiting_promotion = true;
+
+        assert!(renderer
+            .route_input(vec![
+                crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Press, true)),
+                crate::raw_input::RawInputEvent::OuterFocusLost,
+            ])
+            .is_empty());
+        assert!(renderer.server_forwarded_presses.is_empty());
+
+        renderer.resolve_promotion(false, 0);
+        let messages = renderer.take_outbound_messages();
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ClientInputEvent::Key {
+                            kind: crate::protocol::ClientKeyKind::Press,
+                            ..
+                        },
+                        ClientInputEvent::FocusLost,
+                    ]
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_omp_inactive_forwarded_press_gets_focus_loss_teardown() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up(),
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("forwarded Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        deactivate_renderer_surface(&mut renderer);
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert_eq!(
+            input.try_recv().expect("local owner focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
+        assert!(renderer.omp_reply_navigation_presses.is_empty());
+    }
+
+    #[test]
+    fn server_forwarded_physical_key_state_is_bounded() {
+        let mut renderer = ClientOmpRenderer::new(
+            Some(test_omp_executable()),
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+            LOCAL_OMP_MOUSE_SCROLL_LINES,
+        );
+        let events = (1..=MAX_TRACKED_SERVER_PRESSES + 1)
+            .map(|index| {
+                crate::raw_input::RawInputEvent::Key(
+                    crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
+                        .with_windows_record(crate::input::WindowsKeyRecord {
+                            key_down: true,
+                            repeat_count: 1,
+                            virtual_key_code: index as u16,
+                            virtual_scan_code: index as u16,
+                            unicode: u16::from(b'j'),
+                            control_key_state: 0,
+                        }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        renderer.observe_server_input(&events);
+
+        assert_eq!(
+            renderer.server_forwarded_presses.len(),
+            MAX_TRACKED_SERVER_PRESSES
+        );
+        assert!(renderer.server_forwarded_overflow);
+        assert!(!renderer.server_owned_input);
+        assert!(renderer.owns_surface_input());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(!renderer.server_forwarded_overflow);
+        assert!(!renderer.owns_surface_input());
+    }
+
+    #[tokio::test]
+    async fn local_omp_inactive_surface_clears_owned_keys_on_binding_loss() {
+        let (runtime, _input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up(),
+            )])
+            .is_empty());
+        deactivate_renderer_surface(&mut renderer);
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+
+        let target = renderer.target.as_ref().expect("local target");
+        let target_app_client_id = target.target_app_client_id;
+        let route = target.route.clone();
+        let prefix = target.prefix.clone();
+        let size = target.size;
+        renderer.apply_target(
+            1,
+            target_app_client_id,
+            Some(route),
+            false,
+            false,
+            prefix,
+            size,
+            0,
+        );
+
+        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.owns_input());
+    }
+
+    #[tokio::test]
+    async fn local_omp_forwarded_repeat_stays_forwarded_when_navigation_becomes_available() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let option_up = physical_option_up();
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.clone(),
+            )])
+            .is_empty());
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(
+            input.try_recv().expect("fallthrough Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        deactivate_renderer_surface(&mut renderer);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.clone().with_kind(KeyEventKind::Repeat),
+            )])
+            .is_empty());
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
         assert_eq!(
             input.try_recv().expect("fallthrough Option-Up repeat"),
             Bytes::from_static(b"\x1b[1;3:2A")
@@ -2207,6 +2669,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.with_kind(KeyEventKind::Release),
             )])
             .is_empty());
+        assert!(renderer.omp_reply_navigation_presses.is_empty());
         assert_eq!(
             input.try_recv().expect("fallthrough Option-Up release"),
             Bytes::from_static(b"\x1b[1;3:3A")
@@ -2214,7 +2677,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn local_omp_prefix_handoff_clears_consumed_reply_navigation_ownership() {
+    async fn local_omp_prefix_handoff_retains_consumed_reply_navigation_ownership() {
         let (runtime, _input) =
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
         runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
@@ -2234,6 +2697,48 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             messages.as_slice(),
             [ClientMessage::InputEvents { .. }]
         ));
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_bare_up_release(),
+            )])
+            .is_empty());
+        assert!(renderer.omp_reply_navigation_presses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_omp_prefix_handoff_returns_forwarded_release_to_local_pty() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up(),
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("forwarded Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        )]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { .. }]
+        ));
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                physical_bare_up_release(),
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("forwarded Option-Up release"),
+            Bytes::from_static(b"\x1b[1;1:3A")
+        );
         assert!(renderer.omp_reply_navigation_presses.is_empty());
     }
 
@@ -2283,6 +2788,8 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
             )])
             .is_empty());
+        assert!(renderer.needs_render);
+        assert!(renderer.next_frame(Instant::now(), (40, 4)).is_some());
         let local_runtime = renderer
             .target
             .as_ref()
@@ -2340,6 +2847,8 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 crate::input::TextCommit::new("入力"),
             )])
             .is_empty());
+        assert!(renderer.needs_render);
+        assert!(renderer.next_frame(Instant::now(), (40, 4)).is_some());
         assert_eq!(
             renderer
                 .target
@@ -2376,6 +2885,8 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 "pasted".into()
             )])
             .is_empty());
+        assert!(renderer.needs_render);
+        assert!(renderer.next_frame(Instant::now(), (40, 4)).is_some());
         assert_eq!(
             renderer
                 .target
@@ -3401,9 +3912,10 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         let prefix = test_prefix();
         let (mut renderer, _events, _) = active_renderer(runtime, prefix.clone());
         assert!(renderer
-            .route_input(vec![crate::raw_input::RawInputEvent::Key(
-                crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
-            )])
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
             .is_empty());
         assert!(renderer.awaiting_fallback);
         assert!(renderer.take_outbound_messages().is_empty());
@@ -3411,8 +3923,36 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         assert!(!renderer.awaiting_fallback);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputEvents { events }] if events.len() == 1
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    ..
+                }])
         ));
+        assert_eq!(renderer.server_forwarded_presses.len(), 1);
+        assert!(matches!(
+            renderer
+                .route_input(vec![
+                    crate::raw_input::RawInputEvent::Key(physical_j(
+                        KeyEventKind::Repeat,
+                        true,
+                    )),
+                    crate::raw_input::RawInputEvent::Key(physical_j(
+                        KeyEventKind::Release,
+                        false,
+                    )),
+                ])
+                .as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(
+                    events.as_slice(),
+                    [
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
+                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
+                    ]
+                )
+        ));
+        assert!(renderer.server_forwarded_presses.is_empty());
     }
 
     #[tokio::test]

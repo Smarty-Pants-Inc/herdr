@@ -40,7 +40,10 @@ mod sidebar;
 mod terminal;
 
 pub(crate) use self::{
-    lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
+    lease::{
+        ConsumedInputLease, ConsumedRepeatPolicy, ForwardedInputLease, InputLeaseKey,
+        InputLeaseTable, RepeatPlan,
+    },
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
         insert_keybind_help_query_text, insert_navigator_search_text, insert_rename_input_text,
@@ -77,9 +80,17 @@ impl App {
     pub(super) async fn handle_key_with_repeat_outcome(
         &mut self,
         key: TerminalKey,
-    ) -> (Option<super::TerminalInputTarget>, bool) {
+    ) -> (
+        Option<super::TerminalInputTarget>,
+        bool,
+        ConsumedRepeatPolicy,
+    ) {
         let outcome = self.handle_key_with_terminal_outcome(key).await;
-        (outcome.target, outcome.handled_omp_reply_navigation)
+        (
+            outcome.target,
+            outcome.handled_omp_reply_navigation,
+            outcome.consumed_repeat_policy,
+        )
     }
 
     pub(super) fn handle_terminal_key_headless_with_repeat_outcome(
@@ -87,9 +98,17 @@ impl App {
         source_id: super::InputSourceId,
         view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
-    ) -> (Option<super::TerminalInputTarget>, bool) {
+    ) -> (
+        Option<super::TerminalInputTarget>,
+        bool,
+        ConsumedRepeatPolicy,
+    ) {
         let outcome = self.handle_terminal_key_headless_from_view_outcome(source_id, view_id, key);
-        (outcome.target, outcome.handled_omp_reply_navigation)
+        (
+            outcome.target,
+            outcome.handled_omp_reply_navigation,
+            outcome.consumed_repeat_policy,
+        )
     }
 
     async fn handle_key_with_terminal_outcome(

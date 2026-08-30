@@ -8,6 +8,7 @@ mod title;
 pub(crate) use history_read::{merge_scrolled_up, snapshot_text, ScreenSnapshot, UpwardMerge};
 pub use id::TerminalId;
 pub use runtime::TerminalRuntime;
+pub(crate) use runtime::{OmpReplyNavigationPresses, OmpReplyNavigationRoute};
 pub(crate) use runtime_registry::TerminalRuntimeRegistry;
 pub use state::{
     AgentMetadataReport, EffectivePresentation, EffectiveStateChange, TerminalState,
