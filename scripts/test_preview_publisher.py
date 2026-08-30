@@ -681,6 +681,15 @@ class TrustedWorkflowTests(unittest.TestCase):
         for name in artifact_names:
             self.assertIn("${{ github.run_attempt }}", name, name)
 
+    def test_workflow_finds_and_reuses_draft_release_by_tag(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertIn('release(tagName: $tag) { databaseId }', source)
+        self.assertIn('gh api "repos/$REPOSITORY/releases/$release_id" > release.json', source)
+        self.assertIn('gh release create "$TAG"', source)
+        self.assertIn('--draft --verify-tag', source)
+        self.assertLess(source.index("resolve_release\n          if [ -f release-missing ]"), source.index('gh release create "$TAG"'))
+        self.assertIn('check_tag\n            gh release create "$TAG"', source)
+
     def test_workflow_replaces_only_mismatched_draft_assets(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
         self.assertIn('Path("delete-list").write_text', source)
