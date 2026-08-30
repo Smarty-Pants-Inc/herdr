@@ -29,8 +29,8 @@ plugins portable across Unix sockets and Windows named pipes. Use the
 [socket API](/docs/socket-api/) when you want to send raw JSON requests yourself.
 
 Runtime action registration and native non-terminal plugin UI are not part of
-plugin v1. Actions, event hooks, panes, and link handlers are all declared in
-the manifest.
+plugin v1. Actions, event hooks, panes, link handlers, and execution providers
+are declared in the manifest.
 
 ## Trust and security
 
@@ -75,6 +75,12 @@ platforms = ["linux", "macos"]
 [[startup]]
 command = ["node", "dist/restore.js"]
 
+[[execution_providers]]
+scheme = "runtime"
+protocol = 1
+pty_command = ["target/release/herdr-runtime", "connect"]
+process_command = ["target/release/herdr-runtime", "exec"]
+
 [[actions]]
 id = "apply"
 title = "Apply layout"
@@ -111,10 +117,10 @@ dots. Each id type must be unique inside a plugin. Herdr qualifies action ids
 as `plugin.id.action` when it needs a globally unique name.
 
 Use `platforms = ["linux", "macos", "windows"]` to declare where the plugin
-can run. Build commands, startup hooks, actions, event hooks, panes, and link
-handlers can also declare their own `platforms`; item-level platforms override
-the top-level list. Local plugins without top-level `platforms` link with a
-warning.
+can run. Build commands, startup hooks, actions, event hooks, panes, link
+handlers, and execution providers can also declare their own `platforms`;
+item-level platforms override the top-level list. Local plugins without
+top-level `platforms` link with a warning.
 
 `command` values are argv arrays. Herdr does not run them through a shell, so
 there is no shell expansion unless your command starts a shell itself. Put
@@ -258,10 +264,11 @@ execution target. Per-pane SSH execution targets are Unix-only; whole-server
 `herdr --remote` remains available on Windows clients connecting to supported
 Linux and macOS hosts. For an SSH target, the Herdr server uses its local
 manifest for routing, while the same plugin id and entrypoint must be installed
-or linked on the target host. The remote Herdr resolves the target-local
-executable, platform, plugin root, config directory, and state directory;
-Herdr does not copy plugin packages between hosts. Startup and event hooks
-remain local to the Herdr server.
+or linked on the target host. For a plugin-declared execution provider, Herdr
+resolves the action or pane to its manifest argv first and passes that argv to
+the provider. Provider-backed targets therefore require commands that are
+meaningful on the provider's target; Herdr does not copy plugin packages.
+Startup and event hooks remain local to the Herdr server.
 
 Runtime commands receive `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV=1`,
 `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
@@ -296,6 +303,50 @@ while Windows clients connect to a named pipe. CLI calls through
 `HERDR_BIN_PATH` avoid that transport difference. See the
 [CLI reference](/docs/cli-reference/) for available commands and
 [socket API](/docs/socket-api/) for raw request shapes.
+
+**Execution providers.** A manifest can declare one or more
+`[[execution_providers]]` entries. `scheme` uses the lowercase URL-scheme
+grammar `[a-z][a-z0-9+.-]*`; `local` and `ssh` are reserved. `protocol` must be
+a positive integer; current Herdr supports protocol `1`. Both `pty_command` and
+`process_command` are required argv arrays. Herdr requires exactly one enabled,
+platform-compatible provider for a scheme and reports missing, disabled,
+incompatible, unsupported, or ambiguous providers before spawning the pane or
+action. Protocol 1 execution-provider targets require a Unix Herdr server.
+
+An extension target is written as `SCHEME:TARGET`, for example
+`runtime:dev2`. The socket/API form is
+`{"kind":"extension","scheme":"runtime","target":"dev2"}`. Herdr runs the
+provider command locally from its plugin root with that provider plugin's
+`HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
+`HERDR_PLUGIN_STATE_DIR`, and `HERDR_BIN_PATH` environment. It supplies one JSON
+request of at most 16 KiB in `HERDR_EXECUTION_PROVIDER_REQUEST`:
+
+```json
+{
+  "version": 1,
+  "target": "dev2",
+  "cwd": "/repo",
+  "command": { "kind": "argv", "argv": ["omp"] },
+  "env": [["HERDR_ENV", "1"]],
+  "remove_env": ["BUN_OPTIONS"],
+  "ready_nonce": "0123456789abcdef0123456789abcdef"
+}
+```
+
+`command` is `shell`, `shell_command`, or `argv`. The PTY command must relay
+terminal bytes and resize changes. After the target attaches, it must emit this
+exact OSC frame using either BEL or ST as the terminator:
+
+```text
+ESC]6973;herdr-remote-exec-ready={"nonce":"<ready_nonce>","hostname":"<optional>","cwd":"<optional>"}BEL
+ESC]6973;herdr-remote-exec-ready={"nonce":"<ready_nonce>","hostname":"<optional>","cwd":"<optional>"}ESC\
+```
+
+The JSON payload is limited to 32 KiB. `hostname` and `cwd` are optional; the
+nonce must match the request. The process command is the non-TTY path used for
+actions and must keep stdout and stderr separate and forward the exit status.
+The provider owns target syntax, transport, authentication, and remote process
+lifecycle. Herdr keeps rendering, layout, input, and persistence local.
 
 ## Panes
 

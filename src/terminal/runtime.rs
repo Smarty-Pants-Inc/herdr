@@ -55,6 +55,10 @@ impl TerminalRuntime {
         self.0.set_remote_execution_ready_for_test(ready);
     }
 
+    pub fn input_written(&self) -> bool {
+        self.0.input_written()
+    }
+
     #[cfg(unix)]
     pub fn handoff_runtime_state(
         &self,
@@ -358,6 +362,15 @@ impl TerminalRuntime {
 
     pub fn reset_agent_detection(&self) {
         self.0.reset_agent_detection();
+    }
+
+    pub fn set_managed_agent_hint(&self, agent: Option<crate::detect::Agent>) {
+        self.0.set_managed_agent_hint(agent);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_agent_hint_for_test(&self) -> Option<crate::detect::Agent> {
+        self.0.managed_agent_hint_for_test()
     }
 
     #[cfg(test)]

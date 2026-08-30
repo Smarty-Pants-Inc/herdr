@@ -1236,6 +1236,10 @@ fn print_install_preview(
     eprintln!("  startup commands: {}", plugin.startup.len());
     eprintln!("  events: {}", plugin.events.len());
     eprintln!("  panes: {}", plugin.panes.len());
+    eprintln!(
+        "  execution providers: {}",
+        plugin.execution_providers.len()
+    );
     eprintln!("  link handlers: {}", plugin.link_handlers.len());
     eprintln!("  build commands: {}", plugin.build.len());
     for build in &plugin.build {
@@ -1260,6 +1264,18 @@ fn print_install_preview(
     }
     for pane in &plugin.panes {
         eprintln!("    pane {}: {}", pane.id, pane.command.join(" "));
+    }
+    for provider in &plugin.execution_providers {
+        eprintln!(
+            "    execution provider {} PTY: {}",
+            provider.scheme,
+            provider.pty_command.join(" ")
+        );
+        eprintln!(
+            "    execution provider {} process: {}",
+            provider.scheme,
+            provider.process_command.join(" ")
+        );
     }
     for warning in &plugin.warnings {
         eprintln!("  warning: {warning}");
@@ -1811,6 +1827,7 @@ mod tests {
             platforms: None,
             build: vec![],
             startup: vec![],
+            execution_providers: vec![],
             actions: vec![],
             events: vec![],
             panes: vec![],

@@ -187,7 +187,8 @@ fn validate_running_server_compatibility() -> io::Result<()> {
 /// - Stdin/stdout/stderr are redirected to /dev/null
 /// - Inherits relevant environment variables (`XDG_CONFIG_HOME`, `HERDR_SESSION`,
 ///   socket overrides, etc.), except inherited socket overrides are cleared when
-///   this CLI invocation explicitly selected a session.
+///   this CLI invocation explicitly selected a session, and bridge capabilities
+///   are always cleared so the new server owns its own bridge.
 ///
 /// Returns the PID of the spawned server process.
 pub fn spawn_server_daemon() -> io::Result<u32> {
@@ -220,6 +221,9 @@ fn build_server_daemon_command(exe: PathBuf) -> Command {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     crate::platform::detach_server_daemon_command(&mut command);
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        command.env_remove(key);
+    }
 
     match std::env::current_dir() {
         Ok(cwd) => {
@@ -368,6 +372,20 @@ mod tests {
         std::env::remove_var("HERDR_CLIENT_SOCKET_PATH");
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
+    }
+
+    #[test]
+    fn server_daemon_command_clears_inherited_omp_bridge_capabilities() {
+        let command = build_server_daemon_command(PathBuf::from("/tmp/herdr-test"));
+        let envs: Vec<_> = command.get_envs().collect();
+
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+            assert!(
+                envs.iter()
+                    .any(|(name, value)| *name == OsStr::new(key) && value.is_none()),
+                "inherited {key} bridge capability should be cleared"
+            );
+        }
     }
 
     #[test]

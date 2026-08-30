@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -75,6 +75,32 @@ pub struct OmpRendererRoute {
     pub pane_id: String,
     pub omp_session_id: String,
     pub route_generation: u64,
+}
+
+/// Client-local viewport assigned to one native OMP renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererPane {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub scrollback_limit_bytes: u64,
+}
+
+/// Renderer projection attached to the exact server frame it describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmpRendererFrame {
+    pub launch_id: u64,
+    /// Monotonic target authority revision for this launch.
+    pub authority_revision: u64,
+    /// Unpredictable capability disclosed only in this exact authority frame.
+    pub frame_nonce: [u8; 16],
+    pub pane: Option<OmpRendererPane>,
+    pub focused: bool,
+    /// True while server-owned UI overlaps or supersedes the native pane.
+    #[serde(default)]
+    pub server_owned_overlay: bool,
+    pub surface_active: bool,
 }
 
 /// Normalized Herdr prefix metadata retained by the App while native rendering is active.
@@ -739,6 +765,22 @@ pub enum ClientMessage {
         request_id: u64,
         url: String,
     },
+    /// Confirms the App received one exact active renderer authority and its matching frame.
+    OmpRendererAuthorityAck {
+        launch_id: u64,
+        authority_revision: u64,
+        frame_nonce: [u8; 16],
+    },
+    /// Structured input accepted under an exact server-owned renderer frame.
+    ServerOwnedInputEvents { events: Vec<ClientInputEvent> },
+    /// Pixel input accepted under an exact server-owned renderer frame.
+    ServerOwnedInputPixels {
+        data: Vec<u8>,
+        cols: u16,
+        rows: u16,
+        width_px: u32,
+        height_px: u32,
+    },
 }
 
 /// Herdr-owned controller operations; payload bytes remain owned by OMP.
@@ -838,6 +880,9 @@ pub struct FrameData {
     pub hyperlinks: Vec<String>,
     /// Kitty graphics protocol bytes to apply after the text frame.
     pub graphics: Vec<u8>,
+    /// Native renderer projection synchronized with these exact frame cells.
+    #[serde(default)]
+    pub omp_renderer: Option<OmpRendererFrame>,
 }
 
 impl FrameData {
@@ -898,6 +943,7 @@ impl FrameData {
             cursor,
             hyperlinks: hyperlink_uris,
             graphics: Vec::new(),
+            omp_renderer: None,
         }
     }
 
@@ -1100,15 +1146,17 @@ pub enum ServerMessage {
         message: String,
     },
 
-    /// Server-owned native renderer target for exactly one App connection.
+    /// Server-owned native renderer lifecycle target for exactly one App connection.
     OmpRendererTarget {
         launch_id: u64,
+        /// Monotonic target authority revision for this launch.
+        authority_revision: u64,
         target_app_client_id: u64,
         /// `None` stops the current launch without offering a replacement.
         route: Option<OmpRendererRoute>,
         /// True only after the exact launch sideband has attached.
         bound: bool,
-        /// True only while the bound route owns the App's full surface.
+        /// Whether this target currently owns the projected pane surface.
         surface_active: bool,
         prefix: OmpRendererPrefix,
     },
@@ -1469,6 +1517,28 @@ mod tests {
             20
         );
         assert_eq!(
+            tag(&ClientMessage::OmpRendererAuthorityAck {
+                launch_id: 9,
+                authority_revision: 4,
+                frame_nonce: [7; 16],
+            }),
+            21
+        );
+        assert_eq!(
+            tag(&ClientMessage::ServerOwnedInputEvents { events: Vec::new() }),
+            22
+        );
+        assert_eq!(
+            tag(&ClientMessage::ServerOwnedInputPixels {
+                data: b"\x1b[<0;1;1M".to_vec(),
+                cols: 80,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            }),
+            23
+        );
+        assert_eq!(
             tag(&ServerMessage::OmpPane {
                 pane_id: "pane".into(),
                 omp_session_id: "session".into(),
@@ -1503,6 +1573,7 @@ mod tests {
         assert_eq!(
             tag(&ServerMessage::OmpRendererTarget {
                 launch_id: 9,
+                authority_revision: 1,
                 target_app_client_id: 42,
                 route: None,
                 bound: false,
@@ -1667,6 +1738,7 @@ mod tests {
     fn omp_renderer_target_roundtrip() {
         let target = ServerMessage::OmpRendererTarget {
             launch_id: 9,
+            authority_revision: 1,
             target_app_client_id: 42,
             route: Some(OmpRendererRoute {
                 pane_id: "pane".into(),
@@ -1693,6 +1765,20 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(ready, decoded);
+    }
+
+    #[test]
+    fn omp_renderer_authority_ack_roundtrip() {
+        let acknowledgement = ClientMessage::OmpRendererAuthorityAck {
+            launch_id: 9,
+            authority_revision: 4,
+            frame_nonce: [7; 16],
+        };
+        let encoded =
+            bincode::serde::encode_to_vec(&acknowledgement, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(acknowledgement, decoded);
     }
 
     #[test]
@@ -1736,8 +1822,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_26_hello_carries_app_renderer_capability() {
-        assert_eq!(PROTOCOL_VERSION, 26);
+    fn protocol_27_hello_carries_app_renderer_capability() {
+        assert_eq!(PROTOCOL_VERSION, 27);
         let profile = "a".repeat(43);
         let app = ClientMessage::Hello {
             version: PROTOCOL_VERSION,
@@ -1866,6 +1952,29 @@ mod tests {
             }),
             9
         );
+    }
+
+    #[test]
+    fn server_owned_input_roundtrip() {
+        for message in [
+            ClientMessage::ServerOwnedInputEvents {
+                events: vec![ClientInputEvent::TextCommit("accepted".to_owned())],
+            },
+            ClientMessage::ServerOwnedInputPixels {
+                data: b"\x1b[<0;21;31M".to_vec(),
+                cols: 80,
+                rows: 24,
+                width_px: 800,
+                height_px: 480,
+            },
+        ] {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            let (decoded, consumed): (ClientMessage, usize) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+            assert_eq!(decoded, message);
+            assert_eq!(consumed, encoded.len());
+        }
     }
 
     #[test]
@@ -2210,6 +2319,7 @@ mod tests {
             }),
             hyperlinks: vec!["https://example.com".to_owned()],
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let msg = ServerMessage::Frame(frame.clone());
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
@@ -2479,6 +2589,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let msg = ServerMessage::Frame(frame);
 
@@ -2826,6 +2937,7 @@ mod tests {
             cursor: None,
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         assert!(frame.to_ratatui_buffer().is_none());
     }

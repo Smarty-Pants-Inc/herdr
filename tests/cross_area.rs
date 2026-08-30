@@ -543,6 +543,29 @@ struct FrameWire {
     cursor: Option<CursorWire>,
     hyperlinks: Vec<String>,
     graphics: Vec<u8>,
+    omp_renderer: Option<OmpRendererFrameWire>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererFrameWire {
+    launch_id: u64,
+    authority_revision: u64,
+    frame_nonce: [u8; 16],
+    pane: Option<OmpRendererPaneWire>,
+    focused: bool,
+    server_owned_overlay: bool,
+    surface_active: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererPaneWire {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    scrollback_limit_bytes: u64,
 }
 
 #[allow(dead_code)]

@@ -1,6 +1,4 @@
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[cfg(unix)]
@@ -20,6 +18,9 @@ use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const REMOTE_EXEC_PROTOCOL: u32 = 3;
+pub(crate) const EXECUTION_PROVIDER_PROTOCOL: u32 = 1;
+pub(crate) const EXECUTION_PROVIDER_REQUEST_ENV: &str = "HERDR_EXECUTION_PROVIDER_REQUEST";
+const EXECUTION_PROVIDER_REQUEST_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const REMOTE_EXEC_READY_OSC_PREFIX: &[u8] = b"\x1b]6973;herdr-remote-exec-ready=";
 pub(crate) const REMOTE_EXEC_READY_PAYLOAD_MAX_BYTES: usize = 32 * 1024;
 const REMOTE_EXEC_READY_NONCE_BYTES: usize = 16;
@@ -33,7 +34,6 @@ impl std::fmt::Debug for RemoteExecReadyNonce {
     }
 }
 
-#[cfg(any(unix, test))]
 fn random_hex_string(byte_len: usize) -> std::io::Result<String> {
     let mut bytes = vec![0_u8; byte_len];
     getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -47,7 +47,6 @@ fn random_hex_string(byte_len: usize) -> std::io::Result<String> {
 }
 
 impl RemoteExecReadyNonce {
-    #[cfg(any(unix, test))]
     pub(crate) fn generate() -> std::io::Result<Self> {
         Ok(Self(random_hex_string(REMOTE_EXEC_READY_NONCE_BYTES)?))
     }
@@ -113,11 +112,18 @@ pub enum ExecutionTarget {
     Ssh {
         host: String,
     },
+    Extension {
+        scheme: String,
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Osc7Authority {
     accepted: Vec<String>,
+    // Provider target syntax is opaque. Without its optional ready hostname,
+    // host-qualified OSC 7 is equivalent to an accepted authorityless report.
+    allow_unknown_remote: bool,
 }
 
 impl Osc7Authority {
@@ -126,6 +132,7 @@ impl Osc7Authority {
             return true;
         };
         authority.eq_ignore_ascii_case("localhost")
+            || (self.allow_unknown_remote && remote_hostname.is_none())
             || remote_hostname.is_some_and(|host| authority.eq_ignore_ascii_case(host))
             || self
                 .accepted
@@ -141,6 +148,17 @@ impl ExecutionTarget {
         Ok(Self::Ssh { host })
     }
 
+    pub fn extension(
+        scheme: impl Into<String>,
+        target: impl Into<String>,
+    ) -> std::io::Result<Self> {
+        let scheme = scheme.into();
+        let target = target.into();
+        validate_execution_provider_scheme(&scheme)?;
+        validate_execution_provider_target(&target)?;
+        Ok(Self::Extension { scheme, target })
+    }
+
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local)
     }
@@ -154,6 +172,7 @@ impl ExecutionTarget {
         local_hostname: Option<String>,
         effective_ssh_hostname: Option<String>,
     ) -> Osc7Authority {
+        let allow_unknown_remote = matches!(self, Self::Extension { .. });
         let mut accepted = Vec::with_capacity(2);
         match self {
             Self::Local => accepted.extend(local_hostname),
@@ -163,8 +182,12 @@ impl ExecutionTarget {
                     accepted.push(hostname);
                 }
             }
+            Self::Extension { .. } => {}
         }
-        Osc7Authority { accepted }
+        Osc7Authority {
+            accepted,
+            allow_unknown_remote,
+        }
     }
 }
 
@@ -173,6 +196,7 @@ impl std::fmt::Display for ExecutionTarget {
         match self {
             Self::Local => formatter.write_str("local"),
             Self::Ssh { host } => write!(formatter, "ssh:{host}"),
+            Self::Extension { scheme, target } => write!(formatter, "{scheme}:{target}"),
         }
     }
 }
@@ -184,10 +208,41 @@ impl FromStr for ExecutionTarget {
         if value == "local" {
             return Ok(Self::Local);
         }
-        let Some(host) = value.strip_prefix("ssh:") else {
-            return Err("execution target must be local or ssh:<host>".into());
-        };
-        Self::ssh(host).map_err(|err| err.to_string())
+        if let Some(host) = value.strip_prefix("ssh:") {
+            return Self::ssh(host).map_err(|err| err.to_string());
+        }
+        if let Some((scheme, target)) = value.split_once(':') {
+            return Self::extension(scheme, target).map_err(|err| err.to_string());
+        }
+        Err("execution target must be local, ssh:<host>, or <provider-scheme>:<target>".into())
+    }
+}
+
+fn validate_execution_provider_scheme(scheme: &str) -> std::io::Result<()> {
+    let valid = crate::app::normalize_execution_provider_scheme(scheme)
+        .is_some_and(|normalized| normalized == scheme);
+    if valid {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "execution provider scheme must match [a-z][a-z0-9+.-]* and must not be local or ssh",
+        ))
+    }
+}
+
+fn validate_execution_provider_target(target: &str) -> std::io::Result<()> {
+    if target.is_empty()
+        || target
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "execution provider target must be non-empty and contain no whitespace or control characters",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -204,6 +259,148 @@ pub(crate) enum RemoteCommand {
         plugin_id: String,
         target: crate::plugin_command::PluginCommandTarget,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExecutionProviderCommand {
+    Shell,
+    ShellCommand { command: String },
+    Argv { argv: Vec<String> },
+}
+
+impl TryFrom<RemoteCommand> for ExecutionProviderCommand {
+    type Error = std::io::Error;
+
+    fn try_from(command: RemoteCommand) -> Result<Self, Self::Error> {
+        match command {
+            RemoteCommand::Shell => Ok(Self::Shell),
+            RemoteCommand::ShellCommand { command } => Ok(Self::ShellCommand { command }),
+            RemoteCommand::Argv { argv } => Ok(Self::Argv { argv }),
+            RemoteCommand::Plugin { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "execution providers require Herdr to resolve plugin commands to argv",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionProviderRequest {
+    version: u32,
+    target: String,
+    cwd: PathBuf,
+    command: ExecutionProviderCommand,
+    env: Vec<(String, String)>,
+    remove_env: Vec<String>,
+    ready_nonce: RemoteExecReadyNonce,
+}
+
+pub(crate) struct PreparedExecutionProviderPtyCommand {
+    pub(crate) command: CommandBuilder,
+    pub(crate) ready_nonce: RemoteExecReadyNonce,
+}
+
+pub(crate) struct PreparedExecutionProviderProcessCommand {
+    pub(crate) command: std::process::Command,
+}
+
+fn execution_provider_request(
+    target: &ExecutionTarget,
+    cwd: &Path,
+    command: RemoteCommand,
+    env: Vec<(String, String)>,
+    remove_env: Vec<String>,
+) -> std::io::Result<(String, String, RemoteExecReadyNonce)> {
+    let ExecutionTarget::Extension { scheme, target } = target else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "execution provider command requires an extension execution target",
+        ));
+    };
+    validate_execution_provider_scheme(scheme)?;
+    validate_execution_provider_target(target)?;
+    let ready_nonce = RemoteExecReadyNonce::generate()?;
+    let request = ExecutionProviderRequest {
+        version: EXECUTION_PROVIDER_PROTOCOL,
+        target: target.clone(),
+        cwd: cwd.to_path_buf(),
+        command: command.try_into()?,
+        env,
+        remove_env,
+        ready_nonce: ready_nonce.clone(),
+    };
+    let payload = serde_json::to_string(&request).map_err(std::io::Error::other)?;
+    if payload.len() > EXECUTION_PROVIDER_REQUEST_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "execution provider request exceeds {EXECUTION_PROVIDER_REQUEST_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok((scheme.clone(), payload, ready_nonce))
+}
+
+pub(crate) fn execution_provider_pty_command_with_removals(
+    target: &ExecutionTarget,
+    cwd: &Path,
+    command: RemoteCommand,
+    env: Vec<(String, String)>,
+    remove_env: Vec<String>,
+) -> std::io::Result<PreparedExecutionProviderPtyCommand> {
+    let (scheme, payload, ready_nonce) =
+        execution_provider_request(target, cwd, command, env, remove_env)?;
+    let provider = crate::plugin_command::resolve_installed_execution_provider(
+        &scheme,
+        crate::plugin_command::ExecutionProviderCommandKind::Pty,
+    )?;
+    crate::plugin_paths::ensure_plugin_user_dirs(&provider.plugin_id)?;
+    let mut command =
+        crate::plugin_command::pty_command_for_argv_in_dir(&provider.command, &provider.cwd)?;
+    for key in provider.remove_env {
+        command.env_remove(key);
+    }
+    for (key, value) in provider.env {
+        command.env(key, value);
+    }
+    command.env(EXECUTION_PROVIDER_REQUEST_ENV, payload);
+    command.env("TERM", crate::pane::PANE_TERM);
+    command.env("COLORTERM", crate::pane::PANE_COLORTERM);
+    Ok(PreparedExecutionProviderPtyCommand {
+        command,
+        ready_nonce,
+    })
+}
+
+pub(crate) fn execution_provider_process_command(
+    target: &ExecutionTarget,
+    cwd: &Path,
+    command: RemoteCommand,
+    env: Vec<(String, String)>,
+) -> std::io::Result<PreparedExecutionProviderProcessCommand> {
+    let (scheme, payload, _ready_nonce) =
+        execution_provider_request(target, cwd, command, env, Vec::new())?;
+    let provider = crate::plugin_command::resolve_installed_execution_provider(
+        &scheme,
+        crate::plugin_command::ExecutionProviderCommandKind::Process,
+    )?;
+    crate::plugin_paths::ensure_plugin_user_dirs(&provider.plugin_id)?;
+    let (program, args) = provider.command.split_first().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "execution provider process command must not be empty",
+        )
+    })?;
+    let mut command = crate::plugin_command::command_for_argv_in_dir(program, args, &provider.cwd);
+    for key in provider.remove_env {
+        command.env_remove(key);
+    }
+    for (key, value) in provider.env {
+        command.env(key, value);
+    }
+    command.env(EXECUTION_PROVIDER_REQUEST_ENV, payload);
+    Ok(PreparedExecutionProviderProcessCommand { command })
 }
 
 #[cfg(unix)]
@@ -705,10 +902,17 @@ fn apply_remote_exec_env(
     for key in ["TMUX", "STY", "ZELLIJ"] {
         command.env_remove(key);
     }
-    command.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
-    command.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-    command.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
-    command.env_remove("HERDR_VIEW_ID");
+    for key in [
+        crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
+        crate::integration::HERDR_TAB_ID_ENV_VAR,
+        crate::integration::HERDR_PANE_ID_ENV_VAR,
+        "HERDR_VIEW_ID",
+    ] {
+        command.env_remove(key);
+    }
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        command.env_remove(key);
+    }
     for key in remove_env {
         command.env_remove(key);
     }
@@ -724,7 +928,7 @@ struct RemoteExecReadyPayload<'a> {
 }
 
 #[cfg(unix)]
-fn remote_exec_ready_marker(
+pub(crate) fn remote_exec_ready_marker(
     nonce: &RemoteExecReadyNonce,
     hostname: Option<&str>,
     cwd: &Path,
@@ -997,6 +1201,9 @@ mod tests {
         ] {
             command.env(key, "stale");
         }
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+            command.env(key, "stale");
+        }
 
         apply_remote_exec_env(
             &mut command,
@@ -1029,6 +1236,9 @@ mod tests {
             crate::integration::HERDR_TAB_ID_ENV_VAR,
             crate::integration::HERDR_PANE_ID_ENV_VAR,
         ] {
+            assert_eq!(env_value(key), Some(None), "{key} should remain scrubbed");
+        }
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
             assert_eq!(env_value(key), Some(None), "{key} should remain scrubbed");
         }
     }
@@ -1085,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn osc7_authority_uses_only_precomputed_and_runtime_hostnames() {
+    fn osc7_authority_handles_known_and_opaque_provider_hostnames() {
         let local =
             ExecutionTarget::Local.osc7_authority_with(Some("local-node".to_string()), None);
         assert!(local.accepts(Some("LOCAL-NODE"), None));
@@ -1101,15 +1311,69 @@ mod tests {
         assert!(remote.accepts(Some("localhost"), Some("actual-node")));
         assert!(!remote.accepts(Some("deploy@build-alias"), None));
         assert!(!remote.accepts(Some("other-node"), None));
+
+        let extension = ExecutionTarget::extension("runtime", "dev2")
+            .unwrap()
+            .osc7_authority_with(None, None);
+        assert!(extension.accepts(Some("actual-node"), None));
+        assert!(extension.accepts(Some("ACTUAL-NODE"), Some("actual-node")));
+        assert!(!extension.accepts(Some("other-node"), Some("actual-node")));
     }
 
     #[test]
     fn execution_target_round_trips_and_defaults_local() {
         let local: ExecutionTarget = serde_json::from_str("{\"kind\":\"local\"}").unwrap();
         let ssh: ExecutionTarget = "ssh:primary".parse().unwrap();
+        let runtime: ExecutionTarget = "runtime:dev2".parse().unwrap();
         assert_eq!(local, ExecutionTarget::Local);
         assert_eq!(ssh.to_string(), "ssh:primary");
+        assert_eq!(runtime.to_string(), "runtime:dev2");
+        assert_eq!(
+            serde_json::to_value(&runtime).unwrap(),
+            serde_json::json!({
+                "kind": "extension",
+                "scheme": "runtime",
+                "target": "dev2"
+            })
+        );
         assert!("ssh:-bad".parse::<ExecutionTarget>().is_err());
+        assert!("local:anywhere".parse::<ExecutionTarget>().is_err());
+        assert!("Runtime:dev2".parse::<ExecutionTarget>().is_err());
+        assert!("runtime:bad target".parse::<ExecutionTarget>().is_err());
+    }
+
+    #[test]
+    fn execution_provider_request_is_versioned_tagged_and_bounded() {
+        let target = ExecutionTarget::extension("runtime", "dev2").unwrap();
+        let (_, payload, ready_nonce) = execution_provider_request(
+            &target,
+            Path::new("/work"),
+            RemoteCommand::Argv {
+                argv: vec!["omp".into(), "--help".into()],
+            },
+            vec![("EXAMPLE".into(), "value".into())],
+            vec!["BUN_OPTIONS".into()],
+        )
+        .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(request["version"], EXECUTION_PROVIDER_PROTOCOL);
+        assert_eq!(request["target"], "dev2");
+        assert_eq!(request["cwd"], "/work");
+        assert_eq!(request["command"]["kind"], "argv");
+        assert_eq!(request["command"]["argv"][0], "omp");
+        assert_eq!(request["ready_nonce"], ready_nonce.as_str());
+
+        let error = execution_provider_request(
+            &target,
+            Path::new(""),
+            RemoteCommand::ShellCommand {
+                command: "x".repeat(EXECUTION_PROVIDER_REQUEST_MAX_BYTES),
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[cfg(unix)]
