@@ -21359,6 +21359,7 @@ next_tab = ""
                         .to_string(),
                 )
                 .unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
         server
             .app

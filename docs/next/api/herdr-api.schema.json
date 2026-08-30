@@ -1376,6 +1376,13 @@
           ],
           "type": "object"
         },
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSendKeysParams": {
           "properties": {
             "allow_cross_pane": {
@@ -3003,6 +3010,16 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "seq": {
               "format": "uint64",

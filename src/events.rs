@@ -102,6 +102,7 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        resume_policy: crate::agent_resume::AgentResumePolicy,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {

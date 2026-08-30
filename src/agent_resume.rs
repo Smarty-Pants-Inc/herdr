@@ -18,6 +18,22 @@ pub enum AgentSessionRefKind {
     Path,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentResumePolicy {
+    #[default]
+    Native,
+    External,
+}
+
+impl AgentResumePolicy {
+    pub const fn is_native(&self) -> bool {
+        matches!(self, Self::Native)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentResumePlan {
     pub agent: String,
@@ -30,6 +46,7 @@ pub struct PersistedAgentSession {
     pub source: String,
     pub agent: String,
     pub session_ref: AgentSessionRef,
+    pub resume_policy: AgentResumePolicy,
 }
 
 impl AgentSessionRef {
@@ -112,6 +129,7 @@ pub fn session_ref_from_snapshot(
         source: source.to_string(),
         agent: agent.to_string(),
         session_ref,
+        resume_policy: AgentResumePolicy::Native,
     })
 }
 

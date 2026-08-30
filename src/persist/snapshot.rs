@@ -119,6 +119,11 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::agent_resume::AgentResumePolicy::is_native"
+    )]
+    pub resume_policy: crate::agent_resume::AgentResumePolicy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -442,6 +447,16 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        resume_policy: terminal
+                            .persisted_agent_session
+                            .as_ref()
+                            .filter(|session| {
+                                session.source == authority.source
+                                    && session.agent == authority.agent_label
+                                    && session.session_ref == *session_ref
+                            })
+                            .map(|session| session.resume_policy)
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -453,6 +468,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    resume_policy: session.resume_policy,
                 })
         });
         panes.insert(
@@ -1412,6 +1428,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1435,6 +1452,57 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
+        assert_eq!(
+            agent_session.resume_policy,
+            crate::agent_resume::AgentResumePolicy::Native
+        );
+    }
+
+    #[test]
+    fn capture_contract_preserves_external_resume_policy_under_hook_authority() {
+        let mut state = state_with_workspaces(&["one"]);
+        let session_path = test_session_path("omp-session.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Omp),
+            crate::detect::AgentState::Idle,
+        );
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone());
+        terminal
+            .set_agent_session_ref_for_session_start_with_resume_policy(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref.clone(),
+                Some(1),
+                Some("startup".into()),
+                crate::agent_resume::AgentResumePolicy::External,
+            )
+            .expect("external OMP session should persist");
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::detect::AgentState::Working,
+                None,
+                session_ref,
+                Some(2),
+            )
+            .expect("OMP lifecycle report should remain active");
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("external OMP session should remain visible in the snapshot");
+        assert_eq!(
+            agent_session.resume_policy,
+            crate::agent_resume::AgentResumePolicy::External
+        );
     }
 
     #[test]
@@ -1453,6 +1521,7 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
 
         let snapshot = capture_from_state(&state);

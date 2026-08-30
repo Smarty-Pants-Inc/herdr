@@ -34,6 +34,7 @@ struct SuppressedFullLifecycleHookReport {
     observed_at: Instant,
     reason: FullLifecycleHookSuppressionReason,
     replacement_session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    replacement_resume_policy: crate::agent_resume::AgentResumePolicy,
     pending_replacement_report: Option<PendingFullLifecycleHookReport>,
 }
 
@@ -707,6 +708,7 @@ impl TerminalState {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         session_ref: session_ref.clone(),
+                        resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                     }
                 })
             });
@@ -867,7 +869,18 @@ impl TerminalState {
                 }
             }
         }
-        self.persisted_agent_session = None;
+        let preserves_external_session =
+            self.persisted_agent_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.resume_policy == crate::agent_resume::AgentResumePolicy::External
+                        && session.source == source
+                        && session.agent == agent_label
+                        && session_ref.as_ref() == Some(&session.session_ref)
+                });
+        if !preserves_external_session {
+            self.persisted_agent_session = None;
+        }
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -995,6 +1008,7 @@ impl TerminalState {
                 observed_at,
                 reason,
                 replacement_session_ref: None,
+                replacement_resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                 pending_replacement_report: None,
             },
         );
@@ -1119,6 +1133,7 @@ impl TerminalState {
                 observed_at: reported_at,
                 reason: FullLifecycleHookSuppressionReason::ProcessExit,
                 replacement_session_ref: None,
+                replacement_resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                 pending_replacement_report: None,
             });
         let replace_pending = suppressed
@@ -1250,6 +1265,7 @@ impl TerminalState {
                 }
                 if suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit {
                     if let Some(session_ref) = suppressed.replacement_session_ref.take() {
+                        let resume_policy = suppressed.replacement_resume_policy;
                         if let Some(exited_session_ref) = suppressed
                             .session_ref
                             .as_ref()
@@ -1277,6 +1293,7 @@ impl TerminalState {
                             source.clone(),
                             suppressed.agent_label.clone(),
                             session_ref,
+                            resume_policy,
                             pending,
                         ));
                         return false;
@@ -1304,16 +1321,19 @@ impl TerminalState {
         self.hook_report_sequences.retain(|source, _| {
             validated_replacement_sessions
                 .iter()
-                .any(|(validated_source, _, _, _)| validated_source == source)
+                .any(|(validated_source, _, _, _, _)| validated_source == source)
                 || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
-        for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
+        for (source, agent_label, session_ref, resume_policy, pending) in
+            validated_replacement_sessions
+        {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
                 agent: agent_label,
                 session_ref,
+                resume_policy,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
@@ -1387,14 +1407,26 @@ impl TerminalState {
         String,
         crate::agent_resume::AgentSessionRefKind,
         String,
+        crate::agent_resume::AgentResumePolicy,
     )> {
         if let Some(authority) = self.hook_authority.as_ref() {
             if let Some(session_ref) = authority.session_ref.as_ref() {
+                let resume_policy = self
+                    .persisted_agent_session
+                    .as_ref()
+                    .filter(|session| {
+                        session.source == authority.source
+                            && session.agent == authority.agent_label
+                            && session.session_ref == *session_ref
+                    })
+                    .map(|session| session.resume_policy)
+                    .unwrap_or_default();
                 return Some((
                     authority.source.clone(),
                     authority.agent_label.clone(),
                     session_ref.kind,
                     session_ref.value.clone(),
+                    resume_policy,
                 ));
             }
         }
@@ -1404,13 +1436,14 @@ impl TerminalState {
                 session.agent.clone(),
                 session.session_ref.kind,
                 session.session_ref.value.clone(),
+                session.resume_policy,
             )
         })
     }
 
     fn current_session_owner_conflicts(&self, source: &str, agent_label: &str) -> bool {
         self.current_session_identity_for_persistence().is_some_and(
-            |(current_source, current_agent, _, _)| {
+            |(current_source, current_agent, _, _, _)| {
                 current_source != source || current_agent != agent_label
             },
         )
@@ -1424,7 +1457,7 @@ impl TerminalState {
         session_start_source: Option<&str>,
     ) -> Option<crate::agent_resume::AgentSessionRef> {
         self.current_session_identity_for_persistence().and_then(
-            |(current_source, current_agent, current_kind, current_value)| {
+            |(current_source, current_agent, current_kind, current_value, _)| {
                 (current_source == source
                     && current_agent == agent_label
                     && current_kind == crate::agent_resume::AgentSessionRefKind::Id
@@ -1558,6 +1591,25 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        self.set_agent_session_ref_for_session_start_with_resume_policy(
+            source,
+            agent_label,
+            session_ref,
+            seq,
+            session_start_source,
+            crate::agent_resume::AgentResumePolicy::Native,
+        )
+    }
+
+    pub fn set_agent_session_ref_for_session_start_with_resume_policy(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+        resume_policy: crate::agent_resume::AgentResumePolicy,
+    ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
         let process_present = (known_agent.is_some()
@@ -1610,9 +1662,11 @@ impl TerminalState {
                     observed_at: Instant::now(),
                     reason: FullLifecycleHookSuppressionReason::ProcessExit,
                     replacement_session_ref: None,
+                    replacement_resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                     pending_replacement_report: None,
                 });
             suppressed.replacement_session_ref = Some(session_ref);
+            suppressed.replacement_resume_policy = resume_policy;
             suppressed.pending_replacement_report = None;
             return None;
         }
@@ -1648,6 +1702,7 @@ impl TerminalState {
                     observed_at: now,
                     reason: FullLifecycleHookSuppressionReason::ProcessExit,
                     replacement_session_ref: None,
+                    replacement_resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                     pending_replacement_report: None,
                 });
             if suppressed.replacement_session_ref.as_ref() != Some(&session_ref) {
@@ -1662,6 +1717,7 @@ impl TerminalState {
                 }
                 suppressed.replacement_session_ref = Some(session_ref.clone());
             }
+            suppressed.replacement_resume_policy = resume_policy;
             self.hook_report_sequences.insert(source.clone(), seq);
 
             if process_present {
@@ -1699,7 +1755,7 @@ impl TerminalState {
             crate::detect::session_identity_only_integration(&source, &agent_label)
                 && session_replacement_allowed
                 && self.current_session_identity_for_persistence().is_some_and(
-                    |(current_source, current_agent, current_kind, current_value)| {
+                    |(current_source, current_agent, current_kind, current_value, _)| {
                         current_source == source
                             && current_agent == agent_label
                             && current_kind == crate::agent_resume::AgentSessionRefKind::Id
@@ -1770,6 +1826,7 @@ impl TerminalState {
             source,
             agent: agent_label,
             session_ref,
+            resume_policy,
         });
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
@@ -2401,6 +2458,7 @@ mod tests {
             source: source.into(),
             agent: agent_label.into(),
             session_ref,
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
     }
 
@@ -2917,6 +2975,7 @@ mod tests {
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(old_session)
                 .expect("test session path should be valid"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
 
         let startup = terminal.set_agent_session_ref_for_session_start(
@@ -2935,6 +2994,7 @@ mod tests {
                 "pi".into(),
                 crate::agent_resume::AgentSessionRefKind::Path,
                 new_session,
+                crate::agent_resume::AgentResumePolicy::Native,
             ))
         );
     }
@@ -5269,6 +5329,7 @@ mod tests {
                 observed_at: Instant::now(),
                 reason: FullLifecycleHookSuppressionReason::ProcessExit,
                 replacement_session_ref: None,
+                replacement_resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                 pending_replacement_report: None,
             },
         );
@@ -5572,6 +5633,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5608,6 +5670,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5643,6 +5706,7 @@ mod tests {
                     source: "herdr:codex".into(),
                     agent: "codex".into(),
                     session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                    resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                 });
                 terminal.set_detected_state(detected_agent, AgentState::Idle);
 
@@ -5677,6 +5741,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5749,7 +5814,8 @@ mod tests {
                 "herdr:codex".into(),
                 "codex".into(),
                 crate::agent_resume::AgentSessionRefKind::Id,
-                "codex-session".into()
+                "codex-session".into(),
+                crate::agent_resume::AgentResumePolicy::Native,
             ))
         );
         let late_old_session = terminal.set_hook_authority_with_session_ref(
@@ -6098,6 +6164,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
 
         let mutation = terminal
@@ -6116,6 +6183,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
 
@@ -6143,6 +6211,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6176,6 +6245,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6208,6 +6278,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
@@ -6317,6 +6388,7 @@ mod tests {
             source: "herdr:opencode".into(),
             agent: "opencode".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
 
         let first =
@@ -6336,6 +6408,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
 
         let mutation = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);

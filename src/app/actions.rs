@@ -2917,14 +2917,16 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                resume_policy,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_resume_policy(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        resume_policy,
                     )
                 })
                 .into_iter()
@@ -5594,6 +5596,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),
