@@ -1072,6 +1072,17 @@ impl TerminalState {
                 .as_ref()
                 .is_none_or(|incoming| incoming == anchored)
         });
+        let externally_managed_session =
+            self.persisted_agent_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.resume_policy == crate::agent_resume::AgentResumePolicy::External
+                        && session.source == source
+                        && session.agent == agent_label
+                        && session_ref
+                            .as_ref()
+                            .is_none_or(|incoming| incoming == &session.session_ref)
+                });
         let opencode_cross_talk = (source, agent_label) == ("herdr:opencode", "opencode")
             && process_present
             && anchored_session_ref
@@ -1099,7 +1110,7 @@ impl TerminalState {
             }
         }
 
-        if process_present
+        if (process_present || externally_managed_session)
             && session_anchored
             && !self
                 .suppressed_full_lifecycle_hook_reports
@@ -1646,6 +1657,10 @@ impl TerminalState {
             session_start_source.as_deref(),
             seq,
         );
+        let externally_managed_start = resume_policy
+            == crate::agent_resume::AgentResumePolicy::External
+            && Self::session_start_source_is_recognized(session_start_source.as_deref())
+            && seq.is_some();
         let selection_can_reconcile = unsequenced_selection && process_present;
         if selection_can_reconcile {
             self.suppressed_full_lifecycle_hook_reports.remove(&source);
@@ -1682,6 +1697,7 @@ impl TerminalState {
         }
         if full_lifecycle_source
             && !selection_can_reconcile
+            && !externally_managed_start
             && (!process_present || generation_gated || !session_anchored)
         {
             if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
@@ -6362,6 +6378,55 @@ mod tests {
             Some(("herdr:claude", "claude", "claude-session"))
         );
     }
+    #[test]
+    fn external_session_report_anchors_wrapped_omp_without_detected_process() {
+        let mut terminal = test_terminal();
+        let session_path = test_session_path("wrapped-omp.jsonl");
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone())
+            .expect("test session path should be valid");
+
+        let session_mutation = terminal
+            .set_agent_session_ref_for_session_start_with_resume_policy(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".into()),
+                crate::agent_resume::AgentResumePolicy::External,
+            )
+            .expect("external OMP session should not require native process detection");
+        assert!(session_mutation.session_ref_changed);
+
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                Some(session_ref),
+                Some(2),
+            )
+            .expect("external OMP lifecycle should not require native process detection");
+
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .map(|authority| authority.state),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.session_ref.value.as_str(), session.resume_policy,)),
+            Some((
+                session_path.as_str(),
+                crate::agent_resume::AgentResumePolicy::External,
+            ))
+        );
+    }
+
     #[test]
     fn detected_conflict_preserves_matching_external_resume_policy() {
         let mut terminal = test_terminal();
