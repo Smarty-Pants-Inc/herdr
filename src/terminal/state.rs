@@ -704,11 +704,21 @@ impl TerminalState {
         {
             let durable_session = self.hook_authority.as_ref().and_then(|authority| {
                 authority.session_ref.as_ref().map(|session_ref| {
+                    let resume_policy = self
+                        .persisted_agent_session
+                        .as_ref()
+                        .filter(|session| {
+                            session.source == authority.source
+                                && session.agent == authority.agent_label
+                                && session.session_ref == *session_ref
+                        })
+                        .map(|session| session.resume_policy)
+                        .unwrap_or_default();
                     crate::agent_resume::PersistedAgentSession {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         session_ref: session_ref.clone(),
-                        resume_policy: crate::agent_resume::AgentResumePolicy::Native,
+                        resume_policy,
                     }
                 })
             });
@@ -6350,6 +6360,54 @@ mod tests {
                 session.session_ref.value.as_str()
             )),
             Some(("herdr:claude", "claude", "claude-session"))
+        );
+    }
+    #[test]
+    fn detected_conflict_preserves_matching_external_resume_policy() {
+        let mut terminal = test_terminal();
+        let session_path = test_session_path("externally-owned-omp.jsonl");
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone())
+            .expect("test session path should be valid");
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start_with_resume_policy(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref.clone()),
+                Some(1),
+                Some("startup".into()),
+                crate::agent_resume::AgentResumePolicy::External,
+            )
+            .expect("external OMP session should persist");
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                Some(session_ref),
+                Some(2),
+            )
+            .expect("OMP lifecycle report should remain active");
+
+        let mutation =
+            terminal.set_detected_state_with_mutation(Some(Agent::Grok), AgentState::Idle);
+
+        assert!(!mutation.session_ref_changed);
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref().map(|session| (
+                session.source.as_str(),
+                session.agent.as_str(),
+                session.session_ref.value.as_str(),
+                session.resume_policy,
+            )),
+            Some((
+                "herdr:omp",
+                "omp",
+                session_path.as_str(),
+                crate::agent_resume::AgentResumePolicy::External,
+            ))
         );
     }
 

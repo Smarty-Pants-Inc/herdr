@@ -563,11 +563,18 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 }
 
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
+    parse_snapshot_with_supported_version(content, SNAPSHOT_VERSION)
+}
+
+fn parse_snapshot_with_supported_version(
+    content: &str,
+    supported_version: u32,
+) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > SNAPSHOT_VERSION {
+    if raw.version > supported_version {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, SNAPSHOT_VERSION
+            raw.version, supported_version
         ));
     }
     migrate_snapshot(raw)
@@ -1459,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_preserves_external_resume_policy_under_hook_authority() {
+    fn capture_contract_versions_external_resume_policy_under_hook_authority() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("omp-session.jsonl");
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1495,6 +1502,7 @@ mod tests {
             .expect("OMP lifecycle report should remain active");
 
         let snapshot = capture_from_state(&state);
+        assert_eq!(snapshot.version, 4);
         let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
             .agent_session
             .as_ref()
@@ -1502,6 +1510,22 @@ mod tests {
         assert_eq!(
             agent_session.resume_policy,
             crate::agent_resume::AgentResumePolicy::External
+        );
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        assert!(encoded.contains("\"resume_policy\":\"external\""));
+        let restored = parse_snapshot(&encoded).expect("external snapshot should parse");
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&root.raw()]
+                .agent_session
+                .as_ref()
+                .expect("external OMP session should restore from the snapshot")
+                .resume_policy,
+            crate::agent_resume::AgentResumePolicy::External
+        );
+        assert!(
+            parse_snapshot_with_supported_version(&encoded, 3).is_err(),
+            "v3 readers must reject external-policy snapshots rather than ignore the policy"
         );
     }
 
