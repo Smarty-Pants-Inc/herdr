@@ -568,7 +568,6 @@ impl ClientOmpRenderer {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn native_link_active(&self) -> Option<bool> {
         if self.suppress_link_affordance {
             return Some(false);
