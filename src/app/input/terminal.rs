@@ -183,6 +183,21 @@ impl App {
         let target = TerminalInputTarget { terminal_id };
         let rt = self.terminal_input_runtime(&target)?;
         if let Some(pane_id) = pane_id {
+            let recognized_omp =
+                self.state
+                    .terminals
+                    .get(&target.terminal_id)
+                    .is_some_and(|terminal| {
+                        terminal.effective_known_agent() == Some(crate::detect::Agent::Omp)
+                    });
+            if rt.try_navigate_omp_reply(recognized_omp, &key) {
+                debug!(
+                    code = ?key_event.code,
+                    "intercepted OMP semantic reply navigation"
+                );
+                return None;
+            }
+
             // Intercept plain PageUp/PageDown presses for pane scrollback only
             // when the focused pane looks like a shell transcript. Normal-screen
             // pagers such as `less -X` keep the primary screen but enter
@@ -2772,6 +2787,261 @@ mod tests {
         assert_eq!(
             pane_scroll_offset(&app, pane_id),
             info.inner_rect.height as usize
+        );
+    }
+
+    const OMP_REPLY_SCROLLBACK: &[u8] = b"\x1b]133;A\x07shell prompt\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+intro\r\n\
+\x1b]133;A;aid=omp-response-run-a:reply-1\x07reply one\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between one a\r\nbetween one b\r\n\
+\x1b]133;A;aid=omp-response-run-a:reply-2\x07reply two starts here and wraps across several retained terminal rows without creating another reply stop\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between two a\r\nbetween two b\r\n\
+\x1b]133;A;aid=omp-response-run-a:reply-3\x07reply three\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail a\r\ntail b\r\ntail c\r\ntail d\r\ntail e\r\n";
+
+    const GENERIC_PROMPT_SCROLLBACK: &[u8] =
+        b"\x1b]133;A\x07shell prompt\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n";
+
+    fn app_with_reply_scrollback(
+        agent: Option<crate::detect::Agent>,
+        bytes: &[u8],
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("test");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .terminal_id(pane_id)
+            .expect("pane terminal id")
+            .clone();
+        let pane_infos = workspace.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let (runtime, input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                40,
+                4,
+                16 * 1024,
+                &[],
+                8,
+            );
+        runtime.test_process_pty_bytes(bytes);
+        workspace.tabs[0].runtimes.insert(pane_id, runtime);
+
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.detected_agent = agent;
+        app.state.terminals.insert(terminal_id, terminal);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        (app, pane_id, input_rx)
+    }
+
+    fn visible_top_line(app: &App, pane_id: crate::layout::PaneId) -> String {
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .visible_text()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn option_arrows_navigate_omp_semantic_reply_starts() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let option_up = TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+        let option_down = TerminalKey::new(KeyCode::Down, KeyModifiers::ALT);
+
+        for expected in ["reply three", "reply two", "reply one"] {
+            assert!(
+                app.handle_terminal_key_headless(option_up.clone())
+                    .is_none(),
+                "Option-Up should stay in Herdr"
+            );
+            assert!(
+                visible_top_line(&app, pane_id).starts_with(expected),
+                "semantic reply start should be the viewport's first row"
+            );
+            assert!(input_rx.try_recv().is_err());
+        }
+
+        assert!(app.handle_terminal_key_headless(option_up).is_none());
+        assert_eq!(visible_top_line(&app, pane_id), "reply one");
+
+        for expected in ["reply two", "reply three"] {
+            assert!(
+                app.handle_terminal_key_headless(option_down.clone())
+                    .is_none(),
+                "Option-Down should stay in Herdr"
+            );
+            assert!(
+                visible_top_line(&app, pane_id).starts_with(expected),
+                "semantic reply start should be the viewport's first row"
+            );
+            assert!(input_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_option_up_navigates_omp_replies_once_per_repeat() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let option_up = TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_repeat_count(3);
+
+        app.route_client_events(
+            vec![
+                crate::raw_input::RawInputEvent::Key(option_up.clone()),
+                crate::raw_input::RawInputEvent::Key(
+                    option_up
+                        .with_repeat_count(1)
+                        .with_kind(KeyEventKind::Release),
+                ),
+            ],
+            false,
+        );
+
+        assert_eq!(visible_top_line(&app, pane_id), "reply one");
+        assert!(input_rx.try_recv().is_err());
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn option_up_forwards_outside_omp() {
+        let (mut app, _pane_id, mut input_rx) =
+            app_with_reply_scrollback(None, OMP_REPLY_SCROLLBACK);
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT))
+            .is_some());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded Option-Up").as_ref(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_up_forwards_for_unpaired_omp_without_reply_aid() {
+        let (mut app, _pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), GENERIC_PROMPT_SCROLLBACK);
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT))
+            .is_some());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded unpaired OMP Option-Up")
+                .as_ref(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[tokio::test]
+    async fn shift_option_up_forwards_to_omp_queue_binding() {
+        let (mut app, _pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(
+                KeyCode::Up,
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+            ))
+            .is_some());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded Shift-Option-Up")
+                .as_ref(),
+            b"\x1b[1;4A"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_arrows_keep_the_selected_reply_through_streaming_output() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let option_up = TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+
+        assert!(app
+            .handle_terminal_key_headless(option_up.clone())
+            .is_none());
+        assert!(visible_top_line(&app, pane_id).starts_with("reply three"));
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"streaming reply output\r\n");
+
+        assert!(app.handle_terminal_key_headless(option_up).is_none());
+        assert!(visible_top_line(&app, pane_id).starts_with("reply two"));
+        assert!(input_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn option_up_forwards_in_the_alternate_screen() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"\x1b[?1049h");
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT))
+            .is_some());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded Option-Up").as_ref(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_up_forwards_when_anchor_has_no_retained_primary_row() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), &[]);
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(
+                b"\x1b[?1049h\x1b]133;A;aid=omp-response-missing:reply\x07alternate reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?1049l",
+            );
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT))
+            .is_some());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded missing-row Option-Up")
+                .as_ref(),
+            b"\x1b[1;3A"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_up_forwards_after_a_destructive_scrollback_clear() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"\x1b[3J");
+
+        assert!(app
+            .handle_terminal_key_headless(TerminalKey::new(KeyCode::Up, KeyModifiers::ALT))
+            .is_some());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded cleared Option-Up")
+                .as_ref(),
+            b"\x1b[1;3A"
         );
     }
 }

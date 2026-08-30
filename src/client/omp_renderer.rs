@@ -780,11 +780,23 @@ impl ClientOmpRenderer {
                 }
                 continue;
             }
-            let sent = self
+            let (navigated, sent) = self
                 .target
                 .as_ref()
                 .and_then(|target| target.runtime.as_ref())
-                .is_some_and(|runtime| forward_local_event(runtime, event));
+                .map(|runtime| {
+                    if try_navigate_local_omp_reply(runtime, &event) {
+                        (true, true)
+                    } else {
+                        (false, forward_local_event(runtime, event))
+                    }
+                })
+                .unwrap_or((false, false));
+            if navigated {
+                self.needs_render = true;
+                self.refresh_hovered_link();
+                continue;
+            }
             if !sent {
                 self.begin_local_forward_fallback();
                 if let Some(event) = protocol_event {
@@ -1051,17 +1063,26 @@ impl ClientOmpRenderer {
                     .push(ClientMessage::InputEvents { events });
             }
             LinkInput::Events { events, generation } => {
+                let mut navigated = false;
                 let failed_at = self
                     .target
                     .as_ref()
                     .and_then(|target| target.runtime.as_ref())
                     .and_then(|runtime| {
                         events.iter().enumerate().find_map(|(index, event)| {
-                            (!forward_local_event(runtime, event.to_raw_input_event()))
-                                .then_some(index)
+                            let event = event.to_raw_input_event();
+                            if try_navigate_local_omp_reply(runtime, &event) {
+                                navigated = true;
+                                return None;
+                            }
+                            (!forward_local_event(runtime, event)).then_some(index)
                         })
                     })
                     .or_else(|| runtime_missing.then_some(0));
+                if navigated {
+                    self.needs_render = true;
+                    self.refresh_hovered_link();
+                }
                 if let Some(index) = failed_at {
                     self.begin_local_forward_fallback();
                     self.deferred_messages.push(DeferredMessage::InputEvents {
@@ -1484,6 +1505,16 @@ fn forward_local_focus_event(runtime: &TerminalRuntime, event: crate::ghostty::F
             .is_ok_and(|bytes| runtime.try_send_bytes(Bytes::from(bytes)).is_ok())
 }
 
+fn try_navigate_local_omp_reply(
+    runtime: &TerminalRuntime,
+    event: &crate::raw_input::RawInputEvent,
+) -> bool {
+    let crate::raw_input::RawInputEvent::Key(key) = event else {
+        return false;
+    };
+    runtime.try_navigate_omp_reply_repeated(true, key)
+}
+
 fn forward_local_event(runtime: &TerminalRuntime, event: crate::raw_input::RawInputEvent) -> bool {
     let bytes = match event {
         crate::raw_input::RawInputEvent::Key(key) => Some(runtime.encode_terminal_key(key)),
@@ -1526,6 +1557,13 @@ mod tests {
             modifiers: KeyModifiers::CONTROL.bits(),
         }
     }
+
+    const OMP_REPLY_SCROLLBACK: &[u8] = b"\x1b]133;A;aid=omp-response-client-run:reply-1\x07reply one\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between one\r\n\
+\x1b]133;A;aid=omp-response-client-run:reply-2\x07reply two\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between two\r\n\
+\x1b]133;A;aid=omp-response-client-run:reply-3\x07reply three\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
 
     fn test_omp_executable() -> crate::update::OmpExecutable {
         crate::update::OmpExecutable::Explicit("/tmp/pre-resolved-omp".into())
@@ -1685,6 +1723,33 @@ mod tests {
         runtime.resize(30, 100, 8, 16);
         assert_eq!(runtime.current_size(), (30, 100));
         runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn local_omp_grouped_option_up_navigates_each_reply_without_forwarding() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let now = Instant::now();
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_repeat_count(3),
+            )])
+            .is_empty());
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply one")));
+        assert!(renderer
+            .next_frame(now + Duration::from_millis(1), (40, 4))
+            .is_some());
+        assert!(input.try_recv().is_err());
     }
 
     #[tokio::test]

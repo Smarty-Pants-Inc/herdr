@@ -806,6 +806,69 @@ pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
     Ok(buffer)
 }
 
+/// An owned Ghostty grid reference that follows its row through scrollback
+/// changes and reflow. A missing value means its row was pruned or its screen
+/// was replaced.
+pub(crate) struct TrackedGridRef {
+    raw: ffi::GhosttyTrackedGridRef,
+}
+
+impl fmt::Debug for TrackedGridRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrackedGridRef")
+            .field("has_value", &self.has_value())
+            .finish()
+    }
+}
+
+impl TrackedGridRef {
+    pub(crate) fn has_value(&self) -> bool {
+        unsafe { ffi::ghostty_tracked_grid_ref_has_value(self.raw) }
+    }
+
+    pub(crate) fn screen_row(&self) -> Option<usize> {
+        let mut point = ffi::GhosttyPointCoordinate::default();
+        unsafe {
+            ffi::ghostty_tracked_grid_ref_point(
+                self.raw,
+                ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
+                &mut point,
+            )
+            .into_result()
+            .ok()?;
+        }
+        usize::try_from(point.y).ok()
+    }
+
+    pub(crate) fn is_primary_prompt(&self) -> bool {
+        let mut snapshot = ffi::GhosttyGridRef {
+            size: mem::size_of::<ffi::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        if unsafe {
+            ffi::ghostty_tracked_grid_ref_snapshot(self.raw, &mut snapshot)
+                .into_result()
+                .is_err()
+        } {
+            return false;
+        }
+        grid_ref_semantic_prompt(&snapshot)
+            .map(|semantic| semantic == ffi::GhosttyRowSemanticPrompt_GHOSTTY_ROW_SEMANTIC_PROMPT)
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for TrackedGridRef {
+    fn drop(&mut self) {
+        // SAFETY: Ghostty permits freeing a tracked reference after its terminal.
+        unsafe { ffi::ghostty_tracked_grid_ref_free(self.raw) }
+    }
+}
+
+// SAFETY: refs remain owned by a terminal core and are only accessed under its lock.
+unsafe impl Send for TrackedGridRef {}
+
 pub struct Terminal {
     raw: ffi::GhosttyTerminal,
     max_scrollback: usize,
@@ -1135,6 +1198,35 @@ impl Terminal {
         let wide = grid_ref_wide(&grid_ref)?;
         let graphemes = grid_ref_graphemes(&grid_ref)?;
         Ok((wide, graphemes))
+    }
+
+    pub(crate) fn screen_row_is_primary_prompt(&self, y: usize) -> Result<bool, Error> {
+        let Some(y) = u32::try_from(y).ok() else {
+            return Ok(false);
+        };
+        let grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+        Ok(grid_ref_semantic_prompt(&grid_ref)?
+            == ffi::GhosttyRowSemanticPrompt_GHOSTTY_ROW_SEMANTIC_PROMPT)
+    }
+
+    pub(crate) fn track_active_primary_prompt_row(&self) -> Result<Option<TrackedGridRef>, Error> {
+        if self.active_screen()? != ActiveScreen::Primary {
+            return Ok(None);
+        }
+        let y = self.get_u16(ffi::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_Y)?;
+        let point = ghostty_active_point(0, u32::from(y));
+        let grid_ref = self.grid_ref(point)?;
+        if grid_ref_semantic_prompt(&grid_ref)?
+            != ffi::GhosttyRowSemanticPrompt_GHOSTTY_ROW_SEMANTIC_PROMPT
+        {
+            return Ok(None);
+        }
+
+        let mut raw = ptr::null_mut();
+        unsafe {
+            ffi::ghostty_terminal_grid_ref_track(self.raw, point, &mut raw).into_result()?;
+        }
+        Ok((!raw.is_null()).then_some(TrackedGridRef { raw }))
     }
 
     pub(crate) fn screen_text_rows(&self) -> Result<Vec<ScreenTextRow>, Error> {
@@ -1996,6 +2088,15 @@ fn ghostty_viewport_point(x: u16, y: u32) -> ffi::GhosttyPoint {
     }
 }
 
+fn ghostty_active_point(x: u16, y: u32) -> ffi::GhosttyPoint {
+    ffi::GhosttyPoint {
+        tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+        value: ffi::GhosttyPointValue {
+            coordinate: ffi::GhosttyPointCoordinate { x, y },
+        },
+    }
+}
+
 fn ghostty_screen_point(x: u16, y: u32) -> ffi::GhosttyPoint {
     ffi::GhosttyPoint {
         tag: ffi::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
@@ -2073,6 +2174,25 @@ fn grid_ref_wrap_state(grid_ref: &ffi::GhosttyGridRef) -> Result<(bool, bool), E
         .into_result()?;
     }
     Ok((soft_wrapped, wrap_continuation))
+}
+
+fn grid_ref_semantic_prompt(
+    grid_ref: &ffi::GhosttyGridRef,
+) -> Result<ffi::GhosttyRowSemanticPrompt, Error> {
+    let mut row = 0;
+    unsafe {
+        ffi::ghostty_grid_ref_row(grid_ref, &mut row).into_result()?;
+    }
+    let mut semantic = ffi::GhosttyRowSemanticPrompt_GHOSTTY_ROW_SEMANTIC_NONE;
+    unsafe {
+        ffi::ghostty_row_get(
+            row,
+            ffi::GhosttyRowData_GHOSTTY_ROW_DATA_SEMANTIC_PROMPT,
+            (&mut semantic as *mut ffi::GhosttyRowSemanticPrompt).cast(),
+        )
+        .into_result()?;
+    }
+    Ok(semantic)
 }
 
 fn kitty_placement_u32(

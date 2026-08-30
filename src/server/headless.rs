@@ -4670,7 +4670,17 @@ impl HeadlessServer {
             render_notify: self.app.render_notify.clone(),
             render_dirty: self.app.render_dirty.clone(),
         };
-        match PrivateOmpGuest::spawn(config) {
+        #[cfg(test)]
+        let guest = if std::env::current_exe().ok().as_deref()
+            == Some(config.omp_executable.executable())
+        {
+            PrivateOmpGuest::spawn_test_stub(config)
+        } else {
+            PrivateOmpGuest::spawn(config)
+        };
+        #[cfg(not(test))]
+        let guest = PrivateOmpGuest::spawn(config);
+        match guest {
             Ok(guest) => {
                 let guest_rows = initial_inner.map_or(rows.max(1), |inner| inner.height.max(1));
                 let guest_cols = initial_inner.map_or(cols.max(1), |inner| inner.width.max(1));
@@ -5095,9 +5105,11 @@ impl HeadlessServer {
                         && self.app.state.mode == crate::app::Mode::Terminal
                         && !self.app.state.is_prefix_key(&key) =>
                 {
-                    let bytes = runtime.encode_terminal_key(key);
-                    if !bytes.is_empty() {
-                        let _ = guest.input(Bytes::from(bytes));
+                    if !runtime.try_navigate_omp_reply_repeated(true, &key) {
+                        let bytes = runtime.encode_terminal_key(key);
+                        if !bytes.is_empty() {
+                            let _ = guest.input(Bytes::from(bytes));
+                        }
                     }
                     consumed = true;
                 }
@@ -8984,6 +8996,85 @@ mod tests {
             admission: test_host_admission_sender(),
         });
         (peer, outbound_rx)
+    }
+
+    #[tokio::test]
+    async fn private_omp_grouped_option_up_navigates_each_reply_without_forwarding() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-reply-navigation");
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        let mut pane_infos = workspace.tabs[0].layout.panes(Rect::new(0, 0, 40, 4));
+        pane_infos[0].is_focused = true;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.view.pane_infos = pane_infos;
+        server.app.state.ensure_test_terminals();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server.foreground_client_id = Some(1);
+
+        let guest = PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
+            route,
+            omp_executable: crate::update::OmpExecutable::Explicit(
+                std::env::current_exe().expect("test executable"),
+            ),
+            attachment_epoch: 1,
+            controller: true,
+            pane_id: crate::layout::PaneId::alloc(),
+            rows: 4,
+            cols: 40,
+            cwd: std::env::temp_dir(),
+            launch_env: crate::pane::PaneLaunchEnv::from_extra(Vec::new()),
+            scrollback_limit_bytes: 16 * 1024,
+            terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+            terminal_appearance: None,
+            events: server.app.event_tx.clone(),
+            render_notify: server.app.render_notify.clone(),
+            render_dirty: server.app.render_dirty.clone(),
+        })
+        .expect("private OMP guest");
+        guest.runtime().test_process_pty_bytes(
+            b"\x1b]133;A;aid=omp-response-private-run:reply-1\x07reply one\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between one\r\n\
+\x1b]133;A;aid=omp-response-private-run:reply-2\x07reply two\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+between two\r\n\
+\x1b]133;A;aid=omp-response-private-run:reply-3\x07reply three\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
+        );
+        server
+            .clients
+            .get_mut(&1)
+            .expect("App client")
+            .private_omp_guest = Some(guest);
+
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_repeat_count(3),
+            )],
+        );
+
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(guest
+            .runtime()
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply one")));
+        assert!(guest.test_input_is_empty());
+
+        server.clients.get_mut(&1).unwrap().private_omp_guest.take();
+        shutdown_test_runtimes(&mut server);
     }
 
     #[tokio::test]

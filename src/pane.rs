@@ -613,6 +613,10 @@ fn apply_foreground_shell_agent_action(
     }
 }
 
+fn should_clear_omp_reply_anchors_after_agent_change(agent: Option<Agent>) -> bool {
+    agent != Some(Agent::Omp)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ProcessProbeInput {
     current_agent: Option<Agent>,
@@ -1047,6 +1051,11 @@ fn spawn_basic_detection_task(
                         // from the previous process; a first acquisition keeps
                         // the evidence its own process already emitted.
                         clear_osc_evidence_for_agent_transition(&terminal, previous_agent);
+                        // OMP reply anchors reset at their in-stream session boundary;
+                        // clearing them while entering OMP would race its replay.
+                        if should_clear_omp_reply_anchors_after_agent_change(agent) {
+                            terminal.clear_omp_reply_anchors();
+                        }
                         if let Some(agent) = agent {
                             agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
                             state = AgentState::Unknown;
@@ -3092,6 +3101,12 @@ impl PaneRuntime {
                                         &terminal,
                                         previous_agent,
                                     );
+                                    // OMP reply anchors reset at their in-stream session
+                                    // boundary; clearing them while entering OMP would
+                                    // race its replay.
+                                    if should_clear_omp_reply_anchors_after_agent_change(agent) {
+                                        terminal.clear_omp_reply_anchors();
+                                    }
                                     if let Some(agent) = agent {
                                         agent_startup_grace_until =
                                             Some(now + AGENT_STARTUP_GRACE_WINDOW);
@@ -3386,6 +3401,14 @@ impl PaneRuntime {
     /// Set scrollback offset measured from the live bottom of the terminal.
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         self.terminal.set_scroll_offset_from_bottom(lines);
+    }
+
+    pub fn jump_to_previous_semantic_prompt(&self) -> bool {
+        self.terminal.jump_to_previous_semantic_prompt()
+    }
+
+    pub fn jump_to_next_semantic_prompt(&self) -> bool {
+        self.terminal.jump_to_next_semantic_prompt()
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
@@ -3876,6 +3899,17 @@ impl PaneRuntime {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_non_omp_agent_changes_clear_reply_anchors() {
+        assert!(!should_clear_omp_reply_anchors_after_agent_change(Some(
+            Agent::Omp
+        )));
+        assert!(should_clear_omp_reply_anchors_after_agent_change(None));
+        assert!(should_clear_omp_reply_anchors_after_agent_change(Some(
+            Agent::Codex
+        )));
+    }
+
     #[cfg(unix)]
     fn handoff_test_state(
         child_pid: u32,
@@ -3938,12 +3972,12 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let master_fd =
-            crate::pty::fd::duplicate_cloexec_fd(pair.master.as_raw_fd().expect("PTY master fd"))
-                .unwrap();
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.args(["-c", "printf %s \"$1\"", "herdr-test", output]);
         let child = pair.slave.spawn_command(cmd).unwrap();
+        let master_fd =
+            crate::pty::fd::duplicate_cloexec_fd(pair.master.as_raw_fd().expect("PTY master fd"))
+                .unwrap();
         state.child_pid = child.process_id().expect("child pid");
         drop(pair);
 

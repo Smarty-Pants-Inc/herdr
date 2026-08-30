@@ -33,8 +33,8 @@ use super::{
         maybe_filter_primary_screen_scrollback_clear, parse_reported_cwd,
         restore_host_terminal_theme_if_needed, write_host_terminal_theme_selective,
         AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
-        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker, RemoteExecReady,
-        RemoteExecReadyFilter, ReportedCwd,
+        DefaultColorQuery, DefaultColorTrackedEvent, OscDebugTracker, PendingOmpReplyAnchor,
+        RemoteExecReady, RemoteExecReadyFilter, ReportedCwd,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -208,6 +208,7 @@ pub(crate) struct GhosttyPaneTerminal {
 pub(crate) struct GhosttyPaneCore {
     pub terminal: crate::ghostty::Terminal,
     content_generation: u64,
+    semantic_reply_anchor: Option<Vec<u8>>,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -291,6 +292,14 @@ impl PaneTerminal {
 
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         self.ghostty.set_scroll_offset_from_bottom(lines);
+    }
+
+    pub fn jump_to_previous_semantic_prompt(&self) -> bool {
+        self.ghostty.jump_to_previous_semantic_prompt()
+    }
+
+    pub fn jump_to_next_semantic_prompt(&self) -> bool {
+        self.ghostty.jump_to_next_semantic_prompt()
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
@@ -712,6 +721,10 @@ impl PaneTerminal {
     /// Clears retained OSC title/progress evidence on foreground agent change.
     pub fn clear_agent_osc_state(&self) {
         self.ghostty.clear_agent_osc_state()
+    }
+
+    pub fn clear_omp_reply_anchors(&self) {
+        self.ghostty.clear_omp_reply_anchors()
     }
 
     pub fn keyboard_protocol(
@@ -1382,6 +1395,7 @@ impl GhosttyPaneTerminal {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
                 content_generation: 0,
+                semantic_reply_anchor: None,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1548,6 +1562,13 @@ impl GhosttyPaneTerminal {
             core.agent_osc_state.clear_retained();
         }
     }
+
+    pub fn clear_omp_reply_anchors(&self) {
+        if let Ok(mut core) = self.core.lock() {
+            core.agent_osc_state.clear_omp_reply_anchors();
+            core.semantic_reply_anchor = None;
+        }
+    }
     #[cfg(unix)]
     fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
         self.core
@@ -1620,7 +1641,6 @@ impl GhosttyPaneTerminal {
                 "agent OSC evidence observed"
             );
         }
-        let terminal_title_changed = core.agent_osc_state.observe(bytes.as_ref());
 
         let alternate_screen = core
             .terminal
@@ -1647,6 +1667,14 @@ impl GhosttyPaneTerminal {
             );
         }
 
+        let agent_osc_observation = core
+            .agent_osc_state
+            .observe_on_screen(filtered_bytes.as_ref(), alternate_screen);
+        if agent_osc_observation.reset_reply_selection {
+            core.semantic_reply_anchor = None;
+        }
+        let terminal_title_changed = agent_osc_observation.terminal_title_changed;
+
         core.kitty_keyboard.observe(filtered_bytes.as_ref());
         let mut terminal_responses = Vec::new();
         core.default_color_event_tracker
@@ -1664,6 +1692,7 @@ impl GhosttyPaneTerminal {
             default_color_events,
             in_progress_default_color_event,
             xtgettcap_responses,
+            agent_osc_observation.reply_anchor_events,
             &mut terminal_responses,
         );
         if !filtered_bytes.is_empty() {
@@ -1748,20 +1777,28 @@ impl GhosttyPaneTerminal {
         default_color_events: Vec<DefaultColorTrackedEvent>,
         in_progress_default_color_event: Option<DefaultColorEvent>,
         xtgettcap_responses: Vec<XtgettcapResponse>,
+        reply_anchor_events: Vec<PendingOmpReplyAnchor>,
         terminal_responses: &mut Vec<Bytes>,
     ) {
-        let mut events = Vec::with_capacity(default_color_events.len() + xtgettcap_responses.len());
+        let mut events = Vec::with_capacity(
+            default_color_events.len() + xtgettcap_responses.len() + reply_anchor_events.len(),
+        );
         events.extend(
             default_color_events
                 .into_iter()
-                .map(OrderedPtyResponseEvent::DefaultColor),
+                .map(OrderedPtyWriteEvent::DefaultColor),
         );
         events.extend(
             xtgettcap_responses
                 .into_iter()
-                .map(OrderedPtyResponseEvent::Xtgettcap),
+                .map(OrderedPtyWriteEvent::Xtgettcap),
         );
-        events.sort_by_key(OrderedPtyResponseEvent::end_offset);
+        events.extend(
+            reply_anchor_events
+                .into_iter()
+                .map(OrderedPtyWriteEvent::ReplyAnchor),
+        );
+        events.sort_by_key(|event| (event.end_offset(), event.priority()));
 
         let mut written = 0;
         for event in events {
@@ -1773,7 +1810,7 @@ impl GhosttyPaneTerminal {
                 written = end_offset;
             }
             match event {
-                OrderedPtyResponseEvent::DefaultColor(event) => {
+                OrderedPtyWriteEvent::DefaultColor(event) => {
                     let replacement = respond_to_default_color_event(core, event.event);
                     if replacement.is_some() {
                         remove_last_matching_libghostty_color_reply(
@@ -1784,9 +1821,14 @@ impl GhosttyPaneTerminal {
                     terminal_responses.extend(libghostty_responses);
                     terminal_responses.extend(replacement);
                 }
-                OrderedPtyResponseEvent::Xtgettcap(response) => {
+                OrderedPtyWriteEvent::Xtgettcap(response) => {
                     terminal_responses.extend(libghostty_responses);
                     terminal_responses.push(response.bytes);
+                }
+                OrderedPtyWriteEvent::ReplyAnchor(event) => {
+                    core.agent_osc_state
+                        .register_omp_reply_anchor(event, &core.terminal);
+                    terminal_responses.extend(libghostty_responses);
                 }
             }
         }
@@ -2000,18 +2042,21 @@ impl GhosttyPaneTerminal {
         if let Ok(mut core) = self.core.lock() {
             #[cfg(windows)]
             windows_recent_fallback::refresh_if_needed(&mut core);
+            core.semantic_reply_anchor = None;
             core.terminal.scroll_viewport_delta(-(lines as isize));
         }
     }
 
     pub fn scroll_down(&self, lines: usize) {
         if let Ok(mut core) = self.core.lock() {
+            core.semantic_reply_anchor = None;
             core.terminal.scroll_viewport_delta(lines as isize);
         }
     }
 
     pub fn scroll_reset(&self) {
         if let Ok(mut core) = self.core.lock() {
+            core.semantic_reply_anchor = None;
             core.terminal.scroll_viewport_bottom();
         }
     }
@@ -2020,8 +2065,83 @@ impl GhosttyPaneTerminal {
         if let Ok(mut core) = self.core.lock() {
             #[cfg(windows)]
             windows_recent_fallback::refresh_if_needed(&mut core);
+            core.semantic_reply_anchor = None;
             ghostty_set_scroll_offset_from_bottom(&mut core.terminal, lines);
         }
+    }
+
+    pub fn jump_to_previous_semantic_prompt(&self) -> bool {
+        self.jump_to_semantic_prompt(true)
+    }
+
+    pub fn jump_to_next_semantic_prompt(&self) -> bool {
+        self.jump_to_semantic_prompt(false)
+    }
+
+    fn jump_to_semantic_prompt(&self, previous: bool) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if core.terminal.active_screen().ok() != Some(crate::ghostty::ActiveScreen::Primary) {
+            return false;
+        }
+        #[cfg(windows)]
+        windows_recent_fallback::refresh_if_needed(&mut core);
+        let Ok(scrollbar) = core.terminal.scrollbar() else {
+            return false;
+        };
+        let total_rows = scrollbar.total;
+        if total_rows == 0 {
+            core.agent_osc_state.clear_omp_reply_anchors();
+            core.semantic_reply_anchor = None;
+            return false;
+        }
+        let reply_rows = core.agent_osc_state.omp_reply_anchor_rows();
+        if reply_rows.is_empty() {
+            core.semantic_reply_anchor = None;
+            return false;
+        }
+
+        let selected_index = core.semantic_reply_anchor.as_deref().and_then(|anchor_id| {
+            reply_rows
+                .iter()
+                .position(|(id, _)| id.as_slice() == anchor_id)
+        });
+        if core.semantic_reply_anchor.is_some() && selected_index.is_none() {
+            core.semantic_reply_anchor = None;
+        }
+
+        let at_bottom = scrollbar.offset.saturating_add(scrollbar.len) >= total_rows;
+        let target_index = match selected_index {
+            Some(index) if previous => index.checked_sub(1),
+            Some(index) => (index + 1 < reply_rows.len()).then_some(index + 1),
+            None if previous => {
+                let end = if at_bottom {
+                    total_rows
+                } else {
+                    scrollbar.offset.saturating_add(1).min(total_rows)
+                };
+                (0..reply_rows.len())
+                    .rev()
+                    .find(|index| reply_rows[*index].1 < end)
+            }
+            None => {
+                let start = if at_bottom {
+                    total_rows
+                } else {
+                    scrollbar.offset.saturating_add(1).min(total_rows)
+                };
+                (0..reply_rows.len()).find(|index| reply_rows[*index].1 >= start)
+            }
+        };
+        let Some(target_index) = target_index else {
+            return true;
+        };
+        let (anchor_id, row) = &reply_rows[target_index];
+        let max_offset = total_rows.saturating_sub(scrollbar.len);
+        core.terminal.scroll_viewport_row((*row).min(max_offset));
+        core.semantic_reply_anchor = Some(anchor_id.clone());
+        true
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
@@ -3564,16 +3684,25 @@ fn ghostty_cell_style(
 }
 
 #[derive(Debug)]
-enum OrderedPtyResponseEvent {
+enum OrderedPtyWriteEvent {
     DefaultColor(DefaultColorTrackedEvent),
     Xtgettcap(XtgettcapResponse),
+    ReplyAnchor(PendingOmpReplyAnchor),
 }
 
-impl OrderedPtyResponseEvent {
+impl OrderedPtyWriteEvent {
     fn end_offset(&self) -> usize {
         match self {
             Self::DefaultColor(event) => event.end_offset,
             Self::Xtgettcap(response) => response.end_offset,
+            Self::ReplyAnchor(event) => event.end_offset,
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self {
+            Self::DefaultColor(_) | Self::Xtgettcap(_) => 0,
+            Self::ReplyAnchor(_) => 1,
         }
     }
 }
@@ -3977,6 +4106,152 @@ mod tests {
             terminal.write(format!("WRAP-{i:03}-abcdefghijklmnopqrstuvwxyz\r\n").as_bytes());
         }
         terminal.write(b"END");
+    }
+
+    fn omp_reply_pane(
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> (GhosttyPaneTerminal, mpsc::Sender<Bytes>) {
+        let (tx, _rx) = mpsc::channel(64);
+        let terminal = crate::ghostty::Terminal::new(cols, rows, scrollback).expect("terminal");
+        (
+            GhosttyPaneTerminal::new(terminal, tx.clone()).expect("pane terminal"),
+            tx,
+        )
+    }
+
+    fn write_omp_reply(
+        pane: &GhosttyPaneTerminal,
+        tx: &mpsc::Sender<Bytes>,
+        session: &str,
+        id: &str,
+        text: &str,
+    ) {
+        let bytes = format!(
+            "\x1b]133;A;aid=omp-response-{session}:{id}\x07{text}\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n"
+        );
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, bytes.as_bytes(), tx);
+    }
+
+    fn write_reply_tail(pane: &GhosttyPaneTerminal, tx: &mpsc::Sender<Bytes>) {
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"tail a\r\ntail b\r\ntail c\r\ntail d\r\ntail e\r\n",
+            tx,
+        );
+    }
+
+    fn reply_viewport_top(pane: &GhosttyPaneTerminal) -> String {
+        pane.visible_text()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn omp_reply_navigation_tracks_more_than_128_rows() {
+        let (pane, tx) = omp_reply_pane(40, 4, 1024);
+
+        for index in 0..129 {
+            write_omp_reply(
+                &pane,
+                &tx,
+                "run-a",
+                &format!("reply-{index:03}"),
+                &format!("reply {index:03}"),
+            );
+        }
+        write_reply_tail(&pane, &tx);
+        let tracked_rows = pane
+            .core
+            .lock()
+            .expect("pane core")
+            .agent_osc_state
+            .omp_reply_anchor_rows();
+        assert_eq!(tracked_rows.len(), 129, "tracked rows: {tracked_rows:?}");
+
+        for index in (0..129).rev() {
+            assert!(pane.jump_to_previous_semantic_prompt());
+            assert_eq!(reply_viewport_top(&pane), format!("reply {index:03}"));
+        }
+    }
+
+    #[test]
+    fn omp_reply_navigation_ignores_shell_and_alternate_screen_aids() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]133;A\x07shell prompt\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
+\x1b[?1049h\x1b]133;A;aid=omp-response-run-a:alternate\x07alternate reply\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?1049l",
+            &tx,
+        );
+        write_omp_reply(&pane, &tx, "run-a", "reply-1", "reply one");
+        write_omp_reply(&pane, &tx, "run-a", "reply-2", "reply two");
+        write_reply_tail(&pane, &tx);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply two");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply one");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply one");
+    }
+
+    #[test]
+    fn omp_reply_anchor_resets_for_session_rollover_and_split_ed3() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&pane, &tx, "run-a", "old", "old reply");
+        write_omp_reply(&pane, &tx, "run-b", "fresh", "fresh reply");
+        write_reply_tail(&pane, &tx);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "fresh reply");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "fresh reply");
+
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\x1b[3", &tx);
+        let fresh_after_clear = b"J\x1b]133;A;aid=omp-response-run-b:after-clear\x07after clear\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n";
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, fresh_after_clear, &tx);
+        write_reply_tail(&pane, &tx);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "after clear");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "after clear");
+    }
+
+    #[test]
+    fn omp_reply_anchor_discards_invalid_rows_and_survives_reflow() {
+        let (pruned, pruned_tx) = omp_reply_pane(40, 4, 0);
+        write_omp_reply(&pruned, &pruned_tx, "run-a", "old", "old reply");
+        let filler = "filler row\r\n".repeat(3_000);
+        pruned.process_pty_bytes(PaneId::from_raw(1), 0, filler.as_bytes(), &pruned_tx);
+        assert!(
+            pruned
+                .core
+                .lock()
+                .expect("pane core")
+                .agent_osc_state
+                .omp_reply_anchor_rows()
+                .is_empty(),
+            "discarded primary rows must release their tracked anchors"
+        );
+
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        write_omp_reply(&pane, &tx, "run-a", "old", "old reply");
+        write_omp_reply(&pane, &tx, "run-a", "fresh", "fresh reply");
+        write_reply_tail(&pane, &tx);
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "fresh reply");
+
+        pane.resize(4, 20, 0, 0);
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "old reply");
     }
 
     #[test]

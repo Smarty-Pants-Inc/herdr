@@ -1048,7 +1048,11 @@ fn configured_window_title_tracks_all_tokens_and_focused_osc_only() {
         "hostname token was empty: {renamed}"
     );
 
-    send_pane_shell_command(&api_socket, &pane_id, r"printf '\033]0;⠋ building\007'");
+    send_pane_shell_command(
+        &api_socket,
+        &pane_id,
+        r"printf '\033]0;\342\240\213 building\007'",
+    );
     wait_for_window_title(&output, "|W=space-a|T=tab-a|P=pane-a|O=building");
 
     let second_tab = send_json_request(
@@ -1483,21 +1487,12 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
 
     // The client should receive a ServerShutdown message (variant 5)
     // before the connection is closed, not just an abrupt EOF.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let result = read_server_message(&mut stream);
-    match result {
-        Ok((variant, _payload)) => {
-            assert_eq!(
-                variant, 5,
-                "expected ServerShutdown (variant 5), got variant {variant}"
-            );
-        }
-        Err(e) => {
-            panic!("expected ServerShutdown message before connection close, got error: {e}");
-        }
-    }
+    let received_shutdown = wait_for_message_variant(&mut stream, Duration::from_secs(5), 5)
+        .expect("wait for ServerShutdown");
+    assert!(
+        received_shutdown,
+        "expected ServerShutdown before connection close"
+    );
 
     // Wait for the server to exit.
     spawned.close_master();

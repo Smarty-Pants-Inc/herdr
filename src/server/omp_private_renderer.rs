@@ -88,6 +88,12 @@ pub(crate) struct PrivateOmpGuest {
     bridge_ready: Arc<AtomicBool>,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    #[cfg(test)]
+    _test_input: Option<tokio_mpsc::Receiver<bytes::Bytes>>,
+    #[cfg(test)]
+    _test_outbound: Option<mpsc::Receiver<OutboundRecord>>,
+    #[cfg(test)]
+    _test_inbound: Option<mpsc::SyncSender<PrivateOmpGuestRecord>>,
 }
 
 impl PrivateOmpGuest {
@@ -146,6 +152,45 @@ impl PrivateOmpGuest {
             bridge_ready,
             bridge_failed,
             shutting_down,
+            #[cfg(test)]
+            _test_input: None,
+            #[cfg(test)]
+            _test_outbound: None,
+            #[cfg(test)]
+            _test_inbound: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_test_stub(config: PrivateOmpGuestConfig) -> io::Result<Self> {
+        config.omp_executable.verify().map_err(io::Error::other)?;
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0")?);
+        listener.set_nonblocking(true)?;
+        let (runtime, test_input) = TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            config.cols,
+            config.rows,
+            config.scrollback_limit_bytes,
+            &[],
+            4,
+        );
+        let (outbound, test_outbound) = mpsc::sync_channel(OUTBOUND_QUEUE_CAPACITY);
+        let (test_inbound, inbound) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
+        Ok(Self {
+            route: config.route,
+            runtime_pane_id: config.pane_id,
+            attachment_epoch: AtomicU64::new(config.attachment_epoch),
+            controller: AtomicBool::new(config.controller),
+            runtime: Some(runtime),
+            _listener: listener,
+            guest: Arc::new(Mutex::new(None)),
+            outbound,
+            inbound,
+            bridge_ready: Arc::new(AtomicBool::new(false)),
+            bridge_failed: Arc::new(AtomicBool::new(false)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            _test_input: Some(test_input),
+            _test_outbound: Some(test_outbound),
+            _test_inbound: Some(test_inbound),
         })
     }
 
@@ -201,6 +246,13 @@ impl PrivateOmpGuest {
     #[cfg(test)]
     pub(crate) fn test_set_bridge_ready(&self) {
         self.bridge_ready.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_input_is_empty(&mut self) -> bool {
+        self._test_input
+            .as_mut()
+            .is_none_or(|input| input.try_recv().is_err())
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.

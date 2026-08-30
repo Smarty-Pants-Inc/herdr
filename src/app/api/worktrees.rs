@@ -1329,7 +1329,6 @@ mod tests {
         let event_hub = crate::api::EventHub::default();
         let mut app = test_app_with_event_hub(event_hub.clone());
         app.state.worktree_directory = worktree_root.clone();
-        app.state.default_shell = test_shell().into();
 
         let response = run_deferred_api_request(
             &mut app,

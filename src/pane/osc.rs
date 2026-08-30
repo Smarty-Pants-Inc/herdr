@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -562,78 +563,82 @@ impl OscStreamCollector {
 
     fn observe(&mut self, bytes: &[u8], mut receive: impl FnMut(&[u8])) {
         for &byte in bytes {
-            match self.state {
-                OscStreamState::Ground => {
-                    if byte == 0x1b {
-                        self.state = OscStreamState::Escape;
-                    }
+            self.observe_byte(byte, &mut receive);
+        }
+    }
+
+    fn observe_byte(&mut self, byte: u8, receive: &mut impl FnMut(&[u8])) {
+        match self.state {
+            OscStreamState::Ground => {
+                if byte == 0x1b {
+                    self.state = OscStreamState::Escape;
                 }
-                OscStreamState::Escape => match byte {
-                    b']' => {
-                        self.body.clear();
-                        self.state = OscStreamState::Body;
-                    }
-                    0x1b => self.state = OscStreamState::Escape,
-                    byte if is_ignored_string_intro(byte) => {
-                        self.state = OscStreamState::IgnoringString;
-                    }
-                    _ => self.state = OscStreamState::Ground,
-                },
-                OscStreamState::Body => match byte {
-                    0x07 => self.finish(&mut receive),
-                    0x1b => self.state = OscStreamState::BodyEscape,
-                    _ => self.push(byte),
-                },
-                OscStreamState::BodyEscape => match byte {
-                    b'\\' => self.finish(&mut receive),
-                    0x07 => {
-                        self.push(0x1b);
-                        if matches!(self.state, OscStreamState::Body) {
-                            self.finish(&mut receive);
-                        } else {
-                            self.state = OscStreamState::Ground;
-                        }
-                    }
-                    0x1b => {
-                        self.push(0x1b);
-                        self.state = match self.state {
-                            OscStreamState::Body => OscStreamState::BodyEscape,
-                            OscStreamState::Discarding => OscStreamState::DiscardingEscape,
-                            state => state,
-                        };
-                    }
-                    _ => {
-                        self.push(0x1b);
-                        if matches!(self.state, OscStreamState::Body) {
-                            self.push(byte);
-                        }
-                    }
-                },
-                OscStreamState::IgnoringString => {
-                    if byte == 0x1b {
-                        self.state = OscStreamState::IgnoringStringEscape;
-                    }
+            }
+            OscStreamState::Escape => match byte {
+                b']' => {
+                    self.body.clear();
+                    self.state = OscStreamState::Body;
                 }
-                OscStreamState::IgnoringStringEscape => {
-                    if byte == b'\\' {
+                0x1b => self.state = OscStreamState::Escape,
+                byte if is_ignored_string_intro(byte) => {
+                    self.state = OscStreamState::IgnoringString;
+                }
+                _ => self.state = OscStreamState::Ground,
+            },
+            OscStreamState::Body => match byte {
+                0x07 => self.finish(receive),
+                0x1b => self.state = OscStreamState::BodyEscape,
+                _ => self.push(byte),
+            },
+            OscStreamState::BodyEscape => match byte {
+                b'\\' => self.finish(receive),
+                0x07 => {
+                    self.push(0x1b);
+                    if matches!(self.state, OscStreamState::Body) {
+                        self.finish(receive);
+                    } else {
                         self.state = OscStreamState::Ground;
-                    } else if byte != 0x1b {
-                        self.state = OscStreamState::IgnoringString;
                     }
                 }
-                OscStreamState::Discarding => {
-                    if byte == 0x07 {
-                        self.state = OscStreamState::Ground;
-                    } else if byte == 0x1b {
-                        self.state = OscStreamState::DiscardingEscape;
+                0x1b => {
+                    self.push(0x1b);
+                    self.state = match self.state {
+                        OscStreamState::Body => OscStreamState::BodyEscape,
+                        OscStreamState::Discarding => OscStreamState::DiscardingEscape,
+                        state => state,
+                    };
+                }
+                _ => {
+                    self.push(0x1b);
+                    if matches!(self.state, OscStreamState::Body) {
+                        self.push(byte);
                     }
                 }
-                OscStreamState::DiscardingEscape => {
-                    if byte == b'\\' {
-                        self.state = OscStreamState::Ground;
-                    } else if byte != 0x1b {
-                        self.state = OscStreamState::Discarding;
-                    }
+            },
+            OscStreamState::IgnoringString => {
+                if byte == 0x1b {
+                    self.state = OscStreamState::IgnoringStringEscape;
+                }
+            }
+            OscStreamState::IgnoringStringEscape => {
+                if byte == b'\\' {
+                    self.state = OscStreamState::Ground;
+                } else if byte != 0x1b {
+                    self.state = OscStreamState::IgnoringString;
+                }
+            }
+            OscStreamState::Discarding => {
+                if byte == 0x07 {
+                    self.state = OscStreamState::Ground;
+                } else if byte == 0x1b {
+                    self.state = OscStreamState::DiscardingEscape;
+                }
+            }
+            OscStreamState::DiscardingEscape => {
+                if byte == b'\\' {
+                    self.state = OscStreamState::Ground;
+                } else if byte != 0x1b {
+                    self.state = OscStreamState::Discarding;
                 }
             }
         }
@@ -656,9 +661,136 @@ impl OscStreamCollector {
     }
 }
 
+/// Tracks the small subset of terminal control state needed to discard OSC 133
+/// reply markers from alternate screens and to reset anchors before primary ED3.
+#[derive(Debug, Default)]
+struct PrimaryScreenEscapeTracker {
+    alternate_screen: bool,
+    state: PrimaryScreenEscapeState,
+}
+
+#[derive(Debug, Default)]
+enum PrimaryScreenEscapeState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+    CsiDiscard,
+    String,
+    StringEscape,
+}
+
+impl PrimaryScreenEscapeTracker {
+    const MAX_CSI_BYTES: usize = 32;
+
+    fn set_alternate_screen(&mut self, alternate_screen: bool) {
+        self.alternate_screen = alternate_screen;
+    }
+
+    fn alternate_screen(&self) -> bool {
+        self.alternate_screen
+    }
+
+    /// Returns true only for a primary-screen ED3 that has fully arrived.
+    fn observe(&mut self, byte: u8) -> bool {
+        match &mut self.state {
+            PrimaryScreenEscapeState::Ground => {
+                if byte == 0x1b {
+                    self.state = PrimaryScreenEscapeState::Escape;
+                }
+            }
+            PrimaryScreenEscapeState::Escape => match byte {
+                b'[' => self.state = PrimaryScreenEscapeState::Csi(Vec::new()),
+                b']' | b'P' | b'_' | b'^' | b'X' => {
+                    self.state = PrimaryScreenEscapeState::String;
+                }
+                0x1b => {}
+                _ => self.state = PrimaryScreenEscapeState::Ground,
+            },
+            PrimaryScreenEscapeState::Csi(params) => {
+                if byte == 0x1b {
+                    self.state = PrimaryScreenEscapeState::Escape;
+                } else if (0x40..=0x7e).contains(&byte) {
+                    let params = std::mem::take(params);
+                    self.state = PrimaryScreenEscapeState::Ground;
+                    return apply_primary_screen_csi(&params, byte, &mut self.alternate_screen);
+                } else if (0x20..=0x3f).contains(&byte) {
+                    if params.len() < Self::MAX_CSI_BYTES {
+                        params.push(byte);
+                    } else {
+                        self.state = PrimaryScreenEscapeState::CsiDiscard;
+                    }
+                } else {
+                    self.state = PrimaryScreenEscapeState::Ground;
+                }
+            }
+            PrimaryScreenEscapeState::CsiDiscard => {
+                if byte == 0x1b {
+                    self.state = PrimaryScreenEscapeState::Escape;
+                } else if (0x40..=0x7e).contains(&byte) {
+                    self.state = PrimaryScreenEscapeState::Ground;
+                }
+            }
+            PrimaryScreenEscapeState::String => match byte {
+                0x07 => self.state = PrimaryScreenEscapeState::Ground,
+                0x1b => self.state = PrimaryScreenEscapeState::StringEscape,
+                _ => {}
+            },
+            PrimaryScreenEscapeState::StringEscape => {
+                if byte == b'\\' {
+                    self.state = PrimaryScreenEscapeState::Ground;
+                } else if byte != 0x1b {
+                    self.state = PrimaryScreenEscapeState::String;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn apply_primary_screen_csi(params: &[u8], final_byte: u8, alternate_screen: &mut bool) -> bool {
+    if matches!(final_byte, b'h' | b'l') && params.first() == Some(&b'?') {
+        let alternate_mode = params[1..]
+            .split(|byte| *byte == b';')
+            .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"));
+        if alternate_mode {
+            *alternate_screen = final_byte == b'h';
+        }
+    }
+    final_byte == b'J' && !*alternate_screen && matches!(params, b"3" | b"?3")
+}
+
 /// Maximum retained string length for agent OSC title and progress payloads.
 /// Title text is untrusted model output; cap it to bound memory and log size.
 const AGENT_OSC_MAX_CHARS: usize = 256;
+
+/// Maximum retained reply ID length. The pending queue lives only for the
+/// current PTY buffer, so its total allocation is bounded by that buffer.
+const OMP_REPLY_ANCHOR_MAX_BYTES: usize = 256;
+
+#[derive(Debug)]
+pub(super) struct PendingOmpReplyAnchor {
+    pub(super) end_offset: usize,
+    pub(super) anchor_id: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct AgentOscObservation {
+    pub(super) terminal_title_changed: bool,
+    pub(super) reply_anchor_events: Vec<PendingOmpReplyAnchor>,
+    pub(super) reset_reply_selection: bool,
+}
+
+#[derive(Debug)]
+struct OmpReplyAnchor {
+    id: Vec<u8>,
+    row: crate::ghostty::TrackedGridRef,
+}
+
+struct OmpReplyAid<'a> {
+    session: &'a [u8],
+    id: &'a [u8],
+}
 
 /// Always-on tracker that retains the latest OSC 0/2 title and OSC 9 progress
 /// payload emitted by the child process. Nothing here affects rendering; this
@@ -674,37 +806,138 @@ pub(super) struct AgentOscStateTracker {
     latest_title: Option<String>,
     terminal_title: Option<String>,
     latest_progress: Option<String>,
+    primary_screen_escapes: PrimaryScreenEscapeTracker,
+    omp_reply_session: Option<Vec<u8>>,
+    omp_reply_anchors: VecDeque<OmpReplyAnchor>,
 }
 
 impl AgentOscStateTracker {
-    pub(super) fn observe(&mut self, bytes: &[u8]) -> bool {
-        let (collector, latest_title, terminal_title, latest_progress) = (
+    #[cfg(test)]
+    pub(super) fn observe(&mut self, bytes: &[u8]) -> AgentOscObservation {
+        self.observe_on_screen(bytes, false)
+    }
+
+    pub(super) fn observe_on_screen(
+        &mut self,
+        bytes: &[u8],
+        alternate_screen: bool,
+    ) -> AgentOscObservation {
+        self.drop_pruned_omp_reply_anchors();
+        self.primary_screen_escapes
+            .set_alternate_screen(alternate_screen);
+
+        let (
+            collector,
+            latest_title,
+            terminal_title,
+            latest_progress,
+            primary_screen_escapes,
+            omp_reply_session,
+            omp_reply_anchors,
+        ) = (
             &mut self.collector,
             &mut self.latest_title,
             &mut self.terminal_title,
             &mut self.latest_progress,
+            &mut self.primary_screen_escapes,
+            &mut self.omp_reply_session,
+            &mut self.omp_reply_anchors,
         );
-        let mut terminal_title_changed = false;
-        collector.observe(bytes, |body| {
-            let Some((command, payload)) = parse_agent_osc_body(body) else {
-                return;
-            };
-            match command {
-                b"0" | b"2" => {
-                    let title = sanitize_agent_osc_string(payload, AGENT_OSC_MAX_CHARS);
-                    let title = (!title.is_empty()).then_some(title);
-                    terminal_title_changed |= *terminal_title != title;
-                    *terminal_title = title.clone();
-                    *latest_title = title;
-                }
-                b"9" => {
-                    *latest_progress =
-                        Some(sanitize_agent_osc_string(payload, AGENT_OSC_MAX_CHARS));
-                }
-                _ => {}
+        let mut observation = AgentOscObservation::default();
+        let mut queued_anchor_ids: Vec<Vec<u8>> = Vec::new();
+
+        for (index, &byte) in bytes.iter().enumerate() {
+            if primary_screen_escapes.observe(byte) {
+                omp_reply_anchors.clear();
+                observation.reply_anchor_events.clear();
+                queued_anchor_ids.clear();
+                observation.reset_reply_selection = true;
             }
+            collector.observe_byte(byte, &mut |body| {
+                let Some((command, payload)) = parse_agent_osc_body(body) else {
+                    return;
+                };
+                match command {
+                    b"0" | b"2" => {
+                        let title = sanitize_agent_osc_string(payload, AGENT_OSC_MAX_CHARS);
+                        let title = (!title.is_empty()).then_some(title);
+                        observation.terminal_title_changed |= *terminal_title != title;
+                        *terminal_title = title.clone();
+                        *latest_title = title;
+                    }
+                    b"9" => {
+                        *latest_progress =
+                            Some(sanitize_agent_osc_string(payload, AGENT_OSC_MAX_CHARS));
+                    }
+                    b"133" if !primary_screen_escapes.alternate_screen() => {
+                        let Some(aid) = omp_reply_anchor(payload) else {
+                            return;
+                        };
+                        if omp_reply_session.as_deref() != Some(aid.session) {
+                            // The process-session boundary is ordered with this OSC byte stream,
+                            // so a delayed detector cannot erase the new generation afterward.
+                            omp_reply_anchors.clear();
+                            *omp_reply_session = Some(aid.session.to_vec());
+                            observation.reply_anchor_events.clear();
+                            queued_anchor_ids.clear();
+                            observation.reset_reply_selection = true;
+                        }
+                        if !omp_reply_anchors
+                            .iter()
+                            .any(|anchor| anchor.id.as_slice() == aid.id)
+                            && !queued_anchor_ids.iter().any(|id| id.as_slice() == aid.id)
+                        {
+                            let anchor_id = aid.id.to_vec();
+                            queued_anchor_ids.push(anchor_id.clone());
+                            observation.reply_anchor_events.push(PendingOmpReplyAnchor {
+                                end_offset: index + 1,
+                                anchor_id,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        observation
+    }
+
+    pub(super) fn register_omp_reply_anchor(
+        &mut self,
+        event: PendingOmpReplyAnchor,
+        terminal: &crate::ghostty::Terminal,
+    ) {
+        self.drop_pruned_omp_reply_anchors();
+
+        if self
+            .omp_reply_anchors
+            .iter()
+            .any(|anchor| anchor.id == event.anchor_id)
+        {
+            return;
+        }
+        let Ok(Some(row)) = terminal.track_active_primary_prompt_row() else {
+            return;
+        };
+        self.omp_reply_anchors.push_back(OmpReplyAnchor {
+            id: event.anchor_id,
+            row,
         });
-        terminal_title_changed
+    }
+
+    pub(super) fn omp_reply_anchor_rows(&mut self) -> Vec<(Vec<u8>, usize)> {
+        let mut rows = Vec::with_capacity(self.omp_reply_anchors.len());
+        self.omp_reply_anchors.retain(|anchor| {
+            if !anchor.row.is_primary_prompt() {
+                return false;
+            }
+            let Some(row) = anchor.row.screen_row() else {
+                return false;
+            };
+            rows.push((anchor.id.clone(), row));
+            true
+        });
+        rows
     }
 
     pub(super) fn terminal_title(&self) -> Option<&str> {
@@ -717,7 +950,7 @@ impl AgentOscStateTracker {
     }
 
     /// Returns the latest retained OSC title, or `""` if none has been seen or
-    /// the last title was an empty clear.
+    /// the last update was an empty clear.
     #[allow(dead_code)] // used by terminal.rs; full call chain wired in Stage C
     pub(super) fn latest_title(&self) -> &str {
         self.latest_title.as_deref().unwrap_or("")
@@ -727,6 +960,25 @@ impl AgentOscStateTracker {
     #[allow(dead_code)] // used by terminal.rs; full call chain wired in Stage C
     pub(super) fn latest_progress(&self) -> &str {
         self.latest_progress.as_deref().unwrap_or("")
+    }
+
+    pub(super) fn clear_omp_reply_anchors(&mut self) {
+        self.omp_reply_session = None;
+        self.omp_reply_anchors.clear();
+    }
+
+    fn drop_pruned_omp_reply_anchors(&mut self) {
+        // Page-list pruning is chronological, so checking and removing from
+        // the head keeps ordinary PTY writes constant-time. A terminal can
+        // also recycle a visible row without making its pin garbage; require
+        // its original prompt semantic to remain intact in that case.
+        while self
+            .omp_reply_anchors
+            .front()
+            .is_some_and(|anchor| !anchor.row.has_value() || !anchor.row.is_primary_prompt())
+        {
+            self.omp_reply_anchors.pop_front();
+        }
     }
 
     /// Drops the retained title and progress so a new foreground agent cannot
@@ -744,6 +996,28 @@ impl AgentOscStateTracker {
 fn parse_agent_osc_body(body: &[u8]) -> Option<(&[u8], &[u8])> {
     let sep = body.iter().position(|&b| b == b';')?;
     Some((&body[..sep], &body[sep + 1..]))
+}
+
+fn omp_reply_anchor(payload: &[u8]) -> Option<OmpReplyAid<'_>> {
+    let mut fields = payload.split(|byte| *byte == b';');
+    if fields.next() != Some(b"A".as_slice()) {
+        return None;
+    }
+    let id = fields.find_map(|field| field.strip_prefix(b"aid=omp-response-"))?;
+    let separator = id.iter().position(|byte| *byte == b':')?;
+    let (session, durable_id) = id.split_at(separator);
+    let durable_id = &durable_id[1..];
+    (id.len() <= OMP_REPLY_ANCHOR_MAX_BYTES
+        && safe_omp_reply_id_part(session)
+        && safe_omp_reply_id_part(durable_id))
+    .then_some(OmpReplyAid { session, id })
+}
+
+fn safe_omp_reply_id_part(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn sanitize_agent_osc_string(payload: &[u8], max_chars: usize) -> String {
@@ -1377,6 +1651,72 @@ mod tests {
         assert_eq!(t.latest_progress(), "");
         t.observe(b";\x07");
         assert_eq!(t.latest_progress(), "4;3;");
+    }
+
+    #[test]
+    fn agent_osc_queues_unique_safe_reply_aids_by_process_session() {
+        let mut tracker = AgentOscStateTracker::default();
+
+        let first = tracker.observe(
+            b"\x1b]133;A;aid=omp-response-run-a:reply-1\x07\x1b]133;A;redraw=1;aid=omp-response-run-a:reply-1\x1b\\\
+              \x1b]133;A;aid=omp-response-run-a:reply-2\x07",
+        );
+        assert!(first.reset_reply_selection);
+        assert_eq!(
+            first
+                .reply_anchor_events
+                .iter()
+                .map(|event| event.anchor_id.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"run-a:reply-1".as_slice(), b"run-a:reply-2".as_slice()]
+        );
+
+        let replacement = tracker.observe(b"\x1b]133;A;aid=omp-response-run-b:reply-1\x07");
+        assert!(replacement.reset_reply_selection);
+        assert_eq!(
+            replacement
+                .reply_anchor_events
+                .iter()
+                .map(|event| event.anchor_id.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"run-b:reply-1".as_slice()]
+        );
+    }
+
+    #[test]
+    fn agent_osc_discards_alternate_aids_and_resets_before_same_or_split_ed3_replay() {
+        let mut tracker = AgentOscStateTracker::default();
+        let alternate = tracker.observe_on_screen(
+            b"\x1b[?1049h\x1b]133;A;aid=omp-response-forged:reply-1\x07\x1b[?1049l",
+            false,
+        );
+        assert!(alternate.reply_anchor_events.is_empty());
+        assert!(!alternate.reset_reply_selection);
+
+        let same_buffer = tracker.observe(
+            b"\x1b]133;A;aid=omp-response-run-a:old\x07\x1b[3J\x1b]133;A;aid=omp-response-run-a:fresh\x07",
+        );
+        assert!(same_buffer.reset_reply_selection);
+        assert_eq!(same_buffer.reply_anchor_events[0].anchor_id, b"run-a:fresh");
+
+        let split_start = tracker.observe(b"\x1b[3");
+        assert!(!split_start.reset_reply_selection);
+        let split_end = tracker.observe(b"J\x1b]133;A;aid=omp-response-run-a:new\x07");
+        assert!(split_end.reset_reply_selection);
+        assert_eq!(split_end.reply_anchor_events[0].anchor_id, b"run-a:new");
+
+        let oversized = format!(
+            "\x1b]133;A;aid=omp-response-run-a:{}\x07",
+            "x".repeat(OMP_REPLY_ANCHOR_MAX_BYTES)
+        );
+        assert!(tracker
+            .observe(oversized.as_bytes())
+            .reply_anchor_events
+            .is_empty());
+        assert!(tracker
+            .observe(b"\x1b]133;A;aid=omp-response-run-a:reply/unsafe\x07")
+            .reply_anchor_events
+            .is_empty());
     }
 
     #[test]
