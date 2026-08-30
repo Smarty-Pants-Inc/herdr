@@ -790,15 +790,16 @@ native resume plan for it.
 ```json
 {
   "agent_session": {
-    "source": "herdr:codex",
-    "agent": "codex",
-    "kind": "id",
-    "value": "..."
+    "source": "herdr:omp",
+    "agent": "omp",
+    "kind": "path",
+    "value": "...",
+    "resume_policy": "external"
   }
 }
 ```
 
-If no native session reference is stored, the field is omitted.
+If no session reference is stored, the field is omitted. Native session entries omit `resume_policy` to preserve the existing response shape; externally owned entries report `"resume_policy": "external"`.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 

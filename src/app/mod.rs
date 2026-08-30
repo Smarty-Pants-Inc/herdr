@@ -4348,6 +4348,61 @@ mod tests {
     }
 
     #[test]
+    fn pane_info_exposes_external_resume_policy_without_changing_native_shape() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("api-agent-session-policy")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path("/tmp/omp-session.jsonl").unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::External,
+        });
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Idle,
+                None,
+                Some(session_ref),
+                Some(1),
+            )
+            .is_some());
+
+        let external = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(
+            external.agent_session.as_ref().unwrap().resume_policy,
+            Some(crate::agent_resume::AgentResumePolicy::External)
+        );
+        assert_eq!(
+            serde_json::to_value(&external).unwrap()["agent_session"]["resume_policy"],
+            "external"
+        );
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session
+            .as_mut()
+            .unwrap()
+            .resume_policy = crate::agent_resume::AgentResumePolicy::Native;
+
+        let native = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(native.agent_session.as_ref().unwrap().resume_policy, None);
+        assert!(serde_json::to_value(&native).unwrap()["agent_session"]
+            .get("resume_policy")
+            .is_none());
+    }
+
+    #[test]
     fn tab_info_number_uses_stable_public_tab_number() {
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-tab-public-number");

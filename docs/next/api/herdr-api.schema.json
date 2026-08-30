@@ -39,6 +39,13 @@
     },
     "event": {
       "$defs": {
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSessionInfo": {
           "properties": {
             "agent": {
@@ -46,6 +53,16 @@
             },
             "kind": {
               "$ref": "#/schemas/event/$defs/AgentSessionRefKind"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "source": {
               "type": "string"
@@ -6683,6 +6700,13 @@
           ],
           "type": "object"
         },
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSessionInfo": {
           "properties": {
             "agent": {
@@ -6690,6 +6714,16 @@
             },
             "kind": {
               "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "source": {
               "type": "string"

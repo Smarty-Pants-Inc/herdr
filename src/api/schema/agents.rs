@@ -237,4 +237,6 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_policy: Option<crate::agent_resume::AgentResumePolicy>,
 }
