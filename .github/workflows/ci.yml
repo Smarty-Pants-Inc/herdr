@@ -34,7 +34,7 @@ jobs:
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
       - name: Validate PR title
-        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
+        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.login != 'mergify[bot]' || startsWith(github.head_ref, 'mergify/merge-queue/') == false) }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
