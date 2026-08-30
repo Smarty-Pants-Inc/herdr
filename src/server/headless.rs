@@ -57,7 +57,7 @@ use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
     ClientConnection, ClientConnectionMode, ClientNavigationState, DeferredRender,
-    OmpRendererTargetState,
+    NativeOmpServerGesture, OmpRendererTargetState,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -356,6 +356,8 @@ pub struct HeadlessServer {
     private_omp_test_executable: Option<PathBuf>,
     /// Fresh server-owned launch identity for each App-local native renderer offer.
     next_omp_renderer_launch_id: u64,
+    /// Fresh authority revision for each native renderer target transition.
+    next_omp_renderer_authority_revision: u64,
     omp_service: OmpService,
     /// Recent private pane ids retained to consume late or duplicate actor events.
     retired_private_pane_ids: VecDeque<crate::layout::PaneId>,
@@ -595,6 +597,7 @@ impl HeadlessServer {
             #[cfg(test)]
             private_omp_test_executable: None,
             next_omp_renderer_launch_id: 1,
+            next_omp_renderer_authority_revision: 1,
             omp_service,
             retired_private_pane_ids: VecDeque::new(),
             #[cfg(unix)]
@@ -2277,12 +2280,19 @@ impl HeadlessServer {
     fn queue_native_omp_activation(
         &self,
         client_id: u64,
+        target: &OmpRendererTargetState,
         target_message: &ServerMessage,
     ) -> Option<crate::kitty_graphics::HostGraphicsCache> {
-        let direct_cleanup = self.direct_graphics_cleanup_for_client(client_id);
+        let pane_id = target
+            .route
+            .as_ref()
+            .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+            .map(|(_, pane_id)| pane_id)?;
+        let direct_cleanup = self.direct_graphics_cleanup_for_client_pane(client_id, pane_id);
         let (next_graphics_cache, cleanup_bytes) =
-            self.prepare_client_graphics_cleanup(client_id, None, &direct_cleanup)?;
-        let retirement_messages = self.direct_graphics_retirement_messages_for_client(client_id);
+            self.prepare_client_graphics_cleanup(client_id, Some(pane_id), &direct_cleanup)?;
+        let retirement_messages =
+            self.direct_graphics_retirement_messages_for_client_pane(client_id, pane_id);
         let Some(writer) = self
             .clients
             .get(&client_id)
@@ -2304,7 +2314,7 @@ impl HeadlessServer {
         }
         serialized.extend(Self::frame_server_message(target_message).ok()?);
         let queued = if has_cleanup {
-            writer.replace_with_cleanup(serialized)
+            writer.replace_with_pane_cleanup(pane_id, serialized)
         } else {
             writer.control.send(serialized).is_ok()
         };
@@ -4256,11 +4266,18 @@ impl HeadlessServer {
             && self.omp_service.app_has_native_renderer(client_id)
     }
 
-    fn native_omp_surface_active(&self, client_id: u64) -> bool {
+    fn native_omp_surface_active_for_pane(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
         self.clients
             .get(&client_id)
             .and_then(|client| client.omp_renderer_target.as_ref())
-            .is_some_and(|target| target.surface_active)
+            .filter(|target| target.surface_active)
+            .and_then(|target| target.route.as_ref())
+            .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+            .is_some_and(|(_, target_pane)| target_pane == pane_id)
     }
 
     fn private_omp_fallback_ready(&self, client_id: u64, route: &OmpRouteKey) -> bool {
@@ -4306,17 +4323,113 @@ impl HeadlessServer {
         self.desired_private_omp_route(client_id, &routes).as_ref() == Some(route)
     }
 
-    fn allocate_omp_renderer_launch_id(&mut self) -> u64 {
+    fn allocate_omp_renderer_launch_id(&mut self) -> Option<u64> {
         let launch_id = self.next_omp_renderer_launch_id;
-        self.next_omp_renderer_launch_id = self.next_omp_renderer_launch_id.wrapping_add(1).max(1);
-        launch_id
+        self.next_omp_renderer_launch_id = launch_id.checked_add(1)?;
+        Some(launch_id)
+    }
+    fn allocate_omp_renderer_authority_revision(&mut self) -> Option<u64> {
+        let revision = self.next_omp_renderer_authority_revision;
+        self.next_omp_renderer_authority_revision = revision.checked_add(1)?;
+        Some(revision)
+    }
+    fn revoke_omp_renderer_authority(&mut self, client_id: u64) -> bool {
+        let (changed, message) = {
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                return false;
+            };
+            let had_frame_nonce = client.omp_renderer_frame_nonce.take().is_some();
+            let had_frame_pane = client.omp_renderer_frame_pane.take().is_some();
+            let had_server_gesture = client.native_omp_server_mouse_gesture.take().is_some();
+            let mut changed = had_frame_nonce || had_frame_pane || had_server_gesture;
+            let message = client.omp_renderer_target.as_mut().map(|target| {
+                changed |= target.input_authority_acked || target.surface_active;
+                target.input_authority_acked = false;
+                target.surface_active = false;
+                ServerMessage::OmpRendererTarget {
+                    launch_id: target.launch_id,
+                    authority_revision: target.authority_revision,
+                    target_app_client_id: client_id,
+                    route: target.route.clone(),
+                    bound: target.bound,
+                    surface_active: false,
+                    prefix: target.prefix.clone(),
+                }
+            });
+            if changed {
+                client.request_repaint();
+            }
+            (changed, message)
+        };
+        if changed {
+            if let Some(message) = message {
+                if !self.send_to_client(client_id, message) {
+                    self.remove_failed_client_and_resize_if_needed(client_id);
+                }
+            } else {
+                self.remove_failed_client_and_resize_if_needed(client_id);
+            }
+        }
+        changed
+    }
+
+    fn reoffer_native_omp_geometry_authority(
+        &mut self,
+        client_id: u64,
+        previous_revision: u64,
+    ) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| {
+                target.surface_active && target.authority_revision == previous_revision
+            })
+        else {
+            return false;
+        };
+        target.authority_revision = 0;
+        self.update_omp_renderer_target(client_id, target)
     }
 
     fn update_omp_renderer_target(
         &mut self,
         client_id: u64,
-        target: OmpRendererTargetState,
+        mut target: OmpRendererTargetState,
     ) -> bool {
+        if target.surface_active {
+            let navigation_scope = self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.navigation.is_some())
+                .then(|| self.foreground_client_id != Some(client_id))
+                .is_some_and(|background| background)
+                .then(|| self.begin_client_navigation_scope(client_id))
+                .flatten();
+            if navigation_scope.is_some() {
+                self.compute_client_navigation_view(client_id);
+            }
+            let has_area = target
+                .route
+                .as_ref()
+                .and_then(|route| {
+                    let (workspace_id, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+                    (self.app.state.active == Some(workspace_id)).then(|| {
+                        self.app
+                            .state
+                            .view
+                            .pane_infos
+                            .iter()
+                            .find(|info| info.id == pane_id)
+                    })
+                })
+                .flatten()
+                .is_none_or(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0);
+            if let Some(canonical) = navigation_scope {
+                self.finish_client_navigation_scope(client_id, canonical);
+            }
+            target.surface_active &= has_area;
+        }
         let previous = self
             .clients
             .get(&client_id)
@@ -4325,12 +4438,24 @@ impl HeadlessServer {
         if previous.as_ref() == Some(&target) {
             return false;
         }
+        let Some(authority_revision) = self.allocate_omp_renderer_authority_revision() else {
+            warn!("OMP renderer authority revision exhausted; revoking target authority");
+            return self.revoke_omp_renderer_authority(client_id);
+        };
+        target.authority_revision = authority_revision;
+        target.input_authority_acked = false;
+        let clear_server_gesture = !target.surface_active
+            || previous.as_ref().is_some_and(|previous| {
+                previous.launch_id != target.launch_id || previous.route != target.route
+            });
         let activating = target.surface_active
             && previous
                 .as_ref()
                 .is_none_or(|previous| !previous.surface_active);
+        let target_authority = (target.launch_id, target.authority_revision);
         let message = ServerMessage::OmpRendererTarget {
             launch_id: target.launch_id,
+            authority_revision: target.authority_revision,
             target_app_client_id: client_id,
             route: target.route.clone(),
             bound: target.bound,
@@ -4338,7 +4463,16 @@ impl HeadlessServer {
             prefix: target.prefix.clone(),
         };
         if activating {
-            let Some(next_graphics_cache) = self.queue_native_omp_activation(client_id, &message)
+            let Some(pane_id) = target
+                .route
+                .as_ref()
+                .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+                .map(|(_, pane_id)| pane_id)
+            else {
+                return false;
+            };
+            let Some(next_graphics_cache) =
+                self.queue_native_omp_activation(client_id, &target, &message)
             else {
                 // RendererReady is one-shot; retain server-only readiness so reconciliation can retry.
                 let Some(current) = self
@@ -4353,12 +4487,20 @@ impl HeadlessServer {
                 current.ready = target.ready;
                 return ready_changed;
             };
-            self.retire_direct_graphics_for_client_without_notifications(client_id);
+            self.retire_direct_graphics_for_client_pane_without_notifications(client_id, pane_id);
             self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 return false;
             };
             client.omp_renderer_target = Some(target);
+            client.omp_renderer_frame_nonce = None;
+            client.omp_renderer_frame_pane = None;
+            if clear_server_gesture {
+                client.native_omp_server_mouse_gesture = None;
+            } else if let Some(gesture) = client.native_omp_server_mouse_gesture.as_mut() {
+                gesture.launch_id = target_authority.0;
+                gesture.authority_revision = target_authority.1;
+            }
             client.request_repaint();
             return true;
         }
@@ -4366,9 +4508,41 @@ impl HeadlessServer {
             return false;
         };
         client.omp_renderer_target = Some(target);
+        client.omp_renderer_frame_nonce = None;
+        client.omp_renderer_frame_pane = None;
+        if clear_server_gesture {
+            client.native_omp_server_mouse_gesture = None;
+        } else if let Some(gesture) = client.native_omp_server_mouse_gesture.as_mut() {
+            gesture.launch_id = target_authority.0;
+            gesture.authority_revision = target_authority.1;
+        }
         client.request_repaint();
         self.send_to_client(client_id, message);
         true
+    }
+
+    fn reoffer_native_omp_input_authority(
+        &mut self,
+        client_id: u64,
+        gesture: NativeOmpServerGesture,
+    ) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| {
+                target.launch_id == gesture.launch_id
+                    && target.authority_revision == gesture.authority_revision
+                    && target.bound
+                    && target.ready
+                    && target.surface_active
+                    && target.input_authority_acked
+            })
+        else {
+            return false;
+        };
+        target.authority_revision = 0;
+        self.update_omp_renderer_target(client_id, target)
     }
 
     fn reconcile_native_omp_renderers(&mut self) -> bool {
@@ -4397,7 +4571,7 @@ impl HeadlessServer {
                     && client.renderer_binding_token.is_some()
                     && client.committed_identity().is_some()
             });
-            let desired_key = eligible
+            let focused_key = eligible
                 .then(|| self.client_focused_pane(client_id))
                 .flatten()
                 .and_then(|focused| {
@@ -4406,11 +4580,23 @@ impl HeadlessServer {
                         .find(|route| self.app.parse_pane_id(&route.pane_id) == Some(focused))
                 })
                 .cloned();
-            let desired_route = desired_key.as_ref().map(Self::omp_renderer_route);
             let current = self
                 .clients
                 .get(&client_id)
                 .and_then(|client| client.omp_renderer_target.clone());
+            let retained_key = eligible
+                .then(|| current.as_ref().and_then(|target| target.route.as_ref()))
+                .flatten()
+                .and_then(|route| {
+                    routes.iter().find(|key| {
+                        key.pane_id == route.pane_id
+                            && key.omp_session_id == route.omp_session_id
+                            && key.route_generation == route.route_generation
+                    })
+                })
+                .cloned();
+            let desired_key = focused_key.clone().or(retained_key);
+            let desired_route = desired_key.as_ref().map(Self::omp_renderer_route);
 
             if current.as_ref().and_then(|target| target.route.as_ref()) != desired_route.as_ref() {
                 if let Some(current) = current.as_ref().filter(|target| target.route.is_some()) {
@@ -4418,11 +4604,13 @@ impl HeadlessServer {
                         client_id,
                         OmpRendererTargetState {
                             launch_id: current.launch_id,
+                            authority_revision: 0,
                             route: None,
                             bound: false,
                             ready: false,
                             prefix: prefix.clone(),
                             surface_active: false,
+                            input_authority_acked: false,
                         },
                     );
                     if self.omp_service.app_has_native_renderer(client_id) {
@@ -4430,16 +4618,21 @@ impl HeadlessServer {
                     }
                 }
                 if let Some(route) = desired_route {
-                    let launch_id = self.allocate_omp_renderer_launch_id();
+                    let Some(launch_id) = self.allocate_omp_renderer_launch_id() else {
+                        warn!("OMP renderer launch ID exhausted; refusing target launch");
+                        continue;
+                    };
                     changed |= self.update_omp_renderer_target(
                         client_id,
                         OmpRendererTargetState {
                             launch_id,
+                            authority_revision: 0,
                             route: Some(route),
                             bound: false,
                             ready: false,
                             prefix,
                             surface_active: false,
+                            input_authority_acked: false,
                         },
                     );
                 }
@@ -4462,8 +4655,13 @@ impl HeadlessServer {
             }
             target.bound = native_bound;
             target.ready &= target.bound;
-            target.surface_active =
-                target.bound && target.ready && self.client_omp_surface_active(client_id);
+            let route_focused = self
+                .client_focused_pane(client_id)
+                .is_some_and(|focused| self.app.parse_pane_id(&key.pane_id) == Some(focused));
+            target.surface_active = target.bound
+                && target.ready
+                && route_focused
+                && self.client_omp_surface_active(client_id);
             target.prefix = prefix;
             changed |= self.update_omp_renderer_target(client_id, target);
         }
@@ -4888,26 +5086,138 @@ impl HeadlessServer {
         render
     }
 
+    fn native_omp_target_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let route = self
+            .clients
+            .get(&client_id)?
+            .omp_renderer_target
+            .as_ref()?
+            .route
+            .as_ref()?;
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+        (self.app.state.active == Some(ws_idx))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn native_omp_frame_projection(
+        &mut self,
+        client_id: u64,
+    ) -> Option<crate::protocol::OmpRendererFrame> {
+        let info = self
+            .native_omp_target_pane_info(client_id)
+            .filter(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0);
+        let pane = info.as_ref().map(|info| crate::protocol::OmpRendererPane {
+            x: info.inner_rect.x,
+            y: info.inner_rect.y,
+            width: info.inner_rect.width,
+            height: info.inner_rect.height,
+            scrollback_limit_bytes: u64::try_from(self.app.state.pane_scrollback_limit_bytes)
+                .unwrap_or(u64::MAX),
+        });
+        let previous_geometry_revision = self.clients.get(&client_id).and_then(|client| {
+            let target = client.omp_renderer_target.as_ref()?;
+            target.route.as_ref()?;
+            let previous = client
+                .omp_renderer_frame_pane
+                .map(|pane| (pane.x, pane.y, pane.width, pane.height));
+            let current = pane.map(|pane| (pane.x, pane.y, pane.width, pane.height));
+            (target.surface_active
+                && client.omp_renderer_frame_nonce.is_some()
+                && previous != current)
+                .then_some(target.authority_revision)
+        });
+        if let Some(previous_revision) = previous_geometry_revision {
+            self.reoffer_native_omp_geometry_authority(client_id, previous_revision);
+        }
+        let (launch_id, authority_revision, surface_active, existing_nonce) = {
+            let client = self.clients.get(&client_id)?;
+            let target = client.omp_renderer_target.as_ref()?;
+            target.route.as_ref()?;
+            (
+                target.launch_id,
+                target.authority_revision,
+                target.surface_active,
+                client.omp_renderer_frame_nonce,
+            )
+        };
+        let frame_nonce = if let Some(frame_nonce) = existing_nonce {
+            frame_nonce
+        } else {
+            let mut frame_nonce = [0; 16];
+            if let Err(error) = getrandom::fill(&mut frame_nonce) {
+                warn!(%error, "failed to generate OMP renderer frame nonce; revoking authority");
+                self.revoke_omp_renderer_authority(client_id);
+                return None;
+            }
+            let client = self.clients.get_mut(&client_id)?;
+            let current = client.omp_renderer_target.as_ref()?;
+            if (current.launch_id, current.authority_revision) != (launch_id, authority_revision) {
+                return None;
+            }
+            client.omp_renderer_frame_nonce = Some(frame_nonce);
+            client.omp_renderer_frame_pane = pane;
+            frame_nonce
+        };
+        Some(crate::protocol::OmpRendererFrame {
+            launch_id,
+            authority_revision,
+            frame_nonce,
+            pane,
+            focused: info.as_ref().is_some_and(|info| info.is_focused),
+            surface_active: surface_active && pane.is_some(),
+        })
+    }
+
     fn native_bound_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
-        self.client_has_ready_native_renderer(client_id)
-            .then_some(())?;
-        let ws_idx = self.app.state.active?;
-        let workspace = self.app.state.workspaces.get(ws_idx)?;
-        let pane_id = workspace.focused_pane_id()?;
-        let public_pane_id = crate::workspace::public_pane_id_for_number(
-            &workspace.id,
-            workspace.public_pane_number(pane_id)?,
-        );
+        let target = self.clients.get(&client_id)?.omp_renderer_target.as_ref()?;
+        (target.bound && target.ready && target.surface_active).then_some(())?;
         self.omp_service
-            .app_has_native_renderer_for_pane(client_id, &public_pane_id)
+            .app_has_native_renderer(client_id)
             .then_some(())?;
-        self.app
-            .state
-            .view
-            .pane_infos
-            .iter()
-            .find(|info| info.id == pane_id)
-            .cloned()
+        self.native_omp_target_pane_info(client_id)
+            .filter(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0)
+    }
+
+    fn native_input_omp_pane_info(
+        &mut self,
+        client_id: u64,
+    ) -> (Option<crate::layout::PaneInfo>, bool) {
+        let Some((authority_revision, stored_pane)) =
+            self.clients.get(&client_id).and_then(|client| {
+                let target = client.omp_renderer_target.as_ref()?;
+                target
+                    .input_authority_acked
+                    .then_some((target.authority_revision, client.omp_renderer_frame_pane))
+            })
+        else {
+            return (None, false);
+        };
+        let live = self.native_bound_omp_pane_info(client_id);
+        let live_rect = live.as_ref().map(|info| {
+            (
+                info.inner_rect.x,
+                info.inner_rect.y,
+                info.inner_rect.width,
+                info.inner_rect.height,
+            )
+        });
+        let stored_rect = stored_pane.map(|pane| (pane.x, pane.y, pane.width, pane.height));
+        if live_rect != stored_rect {
+            if !self.reoffer_native_omp_geometry_authority(client_id, authority_revision) {
+                self.revoke_omp_renderer_authority(client_id);
+            }
+            return (None, true);
+        }
+        (live, false)
     }
 
     fn failed_private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
@@ -4961,6 +5271,7 @@ impl HeadlessServer {
                     && target.bound
                     && target.ready
                     && target.surface_active
+                    && target.input_authority_acked
             })
             .and_then(|target| target.route.clone())
         else {
@@ -4994,22 +5305,102 @@ impl HeadlessServer {
         activated
     }
 
+    fn clear_native_omp_server_gesture(&mut self, client_id: u64) -> bool {
+        self.clients
+            .get_mut(&client_id)
+            .is_some_and(|client| client.native_omp_server_mouse_gesture.take().is_some())
+    }
+
     fn partition_native_omp_input(
         &mut self,
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
-    ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool, bool) {
+        self.partition_native_omp_input_with_mode(client_id, events, false)
+    }
+
+    fn partition_native_omp_input_with_mode(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        sgr_pixels: bool,
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool, bool) {
         if !self.client_omp_surface_active(client_id) {
-            return (events, false);
+            let changed = self.clear_native_omp_server_gesture(client_id);
+            return (events, false, changed);
         }
-        let Some(info) = self.independent_omp_pane_info(client_id) else {
-            return (events, false);
+        let mut server_gesture = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.native_omp_server_mouse_gesture.clone());
+        let (native_info, pane_mismatch) = if server_gesture.is_some() {
+            (self.native_bound_omp_pane_info(client_id), false)
+        } else {
+            self.native_input_omp_pane_info(client_id)
+        };
+        if pane_mismatch {
+            return (events, false, true);
+        }
+        let native_authority = native_info.as_ref().and_then(|_| {
+            let target = self.clients.get(&client_id)?.omp_renderer_target.as_ref()?;
+            Some((target.launch_id, target.authority_revision))
+        });
+        let info = native_info
+            .or_else(|| self.failed_private_omp_pane_info(client_id))
+            .or_else(|| self.pending_private_omp_pane_info(client_id));
+        let Some(info) = info else {
+            let changed = self.clear_native_omp_server_gesture(client_id);
+            return (events, false, changed);
         };
         let pending = self.pending_private_omp_pane_info(client_id).is_some();
         let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
         let mut remaining = Vec::new();
         let mut consumed = false;
+
+        if server_gesture.as_ref().is_some_and(|gesture| {
+            native_authority != Some((gesture.launch_id, gesture.authority_revision))
+        }) {
+            self.clear_native_omp_server_gesture(client_id);
+            return (events, false, true);
+        }
+        let mut completed_gesture = None;
+        let mut serverward_suffix = false;
         for event in events {
+            if let Some(gesture) = server_gesture.as_mut() {
+                let completed = match &event {
+                    crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(button) => {
+                            gesture.press(button);
+                            false
+                        }
+                        MouseEventKind::Up(button) => gesture.release(button),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if completed {
+                    completed_gesture = server_gesture.take();
+                    serverward_suffix = true;
+                }
+                remaining.push(event);
+                continue;
+            }
+            if serverward_suffix {
+                if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
+                    if let (MouseEventKind::Down(button), Some((launch_id, authority_revision))) =
+                        (mouse.kind, native_authority)
+                    {
+                        server_gesture = Some(NativeOmpServerGesture::new(
+                            button,
+                            launch_id,
+                            authority_revision,
+                            sgr_pixels,
+                        ));
+                    }
+                }
+                remaining.push(event);
+                continue;
+            }
             match event {
                 crate::raw_input::RawInputEvent::Key(key)
                     if terminal_mode && !self.app.state.is_prefix_key(&key) =>
@@ -5022,10 +5413,27 @@ impl HeadlessServer {
                 {
                     consumed = true
                 }
-                crate::raw_input::RawInputEvent::Mouse(mouse)
-                    if info.inner_rect.contains((mouse.column, mouse.row).into()) =>
-                {
-                    consumed = true
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    let inside = info.inner_rect.contains((mouse.column, mouse.row).into());
+                    if let MouseEventKind::Down(button) = mouse.kind {
+                        if inside {
+                            consumed = true;
+                        } else {
+                            if let Some((launch_id, authority_revision)) = native_authority {
+                                server_gesture = Some(NativeOmpServerGesture::new(
+                                    button,
+                                    launch_id,
+                                    authority_revision,
+                                    sgr_pixels,
+                                ));
+                            }
+                            remaining.push(crate::raw_input::RawInputEvent::Mouse(mouse));
+                        }
+                    } else if inside {
+                        consumed = true;
+                    } else {
+                        remaining.push(crate::raw_input::RawInputEvent::Mouse(mouse));
+                    }
                 }
                 crate::raw_input::RawInputEvent::OuterFocusGained
                 | crate::raw_input::RawInputEvent::OuterFocusLost
@@ -5036,7 +5444,14 @@ impl HeadlessServer {
                 event => remaining.push(event),
             }
         }
-        (remaining, consumed)
+        let gesture_active = server_gesture.is_some();
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.native_omp_server_mouse_gesture = server_gesture;
+        }
+        let authority_changed = !gesture_active
+            && completed_gesture
+                .is_some_and(|gesture| self.reoffer_native_omp_input_authority(client_id, gesture));
+        (remaining, consumed, authority_changed)
     }
 
     fn private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
@@ -5309,14 +5724,17 @@ impl HeadlessServer {
         if navigation_scope.is_some() {
             self.compute_client_navigation_view(client_id);
         }
-        let (events, native_consumed) = self.partition_native_omp_input(client_id, events);
+        let (events, native_consumed, native_authority_changed) =
+            self.partition_native_omp_input(client_id, events);
         let (events, private_consumed) = self.partition_private_omp_input(client_id, events);
-        if native_consumed || private_consumed {
+        if native_consumed || native_authority_changed || private_consumed {
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.request_semantic_redraw_after_input();
             }
         }
-        if events.is_empty() && (native_consumed || private_consumed || identity_changed) {
+        if events.is_empty()
+            && (native_consumed || native_authority_changed || private_consumed || identity_changed)
+        {
             if let Some(canonical) = navigation_scope {
                 self.finish_client_navigation_scope(client_id, canonical);
             }
@@ -5426,7 +5844,7 @@ impl HeadlessServer {
         if !config_reloaded {
             self.sync_foreground_client_state();
         }
-        needs_render || renderer_changed
+        needs_render || renderer_changed || native_authority_changed
     }
 
     fn activate_notification_target(
@@ -5636,9 +6054,14 @@ impl HeadlessServer {
                 }
                 self.clear_private_omp_failure_state(client_id, &key);
                 self.clear_private_omp_pending_route(client_id, &key);
+                let route_focused = self
+                    .client_focused_pane(client_id)
+                    .is_some_and(|focused| self.app.parse_pane_id(&key.pane_id) == Some(focused));
                 target.ready = true;
-                target.surface_active =
-                    target.bound && target.ready && self.client_omp_surface_active(client_id);
+                target.surface_active = target.bound
+                    && target.ready
+                    && route_focused
+                    && self.client_omp_surface_active(client_id);
                 self.update_omp_renderer_target(client_id, target);
                 let retired_private = self
                     .clients
@@ -5648,6 +6071,60 @@ impl HeadlessServer {
                     self.omp_service.retire_private_renderer(client_id);
                 }
                 self.reconcile_omp_renderers();
+                true
+            }
+            ServerEvent::OmpRendererAuthorityAck {
+                client_id,
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            } => {
+                let Some(route) = self
+                    .clients
+                    .get(&client_id)
+                    .filter(|client| {
+                        client.is_full_app_client()
+                            && client.omp_renderer_frame_nonce == Some(frame_nonce)
+                    })
+                    .and_then(|client| client.omp_renderer_target.as_ref())
+                    .filter(|target| {
+                        target.launch_id == launch_id
+                            && target.authority_revision == authority_revision
+                            && target.bound
+                            && target.ready
+                            && target.surface_active
+                            && !target.input_authority_acked
+                    })
+                    .and_then(|target| target.route.clone())
+                else {
+                    return false;
+                };
+                let key = OmpRouteKey {
+                    pane_id: route.pane_id,
+                    omp_session_id: route.omp_session_id,
+                    route_generation: route.route_generation,
+                };
+                if !self
+                    .omp_service
+                    .app_has_native_renderer_for_route(client_id, &key)
+                {
+                    return false;
+                }
+                let Some(client) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .filter(|client| client.omp_renderer_frame_nonce == Some(frame_nonce))
+                else {
+                    return false;
+                };
+                let Some(target) = client.omp_renderer_target.as_mut().filter(|target| {
+                    target.launch_id == launch_id
+                        && target.authority_revision == authority_revision
+                        && !target.input_authority_acked
+                }) else {
+                    return false;
+                };
+                target.input_authority_acked = true;
                 true
             }
             ServerEvent::ClientConnected {
@@ -5818,8 +6295,14 @@ impl HeadlessServer {
                 };
                 let valid = self.clients.get(&client_id).is_some_and(|client| {
                     let cell = client.cell_size;
+                    let pixel_mode = client
+                        .native_omp_server_mouse_gesture
+                        .as_ref()
+                        .map_or(client.host_sgr_pixels_active == Some(true), |gesture| {
+                            gesture.sgr_pixels
+                        });
                     client.is_full_app_client()
-                        && client.host_sgr_pixels_active == Some(true)
+                        && pixel_mode
                         && client.terminal_size == (geometry.cols, geometry.rows)
                         && cell.is_known()
                         && cell.width_px == geometry.width_px / u32::from(geometry.cols)
@@ -5838,15 +6321,60 @@ impl HeadlessServer {
                 self.compute_client_navigation_view(client_id);
                 let omp_surface_active = self.client_omp_surface_active(client_id);
                 let host = crate::input::mouse::HostPixels { x, y, geometry };
-                if omp_surface_active
-                    && self
-                        .independent_omp_pane_info(client_id)
-                        .is_some_and(|info| info.inner_rect.contains(cell_position.into()))
-                {
+                let native_pane = omp_surface_active
+                    .then(|| self.independent_omp_pane_info(client_id))
+                    .flatten();
+                let pixel_mouse =
+                    crate::input::mouse::report_at_cell(&data, cell_position.0, cell_position.1)
+                        .and_then(|report| {
+                            crate::raw_input::parse_raw_input_bytes_sync(&report)
+                                .into_iter()
+                                .find_map(|event| match event {
+                                    crate::raw_input::RawInputEvent::Mouse(mouse) => Some(mouse),
+                                    _ => None,
+                                })
+                        });
+                let server_gesture_before = self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.native_omp_server_mouse_gesture.is_some());
+                let native_authority_acked = self.clients.get(&client_id).is_some_and(|client| {
+                    client
+                        .omp_renderer_target
+                        .as_ref()
+                        .is_some_and(|target| target.input_authority_acked)
+                });
+                let (native_consumed, native_authority_changed) = if let Some(mouse) = pixel_mouse
+                    .filter(|_| {
+                        server_gesture_before || native_authority_acked || native_pane.is_some()
+                    }) {
+                    let (_, consumed, authority_changed) = self
+                        .partition_native_omp_input_with_mode(
+                            client_id,
+                            vec![crate::raw_input::RawInputEvent::Mouse(mouse)],
+                            true,
+                        );
+                    (consumed, authority_changed)
+                } else {
+                    (false, false)
+                };
+                let native_serverward = server_gesture_before
+                    || native_authority_changed
+                    || self
+                        .clients
+                        .get(&client_id)
+                        .is_some_and(|client| client.native_omp_server_mouse_gesture.is_some());
+                if native_consumed || native_authority_changed {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.request_semantic_redraw_after_input();
+                    }
+                }
+                if native_consumed {
                     self.finish_client_navigation_scope(client_id, canonical);
-                    return false;
+                    return native_authority_changed;
                 }
                 if omp_surface_active
+                    && !native_serverward
                     && self.route_private_omp_pixel_input(client_id, &data, host, cell_position)
                 {
                     if let Some(client) = self.clients.get_mut(&client_id) {
@@ -5865,11 +6393,12 @@ impl HeadlessServer {
                         return false;
                     };
                     let events = crate::raw_input::parse_raw_input_bytes_sync(&report);
-                    return self.handle_client_input_events(client_id, events);
+                    return self.handle_client_input_events(client_id, events)
+                        || native_authority_changed;
                 }
                 if !self.focused_pane_graphics_demand() {
                     self.finish_client_navigation_scope(client_id, canonical);
-                    return false;
+                    return native_authority_changed;
                 }
                 let foreground_changed = self.promote_client_to_foreground(client_id);
                 if foreground_changed {
@@ -5881,7 +6410,10 @@ impl HeadlessServer {
                         .route_client_pixel_mouse(client_id, view_id.as_ref(), &data, geometry);
                 let deferred_requests_changed = self.handle_deferred_requests_headless();
                 self.finish_client_navigation_scope(client_id, canonical);
-                routed || foreground_changed || deferred_requests_changed
+                routed
+                    || foreground_changed
+                    || deferred_requests_changed
+                    || native_authority_changed
             }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
@@ -6012,6 +6544,24 @@ impl HeadlessServer {
                     client_id,
                     cols, rows, cell_width_px, cell_height_px, "client resize"
                 );
+                let observed_cell_size = crate::kitty_graphics::HostCellSize {
+                    width_px: cell_width_px,
+                    height_px: cell_height_px,
+                };
+                let previous_geometry_revision = self.clients.get(&client_id).and_then(|client| {
+                    let cell_size_changed = observed_cell_size.is_known()
+                        && (client.cell_size.width_px != observed_cell_size.width_px
+                            || client.cell_size.height_px != observed_cell_size.height_px);
+                    (client.terminal_size != (cols, rows) || cell_size_changed)
+                        .then(|| {
+                            client
+                                .omp_renderer_target
+                                .as_ref()
+                                .filter(|target| target.surface_active)
+                                .map(|target| target.authority_revision)
+                        })
+                        .flatten()
+                });
                 let direct_terminal_id = if let Some(ClientConnection {
                     mode: ClientConnectionMode::TerminalAttach { terminal_id },
                     terminal_size,
@@ -6115,6 +6665,10 @@ impl HeadlessServer {
                 self.resize_shared_runtime_to_effective_size();
                 if let Some(canonical) = navigation_scope {
                     self.finish_client_navigation_scope(client_id, canonical);
+                }
+                self.reconcile_omp_renderers();
+                if let Some(previous_revision) = previous_geometry_revision {
+                    self.reoffer_native_omp_geometry_authority(client_id, previous_revision);
                 }
                 true
             }
@@ -7127,7 +7681,6 @@ impl HeadlessServer {
                         agent_label.as_deref(),
                     )
                 {
-                    debug!(sound = ?sound, "forwarding sound notification from API request");
                     self.send_notify_to_foreground_client(
                         protocol::NotifyKind::Sound,
                         sound_notify_message(sound),
@@ -7188,9 +7741,15 @@ impl HeadlessServer {
             if !client.is_full_app_client() {
                 continue;
             }
-            let client_enabled = client.private_surface.is_some() || enabled;
-            let client_sgr_pixels =
+            let client_enabled = client.private_surface.is_some()
+                || enabled
+                || client.native_omp_server_mouse_gesture.is_some();
+            let requested_sgr_pixels =
                 client.private_surface.is_none() && sgr_pixels && client.pixel_mouse;
+            let client_sgr_pixels = client
+                .native_omp_server_mouse_gesture
+                .as_ref()
+                .map_or(requested_sgr_pixels, |gesture| gesture.sgr_pixels);
             if client.host_mouse_capture_active == Some(client_enabled)
                 && client.host_sgr_pixels_active == Some(client_sgr_pixels)
             {
@@ -7894,14 +8453,17 @@ impl HeadlessServer {
                 }
             };
 
+            frame.omp_renderer = is_app_client
+                .then(|| self.native_omp_frame_projection(client_id))
+                .flatten()
+                .map(|mut projection| {
+                    projection.surface_active &= !has_private_surface;
+                    projection
+                });
             let rendered_findr = (is_app_client && findr_changed)
                 .then(|| crate::server::clients::capture_findr(&self.app.state));
 
-            let native_omp_surface_active =
-                !has_private_surface && self.native_omp_surface_active(client_id);
-            let excluded_graphics_pane = (!native_omp_surface_active)
-                .then(|| self.replaced_omp_pane_info(client_id).map(|info| info.id))
-                .flatten();
+            let excluded_graphics_pane = self.replaced_omp_pane_info(client_id).map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -7915,12 +8477,7 @@ impl HeadlessServer {
             }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
-            let mut encoded = if native_omp_surface_active {
-                crate::kitty_graphics::EncodedGraphics {
-                    bytes: Vec::new(),
-                    incomplete: false,
-                }
-            } else if has_private_surface {
+            let mut encoded = if has_private_surface {
                 crate::kitty_graphics::EncodedGraphics {
                     bytes: next_graphics_cache.clear_bytes(),
                     incomplete: false,
@@ -8953,6 +9510,7 @@ mod tests {
                 std::env::current_exe().expect("locate the headless test executable"),
             ),
             next_omp_renderer_launch_id: 1,
+            next_omp_renderer_authority_revision: 1,
             omp_service: OmpService::new(Some(omp_bridge::bind().expect("bind test OMP bridge")))
                 .expect("create test OMP service"),
             retired_private_pane_ids: VecDeque::new(),
@@ -8979,6 +9537,161 @@ mod tests {
             server_event_tx,
         }
     }
+    #[test]
+    fn renderer_identity_counters_fail_closed_before_wrapping() {
+        let mut server = test_headless_server();
+        server.next_omp_renderer_launch_id = u64::MAX;
+        server.next_omp_renderer_authority_revision = u64::MAX;
+
+        assert_eq!(server.allocate_omp_renderer_launch_id(), None);
+        assert_eq!(server.allocate_omp_renderer_authority_revision(), None);
+        assert_eq!(server.next_omp_renderer_launch_id, u64::MAX);
+        assert_eq!(server.next_omp_renderer_authority_revision, u64::MAX);
+    }
+
+    #[test]
+    fn authority_revision_exhaustion_notifies_client_before_revoking_state() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_target = Some(OmpRendererTargetState {
+            launch_id: 7,
+            authority_revision: 11,
+            route: Some(crate::protocol::OmpRendererRoute {
+                pane_id: "missing".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            bound: true,
+            ready: true,
+            prefix: crate::protocol::OmpRendererPrefix {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            },
+            surface_active: true,
+            input_authority_acked: true,
+        });
+        client.omp_renderer_frame_nonce = Some([9; 16]);
+        client.omp_renderer_frame_pane = Some(crate::protocol::OmpRendererPane {
+            x: 1,
+            y: 2,
+            width: 40,
+            height: 12,
+            scrollback_limit_bytes: 1024,
+        });
+        client.native_omp_server_mouse_gesture =
+            Some(NativeOmpServerGesture::new(MouseButton::Left, 7, 11, false));
+        server.clients.insert(1, client);
+        server.next_omp_renderer_authority_revision = u64::MAX;
+
+        let mut update = server.clients[&1].omp_renderer_target.clone().unwrap();
+        update.prefix.modifiers = KeyModifiers::ALT.bits();
+        assert!(server.update_omp_renderer_target(1, update));
+
+        let target = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_eq!(target.authority_revision, 11);
+        assert!(!target.surface_active);
+        assert!(!target.input_authority_acked);
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert_eq!(server.clients[&1].omp_renderer_frame_pane, None);
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("inactive authority transition"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                authority_revision,
+                surface_active,
+                ..
+            } => {
+                assert_eq!((launch_id, authority_revision), (7, 11));
+                assert!(!surface_active);
+            }
+            other => panic!("expected inactive renderer target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projected_pane_rectangle_change_rotates_native_authority() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("geometry-authority");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 80, 24),
+            inner_rect: Rect::new(0, 0, 80, 24),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_target = Some(OmpRendererTargetState {
+            launch_id: 7,
+            authority_revision: 11,
+            route: Some(crate::protocol::OmpRendererRoute {
+                pane_id: route,
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            bound: true,
+            ready: true,
+            prefix: crate::protocol::OmpRendererPrefix {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            },
+            surface_active: true,
+            input_authority_acked: true,
+        });
+        server.clients.insert(1, client);
+        server.next_omp_renderer_authority_revision = 12;
+
+        let first = server
+            .native_omp_frame_projection(1)
+            .expect("initial projection");
+        assert_eq!(first.authority_revision, 11);
+        server.app.state.view.pane_infos[0].rect = Rect::new(3, 4, 70, 18);
+        server.app.state.view.pane_infos[0].inner_rect = Rect::new(3, 4, 70, 18);
+
+        let changed = server
+            .native_omp_frame_projection(1)
+            .expect("changed projection");
+        assert_eq!(changed.authority_revision, 12);
+        assert_eq!(
+            changed
+                .pane
+                .map(|pane| (pane.x, pane.y, pane.width, pane.height)),
+            Some((3, 4, 70, 18))
+        );
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("replacement authority"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                authority_revision,
+                surface_active,
+                ..
+            } => {
+                assert_eq!(authority_revision, 12);
+                assert!(surface_active);
+            }
+            other => panic!("expected replacement renderer target, got {other:?}"),
+        }
+    }
+
     fn start_test_omp_host(
         server: &mut HeadlessServer,
         pane_id: String,
@@ -9180,7 +9893,7 @@ mod tests {
         assert!(writer.test_control_records().is_empty());
         assert!(server.independent_omp_pane_info(7).is_some());
 
-        let (remaining, consumed) = server.partition_native_omp_input(
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
             7,
             vec![crate::raw_input::RawInputEvent::Key(
                 crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
@@ -9188,6 +9901,7 @@ mod tests {
         );
         assert!(consumed);
         assert!(remaining.is_empty());
+        assert!(!authority_changed);
 
         server.private_omp_test_executable = Some(
             server
@@ -9222,7 +9936,6 @@ mod tests {
                 launch_id,
                 route: Some(released_route),
                 bound: false,
-                surface_active: false,
                 ..
             } => {
                 assert_eq!(launch_id, renderer_launch_id);
@@ -10192,7 +10905,11 @@ mod tests {
             .omp_renderer_target
             .as_ref()
             .is_some_and(|target| target.surface_active));
-        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert_eq!(
+            server.clients[&1].graphics_cache.test_image_count(),
+            1,
+            "pane-scoped activation must preserve unrelated cached graphics"
+        );
         assert!(!server.app.pane_graphics.slots.contains_key(&direct_key));
         assert!(matches!(
             direct_response_rx.try_recv(),
@@ -10229,7 +10946,6 @@ mod tests {
                 .expect("active renderer target frame"),
             ServerMessage::OmpRendererTarget {
                 launch_id,
-                surface_active: true,
                 ..
             } if launch_id == renderer_launch_id
         ));
@@ -10405,7 +11121,6 @@ mod tests {
                 launch_id,
                 route: Some(route),
                 bound: true,
-                surface_active: false,
                 ..
             } => {
                 assert_eq!(launch_id, renderer_launch_id);
@@ -10417,12 +11132,14 @@ mod tests {
             KeyCode::Char('x'),
             KeyModifiers::empty(),
         ));
-        let (remaining, consumed) = server.partition_native_omp_input(2, vec![key]);
+        let (remaining, consumed, authority_changed) =
+            server.partition_native_omp_input(2, vec![key]);
         assert!(!consumed);
         assert!(matches!(
             remaining.as_slice(),
             [crate::raw_input::RawInputEvent::Key(_)]
         ));
+        assert!(!authority_changed);
         assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
             client_id: 2,
             data,
@@ -10796,13 +11513,31 @@ mod tests {
             launch_id: renderer_launch_id,
         }));
         assert!(server.clients[&1].private_omp_guest.is_none());
-        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert_eq!(
+            server.clients[&1].graphics_cache.test_image_count(),
+            1,
+            "pane-scoped activation must preserve unrelated cached graphics"
+        );
         server
             .clients
             .get_mut(&1)
             .expect("app client")
             .graphics_cache
             .test_mark_non_empty();
+        let early_authority_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("active native target")
+            .authority_revision;
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert!(
+            !server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: early_authority_revision,
+                frame_nonce: [0; 16],
+            })
+        );
 
         server.render_and_stream();
         let frame = read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
@@ -10811,7 +11546,103 @@ mod tests {
         assert!(!text.contains("HOST PTY"));
         assert!(!frame.hyperlinks.iter().any(|link| link == host_uri));
         assert_eq!(frame.cursor, None);
-        assert!(frame.graphics.is_empty());
+        let projection = frame.omp_renderer.expect("exact native pane projection");
+        assert_eq!(projection.launch_id, renderer_launch_id);
+        assert_eq!(
+            projection.pane,
+            Some(crate::protocol::OmpRendererPane {
+                x: server.app.state.view.pane_infos[0].inner_rect.x,
+                y: server.app.state.view.pane_infos[0].inner_rect.y,
+                width: server.app.state.view.pane_infos[0].inner_rect.width,
+                height: server.app.state.view.pane_infos[0].inner_rect.height,
+                scrollback_limit_bytes: u64::try_from(server.app.state.pane_scrollback_limit_bytes)
+                    .unwrap_or(u64::MAX),
+            })
+        );
+        assert!(projection.focused);
+        assert!(projection.surface_active);
+        let authority_revision = projection.authority_revision;
+        let frame_nonce = projection.frame_nonce;
+        let unacked_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('u'),
+            KeyModifiers::empty(),
+        ));
+        let (remaining, consumed, authority_changed) =
+            server.partition_native_omp_input(1, vec![unacked_key]);
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(_)]
+        ));
+        assert!(
+            !server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: authority_revision.saturating_sub(1),
+                frame_nonce,
+            })
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision,
+                frame_nonce,
+            })
+        );
+        assert!(
+            !frame.graphics.is_empty(),
+            "stale target graphics need cleanup bytes"
+        );
+        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 120,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let resized_revision = {
+            let resized_target = server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .expect("resized native target");
+            assert_ne!(resized_target.authority_revision, authority_revision);
+            assert!(!resized_target.input_authority_acked);
+            resized_target.authority_revision
+        };
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1, "resize click waits for the new frame");
+
+        server.render_and_stream();
+        let resized_frame =
+            read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
+        let resized_projection = resized_frame
+            .omp_renderer
+            .expect("resized projection frame");
+        assert_eq!(resized_projection.authority_revision, resized_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: resized_projection.authority_revision,
+                frame_nonce: resized_projection.frame_nonce,
+            })
+        );
 
         let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
             KeyCode::Char('x'),
@@ -10987,6 +11818,397 @@ mod tests {
                 .runtime_pane_id(),
             private_guest_pane
         );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn native_renderer_survives_focus_changes_for_same_live_route() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("native-focus");
+        let omp_pane = workspace.tabs[0].root_pane;
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(omp_pane);
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+
+        let (app_writer, _app_control, _app_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::App,
+                None,
+                Some("Ada".into()),
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                false,
+                Some(app_writer),
+            ),
+        );
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .omp_renderer_capabilities
+            .client_local_native = true;
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route.clone(), "session", 1);
+        let renderer_launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(other_pane);
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+        }));
+        let background_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("retained native renderer target");
+        assert_eq!(background_target.launch_id, renderer_launch_id);
+        assert_eq!(
+            background_target.route.as_ref(),
+            Some(&HeadlessServer::omp_renderer_route(&OmpRouteKey {
+                pane_id: route.clone(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }))
+        );
+        assert!(background_target.bound);
+        assert!(background_target.ready);
+        assert!(!background_target.surface_active);
+        assert!(server.omp_service.app_has_native_renderer(1));
+
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(omp_pane);
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let refocused_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("refocused native renderer target");
+        assert_eq!(refocused_target.launch_id, renderer_launch_id);
+        assert!(refocused_target.bound);
+        assert!(refocused_target.ready);
+        assert!(refocused_target.surface_active);
+        assert!(server.omp_service.app_has_native_renderer(1));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn server_owned_native_mouse_gesture_routes_tail_and_reoffers_authority() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-mouse-gesture");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, 1),
+            inner_rect: Rect::new(0, 0, 40, 1),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        let mut client = test_identity_client(Some("Ada"), None);
+        client.renderer_binding_token = Some("binding".into());
+        client.omp_renderer_capabilities.client_local_native = true;
+        client.cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        client.host_sgr_pixels_active = Some(true);
+        server.clients.insert(1, client);
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        let (_host, _host_messages) =
+            start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+        let launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers native renderer")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.pane_id.clone(),
+            omp_session_id: route.omp_session_id.clone(),
+            route_generation: route.route_generation,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id,
+        }));
+        let acknowledge_current = |server: &mut HeadlessServer| {
+            let projection = server
+                .native_omp_frame_projection(1)
+                .expect("matching native authority frame");
+            let revision = projection.authority_revision;
+            assert!(
+                server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                    client_id: 1,
+                    launch_id,
+                    authority_revision: revision,
+                    frame_nonce: projection.frame_nonce,
+                })
+            );
+            revision
+        };
+        let stale_revision = acknowledge_current(&mut server);
+        let mouse = |kind, column| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        server.app.state.view.pane_infos[0].inner_rect.width = 50;
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), 45)],
+        );
+        assert!(!consumed);
+        assert!(authority_changed);
+        assert_eq!(remaining.len(), 1);
+        let reoffered = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_ne!(reoffered.authority_revision, stale_revision);
+        assert!(!reoffered.input_authority_acked);
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert_eq!(server.clients[&1].omp_renderer_frame_pane, None);
+        server.app.state.view.pane_infos[0].inner_rect.width = 40;
+        let first_revision = acknowledge_current(&mut server);
+
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), 60)],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Left,
+                launch_id,
+                first_revision,
+                false,
+            ))
+        );
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Right), 60),
+                mouse(MouseEventKind::Up(MouseButton::Left), 1),
+            ],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                first_revision,
+                false,
+            ))
+        );
+
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![
+                mouse(MouseEventKind::Drag(MouseButton::Right), 1),
+                mouse(MouseEventKind::Up(MouseButton::Right), 1),
+                crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::empty(),
+                )),
+            ],
+        );
+        assert!(!consumed);
+        assert!(authority_changed);
+        assert_eq!(
+            remaining.len(),
+            3,
+            "the complete post-Up suffix stays serverward"
+        );
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let second_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(second_revision, first_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+
+        assert_eq!(acknowledge_current(&mut server), second_revision);
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;601;1M".to_vec(),
+            geometry,
+        });
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let reoffered = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_ne!(reoffered.authority_revision, second_revision);
+        assert!(!reoffered.input_authority_acked);
+        let pixel_revision = acknowledge_current(&mut server);
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .native_omp_server_mouse_gesture = Some(NativeOmpServerGesture::new(
+            MouseButton::Left,
+            launch_id,
+            pixel_revision,
+            true,
+        ));
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<2;601;1M".to_vec(),
+            geometry,
+        });
+        assert_eq!(
+            server.clients[&1]
+                .native_omp_server_mouse_gesture
+                .as_ref()
+                .unwrap()
+                .buttons,
+            HashSet::from([MouseButton::Left, MouseButton::Right])
+        );
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;11;1m".to_vec(),
+            geometry,
+        });
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                pixel_revision,
+                true,
+            ))
+        );
+        assert_eq!(
+            server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .authority_revision,
+            pixel_revision
+        );
+        server.clients.get_mut(&1).unwrap().host_sgr_pixels_active = Some(false);
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<2;11;1m".to_vec(),
+            geometry,
+        }));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+
+        let third_revision = acknowledge_current(&mut server);
+        let (_, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), u16::MAX)],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        let mut inactive = server.clients[&1].omp_renderer_target.clone().unwrap();
+        assert_eq!(inactive.authority_revision, third_revision);
+        inactive.surface_active = false;
+        assert!(server.update_omp_renderer_target(1, inactive));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let (remaining, consumed, authority_changed) = server
+            .partition_native_omp_input(1, vec![mouse(MouseEventKind::Up(MouseButton::Left), 1)]);
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1);
         shutdown_test_runtimes(&mut server);
     }
 
@@ -15606,6 +16828,7 @@ next_tab = ""
         server.sync_foreground_client_state();
         server.resize_shared_runtime_to_effective_size();
         let baseline = FrameData {
+            omp_renderer: None,
             cells: Vec::new(),
             width: 0,
             height: 0,

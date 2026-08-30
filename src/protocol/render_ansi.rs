@@ -876,6 +876,7 @@ mod tests {
             cursor: None,
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         }
     }
 
@@ -1074,6 +1075,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut changed = visible.clone();
         changed.cells[0] = make_cell("B", 0, 0, 0);
@@ -1141,6 +1143,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1181,6 +1184,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1221,6 +1225,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let drawn = frame_with_drawn_cursor(frame.clone());
 
@@ -1258,6 +1263,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         assert_eq!(frame_with_drawn_cursor(frame.clone()), frame);
@@ -1277,6 +1283,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1324,6 +1331,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let hidden = FrameData {
             cells: vec![make_cell("B", 0, 0, 0); 9],
@@ -1337,6 +1345,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut last_visible_cursor = None;
         let mut last_cursor_shape = 0;
@@ -1600,6 +1609,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1626,6 +1636,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1641,6 +1652,7 @@ mod tests {
     #[test]
     fn blit_frame_no_cursor_hides_cursor() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1674,6 +1686,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1696,6 +1709,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1725,6 +1739,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut curr = prev.clone();
         curr.cells[0] = make_cell("B", 0, 0, 0);
@@ -1765,8 +1780,10 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let hidden = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0); 9],
             width: 3,
             height: 3,
@@ -1809,6 +1826,7 @@ mod tests {
     #[test]
     fn blit_frame_parks_hidden_cursor_at_bottom_right_without_history() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0); 6],
             width: 3,
             height: 2,
@@ -1850,8 +1868,10 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1872,6 +1892,7 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_wide_graphemes() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1896,6 +1917,7 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_halfwidth_voiced_kana() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -1920,6 +1942,7 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_wide_graphemes() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1932,6 +1955,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1958,6 +1982,7 @@ mod tests {
     #[test]
     fn diff_redraw_skips_new_trailing_cells_covered_by_wide_graphemes() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell("B", 0, 0, 0),
@@ -1970,6 +1995,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1993,6 +2019,7 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_halfwidth_voiced_kana() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -2005,6 +2032,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),

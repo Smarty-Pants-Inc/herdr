@@ -223,6 +223,75 @@ pub(crate) struct EncodedGraphics {
     pub(crate) incomplete: bool,
 }
 
+#[cfg(any(unix, test))]
+pub(crate) struct KittyPlacementReplay {
+    terminal: crate::ghostty::Terminal,
+    size: (u16, u16, u32, u32),
+}
+
+#[cfg(any(unix, test))]
+impl KittyPlacementReplay {
+    pub(crate) fn new(size: (u16, u16, u32, u32)) -> Option<Self> {
+        let mut terminal = crate::ghostty::Terminal::new(size.0.max(1), size.1.max(1), 0).ok()?;
+        terminal.enable_kitty_graphics().ok()?;
+        let mut replay = Self {
+            terminal,
+            size: (0, 0, 0, 0),
+        };
+        replay.resize(size)?;
+        Some(replay)
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8], size: (u16, u16, u32, u32)) -> Option<Vec<u8>> {
+        self.resize(size)?;
+        self.terminal.write(bytes);
+        self.snapshot()
+    }
+
+    fn resize(&mut self, size: (u16, u16, u32, u32)) -> Option<()> {
+        if self.size == size {
+            return Some(());
+        }
+        self.terminal
+            .resize(size.0.max(1), size.1.max(1), size.2.max(1), size.3.max(1))
+            .ok()?;
+        self.size = size;
+        Some(())
+    }
+
+    fn snapshot(&self) -> Option<Vec<u8>> {
+        let placements = self
+            .terminal
+            .kitty_image_placements_with_data_filter(|_| false)
+            .ok()?;
+        let pane_id = PaneId::from_raw(1);
+        let area = Rect::new(0, 0, self.size.0, self.size.1);
+        let cell_size = HostCellSize {
+            width_px: self.size.2.max(1),
+            height_px: self.size.3.max(1),
+        };
+        let mut bytes = Vec::new();
+        for placement in placements {
+            let image_id = placement.image_id;
+            let placement_id = placement.placement_id;
+            let z = placement.z;
+            let host = HostPlacement {
+                pane_id,
+                host_image_id: Some(image_id),
+                area,
+                cell_size,
+                source_key: HostSourceKey::Terminal { pane_id, image_id },
+                placement,
+                scrollback_offset: 0,
+            };
+            if let Some((clipped, _)) = clipped_placement(&host) {
+                encode_display_placement(&mut bytes, clipped, image_id, placement_id, z);
+            }
+        }
+        Some(bytes)
+    }
+}
+
 pub(crate) fn encode_local_pane_graphics(
     app: &AppState,
     graphics: &crate::app::pane_graphics::Runtime,
@@ -1781,6 +1850,47 @@ mod tests {
             }
         );
         assert!(!HostCellSize::fallback_for_area(Rect::default()).is_known());
+    }
+
+    #[test]
+    fn placement_replay_tracks_sibling_transactions_moves_and_deletes() {
+        let size = (20, 10, 10, 20);
+        let mut replay = KittyPlacementReplay::new(size).unwrap();
+        let first = replay
+            .update(
+                b"\x1b_Ga=t,t=d,f=32,s=1,v=1,i=41,q=2,m=0;/wAA/w==\x1b\\\x1b[2;3H\x1b_Ga=p,i=41,p=6,c=1,r=1,z=0,C=1,q=2;\x1b\\",
+                size,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("a=p,i=41,p=6"));
+        assert!(!String::from_utf8_lossy(&first).contains("a=t"));
+
+        let siblings = replay
+            .update(
+                b"\x1b[4;5H\x1b_Ga=T,t=d,f=32,s=1,v=1,i=42,p=7,c=1,r=1,z=-1,C=1,q=2,m=0;AAAAAA==\x1b\\",
+                size,
+            )
+            .unwrap();
+        let siblings = String::from_utf8_lossy(&siblings);
+        assert!(siblings.contains("a=p,i=41,p=6"), "{siblings:?}");
+        assert!(siblings.contains("a=p,i=42,p=7"), "{siblings:?}");
+
+        let moved = replay
+            .update(
+                b"\x1b_Ga=d,d=i,i=41,p=6,q=2;\x1b\\\x1b[5;6H\x1b_Ga=p,i=41,p=6,c=1,r=1,z=0,C=1,q=2;\x1b\\",
+                size,
+            )
+            .unwrap();
+        let moved = String::from_utf8_lossy(&moved);
+        assert!(moved.contains("\x1b[5;6H"), "{moved:?}");
+        assert!(moved.contains("a=p,i=42,p=7"), "{moved:?}");
+
+        let deleted = replay
+            .update(b"\x1b_Ga=d,d=i,i=41,p=6,q=2;\x1b\\", size)
+            .unwrap();
+        let deleted = String::from_utf8_lossy(&deleted);
+        assert!(!deleted.contains("i=41"), "{deleted:?}");
+        assert!(deleted.contains("a=p,i=42,p=7"), "{deleted:?}");
     }
 
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {

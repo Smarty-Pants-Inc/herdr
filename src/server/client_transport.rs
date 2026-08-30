@@ -531,6 +531,13 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// The App displayed the first frame for an exact client-local renderer launch.
     OmpRendererReady { client_id: u64, launch_id: u64 },
+    /// The App received one exact active renderer authority and matching frame.
+    OmpRendererAuthorityAck {
+        client_id: u64,
+        launch_id: u64,
+        authority_revision: u64,
+        frame_nonce: [u8; 16],
+    },
     /// A background managed OMP companion resolution completed for the server-private fallback.
     OmpPrivateCompanionResolved {
         result: Result<crate::update::OmpExecutable, String>,
@@ -1365,6 +1372,16 @@ fn client_read_loop(
                 client_id,
                 launch_id,
             },
+            ClientMessage::OmpRendererAuthorityAck {
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            } => ServerEvent::OmpRendererAuthorityAck {
+                client_id,
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            },
             ClientMessage::ActivateOmpLink {
                 launch_id,
                 request_id,
@@ -1512,6 +1529,24 @@ mod tests {
                 client_id: 7,
                 launch_id: 9,
             }
+        ));
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::OmpRendererAuthorityAck {
+                launch_id: 9,
+                authority_revision: 4,
+                frame_nonce: [7; 16],
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "OMP renderer authority ack event"),
+            ServerEvent::OmpRendererAuthorityAck {
+                client_id: 7,
+                launch_id: 9,
+                authority_revision: 4,
+                frame_nonce,
+            } if frame_nonce == [7; 16]
         ));
         drop(client_stream);
         handle.join().unwrap().unwrap();

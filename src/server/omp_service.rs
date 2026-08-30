@@ -810,22 +810,6 @@ impl OmpService {
         })
     }
 
-    pub(crate) fn app_has_native_renderer_for_pane(
-        &self,
-        app_client_id: u64,
-        pane_id: &str,
-    ) -> bool {
-        self.bound_apps.iter().any(|(renderer_id, bound_app_id)| {
-            *bound_app_id == app_client_id
-                && *renderer_id != app_client_id
-                && self.renderer_modes.get(renderer_id) == Some(&OmpRendererMode::ClientLocalNative)
-                && self
-                    .route_bindings
-                    .get(renderer_id)
-                    .is_some_and(|route| route.pane_id == pane_id)
-        })
-    }
-
     pub(crate) fn app_has_native_renderer_for_route(
         &self,
         app_client_id: u64,
@@ -1920,6 +1904,7 @@ mod tests {
         app.omp_renderer_capabilities.client_local_native = true;
         app.omp_renderer_target = Some(crate::server::clients::OmpRendererTargetState {
             launch_id: 7,
+            authority_revision: 1,
             route: Some(crate::protocol::OmpRendererRoute {
                 pane_id: key.pane_id.clone(),
                 omp_session_id: key.omp_session_id.clone(),
@@ -1932,6 +1917,7 @@ mod tests {
                 modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
             },
             surface_active: false,
+            input_authority_acked: false,
         });
         clients.insert(3, app);
 
@@ -2025,6 +2011,7 @@ mod tests {
         );
         app.omp_renderer_target = Some(crate::server::clients::OmpRendererTargetState {
             launch_id: 7,
+            authority_revision: 1,
             route: Some(crate::protocol::OmpRendererRoute {
                 pane_id: key.pane_id.clone(),
                 omp_session_id: key.omp_session_id.clone(),
@@ -2037,6 +2024,7 @@ mod tests {
                 modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
             },
             surface_active: false,
+            input_authority_acked: false,
         });
         let mut clients = HashMap::from([
             (
@@ -2370,6 +2358,7 @@ mod tests {
         let target =
             |key: &OmpRouteKey, launch_id| crate::server::clients::OmpRendererTargetState {
                 launch_id,
+                authority_revision: 1,
                 route: Some(crate::protocol::OmpRendererRoute {
                     pane_id: key.pane_id.clone(),
                     omp_session_id: key.omp_session_id.clone(),
@@ -2382,6 +2371,7 @@ mod tests {
                     modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
                 },
                 surface_active: false,
+                input_authority_acked: false,
             };
         let mut app = client(
             crate::server::clients::ClientConnectionMode::App,

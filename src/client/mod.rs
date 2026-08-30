@@ -444,8 +444,12 @@ struct ClientState {
     blit_encoder: render_ansi::BlitEncoder,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
-    /// Whether host mouse reports use SGR pixel coordinates.
+    /// Whether host reports use SGR pixel coordinates.
     sgr_pixels_active: bool,
+    /// Mouse capture requested by the server-owned surface.
+    server_mouse_capture_active: bool,
+    /// SGR pixel reporting requested by the server-owned surface.
+    server_sgr_pixels_active: bool,
     /// Whether the host terminal currently reports all keys as Kitty sequences.
     keyboard_report_all_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -624,6 +628,14 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
+    }
+    #[cfg(unix)]
+    fn desired_host_mouse_mode(&self) -> (bool, bool) {
+        let (local_capture, local_sgr_pixels) = self.omp_renderer.local_mouse_mode();
+        let capture = self.server_mouse_capture_active || local_capture;
+        let sgr_pixels =
+            (self.server_mouse_capture_active && self.server_sgr_pixels_active) || local_sgr_pixels;
+        (capture, capture && sgr_pixels)
     }
 
     fn write_mouse_pointer_shape(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
@@ -992,6 +1004,35 @@ fn set_mouse_capture(enabled: bool, sgr_pixels: bool) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn sync_host_mouse_mode(
+    state: &mut ClientState,
+    host_input_state: &HostInputState,
+    applied_host_input_generation: &mut u64,
+) -> Result<(), ClientError> {
+    let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
+    if enabled != state.mouse_capture_active || sgr_pixels != state.sgr_pixels_active {
+        state.omp_renderer.finish_local_mouse_gesture();
+        let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
+        if enabled == state.mouse_capture_active && sgr_pixels == state.sgr_pixels_active {
+            return Ok(());
+        }
+        *applied_host_input_generation = host_input_state
+            .transition_mouse_mode(enabled, sgr_pixels, || {
+                set_mouse_capture(enabled, sgr_pixels)
+            })
+            .map_err(ClientError::ConnectionFailed)?
+            .generation();
+        state.mouse_capture_active = enabled;
+        state.sgr_pixels_active = sgr_pixels;
+        if !enabled {
+            state.mouse_pointer.set_cell(None);
+            state.omp_renderer.observe_pointer_cell(None);
+        }
+    }
+    Ok(())
+}
+
 fn restore_terminal_state(
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
@@ -1236,8 +1277,11 @@ fn client_omp_renderer_eligible(
     stdin_tty: bool,
     stdout_tty: bool,
 ) -> bool {
-    let _ = launch_mode;
-    omp_renderer::capabilities(requested_encoding, false, stdin_tty, stdout_tty, true)
+    let app_surface = matches!(
+        launch_mode,
+        ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+    );
+    omp_renderer::capabilities(requested_encoding, app_surface, stdin_tty, stdout_tty, true)
         .client_local_native
 }
 
@@ -1250,10 +1294,13 @@ fn client_omp_renderer_capabilities(
 ) -> crate::protocol::OmpRendererCapabilities {
     #[cfg(unix)]
     {
-        let _ = launch_mode;
+        let app_surface = matches!(
+            launch_mode,
+            ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+        );
         omp_renderer::capabilities(
             requested_encoding,
-            false,
+            app_surface,
             stdin_tty,
             stdout_tty,
             omp_executable.is_some(),
@@ -2220,12 +2267,18 @@ fn display_semantic_surface(
 fn display_pending_omp_surface(
     state: &mut ClientState,
     write_stream: &mut LocalStream,
+    host_input_state: &HostInputState,
+    applied_host_input_generation: &mut u64,
+    sync_mouse_mode: bool,
 ) -> Result<(), ClientError> {
     if let Some(surface) = state
         .omp_renderer
         .next_frame(Instant::now(), state.reported_size)
     {
         display_semantic_surface(state, surface.frame, surface.force_repaint);
+    }
+    if sync_mouse_mode {
+        sync_host_mouse_mode(state, host_input_state, applied_host_input_generation)?;
     }
     for effect in state.omp_renderer.take_effects() {
         match effect {
@@ -2282,6 +2335,8 @@ async fn run_client_loop(
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
         sgr_pixels_active: false,
+        server_mouse_capture_active: config.mouse_capture_active,
+        server_sgr_pixels_active: false,
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
         sound_config: config.sound_config,
@@ -2303,6 +2358,10 @@ async fn run_client_loop(
         #[cfg(unix)]
         omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
     };
+    #[cfg(unix)]
+    state
+        .omp_renderer
+        .set_server_sgr_pixels_active(state.server_sgr_pixels_active);
     debug!(?negotiated_encoding, "client render encoding active");
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
@@ -2366,9 +2425,9 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
-    let kitty_graphics_enabled = state.kitty_graphics_enabled;
     #[cfg(unix)]
     let resize_input_state = host_input_state.clone();
+    let kitty_graphics_enabled = state.kitty_graphics_enabled;
     std::thread::spawn(move || {
         resize_poll_loop(
             resize_tx,
@@ -2378,9 +2437,9 @@ async fn run_client_loop(
             initial_cell_height_px,
             kitty_graphics_enabled,
             &resize_cell_size,
-            &resize_quit,
             #[cfg(unix)]
             &resize_input_state,
+            &resize_quit,
         );
     });
 
@@ -2418,7 +2477,18 @@ async fn run_client_loop(
     // Main event loop.
     #[cfg(unix)]
     let mut ordered_input = VecDeque::new();
+    #[cfg(unix)]
+    let mut ordered_input_batch_active = false;
     while !should_quit.load(Ordering::Acquire) {
+        #[cfg(unix)]
+        if ordered_input_batch_active && ordered_input.is_empty() {
+            sync_host_mouse_mode(
+                &mut state,
+                &host_input_state,
+                &mut applied_host_input_generation,
+            )?;
+            ordered_input_batch_active = false;
+        }
         let event = {
             #[cfg(unix)]
             if let Some(event) = ordered_input.pop_front() {
@@ -2441,7 +2511,10 @@ async fn run_client_loop(
         match event {
             #[cfg(unix)]
             ClientLoopEvent::OrderedInput(events) => {
-                ordered_input.extend(events);
+                if !events.is_empty() {
+                    ordered_input_batch_active = true;
+                    ordered_input.extend(events);
+                }
                 continue;
             }
             #[cfg(unix)]
@@ -2509,7 +2582,6 @@ async fn run_client_loop(
                     };
                     (data, None)
                 } else {
-                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
                         state.redraw_on_focus_gained,
@@ -2527,6 +2599,9 @@ async fn run_client_loop(
                     }
                     (data, Some(events))
                 };
+                if let Some(events) = parsed_events.as_deref() {
+                    state.omp_renderer.observe_outer_focus(events);
+                }
                 if state.omp_renderer.owns_input() {
                     for message in state.omp_renderer.route_input_at_generation(
                         parsed_events.unwrap_or_default(),
@@ -2536,7 +2611,13 @@ async fn run_client_loop(
                             return Err(ClientError::ConnectionLost(error));
                         }
                     }
-                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                        !ordered_input_batch_active,
+                    )?;
                     let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     continue;
                 }
@@ -2598,7 +2679,13 @@ async fn run_client_loop(
                         return Err(ClientError::ConnectionLost(err));
                     }
                 }
-                display_pending_omp_surface(&mut state, &mut write_stream)?;
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    &host_input_state,
+                    &mut applied_host_input_generation,
+                    !ordered_input_batch_active,
+                )?;
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -2667,7 +2754,13 @@ async fn run_client_loop(
                         host_geometry,
                         applied_host_input_generation,
                     );
-                    display_pending_omp_surface(&mut state, &mut write_stream)?;
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                        !ordered_input_batch_active,
+                    )?;
                 }
                 let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 let msg = ClientMessage::Resize {
@@ -2683,14 +2776,32 @@ async fn run_client_loop(
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
                     #[cfg(unix)]
-                    if let Some(surface) = state.omp_renderer.cache_server_frame(frame_data) {
-                        display_semantic_surface(&mut state, surface.frame, surface.force_repaint);
+                    {
+                        if let Some(surface) = state.omp_renderer.cache_server_frame(
+                            frame_data,
+                            state.reported_cell_size_px,
+                            applied_host_input_generation,
+                        ) {
+                            display_semantic_surface(
+                                &mut state,
+                                surface.frame,
+                                surface.force_repaint,
+                            );
+                        }
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
                     }
                     #[cfg(not(unix))]
                     display_semantic_surface(&mut state, frame_data, false);
                 }
                 ServerMessage::OmpRendererTarget {
                     launch_id,
+                    authority_revision,
                     target_app_client_id,
                     route,
                     bound,
@@ -2701,6 +2812,7 @@ async fn run_client_loop(
                     {
                         state.omp_renderer.apply_target(
                             launch_id,
+                            authority_revision,
                             target_app_client_id,
                             route,
                             bound,
@@ -2714,11 +2826,18 @@ async fn run_client_loop(
                             ),
                             applied_host_input_generation,
                         );
-                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
                     }
                     #[cfg(not(unix))]
                     let _ = (
                         launch_id,
+                        authority_revision,
                         target_app_client_id,
                         route,
                         bound,
@@ -2739,7 +2858,13 @@ async fn run_client_loop(
                             activated,
                             applied_host_input_generation,
                         );
-                        display_pending_omp_surface(&mut state, &mut write_stream)?;
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
                     }
                     #[cfg(not(unix))]
                     let _ = (launch_id, request_id, activated);
@@ -2753,6 +2878,16 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
+                    #[cfg(unix)]
+                    state.omp_renderer.cache_server_graphics(
+                        &bytes,
+                        (
+                            state.reported_size.0,
+                            state.reported_size.1,
+                            state.reported_cell_size_px.0,
+                            state.reported_cell_size_px.1,
+                        ),
+                    );
                     if state.kitty_graphics_enabled {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
@@ -2925,35 +3060,37 @@ async fn run_client_loop(
                     sgr_pixels,
                 } => {
                     let next_sgr_pixels = enabled && sgr_pixels;
-                    let mouse_mode_changed = enabled != state.mouse_capture_active
-                        || next_sgr_pixels != state.sgr_pixels_active;
-                    if mouse_mode_changed {
-                        #[cfg(unix)]
-                        {
-                            applied_host_input_generation = host_input_state
-                                .transition_mouse_mode(enabled, next_sgr_pixels, || {
-                                    set_mouse_capture(enabled, next_sgr_pixels)
-                                })
-                                .map_err(ClientError::ConnectionFailed)?
-                                .generation();
+                    state.server_mouse_capture_active = enabled;
+                    state.server_sgr_pixels_active = next_sgr_pixels;
+                    #[cfg(unix)]
+                    state
+                        .omp_renderer
+                        .set_server_sgr_pixels_active(next_sgr_pixels);
+                    #[cfg(unix)]
+                    sync_host_mouse_mode(
+                        &mut state,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                    )?;
+                    #[cfg(not(unix))]
+                    {
+                        let mouse_mode_changed = enabled != state.mouse_capture_active
+                            || next_sgr_pixels != state.sgr_pixels_active;
+                        if mouse_mode_changed {
+                            set_mouse_capture(enabled, next_sgr_pixels)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            #[cfg(windows)]
+                            if enabled && windows_vti_input_backend_enabled() {
+                                let _ = enable_windows_virtual_terminal_input();
+                            }
                         }
-                        #[cfg(not(unix))]
-                        set_mouse_capture(enabled, next_sgr_pixels)
-                            .map_err(ClientError::ConnectionFailed)?;
-                        #[cfg(windows)]
-                        if enabled && windows_vti_input_backend_enabled() {
-                            let _ = enable_windows_virtual_terminal_input();
-                        }
+                        state.mouse_capture_active = enabled;
+                        state.sgr_pixels_active = next_sgr_pixels;
                     }
-                    state.mouse_capture_active = enabled;
-                    state.sgr_pixels_active = next_sgr_pixels;
-                    if !enabled {
+                    if !state.mouse_capture_active {
                         state.mouse_pointer.set_cell(None);
                         #[cfg(unix)]
-                        {
-                            state.omp_renderer.observe_pointer_cell(None);
-                            display_pending_omp_surface(&mut state, &mut write_stream)?;
-                        }
+                        state.omp_renderer.observe_pointer_cell(None);
                         let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                     }
                 }
@@ -3001,7 +3138,13 @@ async fn run_client_loop(
                     matcher.expire();
                 }
                 #[cfg(unix)]
-                display_pending_omp_surface(&mut state, &mut write_stream)?;
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    &host_input_state,
+                    &mut applied_host_input_generation,
+                    !ordered_input_batch_active,
+                )?;
             }
         }
     }
@@ -3670,6 +3813,11 @@ fn resize_report_required(
     signalled || new_size != last_size
 }
 
+#[cfg(windows)]
+fn resize_event(new_size: (u16, u16, u32, u32)) -> ClientLoopEvent {
+    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0)
+}
+
 /// Watches the terminal size and sends resize events when it changes.
 ///
 /// The baseline cell size must match what the handshake sent to the server:
@@ -3683,8 +3831,8 @@ fn resize_poll_loop(
     initial_cell_height: u32,
     kitty_graphics_enabled: bool,
     reported_cell_size: &AtomicU64,
-    should_quit: &Arc<AtomicBool>,
     #[cfg(unix)] host_input_state: &HostInputState,
+    should_quit: &Arc<AtomicBool>,
 ) {
     crate::platform::watch_terminal_resize_signal();
     let mut last_size = (
@@ -3706,9 +3854,7 @@ fn resize_poll_loop(
             #[cfg(unix)]
             let send_result = host_input_state.send_resize(&resize_tx, new_size);
             #[cfg(windows)]
-            let send_result = resize_tx.blocking_send(ClientLoopEvent::Resize(
-                new_size.0, new_size.1, new_size.2, new_size.3, 0,
-            ));
+            let send_result = resize_tx.blocking_send(resize_event(new_size));
             if send_result.is_err() {
                 break; // Main loop gone.
             }
@@ -3807,26 +3953,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mouse_mode_transition_is_one_versioned_snapshot() {
-        let input_state = HostInputState::new(false, false);
-        let pixels = input_state
-            .transition_mouse_mode(true, true, || Ok(()))
-            .unwrap();
-        assert_eq!(pixels.generation(), 1);
-        assert!(pixels.capture_active());
-        assert!(pixels.sgr_pixels_active());
-        assert_eq!(input_state.load(), pixels);
-
-        let cells = input_state
-            .transition_mouse_mode(true, false, || Ok(()))
-            .unwrap();
-        assert_eq!(cells.generation(), 2);
-        assert!(cells.capture_active());
-        assert!(!cells.sgr_pixels_active());
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn stale_unapplied_and_capture_disabled_mouse_input_is_rejected() {
         let captured = HostInputSnapshot::from_parts(7, true, false);
         assert!(mouse_input_is_current(captured, captured, 7, true));
@@ -3844,6 +3970,20 @@ mod tests {
             7,
             false
         ));
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn resize_signal_reports_even_when_polled_size_is_unchanged() {
+        let size = (120, 40, 8, 16);
+        assert!(resize_report_required(true, size, size));
+        assert!(!resize_report_required(false, size, size));
+        assert!(resize_report_required(false, (120, 41, 8, 16), size));
+        assert!(resize_report_required(false, (120, 40, 9, 18), size));
     }
 
     #[cfg(unix)]
@@ -3916,18 +4056,25 @@ mod tests {
         ));
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
+    #[cfg(unix)]
     #[test]
-    fn resize_signal_reports_even_when_polled_size_is_unchanged() {
-        let size = (120, 40, 8, 16);
-        assert!(resize_report_required(true, size, size));
-        assert!(!resize_report_required(false, size, size));
-        assert!(resize_report_required(false, (120, 41, 8, 16), size));
-        assert!(resize_report_required(false, (120, 40, 9, 18), size));
+    fn mouse_mode_transition_is_one_versioned_snapshot() {
+        let input_state = HostInputState::new(false, false);
+        let pixels = input_state
+            .transition_mouse_mode(true, true, || Ok(()))
+            .unwrap();
+        assert_eq!(pixels.generation(), 1);
+        assert!(pixels.capture_active());
+        assert!(pixels.sgr_pixels_active());
+        assert_eq!(input_state.load(), pixels);
+
+        let cells = input_state
+            .transition_mouse_mode(true, false, || Ok(()))
+            .unwrap();
+        assert_eq!(cells.generation(), 2);
+        assert!(cells.capture_active());
+        assert!(!cells.sgr_pixels_active());
+        assert_eq!(input_state.load(), cells);
     }
 
     #[test]
@@ -3966,7 +4113,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pane_local_omp_skips_native_companion_resolution() {
+    fn pane_local_omp_resolves_companion_and_advertises_native_capability() {
         let calls = std::cell::Cell::new(0);
         let eligible = client_omp_renderer_eligible(
             RenderEncoding::SemanticFrame,
@@ -3974,30 +4121,32 @@ mod tests {
             true,
             true,
         );
-        assert!(!eligible);
+        assert!(eligible);
         let executable = crate::update::OmpExecutable::Explicit(
             std::env::current_exe().expect("current test executable"),
         );
+        let resolved = resolve_client_omp_executable_with(
+            eligible,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(executable.clone())
+            },
+            |_| {},
+        )
+        .expect("verified native companion");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolved.executable(), executable.executable());
         assert!(
-            !client_omp_renderer_capabilities(
+            client_omp_renderer_capabilities(
                 RenderEncoding::SemanticFrame,
                 ClientLaunchMode::App,
                 true,
                 true,
-                Some(&executable),
+                Some(&resolved),
             )
             .client_local_native
         );
-        assert!(resolve_client_omp_executable_with(
-            eligible,
-            || {
-                calls.set(calls.get() + 1);
-                panic!("pane-local OMP must not resolve a full-surface companion")
-            },
-            |_| {},
-        )
-        .is_none());
-        assert_eq!(calls.get(), 0);
     }
     #[cfg(unix)]
     #[test]
@@ -4645,6 +4794,7 @@ mod tests {
             cursor: None,
             hyperlinks: vec!["https://example.com".into()],
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut pointer = MousePointerState::default();
         let mut output = Vec::new();
@@ -4659,7 +4809,6 @@ mod tests {
             .write_for_frame(&mut output, Some(&frame), None)
             .unwrap();
         assert!(output.is_empty());
-
         pointer.set_cell(Some((1, 0)));
         pointer
             .write_for_frame(&mut output, Some(&frame), None)
@@ -4679,6 +4828,7 @@ mod tests {
         assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
 
         output.clear();
+
         pointer
             .write_for_frame(&mut output, Some(&frame), Some(true))
             .unwrap();
