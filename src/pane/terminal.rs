@@ -31,10 +31,11 @@ use super::{
     osc::{
         contains_scrollback_clear_sequence, current_transient_default_color_owner,
         maybe_filter_primary_screen_scrollback_clear, parse_reported_cwd,
-        restore_host_terminal_theme_if_needed, write_host_terminal_theme_selective,
-        AgentOscStateTracker, DefaultColorEvent, DefaultColorEventTracker, DefaultColorOscTracker,
-        DefaultColorQuery, DefaultColorTrackedEvent, OmpReplyGenerationToken, OscDebugTracker,
-        PendingOmpReplyAnchor, RemoteExecReady, RemoteExecReadyFilter, ReportedCwd,
+        restore_host_terminal_theme_if_needed, strip_scrollback_clear_sequences,
+        write_host_terminal_theme_selective, AgentOscStateTracker, DefaultColorEvent,
+        DefaultColorEventTracker, DefaultColorOscTracker, DefaultColorQuery,
+        DefaultColorTrackedEvent, OmpReplyGenerationToken, OscDebugTracker, PendingOmpReplyAnchor,
+        RemoteExecReady, RemoteExecReadyFilter, ReportedCwd,
     },
     xtgettcap::{XtgettcapQueryTracker, XtgettcapResponse},
 };
@@ -228,6 +229,7 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    preserve_primary_scrollback: bool,
 }
 
 pub(crate) struct PaneTerminal {
@@ -248,6 +250,10 @@ impl PaneTerminal {
     ) -> ProcessBytesResult {
         self.ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
+    }
+
+    pub(crate) fn set_preserve_primary_scrollback(&self, enabled: bool) {
+        self.ghostty.set_preserve_primary_scrollback(enabled);
     }
     #[cfg(unix)]
     pub(crate) fn remote_exec_ready_filter_state(&self) -> RemoteExecReadyFilter {
@@ -1435,6 +1441,7 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                preserve_primary_scrollback: false,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1444,6 +1451,12 @@ impl GhosttyPaneTerminal {
     pub(super) fn set_windows_powershell_prompt_cwd_reporting(&self, enabled: bool) {
         if let Ok(mut core) = self.core.lock() {
             core.windows_powershell_prompt_cwd_reporting = enabled;
+        }
+    }
+
+    fn set_preserve_primary_scrollback(&self, enabled: bool) {
+        if let Ok(mut core) = self.core.lock() {
+            core.preserve_primary_scrollback = enabled;
         }
     }
 
@@ -1688,7 +1701,10 @@ impl GhosttyPaneTerminal {
             .active_screen()
             .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
             .unwrap_or(false);
-        let filtered_bytes = if shell_pid > 0 {
+        let preserve_primary_scrollback = core.preserve_primary_scrollback && !alternate_screen;
+        let filtered_bytes = if preserve_primary_scrollback {
+            strip_scrollback_clear_sequences(bytes.as_ref())
+        } else if shell_pid > 0 {
             let foreground_job = (!alternate_screen
                 && contains_scrollback_clear_sequence(bytes.as_ref()))
             .then(|| crate::detect::foreground_job(shell_pid))
@@ -1702,9 +1718,14 @@ impl GhosttyPaneTerminal {
             Cow::Borrowed(bytes.as_ref())
         };
         if filtered_bytes.len() != bytes.len() {
+            let reason = if preserve_primary_scrollback {
+                "private OMP history preservation"
+            } else {
+                "droid compatibility"
+            };
             debug!(
                 pane = pane_id.raw(),
-                shell_pid, "ignored scrollback clear sequence for droid compatibility"
+                shell_pid, reason, "ignored scrollback clear sequence"
             );
         }
 
@@ -4368,6 +4389,26 @@ mod tests {
         assert_eq!(reply_viewport_top(&pane), "reply two");
         assert!(pane.jump_to_previous_semantic_prompt());
         assert_eq!(reply_viewport_top(&pane), "reply one");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply one");
+    }
+
+    #[test]
+    fn private_omp_preserves_reply_history_across_primary_screen_rebuild() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        pane.set_preserve_primary_scrollback(true);
+        write_omp_reply(&pane, &tx, "run-a", "reply-1", "reply one");
+        write_omp_reply(&pane, &tx, "run-a", "reply-2", "reply two");
+        write_reply_tail(&pane, &tx);
+
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\x1b[H\x1b[3J\x1b[2J", &tx);
+        write_omp_reply(&pane, &tx, "run-a", "reply-3", "reply three");
+        write_reply_tail(&pane, &tx);
+
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply three");
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(reply_viewport_top(&pane), "reply two");
         assert!(pane.jump_to_previous_semantic_prompt());
         assert_eq!(reply_viewport_top(&pane), "reply one");
     }

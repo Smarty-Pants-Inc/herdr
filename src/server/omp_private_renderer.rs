@@ -109,6 +109,7 @@ impl PrivateOmpGuest {
             room_id(&config.route, config.attachment_epoch),
         );
         let launch_env = omp_guest_launch_env(config.launch_env, token.clone());
+        let bridge_render_notify = Arc::clone(&config.render_notify);
         let runtime = TerminalRuntime::spawn_argv_command(
             config.pane_id,
             config.rows,
@@ -124,6 +125,10 @@ impl PrivateOmpGuest {
             config.render_notify,
             config.render_dirty,
         )?;
+        // The private guest is a transcript projection. OMP may rebuild its
+        // viewport on startup or resize, but ED3 must not erase finalized replies
+        // that Herdr owns as native scrollback.
+        runtime.set_preserve_primary_scrollback(true);
         let (outbound, outbound_rx) = mpsc::sync_channel(OUTBOUND_QUEUE_CAPACITY);
         let (inbound_tx, inbound) = mpsc::sync_channel(INBOUND_QUEUE_CAPACITY);
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -139,6 +144,7 @@ impl PrivateOmpGuest {
             Arc::clone(&bridge_ready),
             Arc::clone(&bridge_failed),
             Arc::clone(&shutting_down),
+            bridge_render_notify,
         );
         Ok(Self {
             route: config.route,
@@ -430,35 +436,48 @@ fn spawn_bridge_thread(
     bridge_ready: Arc<AtomicBool>,
     bridge_failed: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    render_notify: Arc<Notify>,
 ) {
     std::thread::spawn(move || {
         let Ok((stream, reader)) = accept_authenticated_guest(&listener, &token, &shutting_down)
         else {
-            fail_bridge(&guest, &bridge_failed, &shutting_down);
+            fail_bridge(&guest, &bridge_failed, &shutting_down, &render_notify);
             return;
         };
         if stream.set_nodelay(true).is_err() {
-            fail_bridge(&guest, &bridge_failed, &shutting_down);
+            fail_bridge(&guest, &bridge_failed, &shutting_down, &render_notify);
             return;
         }
         if let Ok(mut slot) = guest.lock() {
             *slot = Some(stream);
         } else {
-            fail_bridge(&guest, &bridge_failed, &shutting_down);
+            fail_bridge(&guest, &bridge_failed, &shutting_down, &render_notify);
             return;
         }
         bridge_ready.store(true, Ordering::Release);
+        render_notify.notify_one();
         let reader_failed = Arc::clone(&bridge_failed);
         let reader_shutdown = Arc::clone(&shutting_down);
         let reader_guest = Arc::clone(&guest);
+        let reader_render_notify = Arc::clone(&render_notify);
         std::thread::spawn(move || {
-            if let Err(error) = read_guest_records(reader, inbound, Arc::clone(&reader_shutdown)) {
+            if let Err(error) = read_guest_records(
+                reader,
+                inbound,
+                Arc::clone(&reader_shutdown),
+                Arc::clone(&reader_render_notify),
+            ) {
                 tracing::warn!(%error, "private OMP guest reader failed");
             }
-            fail_bridge(&reader_guest, &reader_failed, &reader_shutdown);
+            fail_bridge(
+                &reader_guest,
+                &reader_failed,
+                &reader_shutdown,
+                &reader_render_notify,
+            );
         });
         write_guest_records(Arc::clone(&guest), outbound, Arc::clone(&shutting_down));
-        fail_bridge(&guest, &bridge_failed, &shutting_down);
+        fail_bridge(&guest, &bridge_failed, &shutting_down, &render_notify);
     });
 }
 
@@ -466,6 +485,7 @@ fn fail_bridge(
     guest: &Mutex<Option<TcpStream>>,
     bridge_failed: &AtomicBool,
     shutting_down: &AtomicBool,
+    render_notify: &Notify,
 ) {
     if shutting_down.load(Ordering::Acquire) {
         return;
@@ -476,6 +496,7 @@ fn fail_bridge(
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
+    render_notify.notify_one();
 }
 
 fn read_candidate_announcement(
@@ -598,6 +619,7 @@ fn read_guest_records(
     mut reader: BufReader<TcpStream>,
     inbound: mpsc::SyncSender<PrivateOmpGuestRecord>,
     shutting_down: Arc<AtomicBool>,
+    render_notify: Arc<Notify>,
 ) -> io::Result<()> {
     let mut line = String::new();
     while !shutting_down.load(Ordering::Acquire) {
@@ -624,6 +646,7 @@ fn read_guest_records(
                 "private OMP guest queue unavailable",
             )
         })?;
+        render_notify.notify_one();
     }
     Ok(())
 }
@@ -797,6 +820,44 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn guest_record_wakes_server_after_queueing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (reader, _) = listener.accept().unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::sync_channel(1);
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let render_notify = Arc::new(Notify::new());
+        let notified = render_notify.notified();
+        let reader_thread = {
+            let shutting_down = Arc::clone(&shutting_down);
+            let render_notify = Arc::clone(&render_notify);
+            std::thread::spawn(move || {
+                read_guest_records(
+                    BufReader::new(reader),
+                    inbound_tx,
+                    shutting_down,
+                    render_notify,
+                )
+            })
+        };
+
+        writer
+            .write_all(b"{\"t\":\"frame\",\"frame\":{\"t\":\"hello\"}}\n")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("private guest record should wake the server");
+        assert!(matches!(
+            inbound_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(PrivateOmpGuestRecord::Frame { .. })
+        ));
+
+        shutting_down.store(true, Ordering::Release);
+        writer.shutdown(Shutdown::Both).unwrap();
+        assert!(reader_thread.join().unwrap().is_err());
+    }
+
     #[test]
     fn parses_control_and_preserves_frame_json() {
         assert!(matches!(
@@ -832,7 +893,8 @@ mod tests {
         let guest = Mutex::new(None);
         let failed = AtomicBool::new(false);
         let shutting_down = AtomicBool::new(true);
-        fail_bridge(&guest, &failed, &shutting_down);
+        let render_notify = Notify::new();
+        fail_bridge(&guest, &failed, &shutting_down, &render_notify);
         assert!(!failed.load(Ordering::Acquire));
     }
 
@@ -841,7 +903,8 @@ mod tests {
         let guest = Mutex::new(None);
         let failed = AtomicBool::new(false);
         let shutting_down = AtomicBool::new(false);
-        fail_bridge(&guest, &failed, &shutting_down);
+        let render_notify = Notify::new();
+        fail_bridge(&guest, &failed, &shutting_down, &render_notify);
         assert!(failed.load(Ordering::Acquire));
     }
 }

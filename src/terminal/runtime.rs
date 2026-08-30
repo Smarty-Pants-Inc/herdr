@@ -21,6 +21,10 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    pub(crate) fn set_preserve_primary_scrollback(&self, enabled: bool) {
+        self.0.set_preserve_primary_scrollback(enabled);
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()

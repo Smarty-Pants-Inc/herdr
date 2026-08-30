@@ -2123,6 +2123,10 @@ impl PaneRuntime {
         self.preserve_processes_on_drop = true;
     }
 
+    pub(crate) fn set_preserve_primary_scrollback(&self, enabled: bool) {
+        self.terminal.set_preserve_primary_scrollback(enabled);
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.io.duplicate_handoff_fd()

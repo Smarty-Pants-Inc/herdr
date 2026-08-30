@@ -4702,6 +4702,9 @@ impl HeadlessServer {
                     client.private_omp_guest = Some(guest);
                     client.request_repaint();
                 }
+                // The guest can queue its hello before this owner slot exists. Wake once
+                // after installation so that record cannot remain parked until user input.
+                self.app.render_notify.notify_one();
                 self.apply_omp_messages(messages);
                 true
             }
@@ -10511,7 +10514,13 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                 admission: test_host_admission_sender(),
             }
         };
+        server.app.render_notify = Arc::new(tokio::sync::Notify::new());
+        let attach_notify = Arc::clone(&server.app.render_notify);
+        let attached = attach_notify.notified();
         assert!(server.handle_server_event(host_started(foreground_route.clone(), 1)));
+        tokio::time::timeout(Duration::from_secs(1), attached)
+            .await
+            .expect("private guest attachment should wake the server");
         assert_eq!(
             server.clients[&1]
                 .private_omp_guest

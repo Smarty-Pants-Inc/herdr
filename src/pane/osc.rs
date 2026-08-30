@@ -1300,7 +1300,7 @@ pub(super) fn contains_scrollback_clear_sequence(bytes: &[u8]) -> bool {
         || bytes.windows(5).any(|window| window == b"\x1b[?3J")
 }
 
-fn strip_scrollback_clear_sequences<'a>(bytes: &'a [u8]) -> Cow<'a, [u8]> {
+pub(super) fn strip_scrollback_clear_sequences<'a>(bytes: &'a [u8]) -> Cow<'a, [u8]> {
     if !contains_scrollback_clear_sequence(bytes) {
         return Cow::Borrowed(bytes);
     }
