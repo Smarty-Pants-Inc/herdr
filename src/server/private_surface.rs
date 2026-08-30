@@ -228,6 +228,7 @@ impl PrivateSurface {
             }
             crate::raw_input::RawInputEvent::Text(text) => {
                 let runtime = self.runtime.as_ref()?;
+                runtime.scroll_reset();
                 let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()));
             }
             crate::raw_input::RawInputEvent::Paste(text) => {

@@ -3093,6 +3093,47 @@ tail a\r\ntail b\r\ntail c\r\ntail d\r\ntail e\r\n";
     }
 
     #[tokio::test]
+    async fn regular_omp_text_and_bracketed_paste_reset_reply_scrollback() {
+        let (mut app, pane_id, mut input_rx) =
+            app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);
+        let option_up = TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+
+        assert!(app
+            .handle_terminal_key_headless(option_up.clone())
+            .is_none());
+        assert!(pane_scroll_offset(&app, pane_id) > 0);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("入力"),
+            )],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 0);
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded IME text").as_ref(),
+            "入力".as_bytes()
+        );
+
+        app.state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .test_process_pty_bytes(b"\x1b[?2004h");
+        assert!(app.handle_terminal_key_headless(option_up).is_none());
+        assert!(pane_scroll_offset(&app, pane_id) > 0);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste("pasted".into())],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 0);
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded bracketed paste"),
+            Bytes::from_static(b"\x1b[200~pasted\x1b[201~")
+        );
+    }
+
+    #[tokio::test]
     async fn grouped_option_up_navigates_omp_replies_once_per_repeat() {
         let (mut app, pane_id, mut input_rx) =
             app_with_reply_scrollback(Some(crate::detect::Agent::Omp), OMP_REPLY_SCROLLBACK);

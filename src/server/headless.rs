@@ -5152,6 +5152,7 @@ impl HeadlessServer {
                 crate::raw_input::RawInputEvent::Text(text)
                     if keyboard_target && self.app.state.mode == crate::app::Mode::Terminal =>
                 {
+                    runtime.scroll_reset();
                     let _ = guest.input(Bytes::copy_from_slice(text.as_str().as_bytes()));
                     consumed = true;
                 }
@@ -9069,8 +9070,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_omp_reply_navigation_handles_later_grouped_repeats_and_focus_loss_fallthrough()
-    {
+    async fn private_omp_reply_navigation_text_and_paste_handle_later_grouped_repeats_and_focus_loss_fallthrough(
+    ) {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-reply-navigation");
         let route = OmpRouteKey {
@@ -9200,13 +9201,80 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                 .offset_from_bottom,
             0
         );
-        assert!(!guest.test_input_is_empty());
+        assert_eq!(guest.test_take_input(), Some(Bytes::from("x")));
 
         let (remaining, consumed) = server.partition_private_omp_input(
             1,
             vec![crate::raw_input::RawInputEvent::Key(
                 crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT),
             )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(guest
+            .runtime()
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply three")));
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("入力"),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .runtime()
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+        assert_eq!(guest.test_take_input(), Some(Bytes::from("入力")));
+
+        server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("private OMP guest")
+            .runtime()
+            .test_process_pty_bytes(b"\x1b[?2004h");
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(option_up.clone())],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Paste("pasted".into())],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .runtime()
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+        assert_eq!(
+            guest.test_take_input(),
+            Some(Bytes::from_static(b"\x1b[200~pasted\x1b[201~"))
+        );
+
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(option_up.clone())],
         );
         assert!(consumed);
         assert!(remaining.is_empty());

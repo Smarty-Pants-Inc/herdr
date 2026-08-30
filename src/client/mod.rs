@@ -70,6 +70,8 @@ struct ClientLoopConfig {
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     #[cfg(unix)]
     omp_executable: Option<crate::update::OmpExecutable>,
+    #[cfg(unix)]
+    omp_scrollback_limit_bytes: usize,
 }
 
 /// State tracking for the thin client.
@@ -1658,6 +1660,8 @@ fn run_client_with_mode(
         .client_local_native
         .then_some(omp_executable)
         .flatten();
+    #[cfg(unix)]
+    let omp_scrollback_limit_bytes = loaded_config.config.advanced.scrollback_limit_bytes;
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1668,6 +1672,8 @@ fn run_client_with_mode(
         remote_image_paste_key,
         #[cfg(unix)]
         omp_executable: renderer_omp_executable,
+        #[cfg(unix)]
+        omp_scrollback_limit_bytes,
     };
 
     if let Some((terminal_id, takeover)) = attach_request {
@@ -1908,7 +1914,10 @@ async fn run_client_loop(
         reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
         detached_process_children: Vec::new(),
         #[cfg(unix)]
-        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
+        omp_renderer: omp_renderer::ClientOmpRenderer::new(
+            config.omp_executable,
+            config.omp_scrollback_limit_bytes,
+        ),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));

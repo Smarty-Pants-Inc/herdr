@@ -670,10 +670,12 @@ impl TerminalRuntime {
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.scroll_reset();
         self.0.send_paste(text).await
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.scroll_reset();
         self.0.try_send_paste(text)
     }
 

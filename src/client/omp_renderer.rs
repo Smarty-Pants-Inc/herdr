@@ -134,6 +134,7 @@ impl LocalTarget {
         route: OmpRendererRoute,
         prefix: OmpRendererPrefix,
         size: (u16, u16, u32, u32),
+        scrollback_limit_bytes: usize,
     ) -> std::io::Result<Self> {
         let (cols, rows, cell_width_px, cell_height_px) = size;
         let pane_id = PaneId::alloc();
@@ -161,7 +162,7 @@ impl LocalTarget {
             &argv,
             &launch_env,
             crate::pane::AgentDetection::Disabled,
-            0,
+            scrollback_limit_bytes,
             crate::terminal_theme::TerminalTheme::default(),
             None,
             events_tx,
@@ -274,6 +275,7 @@ impl LocalTarget {
 #[derive(Default)]
 pub(super) struct ClientOmpRenderer {
     omp_executable: Option<crate::update::OmpExecutable>,
+    scrollback_limit_bytes: usize,
     latest_launch_id: u64,
     attempted_launches: HashSet<u64>,
     target: Option<LocalTarget>,
@@ -301,9 +303,13 @@ pub(super) struct ClientOmpRenderer {
 }
 
 impl ClientOmpRenderer {
-    pub(super) fn new(omp_executable: Option<crate::update::OmpExecutable>) -> Self {
+    pub(super) fn new(
+        omp_executable: Option<crate::update::OmpExecutable>,
+        scrollback_limit_bytes: usize,
+    ) -> Self {
         Self {
             omp_executable,
+            scrollback_limit_bytes,
             latest_launch_id: 0,
             attempted_launches: HashSet::new(),
             target: None,
@@ -370,6 +376,7 @@ impl ClientOmpRenderer {
             if !self.attempted_launches.insert(launch_id) {
                 return;
             }
+            let scrollback_limit_bytes = self.scrollback_limit_bytes;
             let target = self.omp_executable.as_ref().and_then(|omp_executable| {
                 LocalTarget::spawn(
                     omp_executable,
@@ -378,6 +385,7 @@ impl ClientOmpRenderer {
                     route,
                     prefix.clone(),
                     size,
+                    scrollback_limit_bytes,
                 )
                 .ok()
             });
@@ -1592,7 +1600,10 @@ fn forward_local_event(runtime: &TerminalRuntime, event: crate::raw_input::RawIn
             }
             Some(runtime.encode_terminal_key(key))
         }
-        crate::raw_input::RawInputEvent::Text(text) => Some(text.into_string().into_bytes()),
+        crate::raw_input::RawInputEvent::Text(text) => {
+            runtime.scroll_reset();
+            Some(text.into_string().into_bytes())
+        }
         crate::raw_input::RawInputEvent::Paste(text) => {
             return runtime.try_send_paste(text).is_ok()
         }
@@ -1639,6 +1650,29 @@ between one\r\n\
 between two\r\n\
 \x1b]133;A;aid=omp-response-client-run:reply-3\x07reply three\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
 tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
+    const LOCAL_OMP_SCROLLBACK_LIMIT_BYTES: usize = 128 * 1024;
+
+    fn long_omp_reply_scrollback() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for reply in 1..=3 {
+            bytes.extend_from_slice(
+                format!(
+                    "\x1b]133;A;aid=omp-response-client-long:reply-{reply}\x07reply {reply} finalized\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n"
+                )
+                .as_bytes(),
+            );
+            for line in 0..160 {
+                bytes.extend_from_slice(
+                    format!("reply {reply} transcript line {line:03} retained output\r\n")
+                        .as_bytes(),
+                );
+            }
+        }
+        for line in 0..160 {
+            bytes.extend_from_slice(format!("tail transcript line {line:03}\r\n").as_bytes());
+        }
+        bytes
+    }
     fn physical_option_up() -> crate::input::TerminalKey {
         crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT).with_windows_record(
             crate::input::WindowsKeyRecord {
@@ -1675,7 +1709,10 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     ) -> (ClientOmpRenderer, mpsc::Sender<AppEvent>, PaneId) {
         let pane_id = PaneId::alloc();
         let (events_tx, events) = mpsc::channel(8);
-        let mut renderer = ClientOmpRenderer::new(Some(test_omp_executable()));
+        let mut renderer = ClientOmpRenderer::new(
+            Some(test_omp_executable()),
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+        );
         renderer.latest_launch_id = 1;
         renderer.attempted_launches.insert(1);
         renderer.local_selected = true;
@@ -1741,7 +1778,8 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             |_| {},
         )
         .expect("resolved test executable");
-        let mut renderer = ClientOmpRenderer::new(Some(executable));
+        let mut renderer =
+            ClientOmpRenderer::new(Some(executable), LOCAL_OMP_SCROLLBACK_LIMIT_BYTES);
 
         renderer.apply_target(1, 2, None, false, false, test_prefix(), (80, 24, 0, 0), 0);
 
@@ -1757,7 +1795,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
 
     #[test]
     fn target_handling_ignores_native_target_without_pre_resolved_executable() {
-        let mut renderer = ClientOmpRenderer::new(None);
+        let mut renderer = ClientOmpRenderer::new(None, LOCAL_OMP_SCROLLBACK_LIMIT_BYTES);
         renderer.apply_target(
             1,
             2,
@@ -1823,6 +1861,43 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         runtime.resize(30, 100, 8, 16);
         assert_eq!(runtime.current_size(), (30, 100));
         runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn local_omp_navigates_to_oldest_finalized_reply_through_long_scrollback() {
+        let (runtime, mut input) = TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            40,
+            4,
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES,
+            &[],
+            8,
+        );
+        runtime.test_process_pty_bytes(&long_omp_reply_scrollback());
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert_eq!(
+            renderer.scrollback_limit_bytes,
+            LOCAL_OMP_SCROLLBACK_LIMIT_BYTES
+        );
+        let option_up = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+
+        for _ in 0..3 {
+            assert!(renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                    option_up.clone()
+                )])
+                .is_empty());
+        }
+
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply 1 finalized")));
+        assert!(input.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2081,6 +2156,83 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             .lines()
             .next()
             .is_some_and(|line| line.trim_end().starts_with("reply three")));
+    }
+
+    #[tokio::test]
+    async fn local_omp_text_and_bracketed_paste_reset_reply_scrollback() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let option_up = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.clone()
+            )])
+            .is_empty());
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .and_then(TerminalRuntime::scroll_metrics)
+            .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("入力"),
+            )])
+            .is_empty());
+        assert_eq!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+        assert_eq!(
+            input.try_recv().expect("forwarded IME text").as_ref(),
+            "入力".as_bytes()
+        );
+
+        renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .test_process_pty_bytes(b"\x1b[?2004h");
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(option_up)])
+            .is_empty());
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .and_then(TerminalRuntime::scroll_metrics)
+            .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Paste(
+                "pasted".into()
+            )])
+            .is_empty());
+        assert_eq!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+        assert_eq!(
+            input.try_recv().expect("forwarded bracketed paste"),
+            Bytes::from_static(b"\x1b[200~pasted\x1b[201~")
+        );
     }
 
     #[tokio::test]

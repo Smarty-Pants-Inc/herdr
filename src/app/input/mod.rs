@@ -147,6 +147,7 @@ impl App {
         self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
+                runtime.scroll_reset();
                 let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
             } else {
                 self.close_popup_pane();
@@ -162,6 +163,7 @@ impl App {
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
         if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            runtime.scroll_reset();
             let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
             return;
         }
@@ -170,6 +172,7 @@ impl App {
                 .state
                 .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
             {
+                runtime.scroll_reset();
                 let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
             }
         }
@@ -182,6 +185,7 @@ impl App {
         self.clear_hovered_pane_link();
         if self.state.popup_pane.is_some() {
             if let Some(runtime) = self.popup_runtime() {
+                runtime.scroll_reset();
                 let _ = runtime.send_bytes(Bytes::from(text)).await;
             } else {
                 self.close_popup_pane();
@@ -197,6 +201,7 @@ impl App {
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
         if let Some(runtime) = self.focused_workspace_plugin_runtime() {
+            runtime.scroll_reset();
             let _ = runtime.send_bytes(Bytes::from(text)).await;
             return;
         }
@@ -205,6 +210,7 @@ impl App {
                 .state
                 .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
             {
+                runtime.scroll_reset();
                 let _ = runtime.send_bytes(Bytes::from(text)).await;
             }
         }
