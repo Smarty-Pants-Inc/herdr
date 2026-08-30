@@ -9,7 +9,7 @@ queue_rules:
     checks_timeout: 30 min
     merge_method: merge
     queue_conditions:
-      - base = master
+      - base ~= ^(master|smarty-preview-source)$
       - -draft
       - check-success = smarty-review
       - check-success = smarty-land-ready
