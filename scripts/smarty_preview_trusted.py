@@ -680,8 +680,12 @@ def _load_tar_json(path: Path, member_name: str, label: str) -> Any:
 def validate_git_archive(archive_path: Path, repository: Path) -> None:
     members = _safe_tar_members(archive_path, "Herdr source archive")
     files = {member.name: member for member in members if member.isfile() or member.issym()}
+    head = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "--verify", "HEAD^{commit}"],
+        text=True,
+    ).strip()
     raw = subprocess.check_output(
-        ["git", "-C", str(repository), "ls-tree", "-r", "--full-tree", "-z", "HEAD"]
+        ["git", "-C", str(repository), "ls-tree", "-r", "--full-tree", "-z", head]
     )
     blobs: dict[str, tuple[int, str]] = {}
     for record in raw.split(b"\0"):
@@ -720,20 +724,31 @@ def validate_git_archive(archive_path: Path, repository: Path) -> None:
             else:
                 if not member.isfile():
                     _fail(f"Herdr source archive does not preserve Git regular-file semantics: {path}")
-                expected_permissions = {
-                    git_mode & 0o7777,
-                    0o775 if git_mode & 0o111 else 0o664,
-                }
+                raw_permissions = git_mode & 0o7777
+                native_permissions = 0o775 if git_mode & 0o111 else 0o664
+                expected_permissions = {raw_permissions, native_permissions}
                 source = bundle.extractfile(member)
                 if source is None:
                     _fail(f"Herdr source archive member cannot be read: {path}")
                 expected_size = member.size
-            if (member.mode & 0o7777) not in expected_permissions:
+            member_permissions = member.mode & 0o7777
+            if member_permissions not in expected_permissions:
                 _fail(f"Herdr source archive mode differs from the Git tree: {path}")
-            process = subprocess.Popen(
-                ["git", "-C", str(repository), "cat-file", "blob", object_id],
-                stdout=subprocess.PIPE,
-            )
+            command = ["git", "-C", str(repository), "cat-file", "blob", object_id]
+            environment = None
+            if git_type == 0o100000 and member_permissions == native_permissions:
+                command = [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "cat-file",
+                    "--filters",
+                    f"--path={path}",
+                    object_id,
+                ]
+                environment = os.environ.copy()
+                environment["GIT_ATTR_SOURCE"] = head
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, env=environment)
             if process.stdout is None:
                 process.kill()
                 process.wait()
