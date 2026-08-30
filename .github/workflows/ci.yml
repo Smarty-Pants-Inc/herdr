@@ -16,7 +16,7 @@ env:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.head_ref, 'mergify/merge-queue/') }}
 
 jobs:
   conventional-commits:
@@ -257,7 +257,7 @@ jobs:
 
   smarty-ci:
     name: smarty-ci
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() }}
     needs: [conventional-commits, check, windows-conpty-package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
