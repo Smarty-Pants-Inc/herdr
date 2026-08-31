@@ -1621,133 +1621,182 @@ jobs:
           PY
 
   phase-a-channel:
-    name: Phase A canary TUF handoff
+    name: Phase A render Windows bootstrap bridge
     needs: [validate-seal, publish-release]
     runs-on: ubuntu-latest
-    environment: smarty-release
     permissions:
       actions: read
       contents: read
+    outputs:
+      bridge_commit: ${{ steps.render.outputs.bridge_commit }}
+      canonical_commit: ${{ steps.render.outputs.canonical_commit }}
+      artifact_attempt: ${{ steps.render.outputs.artifact_attempt }}
     steps:
       - name: Install Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Checkout executing trusted publisher revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: publisher-source
       - name: Download final sealed release
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: trusted-final-release-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
           path: .
-      - name: Create exact canary TUF promotion input
+      - name: Render exact bridge and canonical candidates without credentials
+        id: render
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.validate-seal.outputs.tag }}
+          BUILT_AT: ${{ needs.validate-seal.outputs.built_at }}
           PARENT: ${{ needs.validate-seal.outputs.parent }}
           SOURCE: ${{ needs.validate-seal.outputs.source }}
           OMP: ${{ needs.validate-seal.outputs.omp }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -I -S - <<'PY'
-          import hashlib, json, os
-          from pathlib import Path
-          root = Path("release-assets")
-          pair = json.loads((root / "smarty-pair.json").read_text(encoding="utf-8"))
-          handoff = json.loads(Path("final-seal/sealed-handoff.json").read_text(encoding="utf-8"))
-          identity = {key: os.environ[key] for key in ("TAG", "PARENT", "SOURCE", "OMP")}
-          if pair["release"]["tag"] != identity["TAG"] or pair["sources"]["parent"]["commit"] != identity["PARENT"] or pair["sources"]["herdr"]["commit"] != identity["SOURCE"] or pair["sources"]["omp"]["commit"] != identity["OMP"]:
-              raise SystemExit("pair manifest identity mismatch")
-          record = handoff["files"]["smarty-pair.json"]
-          digest = hashlib.sha256()
-          total = 0
-          with (root / "smarty-pair.json").open("rb") as payload:
-              while chunk := payload.read(1024 * 1024):
-                  total += len(chunk)
-                  if total > record["length"]:
-                      raise SystemExit("sealed pair grew while hashing")
-                  digest.update(chunk)
-          if total != record["length"] or record["sha256"] != digest.hexdigest():
-              raise SystemExit("sealed pair digest mismatch")
-          output = {
-              "schema": 1,
-              "status": "awaiting-external-tuf-signing",
-              "channel": "canary",
-              "repository": "Smarty-Pants-Inc/herdr",
-              "identity": {"tag": identity["TAG"], "parent": identity["PARENT"], "source": identity["SOURCE"], "omp": identity["OMP"], "pair_id": pair["pair_id"]},
-              "target": {"name": "smarty-pair.json", "length": record["length"], "sha256": record["sha256"], "release_url": f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{identity['TAG']}/smarty-pair.json"},
-              "requires": {"tuf_root_keys": "external", "tuf_online_signers": "external", "channel_compare_and_swap": True},
-          }
-          Path("channel-handoff.json").write_text(json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-          PY
-      - name: Upload canary TUF promotion input
+          OMP_TREE: ${{ needs.validate-seal.outputs.omp_tree }}
+          OMP_VERSION: ${{ needs.validate-seal.outputs.omp_version }}
+          OMP_BUILD_ID: ${{ needs.validate-seal.outputs.omp_build_id }}
+        run: >-
+          python publisher-source/scripts/smarty_preview_promotion.py render --repository "$REPOSITORY"
+          --tag "$TAG" --built-at "$BUILT_AT" --parent "$PARENT" --source "$SOURCE"
+          --omp "$OMP" --omp-tree "$OMP_TREE" --omp-version "$OMP_VERSION" --omp-build-id "$OMP_BUILD_ID"
+          --producer-attempt "${{ needs.validate-seal.outputs.run_attempt }}" --publisher-attempt "$GITHUB_RUN_ATTEMPT"
+          --release-assets release-assets --final-seal final-seal/sealed-handoff.json --output-root .
+      - name: Upload exact channel bridge handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: trusted-tuf-promotion-input-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
-          path: channel-handoff.json
+          name: trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: |
+            channel
+            phase-a-state.json
           if-no-files-found: error
           compression-level: 0
 
-  phase-b-promotion:
-    name: Phase B protected TUF promotion gate
+  phase-a-commit:
+    name: Phase A publish Windows bootstrap bridge
     needs: [validate-seal, phase-a-channel]
+    runs-on: ubuntu-latest
+    environment: smarty-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout executing trusted publisher revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: publisher-source
+      - name: Download exact channel bridge handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ needs.phase-a-channel.outputs.artifact_attempt }}
+          path: .
+      - name: Advance bridge and authorization refs atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python publisher-source/scripts/smarty_preview_promotion.py publish-bridge --repository "$REPOSITORY"
+          --state phase-a-state.json --channel channel --producer-attempt "${{ needs.validate-seal.outputs.run_attempt }}"
+
+
+  phase-b-promotion:
+    name: Phase B review canonical promotion
+    needs: [validate-seal, phase-a-channel, phase-a-commit]
     runs-on: ubuntu-latest
     environment:
       name: smarty-preview-promotion
     permissions:
       actions: read
       contents: read
+    outputs:
+      canonical_commit: ${{ steps.review.outputs.canonical_commit }}
+      artifact_attempt: ${{ steps.review.outputs.artifact_attempt }}
     steps:
       - name: Install Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Download canary TUF promotion input
+      - name: Checkout executing trusted publisher revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: publisher-source
+      - name: Download exact channel bridge handoff
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: trusted-tuf-promotion-input-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          name: trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ needs.phase-a-channel.outputs.artifact_attempt }}
           path: .
-      - name: Validate protected promotion handoff and stop at external gate
+      - name: Validate exact protected promotion target
+        id: review
         env:
-          TAG: ${{ needs.validate-seal.outputs.tag }}
-          PARENT: ${{ needs.validate-seal.outputs.parent }}
-          SOURCE: ${{ needs.validate-seal.outputs.source }}
-          OMP: ${{ needs.validate-seal.outputs.omp }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -I -S - "$TAG" "$PARENT" "$SOURCE" "$OMP" <<'PY'
-          import hashlib, json, re, sys
-          from pathlib import Path
-          tag, parent, source, omp = sys.argv[1:]
-          handoff = json.loads(Path("channel-handoff.json").read_text(encoding="utf-8"))
-          if set(handoff) != {"schema", "status", "channel", "repository", "identity", "target", "requires"}:
-              raise SystemExit("canary TUF handoff fields are not exact")
-          if handoff["schema"] != 1 or handoff["status"] != "awaiting-external-tuf-signing" or handoff["channel"] != "canary" or handoff["repository"] != "Smarty-Pants-Inc/herdr":
-              raise SystemExit("canary TUF handoff status or repository mismatch")
-          identity = handoff["identity"]
-          if set(identity) != {"tag", "parent", "source", "omp", "pair_id"}:
-              raise SystemExit("canary TUF handoff identity fields are not exact")
-          if identity["tag"] != tag or identity["parent"] != parent or identity["source"] != source or identity["omp"] != omp:
-              raise SystemExit("canary TUF handoff P/R/O identity mismatch")
-          if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in (parent, source, omp)):
-              raise SystemExit("canary TUF handoff commit identity is malformed")
-          expected_pair_id = hashlib.sha256(("smarty.paired-release.v1\0" + "\0".join((parent, source, omp))).encode("ascii")).hexdigest()
-          if re.fullmatch(r"[0-9a-f]{64}", identity["pair_id"]) is None or identity["pair_id"] != expected_pair_id:
-              raise SystemExit("canary TUF handoff pair_id mismatch")
-          target = handoff["target"]
-          expected_url = f"https://github.com/Smarty-Pants-Inc/herdr/releases/download/{tag}/smarty-pair.json"
-          if set(target) != {"name", "length", "sha256", "release_url"} or target.get("name") != "smarty-pair.json" or target.get("release_url") != expected_url:
-              raise SystemExit("canary TUF target identity mismatch")
-          if isinstance(target.get("length"), bool) or not isinstance(target.get("length"), int) or target["length"] < 1 or re.fullmatch(r"[0-9a-f]{64}", target.get("sha256", "")) is None:
-              raise SystemExit("canary TUF target length or digest is malformed")
-          if handoff["requires"] != {"tuf_root_keys": "external", "tuf_online_signers": "external", "channel_compare_and_swap": True}:
-              raise SystemExit("canary TUF external requirements mismatch")
-          Path("promotion-gate.json").write_text(json.dumps({"schema": 1, "status": "blocked-external-gate", "environment": "smarty-preview-promotion", "handoff": handoff, "next": "publish a signed TUF generation and perform channel CAS outside this workflow"}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-          PY
-          echo "Protected Phase B gate is ready; TUF keys/KMS and channel CAS remain an external human-controlled gate."
-      - name: Upload protected promotion gate record
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python publisher-source/scripts/smarty_preview_promotion.py review --repository "$REPOSITORY"
+          --state phase-a-state.json --channel channel --tag "${{ needs.validate-seal.outputs.tag }}"
+          --parent "${{ needs.validate-seal.outputs.parent }}" --source "${{ needs.validate-seal.outputs.source }}"
+          --omp "${{ needs.validate-seal.outputs.omp }}" --producer-attempt "${{ needs.validate-seal.outputs.run_attempt }}"
+          --publisher-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Upload protected promotion authorization
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
-          path: promotion-gate.json
+          name: trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: promotion-authorization.json
+          if-no-files-found: error
+          compression-level: 0
+
+  phase-b-commit:
+    name: Commit protected canonical promotion
+    needs: [validate-seal, phase-a-channel, phase-b-promotion]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Install Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Checkout executing trusted publisher revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: publisher-source
+      - name: Download exact channel bridge handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ needs.phase-a-channel.outputs.artifact_attempt }}
+          path: .
+      - name: Download protected promotion authorization
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ needs.phase-b-promotion.outputs.artifact_attempt }}
+          path: .
+      - name: Promote canonical channel and consume both authorizations atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python publisher-source/scripts/smarty_preview_promotion.py publish-canonical --repository "$REPOSITORY"
+          --state phase-a-state.json --channel channel --authorization promotion-authorization.json
+          --canonical-commit "${{ needs.phase-b-promotion.outputs.canonical_commit }}"
+          --producer-attempt "${{ needs.validate-seal.outputs.run_attempt }}" --output channel-promotion.json
+      - name: Upload canonical promotion record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trusted-channel-promotion-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}
+          path: channel-promotion.json
           if-no-files-found: error
           compression-level: 0
