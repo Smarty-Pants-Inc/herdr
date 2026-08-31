@@ -3,15 +3,14 @@
 ## Status and exact identities
 
 - Mission: `smarty-pants-increment3a-corrective-closure`
-- Result: C3 Herdr source, compatibility, API, schema, full-suite, and arm64 Darwin binary verification complete; Integration Master landing and root pin work remain pending.
-- Review base: `ebb46b51f22505b3fdec447915330754f539de86`
-- Assigned frozen base: `6f8f02db469af0f2592b7ba5ab7b9d5b8ce7a811`
-- Frozen-base tree: `d222a70f5c22255d02f54de38f0fbaf141d76def`
-- Production repair commit: `87c0f9ba919f0a42c1d3347d9c64f9259c9ae889`
-- Production source tree: `9be0f1b2ce459962f30a59d66622609e51eb7a6f`
-- Branch: `i3a-corrective/c3-seam-closure`
-- Evidence commit: the commit containing this file; Git cannot embed its own SHA.
-- Worktree: `/Users/paulbettner/.herdr/worktrees/herdr/i3a-corrective-c3`
+- Result: the rebased C3 source chain, compatibility/API/schema contracts, full `just check`, and arm64 Darwin release candidate are evidenced below; protected landing and root pin/package work remain Integration Master responsibilities.
+- Rebase base: `82f8e5e3de900a685606d2da13ce5eb38ce8764c`.
+- Production source parent: `633b9d66c446998fd5f1532f05c15748f64cb070`; tree `7d3041fa202af2db63c2321d2bf06190183e2552`.
+- Rebased evidence candidate HEAD: `81ff9b2fbc82f3f8a7288c1d979a8d299927a0f7`; tree `9529e5808de55f2e9a760b39b5f86e07fcc40d96`.
+- Rebased sequence: `861dffd`, `734af1d`, `67d5f2a`, `633b9d6`, `81ff9b2`.
+- Branch: `i3a-corrective/c3-seam-closure`.
+- Evidence binding: the exact `81ff9b2` candidate is externally bound by the root proof/package record. This handoff-update commit deliberately makes no self-referential final-HEAD claim.
+- Worktree: `/Users/paulbettner/.herdr/worktrees/herdr/i3a-corrective-c3`.
 - No push, pull request, merge, install, release, deployment, or root-pin change occurred.
 
 ## Authority custody
@@ -58,24 +57,17 @@ wc -c /Users/paulbettner/Downloads/SMARTY_PANTS_INCREMENT3A_CORRECTIVE_SOURCE_HA
 
 ## Patch ledger
 
-The assigned three-commit generic Herdr patch is unchanged. C3 adds one strictly proved public API repair.
+The generic Herdr patch and its public API repair were rebased unchanged in behavior. Reflog/history supplies the following old-to-rebased mapping:
 
-| Commit | Files | Delta | Contract |
-| --- | ---: | ---: | --- |
-| `cce4622f` `fix: support externally owned agent session restore` | 14 | `+276/-21` | Adds product-neutral `AgentResumePolicy::{Native,External}`, public `pane.report_agent_session` input and CLI plumbing, persistence/restore policy, terminal propagation, schema/docs, and External no-native-plan coverage. |
-| `10c7b17c` `fix: preserve external resume policy` | 2 | `+87/-5` | Moves session and history snapshots from v3 to v4, proves a v3 reader rejects v4 policy state, and preserves External through detection conflicts and replacement-generation state. |
-| `6f8f02db` `fix: accept externally managed omp reporters` | 1 | `+66/-1` | Allows fresh sequenced, recognized External OMP startup/lifecycle reports to anchor without premature native process detection; adds focused coverage. |
-| `87c0f9ba` `fix: expose external agent resume policy` | 5 | `+108/-5` | Adds optional public `AgentSessionInfo.resume_policy`, emits only `external` so Native JSON shape stays unchanged, preserves live authority policy projection, regenerates schema, updates draft docs, and adds the fail-first conformance test. |
+| Pre-rebase commit | Rebased commit | Contract |
+| --- | --- | --- |
+| `cce4622faabc48617ca22bc0d24cbf707a42f7b5` | `861dffd2568946ea6fb63e564ebdd69e23dd2c84` | `fix: support externally owned agent session restore` — adds product-neutral `AgentResumePolicy::{Native,External}`, public `pane.report_agent_session` input and CLI plumbing, persistence/restore policy, terminal propagation, schema/docs, and External no-native-plan coverage. |
+| `10c7b17c890b7a8c955d6315a007959117b6f89e` | `734af1d16d077811d96ca2eea1ff0c5ad8e48a28` | `fix: preserve external resume policy` — moves session and history snapshots from v3 to v4, proves a v3 reader rejects v4 policy state, and preserves External through detection conflicts and replacement-generation state. |
+| `6f8f02db469af0f2592b7ba5ab7b9d5b8ce7a811` | `67d5f2a3b81fcf4558404826081bb4d9c2f6e30c` | `fix: accept externally managed omp reporters` — allows fresh sequenced recognized External OMP reports to anchor without premature native process detection. |
+| `87c0f9ba919f0a42c1d3347d9c64f9259c9ae889` | `633b9d66c446998fd5f1532f05c15748f64cb070` | `fix: expose external agent resume policy` — adds optional public `AgentSessionInfo.resume_policy`, emits only `external` so Native JSON shape stays unchanged, preserves live policy projection, and updates schema and draft docs. |
+| `88dc1ea5406cbc63a1fbbf210d647b904a2df731` | `81ff9b2fbc82f3f8a7288c1d979a8d299927a0f7` | `docs: record C3 Herdr verification evidence`. |
 
-Review-base through production head:
-
-```text
-cce4622f fix: support externally owned agent session restore
-10c7b17c fix: preserve external resume policy
-6f8f02db fix: accept externally managed omp reporters
-87c0f9ba fix: expose external agent resume policy
-17 files changed, 535 insertions(+), 30 deletions(-)
-```
+The production source parent is the fourth rebased commit. The fifth commit is the evidence candidate; its exact commit/tree identity is recorded above and bound externally, not asserted as the identity of this update commit.
 
 No Smarty Project, Page, Agent Session, authorization, operation, product-domain, or reconstruction authority was added to Herdr. Smarty remains responsible for authorization and external launch reconstruction; it only emits generic External session reports.
 
@@ -100,7 +92,7 @@ error[E0609]: no field `resume_policy` on type `&schema::agents::AgentSessionInf
 note: available fields are: `source`, `agent`, `kind`, `value`
 ```
 
-After adding the Rust field and projection, the same command passed:
+The pre-rebase fail-first record then showed the same command passing:
 
 ```text
 Summary [0.075s] 1 test run: 1 passed, 3677 skipped
@@ -207,7 +199,7 @@ Generated `docs/next/api/herdr-api.schema.json` now includes optional `AgentResu
 
 ### Focused commands
 
-All final focused commands passed on production commit `87c0f9ba919f0a42c1d3347d9c64f9259c9ae889`:
+The named focused contracts listed below were retained through the rebase; the current rebased candidate's authoritative complete test evidence is the final `just check` log recorded in the next section.
 
 ```text
 cargo fmt --check
@@ -224,82 +216,64 @@ just test-one pane_restore_startup_suppresses_history_for_duplicate_native_agent
 just test-one future_version_is_rejected
 ```
 
-Each named nextest filter returned `1 passed` and no failure.
-
 ### Canonical full check
 
-Command:
-
-```text
-just check
-```
-
-Raw final outcomes:
+The final rebased check log is `/private/tmp/smarty-i3a-corrective-logs-0ym3mh/section7-herdr-final.log`. Its `just check` output records:
 
 ```text
 cargo fmt --check: passed
 cargo clippy --all-targets --locked -- -D warnings: passed
-cargo nextest run --locked -E "all()": 3677 passed, 1 skipped
+cargo nextest run --locked -E "all()": 3383 passed, 1 skipped
 scripts.test_ui_hot_path_architecture: 6 tests, OK
-integration assets: 18 passed; OpenCode state 6 passed; OpenCode TUI session 5 passed
+integration assets: 16 passed; OpenCode state 6 passed; OpenCode TUI session 5 passed
 plugin marketplace: 31 passed, 0 failed, 119 expect() calls
 x86_64-pc-windows-msvc clippy with LIBGHOSTTY_VT_SIMD=false: passed
-maintenance Python suites: 111 tests, OK
+maintenance Python suites: 127 tests, OK
 ```
 
-The first clean-build command completed successfully in `120.22s`. After commit `87c0f9ba` was created with the same source bytes, the exact command was rerun from that clean commit and completed successfully in `34.96s`; its nextest phase reported `3677 passed, 1 skipped` in `23.227s`. The only repeated warning was the repository's external-contributor policy reminder; no lint or test warning was promoted into a failure.
+The log's locked arm64 release build completed successfully and emitted the candidate binary hash recorded below. Its only warning was the repository's external-contributor policy reminder; no lint or test warning became a failure.
 
 ## Exact arm64 Darwin binary provenance
 
 | Field | Value |
 | --- | --- |
-| Source commit | `87c0f9ba919f0a42c1d3347d9c64f9259c9ae889` |
-| Source tree | `9be0f1b2ce459962f30a59d66622609e51eb7a6f` |
-| Cargo.lock SHA-256 | `dd23898939daaf8b5bf1562d5025e26f57b14ed2d4769b34f8d6f80587116627` |
+| Production source parent | `633b9d66c446998fd5f1532f05c15748f64cb070` |
+| Production source tree | `7d3041fa202af2db63c2321d2bf06190183e2552` |
+| Candidate evidence HEAD | `81ff9b2fbc82f3f8a7288c1d979a8d299927a0f7` |
+| Candidate evidence tree | `9529e5808de55f2e9a760b39b5f86e07fcc40d96` |
+| Cargo.toml SHA-256 | `49a3903d4e98b13db6913b52227f8400db63fa135007f3f39c4103fb6ba3b627` |
+| Cargo.lock SHA-256 | `a827ec0ed9dd4593ad9328fe9447edbbcd7eb5e002274d3b7dab14644da7b3fe` |
 | `rustc` | `1.96.1 (31fca3adb 2026-06-26)` |
 | `cargo` | `1.96.1 (356927216 2026-06-26)` |
-| Rust host | `aarch64-apple-darwin` |
-| LLVM | `22.1.2` |
+| Rust host / target | `aarch64-apple-darwin` |
 | OS | Darwin `25.6.0`, arm64 |
 | Cargo package | `herdr 0.8.2` |
-| Cargo features | `{}`; no `[features]` table, default feature set only |
-| Profile | `release` |
-| Target | `aarch64-apple-darwin` |
-| Binary path | `/Users/paulbettner/.herdr/worktrees/herdr/i3a-corrective-c3/target/aarch64-apple-darwin/release/herdr` |
+| Profile | locked `release` |
+| Verified binary path | `/private/tmp/smarty-i3a-corrective-c3-candidate/herdr-rebased-81ff9b2f` |
 | Binary format | `Mach-O 64-bit executable arm64` |
 | Binary version | `herdr 0.8.2` |
-| Binary bytes | `20458304` |
-| Binary SHA-256 | `daba0a008765f8ad52465c1f8aebe66c447e00757d9c7d6eae4836e3212822d5` |
+| Binary bytes | `19329904` |
+| Binary SHA-256 | `8d45b97197a1114a73c53a008ee46d4fddc91334a307f091e5305c86ba509288` |
+| Final verification log | `/private/tmp/smarty-i3a-corrective-logs-0ym3mh/section7-herdr-final.log` |
 
-Reproducible command:
+The verified artifact filename carries the full eight-character candidate prefix (`81ff9b2f`). The supplied seven-character spelling `herdr-rebased-81ff9b2` was not a filesystem path; its verified candidate is the file above.
+
+Reproducible locked release command:
 
 ```text
 cargo build --release --locked --target aarch64-apple-darwin
 ```
 
-Initial clean-target outcome:
-
-```text
-Finished `release` profile [optimized] target(s) in 1m 30s
-```
-
-The exact command was rerun without source changes and returned:
-
-```text
-Finished `release` profile [optimized] target(s) in 0.81s
-daba0a008765f8ad52465c1f8aebe66c447e00757d9c7d6eae4836e3212822d5  target/aarch64-apple-darwin/release/herdr
-```
-
-`Cargo.toml` and `Cargo.lock` are byte-identical to assigned frozen base `6f8f02db`; no dependency, feature, build-option, or lockfile change was made.
+Direct verification recomputed both manifest hashes from candidate commit `81ff9b2` and confirmed they match this worktree. It also recomputed the candidate binary SHA-256 and byte count, confirmed the Mach-O arm64 format and `herdr 0.8.2` version, and confirmed the local `rustc` and `cargo` 1.96.1 toolchain. The source-dependent identity remains the externally bound `81ff9b2` candidate above; this documentation update does not substitute its own commit identity.
 
 ## Precise Integration Master proposals
 
 C3 does not own root configuration, shared fixtures, package production, root pins, or landing. Proposed Integration Master actions only:
 
-1. Integrate the Herdr commit sequence `cce4622f`, `10c7b17c`, `6f8f02db`, `87c0f9ba` through the repository's protected PR and Mergify workflow.
-2. Rebase or reconstruct that sequence on the then-current Herdr upstream before PR if required; rerun this handoff's focused checks, `just check`, and exact release build on the resulting head.
-3. After Herdr lands, update the root Herdr pin to the exact landed commit and bind the package producer to a binary rebuilt from that landed commit/tree. Do not pin this unlanded local commit as if it were landed.
-4. Include this handoff and the exact landed replacement binary provenance in canonical root evidence. No C3 shared protocol fixture change is proposed.
+1. Integrate the rebased source sequence `861dffd`, `734af1d`, `67d5f2a`, and `633b9d6` through the repository's protected PR and Mergify workflow; retain `81ff9b2` as the externally bound evidence candidate.
+2. If the protected landing requires another rebase, rebuild and rebind the landed source commit/tree, rerun the focused checks and `just check`, and produce a new locked arm64 release binary; do not reuse the `81ff9b2` binary as if it came from a different tree.
+3. After Herdr lands, update the root Herdr pin to the exact landed commit and bind the package producer to a binary rebuilt from that landed commit/tree. Do not pin this unlanded local candidate as if it were landed.
+4. Include the root proof/package binding for exact candidate `81ff9b2` and the exact landed replacement binary provenance in canonical root evidence. No C3 shared protocol fixture change is proposed.
 5. Keep Smarty authorization and reconstruction in Smarty. Its only Herdr-facing behavior should be a generic External session report.
 
 ## Patch deletion and task-owned cleanup plan
