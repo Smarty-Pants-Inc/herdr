@@ -72,7 +72,7 @@ use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
 };
 use crate::server::terminal_attach::paste_payload_for_runtime;
-use crate::terminal::OmpReplyNavigationRoute;
+use crate::terminal::{OmpPhysicalKeyRoute, OmpReplyNavigationRoute};
 
 mod pane_graphics;
 
@@ -2118,7 +2118,7 @@ impl HeadlessServer {
 
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
-        self.clear_private_omp_reply_navigation_presses(client_id);
+        self.retire_private_omp_input_owner(client_id);
         self.app.clear_input_source(client_id);
         self.send_client_graphics_cleanup(client_id);
         self.retire_direct_graphics_for_client(client_id);
@@ -3978,7 +3978,7 @@ impl HeadlessServer {
                 surface.route_event(event, mouse_scroll_lines)
             };
             if focus_lost {
-                self.clear_private_omp_reply_navigation_presses(client_id);
+                self.release_private_omp_input_for_focus(client_id);
                 self.app.release_input_source_headless(client_id);
             }
             let Some(click) = click else {
@@ -4107,6 +4107,7 @@ impl HeadlessServer {
     }
 
     fn detach_failed_private_omp_guest(&mut self, client_id: u64) {
+        self.retire_private_omp_input_owner(client_id);
         let route = self
             .clients
             .get_mut(&client_id)
@@ -4774,6 +4775,7 @@ impl HeadlessServer {
                 .map(|guest| guest.route().clone());
             if current_route != desired_route {
                 if current_route.is_some() {
+                    self.retire_private_omp_input_owner(client_id);
                     if let Some(client) = self.clients.get_mut(&client_id) {
                         client.private_omp_guest.take();
                     }
@@ -5052,14 +5054,210 @@ impl HeadlessServer {
         (remaining, consumed)
     }
 
-    fn clear_private_omp_reply_navigation_presses(&self, client_id: u64) {
-        if let Some(guest) = self
+    fn forward_private_omp_key(&self, client_id: u64, key: crate::input::TerminalKey) -> bool {
+        let Some(guest) = self
             .clients
             .get(&client_id)
             .and_then(|client| client.private_omp_guest.as_ref())
-        {
-            guest.clear_omp_reply_navigation_presses();
+        else {
+            return false;
+        };
+        let runtime = guest.runtime();
+        if key.kind != crossterm::event::KeyEventKind::Release {
+            runtime.scroll_reset();
         }
+        let bytes = runtime.encode_terminal_key(key);
+        bytes.is_empty() || guest.input(Bytes::from(bytes)).is_ok()
+    }
+
+    fn route_existing_private_omp_physical_key(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+    ) -> Option<bool> {
+        let route = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+            .and_then(|mut presses| presses.route_existing(key))?;
+        let delivered = match route {
+            OmpPhysicalKeyRoute::Forwarded => {
+                let delivered = self.forward_private_omp_key(client_id, key.clone());
+                if let Some(mut presses) = self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.private_omp_physical_presses.lock().ok())
+                {
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        presses.forget(key);
+                    } else if !delivered {
+                        presses.suppress_existing(key);
+                    }
+                }
+                delivered
+            }
+            OmpPhysicalKeyRoute::ReplyNavigation => {
+                if key.kind != crossterm::event::KeyEventKind::Release {
+                    let _ = self
+                        .clients
+                        .get(&client_id)
+                        .and_then(|client| client.private_omp_guest.as_ref())
+                        .is_some_and(|guest| {
+                            guest.runtime().try_navigate_omp_reply_repeated(true, key)
+                        });
+                }
+                true
+            }
+            OmpPhysicalKeyRoute::Suppressed => true,
+        };
+        Some(delivered)
+    }
+
+    fn route_private_omp_reply_navigation(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+        navigate: impl FnMut() -> bool,
+    ) -> OmpReplyNavigationRoute {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+            .map_or(
+                OmpReplyNavigationRoute::Consumed { navigated: false },
+                |mut presses| presses.route(key, navigate),
+            )
+    }
+
+    fn route_existing_private_omp_reply_navigation(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+        navigate: impl FnMut() -> bool,
+    ) -> Option<OmpReplyNavigationRoute> {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+            .and_then(|mut presses| presses.route_existing_with(key, navigate))
+    }
+
+    fn private_omp_reply_navigation_owns_key(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+    ) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+            .is_some_and(|presses| presses.owns_key(key))
+    }
+
+    fn forget_private_omp_reply_navigation(&self, client_id: u64, key: &crate::input::TerminalKey) {
+        if let Some(mut presses) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+        {
+            presses.forget(key);
+        }
+    }
+    fn suppress_private_omp_reply_navigation(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+    ) {
+        if let Some(mut presses) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+        {
+            presses.suppress_existing(key);
+        }
+    }
+
+    fn retire_private_omp_reply_navigation(
+        &self,
+        client_id: u64,
+    ) -> Vec<crate::input::TerminalKey> {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+            .map(|mut presses| presses.retire_owner())
+            .unwrap_or_default()
+    }
+
+    fn reserve_private_omp_physical_key(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+    ) -> Option<Vec<crate::input::TerminalKey>> {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+            .and_then(|mut presses| presses.reserve_press(key))
+    }
+
+    fn commit_private_omp_physical_key(
+        &self,
+        client_id: u64,
+        key: &crate::input::TerminalKey,
+        route: OmpPhysicalKeyRoute,
+    ) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+            .is_some_and(|mut presses| presses.commit_press(key, route))
+    }
+
+    fn forget_private_omp_forwarded_key(&self, client_id: u64, key: &crate::input::TerminalKey) {
+        if let Some(mut presses) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+        {
+            presses.forget(key);
+        }
+    }
+
+    fn forward_private_omp_releases(
+        &self,
+        client_id: u64,
+        releases: Vec<crate::input::TerminalKey>,
+    ) -> bool {
+        let mut delivered = true;
+        for release in releases {
+            delivered &= self.forward_private_omp_key(client_id, release);
+        }
+        delivered
+    }
+
+    fn release_private_omp_input_for_focus(&self, client_id: u64) -> (bool, bool) {
+        let mut releases = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+            .map(|mut presses| presses.release_for_focus_loss())
+            .unwrap_or_default();
+        releases.extend(
+            self.clients
+                .get(&client_id)
+                .and_then(|client| client.private_omp_reply_navigation_presses.lock().ok())
+                .map(|mut presses| presses.release_for_focus_loss())
+                .unwrap_or_default(),
+        );
+        let had_releases = !releases.is_empty();
+        let delivered = self.forward_private_omp_releases(client_id, releases);
+        (had_releases, delivered)
+    }
+
+    fn retire_private_omp_input_owner(&self, client_id: u64) -> bool {
+        let mut releases = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_physical_presses.lock().ok())
+            .map(|mut presses| presses.retire_owner())
+            .unwrap_or_default();
+        releases.extend(self.retire_private_omp_reply_navigation(client_id));
+        self.forward_private_omp_releases(client_id, releases)
     }
 
     fn private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
@@ -5134,47 +5332,94 @@ impl HeadlessServer {
     }
 
     fn partition_inactive_private_omp_owned_input(
-        &self,
+        &mut self,
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
-        let Some(guest) = self
+        debug_assert!(
+            events.len() <= 1,
+            "private OMP input is partitioned one event at a time so App effects stay ordered"
+        );
+        if matches!(events.as_slice(), [crate::raw_input::RawInputEvent::Key(key)]
+            if self.app.input_source_owns_existing_key(client_id, key))
+        {
+            return (events, false);
+        }
+        if self
             .clients
             .get(&client_id)
             .and_then(|client| client.private_omp_guest.as_ref())
-        else {
-            return (events, false);
-        };
-        let runtime = guest.runtime();
+            .is_none()
+        {
+            self.retire_private_omp_input_owner(client_id);
+        }
         let mut remaining = Vec::new();
         let mut consumed = false;
+        let mut owner_failed = false;
         for event in events {
             match event {
                 crate::raw_input::RawInputEvent::OuterFocusLost => {
-                    if guest.has_forwarded_omp_reply_navigation() {
-                        runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost);
-                    }
-                    guest.clear_omp_reply_navigation_presses();
+                    let (owner_released, releases_delivered) =
+                        self.release_private_omp_input_for_focus(client_id);
+                    let focus_delivered = !owner_released
+                        || self
+                            .clients
+                            .get(&client_id)
+                            .and_then(|client| client.private_omp_guest.as_ref())
+                            .map(PrivateOmpGuest::runtime)
+                            .is_some_and(|runtime| {
+                                !runtime.focus_reporting_enabled()
+                                    || runtime
+                                        .try_send_focus_event(crate::ghostty::FocusEvent::Lost)
+                            });
+                    owner_failed |= !releases_delivered || !focus_delivered;
                     remaining.push(crate::raw_input::RawInputEvent::OuterFocusLost);
                 }
                 crate::raw_input::RawInputEvent::Key(key) => {
-                    let Some(outcome) = guest.route_existing_omp_reply_navigation(&key) else {
-                        remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                    if let Some(delivered) =
+                        self.route_existing_private_omp_physical_key(client_id, &key)
+                    {
+                        if !delivered {
+                            self.retire_private_omp_input_owner(client_id);
+                            owner_failed = true;
+                        }
+                        consumed = true;
                         continue;
-                    };
-                    if outcome == OmpReplyNavigationRoute::Forwarded {
-                        if key.kind != crossterm::event::KeyEventKind::Release {
-                            runtime.scroll_reset();
-                        }
-                        let bytes = runtime.encode_terminal_key(key);
-                        if !bytes.is_empty() {
-                            let _ = guest.input(Bytes::from(bytes));
-                        }
                     }
-                    consumed = true;
+                    if let Some(outcome) =
+                        self.route_existing_private_omp_reply_navigation(client_id, &key, || {
+                            self.clients
+                                .get(&client_id)
+                                .and_then(|client| client.private_omp_guest.as_ref())
+                                .is_some_and(|guest| {
+                                    guest.runtime().try_navigate_omp_reply_repeated(true, &key)
+                                })
+                        })
+                    {
+                        if outcome == OmpReplyNavigationRoute::Forwarded {
+                            let delivered = self.forward_private_omp_key(client_id, key.clone());
+                            if key.kind == crossterm::event::KeyEventKind::Release {
+                                self.forget_private_omp_reply_navigation(client_id, &key);
+                                if !delivered {
+                                    self.retire_private_omp_input_owner(client_id);
+                                    owner_failed = true;
+                                }
+                            } else if !delivered {
+                                self.suppress_private_omp_reply_navigation(client_id, &key);
+                                self.retire_private_omp_input_owner(client_id);
+                                owner_failed = true;
+                            }
+                        }
+                        consumed = true;
+                        continue;
+                    }
+                    remaining.push(crate::raw_input::RawInputEvent::Key(key));
                 }
                 event => remaining.push(event),
             }
+        }
+        if owner_failed {
+            self.detach_failed_private_omp_guest(client_id);
         }
         (remaining, consumed)
     }
@@ -5191,8 +5436,17 @@ impl HeadlessServer {
             return self.partition_inactive_private_omp_owned_input(client_id, events);
         }
         let Some(info) = self.private_omp_pane_info(client_id) else {
-            return (events, false);
+            return self.partition_inactive_private_omp_owned_input(client_id, events);
         };
+        debug_assert!(
+            events.len() <= 1,
+            "private OMP input is partitioned one event at a time so App effects stay ordered"
+        );
+        if matches!(events.as_slice(), [crate::raw_input::RawInputEvent::Key(key)]
+            if self.app.input_source_owns_existing_key(client_id, key))
+        {
+            return (events, false);
+        }
         let keyboard_target = info.is_focused;
         let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
         let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
@@ -5205,29 +5459,63 @@ impl HeadlessServer {
             .get(&client_id)
             .and_then(|client| client.private_omp_guest.as_ref())
         else {
-            return (events, false);
+            return self.partition_inactive_private_omp_owned_input(client_id, events);
         };
         let runtime = guest.runtime();
         let mut remaining = Vec::new();
         let mut consumed = false;
         let mut handoff_to_app = false;
+        let mut owner_failed = false;
         for event in events {
-            if handoff_to_app {
-                if let crate::raw_input::RawInputEvent::Key(key) = &event {
-                    if let Some(outcome) = guest.route_existing_omp_reply_navigation(key) {
-                        if outcome == OmpReplyNavigationRoute::Forwarded {
-                            if key.kind != crossterm::event::KeyEventKind::Release {
-                                runtime.scroll_reset();
-                            }
-                            let bytes = runtime.encode_terminal_key(key.clone());
-                            if !bytes.is_empty() {
-                                let _ = guest.input(Bytes::from(bytes));
-                            }
-                        }
-                        consumed = true;
-                        continue;
+            if let crate::raw_input::RawInputEvent::Key(key) = &event {
+                if let Some(delivered) =
+                    self.route_existing_private_omp_physical_key(client_id, key)
+                {
+                    if !delivered {
+                        self.retire_private_omp_input_owner(client_id);
+                        owner_failed = true;
+                        handoff_to_app = true;
                     }
+                    consumed = true;
+                    continue;
                 }
+                if let Some(outcome) =
+                    self.route_existing_private_omp_reply_navigation(client_id, key, || {
+                        runtime.try_navigate_omp_reply_repeated(true, key)
+                    })
+                {
+                    if outcome == OmpReplyNavigationRoute::Forwarded {
+                        let delivered = self.forward_private_omp_key(client_id, key.clone());
+                        if key.kind == crossterm::event::KeyEventKind::Release {
+                            self.forget_private_omp_reply_navigation(client_id, key);
+                            if !delivered {
+                                self.retire_private_omp_input_owner(client_id);
+                                owner_failed = true;
+                                handoff_to_app = true;
+                            }
+                        } else if !delivered {
+                            self.suppress_private_omp_reply_navigation(client_id, key);
+                            self.retire_private_omp_input_owner(client_id);
+                            owner_failed = true;
+                            handoff_to_app = true;
+                        }
+                    }
+                    consumed = true;
+                    continue;
+                }
+            }
+            if matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost) {
+                let (owner_released, releases_delivered) =
+                    self.release_private_omp_input_for_focus(client_id);
+                let forward_focus = keyboard_target || owner_released;
+                let focus_delivered = !forward_focus
+                    || !runtime.focus_reporting_enabled()
+                    || runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost);
+                owner_failed |= !releases_delivered || !focus_delivered;
+                remaining.push(crate::raw_input::RawInputEvent::OuterFocusLost);
+                continue;
+            }
+            if handoff_to_app {
                 remaining.push(event);
                 continue;
             }
@@ -5246,16 +5534,81 @@ impl HeadlessServer {
                         && self.app.state.mode == crate::app::Mode::Terminal
                         && !self.app.state.is_prefix_key(&key) =>
                 {
-                    let outcome = guest.route_omp_reply_navigation(&key, || {
-                        runtime.try_navigate_omp_reply_repeated(true, &key)
-                    });
-                    if outcome == OmpReplyNavigationRoute::Forwarded {
-                        if key.kind != crossterm::event::KeyEventKind::Release {
-                            runtime.scroll_reset();
+                    if key.has_physical_identity() {
+                        if key.kind != crossterm::event::KeyEventKind::Press {
+                            remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                            continue;
                         }
-                        let bytes = runtime.encode_terminal_key(key);
-                        if !bytes.is_empty() {
-                            let _ = guest.input(Bytes::from(bytes));
+                        let Some(releases) = self.reserve_private_omp_physical_key(client_id, &key)
+                        else {
+                            consumed = true;
+                            continue;
+                        };
+                        if !self.forward_private_omp_releases(client_id, releases) {
+                            self.forget_private_omp_forwarded_key(client_id, &key);
+                            remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                            owner_failed = true;
+                            handoff_to_app = true;
+                            continue;
+                        }
+                        let navigated = runtime.try_navigate_omp_reply_repeated(true, &key);
+                        let route = if navigated {
+                            OmpPhysicalKeyRoute::ReplyNavigation
+                        } else {
+                            OmpPhysicalKeyRoute::Forwarded
+                        };
+                        let committed =
+                            self.commit_private_omp_physical_key(client_id, &key, route);
+                        debug_assert!(committed);
+                        if route == OmpPhysicalKeyRoute::Forwarded
+                            && !self.forward_private_omp_key(client_id, key.clone())
+                        {
+                            self.forget_private_omp_forwarded_key(client_id, &key);
+                            remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                            owner_failed = true;
+                            handoff_to_app = true;
+                            continue;
+                        }
+                    } else {
+                        if key.kind != crossterm::event::KeyEventKind::Press {
+                            remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                            continue;
+                        }
+                        let outcome =
+                            self.route_private_omp_reply_navigation(client_id, &key, || {
+                                runtime.try_navigate_omp_reply_repeated(true, &key)
+                            });
+                        if outcome == OmpReplyNavigationRoute::Forwarded {
+                            if !self.private_omp_reply_navigation_owns_key(client_id, &key) {
+                                let Some(releases) =
+                                    self.reserve_private_omp_physical_key(client_id, &key)
+                                else {
+                                    consumed = true;
+                                    continue;
+                                };
+                                if !self.forward_private_omp_releases(client_id, releases) {
+                                    self.forget_private_omp_forwarded_key(client_id, &key);
+                                    self.forget_private_omp_reply_navigation(client_id, &key);
+                                    remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                                    owner_failed = true;
+                                    handoff_to_app = true;
+                                    continue;
+                                }
+                                let committed = self.commit_private_omp_physical_key(
+                                    client_id,
+                                    &key,
+                                    OmpPhysicalKeyRoute::Forwarded,
+                                );
+                                debug_assert!(committed);
+                            }
+                            if !self.forward_private_omp_key(client_id, key.clone()) {
+                                self.forget_private_omp_forwarded_key(client_id, &key);
+                                self.forget_private_omp_reply_navigation(client_id, &key);
+                                remaining.push(crate::raw_input::RawInputEvent::Key(key));
+                                owner_failed = true;
+                                handoff_to_app = true;
+                                continue;
+                            }
                         }
                     }
                     consumed = true;
@@ -5264,28 +5617,33 @@ impl HeadlessServer {
                     if keyboard_target && self.app.state.mode == crate::app::Mode::Terminal =>
                 {
                     runtime.scroll_reset();
-                    let _ = guest.input(Bytes::copy_from_slice(text.as_str().as_bytes()));
-                    consumed = true;
+                    if guest
+                        .input(Bytes::copy_from_slice(text.as_str().as_bytes()))
+                        .is_ok()
+                    {
+                        consumed = true;
+                    } else {
+                        remaining.push(crate::raw_input::RawInputEvent::Text(text));
+                        owner_failed = true;
+                        handoff_to_app = true;
+                    }
                 }
                 crate::raw_input::RawInputEvent::Paste(text)
                     if keyboard_target && self.app.state.mode == crate::app::Mode::Terminal =>
                 {
-                    let _ = runtime.try_send_paste(text);
-                    consumed = true;
+                    if runtime.try_send_paste(text.clone()).is_ok() {
+                        consumed = true;
+                    } else {
+                        remaining.push(crate::raw_input::RawInputEvent::Paste(text));
+                        owner_failed = true;
+                        handoff_to_app = true;
+                    }
                 }
                 crate::raw_input::RawInputEvent::OuterFocusGained => {
                     if keyboard_target {
                         runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained);
                     }
                     remaining.push(crate::raw_input::RawInputEvent::OuterFocusGained);
-                }
-                crate::raw_input::RawInputEvent::OuterFocusLost => {
-                    let needs_owner_teardown = guest.has_forwarded_omp_reply_navigation();
-                    if keyboard_target || needs_owner_teardown {
-                        runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost);
-                    }
-                    guest.clear_omp_reply_navigation_presses();
-                    remaining.push(crate::raw_input::RawInputEvent::OuterFocusLost);
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse)
                     if info.inner_rect.contains((mouse.column, mouse.row).into()) =>
@@ -5352,6 +5710,9 @@ impl HeadlessServer {
                 }
                 event => remaining.push(event),
             }
+        }
+        if owner_failed {
+            self.detach_failed_private_omp_guest(client_id);
         }
         (remaining, consumed)
     }
@@ -5962,6 +6323,7 @@ impl HeadlessServer {
                 target.surface_active =
                     target.bound && target.ready && self.client_omp_surface_active(client_id);
                 self.update_omp_renderer_target(client_id, target);
+                self.retire_private_omp_input_owner(client_id);
                 let retired_private = self
                     .clients
                     .get_mut(&client_id)
@@ -5994,6 +6356,12 @@ impl HeadlessServer {
                     {
                         let _ = writer.control.send(message);
                     }
+                    return false;
+                }
+                // InputLeaseTable reserves one bounded quarantine slot for every live
+                // remote source plus the in-process local source.
+                if self.clients.len() >= crate::app::MAX_INPUT_SOURCES - 1 {
+                    warn!(client_id, "rejecting client: input source limit reached");
                     return false;
                 }
                 let first_app_client =
@@ -9352,11 +9720,32 @@ mod tests {
             })
     }
 
+    fn physical_j(kind: KeyEventKind) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
+            .with_kind(kind)
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down: kind != KeyEventKind::Release,
+                repeat_count: 1,
+                virtual_key_code: 0x4A,
+                virtual_scan_code: 0x24,
+                unicode: u16::from(b'j'),
+                control_key_state: 0,
+            })
+    }
+
+    fn semantic_j(kind: KeyEventKind) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty()).with_kind(kind)
+    }
+
     #[tokio::test]
     async fn private_omp_reply_navigation_text_and_paste_handle_later_grouped_repeats_and_focus_loss_fallthrough(
     ) {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-reply-navigation");
+        let app_terminal_id = workspace
+            .terminal_id(workspace.tabs[0].root_pane)
+            .expect("App terminal")
+            .clone();
         let route = OmpRouteKey {
             pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
             omp_session_id: "session".into(),
@@ -9370,13 +9759,26 @@ mod tests {
         server.app.state.mode = crate::app::Mode::Terminal;
         server.app.state.view.pane_infos = pane_infos;
         server.app.state.ensure_test_terminals();
+        let (app_runtime, mut app_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                40,
+                4,
+                16 * 1024,
+                &[],
+                32,
+            );
+        app_runtime.test_process_pty_bytes(b"\x1b[>3u");
+        server
+            .app
+            .terminal_runtimes
+            .insert(app_terminal_id, app_runtime);
         server
             .clients
             .insert(1, test_identity_client(Some("Ada"), None));
         server.foreground_client_id = Some(1);
 
         let guest = PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
-            route,
+            route: route.clone(),
             omp_executable: crate::update::OmpExecutable::Explicit(
                 std::env::current_exe().expect("test executable"),
             ),
@@ -9422,6 +9824,82 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                     graphics: Vec::new(),
                 }),
             };
+        let app_key = physical_j(KeyEventKind::Press);
+        server.app.route_client_events_from(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(app_key.clone())],
+            true,
+        );
+        assert!(!app_input
+            .try_recv()
+            .expect("App-owned physical press")
+            .is_empty());
+        assert!(server.app.input_source_owns_existing_key(1, &app_key));
+        for key in [
+            physical_j(KeyEventKind::Press),
+            physical_j(KeyEventKind::Repeat),
+            physical_j(KeyEventKind::Release),
+        ] {
+            let (remaining, consumed) = server
+                .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::Key(key)]);
+            assert!(!consumed);
+            assert_eq!(remaining.len(), 1);
+            server.app.route_client_events_from(1, remaining, true);
+            assert!(!app_input
+                .try_recv()
+                .expect("App-owned physical continuation")
+                .is_empty());
+        }
+        assert!(!server
+            .app
+            .input_source_owns_existing_key(1, &physical_j(KeyEventKind::Release),));
+        assert!(server
+            .clients
+            .get_mut(&1)
+            .and_then(|client| client.private_omp_guest.as_mut())
+            .expect("private OMP guest")
+            .test_input_is_empty());
+
+        server.app.route_client_events_from(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(app_key.clone())],
+            true,
+        );
+        assert!(!app_input
+            .try_recv()
+            .expect("pre-retirement App press")
+            .is_empty());
+        let app_target = server
+            .app
+            .terminal_input_target_for_test()
+            .expect("App terminal target");
+        server.app.release_input_target_headless(&app_target);
+        assert!(!app_input
+            .try_recv()
+            .expect("App target synthetic release")
+            .is_empty());
+        assert!(server.app.input_source_owns_existing_key(1, &app_key));
+        for key in [
+            physical_j(KeyEventKind::Press),
+            physical_j(KeyEventKind::Repeat),
+            physical_j(KeyEventKind::Release),
+        ] {
+            let (remaining, consumed) = server
+                .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::Key(key)]);
+            assert!(!consumed);
+            assert_eq!(remaining.len(), 1);
+            server.app.route_client_events_from(1, remaining, true);
+        }
+        assert!(app_input.try_recv().is_err());
+        assert!(!server
+            .app
+            .input_source_owns_existing_key(1, &physical_j(KeyEventKind::Release),));
+        assert!(server
+            .clients
+            .get_mut(&1)
+            .and_then(|client| client.private_omp_guest.as_mut())
+            .expect("private OMP guest")
+            .test_input_is_empty());
         assert!(server.handle_client_input_events(
             1,
             vec![crate::raw_input::RawInputEvent::Mouse(
@@ -9708,14 +10186,15 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                     .with_kind(KeyEventKind::Release),
             )],
         );
-        assert!(consumed);
-        assert!(remaining.is_empty());
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key.code == KeyCode::Up && key.kind == KeyEventKind::Release
+        ));
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
-        assert_eq!(
-            guest.test_take_input(),
-            Some(Bytes::from_static(b"\x1b[1;3:3A"))
-        );
+        assert!(guest.test_take_input().is_none());
         assert!(guest.test_input_is_empty());
 
         server.clients[&1]
@@ -9749,6 +10228,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
         assert!(guest.test_input_is_empty());
+        guest.runtime().scroll_reset();
 
         let (remaining, consumed) = server.partition_private_omp_input(
             1,
@@ -9761,6 +10241,43 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
         assert!(guest.test_input_is_empty());
+        let prefix_handoff_offset = guest
+            .runtime()
+            .scroll_metrics()
+            .expect("scroll metrics")
+            .offset_from_bottom;
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            )],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL
+        ));
+        server.app.route_client_events_from(1, remaining, true);
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up.clone().with_kind(KeyEventKind::Repeat),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(guest.test_input_is_empty());
+        assert!(
+            guest
+                .runtime()
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom
+                > prefix_handoff_offset
+        );
         guest
             .runtime()
             .test_process_pty_bytes(b"\x1b[?1049h\x1b[>3u");
@@ -9795,6 +10312,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
         assert!(guest.test_input_is_empty());
+        server.app.state.mode = crate::app::Mode::Terminal;
         server.app.state.popup_pane = None;
 
         let (remaining, consumed) = server.partition_private_omp_input(
@@ -9884,21 +10402,25 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
 
         let (remaining, consumed) = server.partition_private_omp_input(
             1,
-            vec![
-                crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
-                    KeyCode::Char('b'),
-                    KeyModifiers::CONTROL,
-                )),
-                crate::raw_input::RawInputEvent::Key(physical_bare_up_release()),
-            ],
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            )],
         );
-        assert!(consumed);
+        assert!(!consumed);
         assert!(matches!(
             remaining.as_slice(),
             [crate::raw_input::RawInputEvent::Key(key)]
-                if key.code == KeyCode::Char('b')
-                    && key.modifiers == KeyModifiers::CONTROL
+                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL
         ));
+        server.app.route_client_events_from(1, remaining, true);
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_bare_up_release(),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
         assert_eq!(
@@ -9907,12 +10429,107 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                 .expect("post-handoff Option-Up release"),
             Bytes::from_static(b"\x1b[1;1:3A")
         );
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("ordinary key press")
+            .is_empty());
+
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            )],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL
+        ));
+        server.app.route_client_events_from(1, remaining, true);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let (remaining, consumed) = server.partition_private_omp_input(
+                1,
+                vec![crate::raw_input::RawInputEvent::Key(physical_j(kind))],
+            );
+            assert!(consumed);
+            assert!(remaining.is_empty());
+        }
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("ordinary key repeat")
+            .is_empty());
+        assert!(!guest
+            .test_take_input()
+            .expect("ordinary key release")
+            .is_empty());
+        server.app.state.mode = crate::app::Mode::Terminal;
         server.clients[&1]
             .private_omp_guest
             .as_ref()
             .expect("private OMP guest")
             .runtime()
             .test_process_pty_bytes(b"\x1b[?1004h");
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("same-batch focus ordinary key press")
+            .is_empty());
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            )],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key.code == KeyCode::Char('b') && key.modifiers == KeyModifiers::CONTROL
+        ));
+        server.app.route_client_events_from(1, remaining, true);
+        let (remaining, consumed) = server
+            .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::OuterFocusLost]
+        ));
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("same-batch focus synthetic release")
+            .is_empty());
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("same-batch private focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
+        server.app.state.mode = crate::app::Mode::Terminal;
         let (remaining, consumed) = server.partition_private_omp_input(
             1,
             vec![crate::raw_input::RawInputEvent::Key(
@@ -9945,10 +10562,239 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let guest = server.clients.get_mut(&1).expect("App client");
         let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
         assert_eq!(
+            guest
+                .test_take_input()
+                .expect("private owner synthetic release"),
+            Bytes::from_static(b"\x1b[1;3:3A")
+        );
+        assert_eq!(
             guest.test_take_input().expect("private owner focus loss"),
             Bytes::from_static(b"\x1b[O")
         );
         server.app.state.popup_pane = None;
+        server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("private OMP guest")
+            .runtime()
+            .test_process_pty_bytes(b"\x1b[?1049l");
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up.clone(),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        assert!(server
+            .clients
+            .get_mut(&1)
+            .and_then(|client| client.private_omp_guest.as_mut())
+            .expect("private OMP guest")
+            .test_input_is_empty());
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("pre-handoff semantic j press")
+            .is_empty());
+
+        server.app.state.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: crate::layout::PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let (remaining, consumed) = server.partition_private_omp_input(
+                1,
+                vec![crate::raw_input::RawInputEvent::Key(semantic_j(kind))],
+            );
+            assert!(consumed);
+            assert!(remaining.is_empty());
+            let guest = server.clients.get_mut(&1).expect("App client");
+            let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+            assert!(!guest
+                .test_take_input()
+                .expect("semantic continuation stays with private owner")
+                .is_empty());
+        }
+        server.app.state.popup_pane = None;
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("first semantic Press reaches private OMP")
+            .is_empty());
+
+        server.app.state.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: crate::layout::PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key == &semantic_j(KeyEventKind::Press)
+        ));
+        assert!(server
+            .clients
+            .get_mut(&1)
+            .and_then(|client| client.private_omp_guest.as_mut())
+            .expect("private OMP guest")
+            .test_input_is_empty());
+        server.app.state.popup_pane = None;
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert!(!guest
+            .test_take_input()
+            .expect("pre-failure physical j press")
+            .is_empty());
+        guest.test_close_input();
+        let physical_j_release = physical_j(KeyEventKind::Release);
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_j_release.clone(),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(!server.clients[&1]
+            .private_omp_physical_presses
+            .lock()
+            .expect("private physical tracker")
+            .owns_key(&physical_j_release));
+        assert!(server.clients[&1]
+            .private_omp_physical_presses
+            .lock()
+            .expect("private semantic tracker")
+            .track(
+                &semantic_j(KeyEventKind::Press),
+                OmpPhysicalKeyRoute::Forwarded,
+            ));
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(key)]
+                if key == &semantic_j(KeyEventKind::Press)
+        ));
+
+        server.retire_private_omp_input_owner(1);
+        drop(server.clients.get_mut(&1).unwrap().private_omp_guest.take());
+        let replacement = PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
+            route: route.clone(),
+            omp_executable: crate::update::OmpExecutable::Explicit(
+                std::env::current_exe().expect("test executable"),
+            ),
+            attachment_epoch: 2,
+            controller: true,
+            pane_id: crate::layout::PaneId::alloc(),
+            rows: 4,
+            cols: 40,
+            cwd: std::env::temp_dir(),
+            launch_env: crate::pane::PaneLaunchEnv::from_extra(Vec::new()),
+            scrollback_limit_bytes: 16 * 1024,
+            terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+            terminal_appearance: None,
+            events: server.app.event_tx.clone(),
+            render_notify: server.app.render_notify.clone(),
+            render_dirty: server.app.render_dirty.clone(),
+        })
+        .expect("replacement private OMP guest");
+        replacement.runtime().test_process_pty_bytes(b"\x1b[>3u");
+        server.clients.get_mut(&1).unwrap().private_omp_guest = Some(replacement);
+
+        for key in [
+            physical_option_up.clone(),
+            physical_option_up.clone().with_kind(KeyEventKind::Repeat),
+        ] {
+            let (remaining, consumed) = server
+                .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::Key(key)]);
+            assert!(consumed);
+            assert!(remaining.is_empty());
+        }
+        assert!(server
+            .clients
+            .get_mut(&1)
+            .and_then(|client| client.private_omp_guest.as_mut())
+            .expect("replacement private OMP guest")
+            .test_input_is_empty());
+
+        let replacement = server.clients.get_mut(&1).unwrap().private_omp_guest.take();
+        let (remaining, consumed) = server
+            .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::OuterFocusLost]
+        ));
+        server.clients.get_mut(&1).unwrap().private_omp_guest = replacement;
+
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_option_up.clone(),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest
+            .private_omp_guest
+            .as_mut()
+            .expect("replacement private OMP guest");
+        assert_eq!(
+            guest.test_take_input().expect("post-focus Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                physical_bare_up_release(),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
         server.clients.get_mut(&1).unwrap().private_omp_guest.take();
         shutdown_test_runtimes(&mut server);
     }
@@ -9976,7 +10822,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         server.foreground_client_id = Some(1);
 
         let guest = PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
-            route,
+            route: route.clone(),
             omp_executable: crate::update::OmpExecutable::Explicit(
                 std::env::current_exe().expect("test executable"),
             ),
@@ -10011,12 +10857,28 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         );
         assert!(consumed);
         assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest.test_take_input().expect("unconsumed Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                option_up.clone().with_kind(KeyEventKind::Repeat),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
         let offset = {
             let guest = server.clients.get_mut(&1).expect("App client");
             let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
             assert_eq!(
-                guest.test_take_input().expect("unconsumed Option-Up press"),
-                Bytes::from_static(b"\x1b[1;3:1A")
+                guest
+                    .test_take_input()
+                    .expect("unconsumed Option-Up repeat"),
+                Bytes::from_static(b"\x1b[1;3:2A")
             );
             guest.runtime().scroll_up(1);
             let offset = guest
@@ -10031,7 +10893,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
         let (remaining, consumed) = server.partition_private_omp_input(
             1,
             vec![crate::raw_input::RawInputEvent::Key(
-                option_up.with_kind(KeyEventKind::Release),
+                option_up.clone().with_kind(KeyEventKind::Release),
             )],
         );
         assert!(consumed);
@@ -10052,8 +10914,237 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n",
                 .offset_from_bottom,
             offset
         );
+        guest.runtime().test_process_pty_bytes(b"\x1b[?1004h");
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(option_up.clone())],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("pre-focus semantic Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        let (remaining, consumed) = server
+            .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::OuterFocusLost]
+        ));
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("synthetic semantic Option-Up release"),
+            Bytes::from_static(b"\x1b[1;3:3A")
+        );
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("private semantic focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(option_up.clone())],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("pre-failure semantic Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        guest.test_close_input();
+
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                option_up.with_kind(KeyEventKind::Release),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_reply_navigation_presses
+                .lock()
+                .expect("private semantic tracker")
+                .len(),
+            0
+        );
+
+        let replacement = PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
+            route,
+            omp_executable: crate::update::OmpExecutable::Explicit(
+                std::env::current_exe().expect("test executable"),
+            ),
+            attachment_epoch: 2,
+            controller: true,
+            pane_id: crate::layout::PaneId::alloc(),
+            rows: 4,
+            cols: 40,
+            cwd: std::env::temp_dir(),
+            launch_env: crate::pane::PaneLaunchEnv::from_extra(Vec::new()),
+            scrollback_limit_bytes: 16 * 1024,
+            terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+            terminal_appearance: None,
+            events: server.app.event_tx.clone(),
+            render_notify: server.app.render_notify.clone(),
+            render_dirty: server.app.render_dirty.clone(),
+        })
+        .expect("replacement private OMP guest");
+        replacement.runtime().test_process_pty_bytes(b"\x1b[>3u");
+        server.clients.get_mut(&1).unwrap().private_omp_guest = Some(replacement);
+        let focus_failure_option_up =
+            crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                focus_failure_option_up,
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        let guest = server.clients.get_mut(&1).expect("App client");
+        let guest = guest.private_omp_guest.as_mut().expect("private OMP guest");
+        assert_eq!(
+            guest
+                .test_take_input()
+                .expect("pre-failure focus lifecycle press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        guest.test_close_input();
+        let (remaining, consumed) = server
+            .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::OuterFocusLost]
+        ));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_reply_navigation_presses
+                .lock()
+                .expect("private semantic tracker")
+                .len(),
+            0
+        );
 
         server.clients.get_mut(&1).unwrap().private_omp_guest.take();
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn private_omp_delivery_failures_return_ordinary_input_and_detach_the_guest() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-delivery-failure");
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        let mut pane_infos = workspace.tabs[0].layout.panes(Rect::new(0, 0, 40, 4));
+        pane_infos[0].is_focused = true;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.view.pane_infos = pane_infos;
+        server.app.state.ensure_test_terminals();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server.foreground_client_id = Some(1);
+        let spawn_guest = |server: &HeadlessServer, attachment_epoch| {
+            PrivateOmpGuest::spawn_test_stub(PrivateOmpGuestConfig {
+                route: route.clone(),
+                omp_executable: crate::update::OmpExecutable::Explicit(
+                    std::env::current_exe().expect("test executable"),
+                ),
+                attachment_epoch,
+                controller: true,
+                pane_id: crate::layout::PaneId::alloc(),
+                rows: 4,
+                cols: 40,
+                cwd: std::env::temp_dir(),
+                launch_env: crate::pane::PaneLaunchEnv::from_extra(Vec::new()),
+                scrollback_limit_bytes: 16 * 1024,
+                terminal_theme: crate::terminal_theme::TerminalTheme::default(),
+                terminal_appearance: None,
+                events: server.app.event_tx.clone(),
+                render_notify: server.app.render_notify.clone(),
+                render_dirty: server.app.render_dirty.clone(),
+            })
+            .expect("private OMP guest")
+        };
+
+        let mut guest = spawn_guest(&server, 1);
+        guest.test_close_input();
+        server.clients.get_mut(&1).unwrap().private_omp_guest = Some(guest);
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("closed-text"),
+            )],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Text(text)] if text.as_str() == "closed-text"
+        ));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+
+        let guest = spawn_guest(&server, 2);
+        server.clients.get_mut(&1).unwrap().private_omp_guest = Some(guest);
+        {
+            let guest = server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("private OMP guest");
+            for _ in 0..4 {
+                guest
+                    .input(Bytes::from_static(b"full"))
+                    .expect("fill private input channel");
+            }
+        }
+        let (remaining, consumed) = server.partition_private_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Paste(
+                "full-paste".to_owned(),
+            )],
+        );
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Paste(text)] if text == "full-paste"
+        ));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+
+        let mut guest = spawn_guest(&server, 3);
+        guest.runtime().test_process_pty_bytes(b"\x1b[?1004h");
+        guest.test_close_input();
+        server.clients.get_mut(&1).unwrap().private_omp_guest = Some(guest);
+        let (remaining, consumed) = server
+            .partition_private_omp_input(1, vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::OuterFocusLost]
+        ));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+
         shutdown_test_runtimes(&mut server);
     }
 

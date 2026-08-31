@@ -17,6 +17,7 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+pub(crate) use input::MAX_INPUT_SOURCES;
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
@@ -1938,6 +1939,16 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn terminal_input_target_for_test(&self) -> Option<TerminalInputTarget> {
+        match self.terminal_input_context()? {
+            TerminalInputContext::Pane(terminal_id) | TerminalInputContext::Popup(terminal_id) => {
+                Some(TerminalInputTarget { terminal_id })
+            }
+            TerminalInputContext::Findr(_) => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn route_client_events(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
@@ -1970,62 +1981,96 @@ impl App {
         for event in events {
             let previous_mode = self.state.mode;
             let mut event_forwarded = false;
+            let suppress_overflowed_input = match &event {
+                crate::raw_input::RawInputEvent::Key(key) => self
+                    .input_leases
+                    .suppress_key(&input::InputLeaseKey::new(source_id, key)),
+                crate::raw_input::RawInputEvent::Text(_)
+                | crate::raw_input::RawInputEvent::Paste(_)
+                | crate::raw_input::RawInputEvent::Mouse(_) => {
+                    self.input_leases.source_suppressed(source_id)
+                }
+                _ => false,
+            };
+            if suppress_overflowed_input {
+                terminal_forward_only = false;
+                self.sync_prefix_input_source(previous_mode);
+                continue;
+            }
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
                     let lease_key = input::InputLeaseKey::new(source_id, &key);
-                    let key = self.input_leases.normalize_press(&lease_key, key);
-                    match key.kind {
-                        crossterm::event::KeyEventKind::Press => {
-                            let initial_context = self.terminal_input_context();
-                            let (target, handled_omp_reply_navigation, consumed_repeat_policy) = if matches!(
-                                initial_context,
-                                Some(TerminalInputContext::Findr(_))
-                            ) {
-                                self.handle_findr_key(key.clone());
-                                (None, false, input::ConsumedRepeatPolicy::StableContext)
-                            } else if initial_context.is_some() {
-                                self.handle_terminal_key_headless_with_repeat_outcome(
-                                    source_id,
-                                    view_id,
-                                    key.clone(),
-                                )
-                            } else {
-                                self.handle_non_terminal_key_headless_for_view(
-                                    key.clone(),
-                                    view_id,
+                    let overflow_releases = (key.kind == crossterm::event::KeyEventKind::Press
+                        && (key.generated_text.is_none() || key.has_physical_identity()))
+                    .then(|| self.input_leases.prepare_press(&lease_key))
+                    .flatten();
+                    if let Some(releases) = overflow_releases {
+                        for pressed in releases {
+                            let release = pressed
+                                .key
+                                .with_kind(crossterm::event::KeyEventKind::Release);
+                            let _ = self
+                                .forward_terminal_key_to_target_headless(&pressed.target, release);
+                        }
+                    } else {
+                        let key = self.input_leases.normalize_press(&lease_key, key);
+                        match key.kind {
+                            crossterm::event::KeyEventKind::Press => {
+                                let initial_context = self.terminal_input_context();
+                                let (target, handled_omp_reply_navigation, consumed_repeat_policy) =
+                                    if matches!(
+                                        initial_context,
+                                        Some(TerminalInputContext::Findr(_))
+                                    ) {
+                                        self.handle_findr_key(key.clone());
+                                        (None, false, input::ConsumedRepeatPolicy::StableContext)
+                                    } else if initial_context.is_some() {
+                                        self.handle_terminal_key_headless_with_repeat_outcome(
+                                            source_id,
+                                            view_id,
+                                            key.clone(),
+                                        )
+                                    } else {
+                                        self.handle_non_terminal_key_headless_for_view(
+                                            key.clone(),
+                                            view_id,
+                                        );
+                                        (None, false, input::ConsumedRepeatPolicy::StableContext)
+                                    };
+                                event_forwarded = target.is_some();
+                                let resulting_context = self.terminal_input_context();
+                                let plan = self.input_leases.complete_press(
+                                    lease_key,
+                                    &key,
+                                    initial_context.as_ref(),
+                                    resulting_context.as_ref(),
+                                    consumed_repeat_policy,
+                                    target,
+                                    handled_omp_reply_navigation,
                                 );
-                                (None, false, input::ConsumedRepeatPolicy::StableContext)
-                            };
-                            event_forwarded = target.is_some();
-                            let resulting_context = self.terminal_input_context();
-                            let plan = self.input_leases.complete_press(
-                                lease_key,
-                                &key,
-                                initial_context.as_ref(),
-                                resulting_context.as_ref(),
-                                consumed_repeat_policy,
-                                target,
-                                handled_omp_reply_navigation,
-                            );
-                            self.execute_repeat_plan_headless(
-                                source_id, view_id, lease_key, key, plan,
-                            );
-                        }
-                        crossterm::event::KeyEventKind::Repeat => {
-                            let current_context = self.terminal_input_context();
-                            let plan = self.input_leases.plan_repeat(
-                                lease_key,
-                                &key,
-                                current_context.as_ref(),
-                            );
-                            event_forwarded = self.execute_repeat_plan_headless(
-                                source_id, view_id, lease_key, key, plan,
-                            );
-                        }
-                        crossterm::event::KeyEventKind::Release => {
-                            if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                                event_forwarded = self
-                                    .forward_terminal_key_to_target_headless(&lease.target, key);
+                                self.execute_repeat_plan_headless(
+                                    source_id, view_id, lease_key, key, plan,
+                                );
+                            }
+                            crossterm::event::KeyEventKind::Repeat => {
+                                let current_context = self.terminal_input_context();
+                                let plan = self.input_leases.plan_repeat(
+                                    lease_key,
+                                    &key,
+                                    current_context.as_ref(),
+                                );
+                                event_forwarded = self.execute_repeat_plan_headless(
+                                    source_id, view_id, lease_key, key, plan,
+                                );
+                            }
+                            crossterm::event::KeyEventKind::Release => {
+                                if let Some(lease) = self.input_leases.remove_forwarded(&lease_key)
+                                {
+                                    event_forwarded = self.forward_terminal_key_to_target_headless(
+                                        &lease.target,
+                                        key,
+                                    );
+                                }
                             }
                         }
                     }
@@ -3907,7 +3952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_mode_handles_repeat_key_events() {
+    async fn terminal_mode_reprocesses_repeat_without_an_owned_press() {
         let mut app = test_app();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -3958,6 +4003,41 @@ mod tests {
         assert_eq!(
             rx.recv().await.unwrap(),
             bytes::Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn report_all_repeats_semantic_generated_text_press_without_a_lease() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, b"\x1b[>15u", 4);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let press = crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
+            .with_text_commit();
+        let repeat = crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
+            .with_kind(KeyEventKind::Repeat)
+            .with_text_commit();
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(press))
+                .await
+        );
+        assert!(
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(repeat))
+                .await
+        );
+
+        assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"j"));
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            bytes::Bytes::from_static(b"\x1b[106;1:2u")
         );
         assert!(rx.try_recv().is_err());
     }
@@ -6151,7 +6231,7 @@ last_pane = "prefix+tab"
     }
 
     #[tokio::test]
-    async fn grouped_physical_press_and_runtime_loss_preserve_count_then_close_the_lease() {
+    async fn grouped_physical_press_and_runtime_loss_preserve_count_then_tombstone_the_lease() {
         let mut app = test_app();
         let workspace = Workspace::test_new("test");
         let pane_id = workspace.focused_pane_id().unwrap();
@@ -6209,6 +6289,18 @@ last_pane = "prefix+tab"
             bytes::Bytes::from_static(b"\x1b[97;1:3u")
         );
         assert!(rx.try_recv().is_err());
+        assert_eq!(app.input_leases.len(), 1);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('a'), KeyModifiers::empty())
+                    .with_kind(KeyEventKind::Release)
+                    .with_windows_record(crate::input::WindowsKeyRecord {
+                        key_down: false,
+                        ..record
+                    }),
+            )],
+            false,
+        );
         assert!(app.input_leases.is_empty());
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
     }

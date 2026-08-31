@@ -16,6 +16,8 @@ use crate::layout::PaneId;
 /// type instead of the pane module's implementation detail.
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
+const MAX_TRACKED_OMP_INPUT_PRESSES: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OmpReplyNavigationRoute {
     Consumed { navigated: bool },
@@ -26,41 +28,54 @@ pub(crate) enum OmpReplyNavigationRoute {
 enum OmpReplyNavigationDisposition {
     Consumed,
     Forwarded,
+    Suppressed,
 }
 
+#[derive(Clone, Debug)]
+struct OmpReplyNavigationPress {
+    identity: crate::input::KeyIdentity,
+    key: crate::input::TerminalKey,
+    disposition: OmpReplyNavigationDisposition,
+}
+
+// `reply_navigation_key_identity` admits only semantic Up and Down here; physical identities use
+// `OmpPhysicalKeyPresses`, so this collection is inherently bounded at two entries.
 #[derive(Default)]
-pub(crate) struct OmpReplyNavigationPresses(
-    Vec<(crate::input::KeyIdentity, OmpReplyNavigationDisposition)>,
-);
+pub(crate) struct OmpReplyNavigationPresses {
+    presses: Vec<OmpReplyNavigationPress>,
+}
 
 impl OmpReplyNavigationPresses {
     pub(crate) fn route(
         &mut self,
         key: &crate::input::TerminalKey,
-        navigate: impl FnOnce() -> bool,
+        mut navigate: impl FnMut() -> bool,
     ) -> OmpReplyNavigationRoute {
-        if let Some(disposition) = self.existing_disposition(key) {
-            return match disposition {
-                OmpReplyNavigationDisposition::Consumed => {
-                    let navigated =
-                        key.kind != crossterm::event::KeyEventKind::Release && navigate();
-                    OmpReplyNavigationRoute::Consumed { navigated }
-                }
-                OmpReplyNavigationDisposition::Forwarded => OmpReplyNavigationRoute::Forwarded,
-            };
+        if let Some(route) = self.route_existing_with(key, &mut navigate) {
+            return route;
         }
 
-        if key.kind == crossterm::event::KeyEventKind::Release {
-            return OmpReplyNavigationRoute::Forwarded;
+        let identity = reply_navigation_key_identity(key);
+        if matches!(
+            key.kind,
+            crossterm::event::KeyEventKind::Repeat | crossterm::event::KeyEventKind::Release
+        ) && identity.is_some()
+        {
+            return OmpReplyNavigationRoute::Consumed { navigated: false };
         }
+
         let navigated = navigate();
-        if let Some(identity) = reply_navigation_key_identity(key) {
+        if let Some(identity) = identity {
             let disposition = if navigated {
                 OmpReplyNavigationDisposition::Consumed
             } else {
                 OmpReplyNavigationDisposition::Forwarded
             };
-            self.0.push((identity, disposition));
+            self.presses.push(OmpReplyNavigationPress {
+                identity,
+                key: key.clone(),
+                disposition,
+            });
         }
         if navigated {
             OmpReplyNavigationRoute::Consumed { navigated: true }
@@ -69,56 +84,270 @@ impl OmpReplyNavigationPresses {
         }
     }
 
-    pub(crate) fn route_existing(
+    pub(crate) fn route_existing_with(
         &mut self,
         key: &crate::input::TerminalKey,
+        mut navigate: impl FnMut() -> bool,
     ) -> Option<OmpReplyNavigationRoute> {
-        self.existing_disposition(key)
-            .map(|disposition| match disposition {
-                OmpReplyNavigationDisposition::Consumed => {
-                    OmpReplyNavigationRoute::Consumed { navigated: false }
-                }
-                OmpReplyNavigationDisposition::Forwarded => OmpReplyNavigationRoute::Forwarded,
-            })
-    }
-
-    fn existing_disposition(
-        &mut self,
-        key: &crate::input::TerminalKey,
-    ) -> Option<OmpReplyNavigationDisposition> {
         let identity = reply_navigation_key_identity(key)?;
+        let index = self
+            .presses
+            .iter()
+            .position(|press| press.identity == identity)?;
+        let disposition = self.presses[index].disposition;
+        // Nonphysical input has no generation or hardware identity. A new Press is the only
+        // reliable lifecycle boundary for press-only protocols; late Repeat/Release events stay
+        // suppressed only until that explicit new lifecycle begins.
         if key.kind == crossterm::event::KeyEventKind::Press && !key.has_physical_identity() {
-            self.0.retain(|(tracked, _)| *tracked != identity);
+            self.presses.swap_remove(index);
             return None;
         }
-        let index = self
-            .0
-            .iter()
-            .position(|(tracked, _)| *tracked == identity)?;
-        let disposition = self.0[index].1;
-        if key.kind == crossterm::event::KeyEventKind::Release {
-            self.0.swap_remove(index);
+        match disposition {
+            OmpReplyNavigationDisposition::Consumed => {
+                let navigated = key.kind != crossterm::event::KeyEventKind::Release && navigate();
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    self.presses.swap_remove(index);
+                }
+                Some(OmpReplyNavigationRoute::Consumed { navigated })
+            }
+            OmpReplyNavigationDisposition::Forwarded => Some(OmpReplyNavigationRoute::Forwarded),
+            OmpReplyNavigationDisposition::Suppressed => {
+                if key.kind == crossterm::event::KeyEventKind::Release {
+                    self.presses.swap_remove(index);
+                }
+                Some(OmpReplyNavigationRoute::Consumed { navigated: false })
+            }
         }
-        Some(disposition)
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
+    pub(crate) fn owns_key(&self, key: &crate::input::TerminalKey) -> bool {
+        reply_navigation_key_identity(key)
+            .is_some_and(|identity| self.presses.iter().any(|press| press.identity == identity))
     }
+
+    pub(crate) fn suppress_existing(&mut self, key: &crate::input::TerminalKey) {
+        let Some(identity) = reply_navigation_key_identity(key) else {
+            return;
+        };
+        if let Some(press) = self
+            .presses
+            .iter_mut()
+            .find(|press| press.identity == identity)
+        {
+            press.disposition = OmpReplyNavigationDisposition::Suppressed;
+        }
+    }
+
+    pub(crate) fn forget(&mut self, key: &crate::input::TerminalKey) {
+        let Some(identity) = reply_navigation_key_identity(key) else {
+            return;
+        };
+        self.presses.retain(|press| press.identity != identity);
+    }
+
+    pub(crate) fn retire_owner(&mut self) -> Vec<crate::input::TerminalKey> {
+        let mut releases = Vec::new();
+        for press in &mut self.presses {
+            if press.disposition == OmpReplyNavigationDisposition::Forwarded {
+                releases.push(
+                    press
+                        .key
+                        .clone()
+                        .with_kind(crossterm::event::KeyEventKind::Release),
+                );
+            }
+            press.disposition = OmpReplyNavigationDisposition::Suppressed;
+        }
+        releases
+    }
+
+    pub(crate) fn release_for_focus_loss(&mut self) -> Vec<crate::input::TerminalKey> {
+        let releases = self.retire_owner();
+        self.presses.clear();
+        releases
+    }
+
+    #[cfg(any(not(windows), test))]
     pub(crate) fn has_forwarded(&self) -> bool {
-        self.0
+        self.presses
             .iter()
-            .any(|(_, disposition)| *disposition == OmpReplyNavigationDisposition::Forwarded)
+            .any(|press| press.disposition == OmpReplyNavigationDisposition::Forwarded)
     }
 
     #[cfg(not(windows))]
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.presses.is_empty()
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.presses.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OmpPhysicalKeyRoute {
+    Forwarded,
+    ReplyNavigation,
+    Suppressed,
+}
+
+#[derive(Clone, Debug)]
+struct OmpPhysicalKeyPress {
+    identity: crate::input::KeyIdentity,
+    key: crate::input::TerminalKey,
+    route: OmpPhysicalKeyRoute,
+}
+
+/// Bounded ownership for ordinary OMP key lifecycles. The historical name is retained because
+/// physical Windows identities were its first consumer; Unix Kitty input uses semantic identities
+/// with explicit Press/Repeat/Release events and requires the same owner continuity.
+#[derive(Default)]
+pub(crate) struct OmpPhysicalKeyPresses {
+    presses: Vec<OmpPhysicalKeyPress>,
+}
+
+impl OmpPhysicalKeyPresses {
+    pub(crate) fn route_existing(
+        &mut self,
+        key: &crate::input::TerminalKey,
+    ) -> Option<OmpPhysicalKeyRoute> {
+        let identity = key.identity();
+        if let Some(index) = self
+            .presses
+            .iter()
+            .position(|press| press.identity == identity)
+        {
+            let route = self.presses[index].route;
+            if key.kind == crossterm::event::KeyEventKind::Press && !key.has_physical_identity() {
+                self.presses.swap_remove(index);
+                return None;
+            }
+            if key.kind == crossterm::event::KeyEventKind::Release
+                && route != OmpPhysicalKeyRoute::Forwarded
+            {
+                self.presses.swap_remove(index);
+            }
+            return Some(route);
+        }
+        None
+    }
+
+    #[cfg(any(not(windows), test))]
+    pub(crate) fn owns_key(&self, key: &crate::input::TerminalKey) -> bool {
+        self.presses
+            .iter()
+            .any(|press| press.identity == key.identity())
+    }
+
+    pub(crate) fn reserve_press(
+        &mut self,
+        key: &crate::input::TerminalKey,
+    ) -> Option<Vec<crate::input::TerminalKey>> {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return None;
+        }
+        let identity = key.identity();
+        if self.presses.iter().any(|press| press.identity == identity) {
+            return None;
+        }
+        let mut releases = Vec::new();
+        if self.presses.len() >= MAX_TRACKED_OMP_INPUT_PRESSES {
+            let evicted = self.presses.remove(0);
+            if evicted.route == OmpPhysicalKeyRoute::Forwarded {
+                releases.push(
+                    evicted
+                        .key
+                        .with_kind(crossterm::event::KeyEventKind::Release),
+                );
+            }
+        }
+        self.presses.push(OmpPhysicalKeyPress {
+            identity,
+            key: key.clone(),
+            route: OmpPhysicalKeyRoute::Suppressed,
+        });
+        Some(releases)
+    }
+
+    pub(crate) fn commit_press(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        route: OmpPhysicalKeyRoute,
+    ) -> bool {
+        let identity = key.identity();
+        let Some(press) = self
+            .presses
+            .iter_mut()
+            .find(|press| press.identity == identity)
+        else {
+            return false;
+        };
+        press.route = route;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn track(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        route: OmpPhysicalKeyRoute,
+    ) -> bool {
+        self.reserve_press(key).is_some() && self.commit_press(key, route)
+    }
+
+    pub(crate) fn forget(&mut self, key: &crate::input::TerminalKey) {
+        let identity = key.identity();
+        self.presses.retain(|press| press.identity != identity);
+    }
+    pub(crate) fn suppress_existing(&mut self, key: &crate::input::TerminalKey) {
+        let identity = key.identity();
+        if let Some(press) = self
+            .presses
+            .iter_mut()
+            .find(|press| press.identity == identity)
+        {
+            press.route = OmpPhysicalKeyRoute::Suppressed;
+        }
+    }
+
+    pub(crate) fn retire_owner(&mut self) -> Vec<crate::input::TerminalKey> {
+        let mut releases = Vec::new();
+        for press in &mut self.presses {
+            if press.route == OmpPhysicalKeyRoute::Forwarded {
+                releases.push(
+                    press
+                        .key
+                        .clone()
+                        .with_kind(crossterm::event::KeyEventKind::Release),
+                );
+            }
+            press.route = OmpPhysicalKeyRoute::Suppressed;
+        }
+        releases
+    }
+
+    pub(crate) fn release_for_focus_loss(&mut self) -> Vec<crate::input::TerminalKey> {
+        let releases = self.retire_owner();
+        self.presses.clear();
+        releases
+    }
+
+    #[cfg(any(not(windows), test))]
+    pub(crate) fn owns_input(&self) -> bool {
+        !self.presses.is_empty()
+    }
+
+    #[cfg(any(not(windows), test))]
+    pub(crate) fn has_forwarded(&self) -> bool {
+        self.presses
+            .iter()
+            .any(|press| press.route == OmpPhysicalKeyRoute::Forwarded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.presses.len()
     }
 }
 
@@ -618,7 +847,6 @@ impl TerminalRuntime {
         self.0.keyboard_report_all_requested()
     }
 
-    #[cfg(unix)]
     pub fn focus_reporting_enabled(&self) -> bool {
         self.0.focus_reporting_enabled()
     }
@@ -952,5 +1180,163 @@ impl TerminalRuntime {
             channel_capacity,
         );
         (Self(runtime), rx)
+    }
+}
+#[cfg(test)]
+mod omp_input_tracker_tests {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    use super::*;
+
+    fn physical_key(index: u16, kind: KeyEventKind) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT)
+            .with_kind(kind)
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down: kind != KeyEventKind::Release,
+                repeat_count: 1,
+                virtual_key_code: 0x26,
+                virtual_scan_code: index,
+                unicode: 0,
+                control_key_state: 0,
+            })
+    }
+    #[test]
+    fn physical_key_tracker_is_bounded_by_releasing_the_oldest_press() {
+        let mut presses = OmpPhysicalKeyPresses::default();
+        for index in 1..=MAX_TRACKED_OMP_INPUT_PRESSES as u16 {
+            assert!(presses.track(
+                &physical_key(index, KeyEventKind::Press),
+                OmpPhysicalKeyRoute::Forwarded,
+            ));
+        }
+        let newest = physical_key(
+            MAX_TRACKED_OMP_INPUT_PRESSES as u16 + 1,
+            KeyEventKind::Press,
+        );
+        let releases = presses.reserve_press(&newest).expect("bounded reservation");
+        assert_eq!(
+            releases,
+            [physical_key(1, KeyEventKind::Press).with_kind(KeyEventKind::Release)]
+        );
+        assert!(presses.commit_press(&newest, OmpPhysicalKeyRoute::Forwarded));
+        assert_eq!(presses.len(), MAX_TRACKED_OMP_INPUT_PRESSES);
+        assert_eq!(
+            presses.route_existing(&physical_key(1, KeyEventKind::Repeat)),
+            None
+        );
+        assert_eq!(
+            presses.route_existing(&newest.with_kind(KeyEventKind::Repeat)),
+            Some(OmpPhysicalKeyRoute::Forwarded)
+        );
+        assert_eq!(
+            presses.release_for_focus_loss().len(),
+            MAX_TRACKED_OMP_INPUT_PRESSES
+        );
+        assert_eq!(presses.len(), 0);
+    }
+
+    #[test]
+    fn semantic_key_tracker_stays_live_without_release_events() {
+        let mut presses = OmpPhysicalKeyPresses::default();
+        let mut latest = None;
+        for index in 0..300_u32 {
+            let key = crate::input::TerminalKey::new(
+                KeyCode::Char(char::from_u32(0x1000 + index).expect("test character")),
+                KeyModifiers::empty(),
+            );
+            let releases = presses.reserve_press(&key).expect("semantic reservation");
+            assert_eq!(
+                releases.len(),
+                usize::from(index >= MAX_TRACKED_OMP_INPUT_PRESSES as u32)
+            );
+            assert!(presses.commit_press(&key, OmpPhysicalKeyRoute::Forwarded));
+            latest = Some(key);
+        }
+
+        assert_eq!(presses.len(), MAX_TRACKED_OMP_INPUT_PRESSES);
+        assert_eq!(
+            presses.route_existing(&latest.expect("latest key").with_kind(KeyEventKind::Repeat)),
+            Some(OmpPhysicalKeyRoute::Forwarded)
+        );
+    }
+
+    #[test]
+    fn ordinary_semantic_key_stays_with_its_owner_until_release_or_retirement() {
+        let press = crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty());
+        let mut presses = OmpPhysicalKeyPresses::default();
+        assert!(presses.track(&press, OmpPhysicalKeyRoute::Forwarded));
+        assert_eq!(
+            presses.route_existing(&press.clone().with_kind(KeyEventKind::Repeat)),
+            Some(OmpPhysicalKeyRoute::Forwarded)
+        );
+
+        assert_eq!(
+            presses.retire_owner(),
+            vec![press.clone().with_kind(KeyEventKind::Release)]
+        );
+        assert_eq!(
+            presses.route_existing(&press.clone().with_kind(KeyEventKind::Repeat)),
+            Some(OmpPhysicalKeyRoute::Suppressed)
+        );
+        assert!(presses.route_existing(&press).is_none());
+        assert!(presses.track(&press, OmpPhysicalKeyRoute::Forwarded));
+        let release = press.with_kind(KeyEventKind::Release);
+        assert_eq!(
+            presses.route_existing(&release),
+            Some(OmpPhysicalKeyRoute::Forwarded)
+        );
+        presses.forget(&release);
+        assert_eq!(presses.len(), 0);
+    }
+
+    #[test]
+    fn retired_semantic_navigation_suppresses_late_events_but_allows_a_new_press() {
+        let mut presses = OmpReplyNavigationPresses::default();
+        let key = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            presses.route(&key, || true),
+            OmpReplyNavigationRoute::Consumed { navigated: true }
+        );
+        presses.retire_owner();
+
+        let mut called = false;
+        assert_eq!(
+            presses.route_existing_with(&key.clone().with_kind(KeyEventKind::Repeat), || {
+                called = true;
+                true
+            }),
+            Some(OmpReplyNavigationRoute::Consumed { navigated: false })
+        );
+        assert!(!called);
+        assert!(presses.route_existing_with(&key, || true).is_none());
+        assert_eq!(
+            presses.route(&key, || false),
+            OmpReplyNavigationRoute::Forwarded
+        );
+        assert_eq!(
+            presses.route_existing_with(&key.clone().with_kind(KeyEventKind::Release), || true),
+            Some(OmpReplyNavigationRoute::Forwarded)
+        );
+        presses.forget(&key);
+        assert_eq!(presses.len(), 0);
+    }
+
+    #[test]
+    fn orphan_semantic_repeat_is_suppressed_without_navigation() {
+        let mut presses = OmpReplyNavigationPresses::default();
+        let mut called = false;
+        assert_eq!(
+            presses.route(
+                &crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT)
+                    .with_kind(KeyEventKind::Repeat),
+                || {
+                    called = true;
+                    true
+                },
+            ),
+            OmpReplyNavigationRoute::Consumed { navigated: false }
+        );
+        assert!(!called);
+        assert_eq!(presses.len(), 0);
     }
 }

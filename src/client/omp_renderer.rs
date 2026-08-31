@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,10 @@ use crate::protocol::{
     RenderEncoding, MAX_LINK_URL_LENGTH,
 };
 use crate::render_signal::RenderSignal;
-use crate::terminal::{OmpReplyNavigationPresses, OmpReplyNavigationRoute, TerminalRuntime};
+use crate::terminal::{
+    OmpPhysicalKeyPresses, OmpPhysicalKeyRoute, OmpReplyNavigationPresses, OmpReplyNavigationRoute,
+    TerminalRuntime,
+};
 
 pub(super) const OMP_RENDERER_LAUNCH_ID_ENV: &str = "HERDR_OMP_RENDERER_LAUNCH_ID";
 
@@ -23,6 +26,8 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_DAMAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_QUEUED_LINK_INPUTS: usize = 256;
 const MAX_TRACKED_SERVER_PRESSES: usize = 256;
+const MAX_PENDING_INPUT_EVENTS: usize = 4096;
+const MAX_PENDING_INPUT_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(super) fn capabilities(
     encoding: RenderEncoding,
     app_surface: bool,
@@ -80,6 +85,50 @@ impl LinkInput {
             Self::Events { generation, .. } | Self::Pixels { generation, .. } => *generation,
         }
     }
+
+    fn input_usage(&self) -> (usize, usize) {
+        match self {
+            Self::Events { events, .. } => client_input_events_usage(events),
+            Self::Pixels { inputs, .. } => inputs.iter().fold((0, 0), |mut total, (data, _)| {
+                add_input_usage(&mut total, (1, data.len()));
+                total
+            }),
+        }
+    }
+}
+
+fn client_input_event_usage(event: &ClientInputEvent) -> (usize, usize) {
+    let payload = match event {
+        ClientInputEvent::Key {
+            generated_text,
+            source,
+            ..
+        } => {
+            generated_text.as_ref().map_or(0, String::len)
+                + match source {
+                    ClientKeySource::Vt { bytes } => bytes.len(),
+                    ClientKeySource::Synthesized | ClientKeySource::WindowsConsole { .. } => 0,
+                }
+        }
+        ClientInputEvent::TextCommit(text) | ClientInputEvent::Paste { text } => text.len(),
+        ClientInputEvent::Mouse { .. }
+        | ClientInputEvent::FocusGained
+        | ClientInputEvent::FocusLost => 0,
+    };
+    (1, payload)
+}
+
+fn add_input_usage(total: &mut (usize, usize), usage: (usize, usize)) {
+    total.0 = total.0.saturating_add(usage.0);
+    total.1 = total.1.saturating_add(usage.1);
+}
+
+fn client_input_events_usage(events: &[ClientInputEvent]) -> (usize, usize) {
+    let mut total = (0, 0);
+    for event in events {
+        add_input_usage(&mut total, client_input_event_usage(event));
+    }
+    total
 }
 
 impl DeferredMessage {
@@ -94,14 +143,10 @@ impl DeferredMessage {
             Self::InputPixels { generation, .. } => *generation == current_generation,
         }
     }
-
-    fn into_client_message(mut self, current_generation: u64) -> Option<ClientMessage> {
-        if !self.retain_for_generation(current_generation) {
-            return None;
-        }
+    fn input_usage(&self) -> (usize, usize) {
         match self {
-            Self::InputEvents { events, .. } => Some(ClientMessage::InputEvents { events }),
-            Self::InputPixels { data, geometry, .. } => Some(pixel_input_message(data, geometry)),
+            Self::InputEvents { events, .. } => client_input_events_usage(events),
+            Self::InputPixels { data, .. } => (1, data.len()),
         }
     }
 }
@@ -280,13 +325,14 @@ pub(super) struct ClientOmpRenderer {
     scrollback_limit_bytes: usize,
     mouse_scroll_lines: usize,
     latest_launch_id: u64,
-    attempted_launches: HashSet<u64>,
     target: Option<LocalTarget>,
     cached_server_frame: Option<FrameData>,
     handoff_frame: Option<FrameData>,
     local_selected: bool,
     server_owned_input: bool,
     omp_reply_navigation_presses: OmpReplyNavigationPresses,
+    local_physical_presses: OmpPhysicalKeyPresses,
+    // Host-key lifecycles already sent to the server, including semantic Unix Kitty keys.
     server_forwarded_presses: Vec<crate::input::KeyIdentity>,
     server_forwarded_overflow: bool,
     next_link_request_id: u64,
@@ -302,6 +348,7 @@ pub(super) struct ClientOmpRenderer {
     awaiting_promotion: bool,
     deferred_messages: Vec<DeferredMessage>,
     outbound_messages: Vec<ClientMessage>,
+    post_send_input: VecDeque<DeferredMessage>,
     effects: Vec<LocalEffect>,
     needs_render: bool,
     force_repaint: bool,
@@ -318,13 +365,13 @@ impl ClientOmpRenderer {
             scrollback_limit_bytes,
             mouse_scroll_lines: mouse_scroll_lines.max(1),
             latest_launch_id: 0,
-            attempted_launches: HashSet::new(),
             target: None,
             cached_server_frame: None,
             handoff_frame: None,
             local_selected: false,
             server_owned_input: false,
             omp_reply_navigation_presses: OmpReplyNavigationPresses::default(),
+            local_physical_presses: OmpPhysicalKeyPresses::default(),
             server_forwarded_presses: Vec::new(),
             server_forwarded_overflow: false,
             next_link_request_id: 1,
@@ -340,6 +387,7 @@ impl ClientOmpRenderer {
             awaiting_promotion: false,
             deferred_messages: Vec::new(),
             outbound_messages: Vec::new(),
+            post_send_input: VecDeque::new(),
             effects: Vec::new(),
             needs_render: false,
             force_repaint: false,
@@ -364,8 +412,8 @@ impl ClientOmpRenderer {
         if route.is_none() {
             self.latest_launch_id = launch_id;
             self.prepare_surface_handoff();
+            self.release_pending_input_to_server();
             self.stop_target();
-            self.discard_deferred_messages();
             self.cached_server_frame = None;
             return;
         }
@@ -378,13 +426,10 @@ impl ClientOmpRenderer {
             });
         if replace {
             self.prepare_surface_handoff();
+            self.release_pending_input_to_server();
             self.stop_target();
-            self.discard_deferred_messages();
             self.cached_server_frame = None;
             self.latest_launch_id = launch_id;
-            if !self.attempted_launches.insert(launch_id) {
-                return;
-            }
             let scrollback_limit_bytes = self.scrollback_limit_bytes;
             let target = self.omp_executable.as_ref().and_then(|omp_executable| {
                 LocalTarget::spawn(
@@ -401,14 +446,16 @@ impl ClientOmpRenderer {
             self.target = target;
             self.needs_render = true;
         }
-        if !bound {
-            self.cached_server_frame = None;
-            self.release_deferred_messages(current_input_generation);
-        }
         let loses_binding = self
             .target
             .as_ref()
             .is_some_and(|target| target.bound && !bound);
+        if loses_binding {
+            self.release_pending_input_to_server();
+        } else if !bound {
+            self.cached_server_frame = None;
+            self.release_deferred_messages();
+        }
         if self.local_selected
             && self
                 .target
@@ -418,7 +465,7 @@ impl ClientOmpRenderer {
             self.prepare_surface_handoff();
         }
         if loses_binding {
-            self.clear_omp_reply_navigation_presses();
+            self.retire_local_input_owner();
         }
         let mut confirm_promotion = None;
         let Some(target) = self
@@ -497,6 +544,8 @@ impl ClientOmpRenderer {
         self.cancel_stale_link_inputs(current_input_generation);
         self.deferred_messages
             .retain_mut(|message| message.retain_for_generation(current_input_generation));
+        self.post_send_input
+            .retain_mut(|message| message.retain_for_generation(current_input_generation));
         self.pointer_pixels = self.pointer_pixels.and_then(|mut pointer| {
             pointer.geometry = host_geometry?;
             Some(pointer)
@@ -524,9 +573,6 @@ impl ClientOmpRenderer {
             let crate::raw_input::RawInputEvent::Key(key) = event else {
                 continue;
             };
-            if !key.has_physical_identity() {
-                continue;
-            }
             let identity = key.identity();
             match key.kind {
                 KeyEventKind::Press => {
@@ -536,8 +582,8 @@ impl ClientOmpRenderer {
                     if self.server_forwarded_presses.len() < MAX_TRACKED_SERVER_PRESSES {
                         self.server_forwarded_presses.push(identity);
                     } else {
-                        // A malicious physical-key stream cannot grow state without bound.
-                        // Keep all input server-routed until focus loss safely resets it.
+                        // A malicious key stream cannot grow state without bound. Keep all input
+                        // server-routed until focus loss safely resets it.
                         self.server_forwarded_overflow = true;
                     }
                 }
@@ -551,9 +597,6 @@ impl ClientOmpRenderer {
     }
 
     fn route_existing_server_input(&mut self, key: &crate::input::TerminalKey) -> bool {
-        if !key.has_physical_identity() || key.kind == KeyEventKind::Press {
-            return false;
-        }
         if self.server_forwarded_overflow {
             return true;
         }
@@ -565,6 +608,10 @@ impl ClientOmpRenderer {
         else {
             return false;
         };
+        if key.kind == KeyEventKind::Press && !key.has_physical_identity() {
+            self.server_forwarded_presses.swap_remove(index);
+            return false;
+        }
         if key.kind == KeyEventKind::Release {
             self.server_forwarded_presses.swap_remove(index);
         }
@@ -591,7 +638,10 @@ impl ClientOmpRenderer {
     }
 
     pub(super) fn owns_input(&self) -> bool {
-        self.owns_surface_input() || !self.omp_reply_navigation_presses.is_empty()
+        self.owns_surface_input()
+            || !self.omp_reply_navigation_presses.is_empty()
+            || self.local_physical_presses.owns_input()
+            || !self.post_send_input.is_empty()
     }
 
     fn prepare_surface_handoff(&mut self) {
@@ -751,6 +801,65 @@ impl ClientOmpRenderer {
         })
     }
 
+    fn can_extend_server_batch(&self, event: &crate::raw_input::RawInputEvent) -> bool {
+        self.pending_link_request_id.is_none()
+            && self.server_owned_input
+            && !matches!(event, crate::raw_input::RawInputEvent::Key(key)
+                if self.local_physical_presses.owns_key(key)
+                    || self.omp_reply_navigation_presses.owns_key(key))
+    }
+
+    fn pending_input_usage(&self) -> (usize, usize) {
+        let mut total = (0, 0);
+        for message in &self.deferred_messages {
+            add_input_usage(&mut total, message.input_usage());
+        }
+        for message in &self.post_send_input {
+            add_input_usage(&mut total, message.input_usage());
+        }
+        if let Some(input) = &self.pending_link_input {
+            add_input_usage(&mut total, input.input_usage());
+        }
+        for input in &self.queued_link_inputs {
+            add_input_usage(&mut total, input.input_usage());
+        }
+        for message in &self.outbound_messages {
+            match message {
+                ClientMessage::InputEvents { events } => {
+                    add_input_usage(&mut total, client_input_events_usage(events));
+                }
+                ClientMessage::InputPixels { data, .. } => {
+                    add_input_usage(&mut total, (1, data.len()));
+                }
+                _ => {}
+            }
+        }
+        total
+    }
+
+    fn pending_input_would_overflow(&self, incoming: (usize, usize)) -> bool {
+        let pending = self.pending_input_usage();
+        pending.0.saturating_add(incoming.0) > MAX_PENDING_INPUT_EVENTS
+            || pending.1.saturating_add(incoming.1) > MAX_PENDING_INPUT_PAYLOAD_BYTES
+    }
+
+    fn route_admission_overflow_to_server(
+        &mut self,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> Vec<ClientMessage> {
+        self.begin_local_forward_fallback();
+        self.release_pending_input_to_server();
+        let events = events
+            .into_iter()
+            .filter_map(|event| client_event_from_raw(&event))
+            .filter(|event| !matches!(event, ClientInputEvent::Mouse { .. }))
+            .collect::<Vec<_>>();
+        if !events.is_empty() {
+            self.queue_server_message(ClientMessage::InputEvents { events });
+        }
+        self.take_outbound_messages()
+    }
+
     pub(super) fn route_input(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
@@ -764,9 +873,15 @@ impl ClientOmpRenderer {
         input_generation: u64,
     ) -> Vec<ClientMessage> {
         self.cancel_stale_link_inputs(input_generation);
+        let incoming = events
+            .iter()
+            .filter_map(client_event_from_raw)
+            .collect::<Vec<_>>();
+        if self.pending_input_would_overflow(client_input_events_usage(&incoming)) {
+            return self.route_admission_overflow_to_server(events);
+        }
         self.route_input_inner(events, input_generation, true)
     }
-
     fn route_input_inner(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
@@ -776,13 +891,155 @@ impl ClientOmpRenderer {
         let mut messages = Vec::new();
         let mut server_batch = Vec::new();
         let mut deferred_events = Vec::new();
+        let mut post_send_events = Vec::new();
+        let mut defer_ordered_tail = false;
         for event in events {
             let protocol_event = client_event_from_raw(&event);
+            if self.pending_link_request_id.is_some() {
+                match &event {
+                    crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        ..
+                    }) => self.pending_link_click = false,
+                    crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Drag(MouseButton::Left),
+                        ..
+                    }) if self.pending_link_click => {
+                        self.append_pending_link_event(protocol_event);
+                        continue;
+                    }
+                    crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        ..
+                    }) if self.pending_link_click => {
+                        self.append_pending_link_event(protocol_event);
+                        self.pending_link_click = false;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(event) = protocol_event {
+                    self.queue_link_input(LinkInput::Events {
+                        events: vec![event],
+                        generation: input_generation,
+                    });
+                }
+                continue;
+            }
+            if (self.awaiting_fallback || self.awaiting_promotion)
+                && (!self.deferred_messages.is_empty() || !deferred_events.is_empty())
+            {
+                if let Some(event) = protocol_event {
+                    deferred_events.push(event);
+                }
+                continue;
+            }
+            if defer_ordered_tail
+                && (!post_send_events.is_empty() || !self.can_extend_server_batch(&event))
+            {
+                if let Some(event) = protocol_event {
+                    post_send_events.push(event);
+                }
+                continue;
+            }
             if matches!(&event, crate::raw_input::RawInputEvent::Key(key)
                 if self.route_existing_server_input(key))
             {
                 if let Some(event) = protocol_event {
                     server_batch.push(event);
+                }
+                defer_ordered_tail = true;
+                continue;
+            }
+            let tracked_key = match &event {
+                crate::raw_input::RawInputEvent::Key(key) => Some(key.clone()),
+                _ => None,
+            };
+            let local_physical_route = tracked_key
+                .as_ref()
+                .and_then(|key| self.local_physical_presses.route_existing(key));
+            if let Some(route) = local_physical_route {
+                match route {
+                    OmpPhysicalKeyRoute::Forwarded => {
+                        let sent = self
+                            .target
+                            .as_ref()
+                            .and_then(|target| target.runtime.as_ref())
+                            .is_some_and(|runtime| {
+                                forward_local_event(runtime, event, self.mouse_scroll_lines)
+                            });
+                        if let Some(key) = tracked_key.as_ref() {
+                            if key.kind == KeyEventKind::Release {
+                                self.local_physical_presses.forget(key);
+                                if !sent {
+                                    self.begin_local_forward_fallback();
+                                }
+                            } else if !sent {
+                                self.local_physical_presses.suppress_existing(key);
+                                self.begin_local_forward_fallback();
+                            }
+                        }
+                    }
+                    OmpPhysicalKeyRoute::ReplyNavigation => {
+                        if matches!(tracked_key.as_ref(), Some(key) if key.kind != KeyEventKind::Release)
+                        {
+                            let navigated = self
+                                .target
+                                .as_ref()
+                                .and_then(|target| target.runtime.as_ref())
+                                .is_some_and(|runtime| {
+                                    try_navigate_local_omp_reply(runtime, &event)
+                                });
+                            if navigated {
+                                self.needs_render = true;
+                                self.refresh_hovered_link();
+                            }
+                        }
+                    }
+                    OmpPhysicalKeyRoute::Suppressed => {}
+                }
+                continue;
+            }
+
+            let target = &self.target;
+            let local_semantic_route = match &event {
+                crate::raw_input::RawInputEvent::Key(key) => self
+                    .omp_reply_navigation_presses
+                    .route_existing_with(key, || {
+                        target
+                            .as_ref()
+                            .and_then(|target| target.runtime.as_ref())
+                            .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event))
+                    }),
+                _ => None,
+            };
+            if let Some(outcome) = local_semantic_route {
+                match outcome {
+                    OmpReplyNavigationRoute::Forwarded => {
+                        let sent = self
+                            .target
+                            .as_ref()
+                            .and_then(|target| target.runtime.as_ref())
+                            .is_some_and(|runtime| {
+                                forward_local_event(runtime, event, self.mouse_scroll_lines)
+                            });
+                        if let Some(key) = tracked_key.as_ref() {
+                            if key.kind == KeyEventKind::Release {
+                                self.omp_reply_navigation_presses.forget(key);
+                                if !sent {
+                                    self.begin_local_forward_fallback();
+                                }
+                            } else if !sent {
+                                self.omp_reply_navigation_presses.suppress_existing(key);
+                                self.begin_local_forward_fallback();
+                            }
+                        }
+                    }
+                    OmpReplyNavigationRoute::Consumed { navigated: true } => {
+                        self.needs_render = true;
+                        self.refresh_hovered_link();
+                    }
+                    OmpReplyNavigationRoute::Consumed { navigated: false } => {}
                 }
                 continue;
             }
@@ -818,15 +1075,6 @@ impl ClientOmpRenderer {
                     _ => {}
                 }
             }
-            if self.pending_link_request_id.is_some() {
-                if let Some(event) = protocol_event {
-                    self.queue_link_input(LinkInput::Events {
-                        events: vec![event],
-                        generation: input_generation,
-                    });
-                }
-                continue;
-            }
             if self.awaiting_fallback || self.awaiting_promotion {
                 if let Some(event) = protocol_event {
                     deferred_events.push(event);
@@ -834,29 +1082,18 @@ impl ClientOmpRenderer {
                 continue;
             }
             if matches!(&event, crate::raw_input::RawInputEvent::OuterFocusLost) {
-                let forward_server_focus_loss = !self.server_forwarded_presses.is_empty()
+                let mut forward_server_focus_loss = !self.server_forwarded_presses.is_empty()
                     || self.server_forwarded_overflow
                     || self.server_owned_input
                     || !self.local_selected;
-                let forward_local_focus_loss = (self.local_selected && !self.server_owned_input)
-                    || self.omp_reply_navigation_presses.has_forwarded();
-                self.clear_omp_reply_navigation_presses();
+                forward_server_focus_loss |= !self.release_local_input_for_focus_loss();
                 self.server_forwarded_presses.clear();
                 self.server_forwarded_overflow = false;
-                self.observe_pointer_cell(None);
-                if forward_local_focus_loss {
-                    let _ = self
-                        .target
-                        .as_ref()
-                        .and_then(|target| target.runtime.as_ref())
-                        .is_some_and(|runtime| {
-                            forward_local_focus_event(runtime, crate::ghostty::FocusEvent::Lost)
-                        });
-                }
                 if forward_server_focus_loss {
                     if let Some(event) = protocol_event {
                         server_batch.push(event);
                     }
+                    defer_ordered_tail = true;
                 }
                 continue;
             }
@@ -873,6 +1110,7 @@ impl ClientOmpRenderer {
                                 });
                             }
                             messages.push(message);
+                            defer_ordered_tail = true;
                             self.pending_link_click = true;
                             self.pending_link_request_id = Some(request_id);
                             self.pending_link_input =
@@ -903,6 +1141,7 @@ impl ClientOmpRenderer {
                         events: vec![event],
                     });
                 }
+                defer_ordered_tail = true;
                 self.prepare_surface_handoff();
                 self.server_owned_input = true;
                 self.refresh_hovered_link();
@@ -912,29 +1151,10 @@ impl ClientOmpRenderer {
                 continue;
             }
             if self.server_owned_input || self.server_forwarded_overflow || !self.local_selected {
-                let owned_route = match &event {
-                    crate::raw_input::RawInputEvent::Key(key) => {
-                        self.omp_reply_navigation_presses.route_existing(key)
-                    }
-                    _ => None,
-                };
-                if let Some(outcome) = owned_route {
-                    if outcome == OmpReplyNavigationRoute::Forwarded {
-                        let _ = self
-                            .target
-                            .as_ref()
-                            .and_then(|target| target.runtime.as_ref())
-                            .is_some_and(|runtime| {
-                                forward_local_event(runtime, event, self.mouse_scroll_lines)
-                            });
-                    }
-                    continue;
-                }
-            }
-            if self.server_owned_input || self.server_forwarded_overflow || !self.local_selected {
                 self.observe_server_input(std::slice::from_ref(&event));
                 if let Some(event) = protocol_event {
                     server_batch.push(event);
+                    defer_ordered_tail = true;
                 }
                 continue;
             }
@@ -962,6 +1182,13 @@ impl ClientOmpRenderer {
                 generation: input_generation,
             });
         }
+        if !post_send_events.is_empty() {
+            self.post_send_input
+                .push_back(DeferredMessage::InputEvents {
+                    events: post_send_events,
+                    generation: input_generation,
+                });
+        }
         messages
     }
 
@@ -972,15 +1199,61 @@ impl ClientOmpRenderer {
             _ => None,
         };
         if let Some(key) = key {
-            let target = &self.target;
-            let outcome = self.omp_reply_navigation_presses.route(key, || {
-                target
+            if key.has_physical_identity() {
+                if key.kind != KeyEventKind::Press {
+                    return (false, true);
+                }
+                let Some(releases) = self.local_physical_presses.reserve_press(key) else {
+                    return (false, true);
+                };
+                if !self.forward_local_releases(releases) {
+                    self.local_physical_presses.forget(key);
+                    self.begin_local_forward_fallback();
+                    return (false, false);
+                }
+                let navigated = self
+                    .target
                     .as_ref()
                     .and_then(|target| target.runtime.as_ref())
-                    .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event))
-            });
-            if let OmpReplyNavigationRoute::Consumed { navigated } = outcome {
-                return (navigated, true);
+                    .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event));
+                let route = if navigated {
+                    OmpPhysicalKeyRoute::ReplyNavigation
+                } else {
+                    OmpPhysicalKeyRoute::Forwarded
+                };
+                let committed = self.local_physical_presses.commit_press(key, route);
+                debug_assert!(committed);
+                if navigated {
+                    return (true, true);
+                }
+            } else {
+                let target = &self.target;
+                let outcome = self.omp_reply_navigation_presses.route(key, || {
+                    target
+                        .as_ref()
+                        .and_then(|target| target.runtime.as_ref())
+                        .is_some_and(|runtime| try_navigate_local_omp_reply(runtime, &event))
+                });
+                if let OmpReplyNavigationRoute::Consumed { navigated } = outcome {
+                    return (navigated, true);
+                }
+                if !self.omp_reply_navigation_presses.owns_key(key) {
+                    if key.kind != KeyEventKind::Press {
+                        return (false, true);
+                    }
+                    let Some(releases) = self.local_physical_presses.reserve_press(key) else {
+                        return (false, true);
+                    };
+                    if !self.forward_local_releases(releases) {
+                        self.local_physical_presses.forget(key);
+                        self.begin_local_forward_fallback();
+                        return (false, false);
+                    }
+                    let committed = self
+                        .local_physical_presses
+                        .commit_press(key, OmpPhysicalKeyRoute::Forwarded);
+                    debug_assert!(committed);
+                }
             }
         }
 
@@ -999,11 +1272,18 @@ impl ClientOmpRenderer {
             | crate::raw_input::RawInputEvent::Paste(_) => true,
             _ => false,
         };
+        let tracked_key = key.cloned();
         let sent = self
             .target
             .as_ref()
             .and_then(|target| target.runtime.as_ref())
             .is_some_and(|runtime| forward_local_event(runtime, event, self.mouse_scroll_lines));
+        if !sent {
+            if let Some(key) = tracked_key.as_ref() {
+                self.local_physical_presses.forget(key);
+                self.omp_reply_navigation_presses.forget(key);
+            }
+        }
         ((wheel || resets_viewport) && sent, sent)
     }
 
@@ -1014,6 +1294,11 @@ impl ClientOmpRenderer {
         input_generation: u64,
     ) -> Option<ClientMessage> {
         self.cancel_stale_link_inputs(input_generation);
+        if self.pending_input_would_overflow((1, data.len())) {
+            self.begin_local_forward_fallback();
+            self.release_pending_input_to_server();
+            return None;
+        }
         self.route_pixel_input_inner(data, geometry, input_generation, true)
     }
 
@@ -1154,9 +1439,9 @@ impl ClientOmpRenderer {
         if self
             .target
             .as_ref()
-            .is_some_and(|target| target.failed || !target.bound || target.runtime.is_none())
+            .is_some_and(|target| target.failed || target.runtime.is_none())
         {
-            self.clear_omp_reply_navigation_presses();
+            self.retire_local_input_owner();
         }
         let should_select = self.target.as_ref().is_some_and(|target| {
             !target.failed
@@ -1220,6 +1505,36 @@ impl ClientOmpRenderer {
 
     pub(super) fn take_outbound_messages(&mut self) -> Vec<ClientMessage> {
         std::mem::take(&mut self.outbound_messages)
+    }
+
+    pub(super) fn flush_post_send_input(&mut self) -> Vec<ClientMessage> {
+        loop {
+            let mut queued = std::mem::take(&mut self.post_send_input);
+            let Some(message) = queued.pop_front() else {
+                return Vec::new();
+            };
+            let messages = match message {
+                DeferredMessage::InputEvents { events, generation } => {
+                    let events = events
+                        .into_iter()
+                        .map(|event| event.to_raw_input_event())
+                        .collect();
+                    self.route_input_inner(events, generation, false)
+                }
+                DeferredMessage::InputPixels {
+                    data,
+                    geometry,
+                    generation,
+                } => self
+                    .route_pixel_input_inner(data, geometry, generation, false)
+                    .into_iter()
+                    .collect(),
+            };
+            self.post_send_input.append(&mut queued);
+            if !messages.is_empty() {
+                return messages;
+            }
+        }
     }
 
     pub(super) fn resolve_link_activation(
@@ -1420,45 +1735,54 @@ impl ClientOmpRenderer {
         }
     }
 
-    fn defer_link_input(&mut self, input: LinkInput) {
+    fn deferred_link_input(input: LinkInput) -> Vec<DeferredMessage> {
         match input {
             LinkInput::Events { events, generation } => {
-                self.deferred_messages
-                    .push(DeferredMessage::InputEvents { events, generation });
+                vec![DeferredMessage::InputEvents { events, generation }]
             }
-            LinkInput::Pixels { inputs, generation } => {
-                for (data, geometry) in inputs {
-                    self.deferred_messages.push(DeferredMessage::InputPixels {
-                        data,
-                        geometry,
-                        generation,
-                    });
-                }
-            }
+            LinkInput::Pixels { inputs, generation } => inputs
+                .into_iter()
+                .map(|(data, geometry)| DeferredMessage::InputPixels {
+                    data,
+                    geometry,
+                    generation,
+                })
+                .collect(),
         }
     }
 
+    fn defer_link_input(&mut self, input: LinkInput) {
+        self.deferred_messages
+            .extend(Self::deferred_link_input(input));
+    }
+
     fn drain_queued_link_inputs(&mut self) {
-        let queued = std::mem::take(&mut self.queued_link_inputs);
-        for input in queued {
-            match input {
-                LinkInput::Events { events, generation } => {
+        let mut queued = std::mem::take(&mut self.queued_link_inputs)
+            .into_iter()
+            .flat_map(Self::deferred_link_input)
+            .collect::<VecDeque<_>>();
+        while let Some(input) = queued.pop_front() {
+            let messages = match input {
+                DeferredMessage::InputEvents { events, generation } => {
                     let raw_events = events
                         .into_iter()
                         .map(|event| event.to_raw_input_event())
                         .collect();
-                    let messages = self.route_input_inner(raw_events, generation, false);
-                    self.outbound_messages.extend(messages);
+                    self.route_input_inner(raw_events, generation, false)
                 }
-                LinkInput::Pixels { inputs, generation } => {
-                    for (data, geometry) in inputs {
-                        if let Some(message) =
-                            self.route_pixel_input_inner(data, geometry, generation, false)
-                        {
-                            self.outbound_messages.push(message);
-                        }
-                    }
-                }
+                DeferredMessage::InputPixels {
+                    data,
+                    geometry,
+                    generation,
+                } => self
+                    .route_pixel_input_inner(data, geometry, generation, false)
+                    .into_iter()
+                    .collect(),
+            };
+            if !messages.is_empty() {
+                self.outbound_messages.extend(messages);
+                self.post_send_input.extend(queued);
+                return;
             }
         }
     }
@@ -1469,7 +1793,7 @@ impl ClientOmpRenderer {
 
     fn begin_local_forward_fallback(&mut self) {
         self.prepare_surface_handoff();
-        self.clear_omp_reply_navigation_presses();
+        self.retire_local_input_owner();
         if let Some(target) = self.target.as_mut() {
             target.fail();
         }
@@ -1496,22 +1820,21 @@ impl ClientOmpRenderer {
 
     fn resolve_promotion(&mut self, local_active: bool, current_input_generation: u64) {
         self.awaiting_promotion = false;
+        let mut deferred = VecDeque::from(std::mem::take(&mut self.deferred_messages));
         if !local_active {
-            let deferred = std::mem::take(&mut self.deferred_messages);
-            let messages = deferred
-                .into_iter()
-                .filter_map(|message| message.into_client_message(current_input_generation))
-                .collect::<Vec<_>>();
-            for message in messages {
-                self.queue_server_message(message);
+            while let Some(message) = deferred.pop_front() {
+                if self.queue_deferred_message_to_server(message) {
+                    self.post_send_input.extend(deferred);
+                    return;
+                }
             }
             return;
         }
-        let deferred = std::mem::take(&mut self.deferred_messages);
-        for message in deferred {
+        while let Some(message) = deferred.pop_front() {
             if self.awaiting_fallback {
                 self.deferred_messages.push(message);
-                continue;
+                self.deferred_messages.extend(deferred);
+                return;
             }
             match message {
                 DeferredMessage::InputEvents { events, .. } => {
@@ -1521,42 +1844,150 @@ impl ClientOmpRenderer {
                         .map(|event| event.to_raw_input_event())
                         .collect();
                     let messages = self.route_input_inner(events, current_input_generation, false);
-                    self.outbound_messages.extend(messages);
+                    if !messages.is_empty() {
+                        self.outbound_messages.extend(messages);
+                        self.post_send_input.extend(deferred);
+                        return;
+                    }
                 }
                 DeferredMessage::InputPixels { .. } => {}
             }
         }
     }
 
-    fn release_deferred_messages(&mut self, current_input_generation: u64) {
+    fn release_deferred_messages(&mut self) {
         if self.awaiting_fallback || self.awaiting_promotion {
             self.awaiting_fallback = false;
             self.awaiting_promotion = false;
-            let deferred = std::mem::take(&mut self.deferred_messages);
-            let messages = deferred
-                .into_iter()
-                .filter_map(|message| message.into_client_message(current_input_generation))
-                .collect::<Vec<_>>();
-            for message in messages {
-                self.queue_server_message(message);
+            let mut deferred = VecDeque::from(std::mem::take(&mut self.deferred_messages));
+            while let Some(message) = deferred.pop_front() {
+                if self.queue_deferred_message_to_server(message) {
+                    self.post_send_input.extend(deferred);
+                    return;
+                }
             }
         }
     }
 
-    fn discard_deferred_messages(&mut self) {
-        self.awaiting_fallback = false;
+    fn release_pending_input_to_server(&mut self) {
+        let outbound = std::mem::take(&mut self.outbound_messages);
+        let post_send = std::mem::take(&mut self.post_send_input);
+        let mut pending = Vec::new();
+        if let Some(input) = self.pending_link_input.take() {
+            pending.push(input);
+        }
+        pending.extend(std::mem::take(&mut self.queued_link_inputs));
+        let deferred = std::mem::take(&mut self.deferred_messages);
 
+        self.clear_pending_link_activation();
+        self.awaiting_fallback = false;
         self.awaiting_promotion = false;
-        self.deferred_messages.clear();
-        self.outbound_messages.clear();
+        self.server_owned_input = true;
+
+        let mut events = Vec::new();
+        for message in outbound {
+            if let ClientMessage::InputEvents { events: input } = message {
+                events.extend(input);
+            }
+        }
+        for message in post_send {
+            if let DeferredMessage::InputEvents { events: input, .. } = message {
+                events.extend(input);
+            }
+        }
+        for input in pending {
+            if let LinkInput::Events { events: queued, .. } = input {
+                events.extend(queued);
+            }
+        }
+        for message in deferred {
+            if let DeferredMessage::InputEvents { events: input, .. } = message {
+                events.extend(input);
+            }
+        }
+        self.queue_input_events_to_server(events);
         self.effects.clear();
     }
 
-    fn clear_omp_reply_navigation_presses(&mut self) {
-        self.omp_reply_navigation_presses.clear();
+    fn queue_deferred_message_to_server(&mut self, message: DeferredMessage) -> bool {
+        match message {
+            DeferredMessage::InputEvents { events, .. } => {
+                self.queue_input_events_to_server(events)
+            }
+            DeferredMessage::InputPixels { data, geometry, .. } => {
+                drop((data, geometry));
+                false
+            }
+        }
+    }
+
+    fn queue_input_events_to_server(&mut self, events: Vec<ClientInputEvent>) -> bool {
+        let events = events
+            .into_iter()
+            .filter(|event| !matches!(event, ClientInputEvent::Mouse { .. }))
+            .map(|event| event.to_raw_input_event())
+            .collect();
+        self.awaiting_fallback = false;
+        self.awaiting_promotion = false;
+        self.server_owned_input = true;
+        let messages = self.route_input_inner(events, 0, false);
+        let emitted = !messages.is_empty();
+        self.outbound_messages.extend(messages);
+        emitted
+    }
+    fn forward_local_releases(&self, releases: Vec<crate::input::TerminalKey>) -> bool {
+        if releases.is_empty() {
+            return true;
+        }
+        let Some(runtime) = self
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+        else {
+            return false;
+        };
+        let mut delivered = true;
+        for release in releases {
+            delivered &= forward_local_event(
+                runtime,
+                crate::raw_input::RawInputEvent::Key(release),
+                self.mouse_scroll_lines,
+            );
+        }
+        delivered
+    }
+
+    fn release_local_input_for_focus_loss(&mut self) -> bool {
+        let forward_focus = (self.local_selected && !self.server_owned_input)
+            || self.omp_reply_navigation_presses.has_forwarded()
+            || self.local_physical_presses.has_forwarded();
+        let mut releases = self.local_physical_presses.release_for_focus_loss();
+        releases.extend(self.omp_reply_navigation_presses.release_for_focus_loss());
+        self.observe_pointer_cell(None);
+        let releases_delivered = self.forward_local_releases(releases);
+        let focus_delivered = !forward_focus
+            || self
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .is_some_and(|runtime| {
+                    forward_local_focus_event(runtime, crate::ghostty::FocusEvent::Lost)
+                });
+        let delivered = releases_delivered && focus_delivered;
+        if !delivered {
+            self.begin_local_forward_fallback();
+        }
+        delivered
+    }
+
+    fn retire_local_input_owner(&mut self) -> bool {
+        let mut releases = self.local_physical_presses.retire_owner();
+        releases.extend(self.omp_reply_navigation_presses.retire_owner());
+        self.forward_local_releases(releases)
     }
 
     fn stop_target(&mut self) {
+        self.retire_local_input_owner();
         if let Some(mut target) = self.target.take() {
             target.stop();
         }
@@ -1565,7 +1996,6 @@ impl ClientOmpRenderer {
         }
         self.local_selected = false;
         self.server_owned_input = false;
-        self.clear_omp_reply_navigation_presses();
         self.clear_pending_link_click();
         self.hovered_link_cells = None;
         self.needs_render = true;
@@ -1889,17 +2319,29 @@ mod tests {
         }
     }
 
-    fn physical_j(kind: KeyEventKind, key_down: bool) -> crate::input::TerminalKey {
+    fn physical_j_with_scan(
+        scan_code: u16,
+        kind: KeyEventKind,
+        key_down: bool,
+    ) -> crate::input::TerminalKey {
         crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty())
             .with_kind(kind)
             .with_windows_record(crate::input::WindowsKeyRecord {
                 key_down,
                 repeat_count: 1,
                 virtual_key_code: 0x4a,
-                virtual_scan_code: 0x24,
+                virtual_scan_code: scan_code,
                 unicode: if key_down { u16::from(b'j') } else { 0 },
                 control_key_state: 0,
             })
+    }
+
+    fn physical_j(kind: KeyEventKind, key_down: bool) -> crate::input::TerminalKey {
+        physical_j_with_scan(0x24, kind, key_down)
+    }
+
+    fn semantic_j(kind: KeyEventKind) -> crate::input::TerminalKey {
+        crate::input::TerminalKey::new(KeyCode::Char('j'), KeyModifiers::empty()).with_kind(kind)
     }
 
     const OMP_REPLY_SCROLLBACK: &[u8] = b"\x1b]133;A;aid=omp-response-client-run:reply-1\x07reply one\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07\r\n\
@@ -1974,7 +2416,6 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             LOCAL_OMP_MOUSE_SCROLL_LINES,
         );
         renderer.latest_launch_id = 1;
-        renderer.attempted_launches.insert(1);
         renderer.local_selected = true;
         renderer.target = Some(LocalTarget {
             launch_id: 1,
@@ -2001,6 +2442,24 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             fallback_confirmed: false,
         });
         (renderer, events_tx, pane_id)
+    }
+
+    fn collect_sent_input_events(
+        renderer: &mut ClientOmpRenderer,
+        mut messages: Vec<ClientMessage>,
+    ) -> Vec<ClientInputEvent> {
+        let mut events = Vec::new();
+        loop {
+            for message in messages {
+                if let ClientMessage::InputEvents { events: sent } = message {
+                    events.extend(sent);
+                }
+            }
+            messages = renderer.flush_post_send_input();
+            if messages.is_empty() {
+                return events;
+            }
+        }
     }
 
     fn deactivate_renderer_surface(renderer: &mut ClientOmpRenderer) {
@@ -2311,13 +2770,13 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.clone(),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
                 physical_bare_up_release(),
             )])
             .is_empty());
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
         assert!(input.try_recv().is_err());
 
         renderer
@@ -2360,7 +2819,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.clone(),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
         renderer
             .target
             .as_ref()
@@ -2374,14 +2833,14 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.clone().with_kind(KeyEventKind::Repeat),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
         assert!(input.try_recv().is_err());
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
                 option_up.with_kind(KeyEventKind::Release),
             )])
             .is_empty());
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
         assert!(input.try_recv().is_err());
     }
 
@@ -2393,25 +2852,85 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
         let option_up = physical_option_up();
         renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(option_up.clone())]);
-
         let messages = renderer.route_input(vec![
             crate::raw_input::RawInputEvent::Key(option_up.clone().with_kind(KeyEventKind::Repeat)),
             crate::raw_input::RawInputEvent::Key(physical_bare_up_release()),
         ]);
 
+        let events = collect_sent_input_events(&mut renderer, messages);
         assert!(matches!(
-            messages.as_slice(),
-            [ClientMessage::InputEvents { events }]
-                if matches!(
-                    events.as_slice(),
-                    [
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
-                    ]
-                )
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Repeat,
+                    ..
+                },
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }
+            ]
         ));
         assert!(renderer.server_forwarded_presses.is_empty());
         assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_activation_keeps_existing_semantic_server_key_lifecycle_on_server() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(semantic_j(
+            KeyEventKind::Press,
+        ))]);
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(semantic_j(KeyEventKind::Repeat)),
+            crate::raw_input::RawInputEvent::Key(semantic_j(KeyEventKind::Release)),
+        ]);
+
+        let events = collect_sent_input_events(&mut renderer, messages);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Repeat,
+                    ..
+                },
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }
+            ]
+        ));
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_omp_promotion_routes_a_fresh_semantic_press_to_the_local_owner() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(semantic_j(
+            KeyEventKind::Press,
+        ))]);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))])
+            .is_empty());
+        assert!(!input
+            .try_recv()
+            .expect("fresh semantic Press reaches local OMP")
+            .is_empty());
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(renderer
+            .local_physical_presses
+            .owns_key(&semantic_j(KeyEventKind::Press)));
     }
 
     #[tokio::test]
@@ -2450,16 +2969,19 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true)),
             crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
         ]);
+        let events = collect_sent_input_events(&mut renderer, messages);
         assert!(matches!(
-            messages.as_slice(),
-            [ClientMessage::InputEvents { events }]
-                if matches!(
-                    events.as_slice(),
-                    [
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
-                    ]
-                )
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Repeat,
+                    ..
+                },
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }
+            ]
         ));
         assert!(renderer.server_forwarded_presses.is_empty());
         assert!(input.try_recv().is_err());
@@ -2507,20 +3029,57 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
 
         renderer.resolve_promotion(false, 0);
         let messages = renderer.take_outbound_messages();
+        let events = collect_sent_input_events(&mut renderer, messages);
         assert!(matches!(
-            messages.as_slice(),
-            [ClientMessage::InputEvents { events }]
-                if matches!(
-                    events.as_slice(),
-                    [
-                        ClientInputEvent::Key {
-                            kind: crate::protocol::ClientKeyKind::Press,
-                            ..
-                        },
-                        ClientInputEvent::FocusLost,
-                    ]
-                )
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    ..
+                },
+                ClientInputEvent::FocusLost,
+            ]
         ));
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(!renderer.server_forwarded_overflow);
+    }
+
+    #[tokio::test]
+    async fn deferred_focus_loss_releases_local_physical_owner_before_server_handoff() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
+            .is_empty());
+        assert!(!input.try_recv().expect("ordinary key press").is_empty());
+        renderer.awaiting_promotion = true;
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost])
+            .is_empty());
+        assert!(input.try_recv().is_err());
+
+        renderer.resolve_promotion(false, 0);
+
+        assert!(!input
+            .try_recv()
+            .expect("synthetic local key release")
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("local focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
+        assert!(matches!(
+            renderer.take_outbound_messages().as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert!(!renderer.local_physical_presses.owns_input());
     }
 
     #[tokio::test]
@@ -2549,10 +3108,14 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
         ));
         assert_eq!(
+            input.try_recv().expect("synthetic owner release"),
+            Bytes::from_static(b"\x1b[1;3:3A")
+        );
+        assert_eq!(
             input.try_recv().expect("local owner focus loss"),
             Bytes::from_static(b"\x1b[O")
         );
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
     }
 
     #[test]
@@ -2594,19 +3157,20 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn local_omp_inactive_surface_clears_owned_keys_on_binding_loss() {
-        let (runtime, _input) =
+    async fn local_omp_binding_loss_releases_owned_keys_and_tombstones_late_release() {
+        let (runtime, mut input) =
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
-        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
 
         assert!(renderer
-            .route_input(vec![crate::raw_input::RawInputEvent::Key(
-                physical_option_up(),
-            )])
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
             .is_empty());
+        assert!(!input.try_recv().expect("ordinary key press").is_empty());
         deactivate_renderer_surface(&mut renderer);
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
 
         let target = renderer.target.as_ref().expect("local target");
         let target_app_client_id = target.target_app_client_id;
@@ -2624,8 +3188,26 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             0,
         );
 
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
-        assert!(!renderer.owns_input());
+        assert!(!input
+            .try_recv()
+            .expect("synthetic owner release")
+            .is_empty());
+        assert!(renderer.owns_input());
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+            assert!(renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                    kind, false,
+                ))])
+                .is_empty());
+        }
+        assert!(input.try_recv().is_err());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Release,
+                false,
+            ))])
+            .is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
     }
 
     #[tokio::test]
@@ -2641,7 +3223,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.clone(),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
         assert_eq!(
             input.try_recv().expect("fallthrough Option-Up press"),
             Bytes::from_static(b"\x1b[1;3:1A")
@@ -2659,7 +3241,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.clone().with_kind(KeyEventKind::Repeat),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
         assert_eq!(
             input.try_recv().expect("fallthrough Option-Up repeat"),
             Bytes::from_static(b"\x1b[1;3:2A")
@@ -2669,7 +3251,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.with_kind(KeyEventKind::Release),
             )])
             .is_empty());
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
         assert_eq!(
             input.try_recv().expect("fallthrough Option-Up release"),
             Bytes::from_static(b"\x1b[1;3:3A")
@@ -2682,28 +3264,45 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
         runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.target.as_mut().expect("local target").size = (40, 4, 10, 20);
+        let option_up = physical_option_up();
 
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
-                physical_option_up(),
+                option_up.clone(),
             )])
             .is_empty());
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
 
-        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
-            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-        )]);
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            )),
+            crate::raw_input::RawInputEvent::Key(option_up.with_kind(KeyEventKind::Repeat)),
+        ]);
         assert!(matches!(
             messages.as_slice(),
             [ClientMessage::InputEvents { .. }]
         ));
-        assert_eq!(renderer.omp_reply_navigation_presses.len(), 1);
+        assert_eq!(renderer.local_physical_presses.len(), 1);
+        assert!(!renderer.awaiting_promotion);
+        assert!(renderer.flush_post_send_input().is_empty());
+        assert!(renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .expect("local runtime")
+            .visible_text()
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_end().starts_with("reply two")));
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
                 physical_bare_up_release(),
             )])
             .is_empty());
-        assert!(renderer.omp_reply_navigation_presses.is_empty());
+        assert!(!renderer.local_physical_presses.owns_input());
     }
 
     #[tokio::test]
@@ -2740,6 +3339,114 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             Bytes::from_static(b"\x1b[1;1:3A")
         );
         assert!(renderer.omp_reply_navigation_presses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_omp_prefix_handoff_keeps_ordinary_physical_key_lifecycle_local() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
+            .is_empty());
+        assert!(!input.try_recv().expect("ordinary key press").is_empty());
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        )]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { .. }]
+        ));
+
+        assert!(renderer
+            .route_input(vec![
+                crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true)),
+                crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+            ])
+            .is_empty());
+        assert!(!input.try_recv().expect("ordinary key repeat").is_empty());
+        assert!(!input.try_recv().expect("ordinary key release").is_empty());
+        assert!(renderer.local_physical_presses.len() == 0);
+    }
+
+    #[tokio::test]
+    async fn local_omp_prefix_handoff_keeps_ordinary_semantic_key_lifecycle_local() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))])
+            .is_empty());
+        assert!(!input.try_recv().expect("semantic key press").is_empty());
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        )]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { .. }]
+        ));
+
+        assert!(renderer
+            .route_input(vec![
+                crate::raw_input::RawInputEvent::Key(semantic_j(KeyEventKind::Repeat)),
+                crate::raw_input::RawInputEvent::Key(semantic_j(KeyEventKind::Release)),
+            ])
+            .is_empty());
+        assert!(!input.try_recv().expect("semantic key repeat").is_empty());
+        assert!(!input.try_recv().expect("semantic key release").is_empty());
+        assert_eq!(renderer.local_physical_presses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_omp_prefix_handoff_routes_a_fresh_semantic_press_to_server() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(semantic_j(
+                KeyEventKind::Press,
+            ))])
+            .is_empty());
+        assert!(!input.try_recv().expect("first semantic Press").is_empty());
+        let prefix_messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        )]);
+        assert!(matches!(
+            prefix_messages.as_slice(),
+            [ClientMessage::InputEvents { .. }]
+        ));
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Key(
+            semantic_j(KeyEventKind::Press),
+        )]);
+        let events = collect_sent_input_events(&mut renderer, messages);
+        assert!(matches!(
+            events.as_slice(),
+            [ClientInputEvent::Key {
+                kind: crate::protocol::ClientKeyKind::Press,
+                ..
+            }]
+        ));
+        assert!(input.try_recv().is_err());
+        assert!(!renderer
+            .local_physical_presses
+            .owns_key(&semantic_j(KeyEventKind::Press)));
+        assert!(renderer
+            .server_forwarded_presses
+            .contains(&semantic_j(KeyEventKind::Press).identity()));
     }
 
     #[tokio::test]
@@ -2938,7 +3645,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
 
         assert!(renderer
             .route_input(vec![crate::raw_input::RawInputEvent::Key(
-                option_up.with_kind(KeyEventKind::Release),
+                option_up.clone().with_kind(KeyEventKind::Release),
             )])
             .is_empty());
         assert_eq!(
@@ -2959,11 +3666,213 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 .offset_from_bottom,
             offset
         );
+        local_runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(option_up)])
+            .is_empty());
+        assert_eq!(
+            input
+                .try_recv()
+                .expect("pre-focus semantic Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost])
+            .is_empty());
+        assert_eq!(
+            input
+                .try_recv()
+                .expect("synthetic semantic Option-Up release"),
+            Bytes::from_static(b"\x1b[1;3:3A")
+        );
+        assert_eq!(
+            input.try_recv().expect("native semantic focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
     }
 
     #[tokio::test]
-    async fn local_omp_focus_loss_clears_consumed_option_release_before_alternate_screen_fallthrough(
-    ) {
+    async fn local_semantic_owner_release_write_failure_closes_the_lifecycle() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1049h\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let option_up = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.clone()
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("semantic Option-Up press"),
+            Bytes::from_static(b"\x1b[1;3:1A")
+        );
+        drop(input);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                option_up.with_kind(KeyEventKind::Release),
+            )])
+            .is_empty());
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert_eq!(renderer.omp_reply_navigation_presses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_physical_owner_release_write_failure_closes_the_lifecycle() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("physical j press"),
+            Bytes::from_static(b"j")
+        );
+        drop(input);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Release,
+                false,
+            ))])
+            .is_empty());
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.take_outbound_messages().is_empty());
+        assert_eq!(renderer.local_physical_presses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_focus_release_write_failure_fails_target_and_forwards_focus_to_server() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("pre-focus physical press"),
+            Bytes::from_static(b"j")
+        );
+        drop(input);
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.target.as_ref().is_some_and(|target| target.failed));
+        assert_eq!(renderer.local_physical_presses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_focus_write_failure_without_held_keys_falls_back_to_server() {
+        let (runtime, input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        drop(input);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert!(renderer.awaiting_fallback);
+        assert!(renderer.target.as_ref().is_some_and(|target| target.failed));
+    }
+
+    #[tokio::test]
+    async fn local_physical_capacity_releases_oldest_press_and_keeps_input_live() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 1024);
+        runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+
+        for scan_code in 1..=256 {
+            assert!(renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                    physical_j_with_scan(scan_code, KeyEventKind::Press, true),
+                )])
+                .is_empty());
+        }
+        for _ in 0..256 {
+            assert_eq!(
+                input.try_recv().expect("forwarded physical key press"),
+                Bytes::from_static(b"j")
+            );
+        }
+        let before = renderer
+            .target
+            .as_ref()
+            .and_then(|target| target.runtime.as_ref())
+            .and_then(TerminalRuntime::scroll_metrics)
+            .expect("local scroll metrics")
+            .offset_from_bottom;
+        let option_up = crate::input::TerminalKey::new(KeyCode::Up, KeyModifiers::ALT)
+            .with_windows_record(crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: 0x26,
+                virtual_scan_code: 257,
+                unicode: 0,
+                control_key_state: 0x0102,
+            });
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(option_up)])
+            .is_empty());
+        assert_ne!(
+            renderer
+                .target
+                .as_ref()
+                .and_then(|target| target.runtime.as_ref())
+                .and_then(TerminalRuntime::scroll_metrics)
+                .expect("local scroll metrics")
+                .offset_from_bottom,
+            before
+        );
+        assert!(!input
+            .try_recv()
+            .expect("synthetic release for the oldest press")
+            .is_empty());
+        assert!(input.try_recv().is_err());
+        assert_eq!(renderer.local_physical_presses.len(), 256);
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("still-live"),
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("input after capacity eviction"),
+            Bytes::from_static(b"still-live")
+        );
+
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::OuterFocusLost])
+            .is_empty());
+        assert_eq!(renderer.local_physical_presses.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_omp_focus_loss_suppresses_late_consumed_option_release() {
         let (runtime, mut input) =
             TerminalRuntime::test_with_channel_and_scrollback_bytes(40, 4, 16 * 1024, &[], 8);
         runtime.test_process_pty_bytes(OMP_REPLY_SCROLLBACK);
@@ -2990,16 +3899,11 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 option_up.with_kind(KeyEventKind::Release),
             )])
             .is_empty());
-        assert_eq!(
-            input
-                .try_recv()
-                .expect("fallthrough Option-Up release after focus reset"),
-            Bytes::from_static(b"\x1b[1;3:3A")
-        );
+        assert!(input.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn prefix_command_batch_waits_for_authoritative_local_restore() {
+    async fn prefix_command_batch_sends_prefix_before_the_command() {
         let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
         let messages = renderer.route_input(vec![
@@ -3012,15 +3916,268 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 KeyModifiers::empty(),
             )),
         ]);
+        let sent = collect_sent_input_events(&mut renderer, messages);
         assert!(matches!(
-            messages.as_slice(),
+            sent.as_slice(),
             [
-                ClientMessage::InputEvents { events: prefix },
-                ClientMessage::InputEvents { events: command }
-            ] if prefix.len() == 1 && command.len() == 1
+                ClientInputEvent::Key {
+                    code: ClientKeyCode::Char('b'),
+                    ..
+                },
+                ClientInputEvent::Key {
+                    code: ClientKeyCode::Char('n'),
+                    ..
+                }
+            ]
         ));
         assert!(renderer.server_owned_input);
         assert!(renderer.local_selected);
+    }
+
+    #[tokio::test]
+    async fn deferred_replay_preserves_two_batch_fifo_across_a_send_barrier() {
+        for local_active in [Some(true), Some(false), None] {
+            let (runtime, mut input) =
+                TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, &[], 8);
+            runtime.test_process_pty_bytes(b"\x1b[>3u");
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            let local_key = physical_j_with_scan(0x25, KeyEventKind::Press, true);
+            assert!(renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                    local_key.clone(),
+                )])
+                .is_empty());
+            assert_eq!(
+                input.try_recv().expect("initial local press"),
+                Bytes::from_static(b"j")
+            );
+            let prefix = client_event_from_raw(&crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            ))
+            .expect("prefix protocol event");
+            let repeat = client_event_from_raw(&crate::raw_input::RawInputEvent::Key(
+                local_key.with_kind(KeyEventKind::Repeat),
+            ))
+            .expect("repeat protocol event");
+            let later = ClientInputEvent::TextCommit("later".to_owned());
+            renderer.awaiting_promotion = local_active.is_some();
+            renderer.awaiting_fallback = local_active.is_none();
+            renderer.deferred_messages = vec![
+                DeferredMessage::InputEvents {
+                    events: vec![prefix.clone(), repeat],
+                    generation: 0,
+                },
+                DeferredMessage::InputEvents {
+                    events: vec![later.clone()],
+                    generation: 0,
+                },
+            ];
+
+            match local_active {
+                Some(local_active) => renderer.resolve_promotion(local_active, 0),
+                None => renderer.release_deferred_messages(),
+            }
+            let prefix_messages = renderer.take_outbound_messages();
+            assert!(matches!(
+                prefix_messages.as_slice(),
+                [ClientMessage::InputEvents { events }] if events == &[prefix]
+            ));
+            assert!(input.try_recv().is_err());
+
+            let later_messages = renderer.flush_post_send_input();
+            assert!(matches!(
+                later_messages.as_slice(),
+                [ClientMessage::InputEvents { events }] if events == &[later]
+            ));
+            assert!(!input
+                .try_recv()
+                .expect("local repeat before later server batch")
+                .is_empty());
+            assert!(renderer.flush_post_send_input().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_ordinary_input_precedes_a_later_server_owned_key_lifecycle() {
+        for local_active in [Some(true), Some(false), None] {
+            let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 24);
+            let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+            renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(physical_j(
+                KeyEventKind::Press,
+                true,
+            ))]);
+            renderer.awaiting_promotion = local_active.is_some();
+            renderer.awaiting_fallback = local_active.is_none();
+
+            assert!(renderer
+                .route_input(vec![crate::raw_input::RawInputEvent::Text(
+                    crate::input::TextCommit::new("older"),
+                )])
+                .is_empty());
+            assert!(renderer
+                .route_input(vec![
+                    crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true,)),
+                    crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false,)),
+                ])
+                .is_empty());
+            assert!(input.try_recv().is_err());
+
+            match local_active {
+                Some(local_active) => renderer.resolve_promotion(local_active, 0),
+                None => renderer.release_deferred_messages(),
+            }
+            let messages = renderer.take_outbound_messages();
+            let sent = collect_sent_input_events(&mut renderer, messages);
+            if local_active == Some(true) {
+                assert_eq!(
+                    input.try_recv().expect("older local text"),
+                    Bytes::from_static(b"older")
+                );
+                assert!(matches!(
+                    sent.as_slice(),
+                    [
+                        ClientInputEvent::Key {
+                            kind: crate::protocol::ClientKeyKind::Repeat,
+                            ..
+                        },
+                        ClientInputEvent::Key {
+                            kind: crate::protocol::ClientKeyKind::Release,
+                            ..
+                        }
+                    ]
+                ));
+            } else {
+                assert!(matches!(
+                    sent.as_slice(),
+                    [
+                        ClientInputEvent::TextCommit(text),
+                        ClientInputEvent::Key {
+                            kind: crate::protocol::ClientKeyKind::Repeat,
+                            ..
+                        },
+                        ClientInputEvent::Key {
+                            kind: crate::protocol::ClientKeyKind::Release,
+                            ..
+                        }
+                    ] if text == "older"
+                ));
+                assert!(input.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_release_is_sent_before_a_later_new_local_press() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(physical_j(
+            KeyEventKind::Press,
+            true,
+        ))]);
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+            crate::raw_input::RawInputEvent::Key(physical_j_with_scan(
+                0x25,
+                KeyEventKind::Press,
+                true,
+            )),
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }])
+        ));
+        assert!(input.try_recv().is_err());
+        assert!(renderer.flush_post_send_input().is_empty());
+        assert_eq!(
+            input.try_recv().expect("post-send local press"),
+            Bytes::from_static(b"j")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_send_precedes_local_repeat_release_and_server_focus() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h\x1b[>3u");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let local_key = physical_j_with_scan(0x25, KeyEventKind::Press, true);
+        assert!(renderer
+            .route_input(vec![crate::raw_input::RawInputEvent::Key(
+                local_key.clone(),
+            )])
+            .is_empty());
+        assert_eq!(
+            input.try_recv().expect("initial local press"),
+            Bytes::from_static(b"j")
+        );
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            )),
+            crate::raw_input::RawInputEvent::Key(local_key.clone().with_kind(KeyEventKind::Repeat)),
+            crate::raw_input::RawInputEvent::Key(local_key.with_kind(KeyEventKind::Release)),
+            crate::raw_input::RawInputEvent::OuterFocusLost,
+        ]);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }] if events.len() == 1
+        ));
+        assert!(input.try_recv().is_err());
+
+        let focus = renderer.flush_post_send_input();
+        assert!(matches!(
+            focus.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::FocusLost])
+        ));
+        assert!(!input.try_recv().expect("post-send local repeat").is_empty());
+        assert!(!input
+            .try_recv()
+            .expect("post-send local release")
+            .is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn server_release_is_sent_before_a_later_local_focus_loss() {
+        let (runtime, mut input) =
+            TerminalRuntime::test_with_channel_and_scrollback_bytes(80, 24, 0, &[], 8);
+        runtime.test_process_pty_bytes(b"\x1b[?1004h");
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        renderer.observe_server_input(&[crate::raw_input::RawInputEvent::Key(physical_j(
+            KeyEventKind::Press,
+            true,
+        ))]);
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+            crate::raw_input::RawInputEvent::OuterFocusLost,
+        ]);
+        assert!(matches!(
+            messages.as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }])
+        ));
+        assert!(input.try_recv().is_err());
+
+        assert!(renderer.flush_post_send_input().is_empty());
+        assert_eq!(
+            input.try_recv().expect("post-send local focus loss"),
+            Bytes::from_static(b"\x1b[O")
+        );
     }
 
     #[tokio::test]
@@ -3099,6 +4256,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 ..
             }] if produced == url
         ));
+        assert!(collect_sent_input_events(&mut renderer, queued).is_empty());
 
         renderer.resolve_link_activation(1, 2, false, 0);
         assert!(renderer.take_outbound_messages().is_empty());
@@ -3191,6 +4349,145 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
+    async fn target_withdrawal_flushes_current_non_pointer_input_in_order() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let pointer = ClientInputEvent::Mouse {
+            kind: ClientMouseKind::Moved,
+            column: 1,
+            row: 1,
+            modifiers: 0,
+        };
+        let key = client_event_from_raw(&crate::raw_input::RawInputEvent::Key(physical_j(
+            KeyEventKind::Press,
+            true,
+        )))
+        .expect("physical key protocol event");
+        let paste = ClientInputEvent::Paste {
+            text: "queued".to_owned(),
+        };
+        let text = ClientInputEvent::TextCommit("deferred".to_owned());
+        let already_queued = ClientInputEvent::TextCommit("outbound".to_owned());
+        renderer.outbound_messages.extend([
+            ClientMessage::InputEvents {
+                events: vec![already_queued.clone()],
+            },
+            ClientMessage::OmpRendererReady { launch_id: 1 },
+        ]);
+
+        renderer.pending_link_request_id = Some(1);
+        renderer.pending_link_click = true;
+        renderer.pending_link_input = Some(LinkInput::Events {
+            events: vec![pointer.clone(), key.clone()],
+            generation: 7,
+        });
+        renderer.queued_link_inputs.push(LinkInput::Events {
+            events: vec![paste.clone()],
+            generation: 7,
+        });
+        renderer
+            .deferred_messages
+            .push(DeferredMessage::InputEvents {
+                events: vec![pointer, text.clone()],
+                generation: 7,
+            });
+        renderer
+            .deferred_messages
+            .push(DeferredMessage::InputPixels {
+                data: vec![1, 2, 3],
+                geometry: crate::input::mouse::HostGeometry::new(80, 24, 800, 480)
+                    .expect("valid geometry"),
+                generation: 7,
+            });
+
+        renderer.apply_target(1, 2, None, false, false, test_prefix(), (80, 24, 0, 0), 7);
+
+        let flushed_messages = renderer.take_outbound_messages();
+        assert!(flushed_messages
+            .iter()
+            .all(|message| matches!(message, ClientMessage::InputEvents { .. })));
+        let flushed = collect_sent_input_events(&mut renderer, flushed_messages);
+        assert_eq!(flushed, vec![already_queued, key, paste, text]);
+        assert!(renderer.pending_link_input.is_none());
+        assert!(renderer.queued_link_inputs.is_empty());
+        assert!(renderer.deferred_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_route_unbind_flushes_pending_input_and_tracks_server_key_lifecycle() {
+        let (runtime, mut input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let press = physical_j(KeyEventKind::Press, true);
+        let protocol_press =
+            client_event_from_raw(&crate::raw_input::RawInputEvent::Key(press.clone()))
+                .expect("physical key protocol event");
+        let paste = ClientInputEvent::Paste {
+            text: "queued".to_owned(),
+        };
+        let text = ClientInputEvent::TextCommit("deferred".to_owned());
+        renderer.pending_link_request_id = Some(1);
+        renderer.pending_link_input = Some(LinkInput::Events {
+            events: vec![protocol_press.clone()],
+            generation: 4,
+        });
+        renderer.queued_link_inputs.push(LinkInput::Events {
+            events: vec![paste.clone()],
+            generation: 4,
+        });
+        renderer
+            .deferred_messages
+            .push(DeferredMessage::InputEvents {
+                events: vec![text.clone()],
+                generation: 4,
+            });
+
+        let target = renderer.target.as_ref().expect("local target");
+        let target_app_client_id = target.target_app_client_id;
+        let route = target.route.clone();
+        let prefix = target.prefix.clone();
+        let size = target.size;
+        renderer.apply_target(
+            1,
+            target_app_client_id,
+            Some(route),
+            false,
+            false,
+            prefix,
+            size,
+            4,
+        );
+
+        let messages = renderer.take_outbound_messages();
+        let flushed = collect_sent_input_events(&mut renderer, messages);
+        assert_eq!(flushed, vec![protocol_press, paste, text]);
+        assert_eq!(renderer.server_forwarded_presses.len(), 1);
+        assert!(renderer.pending_link_input.is_none());
+        assert!(renderer.queued_link_inputs.is_empty());
+        assert!(renderer.deferred_messages.is_empty());
+
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true)),
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+        ]);
+        let events = collect_sent_input_events(&mut renderer, messages);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Repeat,
+                    ..
+                },
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                },
+            ]
+        ));
+        assert!(renderer.server_forwarded_presses.is_empty());
+        assert!(input.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn native_link_queue_overflow_enters_fallback_without_dropping_input() {
         let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
@@ -3251,6 +4548,58 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         assert!(renderer.awaiting_fallback);
         assert!(renderer.pending_link_input.is_none());
         assert!(renderer.deferred_messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn pending_input_item_budget_falls_back_without_dropping_ordinary_input() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let queued = ClientInputEvent::TextCommit("queued".to_owned());
+        renderer.awaiting_promotion = true;
+        renderer
+            .deferred_messages
+            .push(DeferredMessage::InputEvents {
+                events: vec![queued.clone(); MAX_PENDING_INPUT_EVENTS],
+                generation: 0,
+            });
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Text(
+            crate::input::TextCommit::new("current"),
+        )]);
+        let sent = collect_sent_input_events(&mut renderer, messages);
+        assert_eq!(sent.len(), MAX_PENDING_INPUT_EVENTS + 1);
+        assert_eq!(sent.first(), Some(&queued));
+        assert_eq!(
+            sent.last(),
+            Some(&ClientInputEvent::TextCommit("current".to_owned()))
+        );
+        assert_eq!(renderer.pending_input_usage(), (0, 0));
+        assert!(renderer.target.as_ref().is_some_and(|target| target.failed));
+    }
+
+    #[tokio::test]
+    async fn pending_input_payload_budget_falls_back_without_dropping_ordinary_input() {
+        let (runtime, _input) = TerminalRuntime::test_with_channel(80, 24);
+        let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
+        let queued = ClientInputEvent::Paste {
+            text: "x".repeat(MAX_PENDING_INPUT_PAYLOAD_BYTES),
+        };
+        renderer.pending_link_request_id = Some(1);
+        renderer.pending_link_input = Some(LinkInput::Events {
+            events: vec![queued.clone()],
+            generation: 0,
+        });
+
+        let messages = renderer.route_input(vec![crate::raw_input::RawInputEvent::Text(
+            crate::input::TextCommit::new("current"),
+        )]);
+        let sent = collect_sent_input_events(&mut renderer, messages);
+        assert_eq!(
+            sent,
+            vec![queued, ClientInputEvent::TextCommit("current".to_owned())]
+        );
+        assert_eq!(renderer.pending_input_usage(), (0, 0));
+        assert!(renderer.target.as_ref().is_some_and(|target| target.failed));
     }
 
     #[tokio::test]
@@ -3930,27 +5279,23 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
                 }])
         ));
         assert_eq!(renderer.server_forwarded_presses.len(), 1);
+        let messages = renderer.route_input(vec![
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Repeat, true)),
+            crate::raw_input::RawInputEvent::Key(physical_j(KeyEventKind::Release, false)),
+        ]);
+        let events = collect_sent_input_events(&mut renderer, messages);
         assert!(matches!(
-            renderer
-                .route_input(vec![
-                    crate::raw_input::RawInputEvent::Key(physical_j(
-                        KeyEventKind::Repeat,
-                        true,
-                    )),
-                    crate::raw_input::RawInputEvent::Key(physical_j(
-                        KeyEventKind::Release,
-                        false,
-                    )),
-                ])
-                .as_slice(),
-            [ClientMessage::InputEvents { events }]
-                if matches!(
-                    events.as_slice(),
-                    [
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Repeat, .. },
-                        ClientInputEvent::Key { kind: crate::protocol::ClientKeyKind::Release, .. }
-                    ]
-                )
+            events.as_slice(),
+            [
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Repeat,
+                    ..
+                },
+                ClientInputEvent::Key {
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    ..
+                }
+            ]
         ));
         assert!(renderer.server_forwarded_presses.is_empty());
     }
@@ -4230,10 +5575,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         assert!(renderer.target.as_ref().unwrap().promoted);
         assert!(matches!(
             renderer.take_outbound_messages().as_slice(),
-            [
-                ClientMessage::InputEvents { events: input },
-                ClientMessage::InputPixels { .. }
-            ] if input.len() == 1
+            [ClientMessage::InputEvents { events: input }] if input.len() == 1
         ));
         events
             .try_send(AppEvent::TerminalBell { pane_id, count: 1 })
@@ -4268,7 +5610,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn failed_pixel_write_waits_for_server_fallback_before_replay() {
+    async fn failed_pixel_write_drops_pointer_input_during_server_fallback() {
         let (runtime, input) = TerminalRuntime::test_with_channel(80, 24);
         runtime.resize(24, 80, 10, 20);
         runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h");
@@ -4289,16 +5631,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
         assert!(renderer.take_outbound_messages().is_empty());
         renderer.apply_target(1, 2, Some(route), false, false, prefix, (80, 24, 10, 20), 0);
         assert!(!renderer.awaiting_fallback);
-        assert!(matches!(
-            renderer.take_outbound_messages().as_slice(),
-            [ClientMessage::InputPixels {
-                data: replayed,
-                cols: 80,
-                rows: 24,
-                width_px: 800,
-                height_px: 480,
-            }] if replayed == &data
-        ));
+        assert!(renderer.take_outbound_messages().is_empty());
     }
 
     #[tokio::test]
@@ -4364,7 +5697,7 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
     }
 
     #[tokio::test]
-    async fn replacement_launch_discards_deferred_input() {
+    async fn replacement_launch_forwards_deferred_non_pointer_input() {
         let (runtime, input) = TerminalRuntime::test_with_channel(80, 24);
         drop(input);
         let (mut renderer, _events, _) = active_renderer(runtime, test_prefix());
@@ -4374,10 +5707,14 @@ tail one\r\ntail two\r\ntail three\r\ntail four\r\n";
             )])
             .is_empty());
         assert!(renderer.awaiting_fallback);
-        renderer.apply_target(2, 2, None, false, false, test_prefix(), (80, 24, 0, 0), 0);
+        renderer.apply_target(2, 2, None, false, false, test_prefix(), (80, 24, 0, 0), 1);
         assert!(!renderer.awaiting_fallback);
         assert!(renderer.deferred_messages.is_empty());
-        assert!(renderer.take_outbound_messages().is_empty());
+        assert!(matches!(
+            renderer.take_outbound_messages().as_slice(),
+            [ClientMessage::InputEvents { events }]
+                if matches!(events.as_slice(), [ClientInputEvent::Key { .. }])
+        ));
     }
 
     #[tokio::test]

@@ -774,6 +774,12 @@ pub(crate) struct ClientConnection {
     pub(crate) identity: Option<AppIdentity>,
     /// Standalone server-owned OMP guest PTY scoped to this App connection.
     pub(crate) private_omp_guest: Option<crate::server::omp_private_renderer::PrivateOmpGuest>,
+    /// Physical key lifecycles that started in this client's private OMP guest.
+    pub(crate) private_omp_physical_presses:
+        std::sync::Mutex<crate::terminal::OmpPhysicalKeyPresses>,
+    /// Semantic reply-navigation lifecycles that must survive private guest replacement.
+    pub(crate) private_omp_reply_navigation_presses:
+        std::sync::Mutex<crate::terminal::OmpReplyNavigationPresses>,
 }
 
 impl ClientConnection {
@@ -837,6 +843,12 @@ impl ClientConnection {
             omp_renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             omp_renderer_target: None,
             private_omp_guest: None,
+            private_omp_physical_presses: std::sync::Mutex::new(
+                crate::terminal::OmpPhysicalKeyPresses::default(),
+            ),
+            private_omp_reply_navigation_presses: std::sync::Mutex::new(
+                crate::terminal::OmpReplyNavigationPresses::default(),
+            ),
             terminal_size,
             cell_size,
             host_terminal_appearance: host_terminal_theme

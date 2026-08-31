@@ -1,7 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::{InputSourceId, TerminalInputContext, TerminalInputTarget};
 use crate::input::{KeyIdentity, TerminalKey};
+
+const MAX_INPUT_LEASES_PER_SOURCE: usize = 256;
+const MAX_INPUT_LEASES_TOTAL: usize = 4096;
+pub(crate) const MAX_INPUT_SOURCES: usize = 4097;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct InputLeaseKey {
@@ -58,9 +62,59 @@ pub(crate) enum RepeatPlan {
 #[derive(Default)]
 pub(crate) struct InputLeaseTable {
     leases: HashMap<InputLeaseKey, InputLease>,
+    overflowed_sources: HashSet<InputSourceId>,
 }
 
 impl InputLeaseTable {
+    pub(crate) fn source_overflowed(&self, source_id: InputSourceId) -> bool {
+        self.overflowed_sources.contains(&source_id)
+    }
+
+    pub(crate) fn source_suppressed(&self, source_id: InputSourceId) -> bool {
+        self.source_overflowed(source_id) || self.overflowed_sources.len() >= MAX_INPUT_SOURCES
+    }
+
+    pub(crate) fn suppress_key(&self, lease_key: &InputLeaseKey) -> bool {
+        self.source_overflowed(lease_key.source_id)
+            || (self.overflowed_sources.len() >= MAX_INPUT_SOURCES
+                && !self.leases.contains_key(lease_key))
+    }
+
+    pub(crate) fn prepare_press(
+        &mut self,
+        lease_key: &InputLeaseKey,
+    ) -> Option<Vec<ForwardedInputLease>> {
+        if self.leases.contains_key(lease_key) {
+            return None;
+        }
+        if self.source_suppressed(lease_key.source_id) {
+            return Some(Vec::new());
+        }
+        let source_len = self
+            .leases
+            .keys()
+            .filter(|key| key.source_id == lease_key.source_id)
+            .count();
+        if source_len < MAX_INPUT_LEASES_PER_SOURCE && self.leases.len() < MAX_INPUT_LEASES_TOTAL {
+            return None;
+        }
+        let releases = self.remove_source_leases(lease_key.source_id);
+        let inserted = self.overflowed_sources.insert(lease_key.source_id);
+        debug_assert!(inserted && self.overflowed_sources.len() <= MAX_INPUT_SOURCES);
+        Some(releases)
+    }
+
+    fn insertion_allowed(&self, key: &InputLeaseKey) -> bool {
+        self.leases.contains_key(key)
+            || (!self.source_suppressed(key.source_id)
+                && self.leases.len() < MAX_INPUT_LEASES_TOTAL
+                && self
+                    .leases
+                    .keys()
+                    .filter(|existing| existing.source_id == key.source_id)
+                    .count()
+                    < MAX_INPUT_LEASES_PER_SOURCE)
+    }
     pub(crate) fn normalize_press(
         &mut self,
         lease_key: &InputLeaseKey,
@@ -142,43 +196,38 @@ impl InputLeaseTable {
         current_context: Option<&TerminalInputContext>,
     ) -> RepeatPlan {
         match self.leases.get(&lease_key) {
-            Some(InputLease::Forwarded(lease)) => {
-                return RepeatPlan::Forwarded(lease.target.clone());
-            }
+            Some(InputLease::Forwarded(lease)) => RepeatPlan::Forwarded(lease.target.clone()),
             Some(InputLease::Consumed(ConsumedInputLease::OmpReplyNavigation(context)))
                 if current_context == Some(context) =>
             {
-                return RepeatPlan::OmpReplyNavigation(context.clone());
+                RepeatPlan::OmpReplyNavigation(context.clone())
             }
             Some(InputLease::Consumed(ConsumedInputLease::OmpReplyNavigation(_))) => {
                 self.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
-                return RepeatPlan::Ignore;
+                RepeatPlan::Ignore
             }
             Some(InputLease::Consumed(ConsumedInputLease::ReprocessRepeats(context)))
                 if current_context == Some(context) =>
             {
-                return RepeatPlan::Reprocess {
+                RepeatPlan::Reprocess {
                     context: context.clone(),
                     repetitions: key.repeat_count,
                     tracked: true,
-                };
+                }
             }
             Some(InputLease::Consumed(ConsumedInputLease::ReprocessRepeats(_))) => {
                 self.insert_consumed(lease_key, ConsumedInputLease::SuppressRepeats);
-                return RepeatPlan::Ignore;
+                RepeatPlan::Ignore
             }
-            Some(InputLease::Consumed(ConsumedInputLease::SuppressRepeats)) => {
-                return RepeatPlan::Ignore;
-            }
-            None => {}
-        }
-        match current_context {
-            Some(context) => RepeatPlan::Reprocess {
-                context: context.clone(),
-                repetitions: key.repeat_count,
-                tracked: false,
+            Some(InputLease::Consumed(ConsumedInputLease::SuppressRepeats)) => RepeatPlan::Ignore,
+            None => match current_context {
+                Some(context) => RepeatPlan::Reprocess {
+                    context: context.clone(),
+                    repetitions: key.repeat_count,
+                    tracked: false,
+                },
+                None => RepeatPlan::Ignore,
             },
-            None => RepeatPlan::Ignore,
         }
     }
 
@@ -213,6 +262,9 @@ impl InputLeaseTable {
         lease_key: &InputLeaseKey,
         key: &TerminalKey,
     ) -> bool {
+        if self.source_overflowed(lease_key.source_id) {
+            return true;
+        }
         if key.kind == crossterm::event::KeyEventKind::Press && !key.has_physical_identity() {
             self.leases.remove(lease_key);
             return false;
@@ -225,7 +277,10 @@ impl InputLeaseTable {
         key: InputLeaseKey,
         target: TerminalInputTarget,
         original: TerminalKey,
-    ) {
+    ) -> bool {
+        if !self.insertion_allowed(&key) {
+            return false;
+        }
         self.leases.insert(
             key,
             InputLease::Forwarded(ForwardedInputLease {
@@ -233,10 +288,19 @@ impl InputLeaseTable {
                 key: original,
             }),
         );
+        true
     }
 
-    pub(crate) fn insert_consumed(&mut self, key: InputLeaseKey, disposition: ConsumedInputLease) {
+    pub(crate) fn insert_consumed(
+        &mut self,
+        key: InputLeaseKey,
+        disposition: ConsumedInputLease,
+    ) -> bool {
+        if !self.insertion_allowed(&key) {
+            return false;
+        }
         self.leases.insert(key, InputLease::Consumed(disposition));
+        true
     }
 
     pub(crate) fn remove(&mut self, key: &InputLeaseKey) -> Option<InputLease> {
@@ -244,6 +308,11 @@ impl InputLeaseTable {
     }
 
     pub(crate) fn remove_source(&mut self, source_id: InputSourceId) -> Vec<ForwardedInputLease> {
+        self.overflowed_sources.remove(&source_id);
+        self.remove_source_leases(source_id)
+    }
+
+    fn remove_source_leases(&mut self, source_id: InputSourceId) -> Vec<ForwardedInputLease> {
         let keys = self
             .leases
             .keys()
@@ -265,7 +334,17 @@ impl InputLeaseTable {
                 InputLease::Forwarded(_) | InputLease::Consumed(_) => None,
             })
             .collect::<Vec<_>>();
-        self.remove_keys(keys)
+        let mut releases = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(InputLease::Forwarded(lease)) = self.leases.remove(&key) {
+                releases.push(lease);
+                self.leases.insert(
+                    key,
+                    InputLease::Consumed(ConsumedInputLease::SuppressRepeats),
+                );
+            }
+        }
+        releases
     }
 
     fn remove_keys(
@@ -282,7 +361,7 @@ impl InputLeaseTable {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.leases.is_empty()
+        self.leases.is_empty() && self.overflowed_sources.is_empty()
     }
 
     #[cfg(test)]
@@ -320,6 +399,18 @@ mod tests {
             })
     }
 
+    fn physical_key(scan_code: u16) -> TerminalKey {
+        TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: 0x58,
+                virtual_scan_code: scan_code,
+                unicode: u16::from(b'x'),
+                control_key_state: 0,
+            },
+        )
+    }
     #[test]
     fn remove_source_returns_forwarded_and_discards_consumed_leases() {
         let key = TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
@@ -347,8 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn remove_target_closes_only_forwarded_leases_for_that_terminal() {
-        let key = TerminalKey::new(KeyCode::Esc, KeyModifiers::empty());
+    fn remove_target_releases_forwarded_input_and_suppresses_until_physical_release() {
+        let key = physical_key(30);
         let removed_key = InputLeaseKey::new(7, &key);
         let retained_key = InputLeaseKey::new(8, &key);
         let removed_target = target();
@@ -361,11 +452,20 @@ mod tests {
             leases.remove_target(&removed_target),
             vec![ForwardedInputLease {
                 target: removed_target,
-                key,
+                key: key.clone(),
             }]
         );
-        assert_eq!(leases.len(), 1);
+        assert_eq!(leases.len(), 2);
+        assert!(leases.contains(&removed_key));
         assert!(leases.contains(&retained_key));
+        let repeated = leases.normalize_press(&removed_key, key);
+        assert_eq!(repeated.kind, crossterm::event::KeyEventKind::Repeat);
+        assert!(matches!(
+            leases.plan_repeat(removed_key, &repeated, None),
+            RepeatPlan::Ignore
+        ));
+        assert!(leases.remove_forwarded(&removed_key).is_none());
+        assert!(!leases.contains(&removed_key));
     }
 
     #[test]
@@ -592,5 +692,112 @@ mod tests {
             InputLeaseKey::new(7, &physical),
             InputLeaseKey::new(7, &semantic)
         );
+    }
+    #[test]
+    fn per_source_overflow_releases_forwarded_leases_and_quarantines_until_reset() {
+        let source_id = 7;
+        let target = target();
+        let mut leases = InputLeaseTable::default();
+        for scan_code in 1..=MAX_INPUT_LEASES_PER_SOURCE as u16 {
+            let key = physical_key(scan_code);
+            let lease_key = InputLeaseKey::new(source_id, &key);
+            assert!(leases.prepare_press(&lease_key).is_none());
+            assert!(leases.insert_forwarded(lease_key, target.clone(), key));
+        }
+
+        let overflow_key = physical_key(MAX_INPUT_LEASES_PER_SOURCE as u16 + 1);
+        let releases = leases
+            .prepare_press(&InputLeaseKey::new(source_id, &overflow_key))
+            .expect("source should overflow");
+        assert_eq!(releases.len(), MAX_INPUT_LEASES_PER_SOURCE);
+        assert_eq!(leases.len(), 0);
+        assert!(leases.source_overflowed(source_id));
+        assert!(leases
+            .prepare_press(&InputLeaseKey::new(source_id, &overflow_key))
+            .is_some());
+
+        assert!(leases.remove_source(source_id).is_empty());
+        assert!(!leases.source_overflowed(source_id));
+        assert!(leases
+            .prepare_press(&InputLeaseKey::new(source_id, &overflow_key))
+            .is_none());
+    }
+
+    #[test]
+    fn global_lease_bound_quarantines_only_the_overflowing_source() {
+        let mut leases = InputLeaseTable::default();
+        for source_id in 0..(MAX_INPUT_LEASES_TOTAL / MAX_INPUT_LEASES_PER_SOURCE) as u64 {
+            for scan_code in 1..=MAX_INPUT_LEASES_PER_SOURCE as u16 {
+                let key = physical_key(scan_code);
+                assert!(leases.insert_consumed(
+                    InputLeaseKey::new(source_id, &key),
+                    ConsumedInputLease::SuppressRepeats,
+                ));
+            }
+        }
+        let tracked_key = physical_key(1);
+        let tracked_lease = InputLeaseKey::new(0, &tracked_key);
+        let tracked_target = target();
+        assert!(leases.insert_forwarded(
+            tracked_lease,
+            tracked_target.clone(),
+            tracked_key.clone(),
+        ));
+        assert_eq!(leases.len(), MAX_INPUT_LEASES_TOTAL);
+
+        let overflow_source = 99;
+        let overflow_key = physical_key(1);
+        assert_eq!(
+            leases.prepare_press(&InputLeaseKey::new(overflow_source, &overflow_key)),
+            Some(Vec::new())
+        );
+        assert!(leases.source_overflowed(overflow_source));
+        assert!(!leases.source_overflowed(0));
+        assert!(matches!(
+            leases.plan_repeat(tracked_lease, &tracked_key, None),
+            RepeatPlan::Forwarded(target) if target == tracked_target
+        ));
+        assert!(leases.remove_forwarded(&tracked_lease).is_some());
+
+        assert!(leases.remove_source(overflow_source).is_empty());
+        assert!(!leases.source_overflowed(overflow_source));
+        assert!(leases
+            .prepare_press(&InputLeaseKey::new(overflow_source, &overflow_key))
+            .is_none());
+    }
+
+    #[test]
+    fn source_quarantine_registry_covers_every_admitted_source_until_its_own_reset() {
+        let mut leases = InputLeaseTable::default();
+        for source_id in 0..MAX_INPUT_SOURCES as u64 {
+            leases.overflowed_sources.insert(source_id);
+        }
+        let source_id = MAX_INPUT_SOURCES as u64 - 1;
+        let unrelated_source = 0;
+        let key = physical_key(1);
+        let lease_key = InputLeaseKey::new(source_id, &key);
+        assert_eq!(leases.overflowed_sources.len(), MAX_INPUT_SOURCES);
+        assert!(leases.suppress_key(&lease_key));
+        assert!(leases.source_suppressed(source_id));
+
+        leases.remove_source(unrelated_source);
+        assert!(leases.suppress_key(&lease_key));
+        assert!(leases.source_suppressed(source_id));
+
+        leases.remove_source(source_id);
+        assert!(!leases.source_suppressed(source_id));
+        let context = pane_context();
+        assert!(matches!(
+            leases.plan_repeat(
+                lease_key,
+                &key.with_kind(crossterm::event::KeyEventKind::Repeat),
+                Some(&context),
+            ),
+            RepeatPlan::Reprocess {
+                context: planned,
+                repetitions: 1,
+                tracked: false,
+            } if planned == context
+        ));
     }
 }

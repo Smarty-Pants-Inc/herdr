@@ -30,6 +30,7 @@ mod clipboard;
 mod copy_mode;
 mod findr;
 mod lease;
+pub(crate) use lease::MAX_INPUT_SOURCES;
 mod modal;
 mod mouse;
 mod navigate;

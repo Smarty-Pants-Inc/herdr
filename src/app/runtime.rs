@@ -214,55 +214,94 @@ impl App {
         event: crate::raw_input::RawInputEvent,
     ) -> bool {
         let previous_mode = self.state.mode;
+        let suppress_overflowed_input = match &event {
+            crate::raw_input::RawInputEvent::Key(key) => {
+                self.input_leases
+                    .suppress_key(&super::input::InputLeaseKey::new(
+                        super::LOCAL_INPUT_SOURCE,
+                        key,
+                    ))
+            }
+            crate::raw_input::RawInputEvent::Text(_)
+            | crate::raw_input::RawInputEvent::Paste(_)
+            | crate::raw_input::RawInputEvent::Mouse(_) => self
+                .input_leases
+                .source_suppressed(super::LOCAL_INPUT_SOURCE),
+            _ => false,
+        };
         let changed = match event {
+            crate::raw_input::RawInputEvent::Key(_)
+            | crate::raw_input::RawInputEvent::Text(_)
+            | crate::raw_input::RawInputEvent::Paste(_)
+            | crate::raw_input::RawInputEvent::Mouse(_)
+                if suppress_overflowed_input =>
+            {
+                true
+            }
             crate::raw_input::RawInputEvent::Key(key) => {
                 let lease_key = super::input::InputLeaseKey::new(super::LOCAL_INPUT_SOURCE, &key);
-                let key = self.input_leases.normalize_press(&lease_key, key);
-                match key.kind {
-                    crossterm::event::KeyEventKind::Press => {
-                        let initial_context = self.terminal_input_context();
-                        let (target, handled_omp_reply_navigation, consumed_repeat_policy) = if matches!(
-                            initial_context,
-                            Some(super::TerminalInputContext::Findr(_))
-                        ) {
-                            self.handle_findr_key(key.clone());
-                            (
-                                None,
-                                false,
-                                super::input::ConsumedRepeatPolicy::StableContext,
-                            )
-                        } else {
-                            self.handle_key_with_repeat_outcome(key.clone()).await
-                        };
-                        let resulting_context = self.terminal_input_context();
-                        let plan = self.input_leases.complete_press(
-                            lease_key,
-                            &key,
-                            initial_context.as_ref(),
-                            resulting_context.as_ref(),
-                            consumed_repeat_policy,
-                            target,
-                            handled_omp_reply_navigation,
-                        );
-                        self.execute_repeat_plan(lease_key, key, plan).await;
-                        true
+                let overflow_releases = (key.kind == crossterm::event::KeyEventKind::Press
+                    && (key.generated_text.is_none() || key.has_physical_identity()))
+                .then(|| self.input_leases.prepare_press(&lease_key))
+                .flatten();
+                if let Some(releases) = overflow_releases {
+                    for pressed in releases {
+                        let release = pressed
+                            .key
+                            .with_kind(crossterm::event::KeyEventKind::Release);
+                        let _ = self
+                            .forward_terminal_key_to_target(&pressed.target, release)
+                            .await;
                     }
-                    crossterm::event::KeyEventKind::Repeat => {
-                        let current_context = self.terminal_input_context();
-                        let plan = self.input_leases.plan_repeat(
-                            lease_key,
-                            &key,
-                            current_context.as_ref(),
-                        );
-                        self.execute_repeat_plan(lease_key, key, plan).await
-                    }
-                    crossterm::event::KeyEventKind::Release => {
-                        if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
-                            let _ = self
-                                .forward_terminal_key_to_target(&lease.target, key)
-                                .await;
+                    true
+                } else {
+                    let key = self.input_leases.normalize_press(&lease_key, key);
+                    match key.kind {
+                        crossterm::event::KeyEventKind::Press => {
+                            let initial_context = self.terminal_input_context();
+                            let (target, handled_omp_reply_navigation, consumed_repeat_policy) = if matches!(
+                                initial_context,
+                                Some(super::TerminalInputContext::Findr(_))
+                            ) {
+                                self.handle_findr_key(key.clone());
+                                (
+                                    None,
+                                    false,
+                                    super::input::ConsumedRepeatPolicy::StableContext,
+                                )
+                            } else {
+                                self.handle_key_with_repeat_outcome(key.clone()).await
+                            };
+                            let resulting_context = self.terminal_input_context();
+                            let plan = self.input_leases.complete_press(
+                                lease_key,
+                                &key,
+                                initial_context.as_ref(),
+                                resulting_context.as_ref(),
+                                consumed_repeat_policy,
+                                target,
+                                handled_omp_reply_navigation,
+                            );
+                            self.execute_repeat_plan(lease_key, key, plan).await;
+                            true
                         }
-                        false
+                        crossterm::event::KeyEventKind::Repeat => {
+                            let current_context = self.terminal_input_context();
+                            let plan = self.input_leases.plan_repeat(
+                                lease_key,
+                                &key,
+                                current_context.as_ref(),
+                            );
+                            self.execute_repeat_plan(lease_key, key, plan).await
+                        }
+                        crossterm::event::KeyEventKind::Release => {
+                            if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
+                                let _ = self
+                                    .forward_terminal_key_to_target(&lease.target, key)
+                                    .await;
+                            }
+                            false
+                        }
                     }
                 }
             }

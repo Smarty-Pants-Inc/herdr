@@ -19,7 +19,7 @@ use crate::layout::PaneId;
 use crate::pane::{AgentDetection, PaneLaunchEnv};
 use crate::render_signal::RenderSignal;
 use crate::server::omp_route::OmpRouteKey;
-use crate::terminal::{OmpReplyNavigationPresses, OmpReplyNavigationRoute, TerminalRuntime};
+use crate::terminal::TerminalRuntime;
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
 
 /// Maximum bytes in one guest NDJSON record, including its newline.
@@ -80,7 +80,6 @@ pub(crate) struct PrivateOmpGuest {
     runtime_pane_id: PaneId,
     attachment_epoch: AtomicU64,
     controller: AtomicBool,
-    omp_reply_navigation_presses: Mutex<OmpReplyNavigationPresses>,
     runtime: Option<TerminalRuntime>,
     _listener: Arc<TcpListener>,
     guest: Arc<Mutex<Option<TcpStream>>>,
@@ -151,7 +150,6 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
-            omp_reply_navigation_presses: Mutex::new(OmpReplyNavigationPresses::default()),
             runtime: Some(runtime),
             _listener: listener,
             guest,
@@ -188,7 +186,6 @@ impl PrivateOmpGuest {
             runtime_pane_id: config.pane_id,
             attachment_epoch: AtomicU64::new(config.attachment_epoch),
             controller: AtomicBool::new(config.controller),
-            omp_reply_navigation_presses: Mutex::new(OmpReplyNavigationPresses::default()),
             runtime: Some(runtime),
             _listener: listener,
             guest: Arc::new(Mutex::new(None)),
@@ -231,38 +228,6 @@ impl PrivateOmpGuest {
         }
     }
 
-    pub(crate) fn route_omp_reply_navigation(
-        &self,
-        key: &crate::input::TerminalKey,
-        navigate: impl FnOnce() -> bool,
-    ) -> OmpReplyNavigationRoute {
-        let Ok(mut presses) = self.omp_reply_navigation_presses.lock() else {
-            return OmpReplyNavigationRoute::Forwarded;
-        };
-        presses.route(key, navigate)
-    }
-
-    pub(crate) fn route_existing_omp_reply_navigation(
-        &self,
-        key: &crate::input::TerminalKey,
-    ) -> Option<OmpReplyNavigationRoute> {
-        self.omp_reply_navigation_presses
-            .lock()
-            .ok()
-            .and_then(|mut presses| presses.route_existing(key))
-    }
-    pub(crate) fn has_forwarded_omp_reply_navigation(&self) -> bool {
-        self.omp_reply_navigation_presses
-            .lock()
-            .is_ok_and(|presses| presses.has_forwarded())
-    }
-
-    pub(crate) fn clear_omp_reply_navigation_presses(&self) {
-        if let Ok(mut presses) = self.omp_reply_navigation_presses.lock() {
-            presses.clear();
-        }
-    }
-
     pub(crate) fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         if let Some(runtime) = &self.runtime {
             runtime.resize(rows, cols, cell_width_px, cell_height_px);
@@ -299,6 +264,11 @@ impl PrivateOmpGuest {
     #[cfg(test)]
     pub(crate) fn test_take_input(&mut self) -> Option<Bytes> {
         self._test_input.as_mut()?.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_close_input(&mut self) {
+        self._test_input = None;
     }
 
     /// Writes an already formed host bridge record verbatim, followed by one newline.

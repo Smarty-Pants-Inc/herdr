@@ -3814,10 +3814,13 @@ impl PaneRuntime {
         let Ok(bytes) = crate::ghostty::encode_focus(event) else {
             return false;
         };
-        if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
-            warn!(err = %err, ?event, "failed to forward pane focus event");
+        match self.try_send_bytes(Bytes::from(bytes)) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(err = %err, ?event, "failed to forward pane focus event");
+                false
+            }
         }
-        true
     }
 
     pub fn wheel_routing(&self) -> Option<WheelRouting> {
@@ -5304,6 +5307,8 @@ mod tests {
 
         assert!(runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained));
         assert_eq!(rx.recv().await.unwrap(), Bytes::from_static(b"\x1b[I"));
+        drop(rx);
+        assert!(!runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost));
     }
 
     #[tokio::test]

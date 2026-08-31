@@ -1832,6 +1832,23 @@ fn display_semantic_surface(
 }
 
 #[cfg(unix)]
+fn write_omp_renderer_messages(
+    renderer: &mut omp_renderer::ClientOmpRenderer,
+    write_stream: &mut LocalStream,
+    mut messages: Vec<ClientMessage>,
+) -> Result<(), ClientError> {
+    loop {
+        for message in messages {
+            write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
+        }
+        messages = renderer.flush_post_send_input();
+        if messages.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(unix)]
 fn display_pending_omp_surface(
     state: &mut ClientState,
     write_stream: &mut LocalStream,
@@ -1864,9 +1881,8 @@ fn display_pending_omp_surface(
             }
         }
     }
-    for message in state.omp_renderer.take_outbound_messages() {
-        write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
-    }
+    let messages = state.omp_renderer.take_outbound_messages();
+    write_omp_renderer_messages(&mut state.omp_renderer, write_stream, messages)?;
     Ok(())
 }
 
@@ -2116,14 +2132,14 @@ async fn run_client_loop(
                     }
                 }
                 if state.omp_renderer.owns_input() {
-                    for message in state
+                    let messages = state
                         .omp_renderer
-                        .route_input(parsed_events.unwrap_or_default())
-                    {
-                        if let Err(error) = write_to_server(&mut write_stream, &message) {
-                            return Err(ClientError::ConnectionLost(error));
-                        }
-                    }
+                        .route_input(parsed_events.unwrap_or_default());
+                    write_omp_renderer_messages(
+                        &mut state.omp_renderer,
+                        &mut write_stream,
+                        messages,
+                    )?;
                     display_pending_omp_surface(&mut state, &mut write_stream)?;
                     continue;
                 }

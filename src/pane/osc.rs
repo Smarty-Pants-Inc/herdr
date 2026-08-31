@@ -738,7 +738,8 @@ impl PtyStreamScanner {
                     if self.pending.len() <= PRIMARY_SCREEN_CSI_MAX_BYTES {
                         self.pending.push(byte);
                     } else {
-                        self.pending.clear();
+                        self.pending.push(byte);
+                        self.flush_pending(output);
                         self.state = PtyStreamState::EscapeDiscard;
                     }
                 }
@@ -750,10 +751,9 @@ impl PtyStreamScanner {
                 _ => {}
             },
             PtyStreamState::EscapeDiscard => {
+                Self::emit(output, byte);
                 if (0x30..=0x7e).contains(&byte) {
                     self.state = PtyStreamState::Ground;
-                } else if byte <= 0x1f || byte == 0x7f {
-                    Self::emit(output, byte);
                 }
             }
             PtyStreamState::Csi { params, len } => {
@@ -779,7 +779,8 @@ impl PtyStreamScanner {
                         *len += 1;
                         self.pending.push(byte);
                     } else {
-                        self.pending.clear();
+                        self.pending.push(byte);
+                        self.flush_pending(output);
                         self.state = PtyStreamState::CsiDiscard;
                     }
                 } else if byte <= 0x1f || byte == 0x7f {
@@ -787,10 +788,9 @@ impl PtyStreamScanner {
                 }
             }
             PtyStreamState::CsiDiscard => {
+                Self::emit(output, byte);
                 if (0x40..=0x7e).contains(&byte) {
                     self.state = PtyStreamState::Ground;
-                } else if byte <= 0x1f || byte == 0x7f {
-                    Self::emit(output, byte);
                 }
             }
             PtyStreamState::Body => match byte {
@@ -956,6 +956,8 @@ struct OmpReplyAnchor {
     row: crate::ghostty::TrackedGridRef,
 }
 
+pub(super) const MAX_OMP_REPLY_ANCHORS: usize = 1024;
+
 struct OmpReplyAid<'a> {
     session: &'a [u8],
     id: &'a [u8],
@@ -1045,7 +1047,7 @@ impl AgentOscStateTracker {
     }
 
     /// Registers a candidate only when Ghostty confirms a primary prompt at its
-    /// exact stream offset. Returns true when a new process-private session
+    /// exact stream offset. Returns true when session, coalescing, or eviction
     /// invalidated the previous semantic selection.
     pub(super) fn register_omp_reply_anchor(
         &mut self,
@@ -1064,19 +1066,43 @@ impl AgentOscStateTracker {
             self.omp_reply_session = Some(event.session);
             self.omp_reply_owner_pid = event.owner_pid;
         }
-        if let Some(anchor) = self
+        let mut invalidate_selection = reset_selection;
+        let existing_id_index = self
             .omp_reply_anchors
-            .iter_mut()
-            .find(|anchor| anchor.id == event.anchor_id)
-        {
+            .iter()
+            .position(|anchor| anchor.id == event.anchor_id);
+        let same_row_index = row.screen_row().and_then(|screen_row| {
+            self.omp_reply_anchors
+                .iter()
+                .enumerate()
+                .find_map(|(index, anchor)| {
+                    (Some(index) != existing_id_index
+                        && anchor.row.screen_row() == Some(screen_row))
+                    .then_some(index)
+                })
+        });
+        if let Some(index) = existing_id_index {
+            self.omp_reply_anchors[index].row = row;
+            if let Some(duplicate_index) = same_row_index {
+                self.omp_reply_anchors.remove(duplicate_index);
+                invalidate_selection = true;
+            }
+        } else if let Some(index) = same_row_index {
+            let anchor = &mut self.omp_reply_anchors[index];
+            anchor.id = event.anchor_id;
             anchor.row = row;
+            invalidate_selection = true;
         } else {
+            if self.omp_reply_anchors.len() >= MAX_OMP_REPLY_ANCHORS {
+                self.omp_reply_anchors.pop_front();
+                invalidate_selection = true;
+            }
             self.omp_reply_anchors.push_back(OmpReplyAnchor {
                 id: event.anchor_id,
                 row,
             });
         }
-        reset_selection
+        invalidate_selection
     }
 
     pub(super) fn omp_reply_anchor_rows(&mut self) -> Vec<(Vec<u8>, usize)> {
@@ -2351,18 +2377,22 @@ mod tests {
     }
 
     #[test]
-    fn streaming_scrollback_filter_bounds_discarded_csi_state() {
+    fn streaming_scrollback_filter_passes_oversized_csi_byte_for_byte() {
         let mut filter = PrimaryScreenScrollbackFilter::default();
-        assert!(filter.filter(b"\x1b[", false).is_empty());
+        let mut input = Vec::from(b"\x1b[".as_slice());
+        input.extend(std::iter::repeat_n(b'?', 1_000));
+        input.extend_from_slice(b"mtrail");
 
-        for _ in 0..1_000 {
-            let _ = filter.filter(b"?", false);
+        let mut filtered = Vec::new();
+        for chunk in input.chunks(7) {
+            filtered.extend_from_slice(filter.filter(chunk, false).as_ref());
         }
 
+        assert_eq!(filtered, input);
         assert!(filter.scanner.pending.is_empty());
-        assert!(matches!(filter.scanner.state, PtyStreamState::CsiDiscard));
-        assert_eq!(filter.filter(b"mtrail", false).as_ref(), b"trail");
+        assert!(matches!(filter.scanner.state, PtyStreamState::Ground));
     }
+
     #[test]
     fn streaming_scrollback_filter_honors_escape_cancellation() {
         let mut filter = PrimaryScreenScrollbackFilter::default();
@@ -2375,19 +2405,20 @@ mod tests {
     }
 
     #[test]
-    fn streaming_scrollback_filter_bounds_escape_intermediates() {
+    fn streaming_scrollback_filter_passes_oversized_escape_intermediates_byte_for_byte() {
         let mut filter = PrimaryScreenScrollbackFilter::default();
-        assert!(filter.filter(b"\x1b ", false).is_empty());
-        for _ in 0..1_000 {
-            let _ = filter.filter(b" ", false);
+        let mut input = Vec::from(b"\x1b".as_slice());
+        input.extend(std::iter::repeat_n(b' ', 1_000));
+        input.extend_from_slice(b"Xtrail");
+
+        let mut filtered = Vec::new();
+        for chunk in input.chunks(7) {
+            filtered.extend_from_slice(filter.filter(chunk, false).as_ref());
         }
 
+        assert_eq!(filtered, input);
         assert!(filter.scanner.pending.is_empty());
-        assert!(matches!(
-            filter.scanner.state,
-            PtyStreamState::EscapeDiscard
-        ));
-        assert_eq!(filter.filter(b"Xtrail", false).as_ref(), b"trail");
+        assert!(matches!(filter.scanner.state, PtyStreamState::Ground));
     }
     #[test]
     fn streaming_scrollback_filter_cancels_string_before_utf8_c1_lookalike() {

@@ -4341,6 +4341,89 @@ mod tests {
     }
 
     #[test]
+    fn omp_reply_anchor_coalescing_invalidates_selected_reply() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]133;A;aid=omp-response-run-a:first\x07",
+            &tx,
+        );
+        assert!(pane.jump_to_previous_semantic_prompt());
+        assert_eq!(
+            pane.core.lock().expect("pane core").semantic_reply_anchor,
+            Some(b"run-a:first".to_vec())
+        );
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]133;A;aid=omp-response-run-a:second\x07",
+            &tx,
+        );
+
+        let mut core = pane.core.lock().expect("pane core");
+        let tracked_ids: Vec<_> = core
+            .agent_osc_state
+            .omp_reply_anchor_rows()
+            .into_iter()
+            .map(|(id, _)| String::from_utf8(id).expect("UTF-8 test ID"))
+            .collect();
+        assert_eq!(tracked_ids, ["run-a:second"]);
+        assert!(core.semantic_reply_anchor.is_none());
+    }
+
+    #[test]
+    fn omp_reply_anchor_eviction_invalidates_selected_reply_at_the_bound() {
+        let (pane, tx) = omp_reply_pane(40, 4, 4096);
+        for index in 0..crate::pane::osc::MAX_OMP_REPLY_ANCHORS {
+            write_omp_reply(
+                &pane,
+                &tx,
+                "run-a",
+                &format!("reply-{index:04}"),
+                &format!("reply {index:04}"),
+            );
+        }
+        write_reply_tail(&pane, &tx);
+        for _ in 0..crate::pane::osc::MAX_OMP_REPLY_ANCHORS {
+            assert!(pane.jump_to_previous_semantic_prompt());
+        }
+        assert_eq!(
+            pane.core.lock().expect("pane core").semantic_reply_anchor,
+            Some(b"run-a:reply-0000".to_vec())
+        );
+
+        write_omp_reply(&pane, &tx, "run-a", "reply-1024", "reply 1024");
+        let mut core = pane.core.lock().expect("pane core");
+        let tracked = core.agent_osc_state.omp_reply_anchor_rows();
+        assert_eq!(tracked.len(), crate::pane::osc::MAX_OMP_REPLY_ANCHORS);
+        assert!(!tracked.iter().any(|(id, _)| id == b"run-a:reply-0000"));
+        assert!(core.semantic_reply_anchor.is_none());
+    }
+
+    #[test]
+    fn omp_reply_anchor_rebind_removes_a_different_id_on_the_same_row() {
+        let (pane, tx) = omp_reply_pane(40, 4, 128);
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b]133;A;aid=omp-response-run-a:stable\x07first\r\n\x1b]133;A;aid=omp-response-run-a:other\x07\x1b]133;A;aid=omp-response-run-a:stable\x07",
+            &tx,
+        );
+
+        let tracked_ids: Vec<_> = pane
+            .core
+            .lock()
+            .expect("pane core")
+            .agent_osc_state
+            .omp_reply_anchor_rows()
+            .into_iter()
+            .map(|(id, _)| String::from_utf8(id).expect("UTF-8 test ID"))
+            .collect();
+        assert_eq!(tracked_ids, ["run-a:stable"]);
+    }
+
+    #[test]
     fn omp_reply_anchor_rebinds_a_repeated_aid_without_reordering_replies() {
         let (pane, tx) = omp_reply_pane(40, 4, 128);
         pane.process_pty_bytes(
@@ -4448,6 +4531,30 @@ mod tests {
         assert_eq!(reply_viewport_top(&pane), "reply one");
         assert!(pane.jump_to_previous_semantic_prompt());
         assert_eq!(reply_viewport_top(&pane), "reply one");
+    }
+
+    #[test]
+    fn private_omp_preserves_oversized_coalesced_truecolor_sgr() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.set_preserve_primary_scrollback(true);
+        pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"\x1b[38;2;1;2;3;48;2;4;5;6;38;2;68;85;102mhi\x1b[0m",
+            &tx,
+        );
+
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "h");
+        assert_eq!(buffer[(0, 0)].style().fg, Some(Color::Rgb(68, 85, 102)));
     }
 
     #[test]
