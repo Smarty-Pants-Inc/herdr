@@ -3193,6 +3193,127 @@ platforms = ["linux", "macos"]
 
     #[cfg(unix)]
     #[test]
+    fn plugin_completion_joins_readers_and_closes_escaped_output_pipes() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-escaped-output-close");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.escaped-output-close"
+name = "Escaped Output Close"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.escaped-output-close"].clone();
+        let escaped_pid_path = root.join("escaped-child.pid");
+        let release_path = root.join("release-child");
+        let stdout_closed_path = root.join("stdout-closed");
+        let stderr_closed_path = root.join("stderr-closed");
+        let escaped_script_path = root.join("escaped-child.py");
+        let python_pid_path = format!("{escaped_pid_path:?}");
+        let python_release_path = format!("{release_path:?}");
+        let python_stdout_closed_path = format!("{stdout_closed_path:?}");
+        let python_stderr_closed_path = format!("{stderr_closed_path:?}");
+        std::fs::write(
+            &escaped_script_path,
+            format!(
+                r#"import os
+import signal
+import time
+
+child = os.fork()
+if child:
+    os._exit(0)
+os.setsid()
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+open({python_pid_path}, "w").write(str(os.getpid()))
+while not os.path.exists({python_release_path}):
+    time.sleep(0.01)
+for fd, marker in ((1, {python_stdout_closed_path}), (2, {python_stderr_closed_path})):
+    try:
+        os.write(fd, b"late output\n")
+    except BrokenPipeError:
+        open(marker, "w").write("closed\n")
+"#
+            ),
+        )
+        .unwrap();
+        let shell_script_path = format!("{escaped_script_path:?}");
+        let shell_pid_path = format!("{escaped_pid_path:?}");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("escaped-output-close".into()),
+                None,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "printf 'stdout-before-escape'; printf 'stderr-before-escape' >&2; python3 {shell_script_path} & while [ ! -s {shell_pid_path} ]; do sleep 0.01; done; exit 0"
+                    ),
+                ],
+                &app.current_plugin_context("escaped-output-close-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !escaped_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its escaped child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let escaped_pid: i32 = std::fs::read_to_string(&escaped_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _escaped_child = KillProcessOnDrop(escaped_pid);
+
+        while app.plugin_command_runtimes.contains_key(&log.log_id) {
+            app.drain_all_internal_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command completion remained blocked on escaped output pipes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .expect("plugin command log should remain available");
+        assert_eq!(finished.status, PluginCommandStatus::Succeeded);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished
+            .stdout
+            .as_deref()
+            .is_some_and(|stdout| stdout.contains("stdout-before-escape")));
+        assert!(finished
+            .stderr
+            .as_deref()
+            .is_some_and(|stderr| stderr.contains("stderr-before-escape")));
+
+        std::fs::write(&release_path, "release\n").unwrap();
+        assert_eq!(
+            read_capture_when_ready(&stdout_closed_path, 1, || {}).trim(),
+            "closed"
+        );
+        assert_eq!(
+            read_capture_when_ready(&stderr_closed_path, 1, || {}).trim(),
+            "closed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn plugin_completion_kills_descendants_that_outlive_the_direct_child() {
         let mut app = test_app();
         let root = unique_temp_path("plugin-command-orphan");

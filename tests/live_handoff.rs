@@ -53,6 +53,37 @@ fn unique_test_dir() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
 }
+fn write_versioned_handoff_importer(path: &Path, accepted_version: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import socket
+import sys
+
+socket_path, token = sys.argv[-2:]
+stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+stream.connect(socket_path)
+stream.sendall(token.encode() + b"\n")
+line = b""
+while not line.endswith(b"\n"):
+    chunk = stream.recv(4096)
+    if not chunk:
+        sys.exit(20)
+    line += chunk
+manifest = json.loads(line)
+if manifest.get("version") != {accepted_version}:
+    sys.exit(21)
+stream.sendall(b"validated\n")
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
     spawn_server_with_env(config_home, runtime_dir, api_socket, &[])
@@ -889,8 +920,6 @@ fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
 
 #[test]
 fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let _lock = test_lock();
     let base = unique_test_dir();
     let owner = fresh_omp_maintenance_owner();
@@ -899,31 +928,7 @@ fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
     let api_socket = runtime_dir.join("herdr.sock");
     let legacy_import = base.join("legacy-herdr");
     fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &legacy_import,
-        r#"#!/usr/bin/env python3
-import json
-import socket
-import sys
-
-socket_path, token = sys.argv[-2:]
-stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-stream.connect(socket_path)
-stream.sendall(token.encode() + b"\n")
-line = b""
-while not line.endswith(b"\n"):
-    chunk = stream.recv(4096)
-    if not chunk:
-        sys.exit(20)
-    line += chunk
-manifest = json.loads(line)
-if manifest.get("version") != 1:
-    sys.exit(21)
-stream.sendall(b"validated\n")
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&legacy_import, fs::Permissions::from_mode(0o700)).unwrap();
+    write_versioned_handoff_importer(&legacy_import, 1);
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -974,6 +979,48 @@ stream.sendall(b"validated\n")
             "params": {"operation_id": owner}
         }),
     ));
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_rejects_pre_epoch_importer_without_replacing_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let previous_import = base.join("previous-herdr");
+    fs::create_dir_all(&base).unwrap();
+    write_versioned_handoff_importer(&previous_import, 2);
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let response = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff:pre-epoch",
+            "method": "server.live_handoff",
+            "params": {"import_exe": previous_import.to_string_lossy()}
+        }),
+    );
+    assert_eq!(response["error"]["code"], "handoff_failed");
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert!(
+        spawned.child.try_wait().unwrap().is_none(),
+        "the current server must remain alive after importer rejection"
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    ));
+
     let _ = request(
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),

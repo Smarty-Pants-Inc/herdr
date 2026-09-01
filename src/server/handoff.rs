@@ -19,7 +19,9 @@ use tracing::{info, warn};
 #[cfg(unix)]
 const LEGACY_HANDOFF_VERSION: u32 = 1;
 #[cfg(unix)]
-const HANDOFF_VERSION: u32 = 2;
+const PREVIOUS_HANDOFF_VERSION: u32 = 2;
+#[cfg(unix)]
+const HANDOFF_VERSION: u32 = 3;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -281,8 +283,24 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
 
 #[cfg(unix)]
 fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()> {
+    let has_epoch = manifest.snapshot.idempotency_epoch.is_some();
+    let has_valid_epoch = manifest
+        .snapshot
+        .idempotency_epoch
+        .as_deref()
+        .is_some_and(|epoch| !epoch.trim().is_empty());
     match manifest.version {
-        HANDOFF_VERSION => Ok(()),
+        HANDOFF_VERSION if has_valid_epoch => Ok(()),
+        HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {HANDOFF_VERSION} requires an idempotency epoch"
+        ))),
+        PREVIOUS_HANDOFF_VERSION if !has_epoch => Ok(()),
+        PREVIOUS_HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {PREVIOUS_HANDOFF_VERSION} cannot carry an idempotency epoch"
+        ))),
+        LEGACY_HANDOFF_VERSION if has_epoch => Err(io::Error::other(
+            "legacy handoff manifests cannot carry an idempotency epoch",
+        )),
         LEGACY_HANDOFF_VERSION if manifest.omp_maintenance.is_none() => Ok(()),
         LEGACY_HANDOFF_VERSION => Err(io::Error::other(
             "legacy handoff manifests cannot carry OMP maintenance state",
@@ -503,7 +521,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: None,
-            idempotency_epoch: None,
+            idempotency_epoch: Some("test-epoch".into()),
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         }
@@ -524,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_written_before_optional_handoff_fields_still_loads() {
+    fn current_handoff_schema_carries_the_idempotency_epoch() {
         let manifest = manifest_for(
             empty_snapshot(),
             Vec::new(),
@@ -533,20 +551,42 @@ mod tests {
             Some("deploying".to_string()),
             None,
         );
-        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
-        let object = value
-            .as_object_mut()
-            .expect("manifest should be a json object");
-        object.insert("version".into(), LEGACY_HANDOFF_VERSION.into());
-        object.remove("api_window_title");
-        object.remove("omp_maintenance");
 
-        let older: HandoffManifest =
-            serde_json::from_value(value).expect("an older manifest should still load");
+        assert_eq!(manifest.version, 3);
+        assert_eq!(
+            manifest.snapshot.idempotency_epoch.as_deref(),
+            Some("test-epoch")
+        );
+        validate_manifest_compatibility(&manifest).expect("current handoff must be compatible");
+    }
 
-        assert!(older.api_window_title.is_none());
-        assert!(older.omp_maintenance.is_none());
-        validate_manifest_compatibility(&older).expect("legacy new-import handoff is safe");
+    #[test]
+    fn previous_handoff_version_cannot_claim_an_idempotency_epoch() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = PREVIOUS_HANDOFF_VERSION;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("handoff version 2 cannot carry an idempotency epoch"));
+    }
+
+    #[test]
+    fn genuine_previous_handoff_without_an_epoch_remains_compatible() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = PREVIOUS_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
+
+        validate_manifest_compatibility(&manifest).expect("genuine v2 handoff remains compatible");
+    }
+
+    #[test]
+    fn current_handoff_without_idempotency_epoch_is_rejected() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.snapshot.idempotency_epoch = None;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("requires an idempotency epoch"));
     }
 
     #[test]
@@ -584,10 +624,20 @@ mod tests {
             }),
         );
         manifest.version = LEGACY_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
 
         let error = validate_manifest_compatibility(&manifest).unwrap_err();
         assert!(error
             .to_string()
             .contains("cannot carry OMP maintenance state"));
+    }
+
+    #[test]
+    fn genuine_legacy_handoff_without_new_state_remains_compatible() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = LEGACY_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
+
+        validate_manifest_compatibility(&manifest).expect("genuine v1 handoff remains compatible");
     }
 }

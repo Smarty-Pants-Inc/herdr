@@ -16,6 +16,15 @@ const PLUGIN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::f
 const PLUGIN_COMMAND_TERMINATION_ATTEMPTS: usize = 40;
 const PLUGIN_COMMAND_OUTPUT_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(250);
+#[cfg(windows)]
+trait PluginOutputPipe: Read + std::os::windows::io::AsRawHandle + Send {}
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle + Send> PluginOutputPipe for T {}
+
+#[cfg(not(windows))]
+trait PluginOutputPipe: Read + Send {}
+#[cfg(not(windows))]
+impl<T: Read + Send> PluginOutputPipe for T {}
 
 pub(crate) struct PluginCommandRuntime {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -32,16 +41,70 @@ impl PluginCommandRuntime {
             worker: Some(worker),
         }
     }
-}
 
-impl Drop for PluginCommandRuntime {
-    fn drop(&mut self) {
+    fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn join(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
+}
+
+impl Drop for PluginCommandRuntime {
+    fn drop(&mut self) {
+        self.cancel();
+        self.join();
+    }
+}
+
+struct PluginOutputReader {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<String>>,
+}
+
+impl PluginOutputReader {
+    fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .map(std::thread::JoinHandle::is_finished)
+            .unwrap_or(true)
+    }
+
+    fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn join(&mut self) -> String {
+        self.worker
+            .take()
+            .and_then(|worker| worker.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for PluginOutputReader {
+    fn drop(&mut self) {
+        self.stop();
+        let _ = self.join();
+    }
+}
+
+#[cfg(unix)]
+fn configure_plugin_output_pipes(child: &std::process::Child) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    if let Some(stdout) = child.stdout.as_ref() {
+        crate::pty::fd::set_nonblocking(stdout.as_raw_fd())?;
+    }
+    if let Some(stderr) = child.stderr.as_ref() {
+        crate::pty::fd::set_nonblocking(stderr.as_raw_fd())?;
+    }
+    Ok(())
 }
 
 fn spawn_plugin_command(
@@ -53,7 +116,20 @@ fn spawn_plugin_command(
         .stderr(Stdio::piped())
         .spawn()?;
     match crate::platform::ProcessTreeGuard::new_std(&child) {
-        Ok(process_tree) => Ok((child, process_tree)),
+        Ok(process_tree) => {
+            #[cfg(unix)]
+            let process_tree = {
+                let mut process_tree = process_tree;
+                if let Err(error) = configure_plugin_output_pipes(&child) {
+                    process_tree.terminate();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+                process_tree
+            };
+            Ok((child, process_tree))
+        }
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -154,30 +230,57 @@ fn terminate_plugin_child(
     }
 }
 
-fn spawn_plugin_output_reader(
-    reader: impl Read + Send + 'static,
-) -> std::sync::mpsc::Receiver<String> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let _ = std::thread::spawn(move || {
-        let _ = sender.send(read_capped_plugin_output(
+fn spawn_plugin_output_reader(reader: impl PluginOutputPipe + 'static) -> PluginOutputReader {
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stopped = stopped.clone();
+    let worker = std::thread::spawn(move || {
+        read_capped_plugin_output_until_stopped(
             reader,
             PLUGIN_COMMAND_OUTPUT_MAX_BYTES,
-        ));
+            worker_stopped.as_ref(),
+        )
     });
-    receiver
+    PluginOutputReader {
+        stopped,
+        worker: Some(worker),
+    }
 }
 
-fn collect_plugin_output(
-    reader: Option<std::sync::mpsc::Receiver<String>>,
+fn collect_plugin_outputs(
+    mut stdout: Option<PluginOutputReader>,
+    mut stderr: Option<PluginOutputReader>,
     deadline: std::time::Instant,
-) -> String {
-    reader
-        .and_then(|reader| {
-            reader
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .ok()
-        })
-        .unwrap_or_default()
+) -> (String, String) {
+    loop {
+        let all_finished = stdout
+            .as_ref()
+            .map(PluginOutputReader::is_finished)
+            .unwrap_or(true)
+            && stderr
+                .as_ref()
+                .map(PluginOutputReader::is_finished)
+                .unwrap_or(true);
+        if all_finished || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(
+            PLUGIN_COMMAND_POLL_INTERVAL
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    for reader in [&stdout, &stderr].into_iter().flatten() {
+        reader.stop();
+    }
+    (
+        stdout
+            .as_mut()
+            .map(PluginOutputReader::join)
+            .unwrap_or_default(),
+        stderr
+            .as_mut()
+            .map(PluginOutputReader::join)
+            .unwrap_or_default(),
+    )
 }
 
 fn publish_plugin_command_finished(
@@ -436,8 +539,8 @@ impl App {
                     };
                     let output_deadline =
                         std::time::Instant::now() + PLUGIN_COMMAND_OUTPUT_DRAIN_TIMEOUT;
-                    let stdout = collect_plugin_output(stdout_reader, output_deadline);
-                    let stderr = collect_plugin_output(stderr_reader, output_deadline);
+                    let (stdout, stderr) =
+                        collect_plugin_outputs(stdout_reader, stderr_reader, output_deadline);
                     match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,
@@ -479,8 +582,14 @@ impl App {
     }
 
     pub(crate) fn shutdown_plugin_commands(&mut self) {
-        self.plugin_command_runtimes.clear();
+        let mut runtimes = std::mem::take(&mut self.plugin_command_runtimes);
+        for runtime in runtimes.values() {
+            runtime.cancel();
+        }
         self.state.plugin_commands_in_flight = 0;
+        for runtime in runtimes.values_mut() {
+            runtime.join();
+        }
     }
 
     pub(super) fn plugin_command_execution_target(
@@ -605,12 +714,68 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(windows)]
+fn poll_windows_plugin_output<R>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize>
+where
+    R: Read + std::os::windows::io::AsRawHandle,
+{
+    let mut available = 0;
+    let ok = unsafe {
+        windows_sys::Win32::System::Pipes::PeekNamedPipe(
+            reader.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if available == 0 {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
+    let available = buf.len().min(available as usize);
+    reader.read(&mut buf[..available])
+}
+
+#[cfg(test)]
 pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> String {
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    read_capped_plugin_output_with(cap, &stopped, |buf| reader.read(buf))
+}
+
+fn read_capped_plugin_output_until_stopped(
+    mut reader: impl PluginOutputPipe,
+    cap: usize,
+    stopped: &std::sync::atomic::AtomicBool,
+) -> String {
+    read_capped_plugin_output_with(cap, stopped, |buf| {
+        #[cfg(windows)]
+        {
+            poll_windows_plugin_output(&mut reader, buf)
+        }
+        #[cfg(not(windows))]
+        {
+            reader.read(buf)
+        }
+    })
+}
+
+fn read_capped_plugin_output_with(
+    cap: usize,
+    stopped: &std::sync::atomic::AtomicBool,
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> String {
     let mut kept = Vec::with_capacity(cap.min(8192));
     let mut buf = [0u8; 8192];
     let mut truncated = false;
     loop {
-        match reader.read(&mut buf) {
+        if stopped.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        match read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 let remaining = cap.saturating_sub(kept.len());
@@ -622,6 +787,9 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL);
+            }
             Err(_) => break,
         }
     }
@@ -637,6 +805,26 @@ pub(super) fn read_capped_plugin_output(mut reader: impl Read, cap: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    struct ObservedWindowsPluginPipe {
+        stdout: std::process::ChildStdout,
+        polled: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(windows)]
+    impl std::io::Read for ObservedWindowsPluginPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.stdout.read(buf)
+        }
+    }
+
+    #[cfg(windows)]
+    impl std::os::windows::io::AsRawHandle for ObservedWindowsPluginPipe {
+        fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+            let _ = self.polled.send(());
+            std::os::windows::io::AsRawHandle::as_raw_handle(&self.stdout)
+        }
+    }
 
     #[test]
     fn plugin_child_wait_bounds_repeated_interrupted_errors() {
@@ -654,6 +842,119 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(attempts, PLUGIN_COMMAND_TERMINATION_ATTEMPTS);
         assert_eq!(waits, PLUGIN_COMMAND_TERMINATION_ATTEMPTS - 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_plugin_output_reader_stop_and_join_is_bounded_while_pipe_open() {
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let mut reader = spawn_plugin_output_reader(ObservedWindowsPluginPipe {
+            stdout,
+            polled: polled_tx,
+        });
+
+        let polling_open_pipe = polled_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+            && !reader.is_finished();
+        if !polling_open_pipe {
+            reader.stop();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+        }
+        assert!(
+            polling_open_pipe,
+            "plugin output reader did not remain polling while the pipe was open"
+        );
+
+        let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
+        let joiner = std::thread::spawn(move || {
+            reader.stop();
+            let _ = reader.join();
+            let _ = joined_tx.send(());
+        });
+        let joined = joined_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = joiner.join();
+
+        assert!(
+            joined,
+            "plugin output reader stop+join blocked while the Windows pipe remained open"
+        );
+    }
+
+    #[test]
+    fn plugin_shutdown_cancels_all_runtimes_before_joining() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for index in 0..MAX_PLUGIN_COMMANDS_IN_FLIGHT {
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_cancelled = cancelled.clone();
+            let worker_observed = observed_tx.clone();
+            let worker_release = release.clone();
+            let worker = std::thread::spawn(move || {
+                while !worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let _ = worker_observed.send(());
+                while !worker_release.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            app.plugin_command_runtimes.insert(
+                format!("fanout-{index}"),
+                PluginCommandRuntime::new(cancelled, worker),
+            );
+        }
+        drop(observed_tx);
+        app.state.plugin_commands_in_flight = MAX_PLUGIN_COMMANDS_IN_FLIGHT;
+        let observer_release = release.clone();
+        let observer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut observed = 0;
+            while observed < MAX_PLUGIN_COMMANDS_IN_FLIGHT {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() || observed_rx.recv_timeout(remaining).is_err() {
+                    break;
+                }
+                observed += 1;
+            }
+            observer_release.store(true, std::sync::atomic::Ordering::Release);
+            observed
+        });
+
+        app.shutdown_plugin_commands();
+
+        assert_eq!(
+            observer.join().unwrap(),
+            MAX_PLUGIN_COMMANDS_IN_FLIGHT,
+            "every runtime must observe cancellation before the first join blocks"
+        );
+        assert!(app.plugin_command_runtimes.is_empty());
+        assert_eq!(app.state.plugin_commands_in_flight, 0);
     }
 
     #[test]

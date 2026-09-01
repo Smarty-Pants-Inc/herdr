@@ -348,6 +348,13 @@ impl TerminalState {
         self.pending_agent_resume_attempt_pid
             .is_some_and(|attempt_pid| peer_pid == Some(attempt_pid))
     }
+    pub(crate) fn pending_agent_resume_attempt_was_retired(&self, peer_pid: Option<u32>) -> bool {
+        peer_pid.is_some_and(|peer_pid| self.pending_agent_resume_retired_pids.contains(&peer_pid))
+    }
+
+    pub(crate) fn has_pending_agent_resume_attempt(&self) -> bool {
+        self.pending_agent_resume_attempt_pid.is_some()
+    }
 
     pub(crate) fn pending_agent_resume_confirmation_deadline(&self) -> Option<Instant> {
         self.pending_agent_resume_confirmation_deadline
@@ -360,12 +367,12 @@ impl TerminalState {
                 .is_some_and(|deadline| now >= deadline)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) fn pending_agent_resume_attempt_pid(&self) -> Option<u32> {
         self.pending_agent_resume_attempt_pid
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) fn pending_agent_resume_retired_pids(&self) -> &[u32] {
         &self.pending_agent_resume_retired_pids
     }
@@ -1567,6 +1574,19 @@ impl TerminalState {
             == ("herdr:opencode", "opencode", Some("select"), None)
     }
 
+    pub(crate) fn pending_agent_resume_plan_matches_report(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> bool {
+        self.pending_agent_resume_plan.as_ref().is_some_and(|plan| {
+            plan.agent == agent_label
+                && plan.dedupe_key
+                    == crate::agent_resume::dedupe_key(source, agent_label, session_ref)
+        })
+    }
+
     fn confirm_pending_agent_resume(
         &mut self,
         source: &str,
@@ -1576,11 +1596,7 @@ impl TerminalState {
     ) -> bool {
         let matches = (self.pending_agent_resume_attempt_pid.is_some()
             || resume_policy == crate::agent_resume::AgentResumePolicy::External)
-            && self.pending_agent_resume_plan.as_ref().is_some_and(|plan| {
-                plan.agent == agent_label
-                    && plan.dedupe_key
-                        == crate::agent_resume::dedupe_key(source, agent_label, session_ref)
-            });
+            && self.pending_agent_resume_plan_matches_report(source, agent_label, session_ref);
         if matches {
             self.pending_agent_resume_plan = None;
             self.clear_pending_agent_resume_attempt_live();

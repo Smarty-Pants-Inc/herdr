@@ -48,8 +48,15 @@ SPDX_ASSET_NAME = "smarty-pair.spdx.json"
 SPDX_CREATOR = "Tool: smarty-preview-1.0"
 TRUSTED_BUN_VERSION = "1.4.0"
 TRUSTED_ZIG_VERSION = "0.15.2"
-SEMANTIC_VERIFICATION_SCHEMA = "smarty.semantic-verification.v2"
+SEMANTIC_VERIFICATION_SCHEMA = "smarty.semantic-verification.v3"
+SEMANTIC_VERIFICATION_V2_SCHEMA = "smarty.semantic-verification.v2"
+# The latest signed v2 paired build is dated 2026-08-30.
+SEMANTIC_VERIFICATION_V3_CUTOFF_DAY = "2026-08-31"
 SOURCE_ARCHIVE_NAMES = ("herdr-source.tar", "omp-source.tar")
+SEMANTIC_VERIFICATION_SOURCE_ARCHIVES = {
+    SEMANTIC_VERIFICATION_V2_SCHEMA: ("herdr-source.tar",),
+    SEMANTIC_VERIFICATION_SCHEMA: SOURCE_ARCHIVE_NAMES,
+}
 PAIR_PROVENANCE_ASSET_NAME = "smarty-pair.provenance.sigstore.json"
 SPDX_PROVENANCE_ASSET_NAME = "smarty-pair.spdx.sigstore.json"
 HERDR_REPOSITORY = "Smarty-Pants-Inc/herdr"
@@ -1220,6 +1227,25 @@ def _directory_file_records(
     return {name: _file_record(directory / name, f"{label} {name}") for name in names}
 
 
+def _semantic_verification_source_archive_names(schema: Any) -> tuple[str, ...]:
+    if not isinstance(schema, str) or schema not in SEMANTIC_VERIFICATION_SOURCE_ARCHIVES:
+        raise ValueError("pair manifest semantic verification schema mismatch")
+    return SEMANTIC_VERIFICATION_SOURCE_ARCHIVES[schema]
+
+
+def _validate_semantic_verification_schema_for_build(
+    schema: str, trusted_build_id: str
+) -> None:
+    if (
+        schema == SEMANTIC_VERIFICATION_V2_SCHEMA
+        and trusted_build_id[:10] >= SEMANTIC_VERIFICATION_V3_CUTOFF_DAY
+    ):
+        raise ValueError(
+            "semantic verification v2 is only accepted before the "
+            f"{SEMANTIC_VERIFICATION_V3_CUTOFF_DAY} v3 cutoff"
+        )
+
+
 def _semantic_verification_record(
     *,
     verifier_path: Path,
@@ -1228,6 +1254,7 @@ def _semantic_verification_record(
     cargo_metadata_dir: Path,
     omp_rules_rust_toolchains: Path,
     spdx_path: Path,
+    schema: str = SEMANTIC_VERIFICATION_SCHEMA,
 ) -> dict[str, Any]:
     cargo_names = tuple(
         name
@@ -1235,10 +1262,12 @@ def _semantic_verification_record(
         for name in component.values()
     )
     return {
-        "schema": SEMANTIC_VERIFICATION_SCHEMA,
+        "schema": schema,
         "verifier": _file_record(Path(verifier_path), "trusted release verifier"),
         "source_archives": _directory_file_records(
-            Path(source_archive_dir), SOURCE_ARCHIVE_NAMES, "trusted source archives"
+            Path(source_archive_dir),
+            _semantic_verification_source_archive_names(schema),
+            "trusted source archives",
         ),
         "inputs": {
             "cargo_metadata": _directory_file_records(
@@ -2976,6 +3005,7 @@ def build_pair_manifest(
     cargo_metadata_dir: Path,
     bun_version: str,
     zig_version: str,
+    semantic_verification_schema: str = SEMANTIC_VERIFICATION_SCHEMA,
 ) -> str:
     asset_dir = Path(asset_dir)
     repo = _repository(repo, "repo")
@@ -3085,6 +3115,7 @@ def build_pair_manifest(
             cargo_metadata_dir=Path(cargo_metadata_dir),
             omp_rules_rust_toolchains=Path(omp_rules_rust_toolchains),
             spdx_path=asset_dir / SPDX_ASSET_NAME,
+            schema=semantic_verification_schema,
         ),
     }
     return _canonical_json(document)
@@ -3244,12 +3275,11 @@ def _validate_semantic_verification_record(value: Any) -> dict[str, Any]:
         {"schema", "verifier", "source_archives", "inputs", "spdx"},
         "pair manifest semantic verification",
     )
-    if record.get("schema") != SEMANTIC_VERIFICATION_SCHEMA:
-        raise ValueError("pair manifest semantic verification schema mismatch")
+    source_archive_names = _semantic_verification_source_archive_names(record.get("schema"))
     _validate_digest_record(record["verifier"], "pair manifest semantic verifier")
     _validate_named_digest_records(
         record["source_archives"],
-        SOURCE_ARCHIVE_NAMES,
+        source_archive_names,
         "pair manifest semantic source archives",
     )
     inputs = _mapping(record["inputs"], "pair manifest semantic inputs")
@@ -3676,6 +3706,10 @@ def verify_pair(
     for actual, expected, label in expected_values:
         if actual != expected:
             raise ValueError(f"pair manifest {label} mismatch")
+    # Legacy acceptance follows the caller-authenticated build ID, never manifest time.
+    _validate_semantic_verification_schema_for_build(
+        document["verification"]["schema"], expected_build_id
+    )
     herdr_root = Path(herdr_root)
     omp_root = Path(omp_root)
     expected_locks = _lock_input_records(herdr_root, omp_root)
@@ -3742,8 +3776,11 @@ def verify_pair(
         Path(trusted_verifier), "trusted release verifier"
     ):
         raise ValueError("pair manifest trusted verifier record mismatch")
+    source_archive_names = _semantic_verification_source_archive_names(
+        verification["schema"]
+    )
     if verification["source_archives"] != _directory_file_records(
-        Path(source_archive_dir), SOURCE_ARCHIVE_NAMES, "trusted source archives"
+        Path(source_archive_dir), source_archive_names, "trusted source archives"
     ):
         raise ValueError("pair manifest trusted source archive records mismatch")
     if verification["spdx"] != _file_record(
@@ -3781,6 +3818,7 @@ def verify_pair(
                 cargo_metadata_dir=Path(cargo_metadata_dir),
                 bun_version=TRUSTED_BUN_VERSION,
                 zig_version=TRUSTED_ZIG_VERSION,
+                semantic_verification_schema=verification["schema"],
             )
         )
         if document != expected_document:
