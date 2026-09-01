@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [master, windows]
     paths-ignore:
@@ -15,12 +15,11 @@ env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.id == 37929162 && startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false }}
 
 jobs:
   conventional-commits:
-    if: github.event_name != 'push' || github.ref_name == 'master'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -35,7 +34,7 @@ jobs:
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
       - name: Validate PR title
-        if: github.event_name == 'pull_request'
+        if: ${{ github.event_name == 'pull_request' && (github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false) }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
@@ -47,14 +46,17 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            fast_os: ubuntu-latest
             kind: unix
             nextest_filter: all()
           - os: macos-latest
+            fast_os: macos-latest
             kind: unix
             nextest_filter: not binary(live_handoff)
           - os: windows-latest
+            fast_os: windows-latest
             kind: windows
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'pull_request' && matrix.os || matrix.fast_os }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -119,16 +121,16 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .zig-cache
-          key: zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: zig-build-v2-${{ runner.os }}-${{ runner.arch }}-0.15.2-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'rust-toolchain.toml', 'vendor/libghostty-vt/**') }}
           restore-keys: |
-            zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
+            zig-build-v2-${{ runner.os }}-${{ runner.arch }}-0.15.2-
 
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           key: ${{ matrix.os }}
@@ -173,7 +175,7 @@ jobs:
           use-cache: false
 
       - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           key: conpty-package-windows-2022
@@ -252,3 +254,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows PowerShell installer test failed with exit code $LASTEXITCODE"
           }
+
+  smarty-ci:
+    name: smarty-ci
+    if: ${{ always() }}
+    needs: [conventional-commits, check, windows-conpty-package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI lane to succeed
+        run: |
+          test '${{ needs.conventional-commits.result }}' = success
+          test '${{ needs.check.result }}' = success
+          test '${{ needs.windows-conpty-package.result }}' = success
