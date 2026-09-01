@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import scripts.smarty_preview_trusted as trusted
+import scripts.test_preview_promotion as promotion_tests
 
 STRICT_YAML_TO_JSON = r'''
 require "json"
@@ -812,6 +813,7 @@ class TrustedExistingReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "aggregate size"):
                     trusted.validate_existing_release_metadata(release, api_assets, identity)
 
+
 class TrustedWorkflowTests(unittest.TestCase):
     workflow = Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview-publish.yml"
 
@@ -878,25 +880,38 @@ class TrustedWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(artifact_names)
         for name in artifact_names:
-            self.assertIn("${{ github.run_attempt }}", name, name)
+            self.assertTrue(
+                "${{ github.run_attempt }}" in name or ".outputs.artifact_attempt }}" in name,
+                name,
+            )
 
-    def test_workflow_finds_and_reuses_draft_release_by_tag(self) -> None:
+    def test_workflow_promotes_internal_preview_with_protected_channel_cas(self) -> None:
+        workflow = load_workflow(self.workflow)
+        jobs = workflow["jobs"]
+        phase_a = jobs["phase-a-channel"]
+        phase_a_commit = jobs["phase-a-commit"]
+        phase_b = jobs["phase-b-promotion"]
+        phase_b_commit = jobs["phase-b-commit"]
+        self.assertEqual(phase_a["permissions"]["contents"], "read")
+        self.assertEqual(phase_a_commit["permissions"]["contents"], "write")
+        self.assertEqual(phase_a_commit["environment"], "smarty-release")
+        self.assertEqual(phase_b["permissions"]["contents"], "read")
+        self.assertEqual(phase_b["environment"], {"name": "smarty-preview-promotion"})
+        self.assertIn("phase-a-commit", phase_b["needs"])
+        self.assertEqual(phase_b_commit["permissions"]["contents"], "write")
+        self.assertIn("phase-b-promotion", phase_b_commit["needs"])
         source = self.workflow.read_text(encoding="utf-8")
-        self.assertIn('release(tagName: $tag) { databaseId }', source)
-        self.assertIn('gh api "repos/$REPOSITORY/releases/$release_id" > release.json', source)
-        self.assertIn('gh release create "$TAG"', source)
-        self.assertIn('--draft --verify-tag', source)
-        self.assertLess(source.index("resolve_release\n          if [ -f release-missing ]"), source.index('gh release create "$TAG"'))
-        self.assertIn('check_tag\n            gh release create "$TAG"', source)
-        self.assertIn('gh api "repos/$REPOSITORY/releases/$release_id" > "$1"', source)
-        self.assertNotIn('gh api "repos/$REPOSITORY/releases/tags/$TAG"', source)
-
-    def test_workflow_replaces_only_mismatched_draft_assets(self) -> None:
-        source = self.workflow.read_text(encoding="utf-8")
-        self.assertIn('Path("delete-list").write_text', source)
-        self.assertIn('gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"', source)
-        self.assertIn('raise SystemExit(f"release asset metadata mismatch: {name}")', source)
-        self.assertLess(source.index("done < delete-list"), source.index("done < upload-list"))
+        promotion_source = source.split("\n  phase-a-channel:", 1)[1]
+        for forbidden in ("awaiting-external-tuf-signing", "blocked-external-gate", "trusted-tuf-promotion-gate", "SMARTY_RELEASE_TOKEN"):
+            self.assertNotIn(forbidden, promotion_source)
+        self.assertEqual(promotion_source.count("smarty_preview_promotion.py"), 4)
+        self.assertNotIn("push --atomic", promotion_source)
+        self.assertNotIn("git -C", promotion_source)
+        self.assertIn("trusted-channel-promotion-authorization-", source)
+        self.assertIn("--producer-attempt", promotion_source)
+        self.assertIn("${{ github.run_attempt }}", promotion_source)
+        self.assertIn("trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
+        self.assertIn("trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
 
     def test_workflow_reuses_only_verified_immutable_release_bytes(self) -> None:
         workflow = load_workflow(self.workflow)
@@ -975,6 +990,10 @@ class TrustedWorkflowTests(unittest.TestCase):
             self.assertEqual(by_name[name]["if"], "steps.existing.outputs.reuse != 'true'", name)
         self.assertNotIn("if", by_name["Upload final immutable release bytes and seal"])
 
+
+def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None) -> unittest.TestSuite:
+    tests.addTests(loader.loadTestsFromModule(promotion_tests))
+    return tests
 
 if __name__ == "__main__":
     unittest.main()

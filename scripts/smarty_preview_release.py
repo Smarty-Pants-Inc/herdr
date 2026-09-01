@@ -9,7 +9,7 @@ import json
 import re
 import stat
 import subprocess
-import tomllib
+
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1503,7 +1503,10 @@ def _add_spdx_package(
 
 def _read_toml(path: Path, label: str) -> dict[str, Any]:
     try:
+        import tomllib
         value = tomllib.loads(_regular_file(path, label).read_text(encoding="utf-8"))
+    except ModuleNotFoundError as error:
+        raise ValueError(f"{label} requires Python 3.11 or later to parse TOML") from error
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"{label} must be valid TOML") from error
     return _mapping(value, label)
