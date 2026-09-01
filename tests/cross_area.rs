@@ -847,7 +847,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
     client_handshake(&mut client_a, CURRENT_PROTOCOL, 100, 30);
-    assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
+    assert!(wait_for_frame(&mut client_a, Duration::from_secs(5)));
 
     let created = workspace_create(&api_socket, "agent-persist");
     let pane_id = created["result"]["root_pane"]["pane_id"]

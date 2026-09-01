@@ -936,6 +936,8 @@ class TrustedWorkflowTests(unittest.TestCase):
             run.index("verify-attested-pair"),
         )
         self.assertLess(run.index("validate-pair-attestation"), run.index("verify-attested-pair"))
+        self.assertIn("publisher-source/scripts/preview.py verify-attested-pair", run)
+        self.assertNotIn("smarty_preview_release.py verify-attested-pair", run)
         self.assertLess(
             run.index("validate-existing-release-metadata"),
             run.index("Accept: application/octet-stream"),
