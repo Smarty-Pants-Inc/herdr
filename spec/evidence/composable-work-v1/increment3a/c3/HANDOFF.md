@@ -5,8 +5,8 @@
 - Mission: `smarty-pants-increment3a-corrective-closure`
 - Result: the corrected C3 source chain, public API/schema compatibility, layout idempotency persistence, live-handoff identity, plugin shutdown, OMP maintenance replay, and exact-source preview handoff are evidenced below. Protected landing and root pin/package work remain Integration Master responsibilities.
 - Upstream base: `e205b0354a6e7daa1ba61ef0d42a794c263181e0`.
-- Corrected source parent: `dc6995d523266601a65295ad88495f9ffb703e45`; tree `66cad1b9f8371a7ec40a094cd3377a04018606ad`.
-- Corrected source commit: `b9d8582a5b24271a4eb62963a789921ae960e0b0`; tree `b2fc0e9a7f7c3e8b5ed7e0f2cf727917946e77ae`.
+- Corrected source parent: `15d2284014573c3ed7d17296304b97b5e4e448d6`; tree `10edb0a493e33f79ca084f8cf0bc686aabdbf3d5`.
+- Corrected source commit: `400a33af08fa217e78ea435265ba0aaec5c52a23`; tree `c0ba85bc811641e32f06c7d938135d3329dbfe0a`.
 - Branch: `i3a-corrective/c3-seam-closure`.
 - Evidence commit: the next local commit. Its SHA and tree are reported by the Integration Master because a commit cannot contain its own SHA.
 - Worktree: `/Users/paulbettner/.herdr/worktrees/herdr/i3a-corrective-c3`.
@@ -37,12 +37,12 @@ wc -c /Users/paulbettner/Downloads/SMARTY_PANTS_INCREMENT3A_CORRECTIVE_SOURCE_HA
 
 ## Corrective closure addendum
 
-Corrected source commit `b9d8582a5b24271a4eb62963a789921ae960e0b0` closes the independent-review findings against the earlier C3 candidate:
+Corrected source commit `400a33af08fa217e78ea435265ba0aaec5c52a23` closes the independent-review findings against the earlier C3 candidate:
 
-- `.github/workflows/smarty-preview-publish.yml`, `scripts/preview.py`, and their tests now create, validate, transfer, stage, and semantically verify the exact Git-tree `omp-source.tar` beside `herdr-source.tar`. The preview artifact no longer claims source closure while omitting the validated OMP source.
-- `src/app/api/plugins/runtime.rs` bounds stdout/stderr drain waits to one shared 250 ms deadline after child termination. Escaped descendants that retain inherited pipes no longer block command completion or application shutdown.
-- `src/server/headless.rs` places the active layout idempotency epoch into the live handoff snapshot. The successor restores the same receipt namespace rather than rotating identity during an in-memory handoff.
-- `src/terminal/state.rs` accepts a matching, authorized External ownership report as confirmation of a deferred matching Native resume before an attempt PID exists. Native reports still require a live attempt.
+- `scripts/preview.py` and its tests require semantic verification v3 to bind both exact Git-tree archives, `herdr-source.tar` and `omp-source.tar`. Historical v2 one-archive verification is accepted only when the independently supplied paired build ID predates the 2026-08-31 v3 cutoff; a current or future manifest cannot select v2 as a downgrade.
+- `src/app/api/plugins/runtime.rs` owns and joins stdout/stderr readers. Unix pipes are nonblocking; Windows readers use `PeekNamedPipe`; stop and join remain bounded even when descendants inherit the pipe. Application shutdown cancels every plugin runtime before joining any worker.
+- `src/server/handoff.rs` emits handoff format v3 with the active layout idempotency epoch, accepts genuine epoch-free v2 state, and rejects v2/v3 epoch mismatches. A pre-epoch importer rejects v3 before replacing the live server.
+- `src/terminal/state.rs` and `src/app/api.rs` accept a matching authorized External ownership report as confirmation of a deferred matching Native resume only when no attempt PID is tracked and the local peer is not retired. Real remote API reports have no local peer PID and retain the confirmation path; Native, live-attempt, mismatched, stale, and retired reports remain fenced.
 - `src/server/omp_maintenance.rs` replays completed acquire/release operation identities before evaluating a later lease conflict, so lost responses remain idempotent after ownership advances.
 - `src/app/api/layouts.rs` returns a reconcile miss without allocating a durable cancelled receipt. Reconcile-only probes cannot exhaust the 1,024-entry layout receipt capacity or fence a later real apply.
 
@@ -97,6 +97,32 @@ plugin_completion_kills_descendants_that_outlive_the_direct_child — PASS
 git diff --check
 PASS
 ```
+
+### Final corrected-source verification
+
+These final gates ran against source commit `400a33af08fa217e78ea435265ba0aaec5c52a23` and tree `c0ba85bc811641e32f06c7d938135d3329dbfe0a` before the evidence-only commit:
+
+```text
+cargo fmt --all --check
+PASS
+
+cargo clippy --all-targets --locked -- -D warnings
+PASS
+
+python3 -m unittest scripts.test_preview
+PASS — 59 tests
+
+cargo nextest run --locked -E '<nine final resume/plugin/handoff/epoch regressions>'
+PASS — 9 tests, 0 failures
+
+just windows-lint
+PASS — x86_64-pc-windows-msvc production clippy
+
+git diff --check
+PASS
+```
+
+Independent read-only repair reviews found and drove closure of remote confirmation, reader/thread ownership, Windows pipe polling, shutdown ordering, handoff epoch/version compatibility, and semantic-verification downgrade gaps. Final task `herdr-fourth-independent-review` returned `CLEAN` against the complete diff from evidence parent `15d2284014573c3ed7d17296304b97b5e4e448d6` to source commit `400a33af08fa217e78ea435265ba0aaec5c52a23`. It changed no files. The repository-wide nextest baseline remains the same four unrelated failures documented above.
 
 The implementation task was delegated to OMP task agent `herdr-correctness-fixes`, pinned to `terra-high`; the Integration Master re-read the material changes and reran the exact committed-source gates above. The later final root review and package bind the evidence commit and rebuilt binary to the complete landed constellation.
 
