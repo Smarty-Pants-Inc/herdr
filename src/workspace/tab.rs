@@ -56,6 +56,7 @@ enum SplitCommand<'a> {
 pub struct Tab {
     pub custom_name: Option<String>,
     pub number: usize,
+    pub(crate) layout_effect_nonce: Option<String>,
     /// Identity source for this tab's pane tree.
     pub root_pane: PaneId,
     pub layout: TileLayout,
@@ -158,6 +159,7 @@ impl Tab {
             Self {
                 custom_name: None,
                 number,
+                layout_effect_nonce: None,
                 root_pane: root_id,
                 layout,
                 panes,
@@ -523,6 +525,7 @@ impl Tab {
         panes.insert(pane_id, moved.pane_state);
         Self {
             custom_name,
+            layout_effect_nonce: None,
             number,
             root_pane: pane_id,
             layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),

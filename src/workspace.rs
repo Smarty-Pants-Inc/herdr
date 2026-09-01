@@ -1571,6 +1571,7 @@ impl Workspace {
         let tab = Tab {
             custom_name: None,
             number: 1,
+            layout_effect_nonce: None,
             root_pane: root_id,
             layout,
             panes,
@@ -1629,6 +1630,7 @@ impl Workspace {
         let tab = Tab {
             custom_name: name.map(str::to_string),
             number: self.next_public_tab_number,
+            layout_effect_nonce: None,
             root_pane: root_id,
             layout,
             panes,

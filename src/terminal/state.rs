@@ -3784,6 +3784,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &session_ref);
@@ -3836,6 +3837,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: expected.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &expected);
@@ -3876,6 +3878,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.pending_agent_resume_plan =
             crate::agent_resume::plan("herdr:codex", "codex", &session_ref);

@@ -154,8 +154,13 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    pub(crate) layout_apply_epoch: String,
+    pub(crate) layout_apply_receipts: crate::persist::LayoutApplyReceipts,
+    pub(crate) layout_apply_receipts_error: Option<String>,
+    pub(crate) layout_apply_quarantined: bool,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
+    pub(crate) session_persistence_blocked: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
@@ -470,6 +475,21 @@ impl App {
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
         // Try to restore previous session
+        let session_load = if no_session {
+            crate::persist::SessionLoad::Missing
+        } else {
+            crate::persist::load()
+        };
+        let session_persistence_blocked = match &session_load {
+            crate::persist::SessionLoad::Unsupported { version } => {
+                tracing::warn!(
+                    file_version = version,
+                    "refusing to mutate or overwrite unsupported session snapshot"
+                );
+                true
+            }
+            _ => false,
+        };
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (
@@ -490,12 +510,13 @@ impl App {
                 0.5_f32,
                 std::collections::HashSet::new(),
             )
-        } else if let Some(snap) = crate::persist::load() {
+        } else if let crate::persist::SessionLoad::Loaded(snap) = session_load {
             let history = config
                 .experimental
                 .pane_history
                 .then(crate::persist::load_history)
-                .flatten();
+                .flatten()
+                .filter(|history| history.version == snap.version);
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
                 &snap,
                 history.as_ref(),
@@ -881,8 +902,13 @@ impl App {
             input_leases: input::InputLeaseTable::default(),
             api_rx,
             event_hub,
+            layout_apply_epoch: String::new(),
+            layout_apply_receipts: Default::default(),
+            layout_apply_receipts_error: None,
+            layout_apply_quarantined: false,
             last_focus,
             no_session,
+            session_persistence_blocked,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
             render_notify,
@@ -895,7 +921,11 @@ impl App {
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
+        if app.session_persistence_blocked {
+            app.state.should_quit = true;
+        }
         app.configure_window_title(&config.ui.window_title);
+        app.initialize_layout_apply_idempotency(None);
         app
     }
 
@@ -967,6 +997,14 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        app.layout_apply_epoch = match &snapshot.idempotency_epoch {
+            Some(epoch) => epoch.clone(),
+            None => crate::persist::new_layout_session_epoch().map_err(io::Error::other)?,
+        };
+        app.save_layout_apply_session_snapshot_now()
+            .map_err(io::Error::other)?;
+        let restored_epoch = app.layout_apply_epoch.clone();
+        app.initialize_layout_apply_idempotency(Some(Some(&restored_epoch)));
         Ok(app)
     }
 

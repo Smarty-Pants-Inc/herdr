@@ -164,6 +164,13 @@ pub struct LayoutApplyParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LayoutIdempotentParams {
+    pub idempotency_key: String,
+    #[serde(flatten)]
+    pub layout: LayoutApplyParams,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LayoutSetSplitRatioParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,

@@ -503,6 +503,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         }

@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,28 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+
+struct ConnectionAdmission {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_admit_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionAdmission> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_CONCURRENT_CONNECTIONS).then_some(count + 1)
+        })
+        .ok()
+        .map(|_| ConnectionAdmission {
+            active: Arc::clone(active),
+        })
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -100,27 +122,41 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let Some(admission) = try_admit_connection(&active_connections) else {
+                        warn!(
+                            max = MAX_CONCURRENT_CONNECTIONS,
+                            "rejecting api connection: concurrent connection limit reached"
+                        );
+                        continue;
+                    };
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("herdr-api-connection".into())
+                        .spawn(move || {
+                            let _admission = admission;
+                            if let Err(err) = handle_connection_with_stop(
+                                stream,
+                                &api_tx,
+                                &event_hub,
+                                &connection_running,
+                                capabilities,
+                                server_stop.as_ref(),
+                            ) {
+                                warn!(err = %err, "api connection failed");
+                            }
+                        })
+                    {
+                        warn!(err = %err, "failed to spawn api connection thread");
+                    }
                 }
                 Err(err) => {
                     error!(err = %err, "api listener accept failed");
@@ -475,6 +511,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneOmpBridge(_) => "pane.omp_bridge",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
+        Method::LayoutApplyIdempotent(_) => "layout.apply_idempotent",
+        Method::LayoutReconcileIdempotent(_) => "layout.reconcile_idempotent",
         Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
         Method::PaneEdges(_) => "pane.edges",
@@ -1018,6 +1056,17 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn connection_admission_is_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut admissions = (0..MAX_CONCURRENT_CONNECTIONS)
+            .map(|_| try_admit_connection(&active).expect("connection should be admitted"))
+            .collect::<Vec<_>>();
+        assert!(try_admit_connection(&active).is_none());
+        admissions.pop();
+        assert!(try_admit_connection(&active).is_some());
     }
 
     fn unique_test_path(name: &str) -> PathBuf {

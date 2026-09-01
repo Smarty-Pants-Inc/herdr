@@ -12,7 +12,7 @@ enum SessionSaveJob {
 
 impl App {
     pub(super) fn schedule_session_save(&mut self) {
-        if !self.no_session {
+        if !self.no_session && !self.session_persistence_blocked {
             self.session_save_deadline = Some(Instant::now() + SESSION_SAVE_DEBOUNCE);
         }
     }
@@ -36,11 +36,12 @@ impl App {
         }
     }
 
-    fn capture_session_save_job(&self) -> SessionSaveJob {
+    fn capture_session_save_job(&mut self) -> SessionSaveJob {
         if self.state.workspaces.is_empty() {
+            self.reset_layout_apply_idempotency_for_session_clear();
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let mut snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
@@ -50,15 +51,20 @@ impl App {
                 self.state.sidebar_section_split,
                 self.state.collapsed_space_keys.clone(),
             );
+            snapshot.idempotency_epoch = Some(self.layout_apply_epoch.clone());
             let history = self.persist_pane_history.then(|| {
-                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+                crate::persist::capture_history(
+                    &self.state.workspaces,
+                    &self.terminal_runtimes,
+                    snapshot.version,
+                )
             });
             SessionSaveJob::Save { snapshot, history }
         }
     }
 
     pub(crate) fn start_background_session_save(&mut self) {
-        if self.no_session {
+        if self.no_session || self.session_persistence_blocked {
             self.session_save_deadline = None;
             return;
         }
@@ -88,7 +94,7 @@ impl App {
             let _ = thread.join();
         }
 
-        if self.no_session {
+        if self.no_session || self.session_persistence_blocked {
             self.session_save_deadline = None;
             return;
         }

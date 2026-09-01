@@ -2332,6 +2332,43 @@
           },
           "type": "object"
         },
+        "LayoutIdempotentParams": {
+          "properties": {
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "idempotency_key": {
+              "type": "string"
+            },
+            "root": {
+              "$ref": "#/schemas/request/$defs/LayoutNode"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "idempotency_key",
+            "root"
+          ],
+          "type": "object"
+        },
         "LayoutNode": {
           "oneOf": [
             {
@@ -5622,6 +5659,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.apply_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.reconcile_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
             }
           },
           "required": [

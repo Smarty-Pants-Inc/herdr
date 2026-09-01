@@ -23,35 +23,62 @@ fn unique_test_dir() -> PathBuf {
 }
 
 struct SpawnedHerdr {
-    _master: Box<dyn MasterPty + Send>,
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+    exited: bool,
 }
 
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
-
-        if let Some(pid) = pid {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                let mut status = 0;
-                let result =
-                    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-                if result == pid as libc::pid_t || result == -1 {
-                    break;
+        if !self.exited {
+            let _ = self.child.kill();
+            if let Some(pid) = pid {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    let mut status = 0;
+                    let result =
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                    if result == pid as libc::pid_t || result == -1 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
                 }
-                thread::sleep(Duration::from_millis(20));
             }
-
-            unregister_spawned_herdr_pid(Some(pid));
         }
+        unregister_spawned_herdr_pid(pid);
     }
 }
 
 fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
+}
+
+fn wait_for_spawned_exit(spawned: &mut SpawnedHerdr, timeout: Duration) {
+    spawned._master.take();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = spawned.child.try_wait().unwrap() {
+            spawned.exited = true;
+            assert!(
+                status.success(),
+                "herdr server exited unsuccessfully: {status}"
+            );
+            return;
+        }
+        if let Some(pid) = spawned.child.process_id() {
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                spawned.exited = true;
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "herdr child {:?} did not exit within {timeout:?}",
+        spawned.child.process_id()
+    );
 }
 
 fn test_lock() -> MutexGuard<'static, ()> {
@@ -120,6 +147,24 @@ fn spawn_herdr_with_options(
     path_override: Option<&Path>,
     shell: &str,
 ) -> SpawnedHerdr {
+    spawn_herdr_with_options_and_env(
+        config_home,
+        runtime_dir,
+        socket_path,
+        path_override,
+        shell,
+        &[],
+    )
+}
+
+fn spawn_herdr_with_options_and_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    path_override: Option<&Path>,
+    shell: &str,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -149,13 +194,17 @@ fn spawn_herdr_with_options(
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
 
     SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
+        exited: false,
     }
 }
 
@@ -307,6 +356,120 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["protocol"], 27);
 
     cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn layout_apply_second_sidecar_failure_redacts_and_reconciles_on_restart() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let cwd_marker = base.join("raw-cwd-marker");
+    fs::create_dir_all(&cwd_marker).unwrap();
+
+    let mut child = spawn_herdr_with_options_and_env(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "/bin/sh",
+        &[("HERDR_TEST_LAYOUT_IDEMPOTENCY_FAIL_WRITE_AT", "2")],
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"create","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = serde_json::json!({
+        "id": "apply",
+        "method": "layout.apply_idempotent",
+        "params": {
+            "idempotency_key": "second-write-failure",
+            "workspace_id": workspace_id,
+            "tab_label": "durable-after-second-write-failure",
+            "focus": false,
+            "root": {
+                "type": "pane",
+                "cwd": cwd_marker,
+                "command": ["/bin/sh", "-c", "exit 0 # raw-argv-marker"],
+                "env": {"HERDR_RAW_ENV_MARKER": "nonempty-secret-value"}
+            }
+        }
+    });
+
+    let failed = send_request(&socket_path, &request.to_string());
+    assert_eq!(failed["error"]["code"], "idempotency_persist_failed");
+    wait_for_spawned_exit(&mut child, Duration::from_secs(5));
+
+    let sidecar_path = config_home.join("herdr-dev").join("api-idempotency.json");
+    let pending_text = fs::read_to_string(&sidecar_path).unwrap();
+    for raw in [
+        "HERDR_RAW_ENV_MARKER",
+        "nonempty-secret-value",
+        "raw-argv-marker",
+        "raw-cwd-marker",
+    ] {
+        assert!(!pending_text.contains(raw), "sidecar leaked {raw}");
+    }
+    let pending: serde_json::Value = serde_json::from_str(&pending_text).unwrap();
+    let receipt = &pending["layout_apply"]["second-write-failure"];
+    assert_eq!(receipt["outcome"]["state"], "pending");
+    assert_eq!(
+        receipt["outcome"]["expected_tab_id"],
+        format!("{workspace_id}:t2")
+    );
+    assert!(receipt["request_digest"].as_str().is_some());
+    assert!(receipt["effect_nonce"].as_str().is_some());
+    assert!(receipt.get("params").is_none());
+
+    drop(child);
+    let restarted = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let mut reconcile_request = request;
+    reconcile_request["id"] = "reconcile".into();
+    reconcile_request["method"] = "layout.reconcile_idempotent".into();
+    let replay = send_request(&socket_path, &reconcile_request.to_string());
+    assert_eq!(replay["result"]["type"], "layout_apply", "{replay:#}");
+    assert_eq!(
+        replay["result"]["layout"]["tab_id"],
+        format!("{workspace_id}:t2")
+    );
+
+    let tabs = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"tabs","method":"tab.list","params":{{"workspace_id":"{}"}}}}"#,
+            workspace_id
+        ),
+    );
+    assert_eq!(tabs["result"]["tabs"].as_array().unwrap().len(), 2);
+
+    let committed_text = fs::read_to_string(&sidecar_path).unwrap();
+    for raw in [
+        "HERDR_RAW_ENV_MARKER",
+        "nonempty-secret-value",
+        "raw-argv-marker",
+        "raw-cwd-marker",
+    ] {
+        assert!(!committed_text.contains(raw), "sidecar leaked {raw}");
+    }
+    let committed: serde_json::Value = serde_json::from_str(&committed_text).unwrap();
+    assert_eq!(
+        committed["layout_apply"]["second-write-failure"]["outcome"]["state"],
+        "committed"
+    );
+
+    cleanup_spawned_herdr(restarted, base);
 }
 
 #[test]

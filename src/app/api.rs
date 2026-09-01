@@ -5,6 +5,7 @@ mod agents;
 mod env;
 mod input_guard;
 mod integrations;
+mod layout_idempotency;
 mod layouts;
 mod pane_graphics;
 mod panes;
@@ -1141,6 +1142,17 @@ impl App {
         context: crate::api::ApiRequestContext,
     ) -> String {
         self.sync_pending_terminal_titles();
+        if self.session_persistence_blocked && crate::api::request_changes_ui(&request) {
+            let response = crate::api::schema::ErrorResponse {
+                id: request.id,
+                error: crate::api::schema::ErrorBody {
+                    code: "session_snapshot_unsupported".into(),
+                    message: "the persisted session snapshot was written by a newer Herdr version"
+                        .into(),
+                },
+            };
+            return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        }
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             return response;
         }
@@ -1308,6 +1320,12 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutApplyIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, false)
+            }
+            Method::LayoutReconcileIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, true)
+            }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
             }
@@ -2674,6 +2692,7 @@ mod tests {
             agent_session_id: Some("codex-session".into()),
             agent_session_path: None,
             session_start_source: Some("startup".into()),
+            resume_policy: None,
         };
 
         app.handle_api_request_after_internal_events_drained_with_context(
