@@ -539,7 +539,7 @@ class TrustedWorkflowTests(unittest.TestCase):
     def test_workflow_uses_exact_source_handoff_and_isolates_build(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
         self.assertNotIn("eval(", source)
-        self.assertNotIn("omp-source.tar", source)
+        self.assertIn("omp-source.tar", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
         self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
@@ -556,7 +556,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertNotIn("trusted-build", trusted_source)
         self.assertIn("fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'", trusted_source)
         self.assertIn('git -C parent-source merge-base --is-ancestor "$PARENT" refs/remotes/origin/main', trusted_source)
-        self.assertNotIn("tarfile.open", trusted_source)
+        self.assertIn("tarfile.open", trusted_source)
         self.assertIn("runs-on: ${{ matrix.os }}", omp_build)
         self.assertIn("Build trusted Herdr source", trusted_build)
         self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
@@ -580,8 +580,13 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn('cp "omp-source/packages/coding-agent/binaries/omp-$OMP_TARGET" "release-assets/omp-$PLATFORM"', omp_build)
         self.assertIn('test "$(release-assets/omp-$PLATFORM __build-id)" = "$OMP_BUILD_ID"', omp_build)
         self.assertNotIn('bun build omp-source/packages/coding-agent/src/cli.ts --compile --outfile "release-assets/omp-$PLATFORM"', omp_build)
-        for public_handoff in (trusted_source, omp_build, assemble, attest):
-            self.assertNotIn("omp-source.tar", public_handoff)
+        self.assertIn("trusted-source-handoff/omp-source.tar", trusted_source)
+        self.assertIn("validate-git-archive", trusted_source)
+        self.assertIn("cp trusted-source/omp-source.tar source-archives/omp-source.tar", assemble)
+        self.assertLess(
+            source.index("cp trusted-source/omp-source.tar source-archives/omp-source.tar"),
+            source.index("scripts/preview.py pair-manifest"),
+        )
         self.assertIn("source-archives/herdr-source.tar", assemble)
         self.assertIn('Path("validation/producer-record.json")', assemble)
         self.assertNotIn('Path("validation/producer/producer-record.json")', assemble)

@@ -738,6 +738,72 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     cleanup_test_base(&base);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_preserves_layout_apply_idempotency_epoch() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    assert_ok(created.clone());
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace create should return an id")
+        .to_owned();
+    let layout_request = serde_json::json!({
+        "id": "test:layout:apply",
+        "method": "layout.apply_idempotent",
+        "params": {
+            "idempotency_key": "handoff-layout-epoch",
+            "workspace_id": workspace_id,
+            "tab_label": "handoff-idempotency",
+            "focus": false,
+            "root": {
+                "type": "pane",
+                "command": ["/bin/sh", "-c", "sleep 30"]
+            }
+        }
+    });
+    let applied = request(&api_socket, layout_request.clone());
+    assert_ok(applied.clone());
+    let tab_id = applied["result"]["layout"]["tab_id"]
+        .as_str()
+        .expect("layout apply should return a tab id")
+        .to_owned();
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let mut replay_request = layout_request;
+    replay_request["id"] = serde_json::json!("test:layout:replay");
+    let replayed = request(&api_socket, replay_request);
+    assert_ok(replayed.clone());
+    assert_eq!(replayed["result"]["layout"]["tab_id"], tab_id);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
     let _lock = test_lock();

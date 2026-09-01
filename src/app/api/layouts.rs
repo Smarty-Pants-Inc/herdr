@@ -135,6 +135,10 @@ impl App {
             return self.replay_layout_apply_receipt(id, idempotency_key, receipt);
         }
 
+        if reconcile_only {
+            return encode_error(id, "idempotency_no_effect", IDEMPOTENCY_NO_EFFECT_MESSAGE);
+        }
+
         let effect_nonce = match self.new_layout_effect_nonce() {
             Ok(nonce) => nonce,
             Err(err) => return encode_error(id, "idempotency_unavailable", err),
@@ -145,18 +149,6 @@ impl App {
                 "session_persist_failed",
                 format!("failed to bind the idempotency epoch to the current session: {err}"),
             );
-        }
-        if reconcile_only {
-            let receipt = crate::persist::LayoutApplyReceipt {
-                session_epoch: self.layout_apply_epoch.clone(),
-                request_digest,
-                effect_nonce,
-                outcome: crate::persist::LayoutApplyOutcome::Cancelled,
-            };
-            if let Err(err) = self.store_layout_apply_receipt(idempotency_key, receipt) {
-                return encode_layout_idempotency_store_error(id, err);
-            }
-            return encode_error(id, "idempotency_no_effect", IDEMPOTENCY_NO_EFFECT_MESSAGE);
         }
 
         let target = match self.prepare_layout_apply(&layout) {
@@ -1155,9 +1147,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn reconcile_without_receipt_fences_later_apply() {
-        with_test_config_home("reconcile-fence", |_| {
+    #[tokio::test]
+    async fn reconcile_without_receipt_does_not_fence_later_apply() {
+        with_test_config_home("reconcile-no-fence", |_| {
             let mut app = persistent_empty_app();
             let params = idempotent_layout_params(None, "cleanup-first", "cleanup");
 
@@ -1168,22 +1160,53 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(absent.error.code, "idempotency_no_effect");
+            assert!(app.layout_apply_receipts.is_empty());
 
             app.state.workspaces = vec![Workspace::test_new("layout")];
             app.state.active = Some(0);
             app.state.selected = 0;
             app.state.ensure_test_terminals();
-            let replayed_absent: ErrorResponse = serde_json::from_str(
+            let applied: SuccessResponse = serde_json::from_str(
                 &app.handle_layout_apply_idempotent("late".into(), params, false),
             )
             .unwrap();
 
-            assert_eq!(replayed_absent.error.code, "idempotency_no_effect");
-            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-            assert!(matches!(
-                app.layout_apply_receipts["cleanup-first"].outcome,
-                crate::persist::LayoutApplyOutcome::Cancelled
-            ));
+            assert!(matches!(applied.result, ResponseResult::LayoutApply { .. }));
+            assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+            shutdown_test_runtimes(&mut app);
+        });
+    }
+
+    #[tokio::test]
+    async fn fresh_reconcile_keys_do_not_exhaust_idempotency_capacity() {
+        with_test_config_home("reconcile-capacity", |_| {
+            let mut app = persistent_app_with_workspace();
+            let workspace_id = app.public_workspace_id(0);
+
+            for index in 0..=crate::persist::MAX_LAYOUT_IDEMPOTENCY_RECEIPTS {
+                let params = idempotent_layout_params(
+                    Some(workspace_id.clone()),
+                    &format!("reconcile-miss-{index}"),
+                    "reconcile",
+                );
+                let response: ErrorResponse = serde_json::from_str(
+                    &app.handle_layout_apply_idempotent(format!("reconcile-{index}"), params, true),
+                )
+                .unwrap();
+                assert_eq!(response.error.code, "idempotency_no_effect");
+            }
+            assert!(app.layout_apply_receipts.is_empty());
+
+            let applied: SuccessResponse =
+                serde_json::from_str(&app.handle_layout_apply_idempotent(
+                    "apply".into(),
+                    idempotent_layout_params(Some(workspace_id), "real-apply", "applied"),
+                    false,
+                ))
+                .unwrap();
+            assert!(matches!(applied.result, ResponseResult::LayoutApply { .. }));
+            assert_eq!(app.layout_apply_receipts.len(), 1);
+            shutdown_test_runtimes(&mut app);
         });
     }
     #[tokio::test]

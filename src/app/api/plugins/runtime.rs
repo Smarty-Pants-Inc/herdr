@@ -14,6 +14,8 @@ const PLUGIN_COMMAND_LOG_LIMIT: usize = 200;
 
 const PLUGIN_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const PLUGIN_COMMAND_TERMINATION_ATTEMPTS: usize = 40;
+const PLUGIN_COMMAND_OUTPUT_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 pub(crate) struct PluginCommandRuntime {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -120,7 +122,7 @@ fn handoff_plugin_child_to_reaper(
 fn terminate_plugin_child(
     mut child: std::process::Child,
     mut process_tree: crate::platform::ProcessTreeGuard,
-) -> bool {
+) {
     process_tree.terminate();
     let result = wait_for_plugin_child_termination(
         || match child.try_wait()? {
@@ -133,7 +135,7 @@ fn terminate_plugin_child(
         || std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
     );
     if result.is_ok() {
-        return true;
+        return;
     }
 
     let pid = child.id();
@@ -149,9 +151,33 @@ fn terminate_plugin_child(
         if let Err(error) = child.wait() {
             tracing::warn!(pid, err = %error, "synchronous plugin command reaper failed");
         }
-        return true;
     }
-    false
+}
+
+fn spawn_plugin_output_reader(
+    reader: impl Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::spawn(move || {
+        let _ = sender.send(read_capped_plugin_output(
+            reader,
+            PLUGIN_COMMAND_OUTPUT_MAX_BYTES,
+        ));
+    });
+    receiver
+}
+
+fn collect_plugin_output(
+    reader: Option<std::sync::mpsc::Receiver<String>>,
+    deadline: std::time::Instant,
+) -> String {
+    reader
+        .and_then(|reader| {
+            reader
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 fn publish_plugin_command_finished(
@@ -352,34 +378,23 @@ impl App {
                 Ok((mut child, process_tree)) => {
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
-                    let stdout_reader = stdout.map(|stdout| {
-                        std::thread::spawn(move || {
-                            read_capped_plugin_output(stdout, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
-                        })
-                    });
-                    let stderr_reader = stderr.map(|stderr| {
-                        std::thread::spawn(move || {
-                            read_capped_plugin_output(stderr, PLUGIN_COMMAND_OUTPUT_MAX_BYTES)
-                        })
-                    });
+                    let stdout_reader = stdout.map(spawn_plugin_output_reader);
+                    let stderr_reader = stderr.map(spawn_plugin_output_reader);
                     let mut child_and_tree = Some((child, process_tree));
                     let mut remote_request_channel = remote_request_channel;
                     #[cfg(unix)]
                     let mut request_delivered = remote_request_channel.is_none();
-                    let (status, readers_can_join) = loop {
+                    let status = loop {
                         if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
                             if let Some(channel) = remote_request_channel.take() {
                                 channel.cancel();
                             }
                             let (child, process_tree) = child_and_tree.take().unwrap();
-                            let reaped = terminate_plugin_child(child, process_tree);
-                            break (
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::Interrupted,
-                                    "plugin command cancelled",
-                                )),
-                                reaped,
-                            );
+                            terminate_plugin_child(child, process_tree);
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "plugin command cancelled",
+                            ));
                         }
                         #[cfg(unix)]
                         if !request_delivered {
@@ -396,8 +411,8 @@ impl App {
                                         channel.cancel();
                                     }
                                     let (child, process_tree) = child_and_tree.take().unwrap();
-                                    let reaped = terminate_plugin_child(child, process_tree);
-                                    break (Err(std::io::Error::other(err)), reaped);
+                                    terminate_plugin_child(child, process_tree);
+                                    break Err(std::io::Error::other(err));
                                 }
                                 crate::execution::RemoteRequestDelivery::Pending => {}
                             }
@@ -406,7 +421,7 @@ impl App {
                         match child.try_wait() {
                             Ok(Some(status)) => {
                                 process_tree.terminate();
-                                break (Ok(status), true);
+                                break Ok(status);
                             }
                             Ok(None) => std::thread::sleep(PLUGIN_COMMAND_POLL_INTERVAL),
                             Err(err) => {
@@ -414,19 +429,15 @@ impl App {
                                     channel.cancel();
                                 }
                                 let (child, process_tree) = child_and_tree.take().unwrap();
-                                let reaped = terminate_plugin_child(child, process_tree);
-                                break (Err(err), reaped);
+                                terminate_plugin_child(child, process_tree);
+                                break Err(err);
                             }
                         }
                     };
-                    let stdout = readers_can_join
-                        .then(|| stdout_reader.and_then(|reader| reader.join().ok()))
-                        .flatten()
-                        .unwrap_or_default();
-                    let stderr = readers_can_join
-                        .then(|| stderr_reader.and_then(|reader| reader.join().ok()))
-                        .flatten()
-                        .unwrap_or_default();
+                    let output_deadline =
+                        std::time::Instant::now() + PLUGIN_COMMAND_OUTPUT_DRAIN_TIMEOUT;
+                    let stdout = collect_plugin_output(stdout_reader, output_deadline);
+                    let stderr = collect_plugin_output(stderr_reader, output_deadline);
                     match status {
                         Ok(status) => crate::events::AppEvent::PluginCommandFinished {
                             log_id,

@@ -1273,6 +1273,15 @@ action = "open"
             .unwrap_or(0);
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
     }
+    #[cfg(unix)]
+    struct KillProcessOnDrop(i32);
+
+    #[cfg(unix)]
+    impl Drop for KillProcessOnDrop {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
 
     fn canonical_path_string(path: &std::path::Path) -> String {
         path.canonicalize()
@@ -3114,6 +3123,71 @@ platforms = ["linux", "macos"]
                 Some(libc::ESRCH)
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_shutdown_does_not_wait_for_setsid_descendant_output_pipes() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-setsid-output");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.setsid-output"
+name = "Setsid Output"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.setsid-output"].clone();
+        let escaped_pid_path = root.join("escaped-child.pid");
+        let python_pid_path = format!("{escaped_pid_path:?}");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("setsid-output".into()),
+                None,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "python3 -c 'import os,time; child=os.fork(); child and os._exit(0); os.setsid(); open({python_pid_path}, \"w\").write(str(os.getpid())); time.sleep(30)' & while [ ! -s {} ]; do sleep 0.01; done; exit 0",
+                        escaped_pid_path.display()
+                    ),
+                ],
+                &app.current_plugin_context("setsid-output-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !escaped_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its escaped child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let escaped_pid: i32 = std::fs::read_to_string(&escaped_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _escaped_child = KillProcessOnDrop(escaped_pid);
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, 0);
+        assert!(app.plugin_command_runtimes.contains_key(&log.log_id));
+
+        let started = std::time::Instant::now();
+        app.shutdown_plugin_commands();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown waited for an escaped descendant to close plugin output pipes"
+        );
+        assert!(app.plugin_command_runtimes.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

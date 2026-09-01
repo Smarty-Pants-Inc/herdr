@@ -1572,8 +1572,10 @@ impl TerminalState {
         source: &str,
         agent_label: &str,
         session_ref: &crate::agent_resume::AgentSessionRef,
+        resume_policy: crate::agent_resume::AgentResumePolicy,
     ) -> bool {
-        let matches = self.pending_agent_resume_attempt_pid.is_some()
+        let matches = (self.pending_agent_resume_attempt_pid.is_some()
+            || resume_policy == crate::agent_resume::AgentResumePolicy::External)
             && self.pending_agent_resume_plan.as_ref().is_some_and(|plan| {
                 plan.agent == agent_label
                     && plan.dedupe_key
@@ -1748,8 +1750,12 @@ impl TerminalState {
 
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
-                let resume_plan_confirmed =
-                    self.confirm_pending_agent_resume(&source, &agent_label, &session_ref);
+                let resume_plan_confirmed = self.confirm_pending_agent_resume(
+                    &source,
+                    &agent_label,
+                    &session_ref,
+                    resume_policy,
+                );
                 let current_session = self.current_session_identity_for_persistence();
                 return Some(TerminalStateMutation {
                     effective_state_change: self.recompute_effective_state(
@@ -1847,7 +1853,7 @@ impl TerminalState {
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
         let resume_plan_confirmed =
-            self.confirm_pending_agent_resume(&source, &agent_label, &session_ref);
+            self.confirm_pending_agent_resume(&source, &agent_label, &session_ref, resume_policy);
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -3800,6 +3806,39 @@ mod tests {
             .expect("matching report should otherwise be accepted");
 
         assert!(terminal.pending_agent_resume_plan.is_some());
+    }
+
+    #[test]
+    fn accepted_external_report_confirms_deferred_native_resume_without_attempt_pid() {
+        let mut terminal = test_terminal().with_execution_target(
+            crate::execution::ExecutionTarget::ssh("dev1").expect("valid SSH host"),
+        );
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-session.jsonl"))
+                .expect("valid OMP session path");
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
+        });
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        assert_eq!(terminal.pending_agent_resume_attempt_pid(), None);
+
+        let confirmed = terminal
+            .set_agent_session_ref_for_session_start_with_resume_policy(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref),
+                Some(10),
+                Some("startup".into()),
+                crate::agent_resume::AgentResumePolicy::External,
+            )
+            .expect("external OMP ownership report should be accepted");
+
+        assert!(confirmed.session_ref_changed);
+        assert!(terminal.pending_agent_resume_plan.is_none());
     }
 
     #[cfg(unix)]

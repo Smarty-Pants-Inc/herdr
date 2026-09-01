@@ -297,21 +297,78 @@ jobs:
               for key in ("build_id", "commit", "tree", "version"):
                   output.write(f"omp_{key}={omp[key]}\n")
           PY
-      - name: Stage validated OMP identity handoff
+      - name: Archive validated OMP source handoff
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p trusted-source-handoff
           cp trusted-source-record.json trusted-source-handoff/trusted-source-record.json
           python -I -S - <<'PY'
-          import json
+          import io, json, subprocess, tarfile
           from pathlib import Path
           record = json.loads(Path("trusted-source-record.json").read_text(encoding="utf-8"))
           Path("trusted-source-handoff/omp-descriptor.json").write_text(
               json.dumps(record["omp"], sort_keys=True, separators=(",", ":")) + "\n",
               encoding="utf-8",
           )
+          records = subprocess.check_output(["git", "-C", "omp-source", "ls-tree", "-r", "--full-tree", "-z", "HEAD"])
+          max_file_bytes = 4 * 1024 * 1024 * 1024
+          max_total_bytes = 16 * 1024 * 1024 * 1024
+          total = 0
+          with tarfile.open("trusted-source-handoff/omp-source.tar", "w") as archive:
+              for tree_record in records.split(b"\0"):
+                  if not tree_record:
+                      continue
+                  header, raw_name = tree_record.split(b"\t", 1)
+                  mode, kind, object_id = header.split()
+                  if kind != b"blob":
+                      raise SystemExit(f"unsupported non-blob OMP source tree entry: {raw_name!r}")
+                  object_name = object_id.decode("ascii")
+                  git_mode = int(mode, 8)
+                  size = int(subprocess.check_output(["git", "-C", "omp-source", "cat-file", "-s", object_name], text=True).strip())
+                  if size > max_file_bytes or total > max_total_bytes - size:
+                      raise SystemExit(f"OMP source exceeds the bounded archive size limit: {raw_name!r}")
+                  total += size
+                  info = tarfile.TarInfo(raw_name.decode("utf-8"))
+                  info.mtime = 0
+                  if git_mode & 0o170000 == 0o120000:
+                      if size < 1 or size > 4096:
+                          raise SystemExit(f"OMP symlink target exceeds the bounded size limit: {raw_name!r}")
+                      target_bytes = subprocess.check_output(["git", "-C", "omp-source", "cat-file", "blob", object_name])
+                      if len(target_bytes) != size:
+                          raise SystemExit(f"OMP symlink target size changed: {raw_name!r}")
+                      target = target_bytes.decode("utf-8")
+                      if (not target or "\x00" in target or "\\" in target or target.startswith("/")
+                              or any(part in ("", ".") for part in target.split("/"))):
+                          raise SystemExit(f"unsafe OMP symlink target: {raw_name!r}")
+                      info.type = tarfile.SYMTYPE
+                      info.linkname = target
+                      info.mode = 0
+                      info.size = 0
+                      archive.addfile(info)
+                      continue
+                  info.mode = git_mode & 0o7777
+                  info.size = size
+                  process = subprocess.Popen(["git", "-C", "omp-source", "cat-file", "blob", object_name], stdout=subprocess.PIPE)
+                  if process.stdout is None:
+                      process.kill()
+                      process.wait()
+                      raise SystemExit("OMP Git blob stream is unavailable")
+                  try:
+                      archive.addfile(info, process.stdout)
+                      if process.stdout.read(1):
+                          raise SystemExit(f"OMP Git blob exceeds declared size: {raw_name!r}")
+                  except BaseException:
+                      if process.poll() is None:
+                          process.kill()
+                      process.wait()
+                      raise
+                  if process.wait() != 0:
+                      raise SystemExit(f"OMP Git blob could not be read: {raw_name!r}")
           PY
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive \
+            --archive trusted-source-handoff/omp-source.tar \
+            --repository omp-source
       - name: Upload trusted source handoff
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -808,6 +865,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets metadata/cargo-metadata source-archives
           cp trusted-source/trusted-source-record.json metadata/source-validation.json
+          cp trusted-source/omp-source.tar source-archives/omp-source.tar
           cp validation/producer/producer-plan.json metadata/producer-plan.json
           cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar
           python -I -S - <<'PY'

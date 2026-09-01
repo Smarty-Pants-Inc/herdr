@@ -1151,11 +1151,23 @@ file: ../../../public/assets/logo.svg
         self.assertEqual(len(preview.FULL_RELEASE_ASSET_NAMES), 37)
         self.assertEqual(len(set(preview.FULL_RELEASE_ASSET_NAMES)), 37)
         self.assertEqual(preview.SEMANTIC_VERIFICATION_SCHEMA, "smarty.semantic-verification.v2")
-        self.assertEqual(preview.SOURCE_ARCHIVE_NAMES, ("herdr-source.tar",))
+        self.assertEqual(
+            preview.SOURCE_ARCHIVE_NAMES,
+            ("herdr-source.tar", "omp-source.tar"),
+        )
         jobs = workflow_jobs(trusted)
-        self.assertNotIn("omp-source.tar", trusted)
-        self.assertNotIn("tarfile.open", jobs["trusted-source"])
+        self.assertIn("omp-source.tar", trusted)
+        self.assertIn("tarfile.open", jobs["trusted-source"])
+        self.assertIn("trusted-source-handoff/omp-source.tar", jobs["trusted-source"])
         self.assertIn("trusted-source-record.json", jobs["trusted-source"])
+        self.assertIn(
+            "cp trusted-source/omp-source.tar source-archives/omp-source.tar",
+            jobs["trusted-assemble"],
+        )
+        self.assertLess(
+            trusted.index("cp trusted-source/omp-source.tar source-archives/omp-source.tar"),
+            trusted.index("scripts/preview.py pair-manifest"),
+        )
         self.assertNotIn("publisher-source", jobs["trusted-build"])
         self.assertIn("source\\scripts\\package_windows_conpty.ps1", jobs["trusted-build"])
         for job in ("trusted-omp-build", "trusted-assemble", "attest-and-seal"):

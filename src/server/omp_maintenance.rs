@@ -400,19 +400,19 @@ impl OmpMaintenance {
         validate_operation_id(operation_id)?;
         let owner_hash = operation_owner_hash(operation_id);
         self.with_state(|state, dirty| {
+            if state
+                .completed_operations
+                .iter()
+                .any(|completed| owner_matches(completed, &owner_hash))
+            {
+                return Ok(state.status());
+            }
             if let Some(lease) = &state.lease {
                 if !owner_matches(&lease.owner_hash, &owner_hash) {
                     return Err(OmpMaintenanceError::Conflict(
                         "OMP maintenance is already held".into(),
                     ));
                 }
-                return Ok(state.status());
-            }
-            if state
-                .completed_operations
-                .iter()
-                .any(|completed| owner_matches(completed, &owner_hash))
-            {
                 return Ok(state.status());
             }
             state.lease = Some(PersistedLease {
@@ -483,14 +483,14 @@ impl OmpMaintenance {
         validate_operation_id(operation_id)?;
         let owner_hash = operation_owner_hash(operation_id);
         self.with_state(|state, dirty| {
+            if state
+                .completed_operations
+                .iter()
+                .any(|completed| owner_matches(completed, &owner_hash))
+            {
+                return Ok(state.status());
+            }
             let Some(lease) = &state.lease else {
-                if state
-                    .completed_operations
-                    .iter()
-                    .any(|completed| owner_matches(completed, &owner_hash))
-                {
-                    return Ok(state.status());
-                }
                 return Err(OmpMaintenanceError::NotOwner(
                     "OMP maintenance ownership proof is invalid".into(),
                 ));
@@ -2408,6 +2408,34 @@ mod tests {
         ));
         assert!(maintenance.acquire(&next).unwrap().held);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lost_response_acquire_retry_replays_after_later_lease_operation() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store);
+        let original = operation_id(8);
+        let later = operation_id(9);
+
+        maintenance.acquire(&original).unwrap();
+        maintenance.release(&original).unwrap();
+        let current = maintenance.acquire(&later).unwrap();
+
+        assert_eq!(maintenance.acquire(&original).unwrap(), current);
+    }
+
+    #[test]
+    fn lost_response_release_retry_replays_after_later_lease_operation() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store);
+        let original = operation_id(10);
+        let later = operation_id(11);
+
+        maintenance.acquire(&original).unwrap();
+        maintenance.release(&original).unwrap();
+        let current = maintenance.acquire(&later).unwrap();
+
+        assert_eq!(maintenance.release(&original).unwrap(), current);
     }
     #[test]
     fn handoff_validation_rejects_a_route_added_after_state_capture() {
