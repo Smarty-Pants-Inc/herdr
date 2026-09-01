@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(not(test))]
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
@@ -12,10 +13,15 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
 }
 
 pub(crate) fn begin_cli_output() {
+    // Unit tests share one process; changing SIGPIPE here can kill unrelated
+    // tests that deliberately write to closed sockets. Integration tests still
+    // exercise the real executable with the production disposition.
+    #[cfg(not(test))]
     set_sigpipe_disposition(libc::SIG_DFL);
 }
 
 pub(crate) fn end_cli_output() {
+    #[cfg(not(test))]
     set_sigpipe_disposition(libc::SIG_IGN);
 }
 

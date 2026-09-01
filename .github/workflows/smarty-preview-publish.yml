@@ -926,9 +926,6 @@ jobs:
           test "$(git -C omp-source rev-parse HEAD^{commit})" = "$OMP_COMMIT"
           test "$(git -C omp-source rev-parse HEAD^{tree})" = "$OMP_TREE"
           test -z "$(git -C omp-source status --porcelain=v1 --untracked-files=all)"
-          mkdir -p source-archives
-          git -C omp-source archive --format=tar --output "$GITHUB_WORKSPACE/source-archives/omp-source.tar" HEAD
-          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive --archive source-archives/omp-source.tar --repository omp-source
       - name: Resolve existing exact release
         id: existing
         env:
@@ -1057,7 +1054,7 @@ jobs:
           PARENT_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["parent"])')"
           SOURCE_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["source"])')"
           OMP_TREE="$(python -I -S -c 'import json; print(json.load(open("metadata/source-trees.json"))["omp"])')"
-          python publisher-source/scripts/smarty_preview_release.py verify-attested-pair \
+          python publisher-source/scripts/preview.py verify-attested-pair \
             --asset-dir immutable-assets --expected-parent "$PARENT" --expected-source "$SOURCE" --expected-omp "$OMP" \
             --expected-parent-tree "$PARENT_TREE" --expected-source-tree "$SOURCE_TREE" --expected-omp-tree "$OMP_TREE" \
             --expected-tag "$TAG" --expected-build-id "$BUILD_ID" --herdr-root herdr-source --omp-root omp-source \

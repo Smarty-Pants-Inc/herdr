@@ -27,6 +27,8 @@ jobs:
               49699333, // dependabot[bot]
               41898282, // github-actions[bot]
             ]);
+            const MERGIFY_BOT_USER_ID = 37929162;
+            const MERGIFY_QUEUE_BASES = new Set(['master', 'smarty-preview-source']);
             const REVIEW_TRIGGER_MARKER = '<!-- herdr:ai-review-trigger -->';
             const COMMENT_MARKER = '<!-- herdr:pr-gate -->';
 
@@ -39,6 +41,12 @@ jobs:
               pull_number: pullNumber,
             });
             const prAuthor = pr.user.login;
+
+            function isMergifyQueuePullRequest() {
+              return pr.user.id === MERGIFY_BOT_USER_ID
+                && pr.head.ref.startsWith('mergify/merge-queue/')
+                && MERGIFY_QUEUE_BASES.has(pr.base.ref);
+            }
 
             async function getPermission(username) {
               try {
@@ -189,6 +197,11 @@ jobs:
             }
 
             if (pr.state === 'closed') return;
+
+            if (isMergifyQueuePullRequest()) {
+              core.info(`Leaving scoped Mergify queue PR open: ${pr.head.ref} -> ${pr.base.ref}`);
+              return;
+            }
 
             if (CI_ONLY_PR_AUTHOR_IDS.has(pr.user.id)) {
               core.info(`Leaving CI-only bot PR open without automated AI review: ${prAuthor}`);
