@@ -3,15 +3,14 @@
 ## Status and exact identities
 
 - Mission: `smarty-pants-increment3a-corrective-closure`
-- Result: the rebased C3 source chain, compatibility/API/schema contracts, full `just check`, and arm64 Darwin release candidate are evidenced below; protected landing and root pin/package work remain Integration Master responsibilities.
-- Rebase base: `82f8e5e3de900a685606d2da13ce5eb38ce8764c`.
-- Production source parent: `633b9d66c446998fd5f1532f05c15748f64cb070`; tree `7d3041fa202af2db63c2321d2bf06190183e2552`.
-- Rebased evidence candidate HEAD: `81ff9b2fbc82f3f8a7288c1d979a8d299927a0f7`; tree `9529e5808de55f2e9a760b39b5f86e07fcc40d96`.
-- Rebased sequence: `861dffd`, `734af1d`, `67d5f2a`, `633b9d6`, `81ff9b2`.
+- Result: the corrected C3 source chain, public API/schema compatibility, layout idempotency persistence, live-handoff identity, plugin shutdown, OMP maintenance replay, and exact-source preview handoff are evidenced below. Protected landing and root pin/package work remain Integration Master responsibilities.
+- Upstream base: `e205b0354a6e7daa1ba61ef0d42a794c263181e0`.
+- Corrected source parent: `dc6995d523266601a65295ad88495f9ffb703e45`; tree `66cad1b9f8371a7ec40a094cd3377a04018606ad`.
+- Corrected source commit: `b9d8582a5b24271a4eb62963a789921ae960e0b0`; tree `b2fc0e9a7f7c3e8b5ed7e0f2cf727917946e77ae`.
 - Branch: `i3a-corrective/c3-seam-closure`.
-- Evidence binding: the exact `81ff9b2` candidate is externally bound by the root proof/package record. This handoff-update commit deliberately makes no self-referential final-HEAD claim.
+- Evidence commit: the next local commit. Its SHA and tree are reported by the Integration Master because a commit cannot contain its own SHA.
 - Worktree: `/Users/paulbettner/.herdr/worktrees/herdr/i3a-corrective-c3`.
-- No push, pull request, merge, install, release, deployment, or root-pin change occurred.
+- No push, pull request, merge, install, release, deployment, root-pin change, or Increment 3B work occurred in this lane.
 
 ## Authority custody
 
@@ -35,6 +34,71 @@ e16a65689b9f6c39ab4ba62bd4aa5c69efa2553fe1f9b9dc4eaf630d5f0d1ec2
 wc -c /Users/paulbettner/Downloads/SMARTY_PANTS_INCREMENT3A_CORRECTIVE_SOURCE_HANDOFF.md
 23694
 ```
+
+## Corrective closure addendum
+
+Corrected source commit `b9d8582a5b24271a4eb62963a789921ae960e0b0` closes the independent-review findings against the earlier C3 candidate:
+
+- `.github/workflows/smarty-preview-publish.yml`, `scripts/preview.py`, and their tests now create, validate, transfer, stage, and semantically verify the exact Git-tree `omp-source.tar` beside `herdr-source.tar`. The preview artifact no longer claims source closure while omitting the validated OMP source.
+- `src/app/api/plugins/runtime.rs` bounds stdout/stderr drain waits to one shared 250 ms deadline after child termination. Escaped descendants that retain inherited pipes no longer block command completion or application shutdown.
+- `src/server/headless.rs` places the active layout idempotency epoch into the live handoff snapshot. The successor restores the same receipt namespace rather than rotating identity during an in-memory handoff.
+- `src/terminal/state.rs` accepts a matching, authorized External ownership report as confirmation of a deferred matching Native resume before an attempt PID exists. Native reports still require a live attempt.
+- `src/server/omp_maintenance.rs` replays completed acquire/release operation identities before evaluating a later lease conflict, so lost responses remain idempotent after ownership advances.
+- `src/app/api/layouts.rs` returns a reconcile miss without allocating a durable cancelled receipt. Reconcile-only probes cannot exhaust the 1,024-entry layout receipt capacity or fence a later real apply.
+
+Exact corrected-source verification:
+
+```text
+cargo fmt --check
+PASS
+
+cargo clippy --all-targets --locked -- -D warnings
+PASS
+
+python3 -m unittest scripts.test_preview scripts.test_preview_publisher
+PASS — 82 tests
+
+python3 -m unittest \
+  scripts.test_agent_detection_manifest_check \
+  scripts.test_changelog \
+  scripts.test_config_reference_check \
+  scripts.test_docs_translation_parity \
+  scripts.test_hermes_integration_asset \
+  scripts.test_package_windows_conpty \
+  scripts.test_preview \
+  scripts.test_preview_publisher \
+  scripts.test_unix_installer \
+  scripts.test_vendor_libghostty_vt \
+  scripts.test_vendor_portable_pty
+PASS — 172 tests
+
+cargo nextest run --locked --no-fail-fast \
+  --status-level fail --final-status-level fail \
+  --failure-output final --success-output never
+BASELINE-ATTRIBUTED — 4,073 tests ran: 4,069 passed, 4 failed, 1 skipped.
+The four failures were `events_subscribe_streams_output_and_agent_status_events`,
+`live_server_holds_one_pty_master_fd_per_pane`,
+`multi_client_broadcasts_frame_updates_to_all_clients`, and
+`multi_client_keeps_navigation_and_input_routing_independent`.
+An earlier isolated run against clean upstream base `e205b0354` reproduced the same four failures; none touches the corrected paths above.
+
+Focused corrected contracts:
+fresh_reconcile_keys_do_not_exhaust_idempotency_capacity — PASS
+reconcile_without_receipt_does_not_fence_later_apply — PASS
+app_shutdown_does_not_wait_for_setsid_descendant_output_pipes — PASS
+accepted_external_report_confirms_deferred_native_resume_without_attempt_pid — PASS
+matching_resume_report_requires_live_attempt — PASS
+live_handoff_preserves_layout_apply_idempotency_epoch — PASS
+lost_response_acquire_retry_replays_after_later_lease_operation — PASS
+lost_response_release_retry_replays_after_later_lease_operation — PASS
+ownership_capability_is_private_idempotent_and_replay_safe — PASS
+plugin_completion_kills_descendants_that_outlive_the_direct_child — PASS
+
+git diff --check
+PASS
+```
+
+The implementation task was delegated to OMP task agent `herdr-correctness-fixes`, pinned to `terra-high`; the Integration Master re-read the material changes and reran the exact committed-source gates above. The later final root review and package bind the evidence commit and rebuilt binary to the complete landed constellation.
 
 ## Task, session, and model evidence
 
@@ -195,11 +259,11 @@ The shared `terminal_agent_session_info` projection feeds pane APIs. Agent APIs 
 
 Generated `docs/next/api/herdr-api.schema.json` now includes optional `AgentResumePolicy` references for `AgentSessionInfo` in both event and success-response schemas. `docs/next/website/src/content/docs/socket-api.mdx` shows an External example and documents Native omission. Published version docs, root README, root changelog, and stable skill files were not changed.
 
-## Verification
+## Earlier C3 verification record
 
-### Focused commands
+The sections below preserve the earlier rebased-candidate verification and patch provenance. They are historical evidence, not the current corrected-source identity. The authoritative corrected-source results are in the addendum above; final binary identity is rebound by the Integration Master after the evidence commit and protected landing.
 
-The named focused contracts listed below were retained through the rebase; the current rebased candidate's authoritative complete test evidence is the final `just check` log recorded in the next section.
+### Earlier focused commands
 
 ```text
 cargo fmt --check
@@ -233,7 +297,9 @@ maintenance Python suites: 127 tests, OK
 
 The log's locked arm64 release build completed successfully and emitted the candidate binary hash recorded below. Its only warning was the repository's external-contributor policy reminder; no lint or test warning became a failure.
 
-## Exact arm64 Darwin binary provenance
+## Earlier arm64 Darwin binary provenance — superseded
+
+This binary predates corrected source commit `b9d8582a5b24271a4eb62963a789921ae960e0b0` and must not be used or claimed as the corrected or landed artifact. The Integration Master rebuilds and records the exact corrected and landed binary separately.
 
 | Field | Value |
 | --- | --- |
