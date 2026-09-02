@@ -616,3 +616,34 @@ PASS
 ```
 
 No release was published, reconciled, installed, or activated during this verification. The prior Nix CI external crates.io 403 remains a documented infrastructure limitation, not a source failure.
+
+## Post-review maintenance-state repair addendum — 2026-09-02
+
+The independent review's remaining findings are closed by source commit `0d203e3bae39f20a43fd95f58c05614017470529`, tree `a6025bf74f4177d4263dd6ffdd2fdc8e1bfaf219`.
+
+- `PersistedState.completed_operations` is bounded to the most recent 64 operation identities. Validation rejects oversized histories, load rejects state files larger than 64 KiB before JSON parsing, and save rejects serialized state at the same bound. This prevents unbounded replay growth from repeated local acquire/release calls while retaining the required recent idempotency window.
+- Default `omp_maintenance` capability is advertised only on Linux and macOS, matching the implemented ACL-free platform support. Windows remains fail-closed rather than advertising an unavailable capability.
+
+Exact repair verification:
+
+```text
+just test-one omp_maintenance
+PASS — 30 tests, 0 failures
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+python3 -m unittest scripts.test_preview scripts.test_preview_publisher
+PASS — 107 tests
+
+git diff --check
+PASS
+```
+
+The Nix workflow's crates.io HTTP 403 remains an external infrastructure limitation. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
