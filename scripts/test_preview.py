@@ -1055,7 +1055,7 @@ file: ../../../public/assets/logo.svg
         self.assertIn("workflow_run:\n    workflows: [\"Smarty Preview\"]\n    types: [completed]", trusted)
         self.assertEqual(
             list(jobs),
-            ["validate-seal", "trusted-source", "trusted-build", "trusted-omp-build", "trusted-assemble", "attest-and-seal", "publish-release", "phase-a-channel", "phase-b-promotion"],
+            ["validate-seal", "trusted-source", "trusted-build", "trusted-omp-build", "trusted-assemble", "attest-and-seal", "publish-release", "phase-a-channel", "phase-a-commit", "phase-b-promotion", "phase-b-commit"],
         )
         for required in (
             "github.event.workflow_run.id",
@@ -1077,11 +1077,11 @@ file: ../../../public/assets/logo.svg
             trusted,
         )
         self.assertIn(
-            "trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
+            "trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
             trusted,
         )
         self.assertNotIn(
-            "name: trusted-tuf-promotion-gate-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}\n",
+            "name: trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}\n",
             trusted,
         )
         for pool in (
@@ -1134,7 +1134,7 @@ file: ../../../public/assets/logo.svg
         self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6", trusted)
         self.assertIn("smarty-provenance-", trusted)
         self.assertIn("trusted-final-release-", trusted)
-        self.assertIn('gh api "repos/$REPOSITORY/releases/tags/$TAG"', trusted)
+        self.assertIn("Resolve existing exact release", trusted)
         self.assertIn("gh release upload", trusted)
         self.assertIn("smarty_preview_trusted.py seal", trusted)
         self.assertIn('export HERDR_BUILD_UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"', trusted)
@@ -1144,9 +1144,9 @@ file: ../../../public/assets/logo.svg
             self.assertIn("trusted-herdr-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
             self.assertIn("trusted-omp-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
         self.assertIn("trusted-herdr-windows-x86_64-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
-        self.assertIn("canary TUF handoff pair_id mismatch", trusted)
-        self.assertIn("canary TUF target length or digest is malformed", trusted)
-        self.assertIn('"release_url"', trusted)
+        self.assertIn("Validate exact protected promotion target", trusted)
+        self.assertIn("Promote canonical channel and consume both authorizations atomically", trusted)
+        self.assertIn("smarty_preview_promotion.py review", trusted)
         self.assertEqual(len(preview.FULL_RELEASE_ASSET_NAMES), 37)
         self.assertEqual(len(set(preview.FULL_RELEASE_ASSET_NAMES)), 37)
         self.assertEqual(preview.SEMANTIC_VERIFICATION_SCHEMA, "smarty.semantic-verification.v3")
