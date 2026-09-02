@@ -386,10 +386,10 @@ impl OmpMaintenance {
             } => inspect_file_state(state_root, state_path, lock_path),
             #[cfg(test)]
             Backend::Memory(backend) => {
-                let backend = backend.store.lock().map_err(|_| {
+                let mut backend = backend.store.lock().map_err(|_| {
                     OmpMaintenanceError::StateIo("OMP maintenance state lock is poisoned".into())
                 })?;
-                backend.state.validate()?;
+                backend.state.validate_and_compact_legacy()?;
                 Ok(backend.state.status())
             }
         }
@@ -677,8 +677,7 @@ impl OmpMaintenance {
                         "injected OMP maintenance state failure".into(),
                     ));
                 }
-                backend.state.validate()?;
-                let mut dirty = false;
+                let mut dirty = backend.state.validate_and_compact_legacy()?;
                 let result = apply(&mut backend.state, &mut dirty);
                 if dirty {
                     backend.state.validate()?;
@@ -719,7 +718,26 @@ impl PersistedState {
         }
     }
 
+    fn validate_and_compact_legacy(&mut self) -> Result<bool, OmpMaintenanceError> {
+        if self.completed_operations.len() <= MAX_COMPLETED_OPERATIONS {
+            self.validate()?;
+            return Ok(false);
+        }
+        self.validate_with_completed_operation_limit(false)?;
+        let retain_from = self.completed_operations.len() - MAX_COMPLETED_OPERATIONS;
+        self.completed_operations = self.completed_operations.split_off(retain_from);
+        self.validate()?;
+        Ok(true)
+    }
+
     fn validate(&self) -> Result<(), OmpMaintenanceError> {
+        self.validate_with_completed_operation_limit(true)
+    }
+
+    fn validate_with_completed_operation_limit(
+        &self,
+        enforce_completed_operation_limit: bool,
+    ) -> Result<(), OmpMaintenanceError> {
         if self.version != STATE_VERSION {
             return Err(OmpMaintenanceError::StateInvalid(format!(
                 "unsupported OMP maintenance state version {}",
@@ -750,7 +768,9 @@ impl PersistedState {
             }
         }
 
-        if self.completed_operations.len() > MAX_COMPLETED_OPERATIONS {
+        if enforce_completed_operation_limit
+            && self.completed_operations.len() > MAX_COMPLETED_OPERATIONS
+        {
             return Err(OmpMaintenanceError::StateInvalid(format!(
                 "OMP maintenance contains more than {MAX_COMPLETED_OPERATIONS} completed operations"
             )));
@@ -932,8 +952,11 @@ fn inspect_file_state(
         .map_err(|error| state_io(&lock_path, "open state lock", error))?;
     lock.lock()
         .map_err(|error| state_io(&lock_path, "lock state", error))?;
-    let state = load_state(&state_path)?;
-    state.validate()?;
+    let mut state = load_state(&state_path)?;
+    let migrated = state.validate_and_compact_legacy()?;
+    if migrated {
+        save_state(&state_path, &state)?;
+    }
     Ok(state.status())
 }
 
@@ -967,8 +990,8 @@ fn with_file_state<T>(
         .map_err(|error| state_io(lock_path, "lock state", error))?;
 
     let mut state = load_state(state_path)?;
-    state.validate()?;
-    let mut dirty = reconcile_stale_routes(&mut state, instance_dir, current_instance_id)?;
+    let mut dirty = state.validate_and_compact_legacy()?;
+    dirty |= reconcile_stale_routes(&mut state, instance_dir, current_instance_id)?;
     let result = apply(&mut state, &mut dirty);
     if dirty {
         state.validate()?;
@@ -2504,6 +2527,88 @@ mod tests {
                 .unwrap()
                 .held
         );
+    }
+
+    #[test]
+    fn legacy_completed_operations_are_compacted_before_file_state_use() {
+        let dir = test_dir("legacy-compaction");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let legacy = PersistedState {
+            version: STATE_VERSION,
+            lease: None,
+            completed_operations: (0..=MAX_COMPLETED_OPERATIONS as u8)
+                .map(|seed| operation_owner_hash(&operation_id(seed)))
+                .collect(),
+            routes: Vec::new(),
+        };
+        fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        make_private(&state_path);
+        make_private(&lock_path);
+
+        let maintenance = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let inspected = maintenance.inspect().unwrap();
+        assert!(!inspected.held);
+
+        let compacted: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            compacted.completed_operations,
+            (1..=MAX_COMPLETED_OPERATIONS as u8)
+                .map(|seed| operation_owner_hash(&operation_id(seed)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(maintenance.status().unwrap(), inspected);
+
+        let reacquired = maintenance.acquire(&operation_id(0)).unwrap();
+        assert!(reacquired.held);
+        assert!(!maintenance.release(&operation_id(0)).unwrap().held);
+        assert_eq!(
+            serde_json::from_slice::<PersistedState>(&fs::read(&state_path).unwrap())
+                .unwrap()
+                .completed_operations
+                .len(),
+            MAX_COMPLETED_OPERATIONS
+        );
+        drop(maintenance);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_compaction_rejects_an_invalid_entry_before_dropping_it() {
+        let dir = test_dir("legacy-invalid-compaction");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let mut completed_operations = (0..=MAX_COMPLETED_OPERATIONS as u8)
+            .map(|seed| operation_owner_hash(&operation_id(seed)))
+            .collect::<Vec<_>>();
+        completed_operations[0] = "invalid-owner-hash".into();
+        let legacy = PersistedState {
+            version: STATE_VERSION,
+            lease: None,
+            completed_operations,
+            routes: Vec::new(),
+        };
+        fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        make_private(&state_path);
+        make_private(&lock_path);
+
+        let maintenance = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        assert!(matches!(
+            maintenance.inspect(),
+            Err(OmpMaintenanceError::StateInvalid(message))
+                if message.contains("owner hash")
+        ));
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        drop(maintenance);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]
