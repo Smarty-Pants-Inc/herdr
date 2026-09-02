@@ -451,3 +451,41 @@ PASS
 ```
 
 An independent read-only final review of this complete corrective diff returned exactly `CLEAN` with confidence `0.99`; it changed no files. Earlier review findings and their minimum fixes are retained above as provenance. No user-owned daemon was restarted, no release was installed, and no protected landing or root pin is claimed by this lane.
+
+## Post-review corrective closure addendum (2026-09-02)
+
+The final corrective candidate is commit `288aa53bfa1af6fabe956e2bdd406c50dd2c9ab4` with tree `a6fa5171757984facf5d23240f060bfd113a8c69`, based on `ec53b3a7624c6bf82d42f9979daf3f008343e905`; protected `origin/master` is `5c01efa9370168356afc1ba42e2c93c27df55770` and is an ancestor of the candidate. The commit closes the last independent-review findings:
+
+- The trusted publisher's draft-release asset verifier checks out the exact trusted publisher source and uses its HTTPS redirect handler, removing the release token before any cross-origin artifact redirect.
+- Live handoff joins an in-flight source autosave without rewriting source-owned session bytes before commit. The source's exact persisted state therefore remains recoverable when importer replacement fails after restoration.
+- Paired session/history persistence snapshots prior regular-file bytes and restores both files on any later write failure. The layout checkpoint restores an earlier pending save deadline when persistence fails or is blocked. Directory syncing is Unix-only; Windows persistence does not attempt to open directories as regular files.
+
+Final corrective verification against `288aa53b`:
+
+```text
+cargo fmt --all
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
+PASS
+
+just windows-lint
+PASS — x86_64-pc-windows-msvc production clippy
+
+python3 -m unittest scripts.test_preview_publisher
+PASS — 46 tests
+
+cargo nextest run --locked pre_effect_session_checkpoint_restores_pending_save_on_failure baseline_session_save_failure_has_no_effect_or_receipt final_session_save_joins_background_writer_before_returning failed_external_handoff_preserves_v5_session_for_restart live_handoff_preserves_layout_apply_idempotency_epoch external_extension_descendant_reports_confirm_active_attempt_but_not_ssh_or_retired_attempts --status-level fail --final-status-level fail --failure-output final --success-output never
+PASS — 6 tests, 0 failures
+
+git diff --check
+PASS
+```
+
+An independent read-only review of the complete final corrective diff returned `CLEAN` with confidence `0.99`; it found no P0-P2 issue and changed no files. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
