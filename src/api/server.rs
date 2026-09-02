@@ -102,8 +102,23 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-        omp_maintenance: true,
+        omp_maintenance: cfg!(any(target_os = "linux", target_os = "macos")),
     })
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn default_capabilities_advertise_omp_maintenance_only_on_supported_platforms() {
+        assert_eq!(
+            default_capabilities()
+                .expect("default capabilities")
+                .omp_maintenance,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
 }
 
 fn start_server_inner(

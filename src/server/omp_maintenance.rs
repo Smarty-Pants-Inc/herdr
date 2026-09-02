@@ -27,6 +27,8 @@ const STATE_VERSION: u32 = 1;
 const STATUS_SCHEMA: &str = "herdr.omp_maintenance.v1";
 const OPERATION_ID_BYTES: usize = 32;
 const ENCODED_TOKEN_BYTES: usize = 43;
+const MAX_COMPLETED_OPERATIONS: usize = 64;
+const MAX_STATE_FILE_BYTES: usize = 64 * 1024;
 const INSTANCE_DIRECTORY: &str = "omp-maintenance-v1.instances";
 const INSTANCE_CREATE_ATTEMPTS: usize = 8;
 
@@ -508,6 +510,9 @@ impl OmpMaintenance {
                     "OMP maintenance lease disappeared during release".into(),
                 ));
             };
+            if state.completed_operations.len() == MAX_COMPLETED_OPERATIONS {
+                state.completed_operations.remove(0);
+            }
             state.completed_operations.push(released.owner_hash);
             *dirty = true;
             Ok(state.status())
@@ -745,6 +750,11 @@ impl PersistedState {
             }
         }
 
+        if self.completed_operations.len() > MAX_COMPLETED_OPERATIONS {
+            return Err(OmpMaintenanceError::StateInvalid(format!(
+                "OMP maintenance contains more than {MAX_COMPLETED_OPERATIONS} completed operations"
+            )));
+        }
         let mut completed = HashSet::new();
         for owner_hash in &self.completed_operations {
             validate_owner_hash(owner_hash)?;
@@ -1029,17 +1039,33 @@ fn reconcile_stale_routes(
 }
 
 fn load_state(path: &Path) -> Result<PersistedState, OmpMaintenanceError> {
-    let mut file = match open_private(path, false, false) {
+    let file = match open_private(path, false, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(PersistedState::default());
         }
         Err(error) => return Err(state_io(path, "open state", error)),
     };
-    let mut content = String::new();
-    file.read_to_string(&mut content)
+    let metadata = file
+        .metadata()
+        .map_err(|error| state_io(path, "inspect state", error))?;
+    if metadata.len() > MAX_STATE_FILE_BYTES as u64 {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state {} exceeds {MAX_STATE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_STATE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut content)
         .map_err(|error| state_io(path, "read state", error))?;
-    serde_json::from_str(&content).map_err(|error| {
+    if content.len() > MAX_STATE_FILE_BYTES {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state {} exceeds {MAX_STATE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&content).map_err(|error| {
         OmpMaintenanceError::StateInvalid(format!(
             "failed to parse OMP maintenance state {}: {error}",
             path.display()
@@ -1061,6 +1087,11 @@ fn save_state_with_hook(
             "failed to encode OMP maintenance state: {error}"
         ))
     })?;
+    if content.len() >= MAX_STATE_FILE_BYTES {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state exceeds {MAX_STATE_FILE_BYTES} bytes"
+        )));
+    }
     let parent = path.parent().ok_or_else(|| {
         OmpMaintenanceError::StateIo("OMP maintenance state path has no parent".into())
     })?;
@@ -2437,6 +2468,62 @@ mod tests {
 
         assert_eq!(maintenance.release(&original).unwrap(), current);
     }
+
+    #[test]
+    fn completed_operations_are_bounded_to_recent_retries() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store.clone());
+
+        for seed in 0..=MAX_COMPLETED_OPERATIONS as u8 {
+            let operation = operation_id(seed);
+            maintenance.acquire(&operation).unwrap();
+            maintenance.release(&operation).unwrap();
+        }
+
+        {
+            let state = store.0.lock().unwrap();
+            assert_eq!(
+                state.state.completed_operations.len(),
+                MAX_COMPLETED_OPERATIONS
+            );
+            assert!(!state
+                .state
+                .completed_operations
+                .contains(&operation_owner_hash(&operation_id(0))));
+            assert!(state
+                .state
+                .completed_operations
+                .contains(&operation_owner_hash(&operation_id(
+                    MAX_COMPLETED_OPERATIONS as u8
+                ))));
+        }
+
+        assert!(
+            !maintenance
+                .acquire(&operation_id(MAX_COMPLETED_OPERATIONS as u8))
+                .unwrap()
+                .held
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_state_is_rejected_before_parsing() {
+        let dir = test_dir("oversized-state");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        fs::write(&state_path, vec![b'{'; MAX_STATE_FILE_BYTES + 1]).unwrap();
+        make_private(&state_path);
+
+        let error = load_state(&state_path).unwrap_err();
+        assert!(matches!(
+            error,
+            OmpMaintenanceError::StateInvalid(message) if message.contains("exceeds")
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn handoff_validation_rejects_a_route_added_after_state_capture() {
         let store = TestOmpMaintenanceStore::new();
