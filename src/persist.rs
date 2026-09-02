@@ -25,4 +25,6 @@ pub use self::snapshot::{
     SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
 };
 #[cfg(unix)]
-pub(crate) use self::snapshot::{EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION, SNAPSHOT_VERSION};
+pub(crate) use self::snapshot::{
+    has_external_resume_policy, EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION, SNAPSHOT_VERSION,
+};

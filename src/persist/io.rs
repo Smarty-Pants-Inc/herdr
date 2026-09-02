@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use super::snapshot::{
-    parse_history_snapshot, parse_snapshot, snapshot_file_version, SessionHistorySnapshot,
-    SessionSnapshot, SNAPSHOT_VERSION,
+    content_has_external_resume_policy, parse_history_snapshot, parse_snapshot,
+    snapshot_file_version, SessionHistorySnapshot, SessionSnapshot,
+    EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION, SNAPSHOT_VERSION,
 };
 
 fn session_path() -> PathBuf {
@@ -231,11 +232,14 @@ fn load_from_path(path: &Path) -> SessionLoad {
         Ok(snapshot) => SessionLoad::Loaded(snapshot),
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
-                if version > SNAPSHOT_VERSION {
+                if version > SNAPSHOT_VERSION
+                    || (version < EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+                        && content_has_external_resume_policy(&content))
+                {
                     warn!(
                         file_version = version,
                         supported = SNAPSHOT_VERSION,
-                        "session file is from a newer herdr version; persistence is blocked"
+                        "session file is incompatible with this herdr version; persistence is blocked"
                     );
                     return SessionLoad::Unsupported { version };
                 }
@@ -484,5 +488,41 @@ mod tests {
             _ => panic!("future snapshot must block persistence"),
         }
         assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    #[test]
+    fn v5_external_policy_snapshot_blocks_persistence_without_modification() {
+        let path = temp_session_path("v5-external-policy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 5,
+            "workspaces": [{
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": {"Pane": 1},
+                    "panes": {"1": {
+                        "cwd": "/tmp",
+                        "agent_session": {
+                            "source": "herdr:omp",
+                            "agent": "omp",
+                            "kind": "id",
+                            "value": "external-session",
+                            "resume_policy": "external"
+                        }
+                    }},
+                    "zoomed": false
+                }]
+            }],
+            "active": 0,
+            "selected": 0
+        }))
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        match load_from_path(&path) {
+            SessionLoad::Unsupported { version } => assert_eq!(version, 5),
+            _ => panic!("v5 external-policy snapshot must block persistence"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 }

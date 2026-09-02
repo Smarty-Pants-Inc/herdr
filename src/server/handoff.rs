@@ -284,7 +284,6 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     })
 }
 
-#[cfg(unix)]
 fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()> {
     let has_epoch = manifest.snapshot.idempotency_epoch.is_some();
     let has_valid_epoch = manifest
@@ -292,6 +291,7 @@ fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()>
         .idempotency_epoch
         .as_deref()
         .is_some_and(|epoch| !epoch.trim().is_empty());
+    let has_external_resume_policy = crate::persist::has_external_resume_policy(&manifest.snapshot);
     if manifest.snapshot.version > crate::persist::SNAPSHOT_VERSION {
         return Err(io::Error::other(format!(
             "handoff snapshot version {} is newer than supported {}",
@@ -299,7 +299,16 @@ fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()>
             crate::persist::SNAPSHOT_VERSION,
         )));
     }
-    if manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+    if has_external_resume_policy
+        && manifest.snapshot.version < crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+    {
+        return Err(io::Error::other(format!(
+            "external resume snapshot requires snapshot version {} or newer",
+            crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        )));
+    }
+    if (has_external_resume_policy
+        || manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION)
         && manifest.version != EXTERNAL_SNAPSHOT_HANDOFF_VERSION
     {
         return Err(io::Error::other(
@@ -556,6 +565,52 @@ mod tests {
         let mut snapshot = empty_snapshot();
         snapshot.version = crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
         snapshot
+    }
+
+    fn external_policy_snapshot(version: u32) -> crate::persist::SessionSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "version": version,
+            "workspaces": [{
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": {"Pane": 1},
+                    "panes": {"1": {
+                        "cwd": "/tmp",
+                        "agent_session": {
+                            "source": "herdr:omp",
+                            "agent": "omp",
+                            "kind": "id",
+                            "value": "external-session",
+                            "resume_policy": "external"
+                        }
+                    }},
+                    "zoomed": false
+                }]
+            }],
+            "active": 0,
+            "selected": 0,
+            "idempotency_epoch": "test-epoch"
+        }))
+        .expect("external-policy snapshot fixture should deserialize")
+    }
+
+    #[test]
+    fn handoff_rejects_external_policy_smuggled_in_a_v5_snapshot() {
+        let manifest = manifest_for(
+            external_policy_snapshot(5),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(manifest.version, HANDOFF_VERSION);
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "external resume snapshot requires snapshot version 6 or newer"
+        );
     }
 
     fn validate_v5_handoff_fixture(encoded: &str) -> Result<(), String> {

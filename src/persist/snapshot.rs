@@ -620,18 +620,44 @@ fn parse_snapshot_with_supported_version(
         ));
     }
     let snapshot = migrate_snapshot(raw)?;
-    if snapshot.version < 4
-        && snapshot
-            .workspaces
-            .iter()
-            .flat_map(|workspace| &workspace.tabs)
-            .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| pane.agent_session.as_ref())
-            .any(|session| !session.resume_policy.is_native())
+    if snapshot.version < EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        && has_external_resume_policy(&snapshot)
     {
-        return Err("external agent resume policy requires snapshot version 4 or newer".into());
+        return Err(format!(
+            "external agent resume policy requires snapshot version {} or newer",
+            EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        ));
     }
     Ok(snapshot)
+}
+
+pub(crate) fn has_external_resume_policy(snapshot: &SessionSnapshot) -> bool {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .filter_map(|pane| pane.agent_session.as_ref())
+        .any(|session| !session.resume_policy.is_native())
+}
+
+fn value_has_external_resume_policy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object
+                .get("resume_policy")
+                .is_some_and(|value| value.as_str() != Some("native"))
+                || object.values().any(value_has_external_resume_policy)
+        }
+        serde_json::Value::Array(values) => values.iter().any(value_has_external_resume_policy),
+        _ => false,
+    }
+}
+
+pub(super) fn content_has_external_resume_policy(content: &str) -> bool {
+    serde_json::from_str::<RawSessionSnapshot>(content)
+        .ok()
+        .is_some_and(|raw| raw.workspaces.iter().any(value_has_external_resume_policy))
 }
 
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
@@ -1617,6 +1643,21 @@ mod tests {
                 .expect("external OMP session should restore from the snapshot")
                 .resume_policy,
             crate::agent_resume::AgentResumePolicy::External
+        );
+        let mut downgraded: serde_json::Value =
+            serde_json::from_str(&encoded).expect("snapshot JSON should parse");
+        downgraded["version"] = serde_json::json!(REMOTE_WORKSPACE_SNAPSHOT_VERSION);
+        let downgraded_encoded =
+            serde_json::to_string(&downgraded).expect("downgraded snapshot should serialize");
+        let Err(error) = parse_snapshot_with_supported_version(
+            &downgraded_encoded,
+            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
+        ) else {
+            panic!("v5 readers must reject external-policy payloads even at version 5");
+        };
+        assert_eq!(
+            error,
+            "external agent resume policy requires snapshot version 6 or newer"
         );
         let Err(error) =
             parse_snapshot_with_supported_version(&encoded, REMOTE_WORKSPACE_SNAPSHOT_VERSION)

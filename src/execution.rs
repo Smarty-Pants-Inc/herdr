@@ -379,8 +379,9 @@ pub(crate) fn execution_provider_process_command(
     command: RemoteCommand,
     env: Vec<(String, String)>,
 ) -> std::io::Result<PreparedExecutionProviderProcessCommand> {
+    let inherited_removals = crate::plugin_command::execution_provider_inherited_env_removals();
     let (scheme, payload, _ready_nonce) =
-        execution_provider_request(target, cwd, command, env, Vec::new())?;
+        execution_provider_request(target, cwd, command, env, inherited_removals)?;
     let provider = crate::plugin_command::resolve_installed_execution_provider(
         &scheme,
         crate::plugin_command::ExecutionProviderCommandKind::Process,

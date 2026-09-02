@@ -1129,8 +1129,8 @@ file: ../../../public/assets/logo.svg
         self.assertIn("setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6", trusted)
         self.assertIn("bun-version: 1.4.0", trusted)
         self.assertIn("Build trusted OMP and native assets", trusted)
-        self.assertIn("scripts/preview.py spdx", trusted)
-        self.assertIn("scripts/preview.py pair-manifest", trusted)
+        self.assertIn("smarty_preview_release.py spdx", trusted)
+        self.assertIn("smarty_preview_release.py pair-manifest", trusted)
         self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6", trusted)
         self.assertIn("smarty-provenance-", trusted)
         self.assertIn("trusted-final-release-", trusted)
@@ -1156,25 +1156,25 @@ file: ../../../public/assets/logo.svg
             ("herdr-source.tar", "omp-source.tar"),
         )
         jobs = workflow_jobs(trusted)
-        self.assertIn("omp-source.tar", trusted)
-        self.assertIn("tarfile.open", jobs["trusted-source"])
-        self.assertIn("trusted-source-handoff/omp-source.tar", jobs["trusted-source"])
+        self.assertIn("validate-git-archive", jobs["trusted-source"])
+        self.assertIn("validate-sources", jobs["trusted-source"])
         self.assertIn("trusted-source-record.json", jobs["trusted-source"])
+        self.assertNotIn("tarfile.open", jobs["trusted-source"])
         self.assertIn(
-            "cp trusted-source/omp-source.tar source-archives/omp-source.tar",
+            "cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar",
             jobs["trusted-assemble"],
         )
         self.assertLess(
-            trusted.index("cp trusted-source/omp-source.tar source-archives/omp-source.tar"),
-            trusted.index("scripts/preview.py pair-manifest"),
+            trusted.index("cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar"),
+            trusted.index("smarty_preview_release.py pair-manifest"),
         )
         self.assertNotIn("publisher-source", jobs["trusted-build"])
         self.assertIn("source\\scripts\\package_windows_conpty.ps1", jobs["trusted-build"])
         for job in ("trusted-omp-build", "trusted-assemble", "attest-and-seal"):
-            self.assertIn("Checkout exact private OMP source", jobs[job])
-            self.assertIn("ref: ${{ needs.trusted-source.outputs.omp_commit }}", jobs[job])
+            self.assertIn("Checkout exact validated private OMP source", jobs[job])
+            self.assertIn("ref: ${{ needs.validate-seal.outputs.omp }}", jobs[job])
             self.assertIn("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}", jobs[job])
-            self.assertIn('git -C omp-source rev-parse HEAD^{commit}', jobs[job])
+            self.assertIn('git", "-C", "omp-source", "rev-parse", "HEAD"', jobs[job])
         self.assertNotIn("extract-tar", jobs["trusted-omp-build"])
         self.assertNotIn("HERDR_BUILD_OMP", jobs["trusted-omp-build"])
 
