@@ -572,3 +572,47 @@ PASS
 ```
 
 The prior exact-head CI Windows failure was caused by the un-gated Unix-only regression test; no production Windows path changed. The Nix CI failure remains an external crates.io 403 while fetching `clap_complete`, `ctrlc`, `doctest-file`, and `euclid`, not a source failure. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane.
+
+## Final immutable-release reuse compatibility addendum — 2026-09-02
+
+Final committed Herdr source candidate before this evidence-only update:
+
+- commit `c07bc3a41efc26cfe367c269d4fc7d7b1d9eddfc`
+- tree `56676fc2beb143d0c6b69e8f8c0477afef9da639`
+- branch `i3a-corrective/c3-seam-closure`
+
+Independent review found that the attest job always added `omp-source.tar` before verifying an immutable historical semantic-verification v2 release. The v2 manifest authorizes exactly `herdr-source.tar`, so the strict verifier rejected the extra file and blocked immutable-release reuse.
+
+The final workflow fix:
+
+- creates `omp-source.tar` directly in `source-archives` only for a fresh or mutable-draft v3 publication;
+- for immutable reuse, reads the already downloaded and validated pair manifest, creates and validates the exact OMP archive only for v3, and copies only the schema-declared source archives into `attested-source-archives`;
+- passes that exact isolated directory to `verify-attested-pair`; v2 therefore receives only `herdr-source.tar`, while v3 receives both exact Git archives;
+- retains fail-closed behavior for unsupported schemas, missing archives, symlinks, and unexpected destination inventory.
+
+Exact committed-source verification:
+
+```text
+ruby -e 'require "yaml"; YAML.load_file(".github/workflows/smarty-preview-publish.yml")'
+PASS
+
+python3 -m unittest scripts.test_preview scripts.test_preview_publisher
+PASS — 107 tests
+
+python3 -m py_compile scripts/smarty_preview_release.py scripts/smarty_preview_trusted.py scripts/test_preview_publisher.py
+PASS
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+git diff --check
+PASS
+```
+
+No release was published, reconciled, installed, or activated during this verification. The prior Nix CI external crates.io 403 remains a documented infrastructure limitation, not a source failure.
