@@ -9618,7 +9618,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
                 let restored_epoch = server.app.layout_apply_epoch.clone();
                 server
                     .app
-                    .initialize_layout_apply_idempotency(Some(Some(&restored_epoch)));
+                    .initialize_layout_apply_idempotency_after_handoff(Some(Some(&restored_epoch)));
             }
             Err(error) => {
                 warn!(%error, "handoff ownership committed but immediate session persistence failed; continuing with in-memory owner");

@@ -138,6 +138,23 @@ fn shutdown_herdr_socket(stream: &crate::ipc::LocalStream) {
     }
 }
 
+/// Interrupts a guest-to-server worker before joining when it may be blocked
+/// in a local-socket write. The shared endpoint must stay open for best-effort
+/// detach messages when the worker has already finished.
+fn interrupt_guest_forwarder_if_active(
+    stream: &crate::ipc::LocalStream,
+    worker: &Option<std::thread::JoinHandle<io::Result<()>>>,
+) -> bool {
+    let interrupted = worker.as_ref().is_some_and(|worker| !worker.is_finished());
+    if interrupted {
+        // A blocked guest-to-server write cannot be released by shutting down
+        // the guest reader alone. Shutdown the shared endpoint before joining;
+        // detach messages are intentionally skipped after this point.
+        shutdown_herdr_socket(stream);
+    }
+    interrupted
+}
+
 fn read_candidate_announcement(
     stream: &mut std::net::TcpStream,
     deadline: Instant,
@@ -456,6 +473,7 @@ pub(super) fn run(
 
     let (server_tx, server_rx) = mpsc::sync_channel(SERVER_TO_GUEST_QUEUE_CAPACITY);
     let mut server_reader = stream.try_clone()?;
+    let server_reader_shutdown = stream.try_clone()?;
     let guest_shutdown = guest.try_clone()?;
     let server_to_guest = std::thread::spawn(move || {
         while let Ok(message) =
@@ -542,6 +560,7 @@ pub(super) fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
+    let interrupted = interrupt_guest_forwarder_if_active(&stream, &guest_to_server);
     if let Some(Err(error)) = stop_and_join_guest_forwarder(
         || {
             let _ = guest_reader_shutdown.shutdown(Shutdown::Both);
@@ -552,27 +571,30 @@ pub(super) fn run(
             guest_forward_error = Some(error);
         }
     }
-    let final_attachment_epoch = attachment_epoch.load(Ordering::Acquire);
-    let _ = write_to_server(
-        &mut stream,
-        &ClientMessage::OmpPaneDetach {
-            pane_id,
-            omp_session_id,
-            route_generation,
-            attachment_epoch: final_attachment_epoch,
-        },
-    );
-    let _ = write_to_server(&mut stream, &ClientMessage::Detach);
+    if !interrupted {
+        let final_attachment_epoch = attachment_epoch.load(Ordering::Acquire);
+        let _ = write_to_server(
+            &mut stream,
+            &ClientMessage::OmpPaneDetach {
+                pane_id,
+                omp_session_id,
+                route_generation,
+                attachment_epoch: final_attachment_epoch,
+            },
+        );
+        let _ = write_to_server(&mut stream, &ClientMessage::Detach);
+    }
     let _ = crate::ipc::shutdown_local_stream_write(&stream);
     shutdown_herdr_socket(&stream);
     drop(guest_writer);
     let _ = child.kill();
+    shutdown_herdr_socket(&server_reader_shutdown);
     let _ = server_to_guest.join();
     match loop_result {
         Err(error) => Err(error),
         Ok(()) => match guest_forward_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+            Some(error) if !interrupted => Err(error),
+            _ => Ok(()),
         },
     }
 }
@@ -721,6 +743,85 @@ mod tests {
         let error = finished_worker_result(&mut worker).unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(worker.is_none());
+    }
+
+    fn local_socket_pair() -> (crate::ipc::LocalStream, crate::ipc::LocalStream) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client: crate::ipc::LocalStream =
+            interprocess::os::unix::uds_local_socket::Stream::from(client).into();
+        let server: crate::ipc::LocalStream =
+            interprocess::os::unix::uds_local_socket::Stream::from(server).into();
+        (client, server)
+    }
+
+    #[test]
+    fn finished_guest_forwarder_keeps_socket_available_for_detach() {
+        let (mut client, mut server) = local_socket_pair();
+        let mut worker = Some(std::thread::spawn(|| Ok::<(), io::Error>(())));
+        while worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            std::thread::yield_now();
+        }
+
+        assert!(!interrupt_guest_forwarder_if_active(&client, &worker));
+        assert!(worker.take().unwrap().join().unwrap().is_ok());
+
+        write_to_server(&mut client, &ClientMessage::Detach).unwrap();
+        assert!(matches!(
+            protocol::read_message::<_, ClientMessage>(&mut server, MAX_FRAME_SIZE).unwrap(),
+            ClientMessage::Detach
+        ));
+    }
+
+    #[test]
+    fn active_guest_forwarder_shutdown_unblocks_blocked_local_socket_write() {
+        let (client, _server) = local_socket_pair();
+        let mut fill_writer = client.try_clone().unwrap();
+        crate::ipc::set_local_stream_polling(&mut fill_writer, true).unwrap();
+        let fill = [0u8; 64 * 1024];
+        let mut reached_full = false;
+        for _ in 0..1024 {
+            match fill_writer.write(&fill) {
+                Ok(0) => panic!("local socket write made no progress"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    reached_full = true;
+                    break;
+                }
+                Err(error) => panic!("filling local socket failed: {error}"),
+            }
+        }
+        assert!(reached_full, "local socket send buffer did not become full");
+        crate::ipc::set_local_stream_polling(&mut fill_writer, false).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut blocked_writer = client.try_clone().unwrap();
+        let mut worker = Some(std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            write_to_server(&mut blocked_writer, &ClientMessage::Detach)
+        }));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guest-to-server worker started");
+        assert!(
+            worker.as_ref().is_some_and(|worker| !worker.is_finished()),
+            "guest-to-server writer should remain blocked until teardown"
+        );
+
+        assert!(interrupt_guest_forwarder_if_active(&client, &worker));
+        let worker = worker.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            worker.is_finished(),
+            "active guest-to-server writer did not join after shutdown"
+        );
+        let result = worker.join().unwrap();
+        assert!(
+            result.is_err(),
+            "shutdown should interrupt the blocked guest-to-server write"
+        );
     }
 
     #[test]

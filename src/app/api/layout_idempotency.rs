@@ -14,6 +14,22 @@ impl App {
         &mut self,
         restored_epoch: Option<Option<&str>>,
     ) {
+        self.initialize_layout_apply_idempotency_inner(restored_epoch, true);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn initialize_layout_apply_idempotency_after_handoff(
+        &mut self,
+        restored_epoch: Option<Option<&str>>,
+    ) {
+        self.initialize_layout_apply_idempotency_inner(restored_epoch, false);
+    }
+
+    fn initialize_layout_apply_idempotency_inner(
+        &mut self,
+        restored_epoch: Option<Option<&str>>,
+        quarantine_on_reconcile_failure: bool,
+    ) {
         if self.no_session {
             return;
         }
@@ -72,8 +88,14 @@ impl App {
         self.layout_apply_epoch = ledger.session_epoch;
         self.layout_apply_receipts = ledger.receipts;
         self.layout_apply_receipts_error = None;
-        if let Err(err) = self.reconcile_pending_layout_apply_receipts() {
+        if let Err(err) =
+            self.reconcile_pending_layout_apply_receipts(quarantine_on_reconcile_failure)
+        {
             self.mark_layout_apply_idempotency_unavailable(err);
+            if !quarantine_on_reconcile_failure {
+                self.state.session_dirty = true;
+                self.sync_session_save_schedule();
+            }
         }
     }
 
@@ -292,7 +314,10 @@ impl App {
         PendingResolution::Committed(Box::new(layout))
     }
 
-    fn reconcile_pending_layout_apply_receipts(&mut self) -> Result<(), String> {
+    fn reconcile_pending_layout_apply_receipts(
+        &mut self,
+        quarantine_on_failure: bool,
+    ) -> Result<(), String> {
         let mut candidate = self.layout_apply_receipts.clone();
         let mut changed = false;
 
@@ -318,9 +343,13 @@ impl App {
             return Ok(());
         }
         if let Err(err) = self.store_layout_apply_receipts(candidate) {
-            return Err(self.quarantine_layout_apply_after_effect(format!(
-                "failed to persist reconciled layout idempotency receipts: {err}"
-            )));
+            let message =
+                format!("failed to persist reconciled layout idempotency receipts: {err}");
+            return if quarantine_on_failure {
+                Err(self.quarantine_layout_apply_after_effect(message))
+            } else {
+                Err(message)
+            };
         }
         Ok(())
     }

@@ -1500,6 +1500,50 @@ mod tests {
     }
 
     #[test]
+    fn post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable() {
+        with_test_config_home("post-commit-reconciliation-failure", |_| {
+            let mut app = persistent_app_with_workspace();
+            let params = idempotent_layout_params(
+                Some(app.public_workspace_id(0)),
+                "post-commit-reconciliation-failure",
+                "pending",
+            );
+            let nonce = "ab".repeat(16);
+            app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce.clone());
+            let digest = app.layout_apply_request_digest(&params.layout).unwrap();
+            app.store_layout_apply_receipt(
+                params.idempotency_key.clone(),
+                crate::persist::LayoutApplyReceipt {
+                    session_epoch: app.layout_apply_epoch.clone(),
+                    request_digest: digest,
+                    effect_nonce: nonce,
+                    outcome: crate::persist::LayoutApplyOutcome::pending(
+                        app.public_tab_id(0, 0).unwrap(),
+                    ),
+                },
+            )
+            .unwrap();
+            let epoch = app.layout_apply_epoch.clone();
+            std::fs::create_dir_all(crate::session::data_dir().join("api-idempotency.json.tmp"))
+                .unwrap();
+
+            app.initialize_layout_apply_idempotency_after_handoff(Some(Some(&epoch)));
+
+            assert!(app.layout_apply_receipts_error.is_some());
+            assert!(!app.layout_apply_quarantined);
+            assert!(!app.state.should_quit);
+            assert!(!app.no_session);
+            assert!(!app.state.session_dirty);
+            assert!(app.session_save_deadline.is_some());
+            assert!(matches!(
+                app.layout_apply_receipts[&params.idempotency_key].outcome,
+                crate::persist::LayoutApplyOutcome::Pending { .. }
+            ));
+            shutdown_test_runtimes(&mut app);
+        });
+    }
+
+    #[test]
     fn pending_receipt_commits_only_for_matching_live_nonce() {
         with_test_config_home("pending-matching-nonce", |_| {
             let mut app = persistent_app_with_workspace();

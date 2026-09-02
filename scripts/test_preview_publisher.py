@@ -4,6 +4,7 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -12,7 +13,9 @@ from pathlib import Path
 
 from unittest import mock
 
+import scripts.smarty_preview_release as release
 import scripts.smarty_preview_trusted as trusted
+import scripts.test_preview as preview_tests
 import scripts.test_preview_promotion as promotion_tests
 
 STRICT_YAML_TO_JSON = r'''
@@ -812,6 +815,203 @@ class TrustedExistingReleaseTests(unittest.TestCase):
             with mock.patch.object(trusted, "MAX_TOTAL_DOWNLOAD_BYTES", 1):
                 with self.assertRaisesRegex(ValueError, "aggregate size"):
                     trusted.validate_existing_release_metadata(release, api_assets, identity)
+
+class TrustedReleaseSemanticVerificationTests(unittest.TestCase):
+    workflow = Path(__file__).resolve().parents[1] / ".github/workflows/smarty-preview-publish.yml"
+    release_script = Path(__file__).resolve().parents[1] / "scripts/smarty_preview_release.py"
+
+    def _stage_fixture(
+        self, root: Path, **build_options: object
+    ) -> tuple[preview_tests.PairedReleaseMetadataTests, Path, Path]:
+        fixture = preview_tests.PairedReleaseMetadataTests()
+        asset_dir = fixture._build_release(root, **build_options)
+        (root / "omp-descriptor.json").write_text(
+            json.dumps(preview_tests.OMP_SOURCE, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        staged_script = root / "publisher-source/scripts/smarty_preview_release.py"
+        staged_script.parent.mkdir(parents=True)
+        staged_script.write_bytes(self.release_script.read_bytes())
+        return fixture, asset_dir, staged_script
+
+    @staticmethod
+    def _pair_manifest_command(
+        script: Path,
+        fixture: preview_tests.PairedReleaseMetadataTests,
+        asset_dir: Path,
+        output: Path,
+        build_id: str,
+    ) -> list[str]:
+        root = asset_dir.parent
+        return [
+            sys.executable,
+            str(script),
+            "pair-manifest",
+            "--output",
+            str(output),
+            "--asset-dir",
+            str(asset_dir),
+            "--tag",
+            f"smarty-preview-{build_id}",
+            "--build-id",
+            build_id,
+            "--built-at",
+            fixture.built_at,
+            "--parent-commit",
+            fixture.parent_commit,
+            "--parent-tree",
+            fixture.parent_tree,
+            "--herdr-commit",
+            fixture.herdr_commit,
+            "--herdr-tree",
+            fixture.herdr_tree,
+            "--base-version",
+            "0.8.2",
+            "--protocol",
+            "25",
+            "--omp-source",
+            str(root / "omp-descriptor.json"),
+            "--herdr-root",
+            str(root / "herdr"),
+            "--omp-root",
+            str(root / "omp"),
+            "--omp-rules-rust-toolchains",
+            str(root / "omp-rules-rust-toolchains.json"),
+            "--trusted-verifier",
+            str(root / "trusted-release-verifier.py"),
+            "--source-archive-dir",
+            str(root / "source-archives"),
+            "--omp-bazel-graph",
+            str(root / "omp-bazel-graph.json"),
+            "--cargo-metadata-dir",
+            str(root / "cargo-metadata"),
+            "--bun-version",
+            "1.4.0",
+            "--zig-version",
+            "0.15.2",
+        ]
+
+    @staticmethod
+    def _verify_pair_command(
+        script: Path,
+        fixture: preview_tests.PairedReleaseMetadataTests,
+        asset_dir: Path,
+        build_id: str,
+    ) -> list[str]:
+        root = asset_dir.parent
+        return [
+            sys.executable,
+            str(script),
+            "verify-pair",
+            "--asset-dir",
+            str(asset_dir),
+            "--expected-parent",
+            fixture.parent_commit,
+            "--expected-source",
+            fixture.herdr_commit,
+            "--expected-omp",
+            preview_tests.OMP_SOURCE["commit"],
+            "--expected-parent-tree",
+            fixture.parent_tree,
+            "--expected-source-tree",
+            fixture.herdr_tree,
+            "--expected-omp-tree",
+            preview_tests.OMP_SOURCE["tree"],
+            "--expected-tag",
+            f"smarty-preview-{build_id}",
+            "--expected-build-id",
+            build_id,
+            "--herdr-root",
+            str(root / "herdr"),
+            "--omp-root",
+            str(root / "omp"),
+            "--trusted-verifier",
+            str(root / "trusted-release-verifier.py"),
+            "--source-archive-dir",
+            str(root / "source-archives"),
+            "--omp-bazel-graph",
+            str(root / "omp-bazel-graph.json"),
+            "--cargo-metadata-dir",
+            str(root / "cargo-metadata"),
+            "--omp-rules-rust-toolchains",
+            str(root / "omp-rules-rust-toolchains.json"),
+        ]
+
+    def test_workflow_helper_emits_v3_with_both_source_archives(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertIn(
+            "python publisher-source/scripts/smarty_preview_release.py pair-manifest",
+            source,
+        )
+        self.assertNotIn(
+            "python publisher-source/scripts/preview.py pair-manifest", source
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, asset_dir, script = self._stage_fixture(Path(directory))
+            output = Path(directory) / "workflow-pair.json"
+            result = subprocess.run(
+                self._pair_manifest_command(
+                    script, fixture, asset_dir, output, fixture.build_id
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            workflow_manifest = json.loads(output.read_text(encoding="utf-8"))
+            candidate_manifest = json.loads(
+                (asset_dir / release.PAIR_MANIFEST_ASSET_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(workflow_manifest, candidate_manifest)
+            self.assertEqual(
+                workflow_manifest["verification"]["schema"],
+                release.SEMANTIC_VERIFICATION_SCHEMA,
+            )
+            self.assertEqual(
+                set(workflow_manifest["verification"]["source_archives"]),
+                set(release.SOURCE_ARCHIVE_NAMES),
+            )
+
+    def test_workflow_helper_applies_v2_cutoff_to_authenticated_build_id(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        self.assertIn(
+            "python publisher-source/scripts/smarty_preview_release.py verify-pair",
+            source,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for day, expected_returncode in (
+                ("2026-08-30", 0),
+                (release.SEMANTIC_VERIFICATION_V3_CUTOFF_DAY, 1),
+            ):
+                with self.subTest(day=day):
+                    built_at = f"{day}T03:00:00Z"
+                    build_id = preview_tests.preview.paired_build_id(
+                        built_at,
+                        preview_tests.PairedReleaseMetadataTests.parent_commit,
+                        preview_tests.PairedReleaseMetadataTests.herdr_commit,
+                        preview_tests.OMP_SOURCE["commit"],
+                    )
+                    fixture, asset_dir, script = self._stage_fixture(
+                        root / day,
+                        built_at=built_at,
+                        build_id=build_id,
+                        semantic_verification_schema=release.SEMANTIC_VERIFICATION_V2_SCHEMA,
+                    )
+                    result = subprocess.run(
+                        self._verify_pair_command(script, fixture, asset_dir, build_id),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_returncode, result.stderr)
+                    if expected_returncode:
+                        self.assertIn(
+                            "v2 is only accepted before the 2026-08-31 v3 cutoff",
+                            result.stderr,
+                        )
 
 
 class TrustedWorkflowTests(unittest.TestCase):
