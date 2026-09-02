@@ -489,3 +489,53 @@ PASS
 ```
 
 An independent read-only review of the complete final corrective diff returned `CLEAN` with confidence `0.99`; it found no P0-P2 issue and changed no files. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
+
+## Final corrective closure addendum — ownership, publisher, and teardown (2026-09-02)
+
+Final source candidate:
+
+- commit `98815750c6c559237731e417344f09e1ea56f3d7`
+- tree `7573cee694835beb7c748f998eb6c99e44c9d8fb`
+- branch `i3a-corrective/c3-seam-closure`
+- PR #43: `https://github.com/Smarty-Pants-Inc/herdr/pull/43`
+
+This candidate contains the corrective source changes for post-commit handoff persistence failure, semantic publisher verification, and OMP guest-forwarder teardown. Post-commit reconciliation keeps the transferred owner usable and schedules repair rather than quarantining it. Publisher verification is schema-driven and validates the exact trusted source. Active guest forwarders are interrupted by shutting down the local socket before join; already-finished workers retain detach behavior.
+
+Verification on the committed source candidate:
+
+```text
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+just windows-lint
+PASS — x86_64-pc-windows-msvc production clippy
+
+cargo test --locked --bin herdr active_guest_forwarder_shutdown_unblocks_blocked_local_socket_write
+PASS — 1 test
+
+cargo test --locked --bin herdr finished_guest_forwarder_keeps_socket_available_for_detach
+PASS — 1 test
+
+cargo test --locked --bin herdr post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable
+PASS — 1 test
+
+cargo test --locked --bin herdr pending_reconciliation_snapshot_failure_quarantines
+PASS — 1 test
+
+python3 -m unittest scripts.test_preview scripts.test_preview_publisher
+PASS — 107 tests
+
+python3 -m py_compile scripts/smarty_preview_release.py scripts/test_preview_publisher.py
+PASS
+
+git diff --check
+PASS
+```
+
+No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
