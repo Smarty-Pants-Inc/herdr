@@ -146,7 +146,7 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn mark_layout_apply_idempotency_unavailable(&mut self, err: String) {
+    pub(crate) fn mark_layout_apply_idempotency_unavailable(&mut self, err: String) {
         tracing::warn!(err = %err, "layout idempotency is unavailable");
         self.layout_apply_receipts_error = Some(err);
     }

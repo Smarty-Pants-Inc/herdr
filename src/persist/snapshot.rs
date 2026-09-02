@@ -8,8 +8,14 @@ use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
-/// Current snapshot format version. Version 4 adds persisted pane execution targets; version 5 adds workspace identity execution targets.
-pub(super) const SNAPSHOT_VERSION: u32 = 5;
+const REMOTE_WORKSPACE_SNAPSHOT_VERSION: u32 = 5;
+pub(crate) const EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION: u32 = 6;
+
+/// Current snapshot format version. Version 4 adds persisted pane execution
+/// targets; version 5 adds workspace identity execution targets; version 6
+/// fences externally owned sessions from readers that do not understand their
+/// resume policy.
+pub(crate) const SNAPSHOT_VERSION: u32 = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -367,13 +373,7 @@ pub fn capture(
         .iter()
         .flat_map(|workspace| &workspace.tabs)
         .flat_map(|tab| tab.panes.values())
-        .any(|pane| {
-            !pane.execution_target.is_local()
-                || pane
-                    .agent_session
-                    .as_ref()
-                    .is_some_and(|session| !session.resume_policy.is_native())
-        })
+        .any(|pane| !pane.execution_target.is_local())
     {
         version = 4;
     }
@@ -381,7 +381,16 @@ pub fn capture(
         .iter()
         .any(|workspace| !workspace.identity_execution_target.is_local())
     {
-        version = SNAPSHOT_VERSION;
+        version = REMOTE_WORKSPACE_SNAPSHOT_VERSION;
+    }
+    if workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .filter_map(|pane| pane.agent_session.as_ref())
+        .any(|session| !session.resume_policy.is_native())
+    {
+        version = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
     }
     SessionSnapshot {
         version,
@@ -873,7 +882,7 @@ mod tests {
             idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
-            version: SNAPSHOT_VERSION,
+            version: REMOTE_WORKSPACE_SNAPSHOT_VERSION,
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
@@ -1170,6 +1179,7 @@ mod tests {
             snapshot.workspaces[0].identity_execution_target,
             crate::execution::ExecutionTarget::ssh("build.example").unwrap()
         );
+        assert_eq!(snapshot.version, REMOTE_WORKSPACE_SNAPSHOT_VERSION);
     }
 
     #[test]
@@ -1545,6 +1555,8 @@ mod tests {
     #[test]
     fn capture_contract_versions_external_resume_policy_under_hook_authority() {
         let mut state = state_with_workspaces(&["one"]);
+        state.workspaces[0].identity_execution_target =
+            crate::execution::ExecutionTarget::ssh("build.example").unwrap();
         let session_path = test_session_path("omp-session.jsonl");
         let root = state.workspaces[0].tabs[0].root_pane;
         state.ensure_test_terminals();
@@ -1584,7 +1596,7 @@ mod tests {
             &TerminalRuntimeRegistry::new(),
             snapshot.version,
         );
-        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.version, EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION);
         assert_eq!(history.version, snapshot.version);
         let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
             .agent_session
@@ -1606,15 +1618,25 @@ mod tests {
                 .resume_policy,
             crate::agent_resume::AgentResumePolicy::External
         );
-        assert!(
-            parse_snapshot_with_supported_version(&encoded, 3).is_err(),
-            "v3 readers must reject external-policy snapshots rather than ignore the policy"
-        );
+        let Err(error) =
+            parse_snapshot_with_supported_version(&encoded, REMOTE_WORKSPACE_SNAPSHOT_VERSION)
+        else {
+            panic!(
+                "v5 readers must reject external-policy snapshots rather than ignore the policy"
+            );
+        };
+        assert_eq!(error, "snapshot version 6 is newer than supported 5");
         let encoded_history =
             serde_json::to_string(&history).expect("external history should serialize");
-        assert!(
-            parse_history_snapshot_with_supported_version(&encoded_history, 3).is_err(),
-            "v3 readers must reject history paired with external-policy snapshots"
+        let Err(error) = parse_history_snapshot_with_supported_version(
+            &encoded_history,
+            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
+        ) else {
+            panic!("v5 readers must reject history paired with external-policy snapshots");
+        };
+        assert_eq!(
+            error,
+            "history snapshot version 6 is newer than supported 5"
         );
     }
 
@@ -1660,12 +1682,12 @@ mod tests {
     }
 
     #[test]
-    fn v6_snapshot_is_rejected() {
-        let json = r#"{"version":6,"workspaces":[],"active":null,"selected":0}"#;
+    fn v7_snapshot_is_rejected() {
+        let json = r#"{"version":7,"workspaces":[],"active":null,"selected":0}"#;
         let Err(error) = parse_snapshot(json) else {
-            panic!("v6 snapshots must be rejected");
+            panic!("v7 snapshots must be rejected");
         };
-        assert_eq!(error, "snapshot version 6 is newer than supported 5");
+        assert_eq!(error, "snapshot version 7 is newer than supported 6");
     }
 
     #[test]

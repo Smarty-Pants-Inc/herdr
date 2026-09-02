@@ -9609,6 +9609,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.api_window_title = received.manifest.api_window_title.take();
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        match server.app.save_layout_apply_session_snapshot_now() {
+            Ok(()) => {
+                let restored_epoch = server.app.layout_apply_epoch.clone();
+                server
+                    .app
+                    .initialize_layout_apply_idempotency(Some(Some(&restored_epoch)));
+            }
+            Err(error) => {
+                warn!(%error, "handoff ownership committed but immediate session persistence failed; continuing with in-memory owner");
+                server.app.mark_layout_apply_idempotency_unavailable(format!(
+                    "layout idempotency is unavailable because committed handoff persistence failed: {error}"
+                ));
+                server.app.state.session_dirty = true;
+                server.app.sync_session_save_schedule();
+            }
+        }
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;

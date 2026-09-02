@@ -645,9 +645,9 @@ impl App {
             return false;
         };
         // SO_PEERCRED identifies the local SSH client process that owns the
-        // reverse-forwarded connection. A pending resume report is authoritative
-        // only while that exact child PID is the live attempt; accepted requests
-        // from a retired connection remain stale even between retries.
+        // reverse-forwarded connection. SSH reports are authoritative only while
+        // that exact child PID is the live attempt; retired connections remain
+        // stale between retries. Extension provider descendants are handled below.
         !terminal.execution_target.is_local()
             && terminal.pending_agent_resume_plan.is_some()
             && !terminal.pending_agent_resume_attempt_matches_peer(context.local_peer_pid)
@@ -660,7 +660,7 @@ impl App {
         if params.resume_policy != Some(crate::agent_resume::AgentResumePolicy::External) {
             return false;
         }
-        let Some((_, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((workspace_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return false;
         };
         let Some(terminal_id) = self.state.terminal_id_for_runtime_pane(pane_id) else {
@@ -681,8 +681,23 @@ impl App {
         ) else {
             return false;
         };
-        !terminal.has_pending_agent_resume_attempt()
-            && !terminal.pending_agent_resume_attempt_was_retired(context.local_peer_pid)
+        let extension_attempt_matches_peer = matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Extension { .. }
+        ) && context.local_peer_pid.is_some_and(|peer_pid| {
+            self.terminal_target_for_peer_pid(peer_pid)
+                .is_some_and(|target| target.ws_idx == workspace_idx && target.pane_id == pane_id)
+                && self
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(crate::terminal::TerminalRuntime::child_pid)
+                    .is_some_and(|child_pid| {
+                        terminal.pending_agent_resume_attempt_matches_peer(Some(child_pid))
+                    })
+        });
+        let unattributed_remote_report =
+            context.local_peer_pid.is_none() && !terminal.has_pending_agent_resume_attempt();
+        (extension_attempt_matches_peer || unattributed_remote_report)
             && terminal.pending_agent_resume_plan_matches_report(
                 &params.source,
                 &agent_label,
@@ -2875,6 +2890,134 @@ mod tests {
         assert!(app.state.terminals[&terminal_id]
             .pending_agent_resume_retired_pids()
             .is_empty());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn external_extension_descendant_reports_confirm_active_attempt_but_not_ssh_or_retired_attempts(
+    ) {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("extension-resume-attempt");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let session_path = std::env::temp_dir().join("herdr-api-extension-omp-session.jsonl");
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(session_path.display().to_string()).unwrap();
+        let provider_pid = std::process::id();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
+        });
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        let extension_attempt_started =
+            terminal.mark_pending_agent_resume_attempt_live(provider_pid, Instant::now());
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(provider_pid);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let mut reporter = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let reporter_pid = reporter.id();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_pending_agent_resume_handoff(
+                crate::agent_resume::plan("herdr:omp", "omp", &session_ref),
+                Some(provider_pid),
+                vec![reporter_pid],
+                Instant::now(),
+            );
+        let descendant_is_unambiguous = app
+            .terminal_target_for_peer_pid(reporter_pid)
+            .is_some_and(|target| target.ws_idx == 0 && target.pane_id == pane_id);
+        let params = |seq| crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            seq: Some(seq),
+            agent_session_id: None,
+            agent_session_path: Some(session_path.display().to_string()),
+            session_start_source: Some("startup".into()),
+            resume_policy: Some(crate::agent_resume::AgentResumePolicy::External),
+        };
+
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "extension-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(1)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let extension_report_confirmed = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none();
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target = crate::execution::ExecutionTarget::ssh("dev1").unwrap();
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        let ssh_attempt_started =
+            terminal.mark_pending_agent_resume_attempt_live(provider_pid, Instant::now());
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "ssh-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(2)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let ssh_descendant_is_fenced = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some();
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        terminal.retire_pending_agent_resume_attempt();
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "retired-extension-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(3)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let retired_descendant_is_fenced = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some()
+            && app.state.terminals[&terminal_id]
+                .pending_agent_resume_retired_pids()
+                .contains(&provider_pid);
+
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_set_child_pid(0);
+        let _ = reporter.kill();
+        let _ = reporter.wait();
+        test_support::shutdown_test_runtimes(&mut app);
+
+        assert!(extension_attempt_started);
+        assert!(ssh_attempt_started);
+        assert!(descendant_is_unambiguous);
+        assert!(extension_report_confirmed);
+        assert!(ssh_descendant_is_fenced);
+        assert!(retired_descendant_is_fenced);
     }
 
     #[tokio::test]

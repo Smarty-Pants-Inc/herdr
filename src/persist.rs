@@ -24,3 +24,5 @@ pub use self::snapshot::{
     capture, capture_history, DirectionSnapshot, LayoutSnapshot, SessionHistorySnapshot,
     SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
 };
+#[cfg(unix)]
+pub(crate) use self::snapshot::{EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION, SNAPSHOT_VERSION};

@@ -413,3 +413,41 @@ PASS
 ```
 
 This handoff-only evidence commit follows the reconciled source commit. Protected landing, root pinning, landed proof, packaging, and Increment 3B state remain Integration Master responsibilities.
+
+## Final corrective closure addendum (2026-09-02)
+
+The working candidate after the earlier evidence source closes the final independent-review findings. The final source diff is based at `59ccbb2393831bc4f8dc66d0e5fad18d7fd2f83b` and covers `src/app/api.rs`, `src/app/api/layout_idempotency.rs`, `src/app/mod.rs`, `src/persist.rs`, `src/persist/snapshot.rs`, `src/server/handoff.rs`, `src/server/headless.rs`, `src/terminal/state.rs`, and `tests/live_handoff.rs`. The evidence commit records the resulting exact head and tree.
+
+Corrective invariants now proved:
+
+- `App::new_from_handoff` performs no snapshot persistence or layout-idempotency ledger initialization before the importer reports restored, becomes ready, and receives the ownership commit. After `wait_committed`, the importer persists the recaptured snapshot first; only a successful save permits ledger initialization/reconciliation. A failed post-commit save leaves the in-memory owner running, disables idempotency conservatively, and schedules a session retry without touching the ledger.
+- A regression creates a real layout effect and receipt, rewrites the on-disk receipt to pending, injects detected external ownership, forces importer failure after restored, and proves the exact source v5 session bytes and pending idempotency ledger bytes remain unchanged. The old source remains alive and restarts successfully.
+- External-policy snapshot v6 is accepted only in outer handoff format v4. Outer v1, v2, and v3 reject v6; v4 requires v6 plus a nonempty idempotency epoch; future nested versions reject before compatibility dispatch.
+- Extension descendant reports require an Extension target, unique process-to-pane attribution, and a current live child attempt. SSH descendants and retired current attempts remain fenced. A retired historical reporter PID is not itself a fence, so a legitimate current descendant remains valid across PID reuse.
+
+Final verification against the working candidate:
+
+```text
+cargo fmt --all
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
+PASS
+
+python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_preview_publisher scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+PASS — 195 tests
+
+cargo nextest run --locked external_extension_descendant_reports_confirm_active_attempt_but_not_ssh_or_retired_attempts failed_external_handoff_preserves_v5_session_for_restart legacy_outer_handoff_versions_cannot_smuggle_an_external_resume_snapshot live_handoff_preserves_layout_apply_idempotency_epoch external_resume_snapshot_uses_an_outer_version_that_v5_importers_reject handoff_rejects_a_future_nested_snapshot_version capture_contract_versions_external_resume_policy_under_hook_authority --status-level fail --final-status-level fail --failure-output final --success-output never
+PASS — 7 tests, 0 failures
+
+git diff --check
+PASS
+```
+
+An independent read-only final review of this complete corrective diff returned exactly `CLEAN` with confidence `0.99`; it changed no files. Earlier review findings and their minimum fixes are retained above as provenance. No user-owned daemon was restarted, no release was installed, and no protected landing or root pin is claimed by this lane.

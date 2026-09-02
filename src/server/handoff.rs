@@ -22,6 +22,9 @@ const LEGACY_HANDOFF_VERSION: u32 = 1;
 const PREVIOUS_HANDOFF_VERSION: u32 = 2;
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 3;
+/// Outer handoff fence. Older importers reject unknown versions before they restore the snapshot.
+#[cfg(unix)]
+const EXTERNAL_SNAPSHOT_HANDOFF_VERSION: u32 = 4;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -289,7 +292,25 @@ fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()>
         .idempotency_epoch
         .as_deref()
         .is_some_and(|epoch| !epoch.trim().is_empty());
+    if manifest.snapshot.version > crate::persist::SNAPSHOT_VERSION {
+        return Err(io::Error::other(format!(
+            "handoff snapshot version {} is newer than supported {}",
+            manifest.snapshot.version,
+            crate::persist::SNAPSHOT_VERSION,
+        )));
+    }
+    if manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        && manifest.version != EXTERNAL_SNAPSHOT_HANDOFF_VERSION
+    {
+        return Err(io::Error::other(
+            "external resume snapshot requires handoff version 4",
+        ));
+    }
     match manifest.version {
+        EXTERNAL_SNAPSHOT_HANDOFF_VERSION if manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION && has_valid_epoch => Ok(()),
+        EXTERNAL_SNAPSHOT_HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {EXTERNAL_SNAPSHOT_HANDOFF_VERSION} requires an external snapshot and idempotency epoch"
+        ))),
         HANDOFF_VERSION if has_valid_epoch => Ok(()),
         HANDOFF_VERSION => Err(io::Error::other(format!(
             "handoff version {HANDOFF_VERSION} requires an idempotency epoch"
@@ -349,7 +370,11 @@ pub(crate) fn manifest_for(
     omp_maintenance: Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>,
 ) -> HandoffManifest {
     HandoffManifest {
-        version: HANDOFF_VERSION,
+        version: if snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION {
+            EXTERNAL_SNAPSHOT_HANDOFF_VERSION
+        } else {
+            HANDOFF_VERSION
+        },
         source_version: crate::build_info::version(),
         source_protocol: crate::protocol::PROTOCOL_VERSION,
         expected_version,
@@ -527,6 +552,24 @@ mod tests {
         }
     }
 
+    fn external_snapshot() -> crate::persist::SessionSnapshot {
+        let mut snapshot = empty_snapshot();
+        snapshot.version = crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
+        snapshot
+    }
+
+    fn validate_v5_handoff_fixture(encoded: &str) -> Result<(), String> {
+        let version = serde_json::from_str::<serde_json::Value>(encoded)
+            .map_err(|error| error.to_string())?
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "handoff version is missing".to_string())?;
+        match version {
+            1..=3 => Ok(()),
+            version => Err(format!("unsupported handoff version {version}")),
+        }
+    }
+
     #[test]
     fn a_handoff_carries_an_api_set_window_title() {
         let manifest = manifest_for(
@@ -558,6 +601,48 @@ mod tests {
             Some("test-epoch")
         );
         validate_manifest_compatibility(&manifest).expect("current handoff must be compatible");
+    }
+
+    #[test]
+    fn external_resume_snapshot_uses_an_outer_version_that_v5_importers_reject() {
+        let manifest = manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+
+        assert_eq!(manifest.version, EXTERNAL_SNAPSHOT_HANDOFF_VERSION);
+        validate_manifest_compatibility(&manifest)
+            .expect("v6 importer must accept its fenced handoff");
+        let encoded = serde_json::to_string(&manifest).expect("handoff should serialize");
+        assert_eq!(
+            validate_v5_handoff_fixture(&encoded).unwrap_err(),
+            "unsupported handoff version 4"
+        );
+    }
+
+    #[test]
+    fn legacy_outer_handoff_versions_cannot_smuggle_an_external_resume_snapshot() {
+        for version in [
+            LEGACY_HANDOFF_VERSION,
+            PREVIOUS_HANDOFF_VERSION,
+            HANDOFF_VERSION,
+        ] {
+            let mut manifest =
+                manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+            manifest.version = version;
+
+            let error = validate_manifest_compatibility(&manifest).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "external resume snapshot requires handoff version 4"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_rejects_a_future_nested_snapshot_version() {
+        let mut manifest = manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+        manifest.snapshot.version = crate::persist::SNAPSHOT_VERSION + 1;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
     }
 
     #[test]

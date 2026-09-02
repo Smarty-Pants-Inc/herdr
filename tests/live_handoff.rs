@@ -1030,6 +1030,159 @@ fn live_handoff_rejects_pre_epoch_importer_without_replacing_server() {
 }
 
 #[test]
+fn failed_external_handoff_preserves_v5_session_for_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let session_dir = config_home.join(if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    });
+    let session_path = session_dir.join("session.json");
+    let ledger_path = session_dir.join("api-idempotency.json");
+    fs::create_dir_all(&base).unwrap();
+    let fake_omp = base.join("omp");
+    let started_marker = base.join("omp-started");
+    fs::write(
+        &fake_omp,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=omp\necho started > {}\nsleep 30\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    assert_ok(created.clone());
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let applied = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:layout:apply",
+            "method": "layout.apply_idempotent",
+            "params": {
+                "idempotency_key": "handoff-precommit-ledger",
+                "workspace_id": workspace_id,
+                "tab_label": "handoff-precommit",
+                "focus": false,
+                "root": {"type": "pane", "command": ["/bin/sh", "-c", "sleep 30"]}
+            }
+        }),
+    );
+    assert_ok(applied.clone());
+    let tab_id = applied["result"]["layout"]["tab_id"].as_str().unwrap();
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    ledger["layout_apply"]["handoff-precommit-ledger"]["outcome"] =
+        serde_json::json!({"state": "pending", "expected_tab_id": tab_id});
+    let pending_ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
+    fs::write(&ledger_path, &pending_ledger_bytes).unwrap();
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-omp",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": fake_omp, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&started_marker, Duration::from_secs(5));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:external-session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:omp",
+                "agent": "omp",
+                "seq": 1,
+                "agent_session_id": "external-handoff-session",
+                "session_start_source": "startup",
+                "resume_policy": "external"
+            }
+        }),
+    ));
+    let pane = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:get-external","method":"pane.get","params":{"pane_id":pane_id}}),
+    );
+    assert_eq!(
+        pane["result"]["pane"]["agent_session"]["resume_policy"], "external",
+        "external report did not reach pane state: {pane}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut observed_version = serde_json::Value::Null;
+    let mut persisted = loop {
+        if let Ok(bytes) = fs::read(&session_path) {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            observed_version = value["version"].clone();
+            if value["version"] == 6 {
+                break value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "external v6 session was not persisted; observed version {observed_version} at {}",
+            session_path.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    persisted["version"] = serde_json::json!(5);
+    let v5_bytes = serde_json::to_vec_pretty(&persisted).unwrap();
+    fs::write(&session_path, &v5_bytes).unwrap();
+
+    let response = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff:fail-after-restore","method":"server.live_handoff","params":{}}),
+    );
+    assert_eq!(response["error"]["code"], "handoff_failed");
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(fs::read(&session_path).unwrap(), v5_bytes);
+    assert_eq!(fs::read(&ledger_path).unwrap(), pending_ledger_bytes);
+    assert!(spawned.child.try_wait().unwrap().is_none());
+
+    drop(spawned);
+    let _ = fs::remove_file(&api_socket);
+    let _ = fs::remove_file(runtime_dir.join("herdr-client.sock"));
+    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:restart:ping","method":"ping","params":{}}),
+    ));
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(restarted);
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn remote_client_reconnects_after_live_handoff() {
     let _lock = test_lock();
     let base = unique_test_dir();

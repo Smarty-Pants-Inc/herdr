@@ -1001,10 +1001,6 @@ impl App {
             Some(epoch) => epoch.clone(),
             None => crate::persist::new_layout_session_epoch().map_err(io::Error::other)?,
         };
-        app.save_layout_apply_session_snapshot_now()
-            .map_err(io::Error::other)?;
-        let restored_epoch = app.layout_apply_epoch.clone();
-        app.initialize_layout_apply_idempotency(Some(Some(&restored_epoch)));
         Ok(app)
     }
 

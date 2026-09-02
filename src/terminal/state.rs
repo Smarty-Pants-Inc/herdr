@@ -348,9 +348,6 @@ impl TerminalState {
         self.pending_agent_resume_attempt_pid
             .is_some_and(|attempt_pid| peer_pid == Some(attempt_pid))
     }
-    pub(crate) fn pending_agent_resume_attempt_was_retired(&self, peer_pid: Option<u32>) -> bool {
-        peer_pid.is_some_and(|peer_pid| self.pending_agent_resume_retired_pids.contains(&peer_pid))
-    }
 
     pub(crate) fn has_pending_agent_resume_attempt(&self) -> bool {
         self.pending_agent_resume_attempt_pid.is_some()
