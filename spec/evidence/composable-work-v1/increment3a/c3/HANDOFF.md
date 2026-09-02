@@ -386,3 +386,30 @@ C3 does not own root configuration, shared fixtures, package production, root pi
 - No automatic downgrade conversion, rollback backup, or state-file copy was added.
 - No performance path was widened: the repair adds only a small optional API projection when public pane/agent info is constructed. It does not touch render, parse, detection, resize, or client-frame fanout loops.
 - No root regression, package producer, root pin, shared fixture, canonical evidence, protected landing, release, deployment, or owner acceptance is claimed.
+
+## Protected-landing reconciliation addendum (2026-09-02)
+
+The delivery branch was reconciled with current protected `origin/master` (`18b56893e1c329c5e2ca9bd7083bf8858879e0a5`) before landing. The candidate retains the C3 source chain and incorporates the intervening immutable-release, merge-queue, and protected two-phase preview-promotion fixes. Reconciled source commit `cb2a36871944a1355dbefeae01328d40fc61838b` has tree `d5cd384e51e54aa769d7c0a6941e5aa2a786c1d5`; `origin/master` is its ancestor and PR `Smarty-Pants-Inc/herdr#43` is mergeable.
+
+The reconciliation used an ancestry merge plus ordered replay of all 13 protected-master commits. Candidate preview tests remain the superset; their superseded release lookup and promotion assertions now check the current immutable-release and protected Phase A/Phase B promotion contracts.
+
+Verification against `cb2a36871944a1355dbefeae01328d40fc61838b`:
+
+```text
+cargo fmt --all -- --check
+PASS
+
+cargo check --workspace --all-targets
+PASS
+
+cargo clippy --workspace --all-targets -- -D warnings
+PASS
+
+python3 -m unittest scripts.test_preview scripts.test_preview_publisher scripts.test_preview_promotion
+PASS — 117 tests, 0 failures
+
+git diff --check origin/master...HEAD
+PASS
+```
+
+This handoff-only evidence commit follows the reconciled source commit. Protected landing, root pinning, landed proof, packaging, and Increment 3B state remain Integration Master responsibilities.
