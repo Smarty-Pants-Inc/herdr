@@ -1499,6 +1499,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable() {
         with_test_config_home("post-commit-reconciliation-failure", |_| {
