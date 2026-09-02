@@ -1485,6 +1485,10 @@ impl HeadlessServer {
         // events. Reconcile only the queued snapshot before capturing terminal state;
         // private runtimes remain live and must not keep handoff draining forever.
         self.drain_internal_event_snapshot_with_forwarding();
+        // Join any in-flight autosave before the target can persist the committed
+        // handoff. Do not rewrite source-owned session bytes here: a failed handoff
+        // must preserve them exactly. Event-loop scheduling is fenced until return.
+        self.app.join_background_session_save();
         let omp_maintenance = match self.authorize_live_handoff() {
             Ok(state) => state,
             Err(err) => {

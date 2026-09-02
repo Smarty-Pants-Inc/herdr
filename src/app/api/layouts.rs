@@ -1362,6 +1362,28 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pre_effect_session_checkpoint_restores_pending_save_on_failure() {
+        with_test_config_home("pre-effect-checkpoint-failure", |_| {
+            let mut app = persistent_app_with_workspace();
+            app.save_session_now();
+            let session_path = crate::session::data_dir().join("session.json");
+            let session_before = std::fs::read(&session_path).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            app.session_save_deadline = Some(deadline);
+            app.persist_pane_history = true;
+            std::fs::create_dir_all(crate::session::data_dir().join("session-history.json.tmp"))
+                .unwrap();
+
+            let error = app.save_layout_apply_session_snapshot_now().unwrap_err();
+
+            assert!(!error.is_empty());
+            assert_eq!(app.session_save_deadline, Some(deadline));
+            assert_eq!(std::fs::read(session_path).unwrap(), session_before);
+            shutdown_test_runtimes(&mut app);
+        });
+    }
+
     #[tokio::test]
     async fn baseline_session_save_failure_has_no_effect_or_receipt() {
         with_test_config_home("session-save-failure", |_| {

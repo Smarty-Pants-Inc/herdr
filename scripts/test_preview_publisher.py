@@ -913,6 +913,21 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn("trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
         self.assertIn("trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
 
+    def test_draft_release_download_uses_auth_stripping_redirects(self) -> None:
+        source = self.workflow.read_text(encoding="utf-8")
+        publish = source.split("\n  publish-release:", 1)[1]
+        self.assertIn("Checkout trusted publisher source", publish)
+        self.assertIn(
+            "ref: ${{ needs.validate-seal.outputs.publisher_commit }}", publish
+        )
+        self.assertIn("path: publisher-source", publish)
+        self.assertIn(
+            "from smarty_preview_trusted import _HttpsArtifactRedirectHandler", publish
+        )
+        self.assertIn("build_opener(_HttpsArtifactRedirectHandler())", publish)
+        self.assertIn("with opener.open(request, timeout=120)", publish)
+        self.assertNotIn("with urlopen(request", publish)
+
     def test_workflow_reuses_only_verified_immutable_release_bytes(self) -> None:
         workflow = load_workflow(self.workflow)
         jobs = workflow["jobs"]

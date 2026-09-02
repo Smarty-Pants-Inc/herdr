@@ -89,10 +89,14 @@ impl App {
         }
     }
 
-    pub(crate) fn save_session_now(&mut self) {
+    pub(crate) fn join_background_session_save(&mut self) {
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }
+    }
+
+    pub(crate) fn save_session_now(&mut self) {
+        self.join_background_session_save();
 
         if self.no_session || self.session_persistence_blocked {
             self.session_save_deadline = None;

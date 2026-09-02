@@ -52,7 +52,7 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
     save_json_to_path(path, snapshot)
 }
 
-fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+fn write_bytes_to_path(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
     let parent = target
         .parent()
@@ -60,7 +60,6 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
     if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
     let write_result = (|| {
         let mut tmp = std::fs::OpenOptions::new()
@@ -68,7 +67,7 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        tmp.write_all(json.as_bytes())?;
+        tmp.write_all(bytes)?;
         tmp.sync_all()
     })();
     if let Err(err) = write_result {
@@ -80,9 +79,61 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
         return Err(err);
     }
     if let Some(parent) = parent {
-        std::fs::File::open(parent)?.sync_all()?;
+        sync_directory(parent)?;
     }
     Ok(())
+}
+
+fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(snapshot)?;
+    write_bytes_to_path(path, &json)
+}
+
+fn existing_file_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let target = resolve_write_target(path)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "persistence target is not a regular file: {}",
+                target.display()
+            ),
+        )),
+        Ok(_) => std::fs::read(target).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_bytes_to_path(path, bytes),
+        None => clear_path(&resolve_write_target(path)?),
+    }
+}
+
+fn restore_pair_after_failure(
+    error: std::io::Error,
+    session_path: &Path,
+    session_before: Option<&[u8]>,
+    history_path: &Path,
+    history_before: Option<&[u8]>,
+) -> std::io::Result<()> {
+    let mut restore_errors = Vec::new();
+    if let Err(err) = restore_file(session_path, session_before) {
+        restore_errors.push(format!("session restore failed: {err}"));
+    }
+    if let Err(err) = restore_file(history_path, history_before) {
+        restore_errors.push(format!("history restore failed: {err}"));
+    }
+    if restore_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{error}; {}",
+            restore_errors.join("; ")
+        )))
+    }
 }
 
 pub(super) fn save_to_paths(
@@ -91,12 +142,34 @@ pub(super) fn save_to_paths(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
 ) -> std::io::Result<()> {
-    save_to_path(session_path, snapshot)?;
-    if let Some(history) = history {
-        save_json_to_path(history_path, history)?;
-    } else {
-        clear_path(history_path)?;
+    let session_before = existing_file_bytes(session_path)?;
+    let history_before = existing_file_bytes(history_path)?;
+    let result = save_to_path(session_path, snapshot).and_then(|_| {
+        if let Some(history) = history {
+            save_json_to_path(history_path, history)
+        } else {
+            clear_path(&resolve_write_target(history_path)?)
+        }
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => restore_pair_after_failure(
+            error,
+            session_path,
+            session_before.as_deref(),
+            history_path,
+            history_before.as_deref(),
+        ),
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

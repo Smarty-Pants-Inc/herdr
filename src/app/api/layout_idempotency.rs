@@ -163,14 +163,16 @@ impl App {
     }
 
     pub(crate) fn save_layout_apply_session_snapshot_now(&mut self) -> Result<(), String> {
-        if let Some(thread) = self.session_save_thread.take() {
-            let _ = thread.join();
-        }
+        let previous_save_deadline = self.session_save_deadline;
+        self.join_background_session_save();
         self.session_save_deadline = None;
         if self.no_session {
             return Ok(());
         }
         if self.session_persistence_blocked {
+            if previous_save_deadline.is_some() {
+                self.session_save_deadline = previous_save_deadline;
+            }
             return Err("session persistence is blocked by an unsupported snapshot".into());
         }
 
@@ -192,8 +194,13 @@ impl App {
                 snapshot.version,
             )
         });
-        crate::persist::save_layout_apply_session_snapshot(&snapshot, history.as_ref())
-            .map_err(|err| err.to_string())
+        let result =
+            crate::persist::save_layout_apply_session_snapshot(&snapshot, history.as_ref())
+                .map_err(|err| err.to_string());
+        if result.is_err() && previous_save_deadline.is_some() {
+            self.session_save_deadline = previous_save_deadline;
+        }
+        result
     }
 
     pub(super) fn quarantine_layout_apply_after_effect(&mut self, message: String) -> String {
