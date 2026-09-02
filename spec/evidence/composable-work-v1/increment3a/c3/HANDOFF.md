@@ -647,3 +647,53 @@ PASS
 ```
 
 The Nix workflow's crates.io HTTP 403 remains an external infrastructure limitation. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
+
+## Legacy v1 maintenance-state migration addendum — 2026-09-02
+
+The legacy version-1 replay-state recovery is implemented in source commit `92efce2c20a180e483c37a6aafbde6c7464fd12f`, tree `87eab52b59cbf35f11c348bdacd131b63f5beeb5`, with parent `e3e29b1acc17fb30ce93ec0b6a1ad5b1de0140de`. The source diff is `114 insertions, 9 deletions` in `src/server/omp_maintenance.rs`.
+
+Migration is performed under the existing per-state file lock before inspection or the first state transaction. Every completed-operation entry is validated, including entries that will be discarded; only then is a legacy history longer than 64 entries compacted to its newest 64 identities and persisted. Invalid entries, duplicate identities, invalid lease/route state, unsupported versions, and state files over the existing 64 KiB raw-byte limit continue to fail closed before migration or JSON parsing. Ordinary bounded inspection remains passive; only required legacy compaction writes state.
+
+Task metadata:
+
+```text
+taskId=i3a-corrective-herdr-legacy-state-migration
+model=gpt-5.6-sol
+reasoningEffort=high
+```
+
+Exact verification at source head `92efce2c20a180e483c37a6aafbde6c7464fd12f`:
+
+```text
+just test-one omp_maintenance
+PASS — 32 tests, 0 failures
+
+just test-one omp_service
+PASS — 19 tests, 0 failures
+
+just test-one legacy_completed_operations_are_compacted_before_file_state_use
+PASS — 1 test, 0 failures
+
+just test-one legacy_compaction_rejects_an_invalid_entry_before_dropping_it
+PASS — 1 test, 0 failures
+
+just test-one oversized_state_is_rejected_before_parsing
+PASS — 1 test, 0 failures
+
+just test-one inspect_is_passive_and_does_not_reconcile_or_delete_routes
+PASS — 1 test, 0 failures
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+git diff --check HEAD^ HEAD
+PASS
+```
+
+The 65-entry regression proves inspection persists the newest 64 valid identities and that status, acquire, and release remain usable afterward. The invalid-entry regression proves compaction does not drop malformed history. No branch was pushed or landed; release, installation, and activation remain Integration Master responsibilities.
