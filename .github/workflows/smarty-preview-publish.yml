@@ -933,9 +933,7 @@ jobs:
           if commit != record["commit"] or tree != record["tree"]:
               raise SystemExit("private OMP checkout differs from validated source record")
           PY
-          mkdir -p source-archives
-          git -C omp-source archive --format=tar --output "$GITHUB_WORKSPACE/source-archives/omp-source.tar" HEAD
-          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive --archive source-archives/omp-source.tar --repository omp-source
+
       - name: Resolve existing exact release
         id: existing
         env:
@@ -985,6 +983,16 @@ jobs:
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="ascii") as output:
               output.write(f"reuse={reuse}\n")
           PY
+
+      - name: Prepare exact OMP source archive for fresh release
+        if: steps.existing.outputs.reuse != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source-archives
+          git -C omp-source archive --format=tar --output "$GITHUB_WORKSPACE/source-archives/omp-source.tar" HEAD
+          python publisher-source/scripts/smarty_preview_trusted.py validate-git-archive --archive source-archives/omp-source.tar --repository omp-source
+
       - name: Reuse verified immutable release bytes
         if: steps.existing.outputs.reuse == 'true'
         env:
@@ -1048,6 +1056,36 @@ jobs:
             --release-json existing-release.json --assets-json existing-release-assets.json \
             --tag-json existing-tag.json --identity existing-identity.json \
             --asset-dir immutable-assets --output existing-release-record.json
+          python -I -S - <<'PY'
+          import json, shutil, subprocess
+          from pathlib import Path
+          schema = json.loads(Path("immutable-assets/smarty-pair.json").read_text(encoding="utf-8"))["verification"]["schema"]
+          expected = {
+              "smarty.semantic-verification.v2": ("herdr-source.tar",),
+              "smarty.semantic-verification.v3": ("herdr-source.tar", "omp-source.tar"),
+          }.get(schema)
+          if expected is None:
+              raise SystemExit(f"unsupported semantic verification schema: {schema}")
+          source_archives = Path("source-archives")
+          if schema == "smarty.semantic-verification.v3":
+              subprocess.run(
+                  ["git", "-C", "omp-source", "archive", "--format=tar", "--output", str(source_archives / "omp-source.tar"), "HEAD"],
+                  check=True,
+              )
+              subprocess.run(
+                  ["python", "publisher-source/scripts/smarty_preview_trusted.py", "validate-git-archive", "--archive", str(source_archives / "omp-source.tar"), "--repository", "omp-source"],
+                  check=True,
+              )
+          destination = Path("attested-source-archives")
+          destination.mkdir()
+          for name in expected:
+              source = source_archives / name
+              if not source.is_file() or source.is_symlink():
+                  raise SystemExit(f"missing source archive: {name}")
+              shutil.copyfile(source, destination / name)
+          if {path.name for path in destination.iterdir()} != set(expected):
+              raise SystemExit(f"source archive set does not match {schema}")
+          PY
           gh attestation verify immutable-assets/smarty-pair.json \
             --bundle immutable-assets/smarty-pair.provenance.sigstore.json --repo "$REPOSITORY" \
             --cert-identity "$CERT_IDENTITY" --source-ref "$SOURCE_REF" \
@@ -1068,7 +1106,7 @@ jobs:
             --asset-dir immutable-assets --expected-parent "$PARENT" --expected-source "$SOURCE" --expected-omp "$OMP" \
             --expected-parent-tree "$PARENT_TREE" --expected-source-tree "$SOURCE_TREE" --expected-omp-tree "$OMP_TREE" \
             --expected-tag "$TAG" --expected-build-id "$BUILD_ID" --herdr-root herdr-source --omp-root omp-source \
-            --trusted-verifier attested-trusted-verifier.py --source-archive-dir source-archives
+            --trusted-verifier attested-trusted-verifier.py --source-archive-dir attested-source-archives
           while read -r bundle subject; do
             gh attestation verify "immutable-assets/$subject" \
               --bundle "immutable-assets/$bundle" --repo "$REPOSITORY" \

@@ -1067,7 +1067,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn("git -C omp-source archive --format=tar", attest)
         self.assertIn("validate-git-archive --archive source-archives/omp-source.tar", attest)
         self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=off graph --output=json", trusted_assemble)
-        self.assertEqual(source.count("omp-source.tar"), 2)
+        self.assertGreaterEqual(source.count("omp-source.tar"), 5)
 
     def test_workflow_pins_executing_revision_and_publisher_attempt(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
@@ -1178,6 +1178,11 @@ class TrustedWorkflowTests(unittest.TestCase):
             "mv immutable-assets release-assets",
         ):
             self.assertIn(text, run)
+        self.assertIn('attested-source-archives', run)
+        self.assertIn('"smarty.semantic-verification.v2": ("herdr-source.tar",)', run)
+        self.assertIn('"smarty.semantic-verification.v3": ("herdr-source.tar", "omp-source.tar")', run)
+        self.assertIn('verify-attested-pair', run)
+        self.assertIn('--source-archive-dir attested-source-archives', run)
         self.assertNotIn("--signer-workflow", run)
         self.assertNotIn("gh release download", run)
         self.assertEqual(run.count("smarty-pair.provenance.sigstore.json"), 1)
