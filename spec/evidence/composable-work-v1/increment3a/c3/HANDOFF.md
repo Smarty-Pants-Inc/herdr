@@ -539,3 +539,36 @@ PASS
 ```
 
 No user-owned daemon was restarted, and no release was installed, activated, or published by this lane. Protected landing, root pinning, landed proof, and packaging remain Integration Master responsibilities.
+
+## Final portability addendum (2026-09-02)
+
+The Unix-only post-commit handoff regression test is now explicitly gated with `#[cfg(unix)]`; the production handoff method was already Unix-only. This keeps Windows test enumeration/builds valid without weakening the Unix regression coverage.
+
+Final source-plus-evidence candidate:
+
+- commit `c656008d9a56bf5a8c6c1990cd9487c19287c481`
+- tree `7a65b5c563d788a4d1a4079d9ba4e5eb41dc15e4`
+
+Final source candidate before this handoff addendum:
+
+```text
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --all-targets
+PASS
+
+cargo clippy --locked --all-targets -- -D warnings
+PASS
+
+just windows-lint
+PASS — x86_64-pc-windows-msvc production clippy
+
+cargo test --locked --bin herdr post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable
+PASS — 1 test on Unix; the test is excluded on Windows by cfg(unix)
+
+git diff --check
+PASS
+```
+
+The prior exact-head CI Windows failure was caused by the un-gated Unix-only regression test; no production Windows path changed. The Nix CI failure remains an external crates.io 403 while fetching `clap_complete`, `ctrlc`, `doctest-file`, and `euclid`, not a source failure. No user-owned daemon was restarted, and no release was installed, activated, or published by this lane.
