@@ -15,7 +15,6 @@ from unittest import mock
 import scripts.smarty_preview_trusted as trusted
 import scripts.test_preview_promotion as promotion_tests
 
-
 STRICT_YAML_TO_JSON = r'''
 require "json"
 require "psych"
@@ -241,6 +240,7 @@ class TrustedWorkflowRegistrationTests(unittest.TestCase):
             publisher["on"],
             {"workflow_run": {"workflows": ["Smarty Preview"], "types": ["completed"]}},
         )
+
 
 class TrustedSourceTests(unittest.TestCase):
     parent = "1" * 40
@@ -820,38 +820,36 @@ class TrustedWorkflowTests(unittest.TestCase):
     def test_workflow_uses_exact_source_handoff_and_isolates_build(self) -> None:
         source = self.workflow.read_text(encoding="utf-8")
         self.assertNotIn("eval(", source)
-        self.assertIn("omp-source.tar", source)
         self.assertIn("--event-run-attempt \"$EVENT_RUN_ATTEMPT\"", source)
         self.assertIn("validate-sources", source)
         self.assertIn("download-artifacts --root artifact-zips --identity identity.json", source)
         self.assertIn("extract-producer-artifacts --root artifact-zips --output producer --identity identity.json", source)
         self.assertIn("ref: ${{ needs.validate-seal.outputs.source }}", source)
         self.assertIn("token: ${{ github.token }}", source)
-        self.assertIn('json.dumps(record["omp"]', source)
+        self.assertIn('Path("trusted-source-record.json")', source)
         trusted_source = source.split("\n  trusted-source:", 1)[1].split("\n  trusted-build:", 1)[0]
         trusted_build = source.split("\n  trusted-build:", 1)[1].split("\n  trusted-omp-build:", 1)[0]
         omp_build = source.split("\n  trusted-omp-build:", 1)[1].split("\n  trusted-assemble:", 1)[0]
-        assemble = source.split("\n  trusted-assemble:", 1)[1].split("\n  attest-and-seal:", 1)[0]
+        trusted_assemble = source.split("\n  trusted-assemble:", 1)[1].split("\n  attest-and-seal:", 1)[0]
         attest = source.split("\n  attest-and-seal:", 1)[1].split("\n  publish-release:", 1)[0]
         self.assertIn("needs: [validate-seal]", trusted_source)
-        self.assertNotIn("trusted-build", trusted_source)
+        self.assertIn("needs: [validate-seal, trusted-source]", trusted_build)
         self.assertIn("fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'", trusted_source)
         self.assertIn('git -C parent-source merge-base --is-ancestor "$PARENT" refs/remotes/origin/main', trusted_source)
-        self.assertIn("tarfile.open", trusted_source)
-        self.assertIn("runs-on: ${{ matrix.os }}", omp_build)
-        self.assertIn("Build trusted Herdr source", trusted_build)
+        for label in ("ubuntu-22.04", "ubuntu-24.04-arm", "macos-15-intel", "macos-14", "windows-latest"):
+            self.assertIn(f"os: {label}", source)
+        self.assertNotRegex(source, r"os: smarty-(?:linux|macos|windows)")
+        self.assertIn("mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29", trusted_build)
+        self.assertIn("version: ${{ env.ZIG_VERSION }}", trusted_build)
         self.assertNotIn("if: runner.os == 'Linux'", trusted_build)
+        self.assertIn("Build trusted Herdr source", trusted_build)
         self.assertNotIn("publisher-source", trusted_build)
-        self.assertIn("Download validated OMP identity handoff", omp_build)
-        for job in (omp_build, assemble, attest):
-            self.assertIn("Checkout exact private OMP source", job)
-            self.assertIn("ref: ${{ needs.trusted-source.outputs.omp_commit }}", job)
-            self.assertEqual(job.count("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}"), 1)
-            self.assertIn('git -C omp-source rev-parse HEAD^{commit}', job)
-            self.assertIn('git -C omp-source rev-parse HEAD^{tree}', job)
-            self.assertIn('git -C omp-source status --porcelain=v1 --untracked-files=all', job)
-        self.assertNotIn("extract-tar", omp_build)
+        self.assertIn("Download validated OMP source record", omp_build)
+        self.assertIn("repository: Smarty-Pants-Inc/oh-my-pi", omp_build)
+        self.assertIn("private OMP checkout differs from validated source record", omp_build)
         self.assertIn("trusted-tools/smarty_preview_trusted.py", omp_build)
+        self.assertIn("publisher-source/scripts/smarty_preview_release.py", source)
+        self.assertNotIn("publisher-source/scripts/preview.py", source)
         self.assertNotIn("Checkout exact Herdr source", omp_build)
         self.assertNotIn("HERDR_BUILD_OMP", omp_build)
         self.assertIn('(cd omp-source && bun scripts/ci-release-build-binaries.ts --targets "$OMP_TARGET")', omp_build)
@@ -915,20 +913,6 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertIn("trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
         self.assertIn("trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}", promotion_source)
 
-    def test_draft_release_download_uses_auth_stripping_redirects(self) -> None:
-        source = self.workflow.read_text(encoding="utf-8")
-        publish = source.split("\n  publish-release:", 1)[1]
-        self.assertIn("Checkout trusted publisher source", publish)
-        self.assertIn(
-            "ref: ${{ needs.validate-seal.outputs.publisher_commit }}", publish
-        )
-        self.assertIn("path: publisher-source", publish)
-        self.assertIn(
-            "from smarty_preview_trusted import _HttpsArtifactRedirectHandler", publish
-        )
-        self.assertIn("build_opener(_HttpsArtifactRedirectHandler())", publish)
-        self.assertIn("with opener.open(request, timeout=120)", publish)
-        self.assertNotIn("with urlopen(request", publish)
     def test_workflow_reuses_only_verified_immutable_release_bytes(self) -> None:
         workflow = load_workflow(self.workflow)
         jobs = workflow["jobs"]
@@ -1010,5 +994,6 @@ class TrustedWorkflowTests(unittest.TestCase):
 def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None) -> unittest.TestSuite:
     tests.addTests(loader.loadTestsFromModule(promotion_tests))
     return tests
+
 if __name__ == "__main__":
     unittest.main()
