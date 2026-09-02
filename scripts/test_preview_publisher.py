@@ -866,7 +866,7 @@ class TrustedWorkflowTests(unittest.TestCase):
         self.assertNotIn('Path("validation/producer/producer-record.json")', trusted_assemble)
         self.assertIn("git -C omp-source archive --format=tar", attest)
         self.assertIn("validate-git-archive --archive source-archives/omp-source.tar", attest)
-        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=error graph --output=json", trusted_assemble)
+        self.assertIn("mod --repo_env=CARGO_BAZEL_ISOLATED=0 --repo_env=CARGO_BAZEL_TIMEOUT=1800 --lockfile_mode=off graph --output=json", trusted_assemble)
         self.assertEqual(source.count("omp-source.tar"), 2)
 
     def test_workflow_pins_executing_revision_and_publisher_attempt(self) -> None:
