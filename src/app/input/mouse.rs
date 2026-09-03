@@ -123,6 +123,35 @@ impl AppState {
             return None;
         }
 
+        if self.mode == Mode::Findr {
+            let area = if self.view.layout == ViewLayout::Desktop
+                && self.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
+                && self.view.tab_bar_rect.height > 0
+            {
+                self.view.tab_bar_rect
+            } else {
+                self.view.terminal_area
+            };
+            let toggle = crate::ui::findr_scrollback_toggle_rect(self, area);
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if mouse.column >= toggle.x
+                        && mouse.column < toggle.x.saturating_add(toggle.width)
+                        && mouse.row == toggle.y =>
+                {
+                    self.toggle_findr_scrollback(terminal_runtimes);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_findr(terminal_runtimes, self.mouse_scroll_lines, true);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_findr(terminal_runtimes, self.mouse_scroll_lines, false);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         if self.mode == Mode::Settings {
             return self.handle_settings_mouse(mouse).map(MouseAction::Settings);
         }
@@ -822,7 +851,8 @@ impl AppState {
                         DragTarget::SidebarSectionDivider => {
                             self.set_sidebar_section_split(mouse.row);
                         }
-                        DragTarget::ReleaseNotesScrollbar { .. }
+                        DragTarget::WorkspacePluginDivider { .. }
+                        | DragTarget::ReleaseNotesScrollbar { .. }
                         | DragTarget::ProductAnnouncementScrollbar { .. }
                         | DragTarget::KeybindHelpScrollbar { .. } => {}
                     }
@@ -1051,7 +1081,7 @@ impl AppState {
                         .and_then(|ws| {
                             let group_state = crate::ui::workspace_parent_group_state(self, idx);
                             let git_space = ws.git_space().cloned().or_else(|| {
-                                ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
+                                ws.local_git_identity_cwd_from(&self.terminals, terminal_runtimes)
                                     .as_deref()
                                     .and_then(crate::workspace::git_space_metadata)
                             });
@@ -2945,7 +2975,7 @@ mod tests {
         );
         app.state.host_mouse_pixels = None;
 
-        assert!(app.route_client_pixel_mouse(7, report.as_bytes(), geometry));
+        assert!(app.route_client_pixel_mouse(7, None, report.as_bytes(), geometry));
         assert_eq!(
             input_rx.try_recv().expect("forwarded exact mouse motion"),
             Bytes::from_static(b"\x1b[<35;28;69M")

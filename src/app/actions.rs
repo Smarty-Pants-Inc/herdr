@@ -308,9 +308,7 @@ impl AppState {
     }
 
     fn sync_selection_after_focus_navigation(&mut self) {
-        if self.copy_mode.is_some() {
-            self.sync_copy_mode_with_focus();
-        } else {
+        if self.copy_mode.is_none() {
             self.clear_selection();
         }
     }
@@ -322,12 +320,14 @@ impl AppState {
         let Some(tab_idx) = ws.find_tab_index_for_pane(pane_id) else {
             return false;
         };
+        let workspace_id = ws.id.clone();
         let previous = self.current_pane_focus_target();
         let target = PaneFocusTarget {
-            workspace_id: ws.id.clone(),
+            workspace_id: workspace_id.clone(),
             pane_id,
         };
-        if previous.as_ref() == Some(&target) {
+        let workspace_plugin_focus_changed = self.unfocus_workspace_plugin_pane(&workspace_id);
+        if previous.as_ref() == Some(&target) && !workspace_plugin_focus_changed {
             return false;
         }
 
@@ -343,7 +343,7 @@ impl AppState {
             tab.layout.focus_pane(pane_id);
             self.previous_pane_focus = previous;
             self.mark_session_dirty();
-            self.sync_copy_mode_with_focus();
+            self.reconcile_focus_lifecycle();
             return true;
         }
         false
@@ -802,7 +802,7 @@ impl AppState {
                     return false;
                 }
                 self.switch_workspace(ws_idx);
-                self.mode = Mode::Terminal;
+                self.settle_terminal_mode_after_focus();
                 true
             }
             NavigatorTarget::Tab { ws_idx, tab_idx } => {
@@ -817,7 +817,7 @@ impl AppState {
                     return false;
                 }
                 self.switch_workspace_tab(ws_idx, tab_idx);
-                self.mode = Mode::Terminal;
+                self.settle_terminal_mode_after_focus();
                 true
             }
             NavigatorTarget::Pane {
@@ -835,7 +835,7 @@ impl AppState {
                     .is_some_and(|tab| tab.panes.contains_key(&pane_id))
                 {
                     self.focus_pane_in_workspace(ws_idx, pane_id);
-                    self.mode = Mode::Terminal;
+                    self.settle_terminal_mode_after_focus();
                     return true;
                 }
                 false
@@ -1138,6 +1138,7 @@ impl AppState {
             self.refresh_tab_bar_view();
             self.record_pane_focus_after_navigation(previous_focus);
             self.sync_selection_after_focus_navigation();
+            self.reconcile_focus_lifecycle();
         }
     }
 
@@ -1173,6 +1174,7 @@ impl AppState {
         self.refresh_tab_bar_view();
         self.record_pane_focus_after_navigation(previous_focus);
         self.sync_selection_after_focus_navigation();
+        self.reconcile_focus_lifecycle();
         true
     }
 
@@ -1630,6 +1632,55 @@ impl AppState {
             .pane_state(pane_id)
             .map(|pane| pane.attached_terminal_id.clone())
     }
+    pub(crate) fn terminal_id_for_runtime_pane(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<crate::terminal::TerminalId> {
+        self.workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .pane_state(pane_id)
+                    .map(|pane| pane.attached_terminal_id.clone())
+            })
+            .or_else(|| {
+                self.workspace_plugin_panes
+                    .values()
+                    .find(|pane| pane.pane_id == pane_id)
+                    .map(|pane| pane.terminal_id.clone())
+            })
+            .or_else(|| {
+                self.popup_pane
+                    .as_ref()
+                    .filter(|pane| pane.pane_id == pane_id)
+                    .map(|pane| pane.terminal_id.clone())
+            })
+    }
+
+    pub(crate) fn update_terminal_cwd(&mut self, pane_id: PaneId, cwd: std::path::PathBuf) -> bool {
+        let Some(terminal_id) = self.terminal_id_for_runtime_pane(pane_id) else {
+            return false;
+        };
+        let changed = {
+            let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+                return false;
+            };
+            let Some(cwd) = crate::pane::usable_reported_cwd(cwd, &terminal.execution_target)
+            else {
+                return false;
+            };
+            if terminal.cwd == cwd {
+                false
+            } else {
+                terminal.cwd = cwd;
+                true
+            }
+        };
+        if changed {
+            self.mark_session_dirty();
+        }
+        changed
+    }
 
     pub(crate) fn remove_unattached_terminal_ids(
         &mut self,
@@ -1658,6 +1709,7 @@ impl AppState {
     ) {
         let pane_ids = pane_ids.into_iter().collect::<Vec<_>>();
         self.clear_copy_mode_for_removed_panes(pane_ids.iter().copied());
+        self.reconcile_focus_lifecycle_excluding(&pane_ids);
         if self
             .previous_pane_focus
             .as_ref()
@@ -1685,6 +1737,11 @@ impl AppState {
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
             pane_ids.extend(self.pane_ids_for_workspace(*idx));
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
+                if let Some(plugin_pane) = self.workspace_plugin_panes.remove(&workspace_id) {
+                    self.direct_attach_resize_locks
+                        .remove(&plugin_pane.terminal_id);
+                    terminal_ids.push(plugin_pane.terminal_id);
+                }
                 crate::logging::workspace_closed(&workspace_id);
             }
         }
@@ -1721,6 +1778,7 @@ impl AppState {
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
         }
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn refresh_tab_bar_view(&mut self) {
@@ -1896,6 +1954,7 @@ impl AppState {
             self.previous_pane_focus = current;
             self.mark_session_dirty();
         }
+        self.reconcile_focus_lifecycle();
     }
 
     pub(crate) fn apply_pane_zoom(
@@ -2080,6 +2139,7 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(terminal_ids);
         }
+        self.reconcile_focus_lifecycle();
         false
     }
 
@@ -2136,6 +2196,7 @@ impl AppState {
             crate::logging::tab_closed(&workspace_id, &closing_tab_id);
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
+            self.reconcile_focus_lifecycle();
         }
         false
     }
@@ -2144,6 +2205,51 @@ impl AppState {
 // ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
+
+pub(crate) struct ResolvedPaneLink {
+    pub(crate) url: String,
+    pub(crate) hover: crate::app::HoveredPaneLink,
+}
+
+pub(crate) struct ResolvedTerminalLink {
+    pub(crate) url: String,
+    pub(crate) cells: Vec<(u16, u16)>,
+}
+
+pub(crate) fn resolved_terminal_link_at_cell(
+    runtime: &crate::terminal::TerminalRuntime,
+    viewport_row: u16,
+    col: u16,
+    width: u16,
+    height: u16,
+) -> Option<ResolvedTerminalLink> {
+    if let Some(link) = runtime.hyperlink_at_viewport_cell(col, viewport_row, width, height) {
+        return Some(ResolvedTerminalLink {
+            url: safe_osc8_url(&link.uri)?.to_owned(),
+            cells: link.cells,
+        });
+    }
+
+    let line = runtime.logical_line_at_viewport_row(viewport_row, width, height)?;
+    let byte_index = line.cells.iter().find_map(|cell| {
+        (cell.viewport_row == viewport_row
+            && col >= cell.viewport_col
+            && col < cell.viewport_col.saturating_add(cell.width))
+        .then_some(cell.byte_index)
+    })?;
+    let (start, end) = url_byte_span_at_byte_index(&line.text, byte_index)?;
+    let url = crate::web_url::safe_web_url(line.text.get(start..end)?)?.to_owned();
+    let cells = line
+        .cells
+        .into_iter()
+        .filter(|cell| cell.byte_index >= start && cell.byte_index < end)
+        .flat_map(|cell| {
+            (0..cell.width)
+                .map(move |offset| (cell.viewport_col.saturating_add(offset), cell.viewport_row))
+        })
+        .collect();
+    Some(ResolvedTerminalLink { url, cells })
+}
 
 impl AppState {
     pub fn clear_selection(&mut self) {
@@ -2229,6 +2335,7 @@ impl AppState {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn url_at_pane_cell(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
@@ -2236,6 +2343,17 @@ impl AppState {
         viewport_row: u16,
         col: u16,
     ) -> Option<String> {
+        self.resolved_link_at_pane_cell(terminal_runtimes, pane_id, viewport_row, col)
+            .map(|link| link.url)
+    }
+
+    pub(crate) fn resolved_link_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<ResolvedPaneLink> {
         let ws_idx = self
             .active
             .filter(|idx| self.workspaces.get(*idx).is_some())?;
@@ -2245,34 +2363,30 @@ impl AppState {
         }
 
         let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
-        let screen_col = info.inner_rect.x.saturating_add(col);
-        let screen_row = info.inner_rect.y.saturating_add(viewport_row);
-        if let Some((_, _, uri)) = rt
-            .visible_hyperlinks(info.inner_rect)
-            .into_iter()
-            .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
-        {
-            return Some(uri);
-        }
-
-        let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
-        let visible_selection = Selection::line_range(
-            pane_id,
-            Selection::absolute_row_for_viewport(0, metrics),
-            Selection::absolute_row_for_viewport(info.inner_rect.height.saturating_sub(1), metrics),
-            info.inner_rect.width.saturating_sub(1),
-        );
-        let visible_text = rt.extract_selection(&visible_selection)?;
-        let logical_cell =
-            logical_cell_for_visible_cell(&visible_text, info.inner_rect.width, viewport_row, col)?;
-        let line_start = visible_text[..logical_cell.byte_index]
-            .rfind('\n')
-            .map_or(0, |idx| idx + 1);
-        let line_end = visible_text[logical_cell.byte_index..]
-            .find('\n')
-            .map_or(visible_text.len(), |idx| logical_cell.byte_index + idx);
-        let line = visible_text.get(line_start..line_end)?;
-        url_at_column(line, logical_cell.logical_col).map(str::to_owned)
+        let link = resolved_terminal_link_at_cell(
+            rt,
+            viewport_row,
+            col,
+            info.inner_rect.width,
+            info.inner_rect.height,
+        )?;
+        Some(ResolvedPaneLink {
+            url: link.url,
+            hover: crate::app::HoveredPaneLink {
+                pane_id,
+                inner_rect: info.inner_rect,
+                cells: link
+                    .cells
+                    .into_iter()
+                    .map(|(col, row)| {
+                        (
+                            info.inner_rect.x.saturating_add(col),
+                            info.inner_rect.y.saturating_add(row),
+                        )
+                    })
+                    .collect(),
+            },
+        })
     }
 
     pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {
@@ -2303,8 +2417,8 @@ impl AppState {
     }
 }
 
-pub(crate) fn safe_web_url(url: &str) -> Option<&str> {
-    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
+pub(crate) fn safe_osc8_url(url: &str) -> Option<&str> {
+    (!url.is_empty() && !url.bytes().any(|byte| byte < b' ' || byte == 0x7f)).then_some(url)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2350,15 +2464,38 @@ fn word_bounds_at_column(row: &str, col: u16) -> Option<(u16, u16)> {
     Some(span.columns(&cells))
 }
 
+#[cfg(test)]
 pub(crate) fn url_at_column(row: &str, col: u16) -> Option<&str> {
+    let (start, end) = url_byte_span_at_column(row, col)?;
+    crate::web_url::safe_web_url(row.get(start..end)?)
+}
+
+#[cfg(test)]
+fn url_byte_span_at_column(row: &str, col: u16) -> Option<(usize, usize)> {
     let cells = text_cells(row);
-    let clicked_idx = cell_index_at_column(&cells, col)?;
-    let span = url_spans(&cells)
+    url_byte_span_for_cell(row, &cells, cell_index_at_column(&cells, col)?)
+}
+
+fn url_byte_span_at_byte_index(row: &str, byte_index: usize) -> Option<(usize, usize)> {
+    let cells = text_cells(row);
+    let clicked_idx = row
+        .char_indices()
+        .position(|(index, _)| index == byte_index)?;
+    url_byte_span_for_cell(row, &cells, clicked_idx)
+}
+
+fn url_byte_span_for_cell(
+    row: &str,
+    cells: &[TextCell],
+    clicked_idx: usize,
+) -> Option<(usize, usize)> {
+    let span = url_spans(cells)
         .into_iter()
         .find(|span| span.contains(clicked_idx))?;
-    let start_byte = byte_index_for_cell(row, span.start);
-    let end_byte = byte_index_after_cell(row, span.end);
-    safe_web_url(row.get(start_byte..end_byte)?)
+    Some((
+        byte_index_for_cell(row, span.start),
+        byte_index_after_cell(row, span.end),
+    ))
 }
 
 fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
@@ -2381,82 +2518,6 @@ fn url_spans(cells: &[TextCell]) -> Vec<CellSpan> {
         }
     }
     spans
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VisibleTextCell {
-    pub(crate) byte_index: usize,
-    pub(crate) ch: char,
-    pub(crate) logical_col: u16,
-    pub(crate) screen_row: u16,
-    pub(crate) screen_col: u16,
-}
-
-pub(crate) fn visible_text_cells(text: &str, pane_width: u16) -> Vec<VisibleTextCell> {
-    if pane_width == 0 {
-        return Vec::new();
-    }
-
-    let mut cells = Vec::new();
-    let mut screen_row = 0u16;
-    let mut screen_col = 0u16;
-    let mut logical_col = 0u16;
-    let mut pending_wrap = false;
-    for (byte_index, ch) in text.char_indices() {
-        if ch == '\n' {
-            screen_row = screen_row.saturating_add(1);
-            screen_col = 0;
-            logical_col = 0;
-            pending_wrap = false;
-            continue;
-        }
-        if pending_wrap {
-            screen_row = screen_row.saturating_add(1);
-            screen_col = 0;
-            pending_wrap = false;
-        }
-
-        let width = u16::from(crate::ghostty::unicode_codepoint_width(ch as u32));
-        cells.push(VisibleTextCell {
-            byte_index,
-            ch,
-            logical_col,
-            screen_row,
-            screen_col,
-        });
-
-        logical_col = logical_col.saturating_add(width);
-        screen_col = screen_col.saturating_add(width);
-        while screen_col > pane_width {
-            screen_col -= pane_width;
-            screen_row = screen_row.saturating_add(1);
-        }
-        if width > 0 && screen_col == pane_width {
-            pending_wrap = true;
-            screen_col = pane_width.saturating_sub(1);
-        }
-    }
-    cells
-}
-
-pub(crate) fn logical_cell_for_visible_cell(
-    text: &str,
-    pane_width: u16,
-    target_row: u16,
-    target_col: u16,
-) -> Option<VisibleTextCell> {
-    visible_text_cells(text, pane_width)
-        .into_iter()
-        .find(|cell| {
-            let width = u16::from(crate::ghostty::unicode_codepoint_width(cell.ch as u32));
-            cell.screen_row == target_row
-                && if width == 0 {
-                    target_col == cell.screen_col
-                } else {
-                    target_col >= cell.screen_col
-                        && target_col < cell.screen_col.saturating_add(width)
-                }
-        })
 }
 
 fn token_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<CellSpan> {
@@ -2724,10 +2785,11 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, .. } => {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
+            AppEvent::RemoteExecutionReady { .. } => Vec::new(),
             AppEvent::UpdateReady {
                 version,
                 install_command,
@@ -2737,7 +2799,9 @@ impl AppState {
                 self.latest_release_notes_available = true;
                 self.update_dismissed = true;
                 if matches!(
-                    self.toast_config.delivery,
+                    self.toast_config
+                        .delivery
+                        .effective(self.outer_terminal_focus),
                     crate::config::ToastDelivery::Herdr
                 ) {
                     self.toast = Some(ToastNotification {
@@ -2757,7 +2821,9 @@ impl AppState {
                 self.refresh_agent_manifest_summaries();
                 if !updated.is_empty()
                     && matches!(
-                        self.toast_config.delivery,
+                        self.toast_config
+                            .delivery
+                            .effective(self.outer_terminal_focus),
                         crate::config::ToastDelivery::Herdr
                     )
                 {
@@ -2851,14 +2917,16 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                resume_policy,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_resume_policy(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        resume_policy,
                     )
                 })
                 .into_iter()
@@ -2910,40 +2978,29 @@ impl AppState {
                 agent_label,
                 seq,
                 ..
-            } => {
-                if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
-                    Vec::new()
-                } else {
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.release_agent_with_mutation(&source, &agent_label, seq)
-                    })
-                    .into_iter()
-                    .collect()
-                }
-            }
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    let remote_omp = terminal
+                        .remote_lifecycle_report_is_process_authority(&source, &agent_label);
+                    if crate::agent_resume::is_official_agent_source(&source, &agent_label)
+                        && !remote_omp
+                    {
+                        return None;
+                    }
+                    terminal.release_agent_with_mutation(&source, &agent_label, seq)
+                })
+                .into_iter()
+                .collect(),
             // Intercepted before this dispatch — in App::handle_internal_event (monolithic)
-            // or via HeadlessServer forwarding to the foreground client (server); never touch
-            // AppState. Kept for AppEvent exhaustiveness.
+            // or via HeadlessServer forwarding to the originating input client (server); never
+            // touch AppState. Kept for AppEvent exhaustiveness.
             AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
+            AppEvent::PaneClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
+            AppEvent::OpenUrl { .. } => Vec::new(),
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
-                if !cwd.is_absolute() || !cwd.is_dir() {
-                    return Vec::new();
-                }
-                let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
-                    ws.pane_state(pane_id)
-                        .map(|pane| pane.attached_terminal_id.clone())
-                }) else {
-                    return Vec::new();
-                };
-                let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-                    return Vec::new();
-                };
-                if terminal.cwd != cwd {
-                    terminal.cwd = cwd;
-                    self.mark_session_dirty();
-                }
+                self.update_terminal_cwd(pane_id, cwd);
                 Vec::new()
             }
             AppEvent::GitStatusRefreshed {
@@ -2961,7 +3018,11 @@ impl AppState {
         }
     }
 
-    fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
+    pub(crate) fn update_terminal_state<F>(
+        &mut self,
+        pane_id: PaneId,
+        update: F,
+    ) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {
@@ -3281,7 +3342,9 @@ impl AppState {
         }
 
         if matches!(
-            self.toast_config.delivery,
+            self.toast_config
+                .delivery
+                .effective(self.outer_terminal_focus),
             crate::config::ToastDelivery::Herdr
         ) {
             if let Some(toast) = delivery.toast.clone() {
@@ -3412,6 +3475,7 @@ impl AppState {
         } else {
             self.remove_unattached_terminal_ids(pane_terminal_id);
         }
+        self.reconcile_focus_lifecycle();
     }
 }
 
@@ -3664,6 +3728,27 @@ mod tests {
             None
         );
         assert_eq!(selected_url("open file:///tmp/report", "file"), None);
+    }
+
+    #[test]
+    fn osc8_urls_are_safe_for_handlers_without_becoming_platform_openers() {
+        for url in [
+            "https://example.com/report",
+            "file:///tmp/report.md?line=7",
+            "file://build.example/tmp/report.md?line=7",
+            "artifact://5776",
+        ] {
+            assert_eq!(safe_osc8_url(url), Some(url));
+        }
+        for unsafe_url in [
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
+        ] {
+            assert_eq!(safe_osc8_url(unsafe_url), None, "accepted {unsafe_url:?}");
+        }
+        assert!(crate::web_url::safe_web_url("artifact://5776").is_none());
+        assert!(crate::web_url::safe_web_url("file://build.example/tmp/report.md").is_none());
     }
 
     #[test]
@@ -4415,6 +4500,75 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn switch_workspace_closes_findr_targeting_previous_workspace() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        state.switch_workspace(1);
+
+        assert_eq!(state.active, Some(1));
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn switch_workspace_tab_closes_findr_when_target_tab_is_left() {
+        let mut state = app_with_workspaces(&["a"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let other_tab = state.workspaces[0].test_add_tab(Some("other"));
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        assert!(state.switch_workspace_tab(0, other_tab));
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn switch_workspace_tab_keeps_findr_when_target_tab_stays_active() {
+        let mut state = app_with_workspaces(&["a"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        state.mode = Mode::Findr;
+
+        assert!(state.switch_workspace_tab(0, 0));
+
+        assert!(state.findr.is_some());
+        assert_eq!(state.mode, Mode::Findr);
+    }
+
+    #[test]
+    fn focus_pane_closes_findr_when_target_pane_is_left() {
+        let mut state = app_with_workspaces(&["a"]);
+        let target = state.workspaces[0].tabs[0].root_pane;
+        let other = state.workspaces[0].test_split(Direction::Horizontal);
+        state.focus_pane_in_workspace(0, target);
+        state.findr = Some(crate::app::state::FindrState::new(target));
+        state.mode = Mode::Findr;
+
+        assert!(state.focus_pane_in_workspace(0, other));
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn focus_pane_keeps_findr_when_target_stays_focused() {
+        let mut state = app_with_workspaces(&["a"]);
+        let target = state.workspaces[0].tabs[0].root_pane;
+        state.findr = Some(crate::app::state::FindrState::new(target));
+        state.mode = Mode::Findr;
+
+        assert!(!state.focus_pane_in_workspace(0, target));
+
+        assert!(state.findr.is_some());
+        assert_eq!(state.mode, Mode::Findr);
     }
 
     #[test]
@@ -5280,6 +5434,7 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
             pane_id: bg_pane_id,
+            child_pid: None,
         });
 
         assert!(state.pending_agent_notifications.is_empty());
@@ -5441,6 +5596,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),
@@ -5467,6 +5623,66 @@ mod tests {
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.full_lifecycle_hook_authority_active());
         assert!(!state.session_dirty);
+    }
+
+    #[test]
+    fn remote_omp_release_clears_report_owned_agent() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("omp-remote");
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::ssh("dev1").expect("valid SSH host");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:omp".into(),
+            "omp".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Idle,
+            None,
+            session_ref,
+            Some(2),
+        );
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+
+        let stale = state.handle_app_event(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "herdr:omp".into(),
+            agent_label: "omp".into(),
+            known_agent: Some(Agent::Omp),
+            seq: Some(2),
+        });
+        assert!(stale.is_empty());
+        assert_eq!(
+            state.terminals[&terminal_id].detected_agent,
+            Some(Agent::Omp)
+        );
+        assert!(state.terminals[&terminal_id].hook_authority.is_some());
+
+        state.handle_app_event(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "herdr:omp".into(),
+            agent_label: "omp".into(),
+            known_agent: Some(Agent::Omp),
+            seq: Some(3),
+        });
+
+        let terminal = &state.terminals[&terminal_id];
+        assert!(terminal.detected_agent.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
     }
 
     #[test]
@@ -5596,6 +5812,49 @@ mod tests {
         assert_eq!(state.terminals.get(&terminal_id).unwrap().cwd, cwd);
         assert!(state.session_dirty);
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn terminal_cwd_report_requires_existence_only_for_local_targets() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let missing = std::env::temp_dir().join(format!(
+            "herdr-missing-cwd-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos()
+        ));
+        assert!(!missing.exists());
+        let original_cwd = state.terminals[&terminal_id].cwd.clone();
+        state.session_dirty = false;
+
+        state.handle_app_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: missing.clone(),
+        });
+
+        assert_eq!(state.terminals[&terminal_id].cwd, original_cwd);
+        assert!(!state.session_dirty);
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("primary").unwrap();
+        state.handle_app_event(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: missing.clone(),
+        });
+
+        assert_eq!(state.terminals[&terminal_id].cwd, missing);
+        assert!(state.session_dirty);
     }
 
     #[test]
@@ -5948,6 +6207,22 @@ mod tests {
         state.close_pane();
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert!(!state.plugin_panes.contains_key(&closed));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn close_pane_clears_findr_target_and_restores_terminal_mode() {
+        let mut state = app_with_workspaces(&["test"]);
+        let closed = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].layout.focus_pane(closed);
+        state.ensure_test_terminals();
+        state.findr = Some(crate::app::state::FindrState::new(closed));
+        state.mode = Mode::Findr;
+
+        state.close_pane();
+
+        assert!(state.findr.is_none());
+        assert_eq!(state.mode, Mode::Terminal);
         state.assert_invariants_for_test();
     }
 

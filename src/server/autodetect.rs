@@ -126,6 +126,10 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
         requested_encoding: crate::protocol::RenderEncoding::SemanticFrame,
         keybindings: crate::protocol::ClientKeybindings::Server,
         launch_mode: crate::protocol::ClientLaunchMode::App,
+        display_name: None,
+        frontend_profile_id: None,
+        renderer_binding_token: None,
+        renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
     };
 
     match crate::protocol::write_message(&mut stream, &hello) {
@@ -183,7 +187,8 @@ fn validate_running_server_compatibility() -> io::Result<()> {
 /// - Stdin/stdout/stderr are redirected to /dev/null
 /// - Inherits relevant environment variables (`XDG_CONFIG_HOME`, `HERDR_SESSION`,
 ///   socket overrides, etc.), except inherited socket overrides are cleared when
-///   this CLI invocation explicitly selected a session.
+///   this CLI invocation explicitly selected a session, and bridge capabilities
+///   are always cleared so the new server owns its own bridge.
 ///
 /// Returns the PID of the spawned server process.
 pub fn spawn_server_daemon() -> io::Result<u32> {
@@ -216,6 +221,9 @@ fn build_server_daemon_command(exe: PathBuf) -> Command {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     crate::platform::detach_server_daemon_command(&mut command);
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        command.env_remove(key);
+    }
 
     match std::env::current_dir() {
         Ok(cwd) => {
@@ -367,6 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn server_daemon_command_clears_inherited_omp_bridge_capabilities() {
+        let command = build_server_daemon_command(PathBuf::from("/tmp/herdr-test"));
+        let envs: Vec<_> = command.get_envs().collect();
+
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+            assert!(
+                envs.iter()
+                    .any(|(name, value)| *name == OsStr::new(key) && value.is_none()),
+                "inherited {key} bridge capability should be cleared"
+            );
+        }
+    }
+
+    #[test]
     fn server_daemon_command_passes_current_dir_as_startup_cwd() {
         let expected = std::env::current_dir().unwrap();
         let command = build_server_daemon_command(PathBuf::from("/tmp/herdr-test"));
@@ -412,29 +434,15 @@ test "$sid" = "$$"
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.sock");
 
-        // Create a socket and immediately drop the listener.
-        // This leaves a stale socket file with nobody listening.
-        {
-            let _listener = UnixListener::bind(&path).unwrap();
+        // A concurrently forked child can briefly inherit the listener before
+        // exec closes it, so stale detection is eventually consistent.
+        drop(UnixListener::bind(&path).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while is_server_listening_at(&path) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
         }
 
-        // The socket file exists but nobody is listening.
         assert!(!is_server_listening_at(&path));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn is_server_listening_returns_false_when_listener_dropped() {
-        let dir = unique_test_dir("dropped");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.sock");
-
-        // Bind and immediately drop the listener.
-        drop(UnixListener::bind(&path).unwrap());
-
-        // Socket is stale — should return false.
-        assert!(!is_server_listening_at(&path));
-
         let _ = std::fs::remove_dir_all(dir);
     }
 

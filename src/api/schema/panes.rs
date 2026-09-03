@@ -29,11 +29,15 @@ pub struct PaneSplitParams {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
     pub direction: SplitDirection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<crate::execution::ExecutionTarget>,
     #[serde(default)]
     pub focus: bool,
     #[serde(default)]
@@ -133,6 +137,11 @@ pub struct PaneProcessInfoParams {
     pub pane_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneOmpBridgeParams {
+    pub pane_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct LayoutExportParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +161,13 @@ pub struct LayoutApplyParams {
     #[serde(default)]
     pub focus: bool,
     pub root: LayoutNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LayoutIdempotentParams {
+    pub idempotency_key: String,
+    #[serde(flatten)]
+    pub layout: LayoutApplyParams,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -198,6 +214,11 @@ pub struct LayoutPane {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::execution::ExecutionTarget::is_local"
+    )]
+    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
 }
@@ -254,12 +275,18 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendKeysParams {
     pub pane_id: String,
     pub keys: Vec<String>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -269,6 +296,9 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Deliberately allow an agent-originated request to target another pane.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -393,6 +423,8 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_policy: Option<crate::agent_resume::AgentResumePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -452,6 +484,8 @@ pub struct PaneInfo {
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

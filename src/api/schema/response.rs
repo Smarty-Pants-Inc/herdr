@@ -13,9 +13,9 @@ use super::panes::{
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
-    PluginPaneInfo,
+    PluginPaneInfo, PluginWorkspacePaneInfo,
 };
-use super::server::ServerCapabilities;
+use super::server::{ServerBuildIdentity, ServerCapabilities, ServerOmpMaintenanceStatus};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -47,6 +47,11 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<ServerBuildIdentity>,
+    },
+    OmpMaintenance {
+        maintenance: ServerOmpMaintenanceStatus,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
@@ -137,6 +142,11 @@ pub enum ResponseResult {
     },
     PaneProcessInfo {
         process_info: PaneProcessInfo,
+    },
+    PaneOmpBridge {
+        pane_id: String,
+        address: String,
+        token: String,
     },
     LayoutExport {
         layout: LayoutDescription,
@@ -260,6 +270,12 @@ pub enum ResponseResult {
     },
     PluginPaneFocused {
         plugin_pane: PluginPaneInfo,
+    },
+    PluginWorkspacePaneOpened {
+        plugin_pane: PluginWorkspacePaneInfo,
+    },
+    PluginWorkspacePaneFocused {
+        plugin_pane: PluginWorkspacePaneInfo,
     },
     PluginPaneClosed {
         pane_id: String,

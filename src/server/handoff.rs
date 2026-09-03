@@ -17,7 +17,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 #[cfg(unix)]
-const HANDOFF_VERSION: u32 = 1;
+const LEGACY_HANDOFF_VERSION: u32 = 1;
+#[cfg(unix)]
+const PREVIOUS_HANDOFF_VERSION: u32 = 2;
+#[cfg(unix)]
+const HANDOFF_VERSION: u32 = 3;
+/// Outer handoff fence. Older importers reject unknown versions before they restore the snapshot.
+#[cfg(unix)]
+const EXTERNAL_SNAPSHOT_HANDOFF_VERSION: u32 = 4;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -44,6 +51,10 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Host-wide OMP admission lease validated by the importing server.
+    /// Absent from manifests written before the maintenance gate existed.
+    #[serde(default)]
+    pub omp_maintenance: Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>,
 }
 
 #[cfg(unix)]
@@ -85,6 +96,9 @@ pub(crate) fn spawn_handoff_import(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+        command.env_remove(key);
+    }
     if crate::session::explicit_session_requested() {
         // The import child no longer has the original `--session` argument, so
         // stale socket overrides must not mask the inherited HERDR_SESSION.
@@ -238,12 +252,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     let manifest_line = read_line_unbuffered(&mut stream)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
-    if manifest.version != HANDOFF_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported handoff version {}",
-            manifest.version
-        )));
-    }
+    validate_manifest_compatibility(&manifest)?;
     if manifest
         .expected_protocol
         .is_some_and(|protocol| protocol != crate::protocol::PROTOCOL_VERSION)
@@ -273,6 +282,63 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
         fds,
         stream,
     })
+}
+
+fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()> {
+    let has_epoch = manifest.snapshot.idempotency_epoch.is_some();
+    let has_valid_epoch = manifest
+        .snapshot
+        .idempotency_epoch
+        .as_deref()
+        .is_some_and(|epoch| !epoch.trim().is_empty());
+    let has_external_resume_policy = crate::persist::has_external_resume_policy(&manifest.snapshot);
+    if manifest.snapshot.version > crate::persist::SNAPSHOT_VERSION {
+        return Err(io::Error::other(format!(
+            "handoff snapshot version {} is newer than supported {}",
+            manifest.snapshot.version,
+            crate::persist::SNAPSHOT_VERSION,
+        )));
+    }
+    if has_external_resume_policy
+        && manifest.snapshot.version < crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+    {
+        return Err(io::Error::other(format!(
+            "external resume snapshot requires snapshot version {} or newer",
+            crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        )));
+    }
+    if (has_external_resume_policy
+        || manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION)
+        && manifest.version != EXTERNAL_SNAPSHOT_HANDOFF_VERSION
+    {
+        return Err(io::Error::other(
+            "external resume snapshot requires handoff version 4",
+        ));
+    }
+    match manifest.version {
+        EXTERNAL_SNAPSHOT_HANDOFF_VERSION if manifest.snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION && has_valid_epoch => Ok(()),
+        EXTERNAL_SNAPSHOT_HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {EXTERNAL_SNAPSHOT_HANDOFF_VERSION} requires an external snapshot and idempotency epoch"
+        ))),
+        HANDOFF_VERSION if has_valid_epoch => Ok(()),
+        HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {HANDOFF_VERSION} requires an idempotency epoch"
+        ))),
+        PREVIOUS_HANDOFF_VERSION if !has_epoch => Ok(()),
+        PREVIOUS_HANDOFF_VERSION => Err(io::Error::other(format!(
+            "handoff version {PREVIOUS_HANDOFF_VERSION} cannot carry an idempotency epoch"
+        ))),
+        LEGACY_HANDOFF_VERSION if has_epoch => Err(io::Error::other(
+            "legacy handoff manifests cannot carry an idempotency epoch",
+        )),
+        LEGACY_HANDOFF_VERSION if manifest.omp_maintenance.is_none() => Ok(()),
+        LEGACY_HANDOFF_VERSION => Err(io::Error::other(
+            "legacy handoff manifests cannot carry OMP maintenance state",
+        )),
+        version => Err(io::Error::other(format!(
+            "unsupported handoff version {version}"
+        ))),
+    }
 }
 
 #[cfg(unix)]
@@ -310,9 +376,14 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    omp_maintenance: Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>,
 ) -> HandoffManifest {
     HandoffManifest {
-        version: HANDOFF_VERSION,
+        version: if snapshot.version >= crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION {
+            EXTERNAL_SNAPSHOT_HANDOFF_VERSION
+        } else {
+            HANDOFF_VERSION
+        },
         source_version: crate::build_info::version(),
         source_protocol: crate::protocol::PROTOCOL_VERSION,
         expected_version,
@@ -320,6 +391,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        omp_maintenance,
     }
 }
 
@@ -483,8 +555,73 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: Some("test-epoch".into()),
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+        }
+    }
+
+    fn external_snapshot() -> crate::persist::SessionSnapshot {
+        let mut snapshot = empty_snapshot();
+        snapshot.version = crate::persist::EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
+        snapshot
+    }
+
+    fn external_policy_snapshot(version: u32) -> crate::persist::SessionSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "version": version,
+            "workspaces": [{
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": {"Pane": 1},
+                    "panes": {"1": {
+                        "cwd": "/tmp",
+                        "agent_session": {
+                            "source": "herdr:omp",
+                            "agent": "omp",
+                            "kind": "id",
+                            "value": "external-session",
+                            "resume_policy": "external"
+                        }
+                    }},
+                    "zoomed": false
+                }]
+            }],
+            "active": 0,
+            "selected": 0,
+            "idempotency_epoch": "test-epoch"
+        }))
+        .expect("external-policy snapshot fixture should deserialize")
+    }
+
+    #[test]
+    fn handoff_rejects_external_policy_smuggled_in_a_v5_snapshot() {
+        let manifest = manifest_for(
+            external_policy_snapshot(5),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(manifest.version, HANDOFF_VERSION);
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "external resume snapshot requires snapshot version 6 or newer"
+        );
+    }
+
+    fn validate_v5_handoff_fixture(encoded: &str) -> Result<(), String> {
+        let version = serde_json::from_str::<serde_json::Value>(encoded)
+            .map_err(|error| error.to_string())?
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "handoff version is missing".to_string())?;
+        match version {
+            1..=3 => Ok(()),
+            version => Err(format!("unsupported handoff version {version}")),
         }
     }
 
@@ -496,29 +633,151 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
     }
 
     #[test]
-    fn a_manifest_written_before_the_title_field_still_loads() {
+    fn current_handoff_schema_carries_the_idempotency_epoch() {
         let manifest = manifest_for(
             empty_snapshot(),
             Vec::new(),
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
-        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
-        value
-            .as_object_mut()
-            .expect("manifest should be a json object")
-            .remove("api_window_title");
 
-        let older: HandoffManifest =
-            serde_json::from_value(value).expect("an older manifest should still load");
+        assert_eq!(manifest.version, 3);
+        assert_eq!(
+            manifest.snapshot.idempotency_epoch.as_deref(),
+            Some("test-epoch")
+        );
+        validate_manifest_compatibility(&manifest).expect("current handoff must be compatible");
+    }
 
-        assert!(older.api_window_title.is_none());
+    #[test]
+    fn external_resume_snapshot_uses_an_outer_version_that_v5_importers_reject() {
+        let manifest = manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+
+        assert_eq!(manifest.version, EXTERNAL_SNAPSHOT_HANDOFF_VERSION);
+        validate_manifest_compatibility(&manifest)
+            .expect("v6 importer must accept its fenced handoff");
+        let encoded = serde_json::to_string(&manifest).expect("handoff should serialize");
+        assert_eq!(
+            validate_v5_handoff_fixture(&encoded).unwrap_err(),
+            "unsupported handoff version 4"
+        );
+    }
+
+    #[test]
+    fn legacy_outer_handoff_versions_cannot_smuggle_an_external_resume_snapshot() {
+        for version in [
+            LEGACY_HANDOFF_VERSION,
+            PREVIOUS_HANDOFF_VERSION,
+            HANDOFF_VERSION,
+        ] {
+            let mut manifest =
+                manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+            manifest.version = version;
+
+            let error = validate_manifest_compatibility(&manifest).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "external resume snapshot requires handoff version 4"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_rejects_a_future_nested_snapshot_version() {
+        let mut manifest = manifest_for(external_snapshot(), Vec::new(), None, None, None, None);
+        manifest.snapshot.version = crate::persist::SNAPSHOT_VERSION + 1;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn previous_handoff_version_cannot_claim_an_idempotency_epoch() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = PREVIOUS_HANDOFF_VERSION;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("handoff version 2 cannot carry an idempotency epoch"));
+    }
+
+    #[test]
+    fn genuine_previous_handoff_without_an_epoch_remains_compatible() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = PREVIOUS_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
+
+        validate_manifest_compatibility(&manifest).expect("genuine v2 handoff remains compatible");
+    }
+
+    #[test]
+    fn current_handoff_without_idempotency_epoch_is_rejected() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.snapshot.idempotency_epoch = None;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error.to_string().contains("requires an idempotency epoch"));
+    }
+
+    #[test]
+    fn a_handoff_carries_an_armed_omp_maintenance_permit() {
+        let maintenance = crate::server::omp_maintenance::OmpMaintenanceHandoffState {
+            owner_hash: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+            permit: Some(crate::api::schema::ServerOmpMaintenancePermit {
+                session: "proof".into(),
+                pane_id: "w1:p1".into(),
+            }),
+        };
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(maintenance.clone()),
+        );
+
+        assert_eq!(manifest.omp_maintenance, Some(maintenance));
+    }
+
+    #[test]
+    fn legacy_handoff_version_cannot_claim_maintenance_capability() {
+        let mut manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(crate::server::omp_maintenance::OmpMaintenanceHandoffState {
+                owner_hash: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+                permit: None,
+            }),
+        );
+        manifest.version = LEGACY_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
+
+        let error = validate_manifest_compatibility(&manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot carry OMP maintenance state"));
+    }
+
+    #[test]
+    fn genuine_legacy_handoff_without_new_state_remains_compatible() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        manifest.version = LEGACY_HANDOFF_VERSION;
+        manifest.snapshot.idempotency_epoch = None;
+
+        validate_manifest_compatibility(&manifest).expect("genuine v1 handoff remains compatible");
     }
 }

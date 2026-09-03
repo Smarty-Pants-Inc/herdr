@@ -15,7 +15,7 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 21;
+pub const CURRENT_PROTOCOL: u32 = 27;
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -100,12 +100,12 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
 pub fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             return;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("file did not appear at {}", path.display());
+    panic!("non-empty file did not appear at {}", path.display());
 }
 
 pub fn encode_varint_u32(v: u32) -> Vec<u8> {
@@ -230,17 +230,35 @@ pub fn client_handshake(
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
 
+    let encode_option_string = |value: &str| {
+        [
+            encode_varint_u32(1),
+            encode_varint_u32(value.len() as u32),
+            value.as_bytes().to_vec(),
+        ]
+        .concat()
+    };
+    static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let display_name = encode_option_string("Test");
+    let frontend_profile_id = encode_option_string(&format!("{client_id:043}"));
+    let renderer_binding_token = encode_option_string(&format!("r{client_id:042}"));
+
     let hello_payload = encode_varint_enum(
         0,
         &[
             &encode_varint_u32(version),
             &encode_varint_u16(cols),
             &encode_varint_u16(rows),
-            &encode_varint_u32(8),  // cell_width_px
-            &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
+            &encode_varint_u32(8),   // cell_width_px
+            &encode_varint_u32(16),  // cell_height_px
+            &encode_varint_u32(0),   // RenderEncoding::SemanticFrame
+            &encode_varint_u32(0),   // ClientKeybindings::Server
+            &encode_varint_u32(0),   // ClientLaunchMode::App
+            &display_name,           // display_name: Some("Test")
+            &frontend_profile_id,    // frontend_profile_id: Some(valid token)
+            &renderer_binding_token, // renderer_binding_token: Some(valid token)
+            &encode_varint_u32(0),   // OmpRendererCapabilities::client_local_native
         ],
     );
     let framed = frame_message(&hello_payload);

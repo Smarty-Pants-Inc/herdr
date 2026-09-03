@@ -9,8 +9,8 @@ use crate::api::schema::{
     InstalledPluginInfo, Method, PluginActionInvokeParams, PluginActionListParams,
     PluginInvocationContext, PluginLinkParams, PluginListParams, PluginLogListParams,
     PluginPaneCloseParams, PluginPaneFocusParams, PluginPaneOpenParams, PluginPanePlacement,
-    PluginPlatform, PluginSetEnabledParams, PluginSourceInfo, PluginSourceKind, PluginUnlinkParams,
-    Request, ResponseResult, SplitDirection, SuccessResponse,
+    PluginPaneScope, PluginPlatform, PluginSetEnabledParams, PluginSourceInfo, PluginSourceKind,
+    PluginUnlinkParams, Request, ResponseResult, SplitDirection, SuccessResponse, ViewId,
 };
 use crate::popup_size::PopupSize;
 
@@ -450,27 +450,52 @@ fn plugin_action_invoke(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    let caller_pane_id = plugin_caller_pane_id();
     print_plugin_response(Method::PluginActionInvoke(PluginActionInvokeParams {
         action_id: action_id.clone(),
         plugin_id,
-        context: Some(PluginInvocationContext {
-            workspace_id: None,
-            workspace_label: None,
-            workspace_cwd: None,
-            worktree: None,
-            tab_id: None,
-            tab_label: None,
-            focused_pane_id: None,
-            focused_pane_cwd: None,
-            focused_pane_agent: None,
-            focused_pane_status: None,
-            selected_text: None,
-            invocation_source: Some("cli".into()),
-            correlation_id: None,
-            clicked_url: None,
-            link_handler_id: None,
-        }),
+        context: Some(plugin_action_invocation_context(caller_pane_id.as_deref())),
     }))
+}
+
+fn plugin_action_invocation_context(caller_pane_id: Option<&str>) -> PluginInvocationContext {
+    PluginInvocationContext {
+        workspace_id: None,
+        workspace_label: None,
+        workspace_cwd: None,
+        worktree: None,
+        tab_id: None,
+        tab_label: None,
+        focused_pane_id: caller_pane_id.map(super::normalize_pane_id),
+        focused_pane_cwd: None,
+        focused_pane_agent: None,
+        focused_pane_status: None,
+        selected_text: None,
+        invocation_source: Some("cli".into()),
+        correlation_id: None,
+        clicked_url: None,
+        link_handler_id: None,
+        view_id: plugin_view_id(),
+    }
+}
+
+fn plugin_caller_pane_id() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+                .ok()
+                .and_then(|json| serde_json::from_str::<PluginInvocationContext>(&json).ok())
+                .and_then(|context| context.focused_pane_id)
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn plugin_view_id() -> Option<ViewId> {
+    std::env::var("HERDR_VIEW_ID")
+        .ok()
+        .and_then(ViewId::from_opaque)
 }
 
 fn run_plugin_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -495,13 +520,32 @@ fn run_plugin_pane_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn plugin_pane_open(args: &[String]) -> std::io::Result<i32> {
+    let caller_pane_id = plugin_caller_pane_id();
+    let params =
+        match parse_plugin_pane_open_args(args, caller_pane_id.as_deref(), plugin_view_id()) {
+            Ok(params) => params,
+            Err(message) => {
+                eprintln!("{message}");
+                return Ok(2);
+            }
+        };
+
+    print_plugin_response(Method::PluginPaneOpen(params))
+}
+
+fn parse_plugin_pane_open_args(
+    args: &[String],
+    caller_pane_id: Option<&str>,
+    view_id: Option<ViewId>,
+) -> Result<PluginPaneOpenParams, String> {
     let mut plugin_id = None;
     let mut entrypoint = None;
     let mut placement = None;
+    let mut scope = None;
     let mut width = None;
     let mut height = None;
     let mut workspace_id = None;
-    let mut target_pane_id = None;
+    let mut target_pane_id = caller_pane_id.map(super::normalize_pane_id);
     let mut direction = None;
     let mut cwd = None;
     let mut focus = true;
@@ -511,83 +555,68 @@ fn plugin_pane_open(args: &[String]) -> std::io::Result<i32> {
     while index < args.len() {
         match args[index].as_str() {
             "--plugin" => {
-                let Some(value) = required_value(args, &mut index, "--plugin") else {
-                    return Ok(2);
-                };
-                plugin_id = Some(value);
+                let value = args.get(index + 1).ok_or("missing value for --plugin")?;
+                plugin_id = Some(value.clone());
+                index += 2;
             }
             "--entrypoint" => {
-                let Some(value) = required_value(args, &mut index, "--entrypoint") else {
-                    return Ok(2);
-                };
-                entrypoint = Some(value);
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --entrypoint")?;
+                entrypoint = Some(value.clone());
+                index += 2;
             }
             "--placement" => {
-                let Some(value) = required_value(args, &mut index, "--placement") else {
-                    return Ok(2);
-                };
-                let Some(parsed) = parse_pane_placement(&value) else {
-                    return Ok(2);
-                };
-                placement = Some(parsed);
+                let value = args.get(index + 1).ok_or("missing value for --placement")?;
+                placement = Some(parse_pane_placement(value)?);
+                index += 2;
+            }
+            "--scope" => {
+                let value = args.get(index + 1).ok_or("missing value for --scope")?;
+                scope = Some(match value.as_str() {
+                    "shared" => PluginPaneScope::Shared,
+                    "client-private" | "client_private" => PluginPaneScope::ClientPrivate,
+                    _ => return Err("--scope must be shared or client-private".to_string()),
+                });
+                index += 2;
             }
             "--width" => {
-                let Some(value) = required_value(args, &mut index, "--width") else {
-                    return Ok(2);
-                };
-                let Some(parsed) = parse_popup_dimension(&value, "--width") else {
-                    return Ok(2);
-                };
-                width = Some(parsed);
+                let value = args.get(index + 1).ok_or("missing value for --width")?;
+                width = Some(parse_popup_dimension(value, "--width")?);
+                index += 2;
             }
             "--height" => {
-                let Some(value) = required_value(args, &mut index, "--height") else {
-                    return Ok(2);
-                };
-                let Some(parsed) = parse_popup_dimension(&value, "--height") else {
-                    return Ok(2);
-                };
-                height = Some(parsed);
+                let value = args.get(index + 1).ok_or("missing value for --height")?;
+                height = Some(parse_popup_dimension(value, "--height")?);
+                index += 2;
             }
             "--workspace" => {
-                let Some(value) = required_value(args, &mut index, "--workspace") else {
-                    return Ok(2);
-                };
-                workspace_id = Some(value);
+                let value = args.get(index + 1).ok_or("missing value for --workspace")?;
+                workspace_id = Some(super::normalize_workspace_id(value));
+                index += 2;
             }
             "--target-pane" => {
-                let Some(value) = required_value(args, &mut index, "--target-pane") else {
-                    return Ok(2);
-                };
-                target_pane_id = Some(value);
+                let value = args
+                    .get(index + 1)
+                    .ok_or("missing value for --target-pane")?;
+                target_pane_id = Some(super::normalize_pane_id(value));
+                index += 2;
             }
             "--direction" => {
-                let Some(value) = required_value(args, &mut index, "--direction") else {
-                    return Ok(2);
-                };
-                let Some(parsed) = parse_split_direction(&value) else {
-                    return Ok(2);
-                };
-                direction = Some(parsed);
+                let value = args.get(index + 1).ok_or("missing value for --direction")?;
+                direction = Some(parse_split_direction(value)?);
+                index += 2;
             }
             "--cwd" => {
-                let Some(value) = required_value(args, &mut index, "--cwd") else {
-                    return Ok(2);
-                };
-                cwd = Some(value);
+                let value = args.get(index + 1).ok_or("missing value for --cwd")?;
+                cwd = Some(value.clone());
+                index += 2;
             }
             "--env" => {
-                let Some(value) = required_value(args, &mut index, "--env") else {
-                    return Ok(2);
-                };
-                let (key, value) = match super::parse_env_assignment(&value) {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        eprintln!("{err}");
-                        return Ok(2);
-                    }
-                };
+                let value = args.get(index + 1).ok_or("missing value for --env")?;
+                let (key, value) = super::parse_env_assignment(value)?;
                 env.insert(key, value);
+                index += 2;
             }
             "--focus" => {
                 focus = true;
@@ -597,26 +626,18 @@ fn plugin_pane_open(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
-            other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
-            }
+            other => return Err(format!("unknown option: {other}")),
         }
     }
 
-    let Some(plugin_id) = plugin_id else {
-        eprintln!("missing required --plugin");
-        return Ok(2);
-    };
-    let Some(entrypoint) = entrypoint else {
-        eprintln!("missing required --entrypoint");
-        return Ok(2);
-    };
-
-    print_plugin_response(Method::PluginPaneOpen(PluginPaneOpenParams {
+    let plugin_id = plugin_id.ok_or("missing required --plugin")?;
+    let entrypoint = entrypoint.ok_or("missing required --entrypoint")?;
+    Ok(PluginPaneOpenParams {
         plugin_id,
         entrypoint,
         placement,
+        scope,
+        view_id,
         width,
         height,
         workspace_id,
@@ -625,17 +646,11 @@ fn plugin_pane_open(args: &[String]) -> std::io::Result<i32> {
         cwd,
         focus,
         env,
-    }))
+    })
 }
 
-fn parse_popup_dimension(value: &str, flag: &str) -> Option<PopupSize> {
-    match PopupSize::parse_cli(value) {
-        Ok(value) => Some(value),
-        Err(message) => {
-            eprintln!("{flag} {message}");
-            None
-        }
-    }
+fn parse_popup_dimension(value: &str, flag: &str) -> Result<PopupSize, String> {
+    PopupSize::parse_cli(value).map_err(|message| format!("{flag} {message}"))
 }
 
 fn plugin_pane_focus(args: &[String]) -> std::io::Result<i32> {
@@ -675,28 +690,23 @@ fn required_value(args: &[String], index: &mut usize, flag: &str) -> Option<Stri
     Some(value.clone())
 }
 
-fn parse_pane_placement(value: &str) -> Option<PluginPanePlacement> {
+fn parse_pane_placement(value: &str) -> Result<PluginPanePlacement, String> {
     match value {
-        "overlay" => Some(PluginPanePlacement::Overlay),
-        "popup" => Some(PluginPanePlacement::Popup),
-        "split" => Some(PluginPanePlacement::Split),
-        "tab" => Some(PluginPanePlacement::Tab),
-        "zoomed" | "fullscreen" => Some(PluginPanePlacement::Zoomed),
-        _ => {
-            eprintln!("invalid pane placement: {value}");
-            None
-        }
+        "overlay" => Ok(PluginPanePlacement::Overlay),
+        "popup" => Ok(PluginPanePlacement::Popup),
+        "workspace-right" | "workspace_right" => Ok(PluginPanePlacement::WorkspaceRight),
+        "split" => Ok(PluginPanePlacement::Split),
+        "tab" => Ok(PluginPanePlacement::Tab),
+        "zoomed" | "fullscreen" => Ok(PluginPanePlacement::Zoomed),
+        _ => Err(format!("invalid pane placement: {value}")),
     }
 }
 
-fn parse_split_direction(value: &str) -> Option<SplitDirection> {
+fn parse_split_direction(value: &str) -> Result<SplitDirection, String> {
     match value {
-        "right" => Some(SplitDirection::Right),
-        "down" => Some(SplitDirection::Down),
-        _ => {
-            eprintln!("invalid split direction: {value}");
-            None
-        }
+        "right" => Ok(SplitDirection::Right),
+        "down" => Ok(SplitDirection::Down),
+        _ => Err(format!("invalid split direction: {value}")),
     }
 }
 
@@ -1226,6 +1236,10 @@ fn print_install_preview(
     eprintln!("  startup commands: {}", plugin.startup.len());
     eprintln!("  events: {}", plugin.events.len());
     eprintln!("  panes: {}", plugin.panes.len());
+    eprintln!(
+        "  execution providers: {}",
+        plugin.execution_providers.len()
+    );
     eprintln!("  link handlers: {}", plugin.link_handlers.len());
     eprintln!("  build commands: {}", plugin.build.len());
     for build in &plugin.build {
@@ -1250,6 +1264,18 @@ fn print_install_preview(
     }
     for pane in &plugin.panes {
         eprintln!("    pane {}: {}", pane.id, pane.command.join(" "));
+    }
+    for provider in &plugin.execution_providers {
+        eprintln!(
+            "    execution provider {} PTY: {}",
+            provider.scheme,
+            provider.pty_command.join(" ")
+        );
+        eprintln!(
+            "    execution provider {} process: {}",
+            provider.scheme,
+            provider.process_command.join(" ")
+        );
     }
     for warning in &plugin.warnings {
         eprintln!("  warning: {warning}");
@@ -1321,7 +1347,12 @@ fn run_plugin_build_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_herdr_runtime_env(&mut child);
-
+    if let Err(error) = inject_plugin_build_bin_path(&mut child) {
+        return Err(Box::new(PluginBuildFailure {
+            context,
+            kind: PluginBuildFailureKind::Start { error },
+        }));
+    }
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -1505,11 +1536,21 @@ fn scrub_herdr_runtime_env(command: &mut Command) {
         crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
         crate::session::SESSION_ENV_VAR,
         "HERDR_BIN_PATH",
+        "HERDR_BUILD_BIN_PATH",
         "HERDR_ENV",
         "HERDR_WORKSPACE_ID",
         "HERDR_TAB_ID",
         "HERDR_PANE_ID",
+        "HERDR_VIEW_ID",
     ] {
+        command.env_remove(key);
+    }
+    let configured_plugin_keys = command
+        .get_envs()
+        .filter(|(key, _)| key.to_string_lossy().starts_with("HERDR_PLUGIN_"))
+        .map(|(key, _)| key.to_os_string())
+        .collect::<Vec<_>>();
+    for key in configured_plugin_keys {
         command.env_remove(key);
     }
     for (key, _) in std::env::vars_os() {
@@ -1517,6 +1558,21 @@ fn scrub_herdr_runtime_env(command: &mut Command) {
             command.env_remove(key);
         }
     }
+}
+
+fn inject_plugin_build_bin_path(command: &mut Command) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    if !executable.is_absolute() || !executable.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "current Herdr executable is not a validated file: {}",
+                executable.display()
+            ),
+        ));
+    }
+    command.env("HERDR_BUILD_BIN_PATH", executable);
+    Ok(())
 }
 
 fn build_platform_supported(
@@ -1663,7 +1719,7 @@ fn print_plugin_action_help() {
 
 fn print_plugin_pane_help() {
     eprintln!("herdr plugin pane commands:");
-    eprintln!("  herdr plugin pane open --plugin ID --entrypoint ID [--placement overlay|popup|split|tab|zoomed] [--width SIZE] [--height SIZE] [--workspace ID] [--target-pane PANE] [--direction right|down] [--cwd PATH] [--env KEY=VALUE] [--focus|--no-focus]");
+    eprintln!("  herdr plugin pane open --plugin ID --entrypoint ID [--placement overlay|popup|workspace-right|split|tab|zoomed] [--scope shared|client-private] [--width SIZE] [--height SIZE] [--workspace ID] [--target-pane PANE] [--direction right|down] [--cwd PATH] [--env KEY=VALUE] [--focus|--no-focus]");
     eprintln!("  herdr plugin pane focus <pane_id>");
     eprintln!("  herdr plugin pane close <pane_id>");
 }
@@ -1678,6 +1734,79 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         format!("test.{label}.{}.{nanos}", std::process::id())
+    }
+
+    #[test]
+    fn plugin_build_env_scrubs_runtime_identity_and_sets_manager_path() {
+        let mut command = Command::new("true");
+        command
+            .env("HERDR_BIN_PATH", "spoofed-runtime-path")
+            .env("HERDR_BUILD_BIN_PATH", "spoofed-build-path")
+            .env("HERDR_PLUGIN_CONTEXT_JSON", "spoofed-context")
+            .env("HERDR_VIEW_ID", "stale");
+
+        scrub_herdr_runtime_env(&mut command);
+        inject_plugin_build_bin_path(&mut command).unwrap();
+
+        for key in [
+            "HERDR_BIN_PATH",
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            "HERDR_VIEW_ID",
+        ] {
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value);
+            assert_eq!(value, Some(None), "runtime variable {key} was not scrubbed");
+        }
+        let build_path = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new("HERDR_BUILD_BIN_PATH"))
+            .and_then(|(_, value)| value)
+            .expect("build path should be injected");
+        assert_eq!(build_path, std::env::current_exe().unwrap().as_os_str());
+    }
+    #[test]
+    fn plugin_action_context_uses_caller_pane() {
+        let context = plugin_action_invocation_context(Some("w1:p2"));
+
+        assert_eq!(context.focused_pane_id.as_deref(), Some("w1:p2"));
+        assert_eq!(context.invocation_source.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn plugin_pane_open_defaults_source_to_caller_pane() {
+        let args = [
+            "--plugin",
+            "example.board",
+            "--entrypoint",
+            "board",
+            "--placement",
+            "tab",
+            "--workspace",
+            "w2",
+        ]
+        .map(str::to_string);
+        let params = parse_plugin_pane_open_args(&args, Some("w1:p2"), None).unwrap();
+
+        assert_eq!(params.target_pane_id.as_deref(), Some("w1:p2"));
+        assert_eq!(params.workspace_id.as_deref(), Some("w2"));
+    }
+
+    #[test]
+    fn plugin_pane_open_explicit_target_overrides_caller_pane() {
+        let args = [
+            "--plugin",
+            "example.board",
+            "--entrypoint",
+            "board",
+            "--target-pane",
+            "w2:p3",
+        ]
+        .map(str::to_string);
+        let params = parse_plugin_pane_open_args(&args, Some("w1:p2"), None).unwrap();
+
+        assert_eq!(params.target_pane_id.as_deref(), Some("w2:p3"));
     }
 
     fn github_plugin(
@@ -1698,6 +1827,7 @@ mod tests {
             platforms: None,
             build: vec![],
             startup: vec![],
+            execution_providers: vec![],
             actions: vec![],
             events: vec![],
             panes: vec![],

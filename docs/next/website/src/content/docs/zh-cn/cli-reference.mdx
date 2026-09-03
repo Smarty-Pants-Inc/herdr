@@ -172,7 +172,7 @@ herdr pane focus --direction left|right|up|down [--pane ID|--current]
 herdr pane resize --direction left|right|up|down [--amount FLOAT] [--pane ID|--current]
 herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]
 herdr pane rename <pane_id> <label>|--clear
-herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--workspace WORKSPACE] [--ratio FLOAT] [--cwd PATH] [--target local|ssh:HOST] [--env KEY=VALUE] [--focus] [--no-focus]
 herdr pane swap --direction left|right|up|down [--pane ID|--current]
 herdr pane swap --source-pane ID --target-pane ID
 herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]
@@ -181,7 +181,15 @@ herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--f
 herdr pane close <pane_id>
 ```
 
-接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言,显式窗格 ID 或 `--pane ID` 拆分该窗格,`--current` 拆分调用方窗格,省略目标则使用 UI 当前聚焦的窗格。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
+接受 `--current` 的窗格命令在 Herdr 窗格内运行时使用调用方的 `HERDR_PANE_ID`。对 `pane split` 而言,显式窗格 ID、`--pane ID` 或 `--current` 选中的窗格同时决定插入位置以及继承的执行目标/cwd;省略窗格选择器则使用 UI 当前聚焦的窗格。拆分响应中的新窗格 ID 位于 `.result.pane.pane_id`。
+
+`--workspace` 使用该工作区当前聚焦的平铺窗格作为插入位置。受管理的工作区右侧插件在没有显式窗格选择器时发起工作区指定的拆分,新窗格可以继承插件调用方的执行目标和 cwd,同时仍拆分该工作区聚焦的平铺窗格。
+
+逐窗格 SSH 执行目标仅支持 Unix。这与整台服务器的 `herdr --remote` 不同;后者仍支持 Windows 客户端连接到受支持的 Linux 和 macOS 主机。
+
+省略 `--target` 时,拆分会继承来源窗格的执行目标。使用 `--target local` 强制本地执行,或使用 `--target ssh:HOST` 在受信任的 SSH 主机上运行新终端,同时仍保留在当前 Herdr UI 中。同目标拆分沿用来源 cwd。跨目标的本地拆分使用配置的 `terminal.new_cwd`;跨目标的 SSH 拆分从远程用户的主目录开始。显式 `--cwd` 会覆盖两种默认值。请先运行 `herdr --remote HOST` 准备匹配的远程 Herdr;逐窗格启动不会安装或替换远程软件。它使用非交互 OpenSSH,并限制连接和请求投递时间,因此必须预先通过密钥或 `ssh-agent` 提供身份验证。详见[持久化与远程访问](/zh-cn/docs/persistence-remote/)。
+
+`pane get` 和 `pane list` 会报告每个窗格的 `execution_target`。远程 cwd 来自远程终端的报告,不会对照服务器文件系统检查。`pane process-info` 仅支持本地窗格;远程窗格返回 `pane_process_info_unsupported`,而不是本地进程信息。
 
 执行 `pane move` 后,后续命令应使用 `.result.move_result.pane.pane_id`。跨工作区移动会改变带工作区前缀的窗格 ID;旧值保留在 `.result.move_result.previous_pane_id`。运行中进程的 `HERDR_PANE_ID`、`HERDR_TAB_ID` 和 `HERDR_WORKSPACE_ID` 保持启动时的值,但 Herdr 会把旧窗格 ID 保留为该终端的别名,所以使用 `--current` 的窗格命令仍能解析它。实时智能体名称也会跟随终端。
 
@@ -287,7 +295,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 智能体目标只能是唯一的实时智能体名称,或当前承载该智能体的窗格 ID。终端 ID 和单独的智能体 kind 标签不能作为目标。通过 `agent start` 启动的智能体必须有名称;手动启动的智能体保持未命名,通过窗格 ID 寻址。
 
-`agent start` 会在现有可用 shell 窗格中启动智能体:交互式 shell 必须占用前台,不能有正在前台运行的命令、编辑器或智能体。拓扑必须单独创建。名称在实时智能体中必须唯一,并匹配 `[a-z][a-z0-9_-]{0,31}`。支持的 kind 是 `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`qwen`、`maki` 和 `muse`。名称属于当前窗格占用者,在该智能体退出、release 或被替换时清除;短暂的检测不确定不会清除它。
+`agent start` 会在现有可用 shell 窗格中启动智能体:交互式 shell 必须占用前台,不能有正在前台运行的命令、编辑器或智能体。本地窗格和执行提供程序后端窗格受支持。内置 SSH 窗格会返回 `agent_start_unsupported_execution_target`。拓扑必须单独创建。名称在实时智能体中必须唯一,并匹配 `[a-z][a-z0-9_-]{0,31}`。支持的 kind 是 `pi`、`claude`、`codex`、`gemini`、`cursor`、`devin`、`agy`、`cline`、`omp`、`mastracode`、`opencode`、`copilot`、`kimi`、`kiro`、`droid`、`amp`、`grok`、`hermes`、`kilo`、`qodercli`、`qwen`、`maki` 和 `muse`。名称属于当前窗格占用者,在该智能体退出、release 或被替换时清除;短暂的检测不确定不会清除它。
 
 成功的 start 只有在预期智能体占用同一终端并可接受交互输入后才返回。如果启动期间检测到 `blocked`,命令会立即返回 `agent_not_ready`。该名称仍可用于 `agent read` 和 `agent send-keys`,检测变为 `idle` 后即可用于发送提示。默认启动超时是 30000 毫秒;显式值必须大于 3000 且不超过 300000。
 

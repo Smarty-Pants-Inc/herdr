@@ -29,6 +29,13 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+fn forward_build_env(name: &str) {
+    println!("cargo:rerun-if-env-changed={name}");
+    if let Ok(value) = env::var(name) {
+        println!("cargo:rustc-env={name}={value}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -41,9 +48,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SIMD");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_ZIG_SYSTEM_DIR");
-    println!("cargo:rerun-if-env-changed=HERDR_BUILD_CHANNEL");
-    println!("cargo:rerun-if-env-changed=HERDR_BUILD_ID");
-    println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
+    for name in [
+        "HERDR_BUILD_CHANNEL",
+        "HERDR_BUILD_ID",
+        "HERDR_BUILD_COMMIT",
+        "HERDR_BUILD_OMP_BUILD_ID",
+        "HERDR_BUILD_OMP_COMMIT",
+        "HERDR_BUILD_OMP_TREE",
+        "HERDR_BUILD_OMP_VERSION",
+        "HERDR_BUILD_UPDATE_MANIFEST_URL",
+        "HERDR_BUILD_AUTO_UPDATE",
+    ] {
+        forward_build_env(name);
+    }
     println!("cargo:rerun-if-env-changed=ZIG");
     println!(
         "cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work."

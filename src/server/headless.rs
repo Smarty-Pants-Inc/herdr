@@ -14,20 +14,21 @@
 //! - Handles stale socket cleanup, explicit server stop, minimum terminal size,
 //!   and pane spawn failure during restore
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
 #[cfg(unix)]
 use interprocess::local_socket::ListenerNonblockingMode;
-use ratatui::layout::Rect;
+use ratatui::{layout::Rect, widgets::Widget};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -38,12 +39,15 @@ use crate::api;
 use crate::app;
 use crate::config;
 use crate::events::AppEvent;
+#[cfg(test)]
+use crate::ipc::bind_local_listener;
 use crate::ipc::{
-    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
+    bind_private_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
     SocketFileIdentity,
 };
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, CursorState, FrameData, OmpControlAction,
+    OmpFrameDirection, OmpPaneState, ServerMessage, MAX_FRAME_SIZE,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -52,12 +56,19 @@ use crate::server::client_accept::{
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
-    ClientConnection, ClientConnectionMode, DeferredRender,
+    ClientConnection, ClientConnectionMode, ClientNavigationState, DeferredRender,
+    NativeOmpServerGesture, OmpRendererTargetState,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
+use crate::server::omp_bridge;
+use crate::server::omp_private_renderer::{
+    PrivateOmpGuest, PrivateOmpGuestConfig, PrivateOmpGuestControl, PrivateOmpGuestRecord,
+};
+use crate::server::omp_route::OmpRouteKey;
+use crate::server::omp_service::OmpService;
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
 };
@@ -76,6 +87,17 @@ use crate::server::client_transport::ClientWriter;
 use std::fs;
 
 const LIVE_HANDOFF_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(6);
+const PRIVATE_OMP_COMPANION_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RETIRED_PRIVATE_PANE_ID_LIMIT: usize = 256;
+
+const LIVE_HANDOFF_CLIENT_REASON: &str =
+    "live update in progress; reconnect after handoff completes";
+
+fn live_handoff_client_message() -> ServerMessage {
+    ServerMessage::ServerHandoff {
+        reason: LIVE_HANDOFF_CLIENT_REASON.to_owned(),
+    }
+}
 
 fn wait_for_live_handoff_response_write(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -264,6 +286,7 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise idle. Keep this much slower than the old resize-poll cadence to
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PRIVATE_SURFACE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Headless server
@@ -283,6 +306,22 @@ enum AltScreenReadConflict {
     Defer,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateOmpRetryState {
+    Pending(u64),
+    Consumed,
+}
+struct PendingPrivateSurfaceResponse {
+    id: String,
+    respond_to: std::sync::mpsc::Sender<String>,
+}
+
+struct PrivateSurfaceCandidate {
+    surface: crate::server::private_surface::PrivateSurface,
+    pending_response: Option<PendingPrivateSurfaceResponse>,
+    deadline: Instant,
+}
+
 /// The headless server — runs the herdr event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
@@ -296,6 +335,32 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    /// Remote client-private popup launches staged until their helper confirms execution.
+    private_surface_candidates: HashMap<u64, PrivateSurfaceCandidate>,
+    #[cfg(test)]
+    independent_omp_renderers_enabled: bool,
+    /// Routes whose server-private guest failed; retain the normal pane fallback
+    /// instead of immediately respawning a blank replacement for the same route.
+    private_omp_failed_routes: HashMap<u64, OmpRouteKey>,
+    /// Exact route and state of its single transient-failure retry.
+    private_omp_retry_attempted_routes: HashMap<u64, (OmpRouteKey, PrivateOmpRetryState)>,
+    next_private_omp_retry_id: u64,
+    /// Routes waiting on the single private companion resolver; keep their host pane masked.
+    private_omp_pending_routes: HashMap<u64, OmpRouteKey>,
+    /// Last companion resolved and verified off the server event loop. Reverify before every reuse.
+    private_omp_executable: Option<crate::update::OmpExecutable>,
+    /// The route whose executable is being resolved off the server event loop.
+    private_omp_resolving: Option<(u64, OmpRouteKey)>,
+    /// Test harness override for synchronous private guest assertions.
+    #[cfg(test)]
+    private_omp_test_executable: Option<PathBuf>,
+    /// Fresh server-owned launch identity for each App-local native renderer offer.
+    next_omp_renderer_launch_id: u64,
+    /// Fresh authority revision for each native renderer target transition.
+    next_omp_renderer_authority_revision: u64,
+    omp_service: OmpService,
+    /// Recent private pane ids retained to consume late or duplicate actor events.
+    retired_private_pane_ids: VecDeque<crate::layout::PaneId>,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -473,18 +538,24 @@ impl HeadlessServer {
     /// This:
     /// 1. Prepares the client socket path (cleans up stale sockets)
     /// 2. Binds the client socket listener
-    /// 3. Returns the server ready to run
     pub fn new(
-        app: app::App,
+        mut app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
         should_quit: Arc<AtomicBool>,
+        prepared_omp_bridge: Option<(TcpListener, crate::pane::OmpBridgeEnv)>,
     ) -> io::Result<Self> {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
-        let listener = bind_local_listener(&client_path)?;
+        let omp_service = OmpService::new(prepared_omp_bridge)?;
+        app.omp_bridge = Some(omp_service.bridge().clone());
+        for workspace in &mut app.state.workspaces {
+            workspace.omp_bridge = Some(omp_service.bridge().clone());
+        }
+
+        let listener = bind_private_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
@@ -514,6 +585,21 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            private_surface_candidates: HashMap::new(),
+            #[cfg(test)]
+            independent_omp_renderers_enabled: false,
+            private_omp_failed_routes: HashMap::new(),
+            private_omp_retry_attempted_routes: HashMap::new(),
+            next_private_omp_retry_id: 1,
+            private_omp_pending_routes: HashMap::new(),
+            private_omp_executable: None,
+            private_omp_resolving: None,
+            #[cfg(test)]
+            private_omp_test_executable: None,
+            next_omp_renderer_launch_id: 1,
+            next_omp_renderer_authority_revision: 1,
+            omp_service,
+            retired_private_pane_ids: VecDeque::new(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -536,6 +622,20 @@ impl HeadlessServer {
             server_event_rx,
             server_event_tx,
         })
+    }
+
+    // Server-private OMP guests are enabled in production for focus-scoped client
+    // surfaces. Full-surface native OMP remains capability-gated by the client
+    // handshake; tests can disable this path to exercise pane-local fallback.
+    fn independent_omp_renderers_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.independent_omp_renderers_enabled
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     /// Runs the headless server event loop until shutdown.
@@ -563,6 +663,7 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        let mut next_omp_maintenance_check = Instant::now();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -589,6 +690,7 @@ impl HeadlessServer {
                 needs_render = true;
                 crate::render_prof::event("render.request.signal");
             }
+
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
             if self.drain_internal_events_with_forwarding() {
@@ -633,9 +735,21 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
+            let maintenance_now = Instant::now();
+            if maintenance_now >= next_omp_maintenance_check {
+                next_omp_maintenance_check = maintenance_now + CLIENT_ACCEPT_POLL_INTERVAL;
+                if self.enforce_omp_maintenance() {
+                    needs_render = true;
+                    needs_full_render = true;
+                    needs_graphics_render = false;
+                    crate::render_prof::event("full_render_cause.omp_maintenance");
+                }
+            }
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;
+            self.omp_service
+                .accept_pending(self.server_event_tx.clone());
 
             // 5. Drain server events from client threads.
             if self.pane_graphics_runtime_active() {
@@ -658,6 +772,13 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
+            if self.drain_private_omp_guest_records() {
+                needs_render = true;
+                needs_full_render = true;
+                needs_graphics_render = false;
+                crate::render_prof::event("full_render_cause.private_omp_guest");
+            }
+
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
@@ -718,7 +839,14 @@ impl HeadlessServer {
                         )))
             {
                 crate::render_prof::event("render.attempt");
+                self.sync_canonical_navigation_to_foreground();
                 let render_request = self.app.render_dirty.take();
+                if self
+                    .app
+                    .refresh_hovered_link_for_panes(&render_request.pty_sources)
+                {
+                    needs_full_render = true;
+                }
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
                     crate::render_prof::event("render.attempt.pty_dirty");
@@ -726,6 +854,12 @@ impl HeadlessServer {
                         "render.attempt.pty_sources",
                         render_request.pty_sources.len() as u64,
                     );
+                }
+                if self
+                    .app
+                    .refresh_findr_visible_if_needed(&render_request.pty_sources)
+                {
+                    needs_full_render = true;
                 }
                 if render_request.generic {
                     needs_full_render = true;
@@ -768,6 +902,7 @@ impl HeadlessServer {
                 });
                 let rendered_retained = match render_plan {
                     RetainedRenderPlan::Full => false,
+                    RetainedRenderPlan::Graphics if self.app_client_count() > 1 => false,
                     RetainedRenderPlan::Graphics => {
                         match self.render_retained_graphics_update_and_stream() {
                             RetainedGraphicsOutcome::Sent => true,
@@ -779,6 +914,7 @@ impl HeadlessServer {
                         }
                     }
                     RetainedRenderPlan::Pty => self.render_retained_pty_update_and_stream(),
+                    RetainedRenderPlan::HiddenPty if self.app_client_count() > 1 => false,
                     RetainedRenderPlan::HiddenPty => {
                         crate::render_prof::event("render.skipped.hidden_sources");
                         true
@@ -816,6 +952,13 @@ impl HeadlessServer {
                 .map(|pending| pending.next_deadline())
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
+                });
+            let next_deadline = self
+                .private_surface_candidates
+                .values()
+                .map(|candidate| candidate.deadline)
+                .fold(next_deadline, |deadline, candidate| {
+                    Some(deadline.map_or(candidate, |current| current.min(candidate)))
                 });
             let event = {
                 tokio::select! {
@@ -1075,6 +1218,7 @@ impl HeadlessServer {
                     id: id.to_string(),
                     method,
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -1143,14 +1287,14 @@ impl HeadlessServer {
             client.request_repaint();
         }
         if !start_pending_agent_resumes {
-            self.app.pending_agent_resume_deadline = None;
+            self.app.pending_agent_resume_retry_at = None;
             return;
         }
         let now = Instant::now();
-        self.app.sync_pending_agent_resume_deadline(now);
+        self.app.sync_pending_agent_resume_retry_at(now);
         if self
             .app
-            .start_pending_agent_resumes(self.app.pending_agent_resume_due(now))
+            .start_pending_agent_resumes(now, self.app.pending_agent_resume_retry_due(now))
         {
             for client in self.clients.values_mut() {
                 client.request_repaint();
@@ -1232,10 +1376,57 @@ impl HeadlessServer {
     }
 
     #[cfg(unix)]
+    fn authorize_live_handoff(
+        &self,
+    ) -> io::Result<Option<crate::server::omp_maintenance::OmpMaintenanceHandoffState>> {
+        if !self.omp_service.live_route_keys().is_empty() {
+            return Err(io::Error::other(
+                "live handoff is unavailable while OMP host routes are live; restart Herdr normally",
+            ));
+        }
+        if self.app.state.plugin_commands_in_flight != 0
+            || !self.app.plugin_command_runtimes.is_empty()
+        {
+            return Err(io::Error::other(
+                "live handoff is unavailable while plugin commands are running; wait for them to finish or restart Herdr normally",
+            ));
+        }
+        for workspace in &self.app.state.workspaces {
+            for tab in &workspace.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    let terminal_id = &pane.attached_terminal_id;
+                    let Some(terminal) = self.app.state.terminals.get(terminal_id) else {
+                        continue;
+                    };
+                    if terminal.execution_target.is_local() {
+                        continue;
+                    }
+                    if self
+                        .app
+                        .terminal_runtimes
+                        .get(terminal_id)
+                        .is_some_and(|runtime| !runtime.remote_execution_ready())
+                    {
+                        return Err(io::Error::other(format!(
+                            "live handoff is unavailable while SSH pane {} ({}) is still starting; wait for it to become ready and retry",
+                            pane_id.raw(), terminal.execution_target,
+                        )));
+                    }
+                }
+            }
+        }
+        self.omp_service
+            .maintenance_handoff_state()
+            .map_err(|error| io::Error::other(error.message()))
+    }
+
+    #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
+        self.authorize_live_handoff()?;
+
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -1259,7 +1450,10 @@ impl HeadlessServer {
         for ws in &self.app.state.workspaces {
             for tab in &ws.tabs {
                 for (pane_id, pane) in &tab.panes {
-                    pane_by_terminal.insert(pane.attached_terminal_id.clone(), pane_id.raw());
+                    pane_by_terminal.insert(
+                        pane.attached_terminal_id.clone(),
+                        (pane_id.raw(), pane.seen),
+                    );
                 }
             }
         }
@@ -1275,7 +1469,6 @@ impl HeadlessServer {
         }
 
         self.handoff_in_progress = true;
-        self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
 
         let mut paused_terminal_ids = Vec::new();
@@ -1288,8 +1481,23 @@ impl HeadlessServer {
                 paused_terminal_ids.push(terminal_id.clone());
             }
         }
+        // Pausing a reader can synchronously parse final bytes and enqueue ready/cwd
+        // events. Reconcile only the queued snapshot before capturing terminal state;
+        // private runtimes remain live and must not keep handoff draining forever.
+        self.drain_internal_event_snapshot_with_forwarding();
+        // Join any in-flight autosave before the target can persist the committed
+        // handoff. Do not rewrite source-owned session bytes here: a failed handoff
+        // must preserve them exactly. Event-loop scheduling is fenced until return.
+        self.app.join_background_session_save();
+        let omp_maintenance = match self.authorize_live_handoff() {
+            Ok(state) => state,
+            Err(err) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(err);
+            }
+        };
 
-        let snapshot = crate::persist::capture(
+        let mut snapshot = crate::persist::capture(
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -1299,19 +1507,30 @@ impl HeadlessServer {
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
         );
+        snapshot.idempotency_epoch = Some(self.app.layout_apply_epoch.clone());
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
-            let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
+            let Some((pane_id, seen)) = pane_by_terminal.get(terminal_id).copied() else {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            handoff_runtime.agent_state = terminal
+                .map(|terminal| crate::handoff_runtime::HandoffAgentState::capture(terminal, seen));
+            if let Some(terminal) = terminal {
+                handoff_runtime.pending_agent_resume_plan =
+                    terminal.pending_agent_resume_plan.clone();
+                handoff_runtime.pending_agent_resume_attempt_pid =
+                    terminal.pending_agent_resume_attempt_pid();
+                handoff_runtime.pending_agent_resume_retired_pids =
+                    terminal.pending_agent_resume_retired_pids().to_vec();
+                if !terminal.execution_target.is_local() && terminal.launch_argv.is_none() {
+                    handoff_runtime.respawn_shell_on_exit = Some(terminal.respawn_shell_on_exit);
+                }
+            }
+            let has_agent_session =
+                terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
             if !has_agent_session {
                 handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             }
@@ -1328,6 +1547,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            omp_maintenance,
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1427,6 +1647,7 @@ impl HeadlessServer {
             }
             return Err(err);
         }
+        self.disconnect_all_clients_for_handoff();
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
@@ -1482,7 +1703,7 @@ impl HeadlessServer {
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
-        let listener = bind_local_listener(&client_path)?;
+        let listener = bind_private_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
@@ -1566,6 +1787,9 @@ impl HeadlessServer {
         client.last_activity = stamp;
 
         let changed = self.foreground_client_id != Some(client_id);
+        if changed {
+            self.app.clear_hovered_pane_link();
+        }
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
         changed
@@ -1575,6 +1799,11 @@ impl HeadlessServer {
         let next_foreground = latest_app_client(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
+        if changed {
+            self.app.clear_hovered_pane_link();
+            let canonical = ClientNavigationState::capture(&self.app.state);
+            self.restore_foreground_navigation(&canonical);
+        }
         self.sync_foreground_client_state();
         changed
     }
@@ -1598,14 +1827,337 @@ impl HeadlessServer {
     fn has_app_client(&self) -> bool {
         self.app_client_count() > 0
     }
+    fn reconcile_client_navigation_states(&mut self, canonical: &ClientNavigationState) {
+        let state = &self.app.state;
+        for client in self.clients.values_mut() {
+            if !client.is_full_app_client() {
+                continue;
+            }
+            let navigation = client.navigation.as_ref().unwrap_or(canonical);
+            client.navigation = Some(navigation.reconciled(state, canonical));
+        }
+    }
+
+    /// Canonical AppState is always the foreground projection between client operations.
+    fn sync_canonical_navigation_to_foreground(&mut self) -> ClientNavigationState {
+        let canonical = ClientNavigationState::capture(&self.app.state);
+        if let Some(client) = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get_mut(&client_id))
+            .filter(|client| client.is_full_app_client())
+        {
+            client.navigation = Some(canonical.clone());
+        }
+        self.reconcile_client_navigation_states(&canonical);
+        canonical
+    }
+
+    fn sync_findr_scan_deadline_after_projection(&mut self) {
+        let incomplete = self
+            .app
+            .state
+            .findr
+            .as_ref()
+            .is_some_and(|findr| !findr.complete);
+        if incomplete {
+            if self.app.findr_scan_deadline.is_none() {
+                self.app.findr_scan_deadline = Some(Instant::now());
+            }
+        } else {
+            self.app.findr_scan_deadline = None;
+        }
+    }
+
+    fn apply_client_navigation(
+        &mut self,
+        client_id: u64,
+        canonical: &ClientNavigationState,
+    ) -> bool {
+        let Some(client) = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())
+        else {
+            return false;
+        };
+        let navigation = client
+            .navigation
+            .as_ref()
+            .unwrap_or(canonical)
+            .reconciled(&self.app.state, canonical);
+        let applied = navigation.apply_to(&mut self.app.state);
+        self.sync_findr_scan_deadline_after_projection();
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.navigation = Some(applied);
+        }
+        true
+    }
+
+    fn restore_foreground_navigation(&mut self, canonical: &ClientNavigationState) {
+        let current = ClientNavigationState::capture(&self.app.state);
+        let canonical = canonical.reconciled(&self.app.state, &current);
+        self.reconcile_client_navigation_states(&canonical);
+        let navigation = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get(&client_id))
+            .filter(|client| client.is_full_app_client())
+            .and_then(|client| client.navigation.clone())
+            .unwrap_or_else(|| canonical.clone());
+        let applied = navigation.apply_to(&mut self.app.state);
+        self.sync_findr_scan_deadline_after_projection();
+        if let Some(client) = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get_mut(&client_id))
+            .filter(|client| client.is_full_app_client())
+        {
+            client.navigation = Some(applied);
+        }
+    }
+
+    fn begin_client_navigation_scope(&mut self, client_id: u64) -> Option<ClientNavigationState> {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_full_app_client)
+        {
+            return None;
+        }
+        let canonical = self.sync_canonical_navigation_to_foreground();
+        self.apply_client_navigation(client_id, &canonical);
+        Some(canonical)
+    }
+
+    fn finish_client_navigation_scope(&mut self, client_id: u64, canonical: ClientNavigationState) {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(ClientConnection::is_full_app_client)
+        {
+            let navigation = ClientNavigationState::capture(&self.app.state);
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.navigation = Some(navigation);
+            }
+        }
+        self.restore_foreground_navigation(&canonical);
+        self.compute_foreground_navigation_view();
+    }
+
+    fn compute_client_navigation_view(&mut self, client_id: u64) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let (cols, rows) = client.terminal_size;
+        crate::ui::compute_view_without_resizing_panes(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+        );
+    }
+
+    fn compute_foreground_navigation_view(&mut self) {
+        if let Some(client_id) = self.foreground_client_id {
+            self.compute_client_navigation_view(client_id);
+            return;
+        }
+        let (cols, rows) = self.effective_size;
+        crate::ui::compute_view_without_resizing_panes(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+        );
+    }
+
+    fn retire_private_pane_id(&mut self, pane_id: crate::layout::PaneId) {
+        if self.retired_private_pane_ids.contains(&pane_id) {
+            return;
+        }
+        if self.retired_private_pane_ids.len() == RETIRED_PRIVATE_PANE_ID_LIMIT {
+            self.retired_private_pane_ids.pop_front();
+        }
+        self.retired_private_pane_ids.push_back(pane_id);
+    }
+    fn shared_pane_exists(&self, pane_id: crate::layout::PaneId) -> bool {
+        self.app.find_pane(pane_id).is_some()
+            || self
+                .app
+                .state
+                .workspace_plugin_panes
+                .values()
+                .any(|pane| pane.pane_id == pane_id)
+            || self
+                .app
+                .state
+                .popup_pane
+                .as_ref()
+                .is_some_and(|pane| pane.pane_id == pane_id)
+            || self.app.overlay_panes.contains_key(&pane_id)
+    }
+
+    fn retire_private_surface(&mut self, surface: crate::server::private_surface::PrivateSurface) {
+        self.retire_private_pane_id(surface.pane_id());
+        surface.shutdown();
+    }
+    fn private_surface_error_response(
+        id: impl Into<String>,
+        code: &str,
+        message: impl Into<String>,
+    ) -> String {
+        serde_json::to_string(&api::schema::ErrorResponse {
+            id: id.into(),
+            error: api::schema::ErrorBody {
+                code: code.to_string(),
+                message: message.into(),
+            },
+        })
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn private_surface_ok_response(id: impl Into<String>) -> String {
+        serde_json::to_string(&api::schema::SuccessResponse {
+            id: id.into(),
+            result: api::schema::ResponseResult::Ok {},
+        })
+        .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    fn respond_pending_private_surface(pending: PendingPrivateSurfaceResponse, response: String) {
+        let _ = pending.respond_to.send(response);
+    }
+    fn retire_private_surface_candidate(
+        &mut self,
+        candidate: PrivateSurfaceCandidate,
+        code: &str,
+        message: &str,
+    ) {
+        self.retire_private_surface(candidate.surface);
+        if let Some(pending) = candidate.pending_response {
+            let response = Self::private_surface_error_response(pending.id.clone(), code, message);
+            Self::respond_pending_private_surface(pending, response);
+        }
+    }
+
+    fn activate_private_surface(
+        &mut self,
+        client_id: u64,
+        surface: crate::server::private_surface::PrivateSurface,
+    ) -> bool {
+        if !self.clients.contains_key(&client_id) {
+            self.retire_private_surface(surface);
+            return false;
+        }
+        self.app.release_input_source_headless(client_id);
+        let previous = {
+            let client = self
+                .clients
+                .get_mut(&client_id)
+                .expect("owner checked above");
+            let previous = client.private_surface.replace(surface);
+            client.graphics_surface_reset_pending = true;
+            client.request_repaint();
+            client.defer_full_render();
+            previous
+        };
+        if let Some(previous) = previous {
+            self.retire_private_surface(previous);
+        }
+        let _ = self.reconcile_omp_renderers();
+        true
+    }
+
+    #[cfg(test)]
+    fn install_private_surface(
+        &mut self,
+        client_id: u64,
+        surface: crate::server::private_surface::PrivateSurface,
+        wait_for_remote_ready: bool,
+    ) -> bool {
+        self.install_private_surface_with_response(client_id, surface, wait_for_remote_ready, None)
+    }
+
+    fn install_private_surface_with_response(
+        &mut self,
+        client_id: u64,
+        surface: crate::server::private_surface::PrivateSurface,
+        wait_for_remote_ready: bool,
+        pending_response: Option<PendingPrivateSurfaceResponse>,
+    ) -> bool {
+        if !self.clients.contains_key(&client_id) {
+            self.retire_private_surface(surface);
+            if let Some(pending) = pending_response {
+                let response = Self::private_surface_error_response(
+                    pending.id.clone(),
+                    "view_not_found",
+                    "view disconnected during request",
+                );
+                Self::respond_pending_private_surface(pending, response);
+            }
+            return false;
+        }
+        if wait_for_remote_ready {
+            if let Some(previous) = self.private_surface_candidates.insert(
+                client_id,
+                PrivateSurfaceCandidate {
+                    surface,
+                    pending_response,
+                    deadline: Instant::now() + PRIVATE_SURFACE_READY_TIMEOUT,
+                },
+            ) {
+                self.retire_private_surface_candidate(
+                    previous,
+                    "plugin_pane_open_failed",
+                    "private popup launch replaced before execution became ready",
+                );
+            }
+            return true;
+        }
+        if let Some(previous) = self.private_surface_candidates.remove(&client_id) {
+            self.retire_private_surface_candidate(
+                previous,
+                "plugin_pane_open_failed",
+                "private popup launch replaced before execution became ready",
+            );
+        }
+        self.activate_private_surface(client_id, surface)
+    }
+
+    fn close_private_surface(&mut self, client_id: u64) {
+        let surface = self.clients.get_mut(&client_id).and_then(|client| {
+            let surface = client.private_surface.take();
+            client.request_repaint();
+            client.defer_full_render();
+            surface
+        });
+        let Some(surface) = surface else {
+            return;
+        };
+        self.retire_private_surface(surface);
+        if self.foreground_client_id == Some(client_id) {
+            self.sync_foreground_client_state();
+            self.resize_shared_runtime_to_effective_size();
+        }
+        let _ = self.reconcile_omp_renderers();
+    }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
-        self.retire_direct_graphics_for_client(client_id);
         let was_foreground = self.foreground_client_id == Some(client_id);
         self.app.clear_input_source(client_id);
         self.send_client_graphics_cleanup(client_id);
+        self.retire_direct_graphics_for_client(client_id);
         let removed = self.clients.remove(&client_id);
-        if let Some(removed) = removed {
+        if let Some(candidate) = self.private_surface_candidates.remove(&client_id) {
+            self.retire_private_surface_candidate(
+                candidate,
+                "view_not_found",
+                "view disconnected during request",
+            );
+        }
+        self.private_omp_failed_routes.remove(&client_id);
+        self.private_omp_retry_attempted_routes.remove(&client_id);
+        self.private_omp_pending_routes.remove(&client_id);
+        if let Some(mut removed) = removed {
+            if let Some(surface) = removed.private_surface.take() {
+                self.retire_private_surface(surface);
+            }
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
@@ -1622,6 +2174,12 @@ impl HeadlessServer {
         } else {
             false
         }
+    }
+
+    fn client_is_omp_pane(&self, client_id: u64) -> bool {
+        self.clients
+            .get(&client_id)
+            .is_some_and(|client| matches!(client.mode, ClientConnectionMode::OmpPane))
     }
 
     fn client_removal_needs_shared_resize(&self, client_id: u64) -> bool {
@@ -1645,24 +2203,148 @@ impl HeadlessServer {
         }
     }
 
-    fn send_client_graphics_cleanup(&mut self, client_id: u64) {
-        let (writer, bytes) = match self.clients.get_mut(&client_id) {
-            Some(client) => {
-                let bytes = client.graphics_cache.clear_bytes();
-                (client.writer.as_ref().cloned(), bytes)
+    fn remove_failed_client_and_resize_if_needed(&mut self, client_id: u64) {
+        let messages = self.omp_service.disconnect(client_id, &self.clients);
+        self.remove_client_and_resize_if_needed(client_id);
+        for (target, message) in messages {
+            if target != client_id {
+                self.send_to_client(target, message);
             }
-            None => return,
-        };
-        if bytes.is_empty() {
-            return;
         }
-        let Some(writer) = writer else {
-            return;
+        self.reconcile_omp_renderers();
+    }
+
+    fn prepare_client_graphics_cleanup(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+        additional_cleanup: &[u8],
+    ) -> Option<(crate::kitty_graphics::HostGraphicsCache, Vec<u8>)> {
+        let client = self.clients.get(&client_id)?;
+        let mut next_graphics_cache = client.graphics_cache.clone();
+        let mut bytes = match pane_id {
+            Some(pane_id) => next_graphics_cache.clear_pane_bytes(pane_id),
+            None => next_graphics_cache.clear_bytes(),
         };
-        let Ok(serialized) = Self::frame_server_message(&ServerMessage::Graphics { bytes }) else {
-            return;
+        bytes.extend_from_slice(additional_cleanup);
+        Some((next_graphics_cache, bytes))
+    }
+
+    fn queue_client_graphics_cleanup(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+        additional_cleanup: &[u8],
+        trailing_messages: &[ServerMessage],
+    ) -> Option<crate::kitty_graphics::HostGraphicsCache> {
+        let (next_graphics_cache, bytes) =
+            self.prepare_client_graphics_cleanup(client_id, pane_id, additional_cleanup)?;
+        let has_cleanup = !bytes.is_empty();
+        let mut serialized = if has_cleanup {
+            Self::frame_server_message(&ServerMessage::Graphics { bytes }).ok()?
+        } else {
+            Vec::new()
         };
-        writer.replace_with_cleanup(serialized);
+        for message in trailing_messages {
+            serialized.extend(Self::frame_server_message(message).ok()?);
+        }
+        if serialized.is_empty() {
+            return Some(next_graphics_cache);
+        }
+        let writer = self.clients.get(&client_id)?.writer.as_ref()?;
+        let queued = if let Some(pane_id) = pane_id {
+            writer.replace_with_pane_cleanup(pane_id, serialized)
+        } else {
+            writer.replace_with_cleanup(serialized)
+        };
+        queued.then_some(next_graphics_cache)
+    }
+
+    fn commit_client_graphics_cleanup(
+        &mut self,
+        client_id: u64,
+        next_graphics_cache: crate::kitty_graphics::HostGraphicsCache,
+    ) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.graphics_cache = next_graphics_cache;
+        }
+    }
+
+    fn send_client_graphics_cleanup(&mut self, client_id: u64) -> bool {
+        let direct_cleanup = self.direct_graphics_cleanup_for_client(client_id);
+        let Some(next_graphics_cache) =
+            self.queue_client_graphics_cleanup(client_id, None, &direct_cleanup, &[])
+        else {
+            return false;
+        };
+        self.retire_direct_graphics_for_client(client_id);
+        self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
+        true
+    }
+
+    fn queue_native_omp_activation(
+        &self,
+        client_id: u64,
+        target: &OmpRendererTargetState,
+        target_message: &ServerMessage,
+    ) -> Option<crate::kitty_graphics::HostGraphicsCache> {
+        let pane_id = target
+            .route
+            .as_ref()
+            .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+            .map(|(_, pane_id)| pane_id)?;
+        let direct_cleanup = self.direct_graphics_cleanup_for_client_pane(client_id, pane_id);
+        let (next_graphics_cache, cleanup_bytes) =
+            self.prepare_client_graphics_cleanup(client_id, Some(pane_id), &direct_cleanup)?;
+        let retirement_messages =
+            self.direct_graphics_retirement_messages_for_client_pane(client_id, pane_id);
+        let Some(writer) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.writer.as_ref())
+        else {
+            return cleanup_bytes.is_empty().then_some(next_graphics_cache);
+        };
+        let has_cleanup = !cleanup_bytes.is_empty();
+        let mut serialized = if has_cleanup {
+            Self::frame_server_message(&ServerMessage::Graphics {
+                bytes: cleanup_bytes,
+            })
+            .ok()?
+        } else {
+            Vec::new()
+        };
+        for retirement_message in retirement_messages {
+            serialized.extend(Self::frame_server_message(&retirement_message).ok()?);
+        }
+        serialized.extend(Self::frame_server_message(target_message).ok()?);
+        let queued = if has_cleanup {
+            writer.replace_with_pane_cleanup(pane_id, serialized)
+        } else {
+            writer.control.send(serialized).is_ok()
+        };
+        queued.then_some(next_graphics_cache)
+    }
+
+    fn begin_omp_graphics_replacement(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        let direct_cleanup = self.direct_graphics_cleanup_for_client_pane(client_id, pane_id);
+        let retirement_messages =
+            self.direct_graphics_retirement_messages_for_client_pane(client_id, pane_id);
+        let Some(next_graphics_cache) = self.queue_client_graphics_cleanup(
+            client_id,
+            Some(pane_id),
+            &direct_cleanup,
+            &retirement_messages,
+        ) else {
+            return false;
+        };
+        self.retire_direct_graphics_for_client_pane_without_notifications(client_id, pane_id);
+        self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
+        true
     }
 
     fn send_all_clients_graphics_cleanup(&mut self) {
@@ -1716,6 +2398,133 @@ impl HeadlessServer {
         }
     }
 
+    fn intercept_identity_input(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
+        let mut remaining = Vec::with_capacity(events.len());
+        let mut request = false;
+        let mut consumed = false;
+        for event in events {
+            let Some(client) = self.clients.get(&client_id) else {
+                remaining.push(event);
+                continue;
+            };
+            let Some(identity) = client.identity.as_ref() else {
+                remaining.push(event);
+                continue;
+            };
+            let area = Rect::new(0, 0, client.terminal_size.0, client.terminal_size.1);
+            let identity_ui = crate::server::render_stream::identity_ui_state(Some(identity));
+            let header = crate::ui::identity_name_hit_rect(&self.app.state, area, &identity_ui);
+            let (save, cancel) = crate::ui::identity_modal_inner_rect(area)
+                .map_or((Rect::default(), Rect::default()), |inner| {
+                    crate::ui::identity_modal_button_rects(inner, identity.committed.is_some())
+                });
+            let identity = self
+                .clients
+                .get_mut(&client_id)
+                .and_then(|client| client.identity.as_mut())
+                .expect("identity was present for this connected App client");
+
+            if !identity.editor.open {
+                let opens_editor = matches!(
+                    event,
+                    crate::raw_input::RawInputEvent::Mouse(mouse)
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && Self::rect_contains(header, mouse.column, mouse.row)
+                );
+                if opens_editor {
+                    identity.open_editor();
+                    consumed = true;
+                } else {
+                    remaining.push(event);
+                }
+                continue;
+            }
+
+            match event {
+                crate::raw_input::RawInputEvent::Text(text) => {
+                    if identity.pending.is_none() {
+                        identity.insert_editor_text(text.as_str());
+                    }
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::Paste(text) => {
+                    if identity.pending.is_none() {
+                        identity.insert_editor_text(&text);
+                    }
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::Key(key) => {
+                    if key.kind != KeyEventKind::Release && identity.pending.is_none() {
+                        if let Some(text) = key.generated_text.as_deref() {
+                            for _ in 0..key.repeat_count {
+                                identity.insert_editor_text(text);
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Backspace => identity.backspace_editor(),
+                                KeyCode::Delete => identity.delete_editor(),
+                                KeyCode::Left => identity.move_editor_left(),
+                                KeyCode::Right => identity.move_editor_right(),
+                                KeyCode::Home => identity.move_editor_home(),
+                                KeyCode::End => identity.move_editor_end(),
+                                KeyCode::Enter => request = true,
+                                KeyCode::Esc if identity.committed.is_some() => {
+                                    identity.cancel_editor()
+                                }
+                                KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                                    identity.insert_editor_text(&ch.to_string())
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    if identity.pending.is_none()
+                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    {
+                        if Self::rect_contains(save, mouse.column, mouse.row) {
+                            request = true;
+                        } else if identity.committed.is_some()
+                            && Self::rect_contains(cancel, mouse.column, mouse.row)
+                        {
+                            identity.cancel_editor();
+                        }
+                    }
+                    consumed = true;
+                }
+                _ => remaining.push(event),
+            }
+        }
+        if request {
+            let request_id = self.allocate_activity_stamp();
+            if let Some(request) = self
+                .clients
+                .get_mut(&client_id)
+                .and_then(|client| client.identity.as_mut())
+                .and_then(|identity| identity.begin_save(request_id))
+            {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::PersistIdentity {
+                        request_id: request.request_id,
+                        display_name: request.display_name,
+                    },
+                );
+            }
+        }
+        (remaining, consumed)
+    }
+
+    fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+        column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+    }
+
     /// Accepts pending client connections from the non-blocking listener.
     #[cfg(unix)]
     fn accept_client_connections(&mut self) -> io::Result<()> {
@@ -1737,12 +2546,15 @@ impl HeadlessServer {
         Ok(())
     }
 
-    /// Drains server events from the dedicated channel.
+    /// Drains a bounded server-event batch so scheduled deadlines remain serviceable under load.
     ///
     /// Uses the original full-render semantics when pane graphics are dormant.
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) || self.app.scroll_render_pending {
+                break;
+            }
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -1751,10 +2563,13 @@ impl HeadlessServer {
         changed
     }
 
-    /// Returns the strongest render impact from the drained event batch.
+    /// Returns the strongest render impact from one bounded server-event batch.
     fn drain_server_events_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) || self.app.scroll_render_pending {
+                break;
+            }
             let Ok(ev) = self.server_event_rx.try_recv() else {
                 break;
             };
@@ -1832,6 +2647,7 @@ impl HeadlessServer {
             return true;
         }
 
+        let navigation_scope = self.begin_client_navigation_scope(client_id);
         let foreground_changed = self.promote_client_to_foreground(client_id);
         if foreground_changed {
             self.resize_shared_runtime_to_effective_size_before_input();
@@ -1839,10 +2655,14 @@ impl HeadlessServer {
         if let Some(client) = self.clients.get_mut(&client_id) {
             client.request_semantic_redraw_after_input();
         }
-        self.app.route_client_events(
+        self.app.route_client_events_from(
+            client_id,
             vec![crate::raw_input::RawInputEvent::Paste(path)],
-            self.foreground_client_id == Some(client_id),
+            false,
         );
+        if let Some(canonical) = navigation_scope {
+            self.finish_client_navigation_scope(client_id, canonical);
+        }
         true
     }
 
@@ -1898,6 +2718,7 @@ impl HeadlessServer {
             terminal_id: terminal_id.clone(),
         };
         client.pending_terminal_attach = false;
+        client.navigation = None;
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -1983,6 +2804,12 @@ impl HeadlessServer {
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
     ) {
+        let delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
         if self.app.state.toast_config.delay_seconds != 0 {
             return;
         }
@@ -2008,11 +2835,12 @@ impl HeadlessServer {
                     protocol::NotifyKind::Sound,
                     sound_notify_message(sound),
                     None,
+                    None,
                 );
             }
         }
 
-        if !should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+        if !should_forward_toast_to_clients(delivery) {
             return;
         }
         let Some(kind) = crate::app::actions::notification_toast_for_pane_state_update(
@@ -2040,11 +2868,16 @@ impl HeadlessServer {
             update.ws_idx,
             update.pane_id,
         );
+        let target = crate::app::state::ToastTarget {
+            workspace_id: ws.id.clone(),
+            pane_id: update.pane_id,
+        };
         self.send_notify_to_foreground_client(
-            toast_notify_kind(self.app.state.toast_config.delivery)
+            toast_notify_kind(delivery)
                 .expect("toast forwarding requires a client notification kind"),
             format!("{agent_label} {event_text}"),
             non_empty_body(&context),
+            Some(&target),
         );
     }
 
@@ -2052,21 +2885,29 @@ impl HeadlessServer {
         &mut self,
         delivery: &crate::app::state::AgentNotificationDelivery,
     ) {
+        let toast_delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
         if let Some(sound) = delivery.sound {
             self.send_notify_to_foreground_client(
                 protocol::NotifyKind::Sound,
                 sound_notify_message(sound),
                 None,
+                None,
             );
         }
 
-        if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
+        if should_forward_toast_to_clients(toast_delivery) {
             if let Some(toast) = &delivery.client_notification {
                 self.send_notify_to_foreground_client(
-                    toast_notify_kind(self.app.state.toast_config.delivery)
+                    toast_notify_kind(toast_delivery)
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
+                    toast.target.as_ref(),
                 );
             }
         }
@@ -2077,11 +2918,24 @@ impl HeadlessServer {
         kind: protocol::NotifyKind,
         message: impl Into<String>,
         body: Option<String>,
+        target: Option<&crate::app::state::ToastTarget>,
     ) -> bool {
+        let activation = (kind == protocol::NotifyKind::SystemToast)
+            .then_some(target)
+            .flatten()
+            .zip(self.foreground_client_id)
+            .map(
+                |(target, recipient_client_id)| protocol::NotificationActivation {
+                    recipient_client_id,
+                    workspace_id: target.workspace_id.clone(),
+                    pane_id: target.pane_id.raw(),
+                },
+            );
         self.send_to_foreground_client(ServerMessage::Notify {
             kind,
             message: message.into(),
             body,
+            activation,
         })
     }
 
@@ -2089,9 +2943,10 @@ impl HeadlessServer {
         &mut self,
         kind: protocol::NotifyKind,
         message: impl AsRef<str>,
+        target: Option<&crate::app::state::ToastTarget>,
     ) -> bool {
         let (title, body) = crate::terminal_notify::split_message(message.as_ref());
-        self.send_notify_to_foreground_client(kind, title, body.map(str::to_string))
+        self.send_notify_to_foreground_client(kind, title, body.map(str::to_string), target)
     }
 
     fn handle_notification_show_api(
@@ -2112,7 +2967,14 @@ impl HeadlessServer {
             .unwrap_or_else(|_| "{}".to_string());
         };
 
-        match self.app.state.toast_config.delivery {
+        self.sync_foreground_client_state();
+        let delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
+        match delivery {
             config::ToastDelivery::Off => {
                 return serde_json::to_string(&api::schema::SuccessResponse {
                     id,
@@ -2137,6 +2999,9 @@ impl HeadlessServer {
                 return response;
             }
             config::ToastDelivery::Terminal | config::ToastDelivery::System => {}
+            config::ToastDelivery::Hybrid => {
+                unreachable!("hybrid delivery must be resolved before notification routing")
+            }
         }
 
         let body = params
@@ -2153,9 +3018,8 @@ impl HeadlessServer {
             })
             .unwrap_or_else(|_| "{}".to_string());
         }
-        let kind = toast_notify_kind(self.app.state.toast_config.delivery)
-            .expect("terminal/system delivery has notify kind");
-        let shown = self.send_notify_to_foreground_client(kind, title, body);
+        let kind = toast_notify_kind(delivery).expect("terminal/system delivery has notify kind");
+        let shown = self.send_notify_to_foreground_client(kind, title, body, None);
         if shown {
             self.app.mark_api_notification_shown(Instant::now());
             self.forward_api_notification_sound(params.sound);
@@ -2300,6 +3164,7 @@ impl HeadlessServer {
             protocol::NotifyKind::Sound,
             sound_notify_message(sound),
             None,
+            None,
         );
     }
 
@@ -2313,6 +3178,144 @@ impl HeadlessServer {
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
     fn handle_internal_event_with_forwarding(&mut self, ev: AppEvent) -> bool {
+        let private_pane_id = match &ev {
+            AppEvent::PaneDied { pane_id, .. }
+            | AppEvent::RemoteExecutionReady { pane_id, .. }
+            | AppEvent::TerminalBell { pane_id, .. }
+            | AppEvent::PaneClipboardWrite { pane_id, .. }
+            | AppEvent::TerminalCwdReported { pane_id, .. } => Some(*pane_id),
+            _ => None,
+        };
+        if private_pane_id.is_some_and(|pane_id| self.retired_private_pane_ids.contains(&pane_id)) {
+            return false;
+        }
+        if let Some(owner_id) = private_pane_id.and_then(|pane_id| {
+            self.private_surface_candidates
+                .iter()
+                .find_map(|(&client_id, candidate)| {
+                    (candidate.surface.pane_id() == pane_id).then_some(client_id)
+                })
+        }) {
+            match &ev {
+                AppEvent::RemoteExecutionReady { .. } => {
+                    let Some(candidate) = self.private_surface_candidates.remove(&owner_id) else {
+                        return false;
+                    };
+                    if Instant::now() >= candidate.deadline {
+                        self.retire_private_surface_candidate(
+                            candidate,
+                            "plugin_pane_open_failed",
+                            "remote private popup did not become ready before timeout",
+                        );
+                        return false;
+                    }
+                    let activated = self.activate_private_surface(owner_id, candidate.surface);
+                    if let Some(pending) = candidate.pending_response {
+                        let response = if activated {
+                            Self::private_surface_ok_response(pending.id.clone())
+                        } else {
+                            Self::private_surface_error_response(
+                                pending.id.clone(),
+                                "view_not_found",
+                                "view disconnected before remote popup became ready",
+                            )
+                        };
+                        Self::respond_pending_private_surface(pending, response);
+                    }
+                    return activated;
+                }
+                AppEvent::PaneDied { pane_id, .. } => {
+                    if let Some(candidate) = self.private_surface_candidates.remove(&owner_id) {
+                        warn!(
+                            client_id = owner_id,
+                            pane = pane_id.raw(),
+                            "remote private popup exited before execution became ready; keeping existing surface"
+                        );
+                        self.retire_private_surface_candidate(
+                            candidate,
+                            "plugin_pane_open_failed",
+                            "remote private popup exited before execution became ready",
+                        );
+                    }
+                    return false;
+                }
+                AppEvent::TerminalBell { .. }
+                | AppEvent::PaneClipboardWrite { .. }
+                | AppEvent::TerminalCwdReported { .. } => return false,
+                _ => {}
+            }
+        }
+        if let Some(owner_id) = private_pane_id.and_then(|pane_id| {
+            self.clients.iter().find_map(|(&client_id, client)| {
+                client
+                    .private_surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.pane_id() == pane_id)
+                    .then_some(client_id)
+            })
+        }) {
+            match ev {
+                AppEvent::PaneDied { .. } => {
+                    self.close_private_surface(owner_id);
+                    return true;
+                }
+                AppEvent::TerminalBell { count, .. } => {
+                    self.send_to_client(owner_id, ServerMessage::TerminalBell { count });
+                    return false;
+                }
+                AppEvent::TerminalCwdReported { .. } => return false,
+                AppEvent::RemoteExecutionReady { .. } => return false,
+                AppEvent::PaneClipboardWrite { content, .. } => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+                    self.send_to_client(owner_id, ServerMessage::Clipboard { data });
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        if let Some((owner_id, pane_id)) = private_pane_id.and_then(|pane_id| {
+            self.clients.iter().find_map(|(&client_id, client)| {
+                client
+                    .private_omp_guest
+                    .as_ref()
+                    .is_some_and(|guest| guest.runtime_pane_id() == pane_id)
+                    .then_some((client_id, pane_id))
+            })
+        }) {
+            let active = self.private_omp_guest_surface_active(owner_id, pane_id);
+            match &ev {
+                AppEvent::TerminalBell { count, .. } => {
+                    if active {
+                        self.send_to_client(
+                            owner_id,
+                            ServerMessage::TerminalBell { count: *count },
+                        );
+                    }
+                    return false;
+                }
+                AppEvent::PaneClipboardWrite { content, .. } => {
+                    if active {
+                        let data =
+                            base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+                        self.send_to_client(owner_id, ServerMessage::Clipboard { data });
+                    }
+                    return false;
+                }
+                AppEvent::RemoteExecutionReady { .. } | AppEvent::TerminalCwdReported { .. } => {
+                    return false
+                }
+                _ => {}
+            }
+        }
+        if matches!(
+            &ev,
+            AppEvent::TerminalBell { pane_id, .. }
+                | AppEvent::PaneClipboardWrite { pane_id, .. }
+                | AppEvent::TerminalCwdReported { pane_id, .. }
+                if !self.shared_pane_exists(*pane_id)
+        ) {
+            return false;
+        }
         match &ev {
             AppEvent::TerminalBell { pane_id, count } => {
                 if !self.send_to_foreground_client(ServerMessage::TerminalBell { count: *count }) {
@@ -2323,9 +3326,9 @@ impl HeadlessServer {
                 }
                 false
             }
-            AppEvent::ClipboardWrite { content } => {
-                // Clipboard writes are client-local side effects. Forward them only to
-                // the foreground client instead of broadcasting to every attached client.
+            AppEvent::ClipboardWrite { content } | AppEvent::PaneClipboardWrite { content, .. } => {
+                // Clipboard writes are client-local side effects. Shared panes route to the
+                // foreground client; private panes returned above route to their owner.
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
                 if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
                     self.app.show_clipboard_feedback();
@@ -2340,29 +3343,25 @@ impl HeadlessServer {
                 });
                 true
             }
+            AppEvent::OpenUrl { url, source_id } => {
+                if crate::web_url::safe_web_url(url).is_some() {
+                    self.send_to_client(*source_id, ServerMessage::OpenUrl { url: url.clone() });
+                }
+                false
+            }
             AppEvent::StateChanged { pane_id, agent, .. } => {
-                // Capture toast before handling.
                 let toast_before = self.app.state.toast.clone();
                 let pane_id_val = *pane_id;
                 let agent_val = *agent;
-
-                // Find the previous effective state of this pane before the event
-                // is processed. Notifications must follow effective state changes,
-                // not raw fallback reports that may be masked by hook authority.
                 let prev_state = self.pane_effective_state(pane_id_val);
                 let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
 
-                // Handle the state change (updates pane state, sets toast on AppState).
-                // Headless mode disables local sound playback separately from the
-                // sound policy so reloads can keep server-side notification policy live.
                 self.sync_foreground_client_state();
                 let suppress_completion = self
                     .app
                     .handle_internal_event_with_pane_updates(ev)
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
-
-                // Forward sound notification to clients when server-side sound policy allows it.
                 let is_active_tab = self
                     .app
                     .state
@@ -2372,12 +3371,16 @@ impl HeadlessServer {
                         ws.find_tab_index_for_pane(pane_id_val)
                             .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
                     });
-
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);
-
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
 
                 if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
@@ -2396,20 +3399,21 @@ impl HeadlessServer {
                             protocol::NotifyKind::Sound,
                             sound_notify_message(sound),
                             None,
+                            None,
                         );
                     }
                 }
 
-                let toast_msg = if !suppress_completion
+                let toast = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
-                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                    && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                        self.app
-                            .state
-                            .toast
-                            .as_ref()
-                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                        self.app.state.toast.as_ref().and_then(|toast| {
+                            toast.target.clone().map(|target| {
+                                (format!("{}: {}", toast.title, toast.context), target)
+                            })
+                        })
                     } else {
                         toast_message_from_state_change(
                             &self.app.state,
@@ -2425,11 +3429,12 @@ impl HeadlessServer {
                     None
                 };
 
-                if let Some(msg) = toast_msg {
+                if let Some((msg, target)) = toast {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        Some(&target),
                     );
                 }
 
@@ -2440,15 +3445,9 @@ impl HeadlessServer {
                 agent_label,
                 ..
             } => {
-                // Hook reports can be stale or no-op after sequence rejection.
-                // Forward only effective state changes observed after handling.
                 let toast_before = self.app.state.toast.clone();
                 let pane_id_val = *pane_id;
                 let agent_val = crate::detect::parse_agent_label(agent_label);
-
-                // Capture the previous effective state for this pane. Hook reports
-                // are already folded into pane.state; raw hook transitions must not
-                // produce a second notification path.
                 let prev_state = self.pane_effective_state(pane_id_val);
                 let prev_agent_label = self.pane_effective_agent_label(pane_id_val);
 
@@ -2458,9 +3457,6 @@ impl HeadlessServer {
                     .handle_internal_event_with_pane_updates(ev)
                     .iter()
                     .any(|update| update.pane_id == pane_id_val && update.suppress_completion);
-
-                // Forward sound notification based on the effective transition when
-                // server-side sound policy allows it.
                 let is_active_tab = self
                     .app
                     .state
@@ -2470,12 +3466,16 @@ impl HeadlessServer {
                         ws.find_tab_index_for_pane(pane_id_val)
                             .is_some_and(|tab_idx| ws.active_tab_index() == tab_idx)
                     });
-
                 let suppress_active_tab_notifications =
                     self.active_tab_suppresses_notifications(is_active_tab);
-
                 let next_state = self.pane_effective_state(pane_id_val);
                 let next_agent_label = self.pane_effective_agent_label(pane_id_val);
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
 
                 if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
@@ -2494,20 +3494,21 @@ impl HeadlessServer {
                             protocol::NotifyKind::Sound,
                             sound_notify_message(sound),
                             None,
+                            None,
                         );
                     }
                 }
 
-                let toast_msg = if !suppress_completion
+                let toast = if !suppress_completion
                     && self.app.state.toast_config.delay_seconds == 0
-                    && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                    && should_forward_toast_to_clients(toast_delivery)
                 {
                     if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                        self.app
-                            .state
-                            .toast
-                            .as_ref()
-                            .map(|toast| format!("{}: {}", toast.title, toast.context))
+                        self.app.state.toast.as_ref().and_then(|toast| {
+                            toast.target.clone().map(|target| {
+                                (format!("{}: {}", toast.title, toast.context), target)
+                            })
+                        })
                     } else {
                         toast_message_from_state_change(
                             &self.app.state,
@@ -2523,11 +3524,12 @@ impl HeadlessServer {
                     None
                 };
 
-                if let Some(msg) = toast_msg {
+                if let Some((msg, target)) = toast {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        Some(&target),
                     );
                 }
 
@@ -2542,37 +3544,70 @@ impl HeadlessServer {
                 let install_command = install_command.clone();
 
                 self.app.handle_internal_event(ev);
-
-                let toast_msg =
-                    if should_forward_toast_to_clients(self.app.state.toast_config.delivery) {
-                        if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
-                            self.app
-                                .state
-                                .toast
-                                .as_ref()
-                                .map(|toast| format!("{}: {}", toast.title, toast.context))
-                        } else {
-                            Some(format!(
-                                "v{version} available: {}",
-                                crate::update::update_install_instruction(&install_command)
-                            ))
-                        }
+                let toast_delivery = self
+                    .app
+                    .state
+                    .toast_config
+                    .delivery
+                    .effective(self.app.state.outer_terminal_focus);
+                let toast_msg = if should_forward_toast_to_clients(toast_delivery) {
+                    if self.app.state.toast.is_some() && self.app.state.toast != toast_before {
+                        self.app
+                            .state
+                            .toast
+                            .as_ref()
+                            .map(|toast| format!("{}: {}", toast.title, toast.context))
                     } else {
-                        None
-                    };
+                        Some(format!(
+                            "v{version} available: {}",
+                            crate::update::update_install_instruction(&install_command)
+                        ))
+                    }
+                } else {
+                    None
+                };
 
                 if let Some(msg) = toast_msg {
                     self.send_flat_toast_to_foreground_client(
-                        toast_notify_kind(self.app.state.toast_config.delivery)
+                        toast_notify_kind(toast_delivery)
                             .expect("toast forwarding requires a client notification kind"),
                         msg,
+                        None,
                     );
                 }
 
                 true
             }
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id, child_pid } => {
                 let pane_id_val = *pane_id;
+                if let Some(client_id) = self.clients.iter().find_map(|(&client_id, client)| {
+                    client
+                        .private_omp_guest
+                        .as_ref()
+                        .is_some_and(|guest| guest.runtime_pane_id() == pane_id_val)
+                        .then_some(client_id)
+                }) {
+                    self.detach_failed_private_omp_guest(client_id);
+                    return true;
+                }
+                if let Some(event_child_pid) = child_pid {
+                    let current_child_pid = self
+                        .app
+                        .state
+                        .terminal_id_for_runtime_pane(pane_id_val)
+                        .and_then(|terminal_id| self.app.terminal_runtimes.get(&terminal_id))
+                        .and_then(crate::terminal::TerminalRuntime::child_pid);
+                    if current_child_pid != Some(*event_child_pid) {
+                        debug!(
+                            pane = pane_id_val.raw(),
+                            event_child_pid,
+                            current_child_pid,
+                            "ignoring stale PaneDied event before headless publication"
+                        );
+                        return false;
+                    }
+                }
+
                 let terminal_id = self.app.state.workspaces.iter().find_map(|ws| {
                     ws.tabs.iter().find_map(|tab| {
                         tab.panes
@@ -2606,18 +3641,19 @@ impl HeadlessServer {
         }
     }
 
-    /// Drains internal events, forwarding clipboard, sound, and toast
+    /// Drains internal events, forwarding clipboard, sound, toast, and URL-opening
     /// notifications to connected clients instead of processing them locally.
     ///
     /// In the monolithic mode:
     /// - `ClipboardWrite` events are written to stdout via `write_osc52_bytes`.
     /// - Sound notifications are played locally via `sound::play`.
     /// - Toast notifications are set on AppState and rendered into the frame.
+    /// - `OpenUrl` events open their safe HTTP(S) URL on the local desktop.
     ///
-    /// In the headless server, there is no stdout terminal or audio subsystem,
+    /// In the headless server, there is no stdout terminal, audio subsystem, or local desktop,
     /// so we:
-    /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the
-    ///   foreground client only.
+    /// - Forward `ClipboardWrite` as `ServerMessage::Clipboard` to the foreground client only.
+    /// - Forward `OpenUrl` as `ServerMessage::OpenUrl` to the originating input client only.
     /// - Detect when a sound would be played and forward as
     ///   `ServerMessage::Notify { kind: Sound }` to the foreground client.
     /// - Detect when a toast is set on AppState and forward as
@@ -2625,6 +3661,11 @@ impl HeadlessServer {
     fn drain_internal_events_with_forwarding(&mut self) -> bool {
         self.drain_internal_events_with_forwarding_up_to(crate::app::APP_EVENT_DRAIN_LIMIT)
             .1
+    }
+    #[cfg(any(unix, test))]
+    fn drain_internal_event_snapshot_with_forwarding(&mut self) -> bool {
+        let queued = self.app.event_rx.len();
+        self.drain_internal_events_with_forwarding_up_to(queued).1
     }
 
     fn drain_all_internal_events_with_forwarding(&mut self) -> bool {
@@ -2704,9 +3745,10 @@ impl HeadlessServer {
             }
         }
 
-        // Remove broken clients.
+        // Remove broken clients and clear any OMP attachment before the socket
+        // reader can report a separate disconnect.
         for client_id in broken_clients {
-            self.remove_client_and_resize_if_needed(client_id);
+            self.remove_failed_client_and_resize_if_needed(client_id);
         }
     }
 
@@ -2736,7 +3778,7 @@ impl HeadlessServer {
                         client_id,
                         "client writer channel closed during targeted send"
                     );
-                    self.remove_client_and_resize_if_needed(client_id);
+                    self.remove_failed_client_and_resize_if_needed(client_id);
                     return false;
                 }
             }
@@ -2779,23 +3821,18 @@ impl HeadlessServer {
 
     #[cfg(unix)]
     fn disconnect_all_clients_for_handoff(&mut self) {
+        let canonical_navigation = ClientNavigationState::capture(&self.app.state);
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
         for client_id in client_ids {
             self.send_client_graphics_cleanup(client_id);
-            self.send_to_client(
-                client_id,
-                ServerMessage::ServerShutdown {
-                    reason: Some(
-                        "live update in progress; reconnect after handoff completes".to_owned(),
-                    ),
-                },
-            );
+            self.send_to_client(client_id, live_handoff_client_message());
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.writer = None;
             }
             let _ = self.remove_client(client_id);
         }
         self.foreground_client_id = None;
+        canonical_navigation.apply_to(&mut self.app.state);
         self.sync_foreground_client_state();
         self.resize_shared_runtime_to_effective_size();
     }
@@ -2884,6 +3921,7 @@ impl HeadlessServer {
             terminal_id: terminal_id.clone(),
         };
         client.pending_terminal_attach = false;
+        client.navigation = None;
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -2911,24 +3949,2116 @@ impl HeadlessServer {
             client.pending_terminal_attach && matches!(client.mode, ClientConnectionMode::App)
         })
     }
+    fn handle_private_surface_input_events(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> bool {
+        let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
+            &events,
+            self.app.state.redraw_on_focus_gained,
+        );
+        let mouse_scroll_lines = self.app.state.mouse_scroll_lines;
+        let Some(view_id) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone())
+        else {
+            return false;
+        };
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.update_outer_focus_from_events(&events);
+        let theme_changed = client.update_host_theme_from_events(&events);
+        if host_surface_redraw {
+            client.request_repaint();
+            client.defer_full_render();
+        } else if !events.is_empty() {
+            client.request_semantic_redraw_after_input();
+        }
+        let theme = client.host_terminal_theme;
+        let appearance = client.host_terminal_appearance;
+        if theme_changed {
+            if let Some(surface) = client.private_surface.as_ref() {
+                surface.apply_host_theme(theme, appearance);
+            }
+        }
+
+        for event in events {
+            let click = {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return false;
+                };
+                let Some(surface) = client.private_surface.as_mut() else {
+                    return false;
+                };
+                surface.route_event(event, mouse_scroll_lines)
+            };
+            let Some(click) = click else {
+                continue;
+            };
+
+            let mouse = click.mouse;
+            let Some(source_pane_id) = self.app.private_popup_source_pane_id(click.origin) else {
+                self.close_private_surface(client_id);
+                return true;
+            };
+            let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
+                if let Some(surface) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .and_then(|client| client.private_surface.as_mut())
+                {
+                    surface.replay_rejected_link_click(mouse, mouse_scroll_lines);
+                }
+                continue;
+            };
+            let mut open_url = None;
+            let activated = self.app.activate_link_once_from_source_with_fallback(
+                client_id,
+                &source_pane_id,
+                click.url,
+                &view_id,
+                |url| {
+                    open_url = Some(url);
+                    true
+                },
+            );
+            self.finish_client_navigation_scope(client_id, canonical);
+            if let Some(url) = open_url {
+                self.send_to_client(client_id, ServerMessage::OpenUrl { url });
+            }
+            if let Some(surface) = self
+                .clients
+                .get_mut(&client_id)
+                .and_then(|client| client.private_surface.as_mut())
+            {
+                if activated {
+                    surface.mark_link_click_activated();
+                } else {
+                    surface.replay_rejected_link_click(mouse, mouse_scroll_lines);
+                }
+            }
+        }
+        true
+    }
 
     /// Handles a server event. Returns true if the event requires a re-render.
+    fn apply_omp_messages(&mut self, messages: Vec<(u64, ServerMessage)>) -> bool {
+        let mut render = false;
+        let mut teardown = Vec::new();
+        for (client_id, message) in messages {
+            let private = self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.private_omp_guest.is_some());
+            if !private {
+                self.send_to_client(client_id, message);
+                continue;
+            }
+            match message {
+                ServerMessage::OmpPane {
+                    attachment_epoch,
+                    controller,
+                    state,
+                    ..
+                } => {
+                    if let Some(guest) = self
+                        .clients
+                        .get(&client_id)
+                        .and_then(|client| client.private_omp_guest.as_ref())
+                    {
+                        guest.set_attachment_epoch(attachment_epoch);
+                        guest.set_controller(controller);
+                    }
+                    if matches!(state, OmpPaneState::Failed { .. }) {
+                        teardown.push(client_id);
+                    }
+                    render = true;
+                }
+                ServerMessage::OmpFrame { frame, .. } => {
+                    let result =
+                        protocol::validate_omp_frame(&frame, OmpFrameDirection::HostToGuest)
+                            .ok()
+                            .and_then(|payload| std::str::from_utf8(payload).ok())
+                            .map(|payload| {
+                                format!(r#"{{"t":"frame","fromPeer":0,"frame":{payload}}}"#)
+                            })
+                            .and_then(|record| {
+                                self.clients
+                                    .get(&client_id)
+                                    .and_then(|client| client.private_omp_guest.as_ref())
+                                    .and_then(|guest| guest.send_host_frame(&record).ok())
+                            });
+                    if result.is_none() {
+                        teardown.push(client_id);
+                    }
+                }
+                ServerMessage::OmpError { code, message, .. } => {
+                    warn!(client_id, %code, %message, "private OMP renderer route failed");
+                    teardown.push(client_id);
+                }
+                message => {
+                    self.send_to_client(client_id, message);
+                }
+            }
+        }
+        teardown.sort_unstable();
+        teardown.dedup();
+        for client_id in teardown {
+            self.detach_failed_private_omp_guest(client_id);
+            render = true;
+        }
+        render
+    }
+
+    fn enforce_omp_maintenance(&mut self) -> bool {
+        let messages = self.omp_service.enforce_maintenance(&self.clients);
+        if messages.is_empty() {
+            return false;
+        }
+        self.apply_omp_messages(messages) | self.reconcile_omp_renderers()
+    }
+
+    fn detach_failed_private_omp_guest(&mut self, client_id: u64) {
+        let route = self
+            .clients
+            .get_mut(&client_id)
+            .and_then(|client| client.private_omp_guest.take())
+            .map(|guest| guest.route().clone());
+        let Some(route) = route else {
+            return;
+        };
+        warn!(client_id, pane_id = %route.pane_id, "private OMP guest bridge failed; keeping host PTY masked");
+        self.clear_private_omp_pending_route(client_id, &route);
+        self.mark_private_omp_failed_with_retry(client_id, route);
+        let messages = self
+            .omp_service
+            .detach_private_app(client_id, &self.clients);
+        self.apply_omp_messages(messages);
+    }
+
+    fn private_omp_guest_failed(&self, client_id: u64) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_guest.as_ref())
+            .is_some_and(PrivateOmpGuest::bridge_failed)
+    }
+
+    fn client_focused_pane(&self, client_id: u64) -> Option<(usize, crate::layout::PaneId)> {
+        let client = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())?;
+        let Some(navigation) = client.navigation.as_ref() else {
+            return self.app.state.active.and_then(|ws_idx| {
+                self.app
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|workspace| workspace.focused_pane_id())
+                    .map(|pane_id| (ws_idx, pane_id))
+            });
+        };
+        let workspace_id = navigation.active_workspace_id.as_deref()?;
+        let (ws_idx, workspace) = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, workspace)| workspace.id == workspace_id)?;
+        let tab_id = navigation.active_tab_by_workspace.get(&workspace.id)?;
+        let (tab_idx, _) = workspace.tabs.iter().enumerate().find(|(tab_idx, _)| {
+            workspace.public_tab_number(*tab_idx).is_some_and(|number| {
+                crate::workspace::public_tab_id_for_number(&workspace.id, number) == *tab_id
+            })
+        })?;
+        let pane_id = navigation.focused_pane_by_tab.get(tab_id)?;
+        workspace.tabs[tab_idx]
+            .layout
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id_val| {
+                workspace
+                    .public_pane_number(*pane_id_val)
+                    .is_some_and(|number| {
+                        crate::workspace::public_pane_id_for_number(&workspace.id, number)
+                            == *pane_id
+                    })
+            })
+            .map(|pane_id| (ws_idx, pane_id))
+    }
+    fn desired_private_omp_route(
+        &self,
+        client_id: u64,
+        routes: &[OmpRouteKey],
+    ) -> Option<OmpRouteKey> {
+        let focused = self.client_focused_pane(client_id)?;
+        routes
+            .iter()
+            .find(|route| self.app.parse_pane_id(&route.pane_id) == Some(focused))
+            .cloned()
+    }
+
+    fn omp_renderer_route(key: &OmpRouteKey) -> crate::protocol::OmpRendererRoute {
+        crate::protocol::OmpRendererRoute {
+            pane_id: key.pane_id.clone(),
+            omp_session_id: key.omp_session_id.clone(),
+            route_generation: key.route_generation,
+        }
+    }
+
+    fn omp_renderer_prefix(&self, client_id: u64) -> Option<crate::protocol::OmpRendererPrefix> {
+        let prefix = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.keybindings.as_ref().map(|keys| keys.prefix))
+            .unwrap_or(self.server_keybindings.prefix);
+        Some(crate::protocol::OmpRendererPrefix {
+            code: crate::protocol::ClientKeyCode::from_crossterm(prefix.0)?,
+            modifiers: prefix.1.bits(),
+        })
+    }
+
+    fn client_omp_surface_active(&self, client_id: u64) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        let mode = client
+            .navigation
+            .as_ref()
+            .map_or(self.app.state.mode, |navigation| {
+                if navigation.findr.is_some() {
+                    app::Mode::Findr
+                } else {
+                    navigation.non_findr_mode.unwrap_or(self.app.state.mode)
+                }
+            });
+        client.private_surface.is_none()
+            && client
+                .navigation
+                .as_ref()
+                .is_none_or(|navigation| navigation.focused_workspace_plugin_pane.is_none())
+            && mode == app::Mode::Terminal
+            && self.app.state.popup_pane.is_none()
+    }
+
+    fn server_owned_overlay_active(&self, identity: &crate::ui::IdentityUiState) -> bool {
+        identity.editor_open
+            || self.app.state.mode != app::Mode::Terminal
+            || self.app.state.popup_pane.is_some()
+            || self.app.state.config_diagnostic.is_some()
+            || self.app.state.toast.is_some()
+            || self.app.state.copy_feedback.is_some()
+            || self.app.state.focused_workspace_plugin_pane().is_some()
+    }
+    fn client_server_owned_overlay_active(&self, client_id: u64) -> bool {
+        let identity = crate::server::render_stream::identity_ui_state(
+            self.clients
+                .get(&client_id)
+                .and_then(|client| client.identity.as_ref()),
+        );
+        self.server_owned_overlay_active(&identity)
+    }
+
+    fn private_omp_guest_surface_active(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> bool {
+        self.client_omp_surface_active(client_id)
+            && self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.private_omp_guest.as_ref())
+                .is_some_and(|guest| {
+                    guest.runtime_pane_id() == pane_id
+                        && guest.bridge_ready()
+                        && !guest.bridge_failed()
+                        && self.private_omp_pending_routes.get(&client_id) != Some(guest.route())
+                })
+    }
+
+    fn client_has_ready_native_renderer(&self, client_id: u64) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.as_ref())
+            .is_some_and(|target| target.ready)
+            && self.omp_service.app_has_native_renderer(client_id)
+    }
+
+    fn native_omp_surface_active(&self, client_id: u64) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.as_ref())
+            .is_some_and(|target| target.surface_active)
+    }
+
+    fn private_omp_fallback_ready(&self, client_id: u64, route: &OmpRouteKey) -> bool {
+        self.clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_guest.as_ref())
+            .is_some_and(|guest| guest.route() == route && guest.bridge_ready())
+    }
+
+    fn private_omp_fallback_terminally_failed(&self, client_id: u64, route: &OmpRouteKey) -> bool {
+        self.private_omp_failed_routes.get(&client_id) == Some(route)
+            && self
+                .private_omp_retry_attempted_routes
+                .get(&client_id)
+                .is_some_and(|(attempted, state)| {
+                    attempted == route && matches!(state, PrivateOmpRetryState::Consumed)
+                })
+    }
+
+    fn private_omp_resolution_is_current(&self, client_id: u64, route: &OmpRouteKey) -> bool {
+        let eligible = self.clients.get(&client_id).is_some_and(|client| {
+            client.is_full_app_client()
+                && client.committed_identity().is_some()
+                && client.private_omp_guest.is_none()
+        });
+        if !eligible
+            || self.client_has_ready_native_renderer(client_id)
+            || self
+                .private_omp_failed_routes
+                .get(&client_id)
+                .is_some_and(|failed| failed == route)
+        {
+            return false;
+        }
+        let mut routes = self.omp_service.live_route_keys();
+        routes.sort_by(|left, right| {
+            (&left.pane_id, &left.omp_session_id, left.route_generation).cmp(&(
+                &right.pane_id,
+                &right.omp_session_id,
+                right.route_generation,
+            ))
+        });
+        self.desired_private_omp_route(client_id, &routes).as_ref() == Some(route)
+    }
+
+    fn allocate_omp_renderer_launch_id(&mut self) -> Option<u64> {
+        let launch_id = self.next_omp_renderer_launch_id;
+        self.next_omp_renderer_launch_id = launch_id.checked_add(1)?;
+        Some(launch_id)
+    }
+    fn allocate_omp_renderer_authority_revision(&mut self) -> Option<u64> {
+        let revision = self.next_omp_renderer_authority_revision;
+        self.next_omp_renderer_authority_revision = revision.checked_add(1)?;
+        Some(revision)
+    }
+    fn revoke_omp_renderer_authority(&mut self, client_id: u64) -> bool {
+        let (changed, message) = {
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                return false;
+            };
+            let had_frame_nonce = client.omp_renderer_frame_nonce.take().is_some();
+            let had_frame_pane = client.omp_renderer_frame_pane.take().is_some();
+            let had_server_gesture = client.native_omp_server_mouse_gesture.take().is_some();
+            let mut changed = had_frame_nonce || had_frame_pane || had_server_gesture;
+            let message = client.omp_renderer_target.as_mut().map(|target| {
+                changed |= target.input_authority_acked || target.surface_active;
+                target.input_authority_acked = false;
+                target.surface_active = false;
+                ServerMessage::OmpRendererTarget {
+                    launch_id: target.launch_id,
+                    authority_revision: target.authority_revision,
+                    target_app_client_id: client_id,
+                    route: target.route.clone(),
+                    bound: target.bound,
+                    surface_active: false,
+                    prefix: target.prefix.clone(),
+                }
+            });
+            if changed {
+                client.request_repaint();
+            }
+            (changed, message)
+        };
+        if changed {
+            if let Some(message) = message {
+                if !self.send_to_client(client_id, message) {
+                    self.remove_failed_client_and_resize_if_needed(client_id);
+                }
+            } else {
+                self.remove_failed_client_and_resize_if_needed(client_id);
+            }
+        }
+        changed
+    }
+
+    fn reoffer_native_omp_geometry_authority(
+        &mut self,
+        client_id: u64,
+        previous_revision: u64,
+    ) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| {
+                target.surface_active && target.authority_revision == previous_revision
+            })
+        else {
+            return false;
+        };
+        target.authority_revision = 0;
+        self.update_omp_renderer_target(client_id, target)
+    }
+
+    fn update_omp_renderer_target(
+        &mut self,
+        client_id: u64,
+        mut target: OmpRendererTargetState,
+    ) -> bool {
+        if target.surface_active {
+            let navigation_scope = self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.navigation.is_some())
+                .then(|| self.foreground_client_id != Some(client_id))
+                .is_some_and(|background| background)
+                .then(|| self.begin_client_navigation_scope(client_id))
+                .flatten();
+            if navigation_scope.is_some() {
+                self.compute_client_navigation_view(client_id);
+            }
+            let has_area = target
+                .route
+                .as_ref()
+                .and_then(|route| {
+                    let (workspace_id, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+                    (self.app.state.active == Some(workspace_id)).then(|| {
+                        self.app
+                            .state
+                            .view
+                            .pane_infos
+                            .iter()
+                            .find(|info| info.id == pane_id)
+                    })
+                })
+                .flatten()
+                .is_none_or(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0);
+            if let Some(canonical) = navigation_scope {
+                self.finish_client_navigation_scope(client_id, canonical);
+            }
+            target.surface_active &= has_area;
+        }
+        let previous = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.as_ref())
+            .cloned();
+        if previous.as_ref() == Some(&target) {
+            return false;
+        }
+        let Some(authority_revision) = self.allocate_omp_renderer_authority_revision() else {
+            warn!("OMP renderer authority revision exhausted; revoking target authority");
+            return self.revoke_omp_renderer_authority(client_id);
+        };
+        target.authority_revision = authority_revision;
+        target.input_authority_acked = false;
+        let clear_server_gesture = !target.surface_active
+            || previous.as_ref().is_some_and(|previous| {
+                previous.launch_id != target.launch_id || previous.route != target.route
+            });
+        let activating = target.surface_active
+            && previous
+                .as_ref()
+                .is_none_or(|previous| !previous.surface_active);
+        let target_authority = (target.launch_id, target.authority_revision);
+        let message = ServerMessage::OmpRendererTarget {
+            launch_id: target.launch_id,
+            authority_revision: target.authority_revision,
+            target_app_client_id: client_id,
+            route: target.route.clone(),
+            bound: target.bound,
+            surface_active: target.surface_active,
+            prefix: target.prefix.clone(),
+        };
+        if activating {
+            let Some(pane_id) = target
+                .route
+                .as_ref()
+                .and_then(|route| self.app.parse_pane_id(&route.pane_id))
+                .map(|(_, pane_id)| pane_id)
+            else {
+                return false;
+            };
+            let Some(next_graphics_cache) =
+                self.queue_native_omp_activation(client_id, &target, &message)
+            else {
+                // RendererReady is one-shot; retain server-only readiness so reconciliation can retry.
+                let Some(current) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .and_then(|client| client.omp_renderer_target.as_mut())
+                    .filter(|current| current.launch_id == target.launch_id)
+                else {
+                    return false;
+                };
+                let ready_changed = current.ready != target.ready;
+                current.ready = target.ready;
+                return ready_changed;
+            };
+            self.retire_direct_graphics_for_client_pane_without_notifications(client_id, pane_id);
+            self.commit_client_graphics_cleanup(client_id, next_graphics_cache);
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                return false;
+            };
+            client.omp_renderer_target = Some(target);
+            client.omp_renderer_frame_nonce = None;
+            client.omp_renderer_frame_pane = None;
+            if clear_server_gesture {
+                client.native_omp_server_mouse_gesture = None;
+            } else if let Some(gesture) = client.native_omp_server_mouse_gesture.as_mut() {
+                gesture.launch_id = target_authority.0;
+                gesture.authority_revision = target_authority.1;
+            }
+            client.request_repaint();
+            return true;
+        }
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.omp_renderer_target = Some(target);
+        client.omp_renderer_frame_nonce = None;
+        client.omp_renderer_frame_pane = None;
+        if clear_server_gesture {
+            client.native_omp_server_mouse_gesture = None;
+        } else if let Some(gesture) = client.native_omp_server_mouse_gesture.as_mut() {
+            gesture.launch_id = target_authority.0;
+            gesture.authority_revision = target_authority.1;
+        }
+        client.request_repaint();
+        self.send_to_client(client_id, message);
+        true
+    }
+
+    fn reoffer_native_omp_input_authority(
+        &mut self,
+        client_id: u64,
+        gesture: NativeOmpServerGesture,
+    ) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| {
+                target.launch_id == gesture.launch_id
+                    && target.authority_revision == gesture.authority_revision
+                    && target.bound
+                    && target.ready
+                    && target.surface_active
+            })
+        else {
+            return false;
+        };
+        target.authority_revision = 0;
+        self.update_omp_renderer_target(client_id, target)
+    }
+
+    fn reoffer_current_native_omp_input_authority(&mut self, client_id: u64) -> bool {
+        let Some(mut target) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.omp_renderer_target.clone())
+            .filter(|target| target.bound && target.ready && target.surface_active)
+        else {
+            return false;
+        };
+        target.authority_revision = 0;
+        self.update_omp_renderer_target(client_id, target)
+    }
+
+    fn reconcile_native_omp_renderers(&mut self) -> bool {
+        let mut routes = self.omp_service.live_route_keys();
+        routes.sort_by(|left, right| {
+            (&left.pane_id, &left.omp_session_id, left.route_generation).cmp(&(
+                &right.pane_id,
+                &right.omp_session_id,
+                right.route_generation,
+            ))
+        });
+        let mut client_ids = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| client.is_full_app_client().then_some(client_id))
+            .collect::<Vec<_>>();
+        client_ids.sort_unstable();
+
+        let mut changed = false;
+        for client_id in client_ids {
+            let Some(prefix) = self.omp_renderer_prefix(client_id) else {
+                continue;
+            };
+            let eligible = self.clients.get(&client_id).is_some_and(|client| {
+                client.omp_renderer_capabilities.client_local_native
+                    && client.renderer_binding_token.is_some()
+                    && client.committed_identity().is_some()
+            });
+            let focused_key = eligible
+                .then(|| self.client_focused_pane(client_id))
+                .flatten()
+                .and_then(|focused| {
+                    routes
+                        .iter()
+                        .find(|route| self.app.parse_pane_id(&route.pane_id) == Some(focused))
+                })
+                .cloned();
+            let current = self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.omp_renderer_target.clone());
+            let retained_key = eligible
+                .then(|| current.as_ref().and_then(|target| target.route.as_ref()))
+                .flatten()
+                .and_then(|route| {
+                    routes.iter().find(|key| {
+                        key.pane_id == route.pane_id
+                            && key.omp_session_id == route.omp_session_id
+                            && key.route_generation == route.route_generation
+                    })
+                })
+                .cloned();
+            let desired_key = focused_key.clone().or(retained_key);
+            let desired_route = desired_key.as_ref().map(Self::omp_renderer_route);
+
+            if current.as_ref().and_then(|target| target.route.as_ref()) != desired_route.as_ref() {
+                if let Some(current) = current.as_ref().filter(|target| target.route.is_some()) {
+                    changed |= self.update_omp_renderer_target(
+                        client_id,
+                        OmpRendererTargetState {
+                            launch_id: current.launch_id,
+                            authority_revision: 0,
+                            route: None,
+                            bound: false,
+                            ready: false,
+                            prefix: prefix.clone(),
+                            surface_active: false,
+                            input_authority_acked: false,
+                        },
+                    );
+                    if self.omp_service.app_has_native_renderer(client_id) {
+                        continue;
+                    }
+                }
+                if let Some(route) = desired_route {
+                    let Some(launch_id) = self.allocate_omp_renderer_launch_id() else {
+                        warn!("OMP renderer launch ID exhausted; refusing target launch");
+                        continue;
+                    };
+                    changed |= self.update_omp_renderer_target(
+                        client_id,
+                        OmpRendererTargetState {
+                            launch_id,
+                            authority_revision: 0,
+                            route: Some(route),
+                            bound: false,
+                            ready: false,
+                            prefix,
+                            surface_active: false,
+                            input_authority_acked: false,
+                        },
+                    );
+                }
+                continue;
+            }
+
+            let (Some(mut target), Some(key)) = (current, desired_key.as_ref()) else {
+                continue;
+            };
+            let native_bound = self
+                .omp_service
+                .app_has_native_renderer_for_route(client_id, key);
+            if !native_bound
+                && target.bound
+                && target.ready
+                && !self.private_omp_fallback_ready(client_id, key)
+                && !self.private_omp_fallback_terminally_failed(client_id, key)
+            {
+                continue;
+            }
+            target.bound = native_bound;
+            target.ready &= target.bound;
+            let route_focused = self
+                .client_focused_pane(client_id)
+                .is_some_and(|focused| self.app.parse_pane_id(&key.pane_id) == Some(focused));
+            target.surface_active = target.bound
+                && target.ready
+                && route_focused
+                && self.client_omp_surface_active(client_id);
+            target.prefix = prefix;
+            changed |= self.update_omp_renderer_target(client_id, target);
+        }
+        changed
+    }
+
+    fn private_omp_executable_for_launch(
+        &mut self,
+        client_id: u64,
+        route: &OmpRouteKey,
+    ) -> Option<crate::update::OmpExecutable> {
+        if let Some(executable) = self.private_omp_executable.clone() {
+            match executable.verify() {
+                Ok(()) => return Some(executable),
+                Err(error) => {
+                    warn!(%error, "cached private OMP executable failed revalidation");
+                    self.private_omp_executable = None;
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(executable) = &self.private_omp_test_executable {
+            return Some(crate::update::OmpExecutable::Explicit(executable.clone()));
+        }
+
+        if self.private_omp_resolving.is_none() {
+            self.private_omp_resolving = Some((client_id, route.clone()));
+            let event_tx = self.server_event_tx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    crate::update::server_private_omp_executable().and_then(|executable| {
+                        executable.verify()?;
+                        Ok(executable)
+                    });
+                let _ = event_tx.blocking_send(ServerEvent::OmpPrivateCompanionResolved { result });
+            });
+        }
+        None
+    }
+
+    fn set_private_omp_pending_route(&mut self, client_id: u64, route: &OmpRouteKey) -> bool {
+        if self.private_omp_pending_routes.get(&client_id) == Some(route) {
+            return false;
+        }
+        let Some((_, pane_id)) = self.app.parse_pane_id(&route.pane_id) else {
+            return false;
+        };
+        if !self.begin_omp_graphics_replacement(client_id, pane_id) {
+            return false;
+        }
+        self.private_omp_pending_routes
+            .insert(client_id, route.clone());
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.request_repaint();
+        }
+        true
+    }
+
+    fn clear_private_omp_pending_route(&mut self, client_id: u64, route: &OmpRouteKey) -> bool {
+        if self.private_omp_pending_routes.get(&client_id) != Some(route) {
+            return false;
+        }
+        self.private_omp_pending_routes.remove(&client_id);
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.request_repaint();
+        }
+        true
+    }
+
+    fn mark_private_omp_failed_with_retry(&mut self, client_id: u64, route: OmpRouteKey) {
+        let should_retry = !self
+            .private_omp_retry_attempted_routes
+            .get(&client_id)
+            .is_some_and(|(attempted, _)| attempted == &route);
+        self.private_omp_failed_routes
+            .insert(client_id, route.clone());
+        if should_retry {
+            let retry_id = self.next_private_omp_retry_id;
+            self.next_private_omp_retry_id = retry_id.wrapping_add(1).max(1);
+            self.private_omp_retry_attempted_routes.insert(
+                client_id,
+                (route.clone(), PrivateOmpRetryState::Pending(retry_id)),
+            );
+            let event_tx = self.server_event_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(PRIVATE_OMP_COMPANION_RETRY_DELAY);
+                let _ = event_tx.blocking_send(ServerEvent::OmpPrivateCompanionRetry {
+                    client_id,
+                    route,
+                    retry_id,
+                });
+            });
+        }
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.request_repaint();
+        }
+    }
+
+    fn clear_private_omp_failure_state(&mut self, client_id: u64, route: &OmpRouteKey) {
+        if self.private_omp_failed_routes.get(&client_id) == Some(route) {
+            self.private_omp_failed_routes.remove(&client_id);
+        }
+        if self
+            .private_omp_retry_attempted_routes
+            .get(&client_id)
+            .is_some_and(|(attempted, _)| attempted == route)
+        {
+            self.private_omp_retry_attempted_routes.remove(&client_id);
+        }
+    }
+
+    fn reconcile_private_omp_completion(&mut self) -> bool {
+        self.reconcile_omp_renderers()
+    }
+
+    fn reconcile_omp_renderers(&mut self) -> bool {
+        if !self.independent_omp_renderers_enabled() {
+            return false;
+        }
+        let mut changed = self.reconcile_native_omp_renderers();
+        changed |= self.reconcile_private_omp_guests();
+        changed | self.reconcile_native_omp_renderers()
+    }
+
+    fn try_attach_private_omp_guest(&mut self, client_id: u64, route: OmpRouteKey) -> bool {
+        if self
+            .private_omp_failed_routes
+            .get(&client_id)
+            .is_some_and(|failed| failed == &route)
+        {
+            return false;
+        }
+        let eligible = self.clients.get(&client_id).is_some_and(|client| {
+            client.is_full_app_client()
+                && client.committed_identity().is_some()
+                && client.private_omp_guest.is_none()
+        }) && !self.client_has_ready_native_renderer(client_id);
+        let Some((ws_idx, view_pane_id)) = eligible
+            .then(|| self.app.parse_pane_id(&route.pane_id))
+            .flatten()
+        else {
+            return false;
+        };
+        if self.client_focused_pane(client_id) != Some((ws_idx, view_pane_id)) {
+            return false;
+        }
+        let mut changed = self.set_private_omp_pending_route(client_id, &route);
+        if self.private_omp_pending_routes.get(&client_id) != Some(&route) {
+            return changed;
+        }
+        let Some(omp_executable) = self.private_omp_executable_for_launch(client_id, &route) else {
+            return changed;
+        };
+        let initial_inner = self
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == view_pane_id)
+            .map(|info| info.inner_rect);
+        let messages = self
+            .omp_service
+            .attach_private_app(client_id, route.clone(), &self.clients);
+        let attachment = messages.iter().find_map(|(target, message)| match message {
+            ServerMessage::OmpPane {
+                attachment_epoch,
+                controller,
+                state: OmpPaneState::Starting { .. } | OmpPaneState::Live { .. },
+                ..
+            } if *target == client_id => Some((*attachment_epoch, *controller)),
+            _ => None,
+        });
+        let Some((attachment_epoch, controller)) = attachment else {
+            changed |= self.clear_private_omp_pending_route(client_id, &route);
+            self.apply_omp_messages(messages);
+            return changed;
+        };
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        let (cols, rows) = client.terminal_size;
+        let cell_size = client.cell_size;
+        let terminal_theme = client.host_terminal_theme;
+        let terminal_appearance = client.host_terminal_appearance;
+        let Some(launch_env) = self
+            .app
+            .pane_launch_env(ws_idx, view_pane_id, Vec::new())
+            .map(crate::pane::PaneLaunchEnv::without_pane_identity)
+        else {
+            self.clear_private_omp_pending_route(client_id, &route);
+            self.mark_private_omp_failed_with_retry(client_id, route.clone());
+            let cleanup = self
+                .omp_service
+                .detach_private_app(client_id, &self.clients);
+            self.apply_omp_messages(cleanup);
+            return true;
+        };
+        let cwd = self
+            .app
+            .launch_cwd_for_pane_in_workspace(ws_idx, view_pane_id)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let config = PrivateOmpGuestConfig {
+            route: route.clone(),
+            omp_executable,
+            attachment_epoch,
+            controller,
+            pane_id: crate::layout::PaneId::alloc(),
+            rows: initial_inner.map_or(rows.max(1), |inner| inner.height.max(1)),
+            cols: initial_inner.map_or(cols.max(1), |inner| inner.width.max(1)),
+            cwd,
+            launch_env,
+            scrollback_limit_bytes: self.app.state.pane_scrollback_limit_bytes,
+            terminal_theme,
+            terminal_appearance,
+            events: self.app.event_tx.clone(),
+            render_notify: self.app.render_notify.clone(),
+            render_dirty: self.app.render_dirty.clone(),
+        };
+        match PrivateOmpGuest::spawn(config) {
+            Ok(guest) => {
+                let guest_rows = initial_inner.map_or(rows.max(1), |inner| inner.height.max(1));
+                let guest_cols = initial_inner.map_or(cols.max(1), |inner| inner.width.max(1));
+                guest.resize(
+                    guest_rows,
+                    guest_cols,
+                    cell_size.width_px,
+                    cell_size.height_px,
+                );
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.private_omp_guest = Some(guest);
+                    client.request_repaint();
+                }
+                self.apply_omp_messages(messages);
+                true
+            }
+            Err(error) => {
+                warn!(client_id, %error, "failed to spawn private OMP renderer");
+                self.clear_private_omp_pending_route(client_id, &route);
+                self.mark_private_omp_failed_with_retry(client_id, route);
+                let cleanup = self
+                    .omp_service
+                    .detach_private_app(client_id, &self.clients);
+                self.apply_omp_messages(cleanup);
+                true
+            }
+        }
+    }
+
+    fn reconcile_private_omp_guests(&mut self) -> bool {
+        let mut routes = self.omp_service.live_route_keys();
+        routes.sort_by(|left, right| {
+            (&left.pane_id, &left.omp_session_id, left.route_generation).cmp(&(
+                &right.pane_id,
+                &right.omp_session_id,
+                right.route_generation,
+            ))
+        });
+        let mut client_ids = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                (client.is_full_app_client() && !self.client_has_ready_native_renderer(client_id))
+                    .then_some(client_id)
+            })
+            .collect::<Vec<_>>();
+        client_ids.sort_unstable();
+        let mut changed = false;
+        for client_id in client_ids {
+            let desired_route = self.desired_private_omp_route(client_id, &routes);
+            if self
+                .private_omp_failed_routes
+                .get(&client_id)
+                .is_some_and(|failed| desired_route.as_ref() != Some(failed))
+            {
+                self.private_omp_failed_routes.remove(&client_id);
+            }
+            if self
+                .private_omp_retry_attempted_routes
+                .get(&client_id)
+                .is_some_and(|(attempted, _)| desired_route.as_ref() != Some(attempted))
+            {
+                self.private_omp_retry_attempted_routes.remove(&client_id);
+            }
+            if let Some(pending_route) = self.private_omp_pending_routes.get(&client_id).cloned() {
+                if desired_route.as_ref() != Some(&pending_route) {
+                    changed |= self.clear_private_omp_pending_route(client_id, &pending_route);
+                }
+            }
+            let current_route = self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.private_omp_guest.as_ref())
+                .map(|guest| guest.route().clone());
+            if current_route != desired_route {
+                if current_route.is_some() {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.private_omp_guest.take();
+                    }
+                    let messages = self
+                        .omp_service
+                        .detach_private_app(client_id, &self.clients);
+                    self.apply_omp_messages(messages);
+                    changed = true;
+                }
+                if let Some(route) = desired_route {
+                    changed |= self.try_attach_private_omp_guest(client_id, route);
+                }
+            }
+        }
+        changed
+    }
+
+    fn encode_private_omp_guest_frame(
+        frame: &serde_json::value::RawValue,
+    ) -> Result<Vec<u8>, protocol::OmpFrameError> {
+        protocol::encode_omp_frame(OmpFrameDirection::GuestToHost, frame.get().as_bytes())
+    }
+
+    fn drain_private_omp_guest_records(&mut self) -> bool {
+        let failed_clients = self
+            .clients
+            .keys()
+            .copied()
+            .filter(|&client_id| self.private_omp_guest_failed(client_id))
+            .collect::<Vec<_>>();
+        if !failed_clients.is_empty() {
+            for client_id in failed_clients {
+                self.detach_failed_private_omp_guest(client_id);
+            }
+            self.reconcile_native_omp_renderers();
+            return true;
+        }
+
+        let ready_routes = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                let guest = client.private_omp_guest.as_ref()?;
+                (guest.bridge_ready()
+                    && self.private_omp_pending_routes.get(&client_id) == Some(guest.route()))
+                .then(|| (client_id, guest.route().clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut render = false;
+        for (client_id, route) in &ready_routes {
+            render |= self.clear_private_omp_pending_route(*client_id, route);
+        }
+        if !ready_routes.is_empty() {
+            render |= self.reconcile_omp_renderers();
+        }
+
+        let mut events = Vec::new();
+        let mut invalid_clients = Vec::new();
+        for (&client_id, client) in &mut self.clients {
+            let Some(guest) = client.private_omp_guest.as_mut() else {
+                continue;
+            };
+            let route = guest.route().clone();
+            let attachment_epoch = guest.attachment_epoch();
+            for record in guest.drain_guest_records() {
+                match record {
+                    PrivateOmpGuestRecord::Frame { frame, mutation } => {
+                        let frame = match Self::encode_private_omp_guest_frame(&frame) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                warn!(client_id, %error, "invalid private OMP guest frame; retiring renderer");
+                                invalid_clients.push(client_id);
+                                break;
+                            }
+                        };
+                        if mutation {
+                            events.push(ServerEvent::OmpControl {
+                                client_id,
+                                pane_id: route.pane_id.clone(),
+                                omp_session_id: route.omp_session_id.clone(),
+                                route_generation: route.route_generation,
+                                attachment_epoch,
+                                action: OmpControlAction::Mutation { frame },
+                            });
+                        } else {
+                            events.push(ServerEvent::OmpFrame {
+                                client_id,
+                                pane_id: route.pane_id.clone(),
+                                omp_session_id: route.omp_session_id.clone(),
+                                route_generation: route.route_generation,
+                                attachment_epoch,
+                                frame,
+                            });
+                        }
+                    }
+                    PrivateOmpGuestRecord::Control(action) => {
+                        events.push(ServerEvent::OmpControl {
+                            client_id,
+                            pane_id: route.pane_id.clone(),
+                            omp_session_id: route.omp_session_id.clone(),
+                            route_generation: route.route_generation,
+                            attachment_epoch,
+                            action: match action {
+                                PrivateOmpGuestControl::RequestController => {
+                                    OmpControlAction::RequestController
+                                }
+                                PrivateOmpGuestControl::ReleaseController => {
+                                    OmpControlAction::ReleaseController
+                                }
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        invalid_clients.sort_unstable();
+        invalid_clients.dedup();
+        for client_id in invalid_clients {
+            self.detach_failed_private_omp_guest(client_id);
+            render = true;
+        }
+        for event in events {
+            render |= self.handle_server_event(event);
+        }
+        render
+    }
+
+    fn native_omp_target_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let route = self
+            .clients
+            .get(&client_id)?
+            .omp_renderer_target
+            .as_ref()?
+            .route
+            .as_ref()?;
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+        (self.app.state.active == Some(ws_idx))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn native_omp_frame_projection(
+        &mut self,
+        client_id: u64,
+    ) -> Option<crate::protocol::OmpRendererFrame> {
+        let info = self
+            .native_omp_target_pane_info(client_id)
+            .filter(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0);
+        let pane = info.as_ref().map(|info| crate::protocol::OmpRendererPane {
+            x: info.inner_rect.x,
+            y: info.inner_rect.y,
+            width: info.inner_rect.width,
+            height: info.inner_rect.height,
+            scrollback_limit_bytes: u64::try_from(self.app.state.pane_scrollback_limit_bytes)
+                .unwrap_or(u64::MAX),
+        });
+        let previous_geometry_revision = self.clients.get(&client_id).and_then(|client| {
+            let target = client.omp_renderer_target.as_ref()?;
+            target.route.as_ref()?;
+            let previous = client
+                .omp_renderer_frame_pane
+                .map(|pane| (pane.x, pane.y, pane.width, pane.height));
+            let current = pane.map(|pane| (pane.x, pane.y, pane.width, pane.height));
+            (target.surface_active
+                && client.omp_renderer_frame_nonce.is_some()
+                && previous != current)
+                .then_some(target.authority_revision)
+        });
+        if let Some(previous_revision) = previous_geometry_revision {
+            self.reoffer_native_omp_geometry_authority(client_id, previous_revision);
+        }
+        let (launch_id, authority_revision, surface_active, existing_nonce) = {
+            let client = self.clients.get(&client_id)?;
+            let target = client.omp_renderer_target.as_ref()?;
+            target.route.as_ref()?;
+            (
+                target.launch_id,
+                target.authority_revision,
+                target.surface_active,
+                client.omp_renderer_frame_nonce,
+            )
+        };
+        let frame_nonce = if let Some(frame_nonce) = existing_nonce {
+            frame_nonce
+        } else {
+            let mut frame_nonce = [0; 16];
+            if let Err(error) = getrandom::fill(&mut frame_nonce) {
+                warn!(%error, "failed to generate OMP renderer frame nonce; revoking authority");
+                self.revoke_omp_renderer_authority(client_id);
+                return None;
+            }
+            let client = self.clients.get_mut(&client_id)?;
+            let current = client.omp_renderer_target.as_ref()?;
+            if (current.launch_id, current.authority_revision) != (launch_id, authority_revision) {
+                return None;
+            }
+            client.omp_renderer_frame_nonce = Some(frame_nonce);
+            client.omp_renderer_frame_pane = pane;
+            frame_nonce
+        };
+        Some(crate::protocol::OmpRendererFrame {
+            launch_id,
+            authority_revision,
+            frame_nonce,
+            pane,
+            focused: info.as_ref().is_some_and(|info| info.is_focused),
+            server_owned_overlay: false,
+            surface_active: surface_active && pane.is_some(),
+        })
+    }
+
+    fn native_bound_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let target = self.clients.get(&client_id)?.omp_renderer_target.as_ref()?;
+        (target.bound && target.ready && target.surface_active).then_some(())?;
+        self.omp_service
+            .app_has_native_renderer(client_id)
+            .then_some(())?;
+        self.native_omp_target_pane_info(client_id)
+            .filter(|info| info.inner_rect.width > 0 && info.inner_rect.height > 0)
+    }
+
+    fn native_input_omp_pane_info(
+        &mut self,
+        client_id: u64,
+    ) -> (Option<crate::layout::PaneInfo>, bool) {
+        let Some((authority_revision, stored_pane)) =
+            self.clients.get(&client_id).and_then(|client| {
+                let target = client.omp_renderer_target.as_ref()?;
+                target
+                    .input_authority_acked
+                    .then_some((target.authority_revision, client.omp_renderer_frame_pane))
+            })
+        else {
+            return (None, false);
+        };
+        let live = self.native_bound_omp_pane_info(client_id);
+        let live_rect = live.as_ref().map(|info| {
+            (
+                info.inner_rect.x,
+                info.inner_rect.y,
+                info.inner_rect.width,
+                info.inner_rect.height,
+            )
+        });
+        let stored_rect = stored_pane.map(|pane| (pane.x, pane.y, pane.width, pane.height));
+        if live_rect != stored_rect {
+            if !self.reoffer_native_omp_geometry_authority(client_id, authority_revision) {
+                self.revoke_omp_renderer_authority(client_id);
+            }
+            return (None, true);
+        }
+        (live, false)
+    }
+
+    fn failed_private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let route = self.private_omp_failed_routes.get(&client_id)?;
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+        (self.app.state.active == Some(ws_idx))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn pending_private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let route = self.private_omp_pending_routes.get(&client_id)?;
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+        (self.app.state.active == Some(ws_idx))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn independent_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        self.native_bound_omp_pane_info(client_id)
+            .or_else(|| self.failed_private_omp_pane_info(client_id))
+            .or_else(|| self.pending_private_omp_pane_info(client_id))
+    }
+    fn activate_native_omp_link(&mut self, client_id: u64, launch_id: u64, url: String) -> bool {
+        if !self.client_omp_surface_active(client_id) {
+            return false;
+        }
+        let Some(route) = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_full_app_client())
+            .and_then(|client| client.omp_renderer_target.as_ref())
+            .filter(|target| {
+                target.launch_id == launch_id
+                    && target.bound
+                    && target.ready
+                    && target.surface_active
+                    && target.input_authority_acked
+            })
+            .and_then(|target| target.route.clone())
+        else {
+            return false;
+        };
+        let key = OmpRouteKey {
+            pane_id: route.pane_id.clone(),
+            omp_session_id: route.omp_session_id,
+            route_generation: route.route_generation,
+        };
+        if !self
+            .omp_service
+            .app_has_native_renderer_for_route(client_id, &key)
+        {
+            return false;
+        }
+        let Some((_ws_idx, pane_id)) = self.app.parse_pane_id(&route.pane_id) else {
+            return false;
+        };
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
+        let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
+            return false;
+        };
+        let activated = self
+            .app
+            .activate_link_once(client_id, pane_id, url, view_id.as_ref());
+        self.finish_client_navigation_scope(client_id, canonical);
+        activated
+    }
+
+    fn clear_native_omp_server_gesture(&mut self, client_id: u64) -> bool {
+        self.clients.get_mut(&client_id).is_some_and(|client| {
+            let changed = client.native_omp_server_mouse_gesture.take().is_some()
+                || !client.native_omp_server_keys.is_empty();
+            client.native_omp_server_keys.clear();
+            changed
+        })
+    }
+
+    fn clear_native_omp_input_leases_on_focus_lost(&mut self, client_id: u64) -> bool {
+        let had_leases = self.clear_native_omp_server_gesture(client_id);
+        had_leases && self.reoffer_current_native_omp_input_authority(client_id)
+    }
+
+    fn track_server_owned_native_omp_input(
+        &mut self,
+        client_id: u64,
+        events: &[crate::raw_input::RawInputEvent],
+        sgr_pixels: bool,
+        allow_unacked_authority: bool,
+    ) -> bool {
+        let authority = self.clients.get(&client_id).and_then(|client| {
+            let target = client
+                .omp_renderer_target
+                .as_ref()
+                .filter(|target| target.input_authority_acked || allow_unacked_authority)?;
+            Some((target.launch_id, target.authority_revision))
+        });
+        let completed_gesture = self.clients.get_mut(&client_id).and_then(|client| {
+            let mut completed = None;
+            for event in events {
+                match event {
+                    crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(button) => {
+                            if let Some(gesture) = client.native_omp_server_mouse_gesture.as_mut() {
+                                gesture.press(button);
+                            } else if let Some((launch_id, authority_revision)) = authority {
+                                client.native_omp_server_mouse_gesture =
+                                    Some(NativeOmpServerGesture::new(
+                                        button,
+                                        launch_id,
+                                        authority_revision,
+                                        sgr_pixels,
+                                    ));
+                            }
+                        }
+                        MouseEventKind::Up(button) => {
+                            let finished = client
+                                .native_omp_server_mouse_gesture
+                                .as_mut()
+                                .is_some_and(|gesture| gesture.release(button));
+                            if finished {
+                                completed = client.native_omp_server_mouse_gesture.take();
+                            }
+                        }
+                        _ => {}
+                    },
+                    crate::raw_input::RawInputEvent::Key(key) if key.reports_event_types() => {
+                        match key.kind {
+                            KeyEventKind::Press | KeyEventKind::Repeat => {
+                                client.native_omp_server_keys.insert(key.identity());
+                            }
+                            KeyEventKind::Release => {
+                                client.native_omp_server_keys.remove(&key.identity());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            completed
+        });
+        completed_gesture
+            .is_some_and(|gesture| self.reoffer_native_omp_input_authority(client_id, gesture))
+    }
+
+    fn partition_native_omp_input(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool, bool) {
+        let mut remaining = Vec::new();
+        let mut segment = Vec::new();
+        let mut consumed = false;
+        let mut authority_changed = false;
+        let mut continuation: Option<(crate::layout::PaneInfo, u64, u64)> = None;
+        let continuation_for =
+            |server: &Self, pane: Option<crate::layout::PaneInfo>| -> Option<_> {
+                let pane = pane?;
+                let target = server
+                    .clients
+                    .get(&client_id)?
+                    .omp_renderer_target
+                    .as_ref()?;
+                Some((pane, target.launch_id, target.authority_revision))
+            };
+        for event in events {
+            let focus_lost = matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost);
+            segment.push(event);
+            if focus_lost {
+                let segment_pane = continuation
+                    .as_ref()
+                    .map(|(pane, _, _)| pane.clone())
+                    .or_else(|| {
+                        self.clients
+                            .get(&client_id)
+                            .and_then(|client| client.omp_renderer_target.as_ref())
+                            .is_some_and(|target| target.input_authority_acked)
+                            .then(|| self.native_bound_omp_pane_info(client_id))
+                            .flatten()
+                    });
+                let (mut segment_remaining, segment_consumed, segment_authority_changed) = self
+                    .partition_native_omp_input_with_mode(
+                        client_id,
+                        std::mem::take(&mut segment),
+                        false,
+                        continuation.as_ref(),
+                    );
+                remaining.append(&mut segment_remaining);
+                consumed |= segment_consumed;
+                authority_changed |= segment_authority_changed;
+                if segment_authority_changed {
+                    continuation = continuation_for(self, segment_pane.clone());
+                }
+                let focus_authority_changed =
+                    self.clear_native_omp_input_leases_on_focus_lost(client_id);
+                authority_changed |= focus_authority_changed;
+                if focus_authority_changed {
+                    let pane = continuation
+                        .as_ref()
+                        .map(|(pane, _, _)| pane.clone())
+                        .or(segment_pane);
+                    continuation = continuation_for(self, pane);
+                }
+            }
+        }
+        if !segment.is_empty() {
+            let (mut segment_remaining, segment_consumed, segment_authority_changed) = self
+                .partition_native_omp_input_with_mode(
+                    client_id,
+                    segment,
+                    false,
+                    continuation.as_ref(),
+                );
+            remaining.append(&mut segment_remaining);
+            consumed |= segment_consumed;
+            authority_changed |= segment_authority_changed;
+        }
+        (remaining, consumed, authority_changed)
+    }
+
+    fn partition_native_omp_input_with_mode(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        sgr_pixels: bool,
+        continuation: Option<&(crate::layout::PaneInfo, u64, u64)>,
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool, bool) {
+        if self.client_server_owned_overlay_active(client_id) {
+            let authority = self.clients.get(&client_id).and_then(|client| {
+                let target = client.omp_renderer_target.as_ref()?;
+                Some((target.launch_id, target.authority_revision))
+            });
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                for event in &events {
+                    match event {
+                        crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::Down(button) => {
+                                if let Some(gesture) =
+                                    client.native_omp_server_mouse_gesture.as_mut()
+                                {
+                                    gesture.press(button);
+                                } else if let Some((launch_id, authority_revision)) = authority {
+                                    client.native_omp_server_mouse_gesture =
+                                        Some(NativeOmpServerGesture::new(
+                                            button,
+                                            launch_id,
+                                            authority_revision,
+                                            sgr_pixels,
+                                        ));
+                                }
+                            }
+                            MouseEventKind::Up(button) => {
+                                let completed = client
+                                    .native_omp_server_mouse_gesture
+                                    .as_mut()
+                                    .is_some_and(|gesture| gesture.release(button));
+                                if completed {
+                                    client.native_omp_server_mouse_gesture = None;
+                                }
+                            }
+                            _ => {}
+                        },
+                        crate::raw_input::RawInputEvent::Key(key) if key.reports_event_types() => {
+                            match key.kind {
+                                KeyEventKind::Press | KeyEventKind::Repeat => {
+                                    client.native_omp_server_keys.insert(key.identity());
+                                }
+                                KeyEventKind::Release => {
+                                    client.native_omp_server_keys.remove(&key.identity());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return (events, false, false);
+        }
+        if !self.client_omp_surface_active(client_id) {
+            let changed = self.clear_native_omp_server_gesture(client_id);
+            return (events, false, changed);
+        }
+        let continuation = continuation.filter(|(_, launch_id, authority_revision)| {
+            self.clients
+                .get(&client_id)
+                .and_then(|client| client.omp_renderer_target.as_ref())
+                .is_some_and(|target| {
+                    target.bound
+                        && target.ready
+                        && target.surface_active
+                        && (target.launch_id, target.authority_revision)
+                            == (*launch_id, *authority_revision)
+                })
+        });
+        let mut server_gesture = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.native_omp_server_mouse_gesture.clone());
+        let (native_info, pane_mismatch) = if server_gesture.is_some() {
+            (self.native_bound_omp_pane_info(client_id), false)
+        } else if let Some((pane, _, _)) = continuation {
+            (Some(pane.clone()), false)
+        } else {
+            self.native_input_omp_pane_info(client_id)
+        };
+        if pane_mismatch {
+            return (events, false, true);
+        }
+        let mut native_authority = native_info.as_ref().and_then(|_| {
+            continuation
+                .map(|(_, launch_id, authority_revision)| (*launch_id, *authority_revision))
+                .or_else(|| {
+                    let target = self.clients.get(&client_id)?.omp_renderer_target.as_ref()?;
+                    Some((target.launch_id, target.authority_revision))
+                })
+        });
+        let info = native_info
+            .or_else(|| self.failed_private_omp_pane_info(client_id))
+            .or_else(|| self.pending_private_omp_pane_info(client_id));
+        let Some(info) = info else {
+            let changed = self.clear_native_omp_server_gesture(client_id);
+            return (events, false, changed);
+        };
+        let pending = self.pending_private_omp_pane_info(client_id).is_some();
+        let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
+        let mut remaining = Vec::new();
+        let mut consumed = false;
+
+        if server_gesture.as_ref().is_some_and(|gesture| {
+            native_authority != Some((gesture.launch_id, gesture.authority_revision))
+        }) {
+            self.clear_native_omp_server_gesture(client_id);
+            return (events, false, true);
+        }
+        let mut completed_gesture = None;
+        let mut serverward_suffix = false;
+        let mut authority_changed = false;
+        let mut server_keys = self
+            .clients
+            .get(&client_id)
+            .map(|client| client.native_omp_server_keys.clone())
+            .unwrap_or_default();
+        for event in events {
+            if let crate::raw_input::RawInputEvent::Key(key) = &event {
+                if server_keys.contains(&key.identity()) {
+                    if key.kind == KeyEventKind::Release {
+                        server_keys.remove(&key.identity());
+                    }
+                    remaining.push(event);
+                    continue;
+                }
+            }
+            if let Some(gesture) = server_gesture.as_mut() {
+                let completed = match &event {
+                    crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(button) => {
+                            gesture.press(button);
+                            false
+                        }
+                        MouseEventKind::Up(button) => gesture.release(button),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if completed {
+                    if let Some(gesture) = server_gesture.take() {
+                        if self.reoffer_native_omp_input_authority(client_id, gesture.clone()) {
+                            authority_changed = true;
+                            native_authority = self.clients.get(&client_id).and_then(|client| {
+                                let target = client.omp_renderer_target.as_ref()?;
+                                Some((target.launch_id, target.authority_revision))
+                            });
+                        } else {
+                            completed_gesture = Some(gesture);
+                            native_authority = None;
+                        }
+                    }
+                    serverward_suffix = true;
+                }
+                remaining.push(event);
+                continue;
+            }
+            if serverward_suffix {
+                if let crate::raw_input::RawInputEvent::Mouse(mouse) = &event {
+                    if let (MouseEventKind::Down(button), Some((launch_id, authority_revision))) =
+                        (mouse.kind, native_authority)
+                    {
+                        server_gesture = Some(NativeOmpServerGesture::new(
+                            button,
+                            launch_id,
+                            authority_revision,
+                            sgr_pixels,
+                        ));
+                    }
+                }
+                remaining.push(event);
+                continue;
+            }
+            match event {
+                crate::raw_input::RawInputEvent::Key(key)
+                    if terminal_mode && !self.app.state.is_prefix_key(&key) =>
+                {
+                    consumed = true
+                }
+                crate::raw_input::RawInputEvent::Text(_)
+                | crate::raw_input::RawInputEvent::Paste(_)
+                    if terminal_mode =>
+                {
+                    consumed = true
+                }
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    let inside = info.inner_rect.contains((mouse.column, mouse.row).into());
+                    if let MouseEventKind::Down(button) = mouse.kind {
+                        if inside {
+                            consumed = true;
+                        } else {
+                            if let Some((launch_id, authority_revision)) = native_authority {
+                                server_gesture = Some(NativeOmpServerGesture::new(
+                                    button,
+                                    launch_id,
+                                    authority_revision,
+                                    sgr_pixels,
+                                ));
+                            }
+                            remaining.push(crate::raw_input::RawInputEvent::Mouse(mouse));
+                        }
+                    } else if inside {
+                        consumed = true;
+                    } else {
+                        remaining.push(crate::raw_input::RawInputEvent::Mouse(mouse));
+                    }
+                }
+                crate::raw_input::RawInputEvent::OuterFocusGained
+                | crate::raw_input::RawInputEvent::OuterFocusLost
+                    if pending =>
+                {
+                    consumed = true
+                }
+                event => remaining.push(event),
+            }
+        }
+        let gesture_active = server_gesture.is_some();
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.native_omp_server_mouse_gesture = server_gesture;
+            client.native_omp_server_keys = server_keys;
+        }
+        authority_changed |= !gesture_active
+            && completed_gesture
+                .is_some_and(|gesture| self.reoffer_native_omp_input_authority(client_id, gesture));
+        (remaining, consumed, authority_changed)
+    }
+
+    fn private_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        let route = self
+            .clients
+            .get(&client_id)?
+            .private_omp_guest
+            .as_ref()?
+            .route();
+        let (ws_idx, pane_id) = self.app.parse_pane_id(&route.pane_id)?;
+        (self.app.state.active == Some(ws_idx))
+            .then(|| {
+                self.app
+                    .state
+                    .view
+                    .pane_infos
+                    .iter()
+                    .find(|info| info.id == pane_id)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    fn replaced_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        self.private_omp_pane_info(client_id)
+            .or_else(|| self.independent_omp_pane_info(client_id))
+    }
+    fn graphics_excluded_omp_pane_info(&self, client_id: u64) -> Option<crate::layout::PaneInfo> {
+        (!self.client_server_owned_overlay_active(client_id))
+            .then(|| self.replaced_omp_pane_info(client_id))
+            .flatten()
+    }
+    fn private_omp_frame_link_at_cell(
+        runtime: &crate::terminal::TerminalRuntime,
+        row: u16,
+        column: u16,
+        width: u16,
+        height: u16,
+    ) -> Option<String> {
+        let link = runtime.hyperlink_at_viewport_cell(column, row, width, height)?;
+        crate::app::actions::safe_osc8_url(&link.uri).map(str::to_owned)
+    }
+
+    fn partition_private_omp_input(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> (Vec<crate::raw_input::RawInputEvent>, bool) {
+        if !self.client_omp_surface_active(client_id) {
+            return (events, false);
+        }
+        let Some(info) = self.private_omp_pane_info(client_id) else {
+            return (events, false);
+        };
+        let keyboard_target = info.is_focused;
+        let terminal_mode = self.app.state.mode == crate::app::Mode::Terminal;
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
+        let Some(guest) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_guest.as_ref())
+        else {
+            return (events, false);
+        };
+        let runtime = guest.runtime();
+        let mut remaining = Vec::new();
+        let mut consumed = false;
+        for event in events {
+            match event {
+                crate::raw_input::RawInputEvent::Key(key)
+                    if keyboard_target
+                        && self.app.state.mode == crate::app::Mode::Terminal
+                        && !self.app.state.is_prefix_key(&key) =>
+                {
+                    let bytes = runtime.encode_terminal_key(key);
+                    if !bytes.is_empty() {
+                        let _ = guest.input(Bytes::from(bytes));
+                    }
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::Text(text)
+                    if keyboard_target && self.app.state.mode == crate::app::Mode::Terminal =>
+                {
+                    let _ = guest.input(Bytes::copy_from_slice(text.as_str().as_bytes()));
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::Paste(text)
+                    if keyboard_target && self.app.state.mode == crate::app::Mode::Terminal =>
+                {
+                    let _ = runtime.try_send_paste(text);
+                    consumed = true;
+                }
+                crate::raw_input::RawInputEvent::OuterFocusGained => {
+                    if keyboard_target {
+                        runtime.try_send_focus_event(crate::ghostty::FocusEvent::Gained);
+                    }
+                    remaining.push(crate::raw_input::RawInputEvent::OuterFocusGained);
+                }
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    if keyboard_target {
+                        runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost);
+                    }
+                    remaining.push(crate::raw_input::RawInputEvent::OuterFocusLost);
+                }
+                crate::raw_input::RawInputEvent::Mouse(mouse)
+                    if info.inner_rect.contains((mouse.column, mouse.row).into()) =>
+                {
+                    if self
+                        .app
+                        .suppress_pending_url_click_mouse(client_id, mouse.kind)
+                    {
+                        consumed = true;
+                        continue;
+                    }
+                    let column = mouse.column.saturating_sub(info.inner_rect.x);
+                    let row = mouse.row.saturating_sub(info.inner_rect.y);
+                    if terminal_mode
+                        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        && Self::private_omp_frame_link_at_cell(
+                            runtime,
+                            row,
+                            column,
+                            info.inner_rect.width,
+                            info.inner_rect.height,
+                        )
+                        .is_some_and(|url| {
+                            self.app
+                                .activate_link_click(client_id, info.id, url, view_id.as_ref())
+                        })
+                    {
+                        consumed = true;
+                        continue;
+                    }
+                    let position = crate::input::mouse::Position::Cell { column, row };
+                    let bytes = match mouse.kind {
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                            runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
+                        }
+                        MouseEventKind::Moved => {
+                            runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
+                        }
+                        MouseEventKind::Down(_)
+                        | MouseEventKind::Up(_)
+                        | MouseEventKind::Drag(_) => {
+                            runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
+                        }
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
+                    };
+                    if let Some(bytes) = bytes {
+                        let _ = guest.input(Bytes::from(bytes));
+                    }
+                    consumed = true;
+                }
+                event => remaining.push(event),
+            }
+        }
+        (remaining, consumed)
+    }
+    fn route_private_omp_pixel_input(
+        &mut self,
+        client_id: u64,
+        data: &[u8],
+        host: crate::input::mouse::HostPixels,
+        cell: (u16, u16),
+    ) -> bool {
+        let Some(info) = self.private_omp_pane_info(client_id) else {
+            return false;
+        };
+        if !info.inner_rect.contains(cell.into()) {
+            return false;
+        }
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
+        let Some(guest) = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.private_omp_guest.as_ref())
+        else {
+            return false;
+        };
+        let runtime = guest.runtime();
+        let Some(report) = crate::input::mouse::report_at_cell(data, cell.0, cell.1) else {
+            return false;
+        };
+        let Some(mouse) = crate::raw_input::parse_raw_input_bytes_sync(&report)
+            .into_iter()
+            .find_map(|event| match event {
+                crate::raw_input::RawInputEvent::Mouse(mouse) => Some(mouse),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        if self
+            .app
+            .suppress_pending_url_click_mouse(client_id, mouse.kind)
+        {
+            return true;
+        }
+        let column = cell.0.saturating_sub(info.inner_rect.x);
+        let row = cell.1.saturating_sub(info.inner_rect.y);
+        if self.app.state.mode == crate::app::Mode::Terminal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && Self::private_omp_frame_link_at_cell(
+                runtime,
+                row,
+                column,
+                info.inner_rect.width,
+                info.inner_rect.height,
+            )
+            .is_some_and(|url| {
+                self.app
+                    .activate_link_click(client_id, info.id, url, view_id.as_ref())
+            })
+        {
+            return true;
+        }
+        let fallback = crate::input::mouse::Position::Cell { column, row };
+        let position = runtime
+            .pixel_size()
+            .and_then(|(width_px, height_px)| {
+                host.pane_position(info.inner_rect, width_px, height_px)
+            })
+            .unwrap_or(fallback);
+        let bytes = match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                runtime.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
+            }
+            MouseEventKind::Moved => {
+                runtime.encode_mouse_motion(mouse.kind, position, mouse.modifiers)
+            }
+            MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+                runtime.encode_mouse_button(mouse.kind, position, mouse.modifiers)
+            }
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
+        };
+        if let Some(bytes) = bytes {
+            let _ = guest.input(Bytes::from(bytes));
+        }
+        true
+    }
+
     fn handle_client_input_events(
         &mut self,
         client_id: u64,
         events: Vec<crate::raw_input::RawInputEvent>,
     ) -> bool {
-        let source_was_foreground = self.foreground_client_id == Some(client_id);
+        self.handle_client_input_events_with_ownership(client_id, events, false)
+    }
+
+    fn handle_server_owned_client_input_events(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+    ) -> bool {
+        let mut authority_changed = false;
+        let mut allow_unacked_authority = false;
+        for event in &events {
+            let event_authority_changed = self.track_server_owned_native_omp_input(
+                client_id,
+                std::slice::from_ref(event),
+                false,
+                allow_unacked_authority,
+            );
+            authority_changed |= event_authority_changed;
+            allow_unacked_authority |= event_authority_changed;
+            if matches!(event, crate::raw_input::RawInputEvent::OuterFocusLost) {
+                let focus_authority_changed =
+                    self.clear_native_omp_input_leases_on_focus_lost(client_id);
+                authority_changed |= focus_authority_changed;
+                allow_unacked_authority |= focus_authority_changed;
+            }
+        }
+        self.handle_client_input_events_with_ownership(client_id, events, true) || authority_changed
+    }
+
+    fn handle_client_input_events_with_ownership(
+        &mut self,
+        client_id: u64,
+        events: Vec<crate::raw_input::RawInputEvent>,
+        server_owned: bool,
+    ) -> bool {
+        if self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.private_surface.is_some())
+        {
+            return self.handle_private_surface_input_events(client_id, events);
+        }
+
+        let (events, identity_changed) = self.intercept_identity_input(client_id, events);
+        if events.is_empty() && identity_changed {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+            return true;
+        }
         let source_is_full_app = self
             .clients
             .get(&client_id)
             .is_some_and(ClientConnection::is_full_app_client);
+        let navigation_scope = source_is_full_app
+            .then(|| self.begin_client_navigation_scope(client_id))
+            .flatten();
+        if navigation_scope.is_some() {
+            self.compute_client_navigation_view(client_id);
+        }
+        let (events, native_consumed, native_authority_changed) = if server_owned {
+            (events, false, false)
+        } else {
+            self.partition_native_omp_input(client_id, events)
+        };
+        let (events, private_consumed) = if server_owned {
+            (events, false)
+        } else {
+            self.partition_private_omp_input(client_id, events)
+        };
+        if native_consumed || native_authority_changed || private_consumed {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+        }
+        if events.is_empty()
+            && (native_consumed || native_authority_changed || private_consumed || identity_changed)
+        {
+            if let Some(canonical) = navigation_scope {
+                self.finish_client_navigation_scope(client_id, canonical);
+            }
+            return true;
+        }
+
+        let source_was_foreground = self.foreground_client_id == Some(client_id);
         let host_surface_redraw = crate::raw_input::events_require_host_surface_redraw(
             &events,
             self.app.state.redraw_on_focus_gained,
         );
         let render_neutral_mouse_motion =
             events_are_render_neutral_mouse_motion(&events, self.app.state.mode);
+        let hover_generation = self.app.hover_generation;
         if let Some(client) = self.clients.get_mut(&client_id) {
             if host_surface_redraw {
                 client.request_repaint();
@@ -2964,14 +6094,38 @@ impl HeadlessServer {
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
-        self.app.route_client_events_from(client_id, events, false);
-        if self.app.take_config_reloaded_from_disk() {
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
+        let mut events = events.into_iter().peekable();
+        let mut terminal_forward_only = events.peek().is_some();
+        while let Some(event) = events.next() {
+            let forwarded_only = self.app.route_client_events_from_view(
+                client_id,
+                view_id.as_ref(),
+                vec![event],
+                false,
+            );
+            terminal_forward_only &= forwarded_only;
+            if interaction && events.peek().is_some() && !forwarded_only {
+                self.compute_client_navigation_view(client_id);
+            }
+        }
+        let hover_changed = self.app.hover_generation != hover_generation;
+        if hover_changed && !host_surface_redraw {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+        }
+        let deferred_requests_changed =
+            navigation_scope.is_some() && self.handle_deferred_requests_headless();
+        let config_reloaded = self.app.take_config_reloaded_from_disk();
+        if config_reloaded {
             self.reload_server_config(false);
-        } else {
-            self.sync_foreground_client_state();
         }
 
-        if self.app.state.detach_requested {
+        let needs_render = if self.app.state.detach_requested {
             self.app.state.detach_requested = false;
             info!(client_id, "client detach requested via keybind");
 
@@ -2982,23 +6136,475 @@ impl HeadlessServer {
                     reason: Some("detached".to_owned()),
                 },
             );
+            self.remove_client_and_resize_if_needed(client_id);
 
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.writer = None;
-            }
-
-            false
+            true
         } else {
-            foreground_changed || theme_changed || (interaction && !render_neutral_mouse_motion)
+            deferred_requests_changed
+                || foreground_changed
+                || theme_changed
+                || (self.independent_omp_renderers_enabled() && self.reconcile_private_omp_guests())
+                || (interaction
+                    && (hover_changed || (!render_neutral_mouse_motion && !terminal_forward_only)))
+        };
+        if let Some(canonical) = navigation_scope {
+            self.finish_client_navigation_scope(client_id, canonical);
         }
+        let renderer_changed = self.reconcile_omp_renderers();
+        if !config_reloaded {
+            self.sync_foreground_client_state();
+        }
+        needs_render || renderer_changed || native_authority_changed
     }
 
-    fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
-        if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+    fn handle_client_input_pixels(
+        &mut self,
+        client_id: u64,
+        data: Vec<u8>,
+        geometry: crate::input::mouse::HostGeometry,
+        server_owned: bool,
+    ) -> bool {
+        let Some((x, y)) = crate::input::mouse::parse_report(&data) else {
+            return false;
+        };
+        let Some(cell_position) = geometry.cell(x, y) else {
+            return false;
+        };
+        let valid = self.clients.get(&client_id).is_some_and(|client| {
+            let cell = client.cell_size;
+            let pixel_mode = client
+                .native_omp_server_mouse_gesture
+                .as_ref()
+                .map_or(client.host_sgr_pixels_active == Some(true), |gesture| {
+                    gesture.sgr_pixels
+                });
+            client.is_full_app_client()
+                && pixel_mode
+                && client.terminal_size == (geometry.cols, geometry.rows)
+                && cell.is_known()
+                && cell.width_px == geometry.width_px / u32::from(geometry.cols)
+                && cell.height_px == geometry.height_px / u32::from(geometry.rows)
+        });
+        if !valid || self.handoff_in_progress {
+            return false;
+        }
+        let view_id = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.view_id.clone());
+        let Some(canonical) = self.begin_client_navigation_scope(client_id) else {
+            return false;
+        };
+        self.compute_client_navigation_view(client_id);
+        let omp_surface_active = self.client_omp_surface_active(client_id);
+        let host = crate::input::mouse::HostPixels { x, y, geometry };
+        let native_pane = omp_surface_active
+            .then(|| self.independent_omp_pane_info(client_id))
+            .flatten();
+        let pixel_mouse =
+            crate::input::mouse::report_at_cell(&data, cell_position.0, cell_position.1).and_then(
+                |report| {
+                    crate::raw_input::parse_raw_input_bytes_sync(&report)
+                        .into_iter()
+                        .find_map(|event| match event {
+                            crate::raw_input::RawInputEvent::Mouse(mouse) => Some(mouse),
+                            _ => None,
+                        })
+                },
+            );
+        let server_gesture_before = self
+            .clients
+            .get(&client_id)
+            .is_some_and(|client| client.native_omp_server_mouse_gesture.is_some());
+        let native_authority_acked = self.clients.get(&client_id).is_some_and(|client| {
+            client
+                .omp_renderer_target
+                .as_ref()
+                .is_some_and(|target| target.input_authority_acked)
+        });
+        let (native_consumed, native_authority_changed) = if server_owned {
+            let authority_changed = pixel_mouse.is_some_and(|mouse| {
+                self.track_server_owned_native_omp_input(
+                    client_id,
+                    &[crate::raw_input::RawInputEvent::Mouse(mouse)],
+                    true,
+                    false,
+                )
+            });
+            (false, authority_changed)
+        } else if let Some(mouse) = pixel_mouse
+            .filter(|_| server_gesture_before || native_authority_acked || native_pane.is_some())
+        {
+            let (_, consumed, authority_changed) = self.partition_native_omp_input_with_mode(
+                client_id,
+                vec![crate::raw_input::RawInputEvent::Mouse(mouse)],
+                true,
+                None,
+            );
+            (consumed, authority_changed)
+        } else {
+            (false, false)
+        };
+        let native_serverward = server_owned
+            || server_gesture_before
+            || native_authority_changed
+            || self
+                .clients
+                .get(&client_id)
+                .is_some_and(|client| client.native_omp_server_mouse_gesture.is_some());
+        if native_consumed || native_authority_changed {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+        }
+        if native_consumed {
+            self.finish_client_navigation_scope(client_id, canonical);
+            return native_authority_changed;
+        }
+        if server_owned {
+            if self.focused_pane_graphics_demand() {
+                let foreground_changed = self.promote_client_to_foreground(client_id);
+                if foreground_changed {
+                    self.resize_shared_runtime_to_effective_size_before_input();
+                    self.compute_client_navigation_view(client_id);
+                }
+                let routed =
+                    self.app
+                        .route_client_pixel_mouse(client_id, view_id.as_ref(), &data, geometry);
+                let deferred_requests_changed = self.handle_deferred_requests_headless();
+                self.finish_client_navigation_scope(client_id, canonical);
+                return routed
+                    || foreground_changed
+                    || deferred_requests_changed
+                    || native_authority_changed;
+            }
+            self.finish_client_navigation_scope(client_id, canonical);
+            let Some(report) =
+                crate::input::mouse::report_at_cell(&data, cell_position.0, cell_position.1)
+            else {
+                return false;
+            };
+            let events = crate::raw_input::parse_raw_input_bytes_sync(&report);
+            return self.handle_client_input_events_with_ownership(client_id, events, true)
+                || native_authority_changed;
+        }
+        if omp_surface_active
+            && !native_serverward
+            && self.route_private_omp_pixel_input(client_id, &data, host, cell_position)
+        {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+            self.finish_client_navigation_scope(client_id, canonical);
+            return true;
+        }
+        if !omp_surface_active {
+            self.finish_client_navigation_scope(client_id, canonical);
+            let Some(report) =
+                crate::input::mouse::report_at_cell(&data, cell_position.0, cell_position.1)
+            else {
+                return false;
+            };
+            let events = crate::raw_input::parse_raw_input_bytes_sync(&report);
+            return self.handle_client_input_events(client_id, events) || native_authority_changed;
+        }
+        if !self.focused_pane_graphics_demand() {
+            self.finish_client_navigation_scope(client_id, canonical);
+            return native_authority_changed;
+        }
+        let foreground_changed = self.promote_client_to_foreground(client_id);
+        if foreground_changed {
+            self.resize_shared_runtime_to_effective_size_before_input();
+            self.compute_client_navigation_view(client_id);
+        }
+        let routed =
+            self.app
+                .route_client_pixel_mouse(client_id, view_id.as_ref(), &data, geometry);
+        let deferred_requests_changed = self.handle_deferred_requests_headless();
+        self.finish_client_navigation_scope(client_id, canonical);
+        routed || foreground_changed || deferred_requests_changed || native_authority_changed
+    }
+
+    fn activate_notification_target(
+        &mut self,
+        activation: protocol::NotificationActivation,
+    ) -> bool {
+        let pane_id = crate::layout::PaneId::from_raw(activation.pane_id);
+        let Some(ws_idx) = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == activation.workspace_id)
+        else {
+            return false;
+        };
+        if self.app.state.workspaces[ws_idx]
+            .find_tab_index_for_pane(pane_id)
+            .is_none()
+            || !self
+                .clients
+                .get(&activation.recipient_client_id)
+                .is_some_and(|client| client.is_full_app_client() && client.writer.is_some())
+        {
             return false;
         }
 
+        if self.promote_client_to_foreground(activation.recipient_client_id) {
+            self.resize_shared_runtime_to_effective_size();
+        }
+        self.app.focus_pane_internal_via_api(ws_idx, pane_id);
+        self.app.state.mode = app::Mode::Terminal;
+        self.app.toast_deadline = None;
+        self.app.state.toast = None;
+        if let Some(client) = self.clients.get_mut(&activation.recipient_client_id) {
+            client.request_semantic_redraw_after_input();
+        }
+        true
+    }
+    fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        if self.handoff_in_progress {
+            if let ServerEvent::NotificationActivated { respond_to, .. } = &ev {
+                debug!("rejecting notification activation during live handoff");
+                let _ = respond_to.send(false);
+                return false;
+            }
+            if Self::ignore_client_event_during_handoff(&ev) {
+                return false;
+            }
+        }
+        let native_app = match &ev {
+            ServerEvent::OmpPaneAttach {
+                client_id,
+                pane_id,
+                omp_session_id,
+                route_generation,
+                target_app_client_id,
+                renderer_launch_id,
+                ..
+            } => {
+                let key = OmpRouteKey {
+                    pane_id: pane_id.clone(),
+                    omp_session_id: omp_session_id.clone(),
+                    route_generation: *route_generation,
+                };
+                self.omp_service.app_client_for_renderer(
+                    *client_id,
+                    *target_app_client_id,
+                    *renderer_launch_id,
+                    &key,
+                    &self.clients,
+                )
+            }
+            _ => None,
+        };
+        let mut render = false;
+        let omp_client_id = match &ev {
+            ServerEvent::OmpPaneAttach { client_id, .. }
+            | ServerEvent::OmpPaneDetach { client_id, .. }
+            | ServerEvent::OmpControl { client_id, .. }
+            | ServerEvent::OmpFrame { client_id, .. } => Some(*client_id),
+            ServerEvent::OmpHostStarted { .. }
+            | ServerEvent::OmpHostFrame { .. }
+            | ServerEvent::OmpHostStopped { .. } => None,
+            _ => return self.handle_non_omp_server_event(ev),
+        };
+        let client_is_omp_pane = omp_client_id.is_some_and(|client_id| {
+            self.client_is_omp_pane(client_id)
+                && (!matches!(&ev, ServerEvent::OmpPaneAttach { .. }) || native_app.is_some())
+        });
+        let messages = self
+            .omp_service
+            .handle_event(ev, client_is_omp_pane, &self.clients);
+        render |= self.apply_omp_messages(messages);
+        render |= self.reconcile_omp_renderers();
+        render
+    }
+
+    fn handle_non_omp_server_event(&mut self, ev: ServerEvent) -> bool {
         match ev {
+            ServerEvent::OmpPrivateCompanionResolved { result } => {
+                let pending = self.private_omp_resolving.take();
+                match (pending, result) {
+                    (pending, Ok(executable)) => {
+                        self.private_omp_executable = Some(executable);
+                        let mut changed = false;
+                        if let Some((client_id, route)) = pending {
+                            if !self.private_omp_resolution_is_current(client_id, &route) {
+                                changed |= self.clear_private_omp_pending_route(client_id, &route);
+                            }
+                        }
+                        changed || self.reconcile_private_omp_completion()
+                    }
+                    (Some((client_id, route)), Err(error)) => {
+                        warn!(client_id, %error, "failed to resolve private OMP renderer; keeping host PTY masked");
+                        let current = self.private_omp_resolution_is_current(client_id, &route);
+                        let mut changed = self.clear_private_omp_pending_route(client_id, &route);
+                        if current {
+                            self.mark_private_omp_failed_with_retry(client_id, route);
+                            changed = true;
+                        }
+                        let reconciled = self.reconcile_private_omp_completion();
+                        changed || reconciled
+                    }
+                    (None, Err(error)) => {
+                        warn!(%error, "failed to resolve private OMP renderer");
+                        false
+                    }
+                }
+            }
+            ServerEvent::OmpPrivateCompanionRetry {
+                client_id,
+                route,
+                retry_id,
+            } => {
+                if self.private_omp_failed_routes.get(&client_id) != Some(&route)
+                    || !self
+                        .private_omp_retry_attempted_routes
+                        .get(&client_id)
+                        .is_some_and(|(attempted, state)| {
+                            attempted == &route && *state == PrivateOmpRetryState::Pending(retry_id)
+                        })
+                {
+                    return false;
+                }
+                if let Some((_, state)) =
+                    self.private_omp_retry_attempted_routes.get_mut(&client_id)
+                {
+                    *state = PrivateOmpRetryState::Consumed;
+                }
+                self.private_omp_failed_routes.remove(&client_id);
+                let mut changed = true;
+                if self.private_omp_resolution_is_current(client_id, &route) {
+                    changed |= self.set_private_omp_pending_route(client_id, &route);
+                    changed |= self.reconcile_private_omp_completion();
+                } else {
+                    changed |= self.clear_private_omp_pending_route(client_id, &route);
+                    self.private_omp_retry_attempted_routes.remove(&client_id);
+                }
+                changed
+            }
+            ServerEvent::ActivateOmpLink {
+                client_id,
+                launch_id,
+                request_id,
+                url,
+            } => {
+                let activated = self.activate_native_omp_link(client_id, launch_id, url);
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::OmpLinkActivationResult {
+                        launch_id,
+                        request_id,
+                        activated,
+                    },
+                );
+                activated
+            }
+            ServerEvent::OmpRendererReady {
+                client_id,
+                launch_id,
+            } => {
+                let Some(mut target) = self
+                    .clients
+                    .get(&client_id)
+                    .filter(|client| client.is_full_app_client())
+                    .and_then(|client| client.omp_renderer_target.clone())
+                    .filter(|target| {
+                        target.launch_id == launch_id && target.bound && !target.ready
+                    })
+                else {
+                    return false;
+                };
+                let Some(route) = target.route.clone() else {
+                    return false;
+                };
+                let key = OmpRouteKey {
+                    pane_id: route.pane_id,
+                    omp_session_id: route.omp_session_id,
+                    route_generation: route.route_generation,
+                };
+                if !self
+                    .omp_service
+                    .app_has_native_renderer_for_route(client_id, &key)
+                {
+                    return false;
+                }
+                self.clear_private_omp_failure_state(client_id, &key);
+                self.clear_private_omp_pending_route(client_id, &key);
+                let route_focused = self
+                    .client_focused_pane(client_id)
+                    .is_some_and(|focused| self.app.parse_pane_id(&key.pane_id) == Some(focused));
+                target.ready = true;
+                target.surface_active = target.bound
+                    && target.ready
+                    && route_focused
+                    && self.client_omp_surface_active(client_id);
+                self.update_omp_renderer_target(client_id, target);
+                let retired_private = self
+                    .clients
+                    .get_mut(&client_id)
+                    .is_some_and(|client| client.private_omp_guest.take().is_some());
+                if retired_private {
+                    self.omp_service.retire_private_renderer(client_id);
+                }
+                self.reconcile_omp_renderers();
+                true
+            }
+            ServerEvent::OmpRendererAuthorityAck {
+                client_id,
+                launch_id,
+                authority_revision,
+                frame_nonce,
+            } => {
+                let Some(route) = self
+                    .clients
+                    .get(&client_id)
+                    .filter(|client| {
+                        client.is_full_app_client()
+                            && client.omp_renderer_frame_nonce == Some(frame_nonce)
+                    })
+                    .and_then(|client| client.omp_renderer_target.as_ref())
+                    .filter(|target| {
+                        target.launch_id == launch_id
+                            && target.authority_revision == authority_revision
+                            && target.bound
+                            && target.ready
+                            && target.surface_active
+                            && !target.input_authority_acked
+                    })
+                    .and_then(|target| target.route.clone())
+                else {
+                    return false;
+                };
+                let key = OmpRouteKey {
+                    pane_id: route.pane_id,
+                    omp_session_id: route.omp_session_id,
+                    route_generation: route.route_generation,
+                };
+                if !self
+                    .omp_service
+                    .app_has_native_renderer_for_route(client_id, &key)
+                {
+                    return false;
+                }
+                let Some(client) = self
+                    .clients
+                    .get_mut(&client_id)
+                    .filter(|client| client.omp_renderer_frame_nonce == Some(frame_nonce))
+                else {
+                    return false;
+                };
+                let Some(target) = client.omp_renderer_target.as_mut().filter(|target| {
+                    target.launch_id == launch_id
+                        && target.authority_revision == authority_revision
+                        && !target.input_authority_acked
+                }) else {
+                    return false;
+                };
+                target.input_authority_acked = true;
+                true
+            }
             ServerEvent::ClientConnected {
                 client_id,
                 cols,
@@ -3010,21 +6616,21 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 direct_graphics,
+                omp_pane,
+                display_name,
+                frontend_profile_id,
+                renderer_binding_token,
+                renderer_capabilities,
             } => {
                 if self.handoff_in_progress {
-                    if let Ok(message) =
-                        Self::frame_server_message(&ServerMessage::ServerShutdown {
-                            reason: Some(
-                                "live update in progress; reconnect after handoff completes"
-                                    .to_owned(),
-                            ),
-                        })
+                    if let Ok(message) = Self::frame_server_message(&live_handoff_client_message())
                     {
                         let _ = writer.control.send(message);
                     }
                     return false;
                 }
-                let first_app_client = !direct_attach_requested && self.app_client_count() == 0;
+                let first_app_client =
+                    !omp_pane && !direct_attach_requested && self.app_client_count() == 0;
                 info!(
                     client_id,
                     cols,
@@ -3036,8 +6642,15 @@ impl HeadlessServer {
                 );
                 let last_activity = self.allocate_activity_stamp();
                 let mut connection = ClientConnection::new_with_mode(
-                    ClientConnectionMode::App,
+                    if omp_pane {
+                        ClientConnectionMode::OmpPane
+                    } else {
+                        ClientConnectionMode::App
+                    },
                     keybindings,
+                    display_name,
+                    frontend_profile_id,
+                    renderer_binding_token,
                     (cols, rows),
                     crate::kitty_graphics::HostCellSize {
                         width_px: cell_width_px,
@@ -3050,19 +6663,67 @@ impl HeadlessServer {
                     direct_attach_requested,
                     Some(writer),
                 );
+                if !omp_pane && !direct_attach_requested {
+                    if let Some(identity) = connection.identity.as_mut() {
+                        if identity.committed.is_none() {
+                            identity.open_editor();
+                        }
+                    }
+                }
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
-                self.clients.insert(client_id, connection);
+                connection.omp_renderer_capabilities = renderer_capabilities;
                 if !direct_attach_requested {
-                    self.foreground_client_id = Some(client_id);
+                    connection.navigation = Some(ClientNavigationState::capture(&self.app.state));
+                }
+                self.clients.insert(client_id, connection);
+                if !omp_pane && !direct_attach_requested {
+                    self.promote_client_to_foreground(client_id);
+                } else {
+                    self.sync_foreground_client_state();
                 }
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
-                self.sync_foreground_client_state();
                 self.resize_shared_runtime_to_effective_size();
                 self.nudge_handoff_panes_on_first_client_attach();
+                if !omp_pane && !direct_attach_requested {
+                    self.reconcile_omp_renderers();
+                }
                 true
+            }
+            ServerEvent::NotificationActivated {
+                activation,
+                respond_to,
+            } => {
+                let activated = self.activate_notification_target(activation);
+                let _ = respond_to.send(activated);
+                let renderer_changed = activated && self.reconcile_omp_renderers();
+                activated || renderer_changed
+            }
+            ServerEvent::IdentityPersistenceAck {
+                client_id,
+                request_id,
+                display_name,
+                success,
+                error,
+            } => {
+                let result = if success {
+                    Ok(())
+                } else {
+                    Err(error.unwrap_or_else(|| "identity persistence failed".to_owned()))
+                };
+                let applied = self
+                    .clients
+                    .get_mut(&client_id)
+                    .and_then(|client| client.identity.as_mut())
+                    .is_some_and(|identity| {
+                        identity.apply_persistence_ack(request_id, &display_name, result)
+                    });
+                if applied {
+                    self.reconcile_omp_renderers();
+                }
+                applied
             }
             ServerEvent::GraphicsTransmissionResult {
                 client_id,
@@ -3103,31 +6764,12 @@ impl HeadlessServer {
                 client_id,
                 data,
                 geometry,
-            } => {
-                let coordinates_valid = crate::input::mouse::parse_report(&data)
-                    .and_then(|(x, y)| geometry.cell(x, y))
-                    .is_some();
-                let valid = coordinates_valid
-                    && self.clients.get(&client_id).is_some_and(|client| {
-                        let cell = client.cell_size;
-                        client.is_full_app_client()
-                            && client.host_sgr_pixels_active == Some(true)
-                            && client.terminal_size == (geometry.cols, geometry.rows)
-                            && cell.is_known()
-                            && cell.width_px == geometry.width_px / u32::from(geometry.cols)
-                            && cell.height_px == geometry.height_px / u32::from(geometry.rows)
-                    });
-                if !valid || self.handoff_in_progress || !self.focused_pane_graphics_demand() {
-                    return false;
-                }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
-                if foreground_changed {
-                    self.resize_shared_runtime_to_effective_size_before_input();
-                }
-                self.app
-                    .route_client_pixel_mouse(client_id, &data, geometry)
-                    || foreground_changed
-            }
+            } => self.handle_client_input_pixels(client_id, data, geometry, false),
+            ServerEvent::ServerOwnedInputPixels {
+                client_id,
+                data,
+                geometry,
+            } => self.handle_client_input_pixels(client_id, data, geometry, true),
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
                     debug!(
@@ -3152,7 +6794,10 @@ impl HeadlessServer {
                 }
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::OmpPane
+                    )
                 ) {
                     return false;
                 }
@@ -3184,7 +6829,10 @@ impl HeadlessServer {
                 );
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::OmpPane
+                    )
                 ) {
                     return false;
                 }
@@ -3193,6 +6841,35 @@ impl HeadlessServer {
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect();
                 self.handle_client_input_events(client_id, events)
+            }
+            ServerEvent::ServerOwnedInputEvents { client_id, events } => {
+                if self.handoff_in_progress {
+                    debug!(
+                        client_id,
+                        len = events.len(),
+                        "ignored server-owned client input events during handoff"
+                    );
+                    return false;
+                }
+                debug!(
+                    client_id,
+                    len = events.len(),
+                    "server-owned client input events received"
+                );
+                if matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::OmpPane
+                    )
+                ) {
+                    return false;
+                }
+                let events = events
+                    .iter()
+                    .map(crate::protocol::ClientInputEvent::to_raw_input_event)
+                    .collect();
+                self.handle_server_owned_client_input_events(client_id, events)
             }
             ServerEvent::ClientPasteRejected {
                 client_id,
@@ -3207,6 +6884,7 @@ impl HeadlessServer {
                         body: Some(format!(
                             "Input message is {size} bytes; Herdr's limit is {max} bytes"
                         )),
+                        activation: None,
                     },
                 );
                 false
@@ -3224,7 +6902,10 @@ impl HeadlessServer {
                 );
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
-                    Some(ClientConnectionMode::TerminalObserve { .. })
+                    Some(
+                        ClientConnectionMode::TerminalObserve { .. }
+                            | ClientConnectionMode::OmpPane
+                    )
                 ) {
                     return false;
                 }
@@ -3247,6 +6928,24 @@ impl HeadlessServer {
                     client_id,
                     cols, rows, cell_width_px, cell_height_px, "client resize"
                 );
+                let observed_cell_size = crate::kitty_graphics::HostCellSize {
+                    width_px: cell_width_px,
+                    height_px: cell_height_px,
+                };
+                let previous_geometry_revision = self.clients.get(&client_id).and_then(|client| {
+                    let cell_size_changed = observed_cell_size.is_known()
+                        && (client.cell_size.width_px != observed_cell_size.width_px
+                            || client.cell_size.height_px != observed_cell_size.height_px);
+                    (client.terminal_size != (cols, rows) || cell_size_changed)
+                        .then(|| {
+                            client
+                                .omp_renderer_target
+                                .as_ref()
+                                .filter(|target| target.surface_active)
+                                .map(|target| target.authority_revision)
+                        })
+                        .flatten()
+                });
                 let direct_terminal_id = if let Some(ClientConnection {
                     mode: ClientConnectionMode::TerminalAttach { terminal_id },
                     terminal_size,
@@ -3293,6 +6992,25 @@ impl HeadlessServer {
                     render_state.request_repaint();
                     return true;
                 }
+                if self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.private_surface.is_some())
+                {
+                    if let Some(client) = self.clients.get_mut(&client_id) {
+                        client.terminal_size = (cols, rows);
+                        let observed = crate::kitty_graphics::HostCellSize {
+                            width_px: cell_width_px,
+                            height_px: cell_height_px,
+                        };
+                        if observed.is_known() {
+                            client.cell_size = observed;
+                        }
+                        client.request_repaint();
+                        client.defer_full_render();
+                    }
+                    return true;
+                }
                 if let Some(client) = self.clients.get_mut(&client_id) {
                     client.terminal_size = (cols, rows);
                     let observed = crate::kitty_graphics::HostCellSize {
@@ -3303,26 +7021,80 @@ impl HeadlessServer {
                         client.cell_size = observed;
                     }
                 }
+                if let (Some(info), Some(guest)) = (
+                    self.private_omp_pane_info(client_id),
+                    self.clients
+                        .get(&client_id)
+                        .and_then(|client| client.private_omp_guest.as_ref()),
+                ) {
+                    let cell_size = self.clients[&client_id].cell_size;
+                    guest.resize(
+                        info.inner_rect.height.max(1),
+                        info.inner_rect.width.max(1),
+                        cell_size.width_px,
+                        cell_size.height_px,
+                    );
+                    return true;
+                }
+
+                if self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| matches!(client.mode, ClientConnectionMode::OmpPane))
+                {
+                    return false;
+                }
+                let navigation_scope = self.begin_client_navigation_scope(client_id);
                 self.promote_client_to_foreground(client_id);
                 self.resize_shared_runtime_to_effective_size();
+                if let Some(canonical) = navigation_scope {
+                    self.finish_client_navigation_scope(client_id, canonical);
+                }
+                self.reconcile_omp_renderers();
+                if let Some(previous_revision) = previous_geometry_revision {
+                    self.reoffer_native_omp_geometry_authority(client_id, previous_revision);
+                }
                 true
             }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
+                for (client_id, message) in self.omp_service.disconnect(client_id, &self.clients) {
+                    self.send_to_client(client_id, message);
+                }
                 self.send_terminal_stream_detach_shutdown(client_id);
                 self.remove_client_and_resize_if_needed(client_id);
+                self.reconcile_omp_renderers();
                 true
             }
             ServerEvent::ClientDisconnected { client_id } => {
                 info!(client_id, "client disconnected");
+                for (client_id, message) in self.omp_service.disconnect(client_id, &self.clients) {
+                    self.send_to_client(client_id, message);
+                }
                 self.remove_client_and_resize_if_needed(client_id);
+                self.reconcile_omp_renderers();
                 true
+            }
+            ServerEvent::ClientWriterControlDrained { client_id } => {
+                if !self.clients.contains_key(&client_id) {
+                    return false;
+                }
+                self.reconcile_omp_renderers()
             }
             ServerEvent::ClientWriterDrained { client_id } => {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return false;
                 };
                 client.take_deferred_render() != DeferredRender::None
+            }
+            ServerEvent::OmpPaneAttach { .. }
+            | ServerEvent::OmpPaneDetach { .. }
+            | ServerEvent::OmpControl { .. }
+            | ServerEvent::OmpFrame { .. }
+            | ServerEvent::OmpHostStarted { .. }
+            | ServerEvent::OmpHostFrame { .. }
+            | ServerEvent::OmpHostStopped { .. } => {
+                unreachable!("OMP events are delegated before this match")
             }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
@@ -3346,6 +7118,10 @@ impl HeadlessServer {
             ServerEvent::ClientConnected { .. }
                 | ServerEvent::ClientDisconnected { .. }
                 | ServerEvent::ClientWriterDrained { .. }
+                | ServerEvent::ClientWriterControlDrained { .. }
+                | ServerEvent::OmpHostStarted { .. }
+                | ServerEvent::OmpHostFrame { .. }
+                | ServerEvent::OmpHostStopped { .. }
                 | ServerEvent::QuitSignal
         )
     }
@@ -3538,7 +7314,10 @@ impl HeadlessServer {
     /// During shutdown, remaining requests get a `server_unavailable` error.
     fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
@@ -3558,13 +7337,89 @@ impl HeadlessServer {
 
     fn drain_api_requests_with_render_impact(&mut self) -> RenderImpact {
         let mut impact = RenderImpact::None;
-        while !self.should_quit.load(Ordering::Acquire) {
+        for _ in 0..crate::app::APP_EVENT_DRAIN_LIMIT {
+            if self.should_quit.load(Ordering::Acquire) {
+                break;
+            }
             let Ok(msg) = self.app.api_rx.try_recv() else {
                 break;
             };
             impact.merge(self.handle_api_request_with_render_impact(msg));
         }
         impact
+    }
+
+    fn encode_omp_bridge_discovery_denied(id: String) -> String {
+        serde_json::to_string(&api::schema::ErrorResponse {
+            id,
+            error: api::schema::ErrorBody {
+                code: "omp_bridge_discovery_denied".into(),
+                message: "OMP bridge discovery is unavailable for this caller".into(),
+            },
+        })
+        .unwrap_or_else(|_| {
+            r#"{"id":"","error":{"code":"omp_bridge_discovery_denied","message":"OMP bridge discovery is unavailable for this caller"}}"#
+                .to_string()
+        })
+    }
+
+    fn encode_omp_maintenance_response(
+        id: String,
+        result: Result<
+            api::schema::ServerOmpMaintenanceStatus,
+            crate::server::omp_maintenance::OmpMaintenanceError,
+        >,
+    ) -> String {
+        let response = match result {
+            Ok(maintenance) => serde_json::to_string(&api::schema::SuccessResponse {
+                id,
+                result: api::schema::ResponseResult::OmpMaintenance { maintenance },
+            }),
+            Err(error) => serde_json::to_string(&api::schema::ErrorResponse {
+                id,
+                error: api::schema::ErrorBody {
+                    code: error.code().into(),
+                    message: error.message(),
+                },
+            }),
+        };
+        response.unwrap_or_else(|_| {
+            r#"{"id":"","error":{"code":"serialization_error","message":"failed to encode OMP maintenance response"}}"#
+                .to_string()
+        })
+    }
+
+    fn handle_pane_omp_bridge_api(
+        &self,
+        id: String,
+        _params: &api::schema::PaneOmpBridgeParams,
+        context: api::ApiRequestContext,
+    ) -> String {
+        let Some(peer_pid) = context.local_peer_pid else {
+            return Self::encode_omp_bridge_discovery_denied(id);
+        };
+        let Some(target) = self.app.terminal_target_for_peer_pid(peer_pid) else {
+            return Self::encode_omp_bridge_discovery_denied(id);
+        };
+        let Some(workspace) = self.app.state.workspaces.get(target.ws_idx) else {
+            return Self::encode_omp_bridge_discovery_denied(id);
+        };
+        let Some(pane_number) = workspace.public_pane_number(target.pane_id) else {
+            return Self::encode_omp_bridge_discovery_denied(id);
+        };
+        let pane_id = crate::workspace::public_pane_id_for_number(&workspace.id, pane_number);
+
+        let fallback_id = id.clone();
+        let bridge = self.omp_service.bridge();
+        serde_json::to_string(&api::schema::SuccessResponse {
+            id,
+            result: api::schema::ResponseResult::PaneOmpBridge {
+                token: bridge.token(&pane_id),
+                address: bridge.address().to_string(),
+                pane_id,
+            },
+        })
+        .unwrap_or_else(|_| Self::encode_omp_bridge_discovery_denied(fallback_id))
     }
 
     /// Handles a single API request with shutdown awareness.
@@ -3595,6 +7450,151 @@ impl HeadlessServer {
         }
     }
 
+    fn private_popup_terminal_area_for_owner(&mut self, owner_id: u64) -> Option<Rect> {
+        let canonical_navigation = self.begin_client_navigation_scope(owner_id)?;
+        self.compute_client_navigation_view(owner_id);
+        let area = self.app.state.view.terminal_area;
+        self.finish_client_navigation_scope(owner_id, canonical_navigation);
+        Some(area)
+    }
+
+    fn client_private_plugin_popup_spec_for_owner(
+        &mut self,
+        owner_id: u64,
+        params: &api::schema::PluginPaneOpenParams,
+    ) -> Result<crate::app::ClientPrivatePluginPopupSpec, (&'static str, String)> {
+        let canonical_navigation = ClientNavigationState::capture(&self.app.state);
+        if let Some(navigation) = self
+            .clients
+            .get(&owner_id)
+            .and_then(|client| client.navigation.as_ref())
+        {
+            navigation.apply_to(&mut self.app.state);
+        }
+        let spec = self.app.client_private_plugin_popup_spec(params);
+        canonical_navigation.apply_to(&mut self.app.state);
+        spec
+    }
+
+    #[cfg(test)]
+    fn handle_client_private_plugin_pane_open(
+        &mut self,
+        id: String,
+        params: api::schema::PluginPaneOpenParams,
+    ) -> (String, bool) {
+        let (response, changed) =
+            self.handle_client_private_plugin_pane_open_with_response(id, params, None);
+        (response.unwrap_or_default(), changed)
+    }
+
+    fn handle_client_private_plugin_pane_open_with_response(
+        &mut self,
+        id: String,
+        params: api::schema::PluginPaneOpenParams,
+        respond_to: Option<std::sync::mpsc::Sender<String>>,
+    ) -> (Option<String>, bool) {
+        let error = |code: &str, message: String| {
+            Self::private_surface_error_response(id.clone(), code, message)
+        };
+        let Some(requested_view_id) = params.view_id.as_ref() else {
+            return (
+                Some(error(
+                    "view_id_required",
+                    "client-private plugin panes require view_id".to_string(),
+                )),
+                false,
+            );
+        };
+        let owner_id = self.clients.iter().find_map(|(&client_id, client)| {
+            (client.is_full_app_client()
+                && client.writer.is_some()
+                && client.view_id.as_ref() == Some(requested_view_id))
+            .then_some(client_id)
+        });
+        let Some(owner_id) = owner_id else {
+            return (
+                Some(error(
+                    "view_not_found",
+                    format!("view {requested_view_id} is not connected"),
+                )),
+                false,
+            );
+        };
+
+        let spec = match self.client_private_plugin_popup_spec_for_owner(owner_id, &params) {
+            Ok(spec) => spec,
+            Err((code, message)) => return (Some(error(code, message)), false),
+        };
+        let wait_for_remote_ready = !spec.execution_target.is_local();
+        let deferred = wait_for_remote_ready && respond_to.is_some();
+        let Some(area) = self.private_popup_terminal_area_for_owner(owner_id) else {
+            return (
+                Some(error(
+                    "view_not_found",
+                    "view disconnected during request".to_string(),
+                )),
+                false,
+            );
+        };
+        let Some((cell_size, theme, appearance)) = self.clients.get(&owner_id).map(|client| {
+            (
+                client.cell_size,
+                client.host_terminal_theme,
+                client.host_terminal_appearance,
+            )
+        }) else {
+            return (
+                Some(error(
+                    "view_not_found",
+                    "view disconnected during request".to_string(),
+                )),
+                false,
+            );
+        };
+
+        match crate::server::private_surface::PrivateSurface::spawn(
+            spec, area, cell_size, theme, appearance, &self.app,
+        ) {
+            Ok(surface) => {
+                let pending_response = if deferred {
+                    respond_to.map(|respond_to| PendingPrivateSurfaceResponse {
+                        id: id.clone(),
+                        respond_to,
+                    })
+                } else {
+                    None
+                };
+                if !self.install_private_surface_with_response(
+                    owner_id,
+                    surface,
+                    wait_for_remote_ready,
+                    pending_response,
+                ) {
+                    return if deferred {
+                        (None, false)
+                    } else {
+                        (
+                            Some(error(
+                                "view_not_found",
+                                "view disconnected during request".to_string(),
+                            )),
+                            false,
+                        )
+                    };
+                }
+                if deferred {
+                    (None, true)
+                } else {
+                    (Some(Self::private_surface_ok_response(id)), true)
+                }
+            }
+            Err(err) => (
+                Some(error("plugin_pane_open_failed", err.to_string())),
+                false,
+            ),
+        }
+    }
+
     fn handle_api_request_with_shutdown_check_inner(
         &mut self,
         msg: api::ApiRequestMessage,
@@ -3616,13 +7616,111 @@ impl HeadlessServer {
             let _ = msg.respond_to.send(response);
             return false;
         }
+        let mut changed = self.drain_all_internal_events_with_forwarding();
+        let refreshed_shared_plugin_pane =
+            if let api::schema::Method::PluginPaneOpen(params) = &msg.request.method {
+                if let Err(err) = self.app.refresh_installed_plugins() {
+                    let response = serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id.clone(),
+                        error: api::schema::ErrorBody {
+                            code: "plugin_registry_load_failed".to_string(),
+                            message: err.to_string(),
+                        },
+                    })
+                    .unwrap_or_else(|_| "{}".to_string());
+                    let _ = msg.respond_to.send(response);
+                    return changed;
+                }
+                if self.app.plugin_pane_effective_scope(params)
+                    == api::schema::PluginPaneScope::ClientPrivate
+                {
+                    let respond_to = msg.respond_to.clone();
+                    let (response, plugin_changed) = self
+                        .handle_client_private_plugin_pane_open_with_response(
+                            msg.request.id.clone(),
+                            params.clone(),
+                            Some(respond_to),
+                        );
+                    if let Some(response) = response {
+                        let _ = msg.respond_to.send(response);
+                    }
+                    return changed | plugin_changed;
+                }
+                Some((msg.request.id.clone(), params.clone()))
+            } else {
+                None
+            };
+
+        if let api::schema::Method::PaneOmpBridge(params) = &msg.request.method {
+            let response =
+                self.handle_pane_omp_bridge_api(msg.request.id.clone(), params, msg.context);
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenanceAcquire(params) = &msg.request.method {
+            let result = self.omp_service.acquire_maintenance(&params.operation_id);
+            let changed = result.is_ok() && self.enforce_omp_maintenance();
+            let result = result.and_then(|_| self.omp_service.maintenance_status());
+            let response = Self::encode_omp_maintenance_response(msg.request.id.clone(), result);
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::ServerOmpMaintenanceInspect(_)
+        ) {
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.inspect_maintenance(),
+            );
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::ServerOmpMaintenanceStatus(_)
+        ) {
+            let changed = self.enforce_omp_maintenance();
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.maintenance_status(),
+            );
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenancePermit(params) = &msg.request.method {
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.grant_maintenance_permit(
+                    &params.operation_id,
+                    &params.session,
+                    &params.pane_id,
+                ),
+            );
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
+        if let api::schema::Method::ServerOmpMaintenanceRelease(params) = &msg.request.method {
+            let changed = self.enforce_omp_maintenance();
+            let response = Self::encode_omp_maintenance_response(
+                msg.request.id.clone(),
+                self.omp_service.release_maintenance(&params.operation_id),
+            );
+            let _ = msg.respond_to.send(response);
+            return changed;
+        }
 
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
             AltScreenReadConflict::Defer => {
                 self.deferred_alt_screen_reads.push(msg);
-                return false;
+                return changed;
             }
         };
 
@@ -3690,14 +7788,13 @@ impl HeadlessServer {
                 | api::schema::Method::PaneGraphicsStreamClose(_)
         )
         .then_some(self.app.pane_graphics.revision());
-        let mut changed = metadata_expired
+        changed |= metadata_expired
             | (pane_graphics_revision_before.is_none() && api::request_changes_ui(&msg.request));
         let skip_default_workspace = skip_default_workspace_for_request
             || matches!(
                 &msg.request.method,
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
-        changed |= self.drain_all_internal_events_with_forwarding();
 
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
@@ -3776,10 +7873,18 @@ impl HeadlessServer {
                 })
                 .unwrap_or_else(|_| "{}".to_string())
             })
+        } else if let Some((id, params)) = refreshed_shared_plugin_pane {
+            self.app.sync_pending_terminal_titles();
+            self.app
+                .handle_plugin_pane_open_with_refreshed_registry(id, params)
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_after_internal_events_drained_with_context(
+                    msg.request,
+                    msg.context,
+                )
         };
+        changed |= self.reconcile_omp_renderers();
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
             {
@@ -3821,23 +7926,28 @@ impl HeadlessServer {
         if let Some(revision_before) = pane_graphics_revision_before {
             changed |= revision_before != self.app.pane_graphics.revision();
         }
-
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
         // show a terminal or system notification.
         let toast_after = self.app.state.toast.clone();
-        let forwarded_toast_from_state = if should_forward_toast_to_clients(
-            self.app.state.toast_config.delivery,
-        ) && toast_after.is_some()
+        let toast_delivery = self
+            .app
+            .state
+            .toast_config
+            .delivery
+            .effective(self.app.state.outer_terminal_focus);
+        let forwarded_toast_from_state = if should_forward_toast_to_clients(toast_delivery)
+            && toast_after.is_some()
             && toast_after != toast_before
         {
             if let Some(toast) = &toast_after {
                 debug!(title = %toast.title, body = %toast.context, "forwarding toast notification from API request");
                 self.send_notify_to_foreground_client(
-                    toast_notify_kind(self.app.state.toast_config.delivery)
+                    toast_notify_kind(toast_delivery)
                         .expect("toast forwarding requires a client notification kind"),
                     &toast.title,
                     non_empty_body(&toast.context),
+                    toast.target.as_ref(),
                 );
                 true
             } else {
@@ -3894,7 +8004,7 @@ impl HeadlessServer {
 
             if !forwarded_toast_from_state
                 && self.app.state.toast_config.delay_seconds == 0
-                && should_forward_toast_to_clients(self.app.state.toast_config.delivery)
+                && should_forward_toast_to_clients(toast_delivery)
             {
                 if let Some(kind) =
                     crate::app::actions::notification_toast_for_state_change_with_agent_labels(
@@ -3927,11 +8037,16 @@ impl HeadlessServer {
                             *ws_idx,
                             *pane_id,
                         );
+                        let target = crate::app::state::ToastTarget {
+                            workspace_id: self.app.state.workspaces[*ws_idx].id.clone(),
+                            pane_id: *pane_id,
+                        };
                         self.send_notify_to_foreground_client(
-                            toast_notify_kind(self.app.state.toast_config.delivery)
+                            toast_notify_kind(toast_delivery)
                                 .expect("toast forwarding requires a client notification kind"),
                             format!("{agent_label} {event_text}"),
                             non_empty_body(&context),
+                            Some(&target),
                         );
                     }
                 }
@@ -3950,10 +8065,10 @@ impl HeadlessServer {
                         agent_label.as_deref(),
                     )
                 {
-                    debug!(sound = ?sound, "forwarding sound notification from API request");
                     self.send_notify_to_foreground_client(
                         protocol::NotifyKind::Sound,
                         sound_notify_message(sound),
+                        None,
                         None,
                     );
                 }
@@ -3981,10 +8096,9 @@ impl HeadlessServer {
             .app
             .state
             .should_capture_host_mouse_from(&self.app.terminal_runtimes);
-        let pixel_mouse_requested = self
-            .clients
-            .values()
-            .any(|client| client.is_full_app_client() && client.pixel_mouse);
+        let pixel_mouse_requested = self.clients.values().any(|client| {
+            client.is_full_app_client() && client.private_surface.is_none() && client.pixel_mouse
+        });
         let sgr_pixels = pixel_mouse_requested
             && self.focused_pane_graphics_demand()
             && self
@@ -4011,8 +8125,16 @@ impl HeadlessServer {
             if !client.is_full_app_client() {
                 continue;
             }
-            let client_sgr_pixels = sgr_pixels && client.pixel_mouse;
-            if client.host_mouse_capture_active == Some(enabled)
+            let client_enabled = client.private_surface.is_some()
+                || enabled
+                || client.native_omp_server_mouse_gesture.is_some();
+            let requested_sgr_pixels =
+                client.private_surface.is_none() && sgr_pixels && client.pixel_mouse;
+            let client_sgr_pixels = client
+                .native_omp_server_mouse_gesture
+                .as_ref()
+                .map_or(requested_sgr_pixels, |gesture| gesture.sgr_pixels);
+            if client.host_mouse_capture_active == Some(client_enabled)
                 && client.host_sgr_pixels_active == Some(client_sgr_pixels)
             {
                 continue;
@@ -4021,7 +8143,7 @@ impl HeadlessServer {
                 continue;
             };
             let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture {
-                enabled,
+                enabled: client_enabled,
                 sgr_pixels: client_sgr_pixels,
             }) {
                 Ok(framed) => framed,
@@ -4038,7 +8160,7 @@ impl HeadlessServer {
                 broken_clients.push(client_id);
                 continue;
             }
-            client.host_mouse_capture_active = Some(enabled);
+            client.host_mouse_capture_active = Some(client_enabled);
             client.host_sgr_pixels_active = Some(client_sgr_pixels);
         }
 
@@ -4049,27 +8171,36 @@ impl HeadlessServer {
 
     fn stream_host_keyboard_enhancement_flags(&mut self) {
         let report_all_keys = self.app.host_keyboard_report_all_requested();
-        let serialized = match Self::frame_server_message(&ServerMessage::KittyKeyboardReportAll {
-            enabled: report_all_keys,
-        }) {
-            Ok(framed) => framed,
-            Err(err) => {
-                warn!(err = %err, "failed to serialize keyboard enhancement flags for clients");
-                return;
-            }
-        };
 
         let mut broken_clients = Vec::new();
         for (&client_id, client) in &mut self.clients {
-            if !client.is_full_app_client()
-                || client.host_keyboard_report_all_active == Some(report_all_keys)
-            {
+            if !client.is_full_app_client() {
+                continue;
+            }
+            let client_report_all = client
+                .private_surface
+                .as_ref()
+                .map_or(report_all_keys, |surface| {
+                    surface.keyboard_report_all_requested()
+                });
+            if client.host_keyboard_report_all_active == Some(client_report_all) {
                 continue;
             }
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            let serialized = match Self::frame_server_message(
+                &ServerMessage::KittyKeyboardReportAll {
+                    enabled: client_report_all,
+                },
+            ) {
+                Ok(framed) => framed,
+                Err(err) => {
+                    warn!(client_id, err = %err, "failed to serialize keyboard enhancement flags for client");
+                    continue;
+                }
+            };
+            if writer.control.send(serialized).is_err() {
                 debug!(
                     client_id,
                     "client writer channel closed during keyboard enhancement update"
@@ -4077,7 +8208,7 @@ impl HeadlessServer {
                 broken_clients.push(client_id);
                 continue;
             }
-            client.host_keyboard_report_all_active = Some(report_all_keys);
+            client.host_keyboard_report_all_active = Some(client_report_all);
         }
 
         for client_id in broken_clients {
@@ -4100,6 +8231,16 @@ impl HeadlessServer {
         } else {
             HashSet::new()
         };
+        pane_ids.extend(self.clients.values().filter_map(|client| {
+            (client.writer.is_some() && client.is_full_app_client())
+                .then(|| {
+                    client
+                        .private_surface
+                        .as_ref()
+                        .map(|surface| surface.pane_id())
+                })
+                .flatten()
+        }));
         if !direct_terminal_targets.is_empty() {
             for workspace in &self.app.state.workspaces {
                 for tab in &workspace.tabs {
@@ -4135,7 +8276,7 @@ impl HeadlessServer {
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
                     direct_terminal_targets.insert(terminal_id.as_str());
                 }
-                ClientConnectionMode::App => {}
+                ClientConnectionMode::App | ClientConnectionMode::OmpPane => {}
             }
         }
         (has_app_target, direct_terminal_targets)
@@ -4156,6 +8297,17 @@ impl HeadlessServer {
         &self,
         sources: &HashSet<crate::layout::PaneId>,
     ) -> bool {
+        if sources.iter().any(|pane_id| {
+            self.clients.values().any(|client| {
+                client.writer.is_some()
+                    && client
+                        .private_surface
+                        .as_ref()
+                        .is_some_and(|surface| surface.pane_id() == *pane_id)
+            })
+        }) {
+            return true;
+        }
         let (has_app_target, direct_terminal_targets) = self.pty_render_targets();
         if !has_app_target && direct_terminal_targets.is_empty() {
             return false;
@@ -4247,9 +8399,15 @@ impl HeadlessServer {
         if !matches!(mode, ClientConnectionMode::App) {
             retained_fallback!("not_app_client");
         }
+        if self.replaced_omp_pane_info(*client_id).is_some() {
+            retained_fallback!("independent_omp_pane");
+        }
         let Some(client) = self.clients.get(client_id) else {
             retained_fallback!("client_missing");
         };
+        if client.private_surface.is_some() {
+            retained_fallback!("private_surface");
+        }
         if client.deferred_render() != DeferredRender::None {
             retained_fallback!("render_pending");
         }
@@ -4344,7 +8502,9 @@ impl HeadlessServer {
 
     fn retained_pty_update_allowed_by_app_state(&self) -> bool {
         self.app.state.mode == app::Mode::Terminal
+            && self.app.state.focused_workspace_plugin_pane().is_none()
             && self.app.state.popup_pane.is_none()
+            && self.app.state.hovered_link.is_none()
             && self.app.state.selection.is_none()
             && self.app.state.copy_mode.is_none()
             && self.app.state.context_menu.is_none()
@@ -4434,33 +8594,53 @@ impl HeadlessServer {
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
         if render_targets.is_empty() {
-            let (cols, rows) = self.effective_size;
-            let area = Rect::new(0, 0, cols, rows);
-            let resize_panes = self.app.state.view.pane_infos.is_empty();
-            let render_started = crate::render_prof::timer();
-            let _ = crate::server::render_stream::render_virtual_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                resize_panes,
-                crate::kitty_graphics::HostCellSize::default(),
-            );
-            crate::render_prof::duration_since("full_render.render_virtual", render_started);
-            self.app.full_redraw_pending = false;
+            // Keep canonical geometry current for clientless work such as
+            // restored agent resumes, without constructing a synthetic frame.
+            self.compute_foreground_navigation_view();
             crate::render_prof::duration_since("full_render.total", full_started);
-            debug!(
-                cols,
-                rows, resize_panes, "rendered virtual frame with no attached clients"
-            );
             return;
         }
-
+        let canonical_navigation = self.sync_canonical_navigation_to_foreground();
+        let foreground_pre_compute_suppresses_focused_terminal_cursor =
+            self.app.state.popup_pane.is_none()
+                && crate::server::render_stream::focused_terminal_suppresses_host_cursor(
+                    &self.app.state,
+                    &self.app.terminal_runtimes,
+                );
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let foreground_hover = if is_app_client && !is_foreground {
+                Some((
+                    self.app.state.hovered_pane_cell.take(),
+                    self.app.state.hovered_link.take(),
+                ))
+            } else {
+                None
+            };
+            let preserved_scroll = (is_app_client && !is_foreground).then_some((
+                self.app.state.workspace_scroll,
+                self.app.state.agent_panel_scroll,
+                self.app.state.tab_scroll,
+                self.app.state.mobile_switcher_scroll,
+            ));
+            if is_app_client {
+                self.apply_client_navigation(client_id, &canonical_navigation);
+            }
+            let mut findr_changed = false;
+            let mut private_surface = is_app_client
+                .then(|| {
+                    self.clients
+                        .get_mut(&client_id)
+                        .and_then(|client| client.private_surface.take())
+                })
+                .flatten();
+            let has_private_surface = private_surface.is_some();
+            let mut server_owned_overlay = false;
             let mut frame = match mode {
+                ClientConnectionMode::OmpPane => continue,
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
                     let render_cell_size =
@@ -4469,20 +8649,69 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
-                    let preserved_scroll = (!is_foreground).then_some((
-                        self.app.state.workspace_scroll,
-                        self.app.state.agent_panel_scroll,
-                        self.app.state.tab_scroll,
-                        self.app.state.mobile_switcher_scroll,
-                    ));
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_virtual_with_runtime_registry(
+                    let identity = crate::server::render_stream::identity_ui_state(
+                        self.clients
+                            .get(&client_id)
+                            .and_then(|client| client.identity.as_ref()),
+                    );
+                    let pre_compute_suppresses_focused_terminal_cursor =
+                        is_foreground && foreground_pre_compute_suppresses_focused_terminal_cursor;
+                    if is_foreground && !has_private_surface {
+                        crate::ui::compute_view_with_cell_size(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             area,
-                            is_foreground,
                             render_cell_size,
                         );
+                    } else {
+                        crate::ui::compute_view_without_resizing_panes(
+                            &mut self.app.state,
+                            &self.app.terminal_runtimes,
+                            area,
+                        );
+                    }
+                    server_owned_overlay = self.server_owned_overlay_active(&identity);
+                    findr_changed = self.app.refresh_findr_visible_if_needed(&HashSet::new());
+                    let (mut buffer, mut cursor) =
+                        crate::server::render_stream::render_precomputed_virtual_with_runtime_registry_and_private_surface(
+                            &self.app.state,
+                            &self.app.terminal_runtimes,
+                            area,
+                            pre_compute_suppresses_focused_terminal_cursor,
+                            &identity,
+                            private_surface.as_ref(),
+                        );
+                    if !server_owned_overlay {
+                        if let Some(info) = self.independent_omp_pane_info(client_id) {
+                            let inner = info.inner_rect;
+                            if inner.width > 0 && inner.height > 0 {
+                                let message = if self
+                                    .failed_private_omp_pane_info(client_id)
+                                    .is_some()
+                                {
+                                    "OMP renderer unavailable"
+                                } else if self.pending_private_omp_pane_info(client_id).is_some() {
+                                    "OMP renderer starting"
+                                } else {
+                                    "OMP is open in its native renderer"
+                                };
+                                let style = ratatui::style::Style::default()
+                                    .fg(self.app.state.palette.overlay0)
+                                    .bg(self.app.state.palette.panel_bg);
+                                ratatui::widgets::Clear.render(inner, &mut buffer);
+                                ratatui::widgets::Paragraph::new(
+                                    ratatui::text::Line::from(message).centered(),
+                                )
+                                .style(style)
+                                .render(inner, &mut buffer);
+                                cursor = None;
+                            }
+                        }
+                    }
+                    if let Some((position, link)) = foreground_hover {
+                        self.app.state.hovered_pane_cell = position;
+                        self.app.state.hovered_link = link;
+                    }
                     if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
                         self.app.state.agent_panel_scroll = agent_panel;
@@ -4494,10 +8723,78 @@ impl HeadlessServer {
                         render_started,
                     );
                     let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks = crate::server::render_stream::visible_hyperlinks(
+                    let mut hyperlinks = crate::server::render_stream::visible_hyperlinks(
                         &self.app.state,
                         &self.app.terminal_runtimes,
                     );
+                    if !server_owned_overlay {
+                        if let Some(info) = self.independent_omp_pane_info(client_id) {
+                            hyperlinks.retain(|((x, y), _, _)| {
+                                !info.inner_rect.contains((*x, *y).into())
+                            });
+                        }
+                    }
+                    if let (Some(info), Some(guest)) = (
+                        self.private_omp_pane_info(client_id),
+                        self.clients
+                            .get(&client_id)
+                            .and_then(|client| client.private_omp_guest.as_ref()),
+                    ) {
+                        let inner = info.inner_rect;
+                        if inner.width > 0 && inner.height > 0 {
+                            guest.resize(
+                                inner.height,
+                                inner.width,
+                                cell_size.width_px,
+                                cell_size.height_px,
+                            );
+                            let local = Rect::new(0, 0, inner.width, inner.height);
+                            let (guest_buffer, guest_cursor) =
+                                crate::server::render_stream::render_terminal_virtual(
+                                    guest.runtime(),
+                                    local,
+                                );
+                            for y in 0..inner.height {
+                                for x in 0..inner.width {
+                                    buffer[(inner.x + x, inner.y + y)] =
+                                        guest_buffer[(x, y)].clone();
+                                }
+                            }
+                            if info.is_focused {
+                                cursor = guest_cursor.map(|guest_cursor| CursorState {
+                                    x: inner.x.saturating_add(guest_cursor.x),
+                                    y: inner.y.saturating_add(guest_cursor.y),
+                                    visible: guest_cursor.visible,
+                                    shape: guest_cursor.shape,
+                                });
+                            }
+                            hyperlinks.retain(|((x, y), _, _)| !inner.contains((*x, *y).into()));
+                            hyperlinks.extend(
+                                guest
+                                    .runtime()
+                                    .visible_hyperlinks(local)
+                                    .into_iter()
+                                    .map(|((x, y), id, uri)| ((inner.x + x, inner.y + y), id, uri)),
+                            );
+                        }
+                    }
+                    if let Some(surface) = private_surface.as_mut() {
+                        let private_area = self.app.state.view.terminal_area;
+                        surface.resize(private_area, cell_size);
+                        crate::server::render_stream::overlay_private_surface(
+                            &mut buffer,
+                            surface,
+                            &self.app.state.palette,
+                            private_area,
+                        );
+                        cursor = surface.cursor(private_area);
+                        if let Some(outer) = surface.outer_rect(private_area) {
+                            hyperlinks.retain(|((x, y), _, _)| {
+                                !outer.contains(ratatui::layout::Position::new(*x, *y))
+                            });
+                        }
+                        hyperlinks.extend(surface.visible_hyperlinks(private_area));
+                    }
                     crate::render_prof::duration_since(
                         "full_render.visible_hyperlinks",
                         hyperlinks_started,
@@ -4549,14 +8846,39 @@ impl HeadlessServer {
                 }
             };
 
+            frame.omp_renderer = is_app_client
+                .then(|| self.native_omp_frame_projection(client_id))
+                .flatten()
+                .map(|mut projection| {
+                    projection.surface_active &= !has_private_surface;
+                    projection.server_owned_overlay = server_owned_overlay;
+                    projection
+                });
+            let rendered_findr = (is_app_client && findr_changed)
+                .then(|| crate::server::clients::capture_findr(&self.app.state));
+
+            let excluded_graphics_pane = self
+                .graphics_excluded_omp_pane_info(client_id)
+                .map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
+            if let Some(findr) = rendered_findr {
+                if let Some(navigation) = client.navigation.as_mut() {
+                    navigation.findr = findr;
+                }
+            }
+            if let Some(surface) = private_surface {
+                client.private_surface = Some(surface);
+            }
             let mut next_graphics_cache = client.graphics_cache.clone();
             let mut reset_graphics = Vec::new();
-            let mut encoded = if is_app_client
-                && self.app.state.kitty_graphics_enabled
-                && cell_size.is_known()
+            let mut encoded = if has_private_surface {
+                crate::kitty_graphics::EncodedGraphics {
+                    bytes: next_graphics_cache.clear_bytes(),
+                    incomplete: false,
+                }
+            } else if is_app_client && self.app.state.kitty_graphics_enabled && cell_size.is_known()
             {
                 if client.graphics_surface_reset_pending {
                     if self.app.pane_graphics.slots.is_empty() {
@@ -4572,6 +8894,7 @@ impl HeadlessServer {
                     &self.app.terminal_runtimes,
                     self.app.state.view.tab_surface(),
                     cell_size,
+                    excluded_graphics_pane,
                     Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
                     &mut next_graphics_cache,
                 );
@@ -4705,7 +9028,11 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
             }
         }
+        // App targets render background-first and foreground-last, so the final
+        // layout/navigation projection is already canonical for local input.
+        self.restore_foreground_navigation(&canonical_navigation);
 
+        self.compute_foreground_navigation_view();
         let (cols, rows) = self.effective_size;
         if !deferred_frame {
             self.app.full_redraw_pending = false;
@@ -4721,8 +9048,26 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
-        // No resize polling needed — server has no terminal.
-        // Client resize messages drive size changes instead.
+        let expired_clients = self
+            .private_surface_candidates
+            .iter()
+            .filter_map(|(&client_id, candidate)| (now >= candidate.deadline).then_some(client_id))
+            .collect::<Vec<_>>();
+        for client_id in expired_clients {
+            let Some(candidate) = self.private_surface_candidates.remove(&client_id) else {
+                continue;
+            };
+            warn!(
+                client_id,
+                "remote private popup did not become ready before timeout"
+            );
+            self.retire_private_surface_candidate(
+                candidate,
+                "plugin_pane_open_failed",
+                "remote private popup did not become ready before timeout",
+            );
+            changed = true;
+        }
 
         if self
             .app
@@ -4783,6 +9128,8 @@ impl HeadlessServer {
         }
 
         changed |= self.app.clear_due_selection_highlight(now);
+        let findr_changed = self.app.tick_findr_scan(now);
+        changed |= findr_changed && self.has_app_client();
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
@@ -4824,12 +9171,12 @@ impl HeadlessServer {
         changed |= self.app.handle_tab_bar_status_tasks(now);
 
         if geometry_dirty {
-            self.app.pending_agent_resume_deadline = None;
+            self.app.pending_agent_resume_retry_at = None;
         } else {
-            self.app.sync_pending_agent_resume_deadline(now);
+            self.app.sync_pending_agent_resume_retry_at(now);
             changed |= self
                 .app
-                .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
+                .start_pending_agent_resumes(now, self.app.pending_agent_resume_retry_due(now));
         }
         changed
     }
@@ -4879,6 +9226,8 @@ impl HeadlessServer {
 
         // Reject only the requests already queued when shutdown reached cleanup.
         self.reject_queued_api_requests_for_shutdown();
+
+        self.app.shutdown_plugin_commands();
 
         // Close all client connections.
         let staged_files = self
@@ -4966,8 +9315,25 @@ impl Drop for HeadlessServer {
         let staged_files = self
             .clients
             .drain()
-            .flat_map(|(_, client)| client.staged_clipboard_files)
+            .flat_map(|(_, mut client)| {
+                if let Some(surface) = client.private_surface.take() {
+                    surface.shutdown();
+                }
+                client.staged_clipboard_files
+            })
             .collect::<Vec<_>>();
+        let candidates = self
+            .private_surface_candidates
+            .drain()
+            .map(|(_, candidate)| candidate)
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            self.retire_private_surface_candidate(
+                candidate,
+                "server_unavailable",
+                "server is shutting down",
+            );
+        }
         crate::server::clipboard_image::remove_files(staged_files);
         let _ = self.cleanup_sockets();
     }
@@ -5092,13 +9458,16 @@ pub fn run_server() -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        // Create the App (with AppState, event channels, etc.).
-        let mut app = app::App::new(
+        let prepared_omp_bridge = omp_bridge::bind()?;
+        // Restore panes only after the bridge is ready so their shells inherit
+        // the exact address and pane-scoped token used by this server.
+        let mut app = app::App::new_with_omp_bridge(
             &loaded_config.config,
             no_session,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub,
+            Some(prepared_omp_bridge.1.clone()),
         );
         seed_startup_workspace_if_empty(&mut app);
 
@@ -5118,6 +9487,7 @@ pub fn run_server() -> io::Result<()> {
             Some(api_tx.clone()),
             Some(_api_server),
             should_quit,
+            Some(prepared_omp_bridge),
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -5232,12 +9602,33 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             Some(api_tx.clone()),
             Some(api_server),
             should_quit,
+            None,
         )?;
+        server
+            .omp_service
+            .validate_maintenance_handoff_state(received.manifest.omp_maintenance.as_ref())
+            .map_err(|error| io::Error::other(error.message()))?;
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        match server.app.save_layout_apply_session_snapshot_now() {
+            Ok(()) => {
+                let restored_epoch = server.app.layout_apply_epoch.clone();
+                server
+                    .app
+                    .initialize_layout_apply_idempotency_after_handoff(Some(Some(&restored_epoch)));
+            }
+            Err(error) => {
+                warn!(%error, "handoff ownership committed but immediate session persistence failed; continuing with in-memory owner");
+                server.app.mark_layout_apply_idempotency_unavailable(format!(
+                    "layout idempotency is unavailable because committed handoff persistence failed: {error}"
+                ));
+                server.app.state.session_dirty = true;
+                server.app.sync_session_save_schedule();
+            }
+        }
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
@@ -5305,8 +9696,19 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Read as _;
 
-    use crate::app::AppState;
+    fn test_host_admission_sender(
+    ) -> std::sync::mpsc::SyncSender<crate::server::client_transport::OmpHostAdmission> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = receiver.recv();
+        });
+        sender
+    }
+
+    use crate::app::{AppState, ClientPrivatePluginPopupOrigin};
     use crate::protocol::{CellData, CursorState};
     use unicode_width::UnicodeWidthStr;
 
@@ -5349,6 +9751,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retained_pty_update_disables_workspace_plugin_footer_overlay() {
+        let mut server = test_headless_server();
+        server.app.state.mode = app::Mode::Navigate;
+        assert!(!server.retained_pty_update_allowed_by_app_state());
+
+        server.app.state.mode = app::Mode::Terminal;
+        assert!(server.retained_pty_update_allowed_by_app_state());
+
+        server.app.state.hovered_link = Some(crate::app::HoveredPaneLink {
+            pane_id: crate::layout::PaneId::alloc(),
+            inner_rect: Rect::default(),
+            cells: vec![(0, 0)],
+        });
+        assert!(!server.retained_pty_update_allowed_by_app_state());
+        server.app.state.hovered_link = None;
+
+        let workspace = crate::workspace::Workspace::test_new("retained-plugin-footer");
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        server.app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 20, 20);
+        server.app.state.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: crate::layout::PaneId::alloc(),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+
+        assert!(!server.retained_pty_update_allowed_by_app_state());
+    }
+
+    #[tokio::test]
+    async fn clicking_workspace_plugin_then_escape_returns_to_tiled_pane() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("plugin-focus-escape");
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let (plugin_runtime, _plugin_input) =
+            crate::terminal::TerminalRuntime::test_with_channel(40, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(plugin_terminal_id.clone(), plugin_runtime);
+        server.app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(26)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.compute_client_navigation_view(1);
+        let plugin_inner = server.app.state.view.workspace_plugin_pane_inner;
+        assert!(!plugin_inner.is_empty());
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: plugin_inner.x.saturating_add(1),
+                row: plugin_inner.y.saturating_add(1),
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.workspace_plugin_panes[&workspace_id].focused);
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(!server.app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert!(server
+            .clients
+            .get(&1)
+            .and_then(|client| client.navigation.as_ref())
+            .is_some_and(|navigation| navigation.focused_workspace_plugin_pane.is_none()));
+
+        shutdown_test_runtimes(&mut server);
+    }
+
+    static NEXT_TEST_SERVER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
     fn test_headless_server() -> HeadlessServer {
         test_headless_server_with_event_hub(api::EventHub::default())
     }
@@ -5364,10 +9880,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "hh-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            NEXT_TEST_SERVER_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("client.sock");
@@ -5396,6 +9909,23 @@ mod tests {
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
+            private_surface_candidates: HashMap::new(),
+            independent_omp_renderers_enabled: true,
+            private_omp_failed_routes: HashMap::new(),
+            private_omp_retry_attempted_routes: HashMap::new(),
+            next_private_omp_retry_id: 1,
+            private_omp_pending_routes: HashMap::new(),
+            private_omp_executable: None,
+            private_omp_resolving: None,
+            #[cfg(test)]
+            private_omp_test_executable: Some(
+                std::env::current_exe().expect("locate the headless test executable"),
+            ),
+            next_omp_renderer_launch_id: 1,
+            next_omp_renderer_authority_revision: 1,
+            omp_service: OmpService::new(Some(omp_bridge::bind().expect("bind test OMP bridge")))
+                .expect("create test OMP service"),
+            retired_private_pane_ids: VecDeque::new(),
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -5419,11 +9949,585 @@ mod tests {
             server_event_tx,
         }
     }
+    #[test]
+    fn renderer_identity_counters_fail_closed_before_wrapping() {
+        let mut server = test_headless_server();
+        server.next_omp_renderer_launch_id = u64::MAX;
+        server.next_omp_renderer_authority_revision = u64::MAX;
+
+        assert_eq!(server.allocate_omp_renderer_launch_id(), None);
+        assert_eq!(server.allocate_omp_renderer_authority_revision(), None);
+        assert_eq!(server.next_omp_renderer_launch_id, u64::MAX);
+        assert_eq!(server.next_omp_renderer_authority_revision, u64::MAX);
+    }
+
+    #[test]
+    fn authority_revision_exhaustion_notifies_client_before_revoking_state() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_target = Some(OmpRendererTargetState {
+            launch_id: 7,
+            authority_revision: 11,
+            route: Some(crate::protocol::OmpRendererRoute {
+                pane_id: "missing".into(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            bound: true,
+            ready: true,
+            prefix: crate::protocol::OmpRendererPrefix {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            },
+            surface_active: true,
+            input_authority_acked: true,
+        });
+        client.omp_renderer_frame_nonce = Some([9; 16]);
+        client.omp_renderer_frame_pane = Some(crate::protocol::OmpRendererPane {
+            x: 1,
+            y: 2,
+            width: 40,
+            height: 12,
+            scrollback_limit_bytes: 1024,
+        });
+        client.native_omp_server_mouse_gesture =
+            Some(NativeOmpServerGesture::new(MouseButton::Left, 7, 11, false));
+        server.clients.insert(1, client);
+        server.next_omp_renderer_authority_revision = u64::MAX;
+
+        let mut update = server.clients[&1].omp_renderer_target.clone().unwrap();
+        update.prefix.modifiers = KeyModifiers::ALT.bits();
+        assert!(server.update_omp_renderer_target(1, update));
+
+        let target = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_eq!(target.authority_revision, 11);
+        assert!(!target.surface_active);
+        assert!(!target.input_authority_acked);
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert_eq!(server.clients[&1].omp_renderer_frame_pane, None);
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("inactive authority transition"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                authority_revision,
+                surface_active,
+                ..
+            } => {
+                assert_eq!((launch_id, authority_revision), (7, 11));
+                assert!(!surface_active);
+            }
+            other => panic!("expected inactive renderer target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projected_pane_rectangle_change_rotates_native_authority() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("geometry-authority");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 80, 24),
+            inner_rect: Rect::new(0, 0, 80, 24),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_target = Some(OmpRendererTargetState {
+            launch_id: 7,
+            authority_revision: 11,
+            route: Some(crate::protocol::OmpRendererRoute {
+                pane_id: route,
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }),
+            bound: true,
+            ready: true,
+            prefix: crate::protocol::OmpRendererPrefix {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            },
+            surface_active: true,
+            input_authority_acked: true,
+        });
+        server.clients.insert(1, client);
+        server.next_omp_renderer_authority_revision = 12;
+
+        let first = server
+            .native_omp_frame_projection(1)
+            .expect("initial projection");
+        assert_eq!(first.authority_revision, 11);
+        server.app.state.view.pane_infos[0].rect = Rect::new(3, 4, 70, 18);
+        server.app.state.view.pane_infos[0].inner_rect = Rect::new(3, 4, 70, 18);
+
+        let changed = server
+            .native_omp_frame_projection(1)
+            .expect("changed projection");
+        assert_eq!(changed.authority_revision, 12);
+        assert_eq!(
+            changed
+                .pane
+                .map(|pane| (pane.x, pane.y, pane.width, pane.height)),
+            Some((3, 4, 70, 18))
+        );
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("replacement authority"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                authority_revision,
+                surface_active,
+                ..
+            } => {
+                assert_eq!(authority_revision, 12);
+                assert!(surface_active);
+            }
+            other => panic!("expected replacement renderer target, got {other:?}"),
+        }
+    }
+
+    fn start_test_omp_host(
+        server: &mut HeadlessServer,
+        pane_id: String,
+        omp_session_id: &str,
+        host_id: u64,
+    ) -> (std::net::TcpStream, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            .expect("connect OMP host peer");
+        let (socket, _) = listener.accept().expect("accept OMP host peer");
+        let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(8);
+        let _ = server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id,
+            omp_session_id: omp_session_id.into(),
+            route_generation: 1,
+            host_id,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        });
+        (peer, outbound_rx)
+    }
+
+    #[tokio::test]
+    async fn pending_private_companion_masks_host_pane_and_input() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-pending");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        let host_uri = "https://example.com/host";
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                format!("HOST PTY \x1b[?1000h\x1b]8;;{host_uri}\x1b\\HOST LINK\x1b]8;;\x1b\\")
+                    .as_bytes(),
+                8,
+            );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), Some(writer)));
+        server.foreground_client_id = Some(1);
+        server.private_omp_test_executable = None;
+        server.private_omp_resolving = Some((1, route.clone()));
+        let (_host, _host_messages) =
+            start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+
+        assert_eq!(server.private_omp_pending_routes.get(&1), Some(&route));
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let text = frame_text(&frame);
+        assert!(text.contains("OMP renderer starting"));
+        assert!(!text.contains("HOST PTY"));
+        assert!(!frame.hyperlinks.iter().any(|link| link == host_uri));
+        assert_eq!(frame.cursor, None);
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("host runtime")
+            .test_process_pty_bytes(b"\rHOST RETAINED LEAK");
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(render_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        server.render_and_stream();
+        assert!(render_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let rerendered = server.clients[&1]
+            .render_state
+            .last_frame()
+            .expect("masked frame remains retained");
+        let rerendered_text = frame_text(rerendered);
+        assert!(rerendered_text.contains("OMP renderer starting"));
+        assert!(!rerendered_text.contains("HOST RETAINED LEAK"));
+        assert_eq!(rerendered.cursor, None);
+
+        let canonical = server.begin_client_navigation_scope(1).unwrap();
+        server.compute_client_navigation_view(1);
+        let inner = server
+            .pending_private_omp_pane_info(1)
+            .expect("pending OMP route is masked")
+            .inner_rect;
+        server.finish_client_navigation_scope(1, canonical);
+        assert!(server.handle_client_input_events(
+            1,
+            vec![
+                crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::empty(),
+                )),
+                crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new("text")),
+                crate::raw_input::RawInputEvent::Paste("paste".into()),
+                crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: inner.x,
+                    row: inner.y,
+                    modifiers: KeyModifiers::empty(),
+                }),
+                crate::raw_input::RawInputEvent::OuterFocusGained,
+            ],
+        ));
+        assert!(host_input.try_recv().is_err());
+
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let client = server.clients.get_mut(&1).unwrap();
+        client.cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        client.host_sgr_pixels_active = Some(true);
+        let x = u32::from(inner.x) * 10 + 1;
+        let y = u32::from(inner.y) * 20 + 1;
+        assert!(!server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: format!("\x1b[<0;{x};{y}M").into_bytes(),
+            geometry,
+        }));
+        assert!(host_input.try_recv().is_err());
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn private_companion_retry_masks_then_releases_stale_native_target() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-resolution-failure");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 80, 24),
+            inner_rect: Rect::new(0, 0, 80, 24),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        // Inspect the queue synchronously: test_client_writer forwards control records on a
+        // background thread, so try_recv can race with delivery of an already queued message.
+        let writer = ClientWriter::test_backpressured();
+        let mut client = test_identity_client(Some("Ada"), Some(writer.clone()));
+        client.renderer_binding_token = Some("binding".into());
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(7, client);
+        server.private_omp_test_executable = None;
+        server.private_omp_resolving = Some((7, route.clone()));
+        let (_host, _host_messages) =
+            start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+        // The native child is gone from OmpService, but its last target is still bound.
+        let target = server.clients[&7]
+            .omp_renderer_target
+            .clone()
+            .expect("server offers the focused native route");
+        let renderer_launch_id = target.launch_id;
+        server.clients.get_mut(&7).unwrap().omp_renderer_target = Some(OmpRendererTargetState {
+            bound: true,
+            ready: true,
+            surface_active: true,
+            ..target
+        });
+        while writer.test_pop_control().is_some() {}
+        assert_eq!(server.private_omp_pending_routes.get(&7), Some(&route));
+
+        assert!(
+            server.handle_server_event(ServerEvent::OmpPrivateCompanionResolved {
+                result: Err("OMP companion unavailable".into()),
+            })
+        );
+        assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
+        let retry_id = match server.private_omp_retry_attempted_routes.get(&7) {
+            Some((attempted, PrivateOmpRetryState::Pending(retry_id))) if attempted == &route => {
+                *retry_id
+            }
+            other => panic!("unexpected retry state: {other:?}"),
+        };
+        let native_target = server.clients[&7]
+            .omp_renderer_target
+            .as_ref()
+            .expect("stale native target remains masked during retry delay");
+        assert!(native_target.bound);
+        assert!(native_target.ready);
+        assert!(native_target.surface_active);
+        assert!(writer.test_control_records().is_empty());
+        assert!(server.independent_omp_pane_info(7).is_some());
+
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            7,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty()),
+            )],
+        );
+        assert!(consumed);
+        assert!(remaining.is_empty());
+        assert!(!authority_changed);
+
+        server.private_omp_test_executable = Some(
+            server
+                .client_socket_path
+                .with_extension("missing-private-omp"),
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::OmpPrivateCompanionRetry {
+                client_id: 7,
+                route: route.clone(),
+                retry_id,
+            })
+        );
+        assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
+        assert_eq!(
+            server.private_omp_retry_attempted_routes.get(&7),
+            Some(&(route.clone(), PrivateOmpRetryState::Consumed))
+        );
+        let fallback_target = server.clients[&7]
+            .omp_renderer_target
+            .as_ref()
+            .expect("terminal fallback failure releases the stale native target");
+        assert!(!fallback_target.bound);
+        assert!(!fallback_target.ready);
+        assert!(!fallback_target.surface_active);
+        match read_server_message(
+            writer
+                .test_pop_control()
+                .expect("terminal failure target release"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                route: Some(released_route),
+                bound: false,
+                ..
+            } => {
+                assert_eq!(launch_id, renderer_launch_id);
+                assert_eq!(released_route, HeadlessServer::omp_renderer_route(&route));
+            }
+            message => panic!("expected unbound renderer target, got {message:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_private_omp_executable_is_reverified_before_reuse() {
+        let mut server = test_headless_server();
+        let route = OmpRouteKey {
+            pane_id: "w1:p1".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        let missing = server
+            .client_socket_path
+            .with_extension("missing-private-omp");
+        server.private_omp_test_executable = None;
+        server.private_omp_executable = Some(crate::update::OmpExecutable::Explicit(missing));
+        server.private_omp_resolving = Some((99, route.clone()));
+
+        assert!(server
+            .private_omp_executable_for_launch(7, &route)
+            .is_none());
+        assert!(server.private_omp_executable.is_none());
+        assert!(matches!(
+            server.private_omp_resolving.as_ref(),
+            Some((99, resolving_route)) if resolving_route == &route
+        ));
+    }
+
+    #[test]
+    fn stale_private_retry_ticket_cannot_reopen_same_route() {
+        let mut server = test_headless_server();
+        let route = OmpRouteKey {
+            pane_id: "w1:p1".into(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.private_omp_failed_routes.insert(7, route.clone());
+        server
+            .private_omp_retry_attempted_routes
+            .insert(7, (route.clone(), PrivateOmpRetryState::Pending(2)));
+
+        assert!(
+            !server.handle_server_event(ServerEvent::OmpPrivateCompanionRetry {
+                client_id: 7,
+                route: route.clone(),
+                retry_id: 1,
+            })
+        );
+        assert_eq!(server.private_omp_failed_routes.get(&7), Some(&route));
+        assert_eq!(
+            server.private_omp_retry_attempted_routes.get(&7),
+            Some(&(route, PrivateOmpRetryState::Pending(2)))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_private_resolution_restarts_for_waiter_after_owner_disconnect() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-disconnect");
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.private_omp_test_executable = None;
+        let (_host, _host_messages) =
+            start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server
+            .clients
+            .insert(2, test_identity_client(Some("Bea"), None));
+        server.private_omp_resolving = Some((1, route.clone()));
+        assert!(server.reconcile_omp_renderers());
+        assert_eq!(server.private_omp_pending_routes.get(&1), Some(&route));
+        assert_eq!(server.private_omp_pending_routes.get(&2), Some(&route));
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 1 }));
+        assert!(!server.clients.contains_key(&1));
+        assert_eq!(server.private_omp_pending_routes.get(&2), Some(&route));
+        let _ = server.handle_server_event(ServerEvent::OmpPrivateCompanionResolved {
+            result: Err("OMP companion unavailable".into()),
+        });
+
+        assert!(!server.private_omp_failed_routes.contains_key(&1));
+        assert!(matches!(
+            server.private_omp_resolving.as_ref(),
+            Some((2, resolving_route)) if resolving_route == &route
+        ));
+        assert_eq!(server.private_omp_pending_routes.get(&2), Some(&route));
+    }
+
+    #[tokio::test]
+    async fn stale_private_resolution_restarts_for_current_route() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-route-change");
+        let pane_id = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let old_route = OmpRouteKey {
+            pane_id: pane_id.clone(),
+            omp_session_id: "old".into(),
+            route_generation: 1,
+        };
+        let replacement_route = OmpRouteKey {
+            pane_id: pane_id.clone(),
+            omp_session_id: "a".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.private_omp_test_executable = None;
+        let (_old_host, _old_messages) =
+            start_test_omp_host(&mut server, pane_id.clone(), "old", 1);
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server.private_omp_resolving = Some((1, old_route.clone()));
+        assert!(server.reconcile_omp_renderers());
+        assert_eq!(server.private_omp_pending_routes.get(&1), Some(&old_route));
+
+        let (_new_host, _new_messages) = start_test_omp_host(&mut server, pane_id, "a", 2);
+        assert_eq!(
+            server.private_omp_pending_routes.get(&1),
+            Some(&replacement_route)
+        );
+        let _ = server.handle_server_event(ServerEvent::OmpPrivateCompanionResolved {
+            result: Err("OMP companion unavailable".into()),
+        });
+
+        assert!(!server.private_omp_failed_routes.contains_key(&1));
+        assert!(matches!(
+            server.private_omp_resolving.as_ref(),
+            Some((1, resolving_route)) if resolving_route == &replacement_route
+        ));
+        assert_eq!(
+            server.private_omp_pending_routes.get(&1),
+            Some(&replacement_route)
+        );
+    }
 
     fn shutdown_test_runtimes(server: &mut HeadlessServer) {
         for (_, runtime) in server.app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
+    }
+
+    fn request_pane_omp_bridge(
+        server: &mut HeadlessServer,
+        id: &str,
+        pane_id: &str,
+        local_peer_pid: Option<u32>,
+    ) -> String {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(
+            !server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: id.into(),
+                    method: api::schema::Method::PaneOmpBridge(api::schema::PaneOmpBridgeParams {
+                        pane_id: pane_id.into(),
+                    },),
+                },
+                context: api::ApiRequestContext { local_peer_pid },
+                respond_to,
+                response_write_complete: None,
+                stream_active: None,
+            })
+        );
+        response_rx.recv().expect("OMP bridge response")
     }
 
     fn read_server_message(bytes: Vec<u8>) -> ServerMessage {
@@ -5472,6 +10576,208 @@ mod tests {
             )
         );
         assert_eq!(server.effective_size, server.headless_size);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn pane_omp_bridge_resolves_attributed_pane_over_stale_request() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("omp-bridge-discovery");
+        let source_pane = workspace.tabs[0].root_pane;
+        let target_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let source_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .cloned()
+            .expect("source terminal");
+        let target_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(target_pane)
+            .cloned()
+            .expect("target terminal");
+        let (source_runtime, _source_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        source_runtime.test_set_child_pid(std::process::id());
+        server
+            .app
+            .terminal_runtimes
+            .insert(source_terminal_id.clone(), source_runtime);
+        let (target_runtime, _target_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(target_terminal_id, target_runtime);
+
+        let workspace = &server.app.state.workspaces[0];
+        let source_pane_id = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace
+                .public_pane_number(source_pane)
+                .expect("source pane number"),
+        );
+        let target_pane_id = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace
+                .public_pane_number(target_pane)
+                .expect("target pane number"),
+        );
+
+        let response: api::schema::SuccessResponse =
+            serde_json::from_str(&request_pane_omp_bridge(
+                &mut server,
+                "attributed-pane",
+                &target_pane_id,
+                Some(std::process::id()),
+            ))
+            .expect("authorized OMP bridge response");
+        let api::schema::ResponseResult::PaneOmpBridge {
+            pane_id,
+            address,
+            token,
+        } = response.result
+        else {
+            panic!("expected pane OMP bridge response");
+        };
+        assert_eq!(pane_id, source_pane_id);
+        assert_ne!(pane_id, target_pane_id);
+        assert_eq!(address, server.omp_service.bridge().address());
+        assert!(server.omp_service.bridge().validates(&pane_id, &token));
+
+        for (id, requested_pane, peer_pid) in [
+            ("missing-peer", source_pane_id.as_str(), None),
+            ("unknown-peer", source_pane_id.as_str(), Some(2_000_000_000)),
+        ] {
+            let response: api::schema::ErrorResponse = serde_json::from_str(
+                &request_pane_omp_bridge(&mut server, id, requested_pane, peer_pid),
+            )
+            .expect("denied OMP bridge response");
+            assert_eq!(response.id, id);
+            assert_eq!(response.error.code, "omp_bridge_discovery_denied");
+            assert_eq!(
+                response.error.message,
+                "OMP bridge discovery is unavailable for this caller"
+            );
+        }
+
+        server
+            .app
+            .terminal_runtimes
+            .get(&source_terminal_id)
+            .expect("source runtime")
+            .test_set_child_pid(0);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("headless-input-guard");
+        let source_pane = workspace.tabs[0].root_pane;
+        let target_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let source_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .cloned()
+            .expect("source terminal");
+        let target_terminal_id = server.app.state.workspaces[0]
+            .terminal_id(target_pane)
+            .cloned()
+            .expect("target terminal");
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source state")
+            .set_agent_name("source-agent".into());
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source state")
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&target_terminal_id)
+            .expect("target state")
+            .set_agent_name("target-agent".into());
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&target_terminal_id)
+            .expect("target state")
+            .set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+
+        let (source_runtime, _source_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        source_runtime.test_set_child_pid(std::process::id());
+        server
+            .app
+            .terminal_runtimes
+            .insert(source_terminal_id.clone(), source_runtime);
+        let (target_runtime, mut target_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(target_terminal_id, target_runtime);
+
+        let workspace_id = server.app.state.workspaces[0].id.clone();
+        let pane_number = server.app.state.workspaces[0]
+            .public_pane_number(target_pane)
+            .expect("target pane number");
+        let target_pane_id =
+            crate::workspace::public_pane_id_for_number(&workspace_id, pane_number);
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "headless-cross-pane".into(),
+                method: api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+                    pane_id: target_pane_id,
+                    text: "blocked".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            context: api::ApiRequestContext {
+                local_peer_pid: Some(std::process::id()),
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        });
+
+        let response: api::schema::ErrorResponse =
+            serde_json::from_str(&response_rx.recv().expect("headless response")).unwrap();
+        assert_eq!(response.error.code, "cross_pane_input_denied");
+        assert!(target_rx.try_recv().is_err());
+        server
+            .app
+            .terminal_runtimes
+            .get(&source_terminal_id)
+            .expect("source runtime")
+            .test_set_child_pid(0);
+        shutdown_test_runtimes(&mut server);
     }
 
     #[tokio::test]
@@ -5543,6 +10849,7 @@ mod tests {
                 id: "list-titles".into(),
                 method: api::schema::Method::PaneList(api::schema::PaneListParams::default()),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -5555,6 +10862,2484 @@ mod tests {
         panes
     }
 
+    #[tokio::test]
+    async fn api_pane_focus_reconciles_private_omp_guest_route() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("private-omp-focus");
+        let old_pane = workspace.tabs[0].root_pane;
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(old_pane);
+        let old_route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let new_route = crate::workspace::public_pane_id_for_number(&workspace.id, 2);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+
+        let mut host_receivers = Vec::new();
+        let mut host_peers = Vec::new();
+        let mut host_socket = |host_id| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+            let peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+                .expect("connect OMP host peer");
+            host_peers.push(peer);
+            let (socket, _) = listener.accept().expect("accept OMP host peer");
+            let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(1);
+            host_receivers.push(outbound_rx);
+            ServerEvent::OmpHostStarted {
+                pane_id: if host_id == 1 {
+                    old_route.clone()
+                } else {
+                    new_route.clone()
+                },
+                omp_session_id: format!("session-{host_id}"),
+                route_generation: 1,
+                host_id,
+                outbound,
+                socket,
+                admission: test_host_admission_sender(),
+            }
+        };
+        assert!(server.handle_server_event(host_socket(1)));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("focused route attaches private guest")
+                .route()
+                .pane_id,
+            old_route
+        );
+        assert!(!server.handle_server_event(host_socket(2)));
+        headless_pane_list(&mut server);
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("non-focus API leaves private guest attached")
+                .route()
+                .pane_id,
+            old_route
+        );
+
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        assert!(
+            server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: "focus-private-omp".into(),
+                    method: api::schema::Method::PaneFocus(api::schema::PaneTarget {
+                        pane_id: new_route.clone(),
+                    }),
+                },
+                context: api::ApiRequestContext::default(),
+                respond_to,
+                response_write_complete: None,
+                stream_active: None,
+            })
+        );
+
+        let response: api::schema::SuccessResponse =
+            serde_json::from_str(&response_rx.recv().expect("focus response")).unwrap();
+        assert!(matches!(
+            response.result,
+            api::schema::ResponseResult::PaneInfo { .. }
+        ));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("API focus swaps private guest immediately")
+                .route()
+                .pane_id,
+            new_route
+        );
+    }
+    #[tokio::test]
+    async fn private_guest_reconciliation_uses_each_app_navigation_projection() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("private-omp-projections");
+        let foreground_pane = workspace.tabs[0].root_pane;
+        let background_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let foreground_route = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace.public_pane_number(foreground_pane).unwrap(),
+        );
+        let background_route = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace.public_pane_number(background_pane).unwrap(),
+        );
+        workspace.tabs[0].layout.focus_pane(foreground_pane);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(background_pane);
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+        server.app.state.ensure_test_terminals();
+
+        let mut foreground = test_identity_client(Some("Ada"), None);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(1, foreground);
+        let mut background = test_identity_client(Some("Bea"), None);
+        background.navigation = Some(background_navigation);
+        server.clients.insert(2, background);
+        server.foreground_client_id = Some(1);
+
+        let mut host_receivers = Vec::new();
+        let mut host_started = |pane_id: String, host_id| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+            let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+                .expect("connect OMP host peer");
+            let (socket, _) = listener.accept().expect("accept OMP host peer");
+            let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(1);
+            host_receivers.push(outbound_rx);
+            ServerEvent::OmpHostStarted {
+                pane_id,
+                omp_session_id: format!("session-{host_id}"),
+                route_generation: 1,
+                host_id,
+                outbound,
+                socket,
+                admission: test_host_admission_sender(),
+            }
+        };
+        assert!(server.handle_server_event(host_started(foreground_route.clone(), 1)));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("foreground App attaches its focused route")
+                .route()
+                .pane_id,
+            foreground_route
+        );
+        assert!(server.clients[&2].private_omp_guest.is_none());
+        assert!(server.handle_server_event(host_started(background_route.clone(), 2)));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("foreground App keeps its focused route")
+                .route()
+                .pane_id,
+            foreground_route
+        );
+        assert_eq!(
+            server.clients[&2]
+                .private_omp_guest
+                .as_ref()
+                .expect("background App attaches its projected route")
+                .route()
+                .pane_id,
+            background_route
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn private_omp_side_effects_require_a_promoted_active_owner_surface() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-effects");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+
+        let (owner_writer, owner_control_rx, _owner_render_rx) = test_client_writer();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), Some(owner_writer)));
+        let (foreground_writer, foreground_control_rx, _foreground_render_rx) =
+            test_client_writer();
+        let mut foreground = test_app_client(Some(true), 2);
+        foreground.writer = Some(foreground_writer);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route, "session", 1);
+        let private_pane_id = server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("private OMP guest")
+            .runtime_pane_id();
+        assert!(server.private_omp_pending_routes.contains_key(&1));
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+                pane_id: private_pane_id,
+                count: 1,
+            })
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: private_pane_id,
+                content: b"warming".to_vec(),
+            })
+        );
+        assert!(owner_control_rx.try_recv().is_err());
+        assert!(foreground_control_rx.try_recv().is_err());
+
+        server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("private OMP guest")
+            .test_set_bridge_ready();
+        assert!(server.drain_private_omp_guest_records());
+        assert!(!server.private_omp_pending_routes.contains_key(&1));
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+                pane_id: private_pane_id,
+                count: 2,
+            })
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: private_pane_id,
+                content: b"promoted".to_vec(),
+            })
+        );
+        assert!(matches!(
+            read_server_message(
+                owner_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("owner bell")
+            ),
+            ServerMessage::TerminalBell { count: 2 }
+        ));
+        assert!(matches!(
+            read_server_message(
+                owner_control_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("owner clipboard")
+            ),
+            ServerMessage::Clipboard { data } if data == "cHJvbW90ZWQ="
+        ));
+        assert!(foreground_control_rx.try_recv().is_err());
+
+        server.clients.get_mut(&1).unwrap().private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(pane_id),
+                b"hidden",
+            ),
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+                pane_id: private_pane_id,
+                count: 3,
+            })
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: private_pane_id,
+                content: b"hidden".to_vec(),
+            })
+        );
+        assert!(owner_control_rx.try_recv().is_err());
+        assert!(foreground_control_rx.try_recv().is_err());
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn native_surface_activation_uses_client_projection_and_hides_for_popup() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-surface-projection");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        let terminal_navigation = ClientNavigationState::capture(&server.app.state);
+
+        server.app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        server.app.state.mode = app::Mode::Findr;
+        let findr_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut terminal_client = test_identity_client(Some("Ada"), None);
+        terminal_client.navigation = Some(terminal_navigation);
+        server.clients.insert(1, terminal_client);
+        let mut findr_client = test_identity_client(Some("Bea"), None);
+        findr_client.navigation = Some(findr_navigation);
+        server.clients.insert(2, findr_client);
+
+        assert!(server.client_omp_surface_active(1));
+        server.app.state.mode = app::Mode::Terminal;
+        assert!(!server.client_omp_surface_active(2));
+
+        server.app.state.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: crate::layout::PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+        assert!(!server.client_omp_surface_active(1));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn native_surface_activation_retries_after_control_queue_drains() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-control-backpressure");
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let route_key = OmpRouteKey {
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+
+        let writer = crate::server::client_transport::ClientWriter::test_backpressured();
+        let mut client = test_identity_client(Some("Ada"), Some(writer.clone()));
+        client.renderer_binding_token = Some("binding".into());
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(1, client);
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server
+            .private_omp_failed_routes
+            .insert(1, route_key.clone());
+
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route.clone(), "session", 1);
+        let renderer_launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        while writer.test_pop_control().is_some() {}
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        while writer.test_pop_control().is_some() {}
+
+        server
+            .clients
+            .get_mut(&1)
+            .expect("app client")
+            .graphics_cache
+            .test_mark_non_empty();
+        let direct_key = (
+            server.app.state.workspaces[0].tabs[0].root_pane,
+            "native-activation-direct".into(),
+        );
+        let direct_image_id = server
+            .app
+            .pane_graphics
+            .reserve_image_id(&direct_key)
+            .expect("direct image id");
+        let direct_transfer_id = 41;
+        let (direct_respond_to, direct_response_rx) = std::sync::mpsc::channel();
+        let mut direct_slot = crate::app::pane_graphics::Slot::test(direct_image_id, None);
+        direct_slot.direct_gate = Some(crate::app::pane_graphics::DirectGate {
+            transfer_id: direct_transfer_id,
+            client_id: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            written: true,
+            success_response: "ack".into(),
+            respond_to: direct_respond_to,
+        });
+        server
+            .app
+            .pane_graphics
+            .slots
+            .insert(direct_key.clone(), direct_slot);
+        writer.test_fill_control(vec![b'x']);
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+        }));
+        let target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("pending native target");
+        assert!(target.ready, "renderer readiness must survive backpressure");
+        assert!(!target.surface_active, "surface waits for host cleanup");
+        assert!(!server.clients[&1].graphics_cache.is_empty());
+        assert!(server.app.pane_graphics.slots.contains_key(&direct_key));
+        assert!(matches!(
+            direct_response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let blocked = writer.test_control_records();
+        assert_eq!(blocked.len(), 64);
+        assert!(blocked.iter().all(|message| message == b"x"));
+        assert_eq!(writer.test_pop_control(), Some(vec![b'x']));
+        assert!(
+            server.handle_server_event(ServerEvent::ClientWriterControlDrained { client_id: 1 })
+        );
+
+        assert!(
+            server.clients.contains_key(&1),
+            "one free control slot must not disconnect the App"
+        );
+        assert!(server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .is_some_and(|target| target.surface_active));
+        assert_eq!(
+            server.clients[&1].graphics_cache.test_image_count(),
+            1,
+            "pane-scoped activation must preserve unrelated cached graphics"
+        );
+        assert!(!server.app.pane_graphics.slots.contains_key(&direct_key));
+        assert!(matches!(
+            direct_response_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+
+        let queued = writer.test_control_records();
+        assert_eq!(queued.len(), 64);
+        assert!(queued[..63].iter().all(|message| message == b"x"));
+        let combined = queued.last().expect("combined activation record");
+        let mut cursor = std::io::Cursor::new(combined.as_slice());
+        match protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+            .expect("graphics cleanup frame")
+        {
+            ServerMessage::Graphics { bytes } => {
+                let cleanup = String::from_utf8_lossy(&bytes);
+                assert!(
+                    cleanup.contains(&format!("i={direct_image_id}")),
+                    "{cleanup:?}"
+                );
+            }
+            other => panic!("expected graphics cleanup, got {other:?}"),
+        }
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+                .expect("direct graphics retirement frame"),
+            ServerMessage::GraphicsTransmissionRetired {
+                transfer_id,
+                image_id,
+            } if transfer_id == direct_transfer_id && image_id == direct_image_id
+        ));
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut cursor, MAX_FRAME_SIZE)
+                .expect("active renderer target frame"),
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                ..
+            } if launch_id == renderer_launch_id
+        ));
+        assert_eq!(cursor.position() as usize, combined.len());
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn native_renderer_attach_uses_the_bound_background_app_projection() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("native-background-projection");
+        let foreground_pane = workspace.tabs[0].root_pane;
+        let background_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let background_route = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace.public_pane_number(background_pane).unwrap(),
+        );
+        workspace.tabs[0].layout.focus_pane(foreground_pane);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(background_pane);
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+        server.app.state.ensure_test_terminals();
+
+        let mut foreground = test_identity_client(Some("Ada"), None);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(1, foreground);
+        let (background_writer, background_control_rx, _background_render_rx) =
+            test_client_writer();
+        let mut background = test_identity_client(Some("Bea"), Some(background_writer));
+        background.navigation = Some(background_navigation);
+        background.renderer_binding_token = Some("background-binding".into());
+        background.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(2, background);
+        server.clients.insert(
+            3,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("background-profile".into()),
+                Some("background-binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                3,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            .expect("connect OMP host peer");
+        let (socket, _) = listener.accept().expect("accept OMP host peer");
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(8);
+        assert!(server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id: background_route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 1,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        }));
+        assert!(server.clients[&2].private_omp_guest.is_some());
+        let renderer_launch_id = server.clients[&2]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        let renderer_route = server.clients[&2]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .route
+            .clone()
+            .expect("server offers an exact native route");
+
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 3,
+            pane_id: background_route,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(2),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.omp_service.app_has_native_renderer(2));
+        while background_control_rx
+            .recv_timeout(Duration::from_millis(20))
+            .is_ok()
+        {}
+        assert!(server.clients[&2].private_omp_guest.is_some());
+        assert!(
+            !server.clients[&2]
+                .omp_renderer_target
+                .as_ref()
+                .expect("native target")
+                .ready
+        );
+        server.clients[&2]
+            .private_omp_guest
+            .as_ref()
+            .expect("private guest")
+            .test_set_bridge_ready();
+        assert!(server.drain_private_omp_guest_records());
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let canonical = server.begin_client_navigation_scope(2).unwrap();
+        server.compute_client_navigation_view(2);
+        let inner = server
+            .private_omp_pane_info(2)
+            .expect("ready private renderer pane")
+            .inner_rect;
+        server.finish_client_navigation_scope(2, canonical);
+        let x = u32::from(inner.x) * 10 + 1;
+        let y = u32::from(inner.y) * 20 + 1;
+        let data = format!("\x1b[<35;{x};{y}M").into_bytes();
+        let client = server.clients.get_mut(&2).unwrap();
+        client.cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        client.host_sgr_pixels_active = Some(true);
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 2,
+            data: data.clone(),
+            geometry,
+        }));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert!(!server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 2,
+            launch_id: renderer_launch_id + 1,
+        }));
+        assert!(server.clients[&2].private_omp_guest.is_some());
+        server.app.state.mode = crate::app::Mode::Prefix;
+        server
+            .clients
+            .get_mut(&2)
+            .and_then(|client| client.navigation.as_mut())
+            .expect("background projection")
+            .non_findr_mode = Some(crate::app::Mode::Prefix);
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 2,
+            launch_id: renderer_launch_id,
+        }));
+        assert!(server.clients[&2].private_omp_guest.is_none());
+        assert!(
+            server.clients[&2]
+                .omp_renderer_target
+                .as_ref()
+                .expect("native target")
+                .ready
+        );
+        match read_server_message(
+            background_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("inactive ready confirms the exact renderer target"),
+        ) {
+            ServerMessage::OmpRendererTarget {
+                launch_id,
+                route: Some(route),
+                bound: true,
+                ..
+            } => {
+                assert_eq!(launch_id, renderer_launch_id);
+                assert_eq!(route, renderer_route);
+            }
+            message => panic!("expected inactive renderer confirmation, got {message:?}"),
+        }
+        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        let (remaining, consumed, authority_changed) =
+            server.partition_native_omp_input(2, vec![key]);
+        assert!(!consumed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(_)]
+        ));
+        assert!(!authority_changed);
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 2,
+            data,
+            geometry,
+        }));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(
+            server.clients[&2]
+                .committed_identity()
+                .map(|identity| identity.name.as_str()),
+            Some("Bea")
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn background_native_omp_input_preserves_foreground_projection() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("native-background-input");
+        let foreground_pane = workspace.tabs[0].root_pane;
+        let background_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let foreground_terminal_id = workspace
+            .terminal_id(foreground_pane)
+            .expect("foreground terminal")
+            .clone();
+        let background_route = crate::workspace::public_pane_id_for_number(
+            &workspace.id,
+            workspace.public_pane_number(background_pane).unwrap(),
+        );
+        workspace.tabs[0].layout.focus_pane(foreground_pane);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(background_pane);
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+        server.app.state.ensure_test_terminals();
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"foreground host",
+                8,
+            );
+        server
+            .app
+            .terminal_runtimes
+            .insert(foreground_terminal_id, runtime);
+
+        let mut foreground = test_identity_client(Some("Ada"), None);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(1, foreground);
+        let mut background = test_identity_client(Some("Bea"), None);
+        background.navigation = Some(background_navigation);
+        background.renderer_binding_token = Some("background-binding".into());
+        background.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(2, background);
+        server.clients.insert(
+            3,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("background-profile".into()),
+                Some("background-binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                3,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            .expect("connect OMP host peer");
+        let (socket, _) = listener.accept().expect("accept OMP host peer");
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(8);
+        assert!(server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id: background_route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 1,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        }));
+        let renderer_launch_id = server.clients[&2]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 3,
+            pane_id: background_route,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(2),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.omp_service.app_has_native_renderer(2));
+
+        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert!(server.handle_client_input_events(2, vec![key]));
+        assert!(host_input.try_recv().is_err());
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.client_focused_pane(1), Some((0, foreground_pane)));
+        assert_eq!(server.client_focused_pane(2), Some((0, background_pane)));
+        assert_eq!(
+            server.app.state.focused_terminal_pane_id(0),
+            Some(foreground_pane)
+        );
+        assert_eq!(server.app.state.mode, app::Mode::Terminal);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn pane_local_omp_keeps_host_runtime_chrome_input_and_scrollback() {
+        let mut server = test_headless_server();
+        server.independent_omp_renderers_enabled = false;
+        let mut workspace = crate::workspace::Workspace::test_new("pane-local-omp");
+        let omp_pane = workspace.tabs[0].root_pane;
+        workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let other_pane = workspace.tabs[0]
+            .layout
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id| *pane_id != omp_pane)
+            .expect("split pane");
+        workspace.tabs[0].layout.focus_pane(omp_pane);
+        let terminal_id = workspace.terminal_id(omp_pane).unwrap().clone();
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let mut output = Vec::new();
+        for line in 0..80 {
+            output.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        output.extend_from_slice(b"LIVE OMP\r\n");
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 4096, &output, 8,
+            );
+        runtime.test_set_child_pid(4242);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (writer, control_rx, render_rx) = test_client_writer();
+        let mut client = test_identity_client(Some("Ada"), Some(writer));
+        client.omp_renderer_capabilities.client_local_native = true;
+        server.clients.insert(1, client);
+        server.foreground_client_id = Some(1);
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route, "session", 1);
+
+        assert!(server.clients[&1].omp_renderer_target.is_none());
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(server.private_omp_pending_routes.is_empty());
+        assert!(control_rx.try_recv().is_err());
+        server.render_and_stream();
+        let frame = read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let text = frame_text(&frame);
+        assert!(text.contains("LIVE OMP"));
+        assert!(!text.contains("native renderer"));
+
+        let inner = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == omp_pane)
+            .expect("OMP pane info")
+            .inner_rect;
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: inner.x,
+                    row: inner.y,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        ));
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .scroll_metrics()
+                .unwrap()
+                .offset_from_bottom,
+            server.app.state.mouse_scroll_lines
+        );
+        assert!(host_input.try_recv().is_err());
+
+        let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert!(server.handle_client_input_events(1, vec![ordinary_key]));
+        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"x");
+        let prefix = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            server.app.state.prefix_code,
+            server.app.state.prefix_mods,
+        ));
+        assert!(server.handle_client_input_events(1, vec![prefix]));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        server.render_and_stream();
+        let prefix_frame =
+            read_server_frame(render_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        assert!(frame_text(&prefix_frame).contains("LIVE OMP"));
+
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(other_pane);
+        assert!(!server.reconcile_omp_renderers());
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(omp_pane);
+        assert!(!server.reconcile_omp_renderers());
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .child_pid(),
+            Some(4242)
+        );
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn native_bound_app_masks_host_pane_and_consumes_terminal_input() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-omp");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        let host_uri = "https://example.com/host";
+        let (runtime, mut host_input) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                format!("HOST PTY \x1b]8;;{host_uri}\x1b\\HOST LINK\x1b]8;;\x1b\\").as_bytes(),
+                8,
+            );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
+        let (app_writer, app_control, app_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::App,
+                None,
+                Some("Ada".into()),
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                false,
+                Some(app_writer),
+            ),
+        );
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .omp_renderer_capabilities
+            .client_local_native = true;
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 80, 24),
+            inner_rect: Rect::new(0, 0, 80, 24),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _host_peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(8);
+        assert!(server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 1,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        }));
+        let renderer_launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        assert_eq!(server.client_focused_pane(1), Some((0, pane_id)));
+        assert!(server.clients[&1].private_omp_guest.is_some());
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.clients[&1].private_omp_guest.is_some());
+        while app_control.try_recv().is_ok() {}
+        server
+            .clients
+            .get_mut(&1)
+            .expect("app client")
+            .graphics_cache
+            .test_mark_non_empty();
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+        }));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert_eq!(
+            server.clients[&1].graphics_cache.test_image_count(),
+            1,
+            "pane-scoped activation must preserve unrelated cached graphics"
+        );
+        server
+            .clients
+            .get_mut(&1)
+            .expect("app client")
+            .graphics_cache
+            .test_mark_non_empty();
+        let early_authority_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("active native target")
+            .authority_revision;
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert!(
+            !server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: early_authority_revision,
+                frame_nonce: [0; 16],
+            })
+        );
+
+        server.render_and_stream();
+        let frame = read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
+        let text = frame_text(&frame);
+        assert!(text.contains("OMP is open in its native renderer"));
+        assert!(!text.contains("HOST PTY"));
+        assert!(!frame.hyperlinks.iter().any(|link| link == host_uri));
+        assert_eq!(frame.cursor, None);
+        let projection = frame.omp_renderer.expect("exact native pane projection");
+        assert_eq!(projection.launch_id, renderer_launch_id);
+        assert_eq!(
+            projection.pane,
+            Some(crate::protocol::OmpRendererPane {
+                x: server.app.state.view.pane_infos[0].inner_rect.x,
+                y: server.app.state.view.pane_infos[0].inner_rect.y,
+                width: server.app.state.view.pane_infos[0].inner_rect.width,
+                height: server.app.state.view.pane_infos[0].inner_rect.height,
+                scrollback_limit_bytes: u64::try_from(server.app.state.pane_scrollback_limit_bytes)
+                    .unwrap_or(u64::MAX),
+            })
+        );
+        assert!(projection.focused);
+        assert!(projection.surface_active);
+        assert!(!projection.server_owned_overlay);
+        assert_eq!(
+            server
+                .graphics_excluded_omp_pane_info(1)
+                .map(|info| info.id),
+            Some(pane_id)
+        );
+
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "native overlay".into(),
+            context: "server owned".into(),
+            position: None,
+            target: None,
+        });
+        assert!(server.graphics_excluded_omp_pane_info(1).is_none());
+        server.render_and_stream();
+        let overlay_frame =
+            read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
+        assert!(
+            overlay_frame
+                .omp_renderer
+                .expect("overlay projection")
+                .server_owned_overlay
+        );
+        let overlay_text = frame_text(&overlay_frame);
+        assert!(overlay_text.contains("native overlay"));
+        assert!(overlay_text.contains("HOST PTY"));
+        server.app.state.toast = None;
+        let _ = server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('o'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        });
+        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"o");
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "native overlay".into(),
+            context: "server owned".into(),
+            position: None,
+            target: None,
+        });
+        let leased_key = crate::input::TerminalKey::new(KeyCode::Char('k'), KeyModifiers::empty())
+            .with_vt_bytes(b"\x1b[107;1:1u".to_vec());
+        let leased_identity = leased_key.identity();
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(leased_key.clone())],
+        );
+        assert_eq!(host_input.try_recv().unwrap().as_ref(), b"k");
+        assert!(server.clients[&1]
+            .native_omp_server_keys
+            .contains(&leased_identity));
+
+        server.app.state.toast = None;
+        assert_eq!(
+            server
+                .graphics_excluded_omp_pane_info(1)
+                .map(|info| info.id),
+            Some(pane_id)
+        );
+        server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                leased_key.with_kind(KeyEventKind::Release),
+            )],
+        );
+        assert!(server.clients[&1].native_omp_server_keys.is_empty());
+        server.render_and_stream();
+        let resumed_frame =
+            read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
+        assert!(
+            !resumed_frame
+                .omp_renderer
+                .expect("resumed projection")
+                .server_owned_overlay
+        );
+        assert!(frame_text(&resumed_frame).contains("OMP is open in its native renderer"));
+        let authority_revision = projection.authority_revision;
+        let frame_nonce = projection.frame_nonce;
+        let unacked_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('u'),
+            KeyModifiers::empty(),
+        ));
+        let (remaining, consumed, authority_changed) =
+            server.partition_native_omp_input(1, vec![unacked_key]);
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert!(matches!(
+            remaining.as_slice(),
+            [crate::raw_input::RawInputEvent::Key(_)]
+        ));
+        assert!(
+            !server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: authority_revision.saturating_sub(1),
+                frame_nonce,
+            })
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision,
+                frame_nonce,
+            })
+        );
+        assert!(
+            !frame.graphics.is_empty(),
+            "stale target graphics need cleanup bytes"
+        );
+        assert!(server.clients[&1].graphics_cache.is_empty());
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 120,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let resized_revision = {
+            let resized_target = server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .expect("resized native target");
+            assert_ne!(resized_target.authority_revision, authority_revision);
+            assert!(!resized_target.input_authority_acked);
+            resized_target.authority_revision
+        };
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                },
+            )],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1, "resize click waits for the new frame");
+
+        server.render_and_stream();
+        let resized_frame =
+            read_server_frame(app_render.recv_timeout(Duration::from_millis(100)).unwrap());
+        let resized_projection = resized_frame
+            .omp_renderer
+            .expect("resized projection frame");
+        assert_eq!(resized_projection.authority_revision, resized_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                client_id: 1,
+                launch_id: renderer_launch_id,
+                authority_revision: resized_projection.authority_revision,
+                frame_nonce: resized_projection.frame_nonce,
+            })
+        );
+
+        let ordinary_key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert!(server.handle_client_input_events(1, vec![ordinary_key]));
+        assert!(host_input.try_recv().is_err());
+        assert!(server.handle_client_input_events(
+            1,
+            vec![
+                crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new("text")),
+                crate::raw_input::RawInputEvent::Paste("paste".into()),
+                crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::empty(),
+                }),
+            ]
+        ));
+        assert!(host_input.try_recv().is_err());
+        let prefix = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            server.app.state.prefix_code,
+            server.app.state.prefix_mods,
+        ));
+        assert!(server.handle_client_input_events(1, vec![prefix]));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        shutdown_test_runtimes(&mut server);
+    }
+    #[tokio::test]
+    async fn native_renderer_detach_waits_for_private_bridge_before_releasing_target() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-detach");
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.clients.get_mut(&1).unwrap().renderer_binding_token = Some("binding".into());
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .omp_renderer_capabilities
+            .client_local_native = true;
+        server.private_omp_test_executable = None;
+        server.private_omp_executable = Some(crate::update::OmpExecutable::Explicit(
+            std::env::current_exe().expect("locate the headless test executable"),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _host_peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(8);
+        assert!(server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 1,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        }));
+        assert!(server.clients[&1].private_omp_guest.is_some());
+        assert!(server.private_omp_executable.is_some());
+        assert!(server.private_omp_resolving.is_none());
+        let renderer_launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.omp_service.app_has_native_renderer(1));
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+        }));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(server.private_omp_executable.is_some());
+        assert!(server.private_omp_resolving.is_none());
+
+        assert!(server.handle_server_event(ServerEvent::OmpPaneDetach {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            attachment_epoch: 1,
+        }));
+        let private_guest = server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("native detach restores the App private guest immediately");
+        assert_eq!(private_guest.route().pane_id, route);
+        let private_guest_pane = private_guest.runtime_pane_id();
+        let private_route = private_guest.route().clone();
+        assert!(server.private_omp_executable.is_some());
+        assert!(server.private_omp_resolving.is_none());
+        let native_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("native target stays active while the fallback bridge connects");
+        assert!(native_target.bound);
+        assert!(native_target.ready);
+        assert!(native_target.surface_active);
+        assert_eq!(
+            server.private_omp_pending_routes.get(&1),
+            Some(&private_route)
+        );
+
+        server.clients[&1]
+            .private_omp_guest
+            .as_ref()
+            .expect("private guest")
+            .test_set_bridge_ready();
+        assert!(server.drain_private_omp_guest_records());
+        let fallback_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("renderer target after fallback readiness");
+        assert!(!fallback_target.bound);
+        assert!(!fallback_target.ready);
+        assert!(!fallback_target.surface_active);
+        assert!(!server.private_omp_pending_routes.contains_key(&1));
+
+        assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 2 }));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("connection detach leaves the restored guest intact")
+                .runtime_pane_id(),
+            private_guest_pane
+        );
+        assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 2 }));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .expect("repeated connection detach does not spawn another guest")
+                .runtime_pane_id(),
+            private_guest_pane
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn native_renderer_survives_focus_changes_for_same_live_route() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("native-focus");
+        let omp_pane = workspace.tabs[0].root_pane;
+        let other_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(omp_pane);
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+
+        let (app_writer, _app_control, _app_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::App,
+                None,
+                Some("Ada".into()),
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                false,
+                Some(app_writer),
+            ),
+        );
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .omp_renderer_capabilities
+            .client_local_native = true;
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let (_host, _host_messages) = start_test_omp_host(&mut server, route.clone(), "session", 1);
+        let renderer_launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers the focused native route")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.clone(),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(renderer_launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(other_pane);
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id: renderer_launch_id,
+        }));
+        let background_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("retained native renderer target");
+        assert_eq!(background_target.launch_id, renderer_launch_id);
+        assert_eq!(
+            background_target.route.as_ref(),
+            Some(&HeadlessServer::omp_renderer_route(&OmpRouteKey {
+                pane_id: route.clone(),
+                omp_session_id: "session".into(),
+                route_generation: 1,
+            }))
+        );
+        assert!(background_target.bound);
+        assert!(background_target.ready);
+        assert!(!background_target.surface_active);
+        assert!(server.omp_service.app_has_native_renderer(1));
+
+        server.app.state.workspaces[0].tabs[0]
+            .layout
+            .focus_pane(omp_pane);
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let refocused_target = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("refocused native renderer target");
+        assert_eq!(refocused_target.launch_id, renderer_launch_id);
+        assert!(refocused_target.bound);
+        assert!(refocused_target.ready);
+        assert!(refocused_target.surface_active);
+        assert!(server.omp_service.app_has_native_renderer(1));
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn server_owned_native_mouse_gesture_routes_tail_and_reoffers_authority() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("native-mouse-gesture");
+        let pane_id = workspace.tabs[0].root_pane;
+        let route = OmpRouteKey {
+            pane_id: crate::workspace::public_pane_id_for_number(&workspace.id, 1),
+            omp_session_id: "session".into(),
+            route_generation: 1,
+        };
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, 1),
+            inner_rect: Rect::new(0, 0, 40, 1),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        let mut client = test_identity_client(Some("Ada"), None);
+        client.renderer_binding_token = Some("binding".into());
+        client.omp_renderer_capabilities.client_local_native = true;
+        client.cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        client.host_sgr_pixels_active = Some(true);
+        server.clients.insert(1, client);
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_mode(
+                ClientConnectionMode::OmpPane,
+                None,
+                None,
+                Some("profile".into()),
+                Some("binding".into()),
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                false,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        let (_host, _host_messages) =
+            start_test_omp_host(&mut server, route.pane_id.clone(), "session", 1);
+        let launch_id = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .expect("server offers native renderer")
+            .launch_id;
+        assert!(server.handle_server_event(ServerEvent::OmpPaneAttach {
+            client_id: 2,
+            pane_id: route.pane_id.clone(),
+            omp_session_id: route.omp_session_id.clone(),
+            route_generation: route.route_generation,
+            target_app_client_id: Some(1),
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities {
+                client_local_native: true,
+            },
+            renderer_launch_id: Some(launch_id),
+            renderer_request: crate::protocol::OmpRendererRequest::Independent,
+        }));
+        assert!(server.handle_server_event(ServerEvent::OmpRendererReady {
+            client_id: 1,
+            launch_id,
+        }));
+        let acknowledge_current = |server: &mut HeadlessServer| {
+            let projection = server
+                .native_omp_frame_projection(1)
+                .expect("matching native authority frame");
+            let revision = projection.authority_revision;
+            assert!(
+                server.handle_server_event(ServerEvent::OmpRendererAuthorityAck {
+                    client_id: 1,
+                    launch_id,
+                    authority_revision: revision,
+                    frame_nonce: projection.frame_nonce,
+                })
+            );
+            revision
+        };
+        let stale_revision = acknowledge_current(&mut server);
+        let mouse = |kind, column| {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        server.app.state.view.pane_infos[0].inner_rect.width = 50;
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), 45)],
+        );
+        assert!(!consumed);
+        assert!(authority_changed);
+        assert_eq!(remaining.len(), 1);
+        let reoffered = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_ne!(reoffered.authority_revision, stale_revision);
+        assert!(!reoffered.input_authority_acked);
+        assert_eq!(server.clients[&1].omp_renderer_frame_nonce, None);
+        assert_eq!(server.clients[&1].omp_renderer_frame_pane, None);
+        server.app.state.view.pane_infos[0].inner_rect.width = 40;
+        let first_revision = acknowledge_current(&mut server);
+
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), 60)],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Left,
+                launch_id,
+                first_revision,
+                false,
+            ))
+        );
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![
+                mouse(MouseEventKind::Down(MouseButton::Right), 60),
+                mouse(MouseEventKind::Up(MouseButton::Left), 1),
+            ],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                first_revision,
+                false,
+            ))
+        );
+
+        let (remaining, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![
+                mouse(MouseEventKind::Drag(MouseButton::Right), 1),
+                mouse(MouseEventKind::Up(MouseButton::Right), 1),
+                crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::empty(),
+                )),
+            ],
+        );
+        assert!(!consumed);
+        assert!(authority_changed);
+        assert_eq!(
+            remaining.len(),
+            3,
+            "the complete post-Up suffix stays serverward"
+        );
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let second_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(second_revision, first_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+
+        assert_eq!(acknowledge_current(&mut server), second_revision);
+        let server_owned_events_revision = second_revision;
+        let server_mouse = |kind| crate::protocol::ClientInputEvent::Mouse {
+            kind,
+            column: 60,
+            row: 0,
+            modifiers: 0,
+        };
+        let _ = server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+            client_id: 1,
+            events: vec![server_mouse(crate::protocol::ClientMouseKind::Down(
+                crate::protocol::ClientMouseButton::Left,
+            ))],
+        });
+        assert!(server.clients[&1].native_omp_server_mouse_gesture.is_some());
+        assert_eq!(
+            server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .authority_revision,
+            server_owned_events_revision
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Left,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                ],
+            })
+        );
+        let explicit_right_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(explicit_right_revision, server_owned_events_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                explicit_right_revision,
+                false,
+            ))
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle,
+                    )),
+                ],
+            })
+        );
+        let explicit_middle_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(explicit_middle_revision, explicit_right_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                explicit_middle_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), explicit_middle_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
+                    crate::protocol::ClientMouseButton::Middle,
+                ))],
+            })
+        );
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let server_owned_pixels_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(server_owned_pixels_revision, explicit_middle_revision);
+        assert_eq!(
+            acknowledge_current(&mut server),
+            server_owned_pixels_revision
+        );
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let _ = server.handle_server_event(ServerEvent::ServerOwnedInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;601;1M".to_vec(),
+            geometry,
+        });
+        assert!(server.clients[&1].native_omp_server_mouse_gesture.is_some());
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputPixels {
+                client_id: 1,
+                data: b"\x1b[<0;601;1m".to_vec(),
+                geometry,
+            })
+        );
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let focus_loss_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(focus_loss_revision, server_owned_pixels_revision);
+        assert_eq!(acknowledge_current(&mut server), focus_loss_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
+                    crate::protocol::ClientInputEvent::Key {
+                        code: crate::protocol::ClientKeyCode::Char('x'),
+                        modifiers: 0,
+                        kind: crate::protocol::ClientKeyKind::Press,
+                        repeat_count: 1,
+                        generated_text: None,
+                        source: crate::protocol::ClientKeySource::Vt {
+                            bytes: b"\x1b[120;1:1u".to_vec(),
+                        },
+                    },
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Left,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Up(
+                        crate::protocol::ClientMouseButton::Left,
+                    )),
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Right,
+                    )),
+                ],
+            })
+        );
+        let focus_pending_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(focus_pending_revision, focus_loss_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        assert!(!server.clients[&1].native_omp_server_keys.is_empty());
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                focus_pending_revision,
+                false,
+            ))
+        );
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![
+                    crate::protocol::ClientInputEvent::FocusLost,
+                    crate::protocol::ClientInputEvent::FocusGained,
+                    server_mouse(crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle,
+                    )),
+                ],
+            })
+        );
+        assert!(server.clients[&1].native_omp_server_keys.is_empty());
+        let focus_suffix_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(focus_suffix_revision, focus_pending_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                focus_suffix_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), focus_suffix_revision);
+        assert!(
+            server.handle_server_event(ServerEvent::ServerOwnedInputEvents {
+                client_id: 1,
+                events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
+                    crate::protocol::ClientMouseButton::Middle,
+                ))],
+            })
+        );
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let ordinary_pixel_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(ordinary_pixel_revision, focus_suffix_revision);
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+
+        assert_eq!(acknowledge_current(&mut server), ordinary_pixel_revision);
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;601;1M".to_vec(),
+            geometry,
+        });
+        assert!(server.clients[&1].native_omp_server_mouse_gesture.is_some());
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;601;1m".to_vec(),
+            geometry,
+        }));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let reoffered = server.clients[&1].omp_renderer_target.as_ref().unwrap();
+        assert_ne!(reoffered.authority_revision, ordinary_pixel_revision);
+        assert!(!reoffered.input_authority_acked);
+        let pixel_revision = acknowledge_current(&mut server);
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .native_omp_server_mouse_gesture = Some(NativeOmpServerGesture::new(
+            MouseButton::Left,
+            launch_id,
+            pixel_revision,
+            true,
+        ));
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<2;601;1M".to_vec(),
+            geometry,
+        });
+        assert_eq!(
+            server.clients[&1]
+                .native_omp_server_mouse_gesture
+                .as_ref()
+                .unwrap()
+                .buttons,
+            HashSet::from([MouseButton::Left, MouseButton::Right])
+        );
+        let _ = server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<0;11;1m".to_vec(),
+            geometry,
+        });
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                pixel_revision,
+                true,
+            ))
+        );
+        assert_eq!(
+            server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .authority_revision,
+            pixel_revision
+        );
+        server.clients.get_mut(&1).unwrap().host_sgr_pixels_active = Some(false);
+        assert!(server.handle_server_event(ServerEvent::ClientInputPixels {
+            client_id: 1,
+            data: b"\x1b[<2;11;1m".to_vec(),
+            geometry,
+        }));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+
+        let ordinary_outside_revision = acknowledge_current(&mut server);
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                )),
+                crate::protocol::ClientInputEvent::FocusLost,
+                crate::protocol::ClientInputEvent::FocusGained,
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Right,
+                )),
+            ],
+        }));
+        let ordinary_suffix_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(ordinary_suffix_revision, ordinary_outside_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                ordinary_suffix_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), ordinary_suffix_revision);
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
+                crate::protocol::ClientMouseButton::Right,
+            ))],
+        }));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+
+        let ordinary_final_up_revision = acknowledge_current(&mut server);
+        let _ = server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![server_mouse(crate::protocol::ClientMouseKind::Down(
+                crate::protocol::ClientMouseButton::Left,
+            ))],
+        });
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Left,
+                launch_id,
+                ordinary_final_up_revision,
+                false,
+            ))
+        );
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                server_mouse(crate::protocol::ClientMouseKind::Up(
+                    crate::protocol::ClientMouseButton::Left,
+                )),
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Right,
+                )),
+            ],
+        }));
+        let ordinary_followon_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(ordinary_followon_revision, ordinary_final_up_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Right,
+                launch_id,
+                ordinary_followon_revision,
+                false,
+            ))
+        );
+        assert!(
+            !server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .input_authority_acked
+        );
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                server_mouse(crate::protocol::ClientMouseKind::Up(
+                    crate::protocol::ClientMouseButton::Right,
+                )),
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Middle,
+                )),
+            ],
+        }));
+        let ordinary_middle_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(ordinary_middle_revision, ordinary_followon_revision);
+        assert_eq!(
+            server.clients[&1].native_omp_server_mouse_gesture,
+            Some(NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                ordinary_middle_revision,
+                false,
+            ))
+        );
+        assert_eq!(acknowledge_current(&mut server), ordinary_middle_revision);
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![server_mouse(crate::protocol::ClientMouseKind::Up(
+                crate::protocol::ClientMouseButton::Middle,
+            ))],
+        }));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let current_unacked_revision = server.clients[&1]
+            .omp_renderer_target
+            .as_ref()
+            .unwrap()
+            .authority_revision;
+        assert_ne!(current_unacked_revision, ordinary_middle_revision);
+        assert!(!server.reoffer_native_omp_input_authority(
+            1,
+            NativeOmpServerGesture::new(
+                MouseButton::Middle,
+                launch_id,
+                ordinary_middle_revision,
+                false,
+            ),
+        ));
+        assert_eq!(
+            server.clients[&1]
+                .omp_renderer_target
+                .as_ref()
+                .unwrap()
+                .authority_revision,
+            current_unacked_revision
+        );
+
+        let third_revision = acknowledge_current(&mut server);
+        let (_, consumed, authority_changed) = server.partition_native_omp_input(
+            1,
+            vec![mouse(MouseEventKind::Down(MouseButton::Left), u16::MAX)],
+        );
+        assert!(!consumed);
+        assert!(!authority_changed);
+        let mut inactive = server.clients[&1].omp_renderer_target.clone().unwrap();
+        assert_eq!(inactive.authority_revision, third_revision);
+        inactive.surface_active = false;
+        assert!(server.update_omp_renderer_target(1, inactive));
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        let (remaining, consumed, authority_changed) = server
+            .partition_native_omp_input(1, vec![mouse(MouseEventKind::Up(MouseButton::Left), 1)]);
+        assert!(!consumed);
+        assert!(!authority_changed);
+        assert_eq!(remaining.len(), 1);
+        server.app.state.mode = crate::app::Mode::Prefix;
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('x'),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Vt {
+                        bytes: b"\x1b[120;1:1u".to_vec(),
+                    },
+                },
+                server_mouse(crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                )),
+                crate::protocol::ClientInputEvent::FocusLost,
+            ],
+        }));
+        assert!(server.clients[&1].native_omp_server_keys.is_empty());
+        assert_eq!(server.clients[&1].native_omp_server_mouse_gesture, None);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[cfg(unix)]
+    fn live_omp_route(server: &mut HeadlessServer) -> std::net::TcpStream {
+        let pane_id = "w1:p1".to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+            .expect("connect OMP host peer");
+        let (socket, _) = listener.accept().expect("accept OMP host peer");
+        let (outbound, _outbound_rx) = std::sync::mpsc::sync_channel(1);
+        assert!(!server.handle_server_event(ServerEvent::OmpHostStarted {
+            pane_id,
+            omp_session_id: "session".into(),
+            route_generation: 1,
+            host_id: 1,
+            outbound,
+            socket,
+            admission: test_host_admission_sender(),
+        }));
+        peer
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_rejects_live_omp_routes_without_side_effects() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), Some(writer)));
+        server.foreground_client_id = Some(1);
+        let mut host = live_omp_route(&mut server);
+
+        let error = server
+            .perform_live_handoff(api::schema::ServerLiveHandoffParams::default())
+            .expect_err("live OMP route must block handoff");
+        assert_eq!(
+            error.to_string(),
+            "live handoff is unavailable while OMP host routes are live; restart Herdr normally"
+        );
+        assert!(!server.handoff_in_progress);
+        assert!(server.clients.contains_key(&1));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert!(
+            control_rx.try_recv().is_err(),
+            "client must not be disconnected"
+        );
+        host.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert!(
+            matches!(host.read(&mut [0]), Err(error) if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_rejects_running_plugin_commands() {
+        let mut server = test_headless_server();
+        server.app.state.plugin_commands_in_flight = 1;
+
+        let error = server
+            .authorize_live_handoff()
+            .expect_err("running plugin command must block handoff");
+
+        assert_eq!(
+            error.to_string(),
+            "live handoff is unavailable while plugin commands are running; wait for them to finish or restart Herdr normally"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_authorization_allows_no_omp_routes() {
+        let server = test_headless_server();
+        assert!(server.authorize_live_handoff().is_ok());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_handoff_rejects_an_unready_ssh_pane() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("remote-starting");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .execution_target = crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+        let (runtime, _input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.set_remote_execution_ready_for_test(false);
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let error = server
+            .authorize_live_handoff()
+            .expect_err("unready SSH pane must block handoff");
+        assert!(error
+            .to_string()
+            .contains("is still starting; wait for it to become ready and retry"));
+
+        server
+            .app
+            .terminal_runtimes
+            .values()
+            .next()
+            .unwrap()
+            .set_remote_execution_ready_for_test(true);
+        assert!(server.authorize_live_handoff().is_ok());
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[test]
+    fn live_handoff_event_drain_stops_at_the_queued_snapshot() {
+        let mut server = test_headless_server();
+        assert_eq!(server.app.event_rx.len(), 0);
+        for index in 0..crate::app::APP_EVENT_CHANNEL_CAPACITY {
+            server
+                .app
+                .event_tx
+                .try_send(AppEvent::UpdateReady {
+                    version: format!("queued-{index}"),
+                    install_command: "herdr update".into(),
+                })
+                .unwrap();
+        }
+        let event_tx = server.app.event_tx.clone();
+        let producer = std::thread::spawn(move || {
+            while event_tx.capacity() == 0 {
+                std::thread::yield_now();
+            }
+            event_tx
+                .blocking_send(AppEvent::UpdateReady {
+                    version: "after-snapshot".into(),
+                    install_command: "herdr update".into(),
+                })
+                .unwrap();
+        });
+
+        server.drain_internal_event_snapshot_with_forwarding();
+        producer.join().unwrap();
+
+        assert_eq!(server.app.event_rx.len(), 1);
+        assert!(matches!(
+            server.app.event_rx.try_recv(),
+            Ok(AppEvent::UpdateReady { version, .. }) if version == "after-snapshot"
+        ));
+    }
+
+    #[test]
+    fn oversized_private_guest_frame_is_rejected_instead_of_dropped() {
+        let payload = format!("\"{}\"", "x".repeat(crate::protocol::MAX_OMP_FRAME_PAYLOAD));
+        let frame: Box<serde_json::value::RawValue> = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(
+            HeadlessServer::encode_private_omp_guest_frame(&frame),
+            Err(protocol::OmpFrameError::Oversized { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_stop_reconciles_private_guest_to_started_replacement() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("private-omp-replacement");
+        let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.ensure_test_terminals();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+
+        let mut host_receivers = Vec::new();
+        let mut host_started = |host_id, session: &str| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind OMP host listener");
+            let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap())
+                .expect("connect OMP host peer");
+            let (socket, _) = listener.accept().expect("accept OMP host peer");
+            let (outbound, outbound_rx) = std::sync::mpsc::sync_channel(8);
+            host_receivers.push(outbound_rx);
+            ServerEvent::OmpHostStarted {
+                pane_id: route.clone(),
+                omp_session_id: session.into(),
+                route_generation: 1,
+                host_id,
+                outbound,
+                socket,
+                admission: test_host_admission_sender(),
+            }
+        };
+
+        assert!(server.handle_server_event(host_started(1, "old")));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .unwrap()
+                .route()
+                .omp_session_id,
+            "old"
+        );
+        assert!(!server.handle_server_event(host_started(2, "replacement")));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .unwrap()
+                .route()
+                .omp_session_id,
+            "old",
+            "deterministic ordering keeps the selected route while both are live"
+        );
+
+        assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
+            pane_id: route,
+            omp_session_id: "old".into(),
+            route_generation: 1,
+            host_id: 1,
+        }));
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .unwrap()
+                .route()
+                .omp_session_id,
+            "replacement",
+            "stopping the selected live route immediately attaches its replacement"
+        );
+    }
     fn pane_updated_events(event_hub: &api::EventHub) -> usize {
         event_hub
             .events_after(0)
@@ -5601,6 +13386,7 @@ mod tests {
                     id: "headless_stop_after_events".into(),
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -5783,9 +13569,8 @@ mod tests {
             Some(Some("herd".to_string()))
         );
 
-        // ClientConnected assigns the foreground client directly rather than
-        // going through promote_client_to_foreground, so the cache must notice
-        // the new client on its own.
+        // A newly foreground client must receive the current title even when
+        // the title itself has not changed.
         let (client_tx, second_control_rx, _render_rx) = test_client_writer();
         server.clients.insert(
             2,
@@ -6003,6 +13788,136 @@ mod tests {
         )
     }
 
+    fn notification_activation_test_server() -> (HeadlessServer, String, crate::layout::PaneId) {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("activation");
+        let target_tab = workspace.test_add_tab(Some("target"));
+        let target_pane = workspace.tabs[target_tab].root_pane;
+        let workspace_id = workspace.id.clone();
+        server.app.state.workspaces =
+            vec![workspace, crate::workspace::Workspace::test_new("other")];
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = app::Mode::Navigator;
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "done".to_owned(),
+            context: "context".to_owned(),
+            position: None,
+            target: None,
+        });
+        server.app.toast_deadline = Some(Instant::now());
+
+        let (target_writer, _target_control, _target_render) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(target_writer),
+            ),
+        );
+        let (foreground_writer, _foreground_control, _foreground_render) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_writer),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        (server, workspace_id, target_pane)
+    }
+    fn notification_activation_event(
+        activation: protocol::NotificationActivation,
+    ) -> (ServerEvent, std::sync::mpsc::Receiver<bool>) {
+        let (respond_to, response) = std::sync::mpsc::channel();
+        (
+            ServerEvent::NotificationActivated {
+                activation,
+                respond_to,
+            },
+            response,
+        )
+    }
+
+    #[test]
+    fn notification_activation_promotes_and_focuses_its_target() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: target_pane.raw(),
+        });
+        assert!(server.handle_server_event(event));
+        assert!(response.recv().expect("processed activation result"));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(server.app.state.active, Some(0));
+        assert_eq!(server.app.state.mode, app::Mode::Terminal);
+        assert!(server.app.state.toast.is_none());
+        assert!(server.app.toast_deadline.is_none());
+        assert_eq!(
+            server.app.state.workspaces[0].focused_pane_id(),
+            Some(target_pane)
+        );
+    }
+
+    #[test]
+    fn stale_or_mismatched_notification_activation_is_ignored() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 99,
+            workspace_id: workspace_id.clone(),
+            pane_id: target_pane.raw(),
+        });
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("stale client rejection"));
+
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: crate::layout::PaneId::alloc().raw(),
+        });
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("stale pane rejection"));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (80, 24));
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.app.state.mode, app::Mode::Navigator);
+        assert!(server.app.state.toast.is_some());
+    }
+    #[test]
+    fn live_handoff_rejects_notification_activation() {
+        let (mut server, workspace_id, target_pane) = notification_activation_test_server();
+        server.handoff_in_progress = true;
+        let (event, response) = notification_activation_event(protocol::NotificationActivation {
+            recipient_client_id: 1,
+            workspace_id,
+            pane_id: target_pane.raw(),
+        });
+
+        assert!(!server.handle_server_event(event));
+        assert!(!response.recv().expect("handoff rejection"));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.app.state.mode, app::Mode::Navigator);
+    }
+
     fn retained_test_server(
         initial_screen: &[u8],
     ) -> (
@@ -6183,6 +14098,11 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: true,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_a,
         }));
         assert!(server.clients[&1].direct_graphics);
@@ -6200,6 +14120,11 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_b,
         }));
         assert!(!server.direct_graphics_available());
@@ -6230,6 +14155,11 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_a,
         }));
         assert_eq!(
@@ -6255,6 +14185,11 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6296,6 +14231,11 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -6310,6 +14250,11 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6329,7 +14274,7 @@ new_tab = "prefix+t"
                 .unwrap_or(0)
         ));
         std::fs::write(&path, "onboarding = false\n").unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -6354,6 +14299,11 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: Some("Test".into()),
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6401,7 +14351,7 @@ next_tab = ""
             "onboarding = false\n[keys]\nnew_workspace = \"x\"\n[ui.toast]\ndelivery = \"off\"\n",
         )
         .unwrap();
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut server = test_headless_server();
@@ -6430,6 +14380,11 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: Some("Test".into()),
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6451,6 +14406,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer: writer_b,
         }));
         assert_eq!(
@@ -6486,6 +14446,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -6552,6 +14517,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         control_rx
@@ -6966,6 +14936,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
 
@@ -7001,6 +14976,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
 
@@ -7035,6 +15015,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         assert!(server.has_app_client());
@@ -7136,6 +15121,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         assert!(
@@ -7147,12 +15137,57 @@ next_tab = ""
         );
         assert_eq!(server.terminal_attach_owners.get(&terminal_id), Some(&7));
 
-        assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneDied { pane_id }));
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                child_pid: None,
+            })
+        );
 
         assert!(!server.clients.contains_key(&7));
         assert!(!server.terminal_attach_owners.contains_key(&terminal_id));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(reason, Some(format!("terminal {terminal_id} exited")));
+    }
+    #[tokio::test]
+    async fn stale_pane_died_does_not_publish_exit_for_replacement_runtime() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("replacement");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Codex);
+        terminal.state = crate::detect::AgentState::Working;
+        let (runtime, _input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(202);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id,
+                child_pid: Some(101),
+            })
+        );
+
+        assert!(server.app.find_pane(pane_id).is_some());
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Working
+        );
+        assert_eq!(
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .and_then(crate::terminal::TerminalRuntime::child_pid),
+            Some(202)
+        );
+        shutdown_test_runtimes(&mut server);
     }
 
     #[test]
@@ -7487,6 +15522,350 @@ next_tab = ""
                     )
             }));
     }
+    #[tokio::test]
+    async fn headless_scheduled_tasks_advance_findr_scrollback_scan_without_requesting_render() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let scrollback = (0..5_000)
+            .map(|row| format!("needle {row}\r\n"))
+            .collect::<String>();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                128 * 1024,
+                scrollback.as_bytes(),
+            ),
+        );
+        let now = Instant::now();
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.scrollback = true;
+        findr.scan_end_row_exclusive = 5_001;
+        findr.visible_range = Some((4_977, 5_001));
+        findr.visible_geometry = Some((80, 24));
+        findr.complete = false;
+        server.app.state.findr = Some(findr);
+        server.app.findr_scan_deadline = Some(now);
+
+        assert!(!server.handle_scheduled_tasks_headless(now, false));
+
+        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        assert!(findr.scan_end_row_exclusive < 5_001);
+        assert!(findr.scan_end_row_exclusive > 0);
+        assert!(!findr.complete);
+        assert_eq!(
+            server.app.findr_scan_deadline,
+            Some(now + crate::app::state::FINDR_SCAN_INTERVAL)
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+    #[tokio::test]
+    async fn headless_render_refreshes_visible_findr_after_foreground_reflow() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"needle"),
+        );
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        findr.visible_geometry = Some((80, 24));
+        server.app.state.findr = Some(findr);
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        server.render_and_stream();
+
+        let findr = server.app.state.findr.as_ref().expect("Findr state");
+        let info = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("pane info");
+        assert_eq!(
+            findr.visible_geometry,
+            Some((info.inner_rect.width, info.inner_rect.height))
+        );
+        assert_ne!(findr.visible_geometry, Some((80, 24)));
+        assert_eq!(findr.matches.len(), 1);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn background_client_render_does_not_replace_foreground_findr_geometry() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("findr-clients");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let mut scrollback = (0..30)
+            .map(|row| format!("before {row}\r\n"))
+            .collect::<String>();
+        scrollback.push_str("needle-old\r\n");
+        scrollback.extend((0..29).map(|row| format!("after {row}\r\n")));
+        scrollback.push_str("needle-current");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Findr;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                scrollback.as_bytes(),
+            ),
+        );
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        server.app.state.findr = Some(findr);
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.findr = None;
+        server.app.state.mode = app::Mode::Terminal;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+
+        let (background_writer, _background_control, background_render) = test_client_writer();
+        let mut background = ClientConnection::new(
+            (80, 80),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        let mut foreground = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
+        );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        assert!(server.app.refresh_findr_visible_if_needed(&HashSet::new()));
+        let foreground_findr = server.app.state.findr.clone().expect("Findr state");
+        let foreground_geometry = foreground_findr
+            .visible_geometry
+            .expect("foreground geometry");
+        let foreground_matches = foreground_findr.matches.len();
+        assert_eq!(
+            foreground_matches, 1,
+            "only the current match is foreground-visible"
+        );
+
+        server.render_and_stream();
+
+        let background_frame =
+            read_server_frame(background_render.recv().expect("background frame"));
+        let foreground_frame =
+            read_server_frame(foreground_render.recv().expect("foreground frame"));
+        assert!(
+            !frame_text(&background_frame).contains("visible matches"),
+            "background non-Findr projection must not render foreground Findr state: {}",
+            frame_text(&background_frame),
+        );
+        assert!(
+            frame_text(&foreground_frame)
+                .contains(&format!("{foreground_matches} visible matches")),
+            "foreground frame must retain its Findr results: {}",
+            frame_text(&foreground_frame),
+        );
+        assert!(
+            server.clients[&1]
+                .navigation
+                .as_ref()
+                .expect("background projection")
+                .findr
+                .is_none(),
+            "background client state must remain non-Findr",
+        );
+        assert_eq!(
+            server.clients[&2]
+                .navigation
+                .as_ref()
+                .expect("foreground projection")
+                .findr
+                .as_ref()
+                .map(|(_, findr)| findr),
+            Some(&foreground_findr),
+        );
+        assert_eq!(server.app.state.findr.as_ref(), Some(&foreground_findr));
+        assert_eq!(server.app.state.mode, app::Mode::Findr);
+        let info = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("pane info");
+        assert_eq!(
+            server.app.state.findr.as_ref().unwrap().visible_geometry,
+            Some(foreground_geometry)
+        );
+        assert_eq!(
+            server.app.state.findr.as_ref().unwrap().visible_geometry,
+            Some((info.inner_rect.width, info.inner_rect.height))
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn background_findr_render_refreshes_its_projection_without_leaking_foreground() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("background-findr");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let mut scrollback = (0..30)
+            .map(|row| format!("before {row}\r\n"))
+            .collect::<String>();
+        scrollback.push_str("needle-old\r\n");
+        scrollback.extend((0..29).map(|row| format!("after {row}\r\n")));
+        scrollback.push_str("needle-current");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Prefix;
+        server.app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                scrollback.as_bytes(),
+            ),
+        );
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".into();
+        server.app.state.findr = Some(findr);
+        server.app.state.mode = app::Mode::Findr;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+
+        let (background_writer, _background_control, background_render) = test_client_writer();
+        let mut background = ClientConnection::new(
+            (80, 80),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        let mut foreground = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
+        );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        server.render_and_stream();
+
+        let background_frame =
+            read_server_frame(background_render.recv().expect("background frame"));
+        let foreground_frame =
+            read_server_frame(foreground_render.recv().expect("foreground frame"));
+        let background_findr = server.clients[&1]
+            .navigation
+            .as_ref()
+            .expect("background projection")
+            .findr
+            .as_ref()
+            .expect("refreshed background Findr")
+            .1
+            .clone();
+        assert_eq!(background_findr.query, "needle");
+        assert_eq!(background_findr.matches.len(), 2);
+        assert!(
+            background_findr
+                .visible_geometry
+                .is_some_and(|(_, height)| height > 24),
+            "background Findr must use its 80-row client geometry"
+        );
+        assert!(frame_text(&background_frame).contains(&format!(
+            "{} visible matches",
+            background_findr.matches.len()
+        )));
+        assert!(!frame_text(&foreground_frame).contains("visible matches"));
+        assert!(server.clients[&2]
+            .navigation
+            .as_ref()
+            .expect("foreground projection")
+            .findr
+            .is_none());
+        assert!(server.app.state.findr.is_none());
+        assert_eq!(server.app.state.mode, app::Mode::Prefix);
+        server
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .navigation
+            .as_mut()
+            .unwrap()
+            .findr
+            .as_mut()
+            .unwrap()
+            .1
+            .complete = false;
+        server.app.findr_scan_deadline = None;
+        assert!(server.handle_client_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::OuterFocusGained],
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.app.state.mode, app::Mode::Findr);
+        assert!(server
+            .app
+            .state
+            .findr
+            .as_ref()
+            .is_some_and(|findr| !findr.complete));
+        assert!(server.app.findr_scan_deadline.is_some());
+        shutdown_test_runtimes(&mut server);
+    }
 
     #[test]
     fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
@@ -7548,7 +15927,7 @@ next_tab = ""
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
-        server.app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
+        server.app.pending_agent_resume_retry_at = Some(Instant::now() - Duration::from_millis(1));
 
         assert!(!server.handle_scheduled_tasks_headless(Instant::now(), true));
         assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
@@ -7560,7 +15939,7 @@ next_tab = ""
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
             .is_some());
-        assert!(server.app.pending_agent_resume_deadline.is_none());
+        assert!(server.app.pending_agent_resume_retry_at.is_none());
     }
 
     #[cfg(unix)]
@@ -7593,7 +15972,7 @@ next_tab = ""
         assert!(server.app.terminal_runtimes.get(&terminal_id).is_none());
         let deadline = server
             .app
-            .pending_agent_resume_deadline
+            .pending_agent_resume_retry_at
             .expect("clientless resume should wait briefly for a host theme");
 
         assert!(server.handle_scheduled_tasks_headless(deadline, false));
@@ -7659,7 +16038,7 @@ next_tab = ""
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
-        server.app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
+        server.app.pending_agent_resume_retry_at = Some(Instant::now() - Duration::from_millis(1));
 
         server.resize_shared_runtime_to_effective_size_before_input();
 
@@ -7672,7 +16051,7 @@ next_tab = ""
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
             .is_some());
-        assert!(server.app.pending_agent_resume_deadline.is_none());
+        assert!(server.app.pending_agent_resume_retry_at.is_none());
     }
 
     #[test]
@@ -7831,6 +16210,136 @@ next_tab = ""
         );
     }
 
+    #[tokio::test]
+    async fn headless_precomputed_render_hides_cursor_during_synchronized_output_resize() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("sync-resize");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(
+            terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left"),
+        );
+        let (writer, _control_rx, render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.render_and_stream();
+        let _ = render_rx.recv().expect("initial frame");
+
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("pane runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+        server.clients.get_mut(&1).unwrap().terminal_size = (100, 30);
+
+        server.render_and_stream();
+
+        let frame = read_server_frame(render_rx.recv().expect("resized frame"));
+        assert_eq!(frame.cursor, None);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn foreground_cursor_guard_survives_background_navigation_projection() {
+        let mut server = test_headless_server();
+        let first = crate::workspace::Workspace::test_new("foreground-sync");
+        let first_pane = first.tabs[0].root_pane;
+        let first_terminal = first
+            .terminal_id(first_pane)
+            .expect("first terminal")
+            .clone();
+        let second = crate::workspace::Workspace::test_new("background-view");
+        let second_pane = second.tabs[0].root_pane;
+        let second_terminal = second
+            .terminal_id(second_pane)
+            .expect("second terminal")
+            .clone();
+        server.app.state.workspaces = vec![first, second];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(
+            first_terminal.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"first"),
+        );
+        server.app.terminal_runtimes.insert(
+            second_terminal,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"second"),
+        );
+        crate::ui::compute_view_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 80, 24),
+        );
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        foreground_navigation.apply_to(&mut server.app.state);
+        crate::ui::compute_view_with_runtime_registry(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 80, 24),
+        );
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&first_terminal)
+            .expect("foreground runtime");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+
+        let (background_writer, _background_control, _background_render) = test_client_writer();
+        let mut background = ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(false),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(background_writer),
+        );
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let (foreground_writer, _foreground_control, foreground_render) = test_client_writer();
+        let mut foreground = ClientConnection::new(
+            (100, 30),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(foreground_writer),
+        );
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        server.render_and_stream();
+
+        let frame = read_server_frame(foreground_render.recv().expect("foreground frame"));
+        assert_eq!(frame.cursor, None);
+        shutdown_test_runtimes(&mut server);
+    }
     #[tokio::test]
     async fn virtual_render_exposes_hidden_pane_cursor_when_reveal_hidden_for_cjk_ime() {
         let mut state = AppState::test_new();
@@ -8138,6 +16647,288 @@ next_tab = ""
             server.app.state.host_terminal_theme,
             server.clients[&1].host_terminal_theme
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_new_tab_stays_with_requesting_client_across_following_navigation() {
+        let mut server = test_headless_server();
+        let requester_workspace = crate::workspace::Workspace::test_new("requester");
+        let requester_workspace_id = requester_workspace.id.clone();
+        let following_workspace = crate::workspace::Workspace::test_new("following");
+        server.app.state.workspaces = vec![requester_workspace, following_workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let requester_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let following_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut requester = test_app_client(Some(true), 1);
+        requester.navigation = Some(requester_navigation);
+        server.clients.insert(1, requester);
+        let mut following = test_app_client(Some(true), 2);
+        following.navigation = Some(following_navigation);
+        server.clients.insert(2, following);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        server.app.state.request_new_tab = true;
+        assert!(server.handle_client_input_events(1, vec![]));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 2,
+            cols: 100,
+            rows: 30,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        let _ = server.handle_deferred_requests_headless();
+
+        assert_eq!(server.app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(server.app.state.workspaces[1].tabs.len(), 1);
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.app.state.workspaces[1].active_tab, 0);
+        assert!(!server.app.state.request_new_tab);
+        let new_tab_id = crate::workspace::public_tab_id_for_number(&requester_workspace_id, 2);
+        assert_eq!(
+            server.clients[&1]
+                .navigation
+                .as_ref()
+                .and_then(|navigation| navigation
+                    .active_tab_by_workspace
+                    .get(&requester_workspace_id)),
+            Some(&new_tab_id)
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_disconnect_preserves_foreground_navigation_across_removal_order() {
+        let mut server = test_headless_server();
+        let mut first_workspace = crate::workspace::Workspace::test_new("first");
+        let first_second_tab = first_workspace.test_add_tab(Some("first-second"));
+        let mut second_workspace = crate::workspace::Workspace::test_new("second");
+        let second_second_tab = second_workspace.test_add_tab(Some("second-second"));
+        first_workspace.active_tab = first_second_tab;
+        second_workspace.active_tab = 0;
+        server.app.state.workspaces = vec![first_workspace, second_workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        let first_navigation = ClientNavigationState::capture(&server.app.state);
+
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[1].active_tab = second_second_tab;
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let second_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut first = test_app_client(Some(true), 1);
+        first.navigation = Some(first_navigation);
+        server.clients.insert(1, first);
+        let mut second = test_app_client(Some(true), 2);
+        second.navigation = Some(second_navigation);
+        server.clients.insert(2, second);
+
+        let removal_order = server.clients.keys().copied().collect::<Vec<_>>();
+        let original_foreground = removal_order[0];
+        let expected_navigation = server.clients[&original_foreground]
+            .navigation
+            .clone()
+            .unwrap()
+            .apply_to(&mut server.app.state);
+        let expected_workspace = server.app.state.active.unwrap();
+        let expected_tab = server.app.state.workspaces[expected_workspace].active_tab;
+        server.foreground_client_id = Some(original_foreground);
+        server.sync_foreground_client_state();
+
+        server.disconnect_all_clients_for_handoff();
+
+        assert!(server.clients.is_empty());
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(
+            ClientNavigationState::capture(&server.app.state),
+            expected_navigation
+        );
+        assert_eq!(server.app.state.active, Some(expected_workspace));
+        assert_eq!(
+            server.app.state.workspaces[expected_workspace].active_tab,
+            expected_tab
+        );
+    }
+
+    #[test]
+    fn detach_keybind_promotes_and_renders_surviving_client_navigation() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("detach-navigation");
+        let second_tab = workspace.test_add_tab(Some("second"));
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.detach_exits = false;
+
+        let survivor_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = second_tab;
+        let detached_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let (survivor_writer, _survivor_control_rx, survivor_render_rx) = test_client_writer();
+        let mut survivor = ClientConnection::new(
+            (120, 40),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(survivor_writer),
+        );
+        survivor.navigation = Some(survivor_navigation.clone());
+        server.clients.insert(1, survivor);
+
+        let (detached_writer, detached_control_rx, _detached_render_rx) = test_client_writer();
+        let mut detached = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            2,
+            RenderEncoding::SemanticFrame,
+            Some(detached_writer),
+        );
+        detached.navigation = Some(detached_navigation);
+        server.clients.insert(2, detached);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let key = |code, modifiers| crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char(code),
+            modifiers,
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: 1,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::Synthesized,
+        };
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![key('b', KeyModifiers::CONTROL.bits()), key('q', 0)],
+        }));
+
+        assert!(!server.clients.contains_key(&2));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(
+            ClientNavigationState::capture(&server.app.state),
+            survivor_navigation
+        );
+        match read_server_message(
+            detached_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("detached client shutdown"),
+        ) {
+            ServerMessage::ServerShutdown { reason } => {
+                assert_eq!(reason.as_deref(), Some("detached"));
+            }
+            other => panic!("expected detached shutdown, got {other:?}"),
+        }
+
+        server.render_and_stream();
+        survivor_render_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("surviving client repaint");
+    }
+
+    #[test]
+    fn background_focus_loss_does_not_mark_its_projected_tab_seen() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("focus-loss-navigation");
+        let foreground_pane = workspace.tabs[0].root_pane;
+        let background_tab = workspace.test_add_tab(Some("background"));
+        let background_pane = workspace.tabs[background_tab].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = background_tab;
+        let background_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&foreground_pane)
+            .unwrap()
+            .seen = false;
+        server.app.state.workspaces[0].tabs[background_tab]
+            .panes
+            .get_mut(&background_pane)
+            .unwrap()
+            .seen = false;
+
+        let mut background = test_app_client(Some(true), 1);
+        background.navigation = Some(background_navigation);
+        server.clients.insert(1, background);
+        let mut foreground = test_app_client(Some(true), 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        assert!(server.app.state.workspaces[0].tabs[0].panes[&foreground_pane].seen);
+        assert!(!server.app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::FocusLost],
+        }));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.app.state.workspaces[0].active_tab, 0);
+        assert!(!server.app.state.workspaces[0].tabs[background_tab].panes[&background_pane].seen);
+    }
+
+    #[test]
+    fn foreground_disconnect_marks_the_survivors_projected_tab_seen() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("disconnect-navigation");
+        let outgoing_pane = workspace.tabs[0].root_pane;
+        let survivor_tab = workspace.test_add_tab(Some("survivor"));
+        let survivor_pane = workspace.tabs[survivor_tab].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+
+        let outgoing_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = survivor_tab;
+        let survivor_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.workspaces[0].active_tab = 0;
+        server.app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&outgoing_pane)
+            .unwrap()
+            .seen = false;
+        server.app.state.workspaces[0].tabs[survivor_tab]
+            .panes
+            .get_mut(&survivor_pane)
+            .unwrap()
+            .seen = false;
+
+        let mut survivor = test_app_client(Some(true), 1);
+        survivor.navigation = Some(survivor_navigation);
+        server.clients.insert(1, survivor);
+        let mut outgoing = test_app_client(Some(true), 2);
+        outgoing.navigation = Some(outgoing_navigation);
+        server.clients.insert(2, outgoing);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        assert!(server.app.state.workspaces[0].tabs[0].panes[&outgoing_pane].seen);
+        assert!(!server.app.state.workspaces[0].tabs[survivor_tab].panes[&survivor_pane].seen);
+
+        assert!(server.remove_client(2));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.app.state.workspaces[0].active_tab, survivor_tab);
+        assert!(server.app.state.workspaces[0].tabs[survivor_tab].panes[&survivor_pane].seen);
     }
 
     #[test]
@@ -8448,7 +17239,7 @@ next_tab = ""
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
 
-        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
             client_id: 1,
             events: vec![crate::protocol::ClientInputEvent::Key {
                 code: crate::protocol::ClientKeyCode::Char('j'),
@@ -8630,6 +17421,303 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn forwarded_terminal_keys_skip_full_render_unless_local_view_changes() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded terminal key"),
+            Bytes::from_static(b"x")
+        );
+
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        server.app.state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('y'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(server.app.state.selection.is_none());
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("forwarded key after selection clear"),
+            Bytes::from_static(b"y")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL.bits(),
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(server.app.state.mode, crate::app::Mode::Prefix);
+        assert!(matches!(
+            input_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hovering_a_link_requests_headless_render() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+    }
+
+    #[tokio::test]
+    async fn leaving_a_link_requests_headless_render() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 40,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarded_key_clearing_hover_requests_headless_render() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded key"),
+            Bytes::from_static(b"x")
+        );
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('y'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded key"),
+            Bytes::from_static(b"y")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::TextCommit("text".into())],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded text"),
+            Bytes::from_static(b"text")
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Paste {
+                text: "paste".into()
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_none());
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded paste"),
+            Bytes::from_static(b"paste")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_disconnect_clears_inherited_hover_before_rendering_successor() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        let (successor_tx, _successor_control_rx, successor_rx) = test_client_writer();
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(successor_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+
+        assert!(server.remove_client(1));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert!(server.app.state.hovered_link.is_none());
+        assert!(server.app.state.hovered_pane_cell.is_none());
+        server.render_and_stream();
+        let successor_frame = read_server_frame(successor_rx.recv().expect("successor frame"));
+        assert!(!successor_frame.cells.iter().any(|cell| {
+            cell.symbol == "h" && cell.modifier & ratatui::style::Modifier::UNDERLINED.bits() != 0
+        }));
+    }
+
+    #[tokio::test]
+    async fn foreground_connect_clears_inherited_hover() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        assert!(server.app.state.hovered_link.is_some());
+
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 2,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
+            writer,
+        }));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert!(server.app.state.hovered_link.is_none());
+        assert!(server.app.state.hovered_pane_cell.is_none());
+    }
+
+    #[tokio::test]
     async fn passive_mouse_motion_forwards_without_requesting_render() {
         let mut server = test_headless_server();
         let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1003h\x1b[?1006h");
@@ -8638,6 +17726,7 @@ next_tab = ""
         server.sync_foreground_client_state();
         server.resize_shared_runtime_to_effective_size();
         let baseline = FrameData {
+            omp_renderer: None,
             cells: Vec::new(),
             width: 0,
             height: 0,
@@ -8721,8 +17810,9 @@ next_tab = ""
         server: &mut HeadlessServer,
         terminal_bytes: &[u8],
     ) -> tokio::sync::mpsc::Receiver<Bytes> {
-        let mut workspace = crate::workspace::Workspace::test_new("focus-reporting");
+        let workspace = crate::workspace::Workspace::test_new("focus-reporting");
         let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
         let (runtime, input_rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
                 80,
@@ -8731,11 +17821,11 @@ next_tab = ""
                 terminal_bytes,
                 4,
             );
-        workspace.insert_test_runtime(pane_id, runtime);
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.terminal_runtimes.insert(terminal_id, runtime);
         input_rx
     }
 
@@ -8749,6 +17839,271 @@ next_tab = ""
             RenderEncoding::SemanticFrame,
             None,
         )
+    }
+    fn test_private_popup_params(
+        view_id: Option<crate::api::schema::ViewId>,
+    ) -> crate::api::schema::PluginPaneOpenParams {
+        crate::api::schema::PluginPaneOpenParams {
+            plugin_id: "test.private".to_string(),
+            entrypoint: "popup".to_string(),
+            placement: Some(crate::api::schema::PluginPanePlacement::Popup),
+            scope: Some(crate::api::schema::PluginPaneScope::ClientPrivate),
+            view_id,
+            width: None,
+            height: None,
+            workspace_id: None,
+            target_pane_id: None,
+            direction: None,
+            cwd: None,
+            focus: false,
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    fn private_popup_error_code(
+        server: &mut HeadlessServer,
+        view_id: Option<crate::api::schema::ViewId>,
+    ) -> String {
+        let (response, changed) = server.handle_client_private_plugin_pane_open(
+            "private-test".to_string(),
+            test_private_popup_params(view_id),
+        );
+        assert!(!changed);
+        serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("private popup error response")
+            .error
+            .code
+    }
+
+    fn test_identity_client(
+        display_name: Option<&str>,
+        writer: Option<ClientWriter>,
+    ) -> ClientConnection {
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::App,
+            None,
+            display_name.map(str::to_owned),
+            None,
+            None,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            Some(true),
+            1,
+            RenderEncoding::SemanticFrame,
+            false,
+            writer,
+        )
+    }
+
+    fn left_click(column: u16, row: u16) -> crate::raw_input::RawInputEvent {
+        crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn identity_editor_ignores_unrelated_closed_header_clicks() {
+        let mut server = test_headless_server();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+
+        let (remaining, changed) = server.intercept_identity_input(1, vec![left_click(79, 23)]);
+
+        assert!(!changed);
+        assert_eq!(remaining.len(), 1);
+        assert!(!server.clients[&1].identity.as_ref().unwrap().editor.open);
+    }
+
+    #[test]
+    fn identity_header_click_opens_only_its_client_editor() {
+        let mut server = test_headless_server();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), None));
+        server
+            .clients
+            .insert(2, test_identity_client(Some("Bea"), None));
+        let identity =
+            crate::server::render_stream::identity_ui_state(server.clients[&1].identity.as_ref());
+        let header = crate::ui::identity_name_hit_rect(
+            &server.app.state,
+            Rect::new(0, 0, 80, 24),
+            &identity,
+        );
+        assert!(header.width > 0 && header.height > 0);
+
+        let (remaining, changed) =
+            server.intercept_identity_input(1, vec![left_click(header.x, header.y)]);
+
+        assert!(changed);
+        assert!(remaining.is_empty());
+        assert!(server.clients[&1].identity.as_ref().unwrap().editor.open);
+        assert!(!server.clients[&2].identity.as_ref().unwrap().editor.open);
+    }
+
+    #[test]
+    fn uncommitted_identity_consumes_text_before_shared_routing() {
+        let mut server = test_headless_server();
+        let mut client = test_identity_client(None, None);
+        client.identity.as_mut().unwrap().open_editor();
+        server.clients.insert(1, client);
+
+        let (remaining, changed) = server.intercept_identity_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Text(
+                crate::input::TextCommit::new("Ada"),
+            )],
+        );
+
+        assert!(changed);
+        assert!(remaining.is_empty());
+        let identity = server.clients[&1].identity.as_ref().unwrap();
+        assert!(identity.editor.open);
+        assert_eq!(identity.editor.draft, "Ada");
+    }
+
+    #[test]
+    fn identity_editor_accepts_repeated_generated_key_text() {
+        let mut server = test_headless_server();
+        let mut client = test_identity_client(Some("Ada"), None);
+        client.identity.as_mut().unwrap().open_editor();
+        server.clients.insert(1, client);
+        let key = crate::input::TerminalKey::new(KeyCode::Char('E'), KeyModifiers::SHIFT)
+            .with_generated_text(Some("É".to_owned()))
+            .with_repeat_count(2);
+
+        let (remaining, changed) =
+            server.intercept_identity_input(1, vec![crate::raw_input::RawInputEvent::Key(key)]);
+
+        assert!(changed);
+        assert!(remaining.is_empty());
+        assert_eq!(
+            server.clients[&1].identity.as_ref().unwrap().editor.draft,
+            "AdaÉÉ"
+        );
+    }
+
+    #[test]
+    fn identity_enter_sends_targeted_persistence_and_keeps_pending_modal_open() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        let mut client = test_identity_client(None, Some(writer));
+        client.identity.as_mut().unwrap().open_editor();
+        client.identity.as_mut().unwrap().insert_editor_text("Ada");
+        server.clients.insert(1, client);
+
+        let (remaining, changed) = server.intercept_identity_input(
+            1,
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()),
+            )],
+        );
+
+        assert!(changed);
+        assert!(remaining.is_empty());
+        let identity = server.clients[&1].identity.as_ref().unwrap();
+        assert!(identity.editor.open);
+        assert_eq!(
+            identity
+                .pending
+                .as_ref()
+                .map(|pending| pending.name.as_str()),
+            Some("Ada")
+        );
+        let bytes = control_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("persistence request");
+        let message: ServerMessage = protocol::read_message(&mut bytes.as_slice(), MAX_FRAME_SIZE)
+            .expect("decode persistence request");
+        assert!(
+            matches!(message, ServerMessage::PersistIdentity { display_name, .. } if display_name == "Ada")
+        );
+    }
+
+    #[test]
+    fn pending_identity_modal_consumes_text_paste_and_key_release() {
+        let mut server = test_headless_server();
+        let mut client = test_identity_client(Some("Ada"), None);
+        client.identity.as_mut().unwrap().open_editor();
+        client.identity.as_mut().unwrap().pending =
+            Some(crate::server::clients::PendingIdentityPersistence {
+                request_id: 1,
+                name: "Ada".to_owned(),
+            });
+        server.clients.insert(1, client);
+
+        let (remaining, changed) = server.intercept_identity_input(
+            1,
+            vec![
+                crate::raw_input::RawInputEvent::Text(crate::input::TextCommit::new("x")),
+                crate::raw_input::RawInputEvent::Paste("y".into()),
+                crate::raw_input::RawInputEvent::Key(
+                    crate::input::TerminalKey::new(KeyCode::Char('z'), KeyModifiers::empty())
+                        .with_kind(KeyEventKind::Release),
+                ),
+            ],
+        );
+
+        assert!(changed);
+        assert!(remaining.is_empty());
+        assert_eq!(
+            server.clients[&1].identity.as_ref().unwrap().editor.draft,
+            "Ada"
+        );
+    }
+
+    #[test]
+    fn identity_cancel_requires_exact_committed_modal_button() {
+        let mut server = test_headless_server();
+        let mut client = test_identity_client(Some("Ada"), None);
+        client.identity.as_mut().unwrap().open_editor();
+        server.clients.insert(1, client);
+        let inner = crate::ui::identity_modal_inner_rect(Rect::new(0, 0, 80, 24)).unwrap();
+        let (_, cancel) = crate::ui::identity_modal_button_rects(inner, true);
+
+        server.intercept_identity_input(1, vec![left_click(0, 0)]);
+        assert!(server.clients[&1].identity.as_ref().unwrap().editor.open);
+        server.intercept_identity_input(1, vec![left_click(cancel.x, cancel.y)]);
+        assert!(!server.clients[&1].identity.as_ref().unwrap().editor.open);
+    }
+
+    #[test]
+    fn scroll_input_yields_server_event_drain_until_rendered() {
+        let mut server = test_headless_server();
+        server.clients.insert(1, test_app_client(Some(true), 1));
+        server.foreground_client_id = Some(1);
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientInputEvents {
+                client_id: 1,
+                events: vec![crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::ScrollUp,
+                    column: 10,
+                    row: 5,
+                    modifiers: 0,
+                }],
+            })
+            .unwrap();
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientInput {
+                client_id: 99,
+                data: b"queued after scroll".to_vec(),
+            })
+            .unwrap();
+
+        let _ = server.drain_server_events();
+
+        assert!(server.app.scroll_render_pending);
+        assert!(matches!(
+            server.server_event_rx.try_recv(),
+            Ok(ServerEvent::ClientInput { client_id: 99, .. })
+        ));
     }
 
     #[test]
@@ -8981,6 +18336,61 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn background_app_frame_does_not_render_or_clear_foreground_hover() {
+        let mut server = test_headless_server();
+        let _input_rx = install_focused_test_runtime(&mut server, b"https://example.com/hover");
+        let (foreground_tx, _foreground_control_rx, foreground_rx) = test_client_writer();
+        let (background_tx, _background_control_rx, background_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (44, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(background_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server.app.state.view.pane_infos[0].clone();
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: pane.inner_rect.x + 8,
+                row: pane.inner_rect.y,
+                modifiers: 0,
+            }],
+        }));
+        let foreground_hover = server.app.state.hovered_link.clone();
+
+        server.render_and_stream();
+
+        let background_frame = read_server_frame(background_rx.recv().expect("background frame"));
+        let _foreground_frame = read_server_frame(foreground_rx.recv().expect("foreground frame"));
+        assert!(!background_frame.cells.iter().any(|cell| {
+            cell.symbol == "h" && cell.modifier & ratatui::style::Modifier::UNDERLINED.bits() != 0
+        }));
+        assert_eq!(server.app.state.hovered_link, foreground_hover);
+    }
+
+    #[tokio::test]
     async fn render_and_stream_uses_each_client_terminal_size() {
         let mut server = test_headless_server();
         let mut workspace = crate::workspace::Workspace::test_new("test");
@@ -9187,6 +18597,11 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            omp_pane: false,
+            display_name: None,
+            frontend_profile_id: None,
+            renderer_binding_token: None,
+            renderer_capabilities: crate::protocol::OmpRendererCapabilities::default(),
             writer,
         }));
         assert!(
@@ -9830,6 +19245,9 @@ next_tab = ""
             ClientConnection::new_with_mode(
                 ClientConnectionMode::TerminalObserve { terminal_id },
                 None,
+                None,
+                None,
+                None,
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
@@ -9876,6 +19294,49 @@ next_tab = ""
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
         assert_eq!((patched.width, patched.height), (80, 24));
+    }
+
+    #[tokio::test]
+    async fn hovered_plain_url_dirty_row_falls_back_to_full_render() {
+        let url = "https://example.com/link";
+        let initial = format!("{url} old");
+        let update = format!("\r{url} new");
+        let (mut server, client_rx, pane_id) = retained_test_server(initial.as_bytes());
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let pane = server.app.state.view.pane_infos[0].clone();
+        server.app.state.hovered_link = Some(crate::app::HoveredPaneLink {
+            pane_id,
+            inner_rect: pane.inner_rect,
+            cells: (0..url.len() as u16)
+                .map(|col| (pane.inner_rect.x + col, pane.inner_rect.y))
+                .collect(),
+        });
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(update.as_bytes());
+
+        assert!(!server.render_retained_pty_update_and_stream());
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        server.render_and_stream();
+        let refreshed = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full hover frame"),
+        );
+        let h = refreshed
+            .cells
+            .iter()
+            .find(|cell| cell.symbol == "h")
+            .expect("URL cell");
+        assert_ne!(h.modifier & ratatui::style::Modifier::UNDERLINED.bits(), 0);
     }
 
     #[tokio::test]
@@ -10525,6 +19986,9 @@ next_tab = ""
     #[test]
     fn terminal_bell_targets_foreground_client_only() {
         let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("terminal-bell");
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
         let (background_tx, background_control_rx, _background_rx) = test_client_writer();
         let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
 
@@ -10554,10 +20018,8 @@ next_tab = ""
         );
         server.foreground_client_id = Some(2);
 
-        let changed = server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
-            pane_id: crate::layout::PaneId::from_raw(1),
-            count: 3,
-        });
+        let changed = server
+            .handle_internal_event_with_forwarding(AppEvent::TerminalBell { pane_id, count: 3 });
 
         assert!(!changed);
         match read_server_message(
@@ -10576,15 +20038,82 @@ next_tab = ""
         );
 
         server.foreground_client_id = None;
-        server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
-            pane_id: crate::layout::PaneId::from_raw(1),
-            count: 1,
-        });
+        server.handle_internal_event_with_forwarding(AppEvent::TerminalBell { pane_id, count: 1 });
         assert!(
             foreground_control_rx
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "bells without a foreground client must not be retained"
+        );
+    }
+    #[test]
+    fn open_url_targets_originating_client_without_changing_foreground() {
+        let mut server = test_headless_server();
+        let (origin_tx, origin_control_rx, _origin_rx) = test_client_writer();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(origin_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+
+        let changed = server.handle_internal_event_with_forwarding(AppEvent::OpenUrl {
+            url: "https://example.com/issues/21".into(),
+            source_id: 1,
+        });
+
+        assert!(!changed);
+        assert_eq!(server.foreground_client_id, Some(2));
+        match read_server_message(
+            origin_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("originating client open URL message"),
+        ) {
+            ServerMessage::OpenUrl { url } => assert_eq!(url, "https://example.com/issues/21"),
+            other => panic!("expected OpenUrl message, got {other:?}"),
+        }
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "non-originating client should not receive URL opens"
+        );
+        server.handle_internal_event_with_forwarding(AppEvent::OpenUrl {
+            url: "file:///tmp/example.rs".into(),
+            source_id: 1,
+        });
+        assert!(
+            origin_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "server must not forward file URLs to the originating client"
+        );
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "server must not forward file URLs to another client"
         );
     }
 
@@ -10649,6 +20178,69 @@ next_tab = ""
                 .is_err(),
             "background client should not receive clipboard writes"
         );
+    }
+
+    #[tokio::test]
+    async fn private_clipboard_write_targets_private_surface_owner() {
+        let mut server = test_headless_server();
+        let (owner_tx, owner_control_rx, _owner_rx) = test_client_writer();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        let mut owner = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(owner_tx),
+        );
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(crate::layout::PaneId::from_raw(1)),
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: private_pane_id,
+                content: b"private".to_vec(),
+            }),
+            "private clipboard writes should not change shared visual state"
+        );
+        assert!(
+            server.app.state.copy_feedback.is_none(),
+            "private clipboard writes must not set shared copy feedback"
+        );
+
+        match read_server_message(
+            owner_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap(),
+        ) {
+            ServerMessage::Clipboard { data } => assert_eq!(data, "cHJpdmF0ZQ=="),
+            other => panic!("expected clipboard message, got {other:?}"),
+        }
+        assert!(foreground_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
     }
 
     #[test]
@@ -10841,6 +20433,7 @@ next_tab = ""
             kind: protocol::NotifyKind::Toast,
             message: "pi finished".to_string(),
             body: Some("workspace 1".to_string()),
+            activation: None,
         }));
 
         match read_server_message(
@@ -10852,10 +20445,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Toast);
                 assert_eq!(message, "pi finished");
                 assert_eq!(body.as_deref(), Some("workspace 1"));
+                assert!(activation.is_none());
             }
             other => panic!("expected toast notify, got {other:?}"),
         }
@@ -10918,6 +20513,7 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Toast);
                 assert_eq!(message, "Paste rejected");
@@ -10925,6 +20521,7 @@ next_tab = ""
                     body.as_deref(),
                     Some("Input message is 5000012 bytes; Herdr's limit is 1048576 bytes")
                 );
+                assert!(activation.is_none());
             }
             other => panic!("expected paste rejection notification, got {other:?}"),
         }
@@ -10975,7 +20572,7 @@ next_tab = ""
     }
 
     #[test]
-    fn system_toast_delivery_forwards_system_notify_kind() {
+    fn hybrid_unfocused_update_forwards_system_notify_kind() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -10985,14 +20582,15 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.sync_foreground_client_state();
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
@@ -11009,6 +20607,7 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "v9.9.9 available");
@@ -11016,13 +20615,14 @@ next_tab = ""
                     body.as_deref(),
                     Some("detach, run `herdr update`, then follow its restart guidance")
                 );
+                assert!(activation.is_none());
             }
             other => panic!("expected system toast notify, got {other:?}"),
         }
     }
 
     #[test]
-    fn notification_show_api_forwards_system_notification_to_foreground_client() {
+    fn notification_show_api_hybrid_unfocused_forwards_system_notification() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -11032,14 +20632,14 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
@@ -11054,6 +20654,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -11087,10 +20688,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "build failed");
                 assert_eq!(body.as_deref(), Some("api workspace"));
+                assert!(activation.is_none());
             }
             other => panic!("expected api notification, got {other:?}"),
         }
@@ -11099,10 +20702,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Sound);
                 assert_eq!(message, "agent attention");
                 assert!(body.is_none());
+                assert!(activation.is_none());
             }
             other => panic!("expected api sound, got {other:?}"),
         }
@@ -11141,6 +20746,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -11167,10 +20773,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "build: failed");
                 assert_eq!(body.as_deref(), Some("api workspace"));
+                assert!(activation.is_none());
             }
             other => panic!("expected api notification, got {other:?}"),
         }
@@ -11194,6 +20802,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -11227,6 +20836,7 @@ next_tab = ""
                     },
                 ),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -11265,6 +20875,7 @@ next_tab = ""
                         },
                     ),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -11289,7 +20900,7 @@ next_tab = ""
     }
 
     #[test]
-    fn notification_show_api_forwards_sound_for_herdr_delivery() {
+    fn notification_show_api_hybrid_focused_stays_in_frame() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -11299,14 +20910,14 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(true),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
@@ -11322,6 +20933,7 @@ next_tab = ""
                         },
                     ),
                 },
+                context: api::ApiRequestContext::default(),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,
@@ -11348,10 +20960,12 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::Sound);
                 assert_eq!(message, "agent done");
                 assert!(body.is_none());
+                assert!(activation.is_none());
             }
             other => panic!("expected api sound, got {other:?}"),
         }
@@ -11417,9 +21031,10 @@ next_tab = ""
     }
 
     #[test]
-    fn delayed_agent_notification_forwards_after_deadline() {
+    fn delayed_hybrid_unfocused_agent_notification_forwards_system_toast() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
+        let background_id = background.id.clone();
         let pane_id = background.tabs[0].root_pane;
         let foreground = crate::workspace::Workspace::test_new("foreground");
         server.app.state.workspaces = vec![background, foreground];
@@ -11427,9 +21042,8 @@ next_tab = ""
         server.app.state.active = Some(1);
         server.app.state.selected = 1;
         server.app.state.mode = crate::app::Mode::Terminal;
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
         server.app.state.toast_config.delay_seconds = 1;
-
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
             1,
@@ -11437,7 +21051,7 @@ next_tab = ""
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
-                None,
+                Some(false),
                 1,
                 RenderEncoding::SemanticFrame,
                 Some(client_tx),
@@ -11445,18 +21059,17 @@ next_tab = ""
         );
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
-
-        let changed = server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
-            pane_id,
-            agent: Some(crate::detect::Agent::Pi),
-            state: crate::detect::AgentState::Blocked,
-            visible_blocker: false,
-            visible_working: false,
-            process_exited: false,
-            observed_at: Instant::now(),
-        });
-
-        assert!(changed);
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now()
+            })
+        );
         assert!(server.app.state.toast.is_none());
         assert!(
             client_control_rx
@@ -11464,14 +21077,12 @@ next_tab = ""
                 .is_err(),
             "delayed transition should not notify immediately"
         );
-
         let deadline = server
             .app
             .state
             .next_pending_agent_notification_deadline()
             .expect("pending notification deadline");
         assert!(server.handle_scheduled_tasks_headless(deadline, false));
-
         let first = read_server_message(
             client_control_rx
                 .recv_timeout(Duration::from_millis(100))
@@ -11482,11 +21093,11 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("delayed toast message"),
         );
-
         assert!(matches!(
             first,
             ServerMessage::Notify {
                 kind: protocol::NotifyKind::Sound,
+                activation: None,
                 ..
             }
         ));
@@ -11495,10 +21106,19 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "pi needs attention");
                 assert_eq!(body.as_deref(), Some("background · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id: background_id,
+                        pane_id: pane_id.raw()
+                    })
+                );
             }
             other => panic!("expected delayed system toast, got {other:?}"),
         }
@@ -11506,17 +21126,22 @@ next_tab = ""
     }
 
     #[test]
-    fn delayed_active_tab_unfocused_agent_notification_forwards_after_deadline() {
+    fn immediate_hybrid_unfocused_agent_notification_carries_activation_target() {
         let mut server = test_headless_server();
-        let workspace = crate::workspace::Workspace::test_new("active");
-        let pane_id = workspace.tabs[0].root_pane;
-        server.app.state.workspaces = vec![workspace];
+        let background = crate::workspace::Workspace::test_new("background");
+        let background_id = background.id.clone();
+        let pane_id = background.tabs[0].root_pane;
+        server.app.state.workspaces = vec![
+            background,
+            crate::workspace::Workspace::test_new("foreground"),
+        ];
         server.app.state.ensure_test_terminals();
-        server.app.state.active = Some(0);
-        server.app.state.selected = 0;
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
         server.app.state.mode = crate::app::Mode::Terminal;
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
-        server.app.state.toast_config.delay_seconds = 1;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
+        server.app.state.toast_config.delay_seconds = 0;
+        server.app.state.sound.enabled = false;
 
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
@@ -11545,6 +21170,121 @@ next_tab = ""
                 observed_at: Instant::now(),
             })
         );
+
+        match read_server_message(
+            client_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("immediate system toast message"),
+        ) {
+            ServerMessage::Notify {
+                kind,
+                message,
+                body,
+                activation,
+            } => {
+                assert_eq!(kind, protocol::NotifyKind::SystemToast);
+                assert_eq!(message, "pi needs attention");
+                assert_eq!(body.as_deref(), Some("background · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id: background_id,
+                        pane_id: pane_id.raw(),
+                    })
+                );
+            }
+            other => panic!("expected immediate system toast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hybrid_focused_agent_notification_stays_in_frame() {
+        let mut server = test_headless_server();
+        let background = crate::workspace::Workspace::test_new("background");
+        let pane_id = background.tabs[0].root_pane;
+        let foreground = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![background, foreground];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Hybrid;
+        server.app.state.toast_config.delay_seconds = 0;
+        server.app.state.sound.enabled = false;
+
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            })
+        );
+        assert!(server.app.state.toast.is_some());
+        assert!(client_control_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+    }
+
+    #[test]
+    fn delayed_active_tab_unfocused_agent_notification_forwards_after_deadline() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("active");
+        let workspace_id = workspace.id.clone();
+        let pane_id = workspace.tabs[0].root_pane;
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+        server.app.state.toast_config.delay_seconds = 1;
+        let (client_tx, client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(false),
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state: crate::detect::AgentState::Blocked,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now()
+            })
+        );
         assert!(server.app.state.toast.is_none());
         assert!(
             client_control_rx
@@ -11552,14 +21292,12 @@ next_tab = ""
                 .is_err(),
             "delayed transition should not notify immediately"
         );
-
         let deadline = server
             .app
             .state
             .next_pending_agent_notification_deadline()
             .expect("pending notification deadline");
         assert!(server.handle_scheduled_tasks_headless(deadline, false));
-
         let first = read_server_message(
             client_control_rx
                 .recv_timeout(Duration::from_millis(100))
@@ -11570,11 +21308,11 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(100))
                 .expect("delayed toast message"),
         );
-
         assert!(matches!(
             first,
             ServerMessage::Notify {
                 kind: protocol::NotifyKind::Sound,
+                activation: None,
                 ..
             }
         ));
@@ -11583,10 +21321,19 @@ next_tab = ""
                 kind,
                 message,
                 body,
+                activation,
             } => {
                 assert_eq!(kind, protocol::NotifyKind::SystemToast);
                 assert_eq!(message, "pi needs attention");
                 assert_eq!(body.as_deref(), Some("active · 1"));
+                assert_eq!(
+                    activation,
+                    Some(protocol::NotificationActivation {
+                        recipient_client_id: 1,
+                        workspace_id,
+                        pane_id: pane_id.raw()
+                    })
+                );
             }
             other => panic!("expected delayed system toast, got {other:?}"),
         }
@@ -11633,6 +21380,7 @@ next_tab = ""
                         .to_string(),
                 )
                 .unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
         server
             .app
@@ -11682,6 +21430,7 @@ next_tab = ""
                     agent_session_path: None,
                 }),
             },
+            context: api::ApiRequestContext::default(),
             respond_to,
             response_write_complete: None,
             stream_active: None,
@@ -11699,6 +21448,828 @@ next_tab = ""
                 .is_err(),
             "stale idle report must not forward a done sound"
         );
+    }
+    #[test]
+    fn reconnecting_full_app_client_gets_a_distinct_view_id() {
+        let first = test_app_client(None, 1).view_id.expect("first view id");
+        let second = test_app_client(None, 2).view_id.expect("second view id");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn private_popup_requires_a_view_id() {
+        let mut server = test_headless_server();
+
+        assert_eq!(
+            private_popup_error_code(&mut server, None),
+            "view_id_required"
+        );
+    }
+
+    #[test]
+    fn private_popup_rejects_an_unknown_view_id() {
+        let mut server = test_headless_server();
+        let unknown = crate::api::schema::ViewId::from_opaque("view_unknown").unwrap();
+
+        assert_eq!(
+            private_popup_error_code(&mut server, Some(unknown)),
+            "view_not_found"
+        );
+    }
+
+    #[test]
+    fn private_popup_rejects_a_stale_disconnected_view_id() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let client = ClientConnection::new(
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        let stale = client.view_id.clone().expect("connected view id");
+        server.clients.insert(1, client);
+        assert_eq!(server.clients[&1].view_id.as_ref(), Some(&stale));
+        server.clients.remove(&1);
+
+        assert_eq!(
+            private_popup_error_code(&mut server, Some(stale)),
+            "view_not_found"
+        );
+    }
+
+    #[test]
+    fn untargeted_private_popup_uses_owner_navigation_source() {
+        let mut server = test_headless_server();
+        let owner_workspace = crate::workspace::Workspace::test_new("owner");
+        let owner_pane_id = owner_workspace.tabs[0].root_pane;
+        let owner_workspace_id = owner_workspace.id.clone();
+        let foreground_workspace = crate::workspace::Workspace::test_new("foreground");
+        let foreground_workspace_id = foreground_workspace.id.clone();
+        server.app.state.workspaces = vec![owner_workspace, foreground_workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let owner_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+        let mut owner = test_app_client(None, 1);
+        owner.navigation = Some(owner_navigation);
+        server.clients.insert(1, owner);
+        let mut foreground = test_app_client(None, 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "test.private",
+                "name": "Private test",
+                "version": "1.0.0",
+                "manifest_path": "/tmp/test.private/herdr-plugin.toml",
+                "plugin_root": "/tmp/test.private",
+                "enabled": true,
+                "panes": [{
+                    "id": "popup",
+                    "title": "Private test",
+                    "placement": "popup",
+                    "scope": "client_private",
+                    "command": ["true"]
+                }]
+            }))
+            .unwrap();
+        server
+            .app
+            .state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+        let spec = server
+            .client_private_plugin_popup_spec_for_owner(1, &test_private_popup_params(None))
+            .expect("private popup spec");
+
+        assert_eq!(
+            spec.origin,
+            ClientPrivatePluginPopupOrigin::Pane(owner_pane_id)
+        );
+        assert_eq!(
+            server.app.private_popup_source_pane_id(spec.origin),
+            Some(format!("{owner_workspace_id}:p1"))
+        );
+        assert_eq!(
+            server.app.state.active,
+            server
+                .app
+                .state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == foreground_workspace_id)
+        );
+    }
+
+    #[test]
+    fn private_popup_geometry_uses_owner_terminal_area() {
+        let mut server = test_headless_server();
+        let owner_workspace = crate::workspace::Workspace::test_new("owner");
+        let foreground_workspace = crate::workspace::Workspace::test_new("foreground");
+        server.app.state.workspaces = vec![owner_workspace, foreground_workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let owner_navigation = ClientNavigationState::capture(&server.app.state);
+        server.app.state.active = Some(1);
+        server.app.state.selected = 1;
+        let foreground_navigation = ClientNavigationState::capture(&server.app.state);
+
+        let mut owner = test_app_client(None, 1);
+        owner.terminal_size = (120, 40);
+        owner.navigation = Some(owner_navigation);
+        server.clients.insert(1, owner);
+        let mut foreground = test_app_client(None, 2);
+        foreground.navigation = Some(foreground_navigation);
+        server.clients.insert(2, foreground);
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+
+        let area = server
+            .private_popup_terminal_area_for_owner(1)
+            .expect("owner terminal area");
+
+        assert_eq!(area, Rect::new(26, 1, 94, 39));
+        assert_ne!(area, Rect::new(0, 0, 120, 40));
+        assert_eq!(server.app.state.active, Some(1));
+        assert_eq!(server.effective_size, (80, 24));
+    }
+
+    #[tokio::test]
+    async fn opening_private_popup_releases_shared_terminal_input_leases() {
+        let mut server = test_headless_server();
+        let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[>15u");
+        server.app.state.ensure_test_terminals();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let mut client = test_app_client(Some(true), 1);
+        client.writer = Some(writer);
+        server.clients.insert(1, client);
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        let view_id = server.clients[&1]
+            .view_id
+            .clone()
+            .expect("connected app view");
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "test.private",
+                "name": "Private test",
+                "version": "1.0.0",
+                "manifest_path": "/tmp/test.private/herdr-plugin.toml",
+                "plugin_root": "/tmp/test.private",
+                "enabled": true,
+                "panes": [{
+                    "id": "popup",
+                    "title": "Private test",
+                    "placement": "popup",
+                    "scope": "client_private",
+                    "command": ["true"]
+                }]
+            }))
+            .unwrap();
+        server
+            .app
+            .state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('j'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded shared press"),
+            Bytes::from_static(b"\x1b[106;1:1u")
+        );
+        assert!(!server.app.input_leases.is_empty());
+
+        let (response, changed) = server.handle_client_private_plugin_pane_open(
+            "private-input-epoch".into(),
+            test_private_popup_params(Some(view_id)),
+        );
+
+        assert!(changed, "response={response}");
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("synthetic shared release before private routing"),
+            Bytes::from_static(b"\x1b[106;1:3u")
+        );
+        assert!(server.app.input_leases.is_empty());
+        assert!(server.clients[&1].private_surface.is_some());
+        server.close_private_surface(1);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn failed_private_popup_replacement_keeps_the_existing_surface() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("source");
+        let source_pane = workspace.tabs[0].root_pane;
+        let source_pane_id = format!("{}:p1", workspace.id);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let plugin: crate::api::schema::InstalledPluginInfo =
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": "test.private",
+                "name": "Private test",
+                "version": "1.0.0",
+                "manifest_path": "/tmp/test.private/herdr-plugin.toml",
+                "plugin_root": "/tmp/test.private",
+                "enabled": true,
+                "panes": [{
+                    "id": "popup",
+                    "title": "Private test",
+                    "placement": "popup",
+                    "scope": "client_private",
+                    "command": ["true"]
+                }]
+            }))
+            .unwrap();
+        server
+            .app
+            .state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        let mut client = ClientConnection::new(
+            (1, 1),
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            1,
+            RenderEncoding::SemanticFrame,
+            Some(writer),
+        );
+        let view_id = client.view_id.clone().expect("connected view id");
+        client.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(source_pane),
+                b"existing",
+            ),
+        );
+        let existing_pane_id = client.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, client);
+
+        let mut params = test_private_popup_params(Some(view_id));
+        params.target_pane_id = Some(source_pane_id);
+        let (response, changed) =
+            server.handle_client_private_plugin_pane_open("replace-private".to_string(), params);
+        let response = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("private popup launch error");
+
+        assert!(!changed);
+        assert_eq!(response.error.code, "plugin_pane_open_failed");
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(existing_pane_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_private_popup_replacement_promotes_only_after_ready() {
+        let mut server = test_headless_server();
+        let source_pane = crate::layout::PaneId::from_raw(41);
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(source_pane),
+                b"existing",
+            ),
+        );
+        let existing_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        let candidate = crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+            Rect::new(0, 0, 80, 24),
+            ClientPrivatePluginPopupOrigin::Pane(source_pane),
+            b"candidate",
+        );
+        let candidate_pane_id = candidate.pane_id();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let pending = PendingPrivateSurfaceResponse {
+            id: "remote-open".into(),
+            respond_to,
+        };
+
+        assert!(server.install_private_surface_with_response(1, candidate, true, Some(pending)));
+        assert!(
+            response_rx.try_recv().is_err(),
+            "remote open must wait for readiness"
+        );
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(existing_pane_id)
+        );
+        assert_eq!(
+            server
+                .private_surface_candidates
+                .get(&1)
+                .map(|candidate| candidate.surface.pane_id()),
+            Some(candidate_pane_id)
+        );
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::RemoteExecutionReady {
+                pane_id: candidate_pane_id,
+                child_pid: 42,
+                hostname: Some("remote.example".into()),
+                cwd: Some("/remote".into()),
+            })
+        );
+        let response = response_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("remote readiness response");
+        let response = serde_json::from_str::<crate::api::schema::SuccessResponse>(&response)
+            .expect("remote readiness success");
+        assert_eq!(response.id, "remote-open");
+        assert!(server.private_surface_candidates.is_empty());
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(candidate_pane_id)
+        );
+        assert!(server.retired_private_pane_ids.contains(&existing_pane_id));
+    }
+    #[tokio::test]
+    async fn active_private_popup_death_preserves_pending_replacement() {
+        let mut server = test_headless_server();
+        let source_pane = crate::layout::PaneId::from_raw(42);
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(source_pane),
+                b"existing",
+            ),
+        );
+        let existing_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        let candidate = crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+            Rect::new(0, 0, 80, 24),
+            ClientPrivatePluginPopupOrigin::Pane(source_pane),
+            b"candidate",
+        );
+        let candidate_pane_id = candidate.pane_id();
+
+        assert!(server.install_private_surface(1, candidate, true));
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: existing_pane_id,
+                child_pid: None,
+            })
+        );
+
+        assert!(server.clients[&1].private_surface.is_none());
+        assert_eq!(
+            server
+                .private_surface_candidates
+                .get(&1)
+                .map(|candidate| candidate.surface.pane_id()),
+            Some(candidate_pane_id)
+        );
+        assert!(server.retired_private_pane_ids.contains(&existing_pane_id));
+        assert!(!server.retired_private_pane_ids.contains(&candidate_pane_id));
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::RemoteExecutionReady {
+                pane_id: candidate_pane_id,
+                child_pid: 42,
+                hostname: Some("remote.example".into()),
+                cwd: Some("/remote".into()),
+            })
+        );
+        assert!(server.private_surface_candidates.is_empty());
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(candidate_pane_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_private_popup_candidate_death_keeps_existing_surface() {
+        let mut server = test_headless_server();
+        let source_pane = crate::layout::PaneId::from_raw(42);
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(source_pane),
+                b"existing",
+            ),
+        );
+        let existing_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        let candidate = crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+            Rect::new(0, 0, 80, 24),
+            ClientPrivatePluginPopupOrigin::Pane(source_pane),
+            b"candidate",
+        );
+        let candidate_pane_id = candidate.pane_id();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let pending = PendingPrivateSurfaceResponse {
+            id: "remote-open".into(),
+            respond_to,
+        };
+
+        assert!(server.install_private_surface_with_response(1, candidate, true, Some(pending)));
+        assert!(
+            response_rx.try_recv().is_err(),
+            "remote open must wait for readiness"
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: candidate_pane_id,
+                child_pid: None,
+            })
+        );
+        let response = response_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pre-ready remote failure response");
+        let response = serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .expect("pre-ready remote failure error");
+        assert_eq!(response.id, "remote-open");
+        assert_eq!(response.error.code, "plugin_pane_open_failed");
+        assert!(server.private_surface_candidates.is_empty());
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(existing_pane_id)
+        );
+        assert!(server.retired_private_pane_ids.contains(&candidate_pane_id));
+        assert!(!server.retired_private_pane_ids.contains(&existing_pane_id));
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::RemoteExecutionReady {
+                pane_id: candidate_pane_id,
+                child_pid: 42,
+                hostname: Some("remote.example".into()),
+                cwd: Some("/remote".into()),
+            })
+        );
+        assert_eq!(
+            server.clients[&1]
+                .private_surface
+                .as_ref()
+                .map(|surface| surface.pane_id()),
+            Some(existing_pane_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn private_pane_died_removes_only_the_owner_surface() {
+        let mut server = test_headless_server();
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(crate::layout::PaneId::from_raw(2)),
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+        server.clients.insert(2, test_app_client(None, 2));
+        let shared_counts = (
+            server.app.state.workspaces.len(),
+            server.app.state.terminals.len(),
+        );
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: private_pane_id,
+                child_pid: None,
+            })
+        );
+
+        assert!(server.clients[&1].private_surface.is_none());
+        assert!(server.clients.contains_key(&2));
+        assert_eq!(
+            (
+                server.app.state.workspaces.len(),
+                server.app.state.terminals.len(),
+            ),
+            shared_counts,
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_private_pane_death_resynchronizes_shared_runtime() {
+        let (mut server, _render_rx, pane_id) = retained_test_server(b"shared");
+        let private_pane_id = {
+            let client = server.clients.get_mut(&1).expect("foreground owner");
+            client.private_surface = Some(
+                crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                    Rect::new(0, 0, 80, 24),
+                    ClientPrivatePluginPopupOrigin::Pane(pane_id),
+                    b"private",
+                ),
+            );
+            client.private_surface.as_ref().unwrap().pane_id()
+        };
+        let initial_shared_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("shared runtime")
+            .current_size();
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        server.render_and_stream();
+        assert_eq!(server.effective_size, (80, 24));
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .expect("shared runtime")
+                .current_size(),
+            initial_shared_size,
+        );
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                pane_id: private_pane_id,
+                child_pid: None,
+            })
+        );
+
+        let terminal_area = server.app.state.view.terminal_area;
+        assert_eq!(server.effective_size, (120, 40));
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .expect("resized shared runtime")
+                .current_size(),
+            (terminal_area.height, terminal_area.width.saturating_sub(1),),
+        );
+        shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn disconnected_private_pane_died_event_is_consumed() {
+        let mut server = test_headless_server();
+        let mut owner = test_app_client(None, 1);
+        owner.private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(crate::layout::PaneId::from_raw(3)),
+                b"private",
+            ),
+        );
+        let private_pane_id = owner.private_surface.as_ref().unwrap().pane_id();
+        server.clients.insert(1, owner);
+
+        server.remove_client(1);
+        assert!(server.retired_private_pane_ids.contains(&private_pane_id));
+
+        for _ in 0..2 {
+            assert!(
+                !server.handle_internal_event_with_forwarding(AppEvent::PaneDied {
+                    pane_id: private_pane_id,
+                    child_pid: None,
+                })
+            );
+        }
+        assert!(server.retired_private_pane_ids.contains(&private_pane_id));
+    }
+
+    #[test]
+    fn retired_private_pane_ids_are_bounded_and_reclaim_oldest() {
+        let mut server = test_headless_server();
+        for raw in 1..=RETIRED_PRIVATE_PANE_ID_LIMIT as u32 + 1 {
+            server.retire_private_pane_id(crate::layout::PaneId::from_raw(raw));
+        }
+
+        assert_eq!(
+            server.retired_private_pane_ids.len(),
+            RETIRED_PRIVATE_PANE_ID_LIMIT
+        );
+        assert!(!server
+            .retired_private_pane_ids
+            .contains(&crate::layout::PaneId::from_raw(1)));
+        assert!(server
+            .retired_private_pane_ids
+            .contains(&crate::layout::PaneId::from_raw(
+                RETIRED_PRIVATE_PANE_ID_LIMIT as u32 + 1
+            )));
+    }
+    #[test]
+    fn evicted_private_pane_side_effects_do_not_reach_the_foreground_client() {
+        let mut server = test_headless_server();
+        let (writer, control_rx, _render_rx) = test_client_writer();
+        server
+            .clients
+            .insert(1, test_identity_client(Some("Ada"), Some(writer)));
+        server.foreground_client_id = Some(1);
+        let old_private_pane = crate::layout::PaneId::from_raw(u32::MAX);
+        server.retire_private_pane_id(old_private_pane);
+        for raw in 1..=RETIRED_PRIVATE_PANE_ID_LIMIT as u32 {
+            server.retire_private_pane_id(crate::layout::PaneId::from_raw(raw));
+        }
+        assert!(!server.retired_private_pane_ids.contains(&old_private_pane));
+
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::TerminalBell {
+                pane_id: old_private_pane,
+                count: 1,
+            })
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::PaneClipboardWrite {
+                pane_id: old_private_pane,
+                content: b"private".to_vec(),
+            })
+        );
+        assert!(
+            !server.handle_internal_event_with_forwarding(AppEvent::TerminalCwdReported {
+                pane_id: old_private_pane,
+                cwd: std::path::PathBuf::from("/private"),
+            })
+        );
+
+        assert!(control_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn private_link_click_closes_surface_after_origin_retires() {
+        let (mut server, _render_rx, _) = retained_test_server(b"shared");
+        let area = server.app.state.view.terminal_area;
+        let surface = crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+            area,
+            ClientPrivatePluginPopupOrigin::Pane(crate::layout::PaneId::from_raw(u32::MAX)),
+            b"\x1b]8;;https://example.com/stale\x1b\\open\x1b]8;;\x1b\\",
+        );
+        let private_pane_id = surface.pane_id();
+        let ((column, row), _, _) = surface
+            .visible_hyperlinks(area)
+            .into_iter()
+            .next()
+            .expect("private hyperlink");
+        server.clients.get_mut(&1).unwrap().private_surface = Some(surface);
+
+        assert!(server.handle_private_surface_input_events(
+            1,
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }
+            )],
+        ));
+        assert!(server.clients[&1].private_surface.is_none());
+        assert!(server.retired_private_pane_ids.contains(&private_pane_id));
+    }
+
+    #[tokio::test]
+    async fn private_resize_does_not_promote_or_resize_shared_runtime() {
+        let (mut server, _render_rx, pane_id) = retained_test_server(b"shared");
+        server.clients.insert(2, test_app_client(None, 2));
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        server.clients.get_mut(&1).unwrap().private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(pane_id),
+                b"private",
+            ),
+        );
+        let shared_size = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap()
+            .current_size();
+        let effective_size = server.effective_size;
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 1,
+            cols: 100,
+            rows: 30,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+        server.render_and_stream();
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, effective_size);
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                .unwrap()
+                .current_size(),
+            shared_size,
+        );
+        let surface = server.clients[&1].private_surface.as_ref().unwrap();
+        let render_area = surface.render_area_for_test();
+        assert_ne!(render_area, Rect::new(0, 0, 100, 30));
+        let expected = crate::popup_size::resolve_popup_geometry(None, None, render_area)
+            .unwrap()
+            .inner;
+        assert_eq!(
+            surface.runtime_size_for_test(),
+            Some((expected.height, expected.width)),
+        );
+    }
+
+    #[tokio::test]
+    async fn private_render_cursor_and_hyperlinks_are_owner_only() {
+        let (mut server, owner_rx, pane_id) = retained_test_server(b"shared");
+        let (observer_tx, _observer_control_rx, observer_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(observer_tx),
+            ),
+        );
+        server.clients.get_mut(&1).unwrap().private_surface = Some(
+            crate::server::private_surface::PrivateSurface::test_with_screen_bytes(
+                Rect::new(0, 0, 80, 24),
+                ClientPrivatePluginPopupOrigin::Pane(pane_id),
+                b"\x1b[3;4H\x1b]8;;file:///tmp/private.txt\x1b\\private\x1b]8;;\x1b\\",
+            ),
+        );
+
+        server.render_and_stream();
+
+        let owner = read_server_frame(owner_rx.recv_timeout(Duration::from_millis(100)).unwrap());
+        let observer = read_server_frame(
+            observer_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap(),
+        );
+        assert!(owner
+            .hyperlinks
+            .iter()
+            .any(|url| url == "file:///tmp/private.txt"));
+        assert!(!observer
+            .hyperlinks
+            .iter()
+            .any(|url| url == "file:///tmp/private.txt"));
+        let expected_cursor = server.clients[&1]
+            .private_surface
+            .as_ref()
+            .unwrap()
+            .cursor(server.app.state.view.terminal_area);
+        assert_eq!(owner.cursor, expected_cursor);
+        assert_ne!(observer.cursor, expected_cursor);
     }
 
     /// Verify that no direct calls to `self.app.handle_internal_event`

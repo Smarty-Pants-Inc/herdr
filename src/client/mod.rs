@@ -15,14 +15,23 @@
 #[cfg(unix)]
 mod direct_graphics;
 mod input;
+#[cfg(unix)]
+mod omp_pane;
+#[cfg(unix)]
+mod omp_renderer;
 
 use std::collections::HashSet;
 #[cfg(unix)]
+use std::collections::VecDeque;
 use std::io::IsTerminal as _;
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead as _, Write as _};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use base64::Engine;
 use crossterm::event::{
@@ -44,12 +53,14 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientMessage, NotificationActivation, NotifyKind, RenderEncoding, ServerMessage,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+const MOUSE_SHAPE_POINTER_SEQUENCE: &[u8] = b"\x1b]22;pointer\x1b\\";
+const MOUSE_SHAPE_DEFAULT_SEQUENCE: &[u8] = b"\x1b]22;default\x1b\\";
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -63,6 +74,442 @@ struct ClientLoopConfig {
     kitty_graphics_enabled: bool,
     mouse_capture_active: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    #[cfg(unix)]
+    omp_executable: Option<crate::update::OmpExecutable>,
+}
+#[derive(Default)]
+struct MousePointerState {
+    cell: Option<(u16, u16)>,
+    link_active: Option<bool>,
+}
+
+#[cfg(unix)]
+const HOST_INPUT_CAPTURE: u64 = 0b01;
+#[cfg(unix)]
+const HOST_INPUT_SGR_PIXELS: u64 = 0b10;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostInputSnapshot {
+    packed: u64,
+    stable: bool,
+}
+
+#[cfg(unix)]
+impl HostInputSnapshot {
+    fn from_parts(generation: u64, capture_active: bool, sgr_pixels_active: bool) -> Self {
+        let mut packed = generation << 2;
+        if capture_active {
+            packed |= HOST_INPUT_CAPTURE;
+            if sgr_pixels_active {
+                packed |= HOST_INPUT_SGR_PIXELS;
+            }
+        }
+        Self {
+            packed,
+            stable: true,
+        }
+    }
+
+    fn continued_with(mut self, next: Self) -> Self {
+        self.stable &= next.stable && self.packed == next.packed;
+        self
+    }
+
+    fn generation(self) -> u64 {
+        self.packed >> 2
+    }
+    fn capture_active(self) -> bool {
+        self.packed & HOST_INPUT_CAPTURE != 0
+    }
+    fn sgr_pixels_active(self) -> bool {
+        self.packed & HOST_INPUT_SGR_PIXELS != 0
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct HostInputSegment {
+    bytes: usize,
+    snapshot: HostInputSnapshot,
+    geometry: Option<crate::input::mouse::HostGeometry>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct HostInputBoundary {
+    segments: VecDeque<HostInputSegment>,
+    geometry: Option<crate::input::mouse::HostGeometry>,
+}
+
+#[cfg(unix)]
+impl Default for HostInputBoundary {
+    fn default() -> Self {
+        Self {
+            segments: VecDeque::new(),
+            geometry: crate::input::mouse::HostGeometry::current(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct HostInputState {
+    // Serializes input-boundary capture, packed-state mutations, and input-event publication.
+    // Every `packed` mutation must hold this lock so generations remain monotonic.
+    packed: AtomicU64,
+    event_order: Mutex<HostInputBoundary>,
+    input_fd: Option<RawFd>,
+    wake_reader: Option<crate::pty::fd::WakeWriter>,
+}
+
+#[cfg(unix)]
+impl HostInputState {
+    fn new(capture_active: bool, sgr_pixels_active: bool) -> Self {
+        let snapshot = HostInputSnapshot::from_parts(0, capture_active, sgr_pixels_active);
+        Self {
+            packed: AtomicU64::new(snapshot.packed),
+            event_order: Mutex::new(HostInputBoundary::default()),
+            input_fd: None,
+            wake_reader: None,
+        }
+    }
+
+    fn with_input_fd(
+        capture_active: bool,
+        sgr_pixels_active: bool,
+        input_fd: RawFd,
+    ) -> io::Result<(Self, OwnedFd)> {
+        let wake = crate::pty::fd::create_wake_pipe()?;
+        let mut state = Self::new(capture_active, sgr_pixels_active);
+        state.input_fd = Some(input_fd);
+        state.wake_reader = Some(wake.writer);
+        Ok((state, wake.read_fd))
+    }
+
+    fn load(&self) -> HostInputSnapshot {
+        HostInputSnapshot {
+            packed: self.packed.load(Ordering::Acquire),
+            stable: true,
+        }
+    }
+    fn load_context(&self) -> (HostInputSnapshot, Option<crate::input::mouse::HostGeometry>) {
+        let boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (self.load(), boundary.geometry)
+    }
+
+    fn assigned_input_bytes(boundary: &HostInputBoundary) -> usize {
+        boundary.segments.iter().map(|segment| segment.bytes).sum()
+    }
+
+    fn push_input_segment(
+        boundary: &mut HostInputBoundary,
+        bytes: usize,
+        snapshot: HostInputSnapshot,
+        geometry: Option<crate::input::mouse::HostGeometry>,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(last) = boundary
+            .segments
+            .back_mut()
+            .filter(|last| last.snapshot == snapshot && last.geometry == geometry)
+        {
+            last.bytes = last.bytes.saturating_add(bytes);
+        } else {
+            boundary.segments.push_back(HostInputSegment {
+                bytes,
+                snapshot,
+                geometry,
+            });
+        }
+    }
+
+    fn capture_input_boundary(&self, boundary: &mut HostInputBoundary) -> io::Result<()> {
+        let pending = self
+            .input_fd
+            .map(input::pending_input_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let unassigned = pending.saturating_sub(Self::assigned_input_bytes(boundary));
+        let geometry = boundary.geometry;
+        Self::push_input_segment(boundary, unassigned, self.load(), geometry);
+        Ok(())
+    }
+
+    fn wake_input_reader(&self) -> io::Result<()> {
+        self.wake_reader
+            .as_ref()
+            .map(crate::pty::fd::WakeWriter::wake)
+            .transpose()
+            .map(|_| ())
+    }
+
+    fn read_input_locked(
+        &self,
+        boundary: &mut HostInputBoundary,
+        scratch: &mut [u8],
+    ) -> io::Result<(
+        usize,
+        HostInputSnapshot,
+        Option<crate::input::mouse::HostGeometry>,
+    )> {
+        let segment = boundary.segments.front().copied();
+        let input_state = segment.map_or_else(|| self.load(), |segment| segment.snapshot);
+        let assigned_geometry = segment.map(|segment| segment.geometry);
+        let limit = segment.map_or(scratch.len(), |segment| segment.bytes.min(scratch.len()));
+        let input_fd = self.input_fd.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "stdin reader is not configured")
+        })?;
+        let read = unsafe { libc::read(input_fd, scratch.as_mut_ptr().cast(), limit) };
+        if read < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read = read as usize;
+        if let Some(segment) = boundary.segments.front_mut() {
+            segment.bytes = segment.bytes.saturating_sub(read);
+            if segment.bytes == 0 {
+                boundary.segments.pop_front();
+            }
+        }
+        let geometry = match assigned_geometry {
+            Some(geometry) => geometry,
+            None => crate::input::mouse::HostGeometry::current(),
+        };
+        Ok((read, input_state, geometry))
+    }
+
+    #[cfg(test)]
+    fn read_input(
+        &self,
+        scratch: &mut [u8],
+    ) -> io::Result<(
+        usize,
+        HostInputSnapshot,
+        Option<crate::input::mouse::HostGeometry>,
+    )> {
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.read_input_locked(&mut boundary, scratch)
+    }
+
+    fn read_input_and_send(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        scratch: &mut [u8],
+        build: impl FnOnce(
+            &[u8],
+            HostInputSnapshot,
+            Option<crate::input::mouse::HostGeometry>,
+        ) -> Option<ClientLoopEvent>,
+    ) -> io::Result<usize> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (read, input_state, geometry) = self.read_input_locked(&mut boundary, scratch)?;
+        if read > 0 {
+            if let Some(event) = build(&scratch[..read], input_state, geometry) {
+                permit.send(event);
+            }
+        }
+        Ok(read)
+    }
+
+    fn advance_generation(&self) -> HostInputSnapshot {
+        let previous = self.packed.fetch_add(1 << 2, Ordering::AcqRel);
+        HostInputSnapshot {
+            packed: previous.wrapping_add(1 << 2),
+            stable: true,
+        }
+    }
+
+    fn transition_mouse_mode(
+        &self,
+        capture_active: bool,
+        sgr_pixels_active: bool,
+        apply: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<HostInputSnapshot> {
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = self.load();
+        let snapshot = HostInputSnapshot::from_parts(
+            previous.generation().wrapping_add(1),
+            capture_active,
+            sgr_pixels_active,
+        );
+        self.capture_input_boundary(&mut boundary)?;
+        apply()?;
+        // Bytes captured after apply but before this store crossed the mode boundary.
+        // Keep them unstable even though the next generation has not been published yet.
+        let pending = self
+            .input_fd
+            .map(input::pending_input_bytes)
+            .transpose()?
+            .unwrap_or(0);
+        let during_apply = pending.saturating_sub(Self::assigned_input_bytes(&boundary));
+        let geometry = boundary.geometry;
+        Self::push_input_segment(
+            &mut boundary,
+            during_apply,
+            previous.continued_with(snapshot),
+            geometry,
+        );
+        self.packed.store(snapshot.packed, Ordering::Release);
+        self.wake_input_reader()?;
+        Ok(snapshot)
+    }
+
+    fn reserve_event_slot(
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    ) -> io::Result<tokio::sync::mpsc::Permit<'_, ClientLoopEvent>> {
+        loop {
+            match event_tx.try_reserve() {
+                Ok(permit) => return Ok(permit),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "client event loop closed",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn send_event(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        event: ClientLoopEvent,
+    ) -> io::Result<()> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let _guard = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        permit.send(event);
+        Ok(())
+    }
+
+    fn send_resize(
+        &self,
+        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+        new_size: (u16, u16, u32, u32),
+        host_geometry: Option<crate::input::mouse::HostGeometry>,
+    ) -> io::Result<()> {
+        let permit = Self::reserve_event_slot(event_tx)?;
+        let mut boundary = self
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.capture_input_boundary(&mut boundary)?;
+        let generation = self.advance_generation().generation();
+        boundary.geometry = host_geometry;
+        permit.send(ClientLoopEvent::Resize(
+            new_size.0,
+            new_size.1,
+            new_size.2,
+            new_size.3,
+            generation,
+            host_geometry,
+        ));
+        self.wake_input_reader()
+    }
+}
+
+#[cfg(unix)]
+fn mouse_input_is_current(
+    input: HostInputSnapshot,
+    current: HostInputSnapshot,
+    applied_generation: u64,
+    require_capture: bool,
+) -> bool {
+    input.stable
+        && input.generation() == applied_generation
+        && (!require_capture || current.capture_active())
+}
+
+#[cfg(unix)]
+fn pixel_input_is_current(
+    input: HostInputSnapshot,
+    current: HostInputSnapshot,
+    applied_generation: u64,
+    input_geometry: crate::input::mouse::HostGeometry,
+    applied_geometry: Option<crate::input::mouse::HostGeometry>,
+) -> bool {
+    mouse_input_is_current(input, current, applied_generation, true)
+        && applied_geometry == Some(input_geometry)
+}
+#[cfg(unix)]
+fn apply_resize_input_boundary(
+    applied_generation: &mut u64,
+    applied_geometry: &mut Option<crate::input::mouse::HostGeometry>,
+    resize_generation: u64,
+    resize_geometry: Option<crate::input::mouse::HostGeometry>,
+) {
+    *applied_generation = (*applied_generation).max(resize_generation);
+    *applied_geometry = resize_geometry;
+}
+
+impl MousePointerState {
+    fn observe_raw_events(
+        &mut self,
+        events: &[crate::raw_input::RawInputEvent],
+    ) -> Option<Option<(u16, u16)>> {
+        let mut update = None;
+        for event in events {
+            match event {
+                crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                    self.cell = Some((mouse.column, mouse.row));
+                    update = Some(self.cell);
+                }
+                crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    self.cell = None;
+                    update = Some(None);
+                }
+                _ => {}
+            }
+        }
+        update
+    }
+
+    fn set_cell(&mut self, cell: Option<(u16, u16)>) {
+        self.cell = cell;
+    }
+
+    fn write_for_frame(
+        &mut self,
+        writer: &mut impl io::Write,
+        frame: Option<&crate::protocol::FrameData>,
+        link_active_override: Option<bool>,
+    ) -> io::Result<()> {
+        let link_active = link_active_override.unwrap_or_else(|| {
+            self.cell.is_some_and(|(column, row)| {
+                frame.is_some_and(|frame| render_ansi::frame_has_hyperlink_at(frame, column, row))
+            })
+        });
+        if self.link_active == Some(link_active) {
+            return Ok(());
+        }
+        writer.write_all(if link_active {
+            MOUSE_SHAPE_POINTER_SEQUENCE
+        } else {
+            MOUSE_SHAPE_DEFAULT_SEQUENCE
+        })?;
+        writer.flush()?;
+        self.link_active = Some(link_active);
+        Ok(())
+    }
 }
 
 /// State tracking for the thin client.
@@ -71,6 +518,12 @@ struct ClientState {
     blit_encoder: render_ansi::BlitEncoder,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
+    /// Whether host reports use SGR pixel coordinates.
+    sgr_pixels_active: bool,
+    /// Mouse capture requested by the server-owned surface.
+    server_mouse_capture_active: bool,
+    /// SGR pixel reporting requested by the server-owned surface.
+    server_sgr_pixels_active: bool,
     /// Whether the host terminal currently reports all keys as Kitty sequences.
     keyboard_report_all_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -98,6 +551,15 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// Last physical cell size paired with `reported_size`.
+    reported_cell_size_px: (u32, u32),
+    /// Detached URL opener children owned until they exit.
+    detached_process_children: Vec<std::process::Child>,
+    /// Client-local pointer position and emitted OSC 22 cursor shape.
+    mouse_pointer: MousePointerState,
+    /// App-owned full-surface OMP renderer, when this Unix client advertised support.
+    #[cfg(unix)]
+    omp_renderer: omp_renderer::ClientOmpRenderer,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +703,26 @@ impl ClientState {
     fn request_repaint(&mut self) {
         self.repaint_pending = true;
     }
+    #[cfg(unix)]
+    fn desired_host_mouse_mode(&self) -> (bool, bool) {
+        let (local_capture, local_sgr_pixels) = self.omp_renderer.local_mouse_mode();
+        let capture = self.server_mouse_capture_active || local_capture;
+        let sgr_pixels =
+            (self.server_mouse_capture_active && self.server_sgr_pixels_active) || local_sgr_pixels;
+        (capture, capture && sgr_pixels)
+    }
+
+    fn write_mouse_pointer_shape(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
+        #[cfg(unix)]
+        let native_link_active = self.omp_renderer.native_link_active();
+        #[cfg(not(unix))]
+        let native_link_active = None;
+        self.mouse_pointer.write_for_frame(
+            writer,
+            self.blit_encoder.last_frame(),
+            native_link_active,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +738,8 @@ pub enum ClientError {
     HandshakeRejected { version: u32, error: String },
     /// Server shut down.
     ServerShutdown { reason: Option<String> },
+    /// Server is handing live state to a replacement build.
+    ServerHandoff { reason: String },
     /// Lost connection to the server.
     ConnectionLost(io::Error),
     /// Protocol error (framing, deserialization).
@@ -302,6 +786,9 @@ impl std::fmt::Display for ClientError {
                     }
                 }
                 Ok(())
+            }
+            ClientError::ServerHandoff { reason } => {
+                write!(f, "server handoff in progress: {reason}")
             }
             ClientError::ConnectionLost(err) => {
                 if let Ok(reattach_command) = std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
@@ -472,7 +959,8 @@ fn write_terminal_restore_postlude(
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
         )?;
     }
-    // Restore a visible cursor and reset DECSCUSR back to the terminal default.
+    // Restore the terminal-default pointer, a visible cursor, and default DECSCUSR shape.
+    writer.write_all(MOUSE_SHAPE_DEFAULT_SEQUENCE)?;
     writer.write_all(b"\x1b[?25h\x1b[0 q")?;
     writer.flush()
 }
@@ -588,6 +1076,35 @@ fn set_mouse_capture(enabled: bool, sgr_pixels: bool) -> io::Result<()> {
             Err(err) => Err(err),
         }
     }
+}
+
+#[cfg(unix)]
+fn sync_host_mouse_mode(
+    state: &mut ClientState,
+    host_input_state: &HostInputState,
+    applied_host_input_generation: &mut u64,
+) -> Result<(), ClientError> {
+    let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
+    if enabled != state.mouse_capture_active || sgr_pixels != state.sgr_pixels_active {
+        state.omp_renderer.finish_local_mouse_gesture();
+        let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
+        if enabled == state.mouse_capture_active && sgr_pixels == state.sgr_pixels_active {
+            return Ok(());
+        }
+        *applied_host_input_generation = host_input_state
+            .transition_mouse_mode(enabled, sgr_pixels, || {
+                set_mouse_capture(enabled, sgr_pixels)
+            })
+            .map_err(ClientError::ConnectionFailed)?
+            .generation();
+        state.mouse_capture_active = enabled;
+        state.sgr_pixels_active = sgr_pixels;
+        if !enabled {
+            state.mouse_pointer.set_cell(None);
+            state.omp_renderer.observe_pointer_cell(None);
+        }
+    }
+    Ok(())
 }
 
 fn restore_terminal_state(
@@ -827,6 +1344,141 @@ fn client_launch_mode(
     }
 }
 
+#[cfg(unix)]
+fn client_omp_renderer_eligible(
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> bool {
+    let app_surface = matches!(
+        launch_mode,
+        ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+    );
+    omp_renderer::capabilities(requested_encoding, app_surface, stdin_tty, stdout_tty, true)
+        .client_local_native
+}
+
+fn client_omp_renderer_capabilities(
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    omp_executable: Option<&crate::update::OmpExecutable>,
+) -> crate::protocol::OmpRendererCapabilities {
+    #[cfg(unix)]
+    {
+        let app_surface = matches!(
+            launch_mode,
+            ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
+        );
+        omp_renderer::capabilities(
+            requested_encoding,
+            app_surface,
+            stdin_tty,
+            stdout_tty,
+            omp_executable.is_some(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            requested_encoding,
+            launch_mode,
+            stdin_tty,
+            stdout_tty,
+            omp_executable,
+        );
+        crate::protocol::OmpRendererCapabilities::default()
+    }
+}
+
+#[cfg(unix)]
+fn resolve_client_omp_executable(eligible: bool) -> Option<crate::update::OmpExecutable> {
+    resolve_client_omp_executable_with(eligible, crate::update::native_omp_executable, |error| {
+        eprintln!("herdr: native OMP renderer unavailable ({error}); using server-side rendering");
+    })
+}
+
+#[cfg(unix)]
+fn client_omp_resolution_is_benign(error: &str) -> bool {
+    matches!(
+        error,
+        "managed OMP companion is disabled for this client attach"
+            | "managed OMP companion is unavailable for this platform"
+            | "this Herdr build has no paired OMP companion"
+    )
+}
+
+#[cfg(unix)]
+fn resolve_client_omp_executable_with(
+    eligible: bool,
+    resolve: impl FnOnce() -> Result<crate::update::OmpExecutable, String>,
+    report_failure: impl FnOnce(&str),
+) -> Option<crate::update::OmpExecutable> {
+    if !eligible {
+        return None;
+    }
+    match resolve().and_then(|executable| executable.verify().map(|()| executable)) {
+        Ok(executable) => Some(executable),
+        Err(error) if client_omp_resolution_is_benign(&error) => None,
+        Err(error) => {
+            report_failure(&error);
+            None
+        }
+    }
+}
+#[cfg(unix)]
+fn probe_connect_then_resolve_client_omp_and_handshake_with<T, H>(
+    eligible: bool,
+    probe_connect: impl FnOnce() -> io::Result<T>,
+    resolve: impl FnOnce(bool) -> Option<crate::update::OmpExecutable>,
+    connect: impl FnOnce() -> io::Result<T>,
+    handshake: impl FnOnce(&mut T, Option<&crate::update::OmpExecutable>) -> Result<H, ClientError>,
+) -> Result<(T, Option<crate::update::OmpExecutable>, H), ClientError> {
+    if eligible {
+        drop(probe_connect().map_err(ClientError::ConnectionFailed)?);
+    }
+    let omp_executable = resolve(eligible);
+    let mut stream = connect().map_err(|error| {
+        if eligible {
+            ClientError::ConnectionLost(error)
+        } else {
+            ClientError::ConnectionFailed(error)
+        }
+    })?;
+    let handshake_result = handshake(&mut stream, omp_executable.as_ref()).map_err(|error| {
+        if !eligible {
+            return error;
+        }
+        match error {
+            ClientError::ConnectionFailed(error) => ClientError::ConnectionLost(error),
+            ClientError::Protocol(protocol::FramingError::UnexpectedEof) => {
+                ClientError::ConnectionLost(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "server connection closed during handshake",
+                ))
+            }
+            ClientError::Protocol(protocol::FramingError::Io(error))
+                if error.kind() != io::ErrorKind::InvalidData =>
+            {
+                ClientError::ConnectionLost(error)
+            }
+            error => error,
+        }
+    })?;
+    Ok((stream, omp_executable, handshake_result))
+}
+fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
+    match crate::config::load_or_create_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!("herdr: unable to load client identity: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Performs the client→server handshake.
 ///
 /// Sends Hello with the terminal size and protocol version, reads the Welcome
@@ -837,9 +1489,33 @@ fn do_handshake(
     rows: u16,
     cell_width_px: u32,
     cell_height_px: u32,
-    exact_cell_size: bool,
     requested_encoding: RenderEncoding,
-    direct_attach_requested: bool,
+    launch_mode: ClientLaunchMode,
+    identity: &crate::config::ClientIdentity,
+) -> Result<RenderEncoding, ClientError> {
+    do_handshake_with_renderer_capabilities(
+        stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        launch_mode,
+        crate::protocol::OmpRendererCapabilities::default(),
+        identity,
+    )
+}
+
+fn do_handshake_with_renderer_capabilities(
+    stream: &mut LocalStream,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    launch_mode: ClientLaunchMode,
+    renderer_capabilities: crate::protocol::OmpRendererCapabilities,
+    identity: &crate::config::ClientIdentity,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -854,12 +1530,13 @@ fn do_handshake(
         cell_height_px,
         requested_encoding,
         keybindings: requested_keybindings(),
-        launch_mode: client_launch_mode(
-            direct_attach_requested,
-            exact_cell_size,
-            cell_width_px,
-            cell_height_px,
-        ),
+        launch_mode,
+        display_name: (launch_mode != ClientLaunchMode::OmpPane)
+            .then(|| identity.display_name.clone())
+            .flatten(),
+        frontend_profile_id: Some(identity.frontend_profile_id.clone()),
+        renderer_binding_token: Some(identity.renderer_binding_token.clone()),
+        renderer_capabilities,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -901,19 +1578,33 @@ fn do_handshake(
 
 /// Internal events for the client event loop.
 enum ClientLoopEvent {
-    /// Raw input bytes from stdin.
+    /// Raw input bytes from stdin with the host-input state at their boundary.
     #[cfg(unix)]
-    StdinInput(Vec<u8>),
-    /// One confirmed SGR pixel report with geometry captured by the reader.
+    StdinInput(Vec<u8>, HostInputSnapshot),
+    /// Framed events from one stdin read, published as one ordering unit.
     #[cfg(unix)]
-    PixelMouse(Vec<u8>, crate::input::mouse::HostGeometry),
+    OrderedInput(Vec<ClientLoopEvent>),
+    /// One confirmed SGR pixel report with geometry and input snapshot captured by the reader.
+    #[cfg(unix)]
+    PixelMouse(
+        Vec<u8>,
+        crate::input::mouse::HostGeometry,
+        HostInputSnapshot,
+    ),
     #[cfg(unix)]
     DirectGraphicsResponse(direct_graphics::Response),
     /// Structured input events from platforms without Unix-style stdin bytes.
     #[cfg(windows)]
     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
     /// Terminal resize detected.
-    Resize(u16, u16, u32, u32),
+    Resize(
+        u16,
+        u16,
+        u32,
+        u32,
+        u64,
+        Option<crate::input::mouse::HostGeometry>,
+    ),
     /// Server message received.
     ServerMessage(ServerMessage),
     /// Server reader thread exited (connection lost).
@@ -922,9 +1613,121 @@ enum ClientLoopEvent {
     Timer,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct ClientExecutableIdentity {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl ClientExecutableIdentity {
+    fn capture() -> Option<Self> {
+        Self::capture_at(std::env::current_exe().ok()?)
+    }
+
+    fn capture_at(path: std::path::PathBuf) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn was_replaced(&self) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        std::fs::metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() != self.device || metadata.ino() != self.inode)
+    }
+
+    fn exec_replacement(&self) -> io::Error {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(&self.path);
+        command.args(std::env::args_os().skip(1));
+        command.exec()
+    }
+}
+
+#[cfg(unix)]
+fn should_relaunch_updated_client_during_startup(
+    direct_attach_requested: bool,
+    remote_client: bool,
+    executable_replaced: bool,
+) -> bool {
+    !direct_attach_requested && !remote_client && executable_replaced
+}
+
+#[cfg(unix)]
+fn should_relaunch_updated_client(
+    error: &ClientError,
+    direct_attach_requested: bool,
+    remote_client: bool,
+    executable_replaced: bool,
+) -> bool {
+    if direct_attach_requested || remote_client || !executable_replaced {
+        return false;
+    }
+
+    match error {
+        ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. } => true,
+        ClientError::ServerShutdown { reason } => reason.as_deref() != Some("detached"),
+        _ => false,
+    }
+}
+fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> bool {
+    remote_client
+        && matches!(
+            error,
+            ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. }
+        )
+}
+
+#[cfg(unix)]
+fn client_error_exit_code(error: &ClientError, remote_client: bool) -> i32 {
+    if should_request_remote_reconnect(error, remote_client) {
+        crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+    } else {
+        1
+    }
+}
+
 /// Runs the thin client: connects to the server, performs the handshake,
 /// and enters the main event loop.
 ///
+/// Runs the hidden OMP logical-pane client.
+#[cfg(unix)]
+pub fn run_omp_pane(
+    pane_id: String,
+    omp_session_id: String,
+    route_generation: u64,
+    target_app_client_id: Option<u64>,
+) -> io::Result<()> {
+    omp_pane::run(
+        pane_id,
+        omp_session_id,
+        route_generation,
+        target_app_client_id,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn run_omp_pane(
+    _pane_id: String,
+    _omp_session_id: String,
+    _route_generation: u64,
+    _target_app_client_id: Option<u64>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "OMP pane POC is Unix-only",
+    ))
+}
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
     run_client_with_mode(
@@ -1037,9 +1840,9 @@ fn connect_terminal_session_stream(
         rows,
         0,
         0,
-        false,
         RenderEncoding::TerminalAnsi,
-        true,
+        ClientLaunchMode::TerminalAttach,
+        &load_client_identity_or_exit(),
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1056,6 +1859,19 @@ fn connect_terminal_session_stream(
 
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+fn write_terminal_session_closed(
+    stdout: &mut impl io::Write,
+    reason: Option<String>,
+) -> io::Result<()> {
+    let line = serde_json::json!({
+        "type": "terminal.closed",
+        "reason": reason,
+    });
+    serde_json::to_writer(&mut *stdout, &line)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 
 fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
@@ -1078,14 +1894,10 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                 stdout.flush()?;
             }
             Ok(ServerMessage::ServerShutdown { reason }) => {
-                let line = serde_json::json!({
-                    "type": "terminal.closed",
-                    "reason": reason,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-                return Ok(());
+                return write_terminal_session_closed(&mut stdout, reason)
+            }
+            Ok(ServerMessage::ServerHandoff { reason }) => {
+                return write_terminal_session_closed(&mut stdout, Some(reason))
             }
             Ok(ServerMessage::Graphics { .. }) => {}
             Ok(_) => {}
@@ -1223,6 +2035,7 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
+    let identity = load_client_identity_or_exit();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
@@ -1230,8 +2043,139 @@ fn run_client_with_mode(
     let host_cursor = loaded_config.config.ui.host_cursor;
     let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    #[cfg(unix)]
+    let client_executable = ClientExecutableIdentity::capture();
+    let remote_client = std::env::var_os(crate::remote::REATTACH_COMMAND_ENV_VAR).is_some();
+
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+
+    let socket_path = client_socket_path();
+    crate::logging::startup("client");
+    info!(path = %socket_path.display(), "{log_message}");
+
+    // Get the terminal geometry before handshake (before raw mode).
+    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
+        initial_terminal_geometry(kitty_graphics_enabled);
+    let launch_mode = client_launch_mode(
+        direct_attach_requested,
+        exact_cell_size,
+        cell_width_px,
+        cell_height_px,
+    );
+    let stdin_tty = io::stdin().is_terminal();
+    let stdout_tty = io::stdout().is_terminal();
+    #[cfg(unix)]
+    let omp_eligible =
+        client_omp_renderer_eligible(requested_encoding, launch_mode, stdin_tty, stdout_tty);
+    #[cfg(unix)]
+    let (mut stream, omp_executable, (renderer_capabilities, negotiated_encoding)) =
+        match probe_connect_then_resolve_client_omp_and_handshake_with(
+            omp_eligible,
+            || crate::ipc::connect_local_stream(&socket_path),
+            resolve_client_omp_executable,
+            || crate::ipc::connect_local_stream(&socket_path),
+            |stream, omp_executable| {
+                let renderer_capabilities = client_omp_renderer_capabilities(
+                    requested_encoding,
+                    launch_mode,
+                    stdin_tty,
+                    stdout_tty,
+                    omp_executable,
+                );
+                let negotiated_encoding = do_handshake_with_renderer_capabilities(
+                    stream,
+                    cols,
+                    rows,
+                    cell_width_px,
+                    cell_height_px,
+                    requested_encoding,
+                    launch_mode,
+                    renderer_capabilities,
+                    &identity,
+                )?;
+                Ok((renderer_capabilities, negotiated_encoding))
+            },
+        ) {
+            Ok(values) => values,
+            Err(err) => {
+                #[cfg(unix)]
+                if let Some(executable) = client_executable.as_ref().filter(|executable| {
+                    should_relaunch_updated_client_during_startup(
+                        direct_attach_requested,
+                        remote_client,
+                        executable.was_replaced(),
+                    )
+                }) {
+                    info!(path = %executable.path.display(), "relaunching updated client during startup");
+                    let relaunch_error = executable.exec_replacement();
+                    eprintln!("herdr: {err}");
+                    eprintln!(
+                        "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+                    );
+                    std::process::exit(1);
+                }
+                eprintln!("herdr: {err}");
+                std::process::exit(client_error_exit_code(&err, remote_client));
+            }
+        };
+    #[cfg(unix)]
+    if let Some(executable) = client_executable.as_ref().filter(|executable| {
+        should_relaunch_updated_client_during_startup(
+            direct_attach_requested,
+            remote_client,
+            executable.was_replaced(),
+        )
+    }) {
+        info!(path = %executable.path.display(), "relaunching updated client during startup");
+        let relaunch_error = executable.exec_replacement();
+        eprintln!(
+            "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+        );
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    let omp_executable: Option<crate::update::OmpExecutable> = None;
+    #[cfg(not(unix))]
+    let renderer_capabilities = client_omp_renderer_capabilities(
+        requested_encoding,
+        launch_mode,
+        stdin_tty,
+        stdout_tty,
+        omp_executable.as_ref(),
+    );
+    #[cfg(not(unix))]
+    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("herdr: {}", ClientError::ConnectionFailed(err));
+            std::process::exit(1);
+        }
+    };
+    #[cfg(not(unix))]
+    let negotiated_encoding = match do_handshake_with_renderer_capabilities(
+        &mut stream,
+        cols,
+        rows,
+        cell_width_px,
+        cell_height_px,
+        requested_encoding,
+        launch_mode,
+        renderer_capabilities,
+        &identity,
+    ) {
+        Ok(encoding) => encoding,
+        Err(err) => {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(unix)]
+    let renderer_omp_executable = renderer_capabilities
+        .client_local_native
+        .then_some(omp_executable)
+        .flatten();
     let loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
@@ -1240,43 +2184,8 @@ fn run_client_with_mode(
         kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
         remote_image_paste_key,
-    };
-
-    let socket_path = client_socket_path();
-    crate::logging::startup("client");
-    info!(path = %socket_path.display(), "{log_message}");
-
-    // Try to connect to the server.
-    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(s) => s,
-        Err(err) => {
-            // Server unreachable — show clear error and exit.
-            let client_err = ClientError::ConnectionFailed(err);
-            eprintln!("herdr: {client_err}");
-            std::process::exit(1);
-        }
-    };
-
-    // Get the terminal geometry before handshake (before raw mode).
-    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(kitty_graphics_enabled);
-
-    // Perform handshake while the stream is still in blocking mode.
-    let negotiated_encoding = match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        exact_cell_size,
-        requested_encoding,
-        direct_attach_requested,
-    ) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
-        }
+        #[cfg(unix)]
+        omp_executable: renderer_omp_executable,
     };
 
     if let Some((terminal_id, takeover)) = attach_request {
@@ -1355,9 +2264,32 @@ fn run_client_with_mode(
     let terminal_restore_failed = terminal_guard.restore().is_err();
 
     if let Err(err) = result {
-        let _ = writeln!(io::stderr(), "herdr: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
+
+        #[cfg(unix)]
+        if let Some(executable) = client_executable.as_ref().filter(|executable| {
+            should_relaunch_updated_client(
+                &err,
+                direct_attach_requested,
+                remote_client,
+                executable.was_replaced(),
+            )
+        }) {
+            info!(path = %executable.path.display(), "relaunching updated client");
+            let relaunch_error = executable.exec_replacement();
+            let _ = writeln!(io::stderr(), "herdr: {err}");
+            let _ = writeln!(
+                io::stderr(),
+                "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
+            );
+            std::process::exit(1);
+        }
+
+        let _ = writeln!(io::stderr(), "herdr: {err}");
+        if should_request_remote_reconnect(&err, remote_client) {
+            std::process::exit(crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE);
+        }
 
         let detached = matches!(
             &err,
@@ -1376,6 +2308,84 @@ fn run_client_with_mode(
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
+
+    Ok(())
+}
+fn display_semantic_surface(
+    state: &mut ClientState,
+    frame_data: crate::protocol::FrameData,
+    force_repaint: bool,
+) {
+    state.repaint_pending |= force_repaint;
+    let frame_data = if state.draw_host_cursor {
+        render_ansi::frame_with_drawn_cursor(frame_data)
+    } else {
+        frame_data
+    };
+    let encoded = if state.draw_host_cursor {
+        state
+            .blit_encoder
+            .encode_with_suppressed_visible_cursor(&frame_data, state.repaint_pending)
+    } else {
+        state
+            .blit_encoder
+            .encode(&frame_data, state.repaint_pending)
+    };
+    let mut stdout = io::stdout();
+    let graphics = if state.kitty_graphics_enabled {
+        frame_data.graphics.as_slice()
+    } else {
+        &[]
+    };
+    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+    state.blit_encoder.commit(frame_data, encoded);
+    let _ = state.write_mouse_pointer_shape(&mut stdout);
+    let _ = stdout.flush();
+    state.repaint_pending = false;
+}
+
+#[cfg(unix)]
+fn display_pending_omp_surface(
+    state: &mut ClientState,
+    write_stream: &mut LocalStream,
+    host_input_state: &HostInputState,
+    applied_host_input_generation: &mut u64,
+    sync_mouse_mode: bool,
+) -> Result<(), ClientError> {
+    if let Some(surface) = state
+        .omp_renderer
+        .next_frame(Instant::now(), state.reported_size)
+    {
+        display_semantic_surface(state, surface.frame, surface.force_repaint);
+    }
+    if sync_mouse_mode {
+        sync_host_mouse_mode(state, host_input_state, applied_host_input_generation)?;
+    }
+    for effect in state.omp_renderer.take_effects() {
+        match effect {
+            omp_renderer::LocalEffect::Bell(count) => {
+                if let Err(err) =
+                    crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
+                {
+                    warn!(err = %err, "failed to emit local OMP terminal bell");
+                }
+            }
+            omp_renderer::LocalEffect::ClipboardWrite(content) => {
+                crate::selection::write_osc52_bytes(&content);
+                let _ = io::stdout().flush();
+            }
+            omp_renderer::LocalEffect::OpenUrl(url) => {
+                open_safe_url(
+                    &url,
+                    &mut state.detached_process_children,
+                    crate::platform::open_url,
+                );
+            }
+        }
+    }
+    for message in state.omp_renderer.take_outbound_messages() {
+        write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
+    }
     Ok(())
 }
 
@@ -1405,6 +2415,9 @@ async fn run_client_loop(
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
+        sgr_pixels_active: false,
+        server_mouse_capture_active: config.mouse_capture_active,
+        server_sgr_pixels_active: false,
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
         sound_config: config.sound_config,
@@ -1420,13 +2433,41 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
+        detached_process_children: Vec::new(),
+        mouse_pointer: MousePointerState::default(),
+        #[cfg(unix)]
+        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
     };
+    #[cfg(unix)]
+    state
+        .omp_renderer
+        .set_server_sgr_pixels_active(state.server_sgr_pixels_active);
     debug!(?negotiated_encoding, "client render encoding active");
-    let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
-    let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let initial_host_geometry = crate::input::mouse::HostGeometry::current()
+        .filter(|geometry| geometry.cols == cols && geometry.rows == rows);
+    #[cfg(unix)]
+    let (host_input_state, stdin_input_wake) =
+        HostInputState::with_input_fd(state.mouse_capture_active, false, io::stdin().as_raw_fd())
+            .map_err(ClientError::ConnectionFailed)?;
+    #[cfg(unix)]
+    {
+        host_input_state
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .geometry = initial_host_geometry;
+    }
+    #[cfg(unix)]
+    let host_input_state = Arc::new(host_input_state);
+    #[cfg(unix)]
+    let mut applied_host_input_generation = host_input_state.load().generation();
+    #[cfg(unix)]
+    let mut applied_host_geometry = initial_host_geometry;
 
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -1440,8 +2481,8 @@ async fn run_client_loop(
         && host_cell_size_query_required(state.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
-    let stdin_mouse_capture_active = host_mouse_capture_active.clone();
-    let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
+    #[cfg(unix)]
+    let stdin_host_input_state = host_input_state.clone();
     #[cfg(unix)]
     let stdin_direct_response = state.direct_graphics_response.clone();
     #[cfg(unix)]
@@ -1455,8 +2496,10 @@ async fn run_client_loop(
             &stdin_quit,
             will_query_host_terminal_theme,
             will_query_host_cell_size,
-            stdin_mouse_capture_active,
-            stdin_sgr_pixels_active,
+            #[cfg(unix)]
+            stdin_host_input_state,
+            #[cfg(unix)]
+            stdin_input_wake,
             #[cfg(unix)]
             stdin_direct_response,
             #[cfg(unix)]
@@ -1476,6 +2519,8 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
+    #[cfg(unix)]
+    let resize_input_state = host_input_state.clone();
     let kitty_graphics_enabled = state.kitty_graphics_enabled;
     std::thread::spawn(move || {
         resize_poll_loop(
@@ -1486,6 +2531,8 @@ async fn run_client_loop(
             initial_cell_height_px,
             kitty_graphics_enabled,
             &resize_cell_size,
+            #[cfg(unix)]
+            &resize_input_state,
             &resize_quit,
         );
     });
@@ -1522,17 +2569,72 @@ async fn run_client_loop(
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
     // Main event loop.
+    #[cfg(unix)]
+    let mut ordered_input = VecDeque::new();
+    #[cfg(unix)]
+    let mut ordered_input_batch_active = false;
     while !should_quit.load(Ordering::Acquire) {
-        let event = tokio::select! {
-            ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+        #[cfg(unix)]
+        if ordered_input_batch_active && ordered_input.is_empty() {
+            sync_host_mouse_mode(
+                &mut state,
+                &host_input_state,
+                &mut applied_host_input_generation,
+            )?;
+            ordered_input_batch_active = false;
+        }
+        let event = {
+            #[cfg(unix)]
+            if let Some(event) = ordered_input.pop_front() {
+                event
+            } else {
+                tokio::select! {
+                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+                }
+            }
         };
 
         match event {
             #[cfg(unix)]
-            ClientLoopEvent::StdinInput(data) => {
-                let data = if let Some(attach_escape) = &mut state.attach_escape {
-                    match attach_escape.filter_input(
+            ClientLoopEvent::OrderedInput(events) => {
+                if !events.is_empty() {
+                    ordered_input_batch_active = true;
+                    ordered_input.extend(events);
+                }
+                continue;
+            }
+            #[cfg(unix)]
+            ClientLoopEvent::StdinInput(data, input_state) => {
+                let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                let has_mouse = events
+                    .iter()
+                    .any(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)));
+                let attach_mode = state.attach_escape.is_some();
+                let current_input_state = host_input_state.load();
+                if has_mouse
+                    && !mouse_input_is_current(
+                        input_state,
+                        current_input_state,
+                        applied_host_input_generation,
+                        !attach_mode,
+                    )
+                {
+                    continue;
+                }
+                if let Some(cell) = state.mouse_pointer.observe_raw_events(&events) {
+                    state.omp_renderer.observe_pointer_cell(cell);
+                }
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                let (data, parsed_events) = if let Some(attach_escape) = &mut state.attach_escape {
+                    let data = match attach_escape.filter_input(
                         data,
                         state.reported_size.1,
                         state.mouse_scroll_lines,
@@ -1571,9 +2673,9 @@ async fn run_client_loop(
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
-                    }
+                    };
+                    (data, None)
                 } else {
-                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
                         state.redraw_on_focus_gained,
@@ -1589,8 +2691,30 @@ async fn run_client_loop(
                     if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
                         store_reported_cell_size(&reported_cell_size, width_px, height_px);
                     }
-                    data
+                    (data, Some(events))
                 };
+                if state.omp_renderer.owns_input() {
+                    for message in state.omp_renderer.route_input_at_generation(
+                        parsed_events.unwrap_or_default(),
+                        input_state.generation(),
+                    ) {
+                        if let Err(error) = write_to_server(&mut write_stream, &message) {
+                            return Err(ClientError::ConnectionLost(error));
+                        }
+                    }
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                        !ordered_input_batch_active,
+                    )?;
+                    let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                    continue;
+                }
+                if let Some(events) = parsed_events.as_deref() {
+                    state.omp_renderer.observe_outer_focus(events);
+                }
                 if should_bridge_clipboard_image_paste(
                     &data,
                     is_remote_client,
@@ -1615,6 +2739,11 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
+                state.omp_renderer.complete_direct_graphics(
+                    response.transfer_id,
+                    response.image_id,
+                    response.success,
+                );
                 let message = ClientMessage::GraphicsTransmissionResult {
                     transfer_id: response.transfer_id,
                     image_id: response.image_id,
@@ -1625,17 +2754,38 @@ async fn run_client_loop(
                 }
             }
             #[cfg(unix)]
-            ClientLoopEvent::PixelMouse(data, geometry) => {
-                let message = ClientMessage::InputPixels {
-                    data,
-                    cols: geometry.cols,
-                    rows: geometry.rows,
-                    width_px: geometry.width_px,
-                    height_px: geometry.height_px,
-                };
-                if let Err(err) = write_to_server(&mut write_stream, &message) {
-                    return Err(ClientError::ConnectionLost(err));
+            ClientLoopEvent::PixelMouse(data, geometry, input_state) => {
+                let current_input_state = host_input_state.load();
+                if !pixel_input_is_current(
+                    input_state,
+                    current_input_state,
+                    applied_host_input_generation,
+                    geometry,
+                    applied_host_geometry,
+                ) || !current_input_state.sgr_pixels_active()
+                {
+                    continue;
                 }
+                let cell =
+                    crate::input::mouse::parse_report(&data).and_then(|(x, y)| geometry.cell(x, y));
+                state.mouse_pointer.set_cell(cell);
+                let message =
+                    state
+                        .omp_renderer
+                        .route_pixel_input(data, geometry, input_state.generation());
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                if let Some(message) = message {
+                    if let Err(err) = write_to_server(&mut write_stream, &message) {
+                        return Err(ClientError::ConnectionLost(err));
+                    }
+                }
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    &host_input_state,
+                    &mut applied_host_input_generation,
+                    !ordered_input_batch_active,
+                )?;
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
@@ -1663,6 +2813,8 @@ async fn run_client_loop(
                     .iter()
                     .map(crate::protocol::ClientInputEvent::to_raw_input_event)
                     .collect::<Vec<_>>();
+                let _ = state.mouse_pointer.observe_raw_events(&raw_events);
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 if crate::raw_input::events_require_host_surface_redraw(
                     &raw_events,
                     state.redraw_on_focus_gained,
@@ -1674,10 +2826,46 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+            ClientLoopEvent::Resize(
+                new_cols,
+                new_rows,
+                cell_width_px,
+                cell_height_px,
+                resize_generation,
+                host_geometry,
+            ) => {
+                #[cfg(unix)]
+                {
+                    apply_resize_input_boundary(
+                        &mut applied_host_input_generation,
+                        &mut applied_host_geometry,
+                        resize_generation,
+                        host_geometry,
+                    );
+                }
+                #[cfg(windows)]
+                let _ = (resize_generation, host_geometry);
                 state.reported_size = (new_cols, new_rows);
-                // Resizing invalidates the host-side blit baseline.
+                state.reported_cell_size_px = (cell_width_px, cell_height_px);
+                state.mouse_pointer.set_cell(None);
+                // Resizing invalidates both server and local PTY blit baselines.
                 state.request_repaint();
+                #[cfg(unix)]
+                {
+                    state.omp_renderer.resize(
+                        (new_cols, new_rows, cell_width_px, cell_height_px),
+                        applied_host_geometry,
+                        applied_host_input_generation,
+                    );
+                    display_pending_omp_surface(
+                        &mut state,
+                        &mut write_stream,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                        !ordered_input_batch_active,
+                    )?;
+                }
+                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -1690,32 +2878,99 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
-                    let frame_data = if state.draw_host_cursor {
-                        render_ansi::frame_with_drawn_cursor(frame_data)
-                    } else {
-                        frame_data
-                    };
-                    let encoded = if state.draw_host_cursor {
-                        state.blit_encoder.encode_with_suppressed_visible_cursor(
-                            &frame_data,
-                            state.repaint_pending,
-                        )
-                    } else {
-                        state
-                            .blit_encoder
-                            .encode(&frame_data, state.repaint_pending)
-                    };
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                    state.repaint_pending = false;
+                    #[cfg(unix)]
+                    {
+                        if let Some(surface) = state.omp_renderer.cache_server_frame(
+                            frame_data,
+                            state.reported_cell_size_px,
+                            applied_host_input_generation,
+                        ) {
+                            display_semantic_surface(
+                                &mut state,
+                                surface.frame,
+                                surface.force_repaint,
+                            );
+                        }
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
+                    }
+                    #[cfg(not(unix))]
+                    display_semantic_surface(&mut state, frame_data, false);
+                }
+                ServerMessage::OmpRendererTarget {
+                    launch_id,
+                    authority_revision,
+                    target_app_client_id,
+                    route,
+                    bound,
+                    surface_active,
+                    prefix,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        state.omp_renderer.apply_target(
+                            launch_id,
+                            authority_revision,
+                            target_app_client_id,
+                            route,
+                            bound,
+                            surface_active,
+                            prefix,
+                            (
+                                state.reported_size.0,
+                                state.reported_size.1,
+                                state.reported_cell_size_px.0,
+                                state.reported_cell_size_px.1,
+                            ),
+                            applied_host_input_generation,
+                        );
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (
+                        launch_id,
+                        authority_revision,
+                        target_app_client_id,
+                        route,
+                        bound,
+                        surface_active,
+                        prefix,
+                    );
+                }
+                ServerMessage::OmpLinkActivationResult {
+                    launch_id,
+                    request_id,
+                    activated,
+                } => {
+                    #[cfg(unix)]
+                    {
+                        state.omp_renderer.resolve_link_activation(
+                            launch_id,
+                            request_id,
+                            activated,
+                            applied_host_input_generation,
+                        );
+                        display_pending_omp_surface(
+                            &mut state,
+                            &mut write_stream,
+                            &host_input_state,
+                            &mut applied_host_input_generation,
+                            !ordered_input_batch_active,
+                        )?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = (launch_id, request_id, activated);
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
@@ -1726,6 +2981,16 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                 }
                 ServerMessage::Graphics { bytes } => {
+                    #[cfg(unix)]
+                    state.omp_renderer.cache_server_graphics(
+                        &bytes,
+                        (
+                            state.reported_size.0,
+                            state.reported_size.1,
+                            state.reported_cell_size_px.0,
+                            state.reported_cell_size_px.1,
+                        ),
+                    );
                     if state.kitty_graphics_enabled {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
@@ -1766,6 +3031,20 @@ async fn run_client_loop(
                                 .direct_graphics_response
                                 .lock()
                                 .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
+                        if valid {
+                            state.omp_renderer.stage_direct_graphics(
+                                transfer_id,
+                                image_id,
+                                leading.clone(),
+                                control.clone(),
+                                (
+                                    state.reported_size.0,
+                                    state.reported_size.1,
+                                    state.reported_cell_size_px.0,
+                                    state.reported_cell_size_px.1,
+                                ),
+                            );
+                        }
                         let sent = if valid {
                             let mut command = Vec::new();
                             crate::kitty_graphics::encode_kitty_regular_file(
@@ -1805,6 +3084,11 @@ async fn run_client_loop(
                                     matcher.cancel(transfer_id);
                                 }
                             }
+                            state.omp_renderer.complete_direct_graphics(
+                                transfer_id,
+                                image_id,
+                                false,
+                            );
                             let result = ClientMessage::GraphicsTransmissionResult {
                                 transfer_id,
                                 image_id,
@@ -1828,19 +3112,65 @@ async fn run_client_loop(
                         if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                             matcher.retire(transfer_id);
                         }
+                        state
+                            .omp_renderer
+                            .retire_direct_graphics(transfer_id, image_id);
+                        let mut cleanup = Vec::new();
+                        crate::kitty_graphics::encode_delete_image(&mut cleanup, image_id);
+                        let mut stdout = io::stdout();
+                        if stdout
+                            .write_all(&cleanup)
+                            .and_then(|()| stdout.flush())
+                            .is_ok()
+                        {
+                            record_received_kitty_graphics(&cleanup);
+                        }
                     }
                     #[cfg(not(unix))]
                     let _ = (transfer_id, image_id);
                 }
+                ServerMessage::PersistIdentity {
+                    request_id,
+                    display_name,
+                } => {
+                    let result =
+                        crate::config::load_or_create_identity().and_then(|mut identity| {
+                            identity.display_name = Some(display_name.clone());
+                            crate::config::save_identity(&identity)
+                        });
+                    let acknowledgement = ClientMessage::IdentityPersistenceAck {
+                        request_id,
+                        display_name,
+                        success: result.is_ok(),
+                        error: result.err().map(|error| error.to_string()),
+                    };
+                    if let Err(error) = write_to_server(&mut write_stream, &acknowledgement) {
+                        return Err(ClientError::ConnectionLost(error));
+                    }
+                }
                 ServerMessage::ServerShutdown { reason } => {
                     return Err(ClientError::ServerShutdown { reason });
                 }
+                ServerMessage::ServerHandoff { reason } => {
+                    return Err(ClientError::ServerHandoff { reason });
+                }
+                // OMP traffic is sideband-only in this POC; never render opaque bytes as ANSI.
+                ServerMessage::OmpPane { .. }
+                | ServerMessage::OmpFrame { .. }
+                | ServerMessage::OmpError { .. } => {}
                 ServerMessage::Notify {
                     kind,
                     message,
                     body,
+                    activation,
                 } => {
-                    handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    handle_notify(
+                        kind,
+                        &message,
+                        body.as_deref(),
+                        activation.as_ref(),
+                        &state.sound_config,
+                    );
                 }
                 ServerMessage::Clipboard { data } => {
                     forward_clipboard(&data);
@@ -1865,19 +3195,39 @@ async fn run_client_loop(
                     sgr_pixels,
                 } => {
                     let next_sgr_pixels = enabled && sgr_pixels;
-                    let mouse_mode_changed = enabled != state.mouse_capture_active
-                        || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
-                    if mouse_mode_changed {
-                        set_mouse_capture(enabled, next_sgr_pixels)
-                            .map_err(ClientError::ConnectionFailed)?;
-                        #[cfg(windows)]
-                        if enabled && windows_vti_input_backend_enabled() {
-                            let _ = enable_windows_virtual_terminal_input();
+                    state.server_mouse_capture_active = enabled;
+                    state.server_sgr_pixels_active = next_sgr_pixels;
+                    #[cfg(unix)]
+                    state
+                        .omp_renderer
+                        .set_server_sgr_pixels_active(next_sgr_pixels);
+                    #[cfg(unix)]
+                    sync_host_mouse_mode(
+                        &mut state,
+                        &host_input_state,
+                        &mut applied_host_input_generation,
+                    )?;
+                    #[cfg(not(unix))]
+                    {
+                        let mouse_mode_changed = enabled != state.mouse_capture_active
+                            || next_sgr_pixels != state.sgr_pixels_active;
+                        if mouse_mode_changed {
+                            set_mouse_capture(enabled, next_sgr_pixels)
+                                .map_err(ClientError::ConnectionFailed)?;
+                            #[cfg(windows)]
+                            if enabled && windows_vti_input_backend_enabled() {
+                                let _ = enable_windows_virtual_terminal_input();
+                            }
                         }
+                        state.mouse_capture_active = enabled;
+                        state.sgr_pixels_active = next_sgr_pixels;
                     }
-                    state.mouse_capture_active = enabled;
-                    host_mouse_capture_active.store(enabled, Ordering::Release);
-                    host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
+                    if !state.mouse_capture_active {
+                        state.mouse_pointer.set_cell(None);
+                        #[cfg(unix)]
+                        state.omp_renderer.observe_pointer_cell(None);
+                        let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                    }
                 }
                 ServerMessage::KittyKeyboardReportAll { enabled } => {
                     if enabled != state.keyboard_report_all_active {
@@ -1896,8 +3246,18 @@ async fn run_client_loop(
                         prefix_input_source.restore();
                     }
                 }
+                ServerMessage::OpenUrl { url } => {
+                    open_safe_url(
+                        &url,
+                        &mut state.detached_process_children,
+                        crate::platform::open_url,
+                    );
+                }
                 ServerMessage::Welcome { .. } => {
                     debug!("received unexpected Welcome in main loop");
+                }
+                ServerMessage::NotificationActivationProcessed { .. } => {
+                    debug!("received unexpected notification activation result in main loop");
                 }
             },
             ClientLoopEvent::ServerDisconnected => {
@@ -1907,10 +3267,19 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
+                reap_finished_detached_processes(&mut state.detached_process_children);
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
                 }
+                #[cfg(unix)]
+                display_pending_omp_surface(
+                    &mut state,
+                    &mut write_stream,
+                    &host_input_state,
+                    &mut applied_host_input_generation,
+                    !ordered_input_batch_active,
+                )?;
             }
         }
     }
@@ -2065,19 +3434,45 @@ fn reload_local_client_config(
     }
 }
 
+fn notification_action_args(
+    socket_path: &std::path::Path,
+    activation: &NotificationActivation,
+) -> Vec<String> {
+    vec![
+        "notification".into(),
+        "activate".into(),
+        socket_path.display().to_string(),
+        activation.recipient_client_id.to_string(),
+        activation.workspace_id.clone(),
+        activation.pane_id.to_string(),
+    ]
+}
+
+fn notification_action(
+    activation: &NotificationActivation,
+) -> Option<crate::platform::DesktopNotificationAction> {
+    Some(crate::platform::DesktopNotificationAction {
+        executable: std::env::current_exe().ok()?,
+        args: notification_action_args(&client_socket_path(), activation),
+    })
+}
+
 fn handle_notify(
     kind: NotifyKind,
     message: &str,
     body: Option<&str>,
+    activation: Option<&NotificationActivation>,
     sound_config: &crate::config::SoundConfig,
 ) {
+    let action = activation.and_then(notification_action);
     handle_notify_with_notifiers(
         kind,
         message,
         body,
         sound_config,
         crate::terminal_notify::show_notification,
-        crate::platform::show_desktop_notification,
+        crate::platform::show_desktop_notification_with_action,
+        action.as_ref(),
     );
 }
 
@@ -2087,7 +3482,12 @@ fn handle_notify_with_notifiers(
     body: Option<&str>,
     sound_config: &crate::config::SoundConfig,
     mut show_terminal_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
-    mut show_system_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
+    mut show_system_notification: impl FnMut(
+        &str,
+        Option<&str>,
+        Option<&crate::platform::DesktopNotificationAction>,
+    ) -> io::Result<bool>,
+    action: Option<&crate::platform::DesktopNotificationAction>,
 ) {
     match kind {
         NotifyKind::Sound => {
@@ -2116,7 +3516,7 @@ fn handle_notify_with_notifiers(
                 message = message,
                 "received system toast notification from server"
             );
-            if let Err(err) = show_system_notification(message, body) {
+            if let Err(err) = show_system_notification(message, body, action) {
                 warn!(err = %err, "failed to emit system notification");
             }
         }
@@ -2323,6 +3723,41 @@ fn recognized_image_extension(extension: &str) -> Option<&'static str> {
     }
 }
 
+fn retain_detached_process_after_wait(
+    pid: u32,
+    result: io::Result<Option<std::process::ExitStatus>>,
+) -> bool {
+    match result {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => true,
+        Err(err) => {
+            warn!(pid, err = %err, "failed to reap detached client process");
+            false
+        }
+    }
+}
+
+fn reap_finished_detached_processes(children: &mut Vec<std::process::Child>) {
+    children.retain_mut(|child| retain_detached_process_after_wait(child.id(), child.try_wait()));
+}
+
+/// Opens a server-forwarded URL only when it remains safe on this client.
+fn open_safe_url(
+    url: &str,
+    children: &mut Vec<std::process::Child>,
+    open: impl FnOnce(&str) -> io::Result<Option<std::process::Child>>,
+) {
+    let Some(url) = crate::web_url::safe_web_url(url) else {
+        return;
+    };
+    reap_finished_detached_processes(children);
+    match open(url) {
+        Ok(Some(child)) => children.push(child),
+        Ok(None) => {}
+        Err(err) => warn!(err = %err, url = %url, "failed to open server URL"),
+    }
+}
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
 // ---------------------------------------------------------------------------
@@ -2437,12 +3872,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-// ---------------------------------------------------------------------------
-// Resize polling
-// ---------------------------------------------------------------------------
-
-/// Cell size assumed when neither the terminal size ioctl nor the host
-/// terminal reports pixel dimensions.
 const DEFAULT_CELL_WIDTH_PX: u32 = 8;
 const DEFAULT_CELL_HEIGHT_PX: u32 = 16;
 
@@ -2480,15 +3909,53 @@ fn current_terminal_geometry(
     kitty_graphics_enabled: bool,
     reported_cell_size: &AtomicU64,
     last_cell_size: Option<(u32, u32)>,
-) -> (u16, u16, u32, u32) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0);
-    }
-    let (cell_width_px, cell_height_px) = ioctl_cell_size().unwrap_or_else(|| {
-        cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size)
-    });
-    (cols, rows, cell_width_px, cell_height_px)
+) -> (
+    (u16, u16, u32, u32),
+    Option<crate::input::mouse::HostGeometry>,
+) {
+    #[cfg(unix)]
+    let (cols, rows, host_geometry, ioctl_cell_size) = match crossterm::terminal::window_size() {
+        Ok(size) => {
+            let cell_size =
+                (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then(
+                    || {
+                        (
+                            (u32::from(size.width) / u32::from(size.columns)).max(1),
+                            (u32::from(size.height) / u32::from(size.rows)).max(1),
+                        )
+                    },
+                );
+            (
+                size.columns,
+                size.rows,
+                crate::input::mouse::HostGeometry::new(
+                    size.columns,
+                    size.rows,
+                    u32::from(size.width),
+                    u32::from(size.height),
+                ),
+                cell_size,
+            )
+        }
+        Err(_) => {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            (cols, rows, None, None)
+        }
+    };
+    #[cfg(not(unix))]
+    let (cols, rows, host_geometry, ioctl_cell_size) = {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let host_geometry: Option<crate::input::mouse::HostGeometry> = None;
+        (cols, rows, host_geometry, None)
+    };
+    let (cell_width_px, cell_height_px) = if kitty_graphics_enabled {
+        ioctl_cell_size.unwrap_or_else(|| {
+            cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size)
+        })
+    } else {
+        (0, 0)
+    };
+    ((cols, rows, cell_width_px, cell_height_px), host_geometry)
 }
 
 /// Reads terminal geometry before the handshake. Direct graphics is eligible
@@ -2518,6 +3985,18 @@ fn resize_report_required(
 ) -> bool {
     signalled || new_size != last_size
 }
+#[cfg(any(unix, test))]
+fn resize_host_geometry_report_required(
+    current: Option<crate::input::mouse::HostGeometry>,
+    last: Option<crate::input::mouse::HostGeometry>,
+) -> bool {
+    current.is_some() && current != last
+}
+
+#[cfg(windows)]
+fn resize_event(new_size: (u16, u16, u32, u32)) -> ClientLoopEvent {
+    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0, None)
+}
 
 /// Watches the terminal size and sends resize events when it changes.
 ///
@@ -2532,6 +4011,7 @@ fn resize_poll_loop(
     initial_cell_height: u32,
     kitty_graphics_enabled: bool,
     reported_cell_size: &AtomicU64,
+    #[cfg(unix)] host_input_state: &HostInputState,
     should_quit: &Arc<AtomicBool>,
 ) {
     crate::platform::watch_terminal_resize_signal();
@@ -2541,23 +4021,35 @@ fn resize_poll_loop(
         initial_cell_width,
         initial_cell_height,
     );
+    #[cfg(unix)]
+    let mut last_host_geometry = host_input_state.load_context().1;
     while !should_quit.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
         let signalled = crate::platform::take_terminal_resize_signal();
-        let new_size = current_terminal_geometry(
+        let (new_size, host_geometry) = current_terminal_geometry(
             kitty_graphics_enabled,
             reported_cell_size,
             Some((last_size.2, last_size.3)),
         );
-        if resize_report_required(signalled, new_size, last_size) {
-            last_size = new_size;
-            if resize_tx
-                .blocking_send(ClientLoopEvent::Resize(
-                    new_size.0, new_size.1, new_size.2, new_size.3,
-                ))
-                .is_err()
-            {
+        #[cfg(not(unix))]
+        let _ = &host_geometry;
+        #[cfg(unix)]
+        let geometry_changed =
+            resize_host_geometry_report_required(host_geometry, last_host_geometry);
+        #[cfg(not(unix))]
+        let geometry_changed = false;
+        if resize_report_required(signalled, new_size, last_size) || geometry_changed {
+            #[cfg(unix)]
+            let send_result = host_input_state.send_resize(&resize_tx, new_size, host_geometry);
+            #[cfg(windows)]
+            let send_result = resize_tx.blocking_send(resize_event(new_size));
+            if send_result.is_err() {
                 break; // Main loop gone.
+            }
+            last_size = new_size;
+            #[cfg(unix)]
+            {
+                last_host_geometry = host_geometry;
             }
         }
     }
@@ -2652,6 +4144,63 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_unapplied_and_capture_disabled_mouse_input_is_rejected() {
+        let captured = HostInputSnapshot::from_parts(7, true, false);
+        assert!(mouse_input_is_current(captured, captured, 7, true));
+        assert!(!mouse_input_is_current(captured, captured, 6, true));
+        let capture_disabled = HostInputSnapshot::from_parts(7, false, false);
+        assert!(!mouse_input_is_current(
+            capture_disabled,
+            capture_disabled,
+            7,
+            true
+        ));
+        assert!(mouse_input_is_current(
+            capture_disabled,
+            capture_disabled,
+            7,
+            false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pixel_mouse_requires_the_exact_applied_host_geometry() {
+        let snapshot = HostInputSnapshot::from_parts(7, true, true);
+        let applied = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let observed = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
+
+        assert!(!pixel_input_is_current(
+            snapshot,
+            snapshot,
+            7,
+            observed,
+            Some(applied),
+        ));
+        assert!(pixel_input_is_current(
+            snapshot,
+            snapshot,
+            7,
+            observed,
+            Some(observed),
+        ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resize_geometry_applies_after_a_newer_mouse_mode_generation() {
+        let old = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let resized = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
+        let mut generation = 2;
+        let mut geometry = Some(old);
+
+        apply_resize_input_boundary(&mut generation, &mut geometry, 1, Some(resized));
+
+        assert_eq!(generation, 2);
+        assert_eq!(geometry, Some(resized));
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -2664,6 +4213,115 @@ mod tests {
         assert!(!resize_report_required(false, size, size));
         assert!(resize_report_required(false, (120, 41, 8, 16), size));
         assert!(resize_report_required(false, (120, 40, 9, 18), size));
+    }
+
+    #[test]
+    fn resize_geometry_reports_only_new_usable_samples() {
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        assert!(!resize_host_geometry_report_required(None, Some(geometry)));
+        assert!(!resize_host_geometry_report_required(None, None));
+        assert!(resize_host_geometry_report_required(Some(geometry), None));
+        assert!(!resize_host_geometry_report_required(
+            Some(geometry),
+            Some(geometry)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_event_advances_generation_before_dispatch() {
+        let input_state = HostInputState::new(true, true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let geometry = crate::input::mouse::HostGeometry::new(120, 40, 1200, 800).unwrap();
+        input_state
+            .send_resize(&tx, (120, 40, 8, 16), Some(geometry))
+            .expect("resize dispatch");
+        assert_eq!(input_state.load().generation(), 1);
+        let ClientLoopEvent::Resize(120, 40, 8, 16, generation, sent_geometry) =
+            rx.try_recv().unwrap()
+        else {
+            panic!("expected resize event");
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(sent_geometry, Some(geometry));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_is_enqueued_before_new_generation_input() {
+        let input_state = HostInputState::new(true, true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        input_state
+            .send_resize(&tx, (120, 40, 8, 16), None)
+            .unwrap();
+        let snapshot = input_state.load();
+        input_state
+            .send_event(
+                &tx,
+                ClientLoopEvent::StdinInput(b"mouse".to_vec(), snapshot),
+            )
+            .unwrap();
+
+        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Resize(..))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientLoopEvent::StdinInput(_, captured)) if captured == snapshot
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_event_queue_reserves_capacity_before_input_order_lock() {
+        let input_state = Arc::new(HostInputState::new(true, true));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.blocking_send(ClientLoopEvent::Timer).unwrap();
+        let order_guard = input_state
+            .event_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sender_state = input_state.clone();
+        let sender_tx = tx.clone();
+        let sender = std::thread::spawn(move || {
+            sender_state.send_event(
+                &sender_tx,
+                ClientLoopEvent::StdinInput(b"mouse".to_vec(), sender_state.load()),
+            )
+        });
+
+        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while tx.capacity() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(tx.capacity(), 0, "sender did not reserve queue capacity");
+
+        drop(order_guard);
+        sender.join().unwrap().unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientLoopEvent::StdinInput(data, _)) if data == b"mouse"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_mode_transition_is_one_versioned_snapshot() {
+        let input_state = HostInputState::new(false, false);
+        let pixels = input_state
+            .transition_mouse_mode(true, true, || Ok(()))
+            .unwrap();
+        assert_eq!(pixels.generation(), 1);
+        assert!(pixels.capture_active());
+        assert!(pixels.sgr_pixels_active());
+        assert_eq!(input_state.load(), pixels);
+
+        let cells = input_state
+            .transition_mouse_mode(true, false, || Ok(()))
+            .unwrap();
+        assert_eq!(cells.generation(), 2);
+        assert!(cells.capture_active());
+        assert!(!cells.sgr_pixels_active());
+        assert_eq!(input_state.load(), cells);
     }
 
     #[test]
@@ -2698,6 +4356,258 @@ mod tests {
         assert!(!direct_graphics_profile_values(
             "ghostty", "", false, false, false
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_local_omp_resolves_companion_and_advertises_native_capability() {
+        let calls = std::cell::Cell::new(0);
+        let eligible = client_omp_renderer_eligible(
+            RenderEncoding::SemanticFrame,
+            ClientLaunchMode::App,
+            true,
+            true,
+        );
+        assert!(eligible);
+        let executable = crate::update::OmpExecutable::Explicit(
+            std::env::current_exe().expect("current test executable"),
+        );
+        let resolved = resolve_client_omp_executable_with(
+            eligible,
+            || {
+                calls.set(calls.get() + 1);
+                Ok(executable.clone())
+            },
+            |_| {},
+        )
+        .expect("verified native companion");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolved.executable(), executable.executable());
+        assert!(
+            client_omp_renderer_capabilities(
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                true,
+                true,
+                Some(&resolved),
+            )
+            .client_local_native
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_probes_then_resolves_then_connects_and_handshakes() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let expected = std::env::current_exe().expect("current test executable");
+
+        let (_, resolved, ()) = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || {
+                steps.borrow_mut().push("probe-connect");
+                Ok(())
+            },
+            |eligible| {
+                assert!(eligible);
+                steps.borrow_mut().push("resolve");
+                Some(crate::update::OmpExecutable::Explicit(expected.clone()))
+            },
+            || {
+                steps.borrow_mut().push("connect");
+                Ok(())
+            },
+            |_, executable| {
+                steps.borrow_mut().push("handshake");
+                assert_eq!(
+                    executable.map(|executable| executable.executable()),
+                    Some(expected.as_path())
+                );
+                Ok(())
+            },
+        )
+        .expect("client startup succeeds");
+
+        assert_eq!(resolved.expect("resolved companion").executable(), expected);
+        assert_eq!(
+            steps.into_inner(),
+            vec!["probe-connect", "resolve", "connect", "handshake"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_native_omp_probe_connect_skips_resolution() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
+            true,
+            || Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            |_| panic!("failed probe must prevent native OMP resolution"),
+            || unreachable!("failed probe must prevent the real connection"),
+            |_, _| unreachable!("failed probe must prevent the handshake"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClientError::ConnectionFailed(error))
+                if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_second_connect_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
+            true,
+            || Ok(()),
+            |_| None,
+            || Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            |_, _| unreachable!("failed second connect must prevent the handshake"),
+        );
+
+        let error = result.expect_err("second connection should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source)
+                if source.kind() == io::ErrorKind::ConnectionReset
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+        assert_eq!(client_error_exit_code(&error, false), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_handshake_write_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || Ok(()),
+            |_| None,
+            || Ok(()),
+            |_, _| {
+                Err::<(), _>(ClientError::ConnectionFailed(io::Error::from(
+                    io::ErrorKind::BrokenPipe,
+                )))
+            },
+        );
+
+        let error = result.expect_err("handshake write should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source) if source.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_native_omp_handshake_read_loss_requests_remote_reconnect() {
+        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
+            true,
+            || Ok(()),
+            |_| None,
+            || Ok(()),
+            |_, _| Err::<(), _>(ClientError::Protocol(protocol::FramingError::UnexpectedEof)),
+        );
+
+        let error = result.expect_err("handshake read should be lost");
+        assert!(matches!(
+            &error,
+            ClientError::ConnectionLost(source)
+                if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            client_error_exit_code(&error, true),
+            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ineligible_native_omp_clients_skip_resolution() {
+        for (encoding, launch_mode, stdin_tty, stdout_tty) in [
+            (
+                RenderEncoding::TerminalAnsi,
+                ClientLaunchMode::App,
+                true,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::TerminalAttach,
+                true,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                false,
+                true,
+            ),
+            (
+                RenderEncoding::SemanticFrame,
+                ClientLaunchMode::App,
+                true,
+                false,
+            ),
+        ] {
+            let eligible =
+                client_omp_renderer_eligible(encoding, launch_mode, stdin_tty, stdout_tty);
+            assert!(!eligible);
+            let called = std::cell::Cell::new(false);
+            assert!(resolve_client_omp_executable_with(
+                eligible,
+                || {
+                    called.set(true);
+                    panic!("ineligible client must not resolve a native OMP companion")
+                },
+                |_| {},
+            )
+            .is_none());
+            assert!(!called.get());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_omp_resolution_keeps_expected_unavailability_quiet() {
+        let mut diagnostics = Vec::new();
+
+        for error in [
+            "managed OMP companion is disabled for this client attach",
+            "managed OMP companion is unavailable for this platform",
+            "this Herdr build has no paired OMP companion",
+        ] {
+            assert!(resolve_client_omp_executable_with(
+                true,
+                || Err(error.to_string()),
+                |error| diagnostics.push(error.to_owned()),
+            )
+            .is_none());
+        }
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_omp_resolution_reports_invalid_or_unverified_companions() {
+        for error in [
+            "OMP executable path must be absolute: relative-omp",
+            "OMP companion checksum verification failed: mismatch",
+        ] {
+            let mut diagnostic = None;
+            assert!(resolve_client_omp_executable_with(
+                true,
+                || Err(error.to_string()),
+                |error| diagnostic = Some(error.to_owned()),
+            )
+            .is_none());
+            assert_eq!(diagnostic.as_deref(), Some(error));
+        }
     }
 
     fn restore_env_var(key: &str, value: Option<OsString>) {
@@ -2824,6 +4734,8 @@ mod tests {
         ));
     }
 
+    static NEXT_TEMP_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
     struct TempImageFile {
         path: std::path::PathBuf,
     }
@@ -2838,8 +4750,9 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let id = NEXT_TEMP_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "herdr-client-drop-{name_fragment}-{}-{nanos}.{extension}",
+                "herdr-client-drop-{name_fragment}-{}-{nanos}-{id}.{extension}",
                 std::process::id()
             ));
             std::fs::write(&path, bytes).unwrap();
@@ -3103,10 +5016,130 @@ mod tests {
     }
 
     #[test]
-    fn terminal_restore_postlude_restores_visible_default_cursor() {
+    fn mouse_pointer_shape_emits_initial_default_and_deduplicates_link_state() {
+        let frame = crate::protocol::FrameData {
+            cells: vec![
+                crate::protocol::CellData {
+                    symbol: " ".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                },
+                crate::protocol::CellData {
+                    symbol: "L".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: Some(0),
+                },
+            ],
+            width: 2,
+            height: 1,
+            cursor: None,
+            hyperlinks: vec!["https://example.com".into()],
+            graphics: Vec::new(),
+            omp_renderer: None,
+        };
+        let mut pointer = MousePointerState::default();
+        let mut output = Vec::new();
+
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+
+        output.clear();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert!(output.is_empty());
+        pointer.set_cell(Some((1, 0)));
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+
+        output.clear();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert!(output.is_empty());
+
+        pointer.set_cell(Some((0, 0)));
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+
+        output.clear();
+
+        pointer
+            .write_for_frame(&mut output, Some(&frame), Some(true))
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+
+        output.clear();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), Some(true))
+            .unwrap();
+        assert!(output.is_empty());
+
+        pointer.set_cell(Some((1, 0)));
+        pointer
+            .write_for_frame(&mut output, Some(&frame), Some(false))
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+
+        output.clear();
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
+
+        output.clear();
+        assert_eq!(
+            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
+            Some(None)
+        );
+        pointer
+            .write_for_frame(&mut output, Some(&frame), None)
+            .unwrap();
+        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
+    }
+
+    #[test]
+    fn raw_pointer_observation_reports_only_pointer_changes() {
+        let mut pointer = MousePointerState::default();
+        pointer.set_cell(Some((1, 0)));
+
+        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::empty(),
+        ));
+        assert_eq!(pointer.observe_raw_events(&[key]), None);
+        assert_eq!(pointer.cell, Some((1, 0)));
+
+        let mouse = crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 2,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert_eq!(pointer.observe_raw_events(&[mouse]), Some(Some((2, 0))));
+        assert_eq!(
+            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn terminal_restore_postlude_restores_default_pointer_and_visible_default_cursor() {
         let mut output = Vec::new();
         write_terminal_restore_postlude(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b[?25h\x1b[0 q");
+        assert_eq!(output, b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
     }
 
     #[test]
@@ -3118,7 +5151,7 @@ mod tests {
         expected.extend_from_slice(
             crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
         );
-        expected.extend_from_slice(b"\x1b[?25h\x1b[0 q");
+        expected.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
         assert_eq!(output, expected);
     }
 
@@ -3280,6 +5313,103 @@ mod tests {
             AttachInputAction::Forward(bytes) => assert_eq!(bytes, b"\x1b[5;5~"),
             other => panic!("expected modified page key to forward, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_identity_detects_atomic_replacement() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-client-relaunch-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("herdr");
+        let replacement = dir.join("herdr.new");
+        std::fs::write(&executable, b"old").unwrap();
+        let identity = ClientExecutableIdentity::capture_at(executable.clone()).unwrap();
+
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(&replacement, &executable).unwrap();
+
+        assert!(identity.was_replaced());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_local_app_client_relaunches_during_startup() {
+        assert!(should_relaunch_updated_client_during_startup(
+            false, false, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            true, false, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            false, true, true
+        ));
+        assert!(!should_relaunch_updated_client_during_startup(
+            false, false, false
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_local_app_client_relaunches_only_after_server_disconnect() {
+        let lost = ClientError::ConnectionLost(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed connection",
+        ));
+        assert!(should_relaunch_updated_client(&lost, false, false, true));
+        assert!(!should_relaunch_updated_client(&lost, true, false, true));
+        assert!(!should_relaunch_updated_client(&lost, false, true, true));
+        assert!(!should_relaunch_updated_client(&lost, false, false, false));
+
+        let shutdown = ClientError::ServerShutdown {
+            reason: Some("live update in progress".into()),
+        };
+        assert!(should_relaunch_updated_client(
+            &shutdown, false, false, true
+        ));
+        let detached = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        assert!(!should_relaunch_updated_client(
+            &detached, false, false, true
+        ));
+        let rejected = ClientError::HandshakeRejected {
+            version: 1,
+            error: "incompatible".into(),
+        };
+        assert!(!should_relaunch_updated_client(
+            &rejected, false, false, true
+        ));
+    }
+
+    #[test]
+    fn remote_reconnects_only_for_connection_loss_or_server_handoff() {
+        let connection_lost = ClientError::ConnectionLost(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "server closed connection",
+        ));
+        let handoff = ClientError::ServerHandoff {
+            reason: "live update in progress".into(),
+        };
+        let detached = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        let shutdown = ClientError::ServerShutdown {
+            reason: Some("maintenance".into()),
+        };
+
+        for error in [&connection_lost, &handoff] {
+            assert!(should_request_remote_reconnect(error, true));
+            assert!(!should_request_remote_reconnect(error, false));
+        }
+        assert!(!should_request_remote_reconnect(&detached, true));
+        assert!(!should_request_remote_reconnect(&shutdown, true));
     }
 
     #[test]
@@ -3446,7 +5576,7 @@ mod tests {
 
     #[test]
     fn reload_local_client_config_refreshes_local_client_presentation_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock().lock();
         let path = std::env::temp_dir().join(format!(
             "herdr-client-config-reload-{}-{}.toml",
             std::process::id(),
@@ -3493,7 +5623,8 @@ mod tests {
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
-            |_, _| Ok(false),
+            |_, _, _| Ok(false),
+            None,
         );
 
         assert_eq!(
@@ -3513,10 +5644,12 @@ mod tests {
             Some("workspace 1"),
             &sound_config,
             |_, _| Ok(false),
-            |title, body| {
+            |title, body, action| {
+                assert!(action.is_none());
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
+            None,
         );
 
         assert_eq!(
@@ -3536,10 +5669,11 @@ mod tests {
             Some("api workspace"),
             &sound_config,
             |_, _| Ok(false),
-            |title, body| {
+            |title, body, _| {
                 emitted = Some((title.to_string(), body.map(str::to_string)));
                 Ok(true)
             },
+            None,
         );
 
         assert_eq!(
@@ -3548,6 +5682,83 @@ mod tests {
                 "build: failed".to_string(),
                 Some("api workspace".to_string())
             ))
+        );
+    }
+
+    #[test]
+    fn open_safe_url_accepts_http_and_https() {
+        let mut opened = Vec::new();
+        let mut children = Vec::new();
+        for url in ["http://example.com", "https://example.com"] {
+            open_safe_url(url, &mut children, |url| {
+                opened.push(url.to_owned());
+                Ok(None)
+            });
+        }
+        assert_eq!(opened, ["http://example.com", "https://example.com"]);
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn open_safe_url_rejects_file_and_custom_schemes() {
+        let mut calls = 0;
+        let mut children = Vec::new();
+        for url in ["file:///tmp/example.rs", "mailto:user@example.com"] {
+            open_safe_url(url, &mut children, |_| {
+                calls += 1;
+                Ok(None)
+            });
+        }
+        assert_eq!(calls, 0);
+        assert!(children.is_empty());
+    }
+
+    #[test]
+    fn system_toast_notify_passes_activation_action_only_to_system_notifier() {
+        let sound_config = crate::config::SoundConfig::default();
+        let activation_action = crate::platform::DesktopNotificationAction {
+            executable: std::path::PathBuf::from("/tmp/herdr"),
+            args: vec!["notification".into(), "activate".into()],
+        };
+        let mut received = false;
+
+        handle_notify_with_notifiers(
+            NotifyKind::SystemToast,
+            "pi finished",
+            None,
+            &sound_config,
+            |_, _| Ok(false),
+            |_, _, action| {
+                received = action == Some(&activation_action);
+                Ok(true)
+            },
+            Some(&activation_action),
+        );
+
+        assert!(received);
+    }
+
+    #[test]
+    fn notification_action_args_preserve_the_explicit_client_socket() {
+        let activation = NotificationActivation {
+            recipient_client_id: 42,
+            workspace_id: "work space;$(bad)".into(),
+            pane_id: 7,
+        };
+
+        assert_eq!(
+            notification_action_args(
+                std::path::Path::new("/tmp/client socket;$(bad)"),
+                &activation,
+            ),
+            vec![
+                "notification".to_owned(),
+                "activate".to_owned(),
+                "/tmp/client socket;$(bad)".to_owned(),
+                "42".to_owned(),
+                "work space;$(bad)".to_owned(),
+                "7".to_owned(),
+            ]
         );
     }
 

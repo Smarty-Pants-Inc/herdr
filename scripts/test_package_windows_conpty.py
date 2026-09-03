@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -37,6 +38,12 @@ class WindowsConptyPackageTests(unittest.TestCase):
             self.assertNotIn(item["sha256"], installer)
         self.assertIn('Get-Content -LiteralPath $markerPath -Raw', installer)
         self.assertIn('$filesProperty.Value.PSObject.Properties[$relative]', installer)
+        self.assertNotIn(".PSObject.Properties.Count", installer)
+        self.assertIn("@($identity.PSObject.Properties).Count", installer)
+        fixture = (
+            package.PROJECT_ROOT / "scripts/windows_install_conpty_package_test.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(".PSObject.Properties.Count", fixture)
         for notice in metadata["notices"]:
             source = package.PROJECT_ROOT / notice["source"]
             self.assertEqual(package.sha256_file(source), notice["sha256"])
@@ -115,6 +122,7 @@ class WindowsConptyPackageTests(unittest.TestCase):
             stage = root / "stage"
             package.stage_bundle(metadata_path, "x86_64", nupkg, herdr, stage)
             package.validate_stage(metadata_path, "x86_64", stage)
+            os.utime(stage / "herdr.exe", (0, 0))
 
             output = root / "herdr.zip"
             package.archive_bundle(metadata_path, "x86_64", stage, output)

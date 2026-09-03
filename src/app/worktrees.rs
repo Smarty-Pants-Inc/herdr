@@ -36,34 +36,32 @@ impl App {
             );
         }
 
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
-        if git_space
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_linked_worktree)
-        {
-            return Err(
-                "New and open worktree actions start from the repo parent workspace.".into(),
-            );
-        }
-
-        let space = existing_membership
-            .as_ref()
-            .map_or(git_space, |membership| {
-                Some(crate::workspace::GitSpaceMetadata {
-                    key: membership.key.clone(),
-                    checkout_key: membership.checkout_path.display().to_string(),
-                    repo_name: membership.label.clone(),
-                    repo_root: membership.repo_root.clone(),
-                    is_linked_worktree: membership.is_linked_worktree,
-                })
-            })
-            .ok_or_else(|| {
+        let space = if let Some(membership) = existing_membership.as_ref() {
+            crate::workspace::GitSpaceMetadata {
+                key: membership.key.clone(),
+                checkout_key: membership.checkout_path.display().to_string(),
+                repo_name: membership.label.clone(),
+                repo_root: membership.repo_root.clone(),
+                is_linked_worktree: membership.is_linked_worktree,
+            }
+        } else {
+            let git_space = ws.git_space().cloned().or_else(|| {
+                ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                    .as_deref()
+                    .and_then(crate::workspace::git_space_metadata)
+            });
+            if git_space
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_linked_worktree)
+            {
+                return Err(
+                    "New and open worktree actions start from the repo parent workspace.".into(),
+                );
+            }
+            git_space.ok_or_else(|| {
                 "Herdr worktree actions require a workspace inside a Git work tree.".to_string()
-            })?;
+            })?
+        };
         let source_checkout_path = existing_membership
             .as_ref()
             .map(|membership| membership.checkout_path.clone())
@@ -182,7 +180,7 @@ impl App {
                     }
 
                     let git_space = ws.git_space().cloned().or_else(|| {
-                        ws.resolved_identity_cwd_from(
+                        ws.local_git_identity_cwd_from(
                             &self.state.terminals,
                             &self.terminal_runtimes,
                         )
@@ -196,7 +194,7 @@ impl App {
                         return true;
                     }
 
-                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                    ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                         .as_deref()
                         .is_some_and(|cwd| {
                             crate::worktree::canonical_or_original(cwd) == entry_checkout_path
@@ -1531,6 +1529,37 @@ mod tests {
     }
 
     #[test]
+    fn worktree_source_metadata_prefers_parent_membership_over_stale_linked_git_space() {
+        let mut app = app_for_worktree_tests();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("parent")];
+        app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceMetadata {
+            key: "stale-repo-key".into(),
+            checkout_key: "/repo/herdr-old-worktree".into(),
+            repo_name: "herdr-old".into(),
+            repo_root: "/repo/herdr-old".into(),
+            is_linked_worktree: true,
+        });
+
+        let (membership, space, source_checkout_path, _) = app
+            .worktree_source_metadata(0)
+            .expect("explicit parent membership should be authoritative");
+
+        assert_eq!(membership, app.state.workspaces[0].worktree_space);
+        assert_eq!(space.key, "repo-key");
+        assert_eq!(
+            source_checkout_path,
+            std::path::PathBuf::from("/repo/herdr")
+        );
+    }
+
+    #[test]
     fn sync_worktree_branch_updates_derived_path() {
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = std::path::PathBuf::from("/w");
@@ -1761,6 +1790,7 @@ mod tests {
                 platforms: None,
                 build: Vec::new(),
                 startup: Vec::new(),
+                execution_providers: Vec::new(),
                 actions: Vec::new(),
                 events: vec![crate::api::schema::PluginManifestEventHook {
                     on: "worktree.created".into(),

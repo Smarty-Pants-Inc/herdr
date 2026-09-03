@@ -7,7 +7,7 @@ mod support;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,6 +93,7 @@ fn spawn_client_process_with_args(
     args: &[&str],
 ) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
+    write_test_identity(config_home);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -111,6 +112,7 @@ fn spawn_client_process_with_args(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -152,6 +154,7 @@ fn spawn_no_session_process(config_home: &PathBuf, runtime_dir: &PathBuf) -> Spa
     cmd.env_remove("HERDR_WORKSPACE_ID");
     cmd.env_remove("HERDR_TAB_ID");
     cmd.env_remove("HERDR_PANE_ID");
+    cmd.env_remove("HERDR_CONFIG_PATH");
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
     drop(pair.slave);
@@ -206,6 +209,7 @@ fn spawn_server_with_config(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -266,6 +270,20 @@ fn app_dir_name() -> &'static str {
     }
 }
 
+fn write_test_identity(config_home: &Path) {
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("identity.toml"),
+        concat!(
+            "display_name = \"Test\"\n",
+            "frontend_profile_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "renderer_binding_token = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+        ),
+    )
+    .unwrap();
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct FrameWire {
@@ -275,6 +293,29 @@ struct FrameWire {
     cursor: Option<CursorWire>,
     hyperlinks: Vec<String>,
     graphics: Vec<u8>,
+    omp_renderer: Option<OmpRendererFrameWire>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererFrameWire {
+    launch_id: u64,
+    authority_revision: u64,
+    frame_nonce: [u8; 16],
+    pane: Option<OmpRendererPaneWire>,
+    focused: bool,
+    server_owned_overlay: bool,
+    surface_active: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererPaneWire {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    scrollback_limit_bytes: u64,
 }
 
 #[allow(dead_code)]
@@ -321,7 +362,7 @@ fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
-            Ok((1, payload)) => return Ok(payload),
+            Ok((2, payload)) => return Ok(payload),
             Ok(_) => continue,
             Err(_) => continue,
         }
@@ -548,6 +589,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -574,7 +616,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     let mut last_frame_text = String::new();
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
-            Ok((1, payload)) => {
+            Ok((2, payload)) => {
                 let frame = decode_frame_payload(&payload).expect("decode frame");
                 last_frame_text = frame_text(&frame);
                 if last_frame_text.contains("config.toml")
@@ -1351,7 +1393,7 @@ fn client_receives_frame_after_pane_output() {
 
     // Read subsequent frames — the server should have re-rendered after
     // the input was processed.
-    let received_frame = wait_for_message_variant(&mut stream, Duration::from_secs(2), 1)
+    let received_frame = wait_for_message_variant(&mut stream, Duration::from_secs(2), 2)
         .expect("wait for post-output frame");
     assert!(received_frame, "should receive a Frame after pane output");
 
@@ -1462,7 +1504,7 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
         }
     }
 
-    // The client should receive a ServerShutdown message (variant 4)
+    // The client should receive a ServerShutdown message (variant 5)
     // before the connection is closed, not just an abrupt EOF.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1471,8 +1513,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     match result {
         Ok((variant, _payload)) => {
             assert_eq!(
-                variant, 4,
-                "expected ServerShutdown (variant 4), got variant {variant}"
+                variant, 5,
+                "expected ServerShutdown (variant 5), got variant {variant}"
             );
         }
         Err(e) => {
@@ -1529,6 +1571,7 @@ fn client_receives_notify_on_agent_state_change() {
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -1596,8 +1639,8 @@ fn client_receives_notify_on_agent_state_change() {
     let mut report_response = String::new();
     report_reader.read_line(&mut report_response).unwrap();
 
-    // Read messages from the client stream and look for Notify (variant 5).
-    // Notify = ServerMessage variant index 5.
+    // Read messages from the client stream and look for Notify (variant 6).
+    // Notify = ServerMessage variant index 6.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
@@ -1606,12 +1649,12 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
+                if variant == 6 {
                     // ServerMessage::Notify — found it!
                     found_notify = true;
                     break;
                 }
-                // Continue reading — Frame messages (variant 1) will come first.
+                // Continue reading — Frame messages (variant 2) will come first.
             }
             Err(_) => {
                 break;
@@ -1692,7 +1735,7 @@ fn client_receives_notify_on_agent_state_change() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream) {
             Ok((variant, _payload)) => {
-                if variant == 5 {
+                if variant == 6 {
                     // Found a Notify message — that's good enough.
                     // The test already verified the Blocked→Notify path above.
                     found_done_notify = true;
