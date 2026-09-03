@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,11 +15,15 @@ use crate::api::schema::{
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
-use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
+use crate::api::{
+    request_changes_ui, socket_path, ApiRequestContext, ApiRequestMessage, ApiRequestSender,
+    EventHub,
+};
 use crate::ipc::{
-    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    bind_private_local_listener, is_connection_closed_error, local_stream_peer_closed,
+    local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
+    set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
+    SocketFileIdentity,
 };
 
 mod pane_graphics_stream;
@@ -30,6 +34,28 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+
+struct ConnectionAdmission {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionAdmission {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_admit_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionAdmission> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_CONCURRENT_CONNECTIONS).then_some(count + 1)
+        })
+        .ok()
+        .map(|_| ConnectionAdmission {
+            active: Arc::clone(active),
+        })
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -76,7 +102,23 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+        omp_maintenance: cfg!(any(target_os = "linux", target_os = "macos")),
     })
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn default_capabilities_advertise_omp_maintenance_only_on_supported_platforms() {
+        assert_eq!(
+            default_capabilities()
+                .expect("default capabilities")
+                .omp_maintenance,
+            cfg!(any(target_os = "linux", target_os = "macos"))
+        );
+    }
 }
 
 fn start_server_inner(
@@ -88,34 +130,48 @@ fn start_server_inner(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
-    let listener = bind_local_listener(&path)?;
+    let listener = bind_private_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let active_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let Some(admission) = try_admit_connection(&active_connections) else {
+                        warn!(
+                            max = MAX_CONCURRENT_CONNECTIONS,
+                            "rejecting api connection: concurrent connection limit reached"
+                        );
+                        continue;
+                    };
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("herdr-api-connection".into())
+                        .spawn(move || {
+                            let _admission = admission;
+                            if let Err(err) = handle_connection_with_stop(
+                                stream,
+                                &api_tx,
+                                &event_hub,
+                                &connection_running,
+                                capabilities,
+                                server_stop.as_ref(),
+                            ) {
+                                warn!(err = %err, "api connection failed");
+                            }
+                        })
+                    {
+                        warn!(err = %err, "failed to spawn api connection thread");
+                    }
                 }
                 Err(err) => {
                     error!(err = %err, "api listener accept failed");
@@ -169,6 +225,10 @@ fn handle_connection_with_stop(
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
+
+    let context = ApiRequestContext {
+        local_peer_pid: local_stream_peer_pid(&stream),
+    };
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -255,6 +315,7 @@ fn handle_connection_with_stop(
             let response = prompt_agent(
                 request_id.clone(),
                 params,
+                context,
                 &mut stream,
                 api_tx,
                 event_hub,
@@ -280,11 +341,12 @@ fn handle_connection_with_stop(
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
-            let response = handle_request(
+            let response = handle_request_with_context(
                 Request {
                     id: request_id.clone(),
                     method: method_body,
                 },
+                context,
                 api_tx,
                 capabilities,
                 server_stop,
@@ -337,8 +399,27 @@ fn finish_wait_response(
     result
 }
 
+#[cfg(test)]
 fn handle_request(
     request: Request,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+) -> String {
+    handle_request_with_context(
+        request,
+        ApiRequestContext::default(),
+        api_tx,
+        capabilities,
+        server_stop,
+        response_write_complete,
+    )
+}
+
+fn handle_request_with_context(
+    request: Request,
+    context: ApiRequestContext,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
@@ -351,6 +432,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                build: crate::build_info::server_build_identity(),
             },
         })
         .unwrap_or_else(|_| {
@@ -376,7 +458,14 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(
+        request,
+        api_tx,
+        None,
+        context,
+        response_write_complete,
+        None,
+    )
 }
 
 fn api_method_name(method: &Method) -> &'static str {
@@ -384,6 +473,11 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
+        Method::ServerOmpMaintenanceAcquire(_) => "server.omp_maintenance.acquire",
+        Method::ServerOmpMaintenanceStatus(_) => "server.omp_maintenance.status",
+        Method::ServerOmpMaintenanceInspect(_) => "server.omp_maintenance.inspect",
+        Method::ServerOmpMaintenancePermit(_) => "server.omp_maintenance.permit",
+        Method::ServerOmpMaintenanceRelease(_) => "server.omp_maintenance.release",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
@@ -429,8 +523,11 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneZoom(_) => "pane.zoom",
         Method::PaneLayout(_) => "pane.layout",
         Method::PaneProcessInfo(_) => "pane.process_info",
+        Method::PaneOmpBridge(_) => "pane.omp_bridge",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
+        Method::LayoutApplyIdempotent(_) => "layout.apply_idempotent",
+        Method::LayoutReconcileIdempotent(_) => "layout.reconcile_idempotent",
         Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
         Method::PaneEdges(_) => "pane.edges",
@@ -681,6 +778,45 @@ mod windows_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn named_pipe_dispatch_preserves_client_pid_context() {
+        let (mut client, server, path) = local_stream_pair("peer-pid-context");
+        client
+            .write_all(b"{\"id\":\"peer_pid\",\"method\":\"workspace.list\",\"params\":{}}\n")
+            .expect("write API request");
+        client.flush().expect("flush API request");
+
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &EventHub::default(), &server_running, None)
+        });
+
+        let msg = api_rx.blocking_recv().expect("API request dispatch");
+        assert_eq!(msg.context.local_peer_pid, Some(std::process::id()));
+        msg.respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: msg.request.id,
+                    result: ResponseResult::Ok {},
+                })
+                .expect("encode API response"),
+            )
+            .expect("send API response");
+
+        let mut response = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response)
+            .expect("read API response");
+        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("serve API");
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn stream_subscriptions(
@@ -795,7 +931,23 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(
+        request,
+        api_tx,
+        timeout,
+        ApiRequestContext::default(),
+        None,
+        None,
+    )
+}
+
+pub(super) fn dispatch_to_app_with_timeout_and_context(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+    context: ApiRequestContext,
+) -> String {
+    dispatch_to_app(request, api_tx, timeout, context, None, None)
 }
 
 pub(super) fn dispatch_stream_open(
@@ -804,7 +956,14 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active))
+    dispatch_to_app(
+        request,
+        api_tx,
+        Some(timeout),
+        ApiRequestContext::default(),
+        None,
+        Some(active),
+    )
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -816,6 +975,7 @@ pub(super) fn dispatch_stream_frame(
         request,
         api_tx,
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
+        ApiRequestContext::default(),
         None,
         Some(active),
     )
@@ -825,6 +985,7 @@ fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
+    context: ApiRequestContext,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
 ) -> String {
@@ -833,6 +994,7 @@ fn dispatch_to_app(
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
+        context,
         respond_to,
         response_write_complete,
         stream_active,
@@ -911,6 +1073,17 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[test]
+    fn connection_admission_is_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut admissions = (0..MAX_CONCURRENT_CONNECTIONS)
+            .map(|_| try_admit_connection(&active).expect("connection should be admitted"))
+            .collect::<Vec<_>>();
+        assert!(try_admit_connection(&active).is_none());
+        admissions.pop();
+        assert!(try_admit_connection(&active).is_some());
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -945,6 +1118,7 @@ mod tests {
             tab_id: "tab_1".into(),
             focused: true,
             cwd: None,
+            execution_target: crate::execution::ExecutionTarget::Local,
             foreground_cwd: None,
             label: None,
             agent: Some("pi".into()),
@@ -1088,6 +1262,7 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                omp_maintenance: true,
             }),
             None,
             None,
@@ -1437,6 +1612,86 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn agent_prompt_wait_preserves_local_peer_context() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, path) = local_stream_pair("agent-prompt-context");
+        client
+            .write_all(
+                br#"{"id":"prompt_wait","method":"agent.prompt","params":{"target":"target","text":"hello","wait":{"timeout_ms":100}}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
+        assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
+        agent_get
+            .respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: agent_get.request.id,
+                    result: ResponseResult::AgentInfo {
+                        agent: crate::api::schema::AgentInfo {
+                            terminal_id: "term_1".into(),
+                            name: Some("target".into()),
+                            agent: Some("pi".into()),
+                            title: None,
+                            terminal_title: None,
+                            terminal_title_stripped: None,
+                            display_agent: None,
+                            agent_status: crate::api::schema::AgentStatus::Idle,
+                            screen_detection_skipped: false,
+                            state_labels: HashMap::new(),
+                            tokens: HashMap::new(),
+                            agent_session: None,
+                            workspace_id: "ws_1".into(),
+                            tab_id: "tab_1".into(),
+                            pane_id: "pane_1".into(),
+                            focused: true,
+                            launch_pending: false,
+                            interactive_ready: true,
+                            state_change_seq: 1,
+                            cwd: None,
+                            foreground_cwd: None,
+                            revision: 0,
+                        },
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
+        assert_eq!(
+            prompt.context.local_peer_pid,
+            Some(std::process::id()),
+            "wait-mode prompt must retain the socket origin"
+        );
+        assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
+        let prompt_id = prompt.request.id.clone();
+        prompt
+            .respond_to
+            .send(error_response_json(
+                prompt_id,
+                "cross_pane_input_denied",
+                "agent-originated input cannot target a different pane".into(),
+            ))
+            .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response["error"]["code"], "cross_pane_input_denied");
+        server_thread.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }
 

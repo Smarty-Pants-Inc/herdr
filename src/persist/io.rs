@@ -1,10 +1,12 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
 use super::snapshot::{
-    parse_history_snapshot, parse_snapshot, snapshot_file_version, SessionHistorySnapshot,
-    SessionSnapshot, SNAPSHOT_VERSION,
+    content_has_external_resume_policy, parse_history_snapshot, parse_snapshot,
+    snapshot_file_version, SessionHistorySnapshot, SessionSnapshot,
+    EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION, SNAPSHOT_VERSION,
 };
 
 fn session_path() -> PathBuf {
@@ -13,6 +15,12 @@ fn session_path() -> PathBuf {
 
 fn session_history_path() -> PathBuf {
     crate::session::data_dir().join("session-history.json")
+}
+
+pub enum SessionLoad {
+    Missing,
+    Loaded(SessionSnapshot),
+    Unsupported { version: u32 },
 }
 
 // Follow symlinks manually so a write through a (possibly dangling) symlink
@@ -45,19 +53,88 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
     save_json_to_path(path, snapshot)
 }
 
-fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+fn write_bytes_to_path(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
-    if let Some(parent) = target.parent() {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
+    let write_result = (|| {
+        let mut tmp = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        tmp.write_all(bytes)?;
+        tmp.sync_all()
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
     if let Err(err) = std::fs::rename(&tmp_path, &target) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
+    if let Some(parent) = parent {
+        sync_directory(parent)?;
+    }
     Ok(())
+}
+
+fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(snapshot)?;
+    write_bytes_to_path(path, &json)
+}
+
+fn existing_file_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let target = resolve_write_target(path)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "persistence target is not a regular file: {}",
+                target.display()
+            ),
+        )),
+        Ok(_) => std::fs::read(target).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_bytes_to_path(path, bytes),
+        None => clear_path(&resolve_write_target(path)?),
+    }
+}
+
+fn restore_pair_after_failure(
+    error: std::io::Error,
+    session_path: &Path,
+    session_before: Option<&[u8]>,
+    history_path: &Path,
+    history_before: Option<&[u8]>,
+) -> std::io::Result<()> {
+    let mut restore_errors = Vec::new();
+    if let Err(err) = restore_file(session_path, session_before) {
+        restore_errors.push(format!("session restore failed: {err}"));
+    }
+    if let Err(err) = restore_file(history_path, history_before) {
+        restore_errors.push(format!("history restore failed: {err}"));
+    }
+    if restore_errors.is_empty() {
+        Err(error)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{error}; {}",
+            restore_errors.join("; ")
+        )))
+    }
 }
 
 pub(super) fn save_to_paths(
@@ -66,12 +143,34 @@ pub(super) fn save_to_paths(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
 ) -> std::io::Result<()> {
-    save_to_path(session_path, snapshot)?;
-    if let Some(history) = history {
-        save_json_to_path(history_path, history)?;
-    } else {
-        clear_path(history_path)?;
+    let session_before = existing_file_bytes(session_path)?;
+    let history_before = existing_file_bytes(history_path)?;
+    let result = save_to_path(session_path, snapshot).and_then(|_| {
+        if let Some(history) = history {
+            save_json_to_path(history_path, history)
+        } else {
+            clear_path(&resolve_write_target(history_path)?)
+        }
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => restore_pair_after_failure(
+            error,
+            session_path,
+            session_before.as_deref(),
+            history_path,
+            history_before.as_deref(),
+        ),
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -100,6 +199,10 @@ pub fn clear() {
         return;
     }
     clear_history();
+    if let Err(err) = super::idempotency::clear_layout_apply_ledger() {
+        crate::logging::session_clear_failed(&path, &err.to_string());
+        return;
+    }
     crate::logging::session_cleared(&path);
 }
 
@@ -110,33 +213,39 @@ pub fn clear_history() {
     }
 }
 
-pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
+pub fn load() -> SessionLoad {
+    load_from_path(&session_path())
+}
+
+fn load_from_path(path: &Path) -> SessionLoad {
     if !path.exists() {
-        return None;
+        return SessionLoad::Missing;
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) => {
             warn!(err = %err, "failed to read session file");
-            return None;
+            return SessionLoad::Missing;
         }
     };
     match parse_snapshot(&content) {
-        Ok(snapshot) => Some(snapshot),
+        Ok(snapshot) => SessionLoad::Loaded(snapshot),
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
-                if version > SNAPSHOT_VERSION {
+                if version > SNAPSHOT_VERSION
+                    || (version < EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+                        && content_has_external_resume_policy(&content))
+                {
                     warn!(
                         file_version = version,
                         supported = SNAPSHOT_VERSION,
-                        "session file is from a newer herdr version, ignoring"
+                        "session file is incompatible with this herdr version; persistence is blocked"
                     );
-                    return None;
+                    return SessionLoad::Unsupported { version };
                 }
             }
             warn!(err = %err, "failed to parse session file, ignoring");
-            None
+            SessionLoad::Missing
         }
     }
 }
@@ -205,6 +314,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: Some(26),
+            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         }
@@ -244,6 +354,31 @@ mod tests {
         assert!(!session.contains("split-secret"));
         assert!(!session.contains("history"));
         assert!(history.contains("split-secret"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&session).unwrap()["version"],
+            SNAPSHOT_VERSION
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&history).unwrap()["version"],
+            SNAPSHOT_VERSION
+        );
+    }
+
+    #[test]
+    fn save_to_paths_preserves_native_v3_pair() {
+        let (session_path, history_path) = temp_session_paths("native-v3-pair");
+        let mut snapshot = empty_snapshot();
+        snapshot.version = 3;
+        let mut history = history_snapshot("native-history");
+        history.version = snapshot.version;
+
+        save_to_paths(&session_path, &history_path, &snapshot, Some(&history)).unwrap();
+
+        for path in [session_path, history_path] {
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(saved["version"], 3);
+        }
     }
 
     #[test]
@@ -336,5 +471,58 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn future_snapshot_is_reported_unsupported_without_modification() {
+        let path = temp_session_path("future-version");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = format!(
+            r#"{{"version":{},"workspaces":[],"active":null,"selected":0}}"#,
+            SNAPSHOT_VERSION + 1
+        );
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        match load_from_path(&path) {
+            SessionLoad::Unsupported { version } => assert_eq!(version, SNAPSHOT_VERSION + 1),
+            _ => panic!("future snapshot must block persistence"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+
+    #[test]
+    fn v5_external_policy_snapshot_blocks_persistence_without_modification() {
+        let path = temp_session_path("v5-external-policy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 5,
+            "workspaces": [{
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": {"Pane": 1},
+                    "panes": {"1": {
+                        "cwd": "/tmp",
+                        "agent_session": {
+                            "source": "herdr:omp",
+                            "agent": "omp",
+                            "kind": "id",
+                            "value": "external-session",
+                            "resume_policy": "external"
+                        }
+                    }},
+                    "zoomed": false
+                }]
+            }],
+            "active": 0,
+            "selected": 0
+        }))
+        .unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        match load_from_path(&path) {
+            SessionLoad::Unsupported { version } => assert_eq!(version, 5),
+            _ => panic!("v5 external-policy snapshot must block persistence"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), content);
     }
 }

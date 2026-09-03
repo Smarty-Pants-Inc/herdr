@@ -580,19 +580,29 @@ pub(crate) fn status_commands_supported() -> bool {
     true
 }
 
-pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+pub(crate) fn configure_process_tree_command(process: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
 
     // The process must not run before it is assigned to the kill-on-close job.
     process.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
 }
 
-pub(crate) struct StatusCommandGuard {
+pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+    configure_process_tree_command(process);
+}
+
+pub(crate) struct ProcessTreeGuard {
     job: usize,
 }
 
-impl StatusCommandGuard {
-    pub(crate) fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
+pub(crate) type StatusCommandGuard = ProcessTreeGuard;
+
+impl ProcessTreeGuard {
+    fn for_process(
+        process: HANDLE,
+        process_id: Option<u32>,
+        subject: &str,
+    ) -> std::io::Result<Self> {
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             return Err(std::io::Error::last_os_error());
@@ -625,22 +635,22 @@ impl StatusCommandGuard {
             return Err(error);
         }
 
-        let Some(process) = child.raw_handle() else {
+        if process.is_null() {
             unsafe {
                 CloseHandle(job);
             }
-            return Err(std::io::Error::other(
-                "status command has no process handle",
-            ));
-        };
-        if unsafe { AssignProcessToJobObject(job, process.cast()) } == 0 {
+            return Err(std::io::Error::other(format!(
+                "{subject} has no process handle"
+            )));
+        }
+        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
             let error = std::io::Error::last_os_error();
             unsafe {
                 CloseHandle(job);
             }
             return Err(error);
         }
-        if let Err(error) = resume_suspended_process(child.id()) {
+        if let Err(error) = resume_suspended_process(process_id, subject) {
             unsafe {
                 CloseHandle(job);
             }
@@ -649,11 +659,36 @@ impl StatusCommandGuard {
 
         Ok(Self { job: job as usize })
     }
+
+    pub(crate) fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("status command has no process handle"))?;
+        Self::for_process(process.cast(), child.id(), "status command")
+    }
+
+    pub(crate) fn new_std(child: &std::process::Child) -> std::io::Result<Self> {
+        Self::for_process(
+            child.as_raw_handle().cast(),
+            Some(child.id()),
+            "child process",
+        )
+    }
+
+    pub(crate) fn terminate(&mut self) {
+        if self.job != 0 {
+            // KILL_ON_JOB_CLOSE terminates the direct child and every descendant.
+            unsafe {
+                CloseHandle(self.job as HANDLE);
+            }
+            self.job = 0;
+        }
+    }
 }
 
-fn resume_suspended_process(process_id: Option<u32>) -> std::io::Result<()> {
+fn resume_suspended_process(process_id: Option<u32>, subject: &str) -> std::io::Result<()> {
     let process_id =
-        process_id.ok_or_else(|| std::io::Error::other("status command has no process id"))?;
+        process_id.ok_or_else(|| std::io::Error::other(format!("{subject} has no process id")))?;
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
@@ -684,9 +719,9 @@ fn resume_suspended_process(process_id: Option<u32>) -> std::io::Result<()> {
                 return Ok(());
             }
             if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
-                return Err(std::io::Error::other(
-                    "status command primary thread was not found",
-                ));
+                return Err(std::io::Error::other(format!(
+                    "{subject} primary thread was not found"
+                )));
             }
         }
     })();
@@ -697,20 +732,7 @@ fn resume_suspended_process(process_id: Option<u32>) -> std::io::Result<()> {
     result
 }
 
-impl StatusCommandGuard {
-    pub(crate) fn terminate(&mut self) {
-        if self.job != 0 {
-            // KILL_ON_JOB_CLOSE terminates the shell and every descendant still in
-            // the job, including on task cancellation and config reload.
-            unsafe {
-                CloseHandle(self.job as HANDLE);
-            }
-            self.job = 0;
-        }
-    }
-}
-
-impl Drop for StatusCommandGuard {
+impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
         self.terminate();
     }
@@ -1989,6 +2011,14 @@ fn clipboard_global_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
 }
 
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    title: &str,
+    body: Option<&str>,
+    _action: Option<&super::DesktopNotificationAction>,
+) -> std::io::Result<bool> {
     let title = title.to_owned();
     let body = body.unwrap_or(&title).to_owned();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);

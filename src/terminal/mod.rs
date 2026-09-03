@@ -13,4 +13,4 @@ pub use state::{
     AgentMetadataReport, EffectivePresentation, EffectiveStateChange, TerminalState,
     TerminalStateMutation,
 };
-pub(crate) use title::stripped_terminal_title;
+pub(crate) use title::{stripped_terminal_title, terminal_title_indicates_omp_working};

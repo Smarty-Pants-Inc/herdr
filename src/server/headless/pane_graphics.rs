@@ -93,7 +93,11 @@ impl HeadlessServer {
                             &self.app.pane_graphics,
                             self.app.state.view.tab_surface(),
                             client.cell_size,
-                            !internal_changed,
+                            !internal_changed
+                                && !self.native_omp_surface_active(client_id)
+                                && self
+                                    .replaced_omp_pane_info(client_id)
+                                    .is_none_or(|info| info.id != key.0),
                             &client.graphics_cache,
                             &key,
                         )
@@ -101,7 +105,7 @@ impl HeadlessServer {
                     let Some(command) = command else {
                         if self.install_inline_fallback(&key) {
                             if msg.respond_to.send(response).is_err() {
-                                self.retire_direct_gate(&key);
+                                self.retire_direct_gate_with_notification(&key);
                             }
                             return if internal_changed {
                                 RenderImpact::Full
@@ -109,7 +113,7 @@ impl HeadlessServer {
                                 RenderImpact::Graphics
                             };
                         }
-                        self.retire_direct_gate(&key);
+                        self.retire_direct_gate_with_notification(&key);
                         return if internal_changed {
                             RenderImpact::Full
                         } else {
@@ -137,7 +141,7 @@ impl HeadlessServer {
                                         framed,
                                     ));
                                 };
-                                writer.render.send_ordered(framed)
+                                writer.render.send_ordered(key.0, framed)
                             });
                     match send {
                         Ok(()) => {
@@ -175,7 +179,7 @@ impl HeadlessServer {
         let response_failed = msg.respond_to.send(response).is_err();
         if succeeded && response_failed {
             if let Some(key) = direct_key {
-                self.retire_direct_gate(&key);
+                self.retire_direct_gate_with_notification(&key);
             }
         }
         if internal_changed {
@@ -250,7 +254,7 @@ impl HeadlessServer {
         {
             return true;
         }
-        self.retire_direct_gate(key);
+        self.retire_direct_gate_with_notification(key);
         false
     }
 
@@ -258,6 +262,24 @@ impl HeadlessServer {
         if self.app.pane_graphics.slots.remove(key).is_some() {
             self.app.pane_graphics.mark_changed();
         }
+    }
+
+    fn retire_direct_gate_with_notification(&mut self, key: &crate::app::pane_graphics::Key) {
+        let retirement = self.app.pane_graphics.slots.get(key).and_then(|slot| {
+            slot.direct_gate
+                .as_ref()
+                .map(|gate| (gate.client_id, gate.transfer_id, slot.host_image_id))
+        });
+        if let Some((client_id, transfer_id, image_id)) = retirement {
+            self.send_to_client(
+                client_id,
+                ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id,
+                    image_id,
+                },
+            );
+        }
+        self.retire_direct_gate(key);
     }
 
     pub(super) fn start_direct_graphics_response(
@@ -312,7 +334,7 @@ impl HeadlessServer {
             .iter()
             .any(|workspace| workspace.pane_state(key.0).is_some());
         if !pane_is_live {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             return false;
         }
         if success {
@@ -347,6 +369,13 @@ impl HeadlessServer {
                     .trust_pane_layer(&key, host_image_id, layer);
             }
             if gate.respond_to.send(gate.success_response).is_err() {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    },
+                );
                 self.retire_direct_gate(&key);
                 return true;
             }
@@ -358,7 +387,7 @@ impl HeadlessServer {
         }
         self.app.direct_graphics_available = false;
         if !self.install_inline_fallback(&key) {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             self.retire_all_direct_graphics();
             return true;
         }
@@ -373,10 +402,17 @@ impl HeadlessServer {
             .filter(|slot| slot.stream_is_active())
             .and_then(|slot| slot.direct_gate.take());
         let Some(gate) = gate else {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
             return true;
         };
         if gate.respond_to.send(gate.success_response).is_err() {
+            self.send_to_client(
+                client_id,
+                ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id,
+                    image_id,
+                },
+            );
             self.retire_direct_gate(&key);
             return true;
         }
@@ -435,36 +471,166 @@ impl HeadlessServer {
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in keys {
-            self.retire_direct_gate(&key);
+            self.retire_direct_gate_with_notification(&key);
         }
     }
 
-    pub(super) fn retire_direct_graphics_for_client(&mut self, client_id: u64) {
-        let keys = self
-            .app
+    fn direct_graphics_keys_for_client(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) -> Vec<crate::app::pane_graphics::Key> {
+        self.app
             .pane_graphics
             .slots
             .iter()
             .filter_map(|(key, slot)| {
-                let layer = slot.layer.as_ref()?;
-                let owned = layer.resident_client() == Some(client_id)
-                    || (layer.direct_lease().is_some()
+                let owned_gate = slot
+                    .direct_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.client_id == client_id);
+                let owned_resident = slot.layer.as_ref().is_some_and(|layer| {
+                    layer.terminal_only() && layer.resident_client() == Some(client_id)
+                });
+                let removable = owned_gate
+                    || (owned_resident
                         && slot
                             .direct_gate
                             .as_ref()
-                            .is_some_and(|gate| gate.client_id == client_id));
-                (layer.terminal_only() && owned).then(|| key.clone())
+                            .is_none_or(|gate| gate.client_id == client_id));
+                (removable && pane_id.is_none_or(|pane_id| key.0 == pane_id)).then(|| key.clone())
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn direct_graphics_cleanup_for_client_scope(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) -> Vec<u8> {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
+        let mut cleanup = Vec::new();
+        for key in keys {
+            if self
+                .app
+                .pane_graphics
+                .slots
+                .get(&key)
+                .and_then(|slot| slot.direct_gate.as_ref())
+                .is_some_and(|gate| gate.client_id == client_id)
+            {
+                let image_id = self.app.pane_graphics.slots[&key].host_image_id;
+                crate::kitty_graphics::encode_delete_image(&mut cleanup, image_id);
+            }
+        }
+        cleanup
+    }
+
+    fn direct_graphics_retirement_messages_for_client_scope(
+        &self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) -> Vec<ServerMessage> {
+        self.direct_graphics_keys_for_client(client_id, pane_id)
+            .into_iter()
+            .filter_map(|key| {
+                let slot = self.app.pane_graphics.slots.get(&key)?;
+                let gate = slot
+                    .direct_gate
+                    .as_ref()
+                    .filter(|gate| gate.client_id == client_id)?;
+                Some(ServerMessage::GraphicsTransmissionRetired {
+                    transfer_id: gate.transfer_id,
+                    image_id: slot.host_image_id,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn direct_graphics_retirement_messages_for_client_pane(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> Vec<ServerMessage> {
+        self.direct_graphics_retirement_messages_for_client_scope(client_id, Some(pane_id))
+    }
+
+    fn retire_direct_graphics_for_client_scope(
+        &mut self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
+        for key in keys {
+            let retired = self.app.pane_graphics.slots.get(&key).and_then(|slot| {
+                slot.direct_gate
+                    .as_ref()
+                    .filter(|gate| gate.client_id == client_id)
+                    .map(|gate| (gate.transfer_id, slot.host_image_id))
+            });
+            self.retire_direct_gate(&key);
+            if let Some((transfer_id, image_id)) = retired {
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(super) fn direct_graphics_cleanup_for_client(&self, client_id: u64) -> Vec<u8> {
+        self.direct_graphics_cleanup_for_client_scope(client_id, None)
+    }
+
+    pub(super) fn retire_direct_graphics_for_client(&mut self, client_id: u64) {
+        self.retire_direct_graphics_for_client_scope(client_id, None);
+    }
+
+    fn retire_direct_graphics_for_client_scope_without_notifications(
+        &mut self,
+        client_id: u64,
+        pane_id: Option<crate::layout::PaneId>,
+    ) {
+        let keys = self.direct_graphics_keys_for_client(client_id, pane_id);
         for key in keys {
             self.retire_direct_gate(&key);
         }
+    }
+
+    pub(super) fn retire_direct_graphics_for_client_pane_without_notifications(
+        &mut self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) {
+        self.retire_direct_graphics_for_client_scope_without_notifications(
+            client_id,
+            Some(pane_id),
+        );
+    }
+
+    pub(super) fn direct_graphics_cleanup_for_client_pane(
+        &self,
+        client_id: u64,
+        pane_id: crate::layout::PaneId,
+    ) -> Vec<u8> {
+        self.direct_graphics_cleanup_for_client_scope(client_id, Some(pane_id))
     }
 
     pub(super) fn render_retained_graphics_update_and_stream(&mut self) -> RetainedGraphicsOutcome {
         crate::render_prof::event("retained_graphics.attempt");
         if self.app.full_redraw_pending {
             crate::render_prof::event("retained_graphics_fallback.full_redraw_pending");
+            return RetainedGraphicsOutcome::Fallback;
+        }
+        if self
+            .clients
+            .values()
+            .any(|client| client.is_full_app_client() && client.private_surface.is_some())
+        {
+            crate::render_prof::event("retained_graphics_fallback.private_surface");
             return RetainedGraphicsOutcome::Fallback;
         }
 
@@ -487,6 +653,9 @@ impl HeadlessServer {
             if !matches!(mode, ClientConnectionMode::App) {
                 continue;
             }
+            let excluded_graphics_pane = self
+                .graphics_excluded_omp_pane_info(client_id)
+                .map(|info| info.id);
             let Some(client) = self.clients.get_mut(&client_id) else {
                 crate::render_prof::event("retained_graphics_fallback.client_missing");
                 return RetainedGraphicsOutcome::Fallback;
@@ -520,6 +689,7 @@ impl HeadlessServer {
                 &self.app.terminal_runtimes,
                 self.app.state.view.tab_surface(),
                 cell_size,
+                excluded_graphics_pane,
                 Some(crate::kitty_graphics::HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
                 &mut next_graphics_cache,
             );

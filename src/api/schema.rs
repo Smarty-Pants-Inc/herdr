@@ -49,6 +49,16 @@ pub enum Method {
     ServerStop(EmptyParams),
     #[serde(rename = "server.live_handoff")]
     ServerLiveHandoff(ServerLiveHandoffParams),
+    #[serde(rename = "server.omp_maintenance.acquire")]
+    ServerOmpMaintenanceAcquire(ServerOmpMaintenanceAcquireParams),
+    #[serde(rename = "server.omp_maintenance.status")]
+    ServerOmpMaintenanceStatus(EmptyParams),
+    #[serde(rename = "server.omp_maintenance.inspect")]
+    ServerOmpMaintenanceInspect(EmptyParams),
+    #[serde(rename = "server.omp_maintenance.permit")]
+    ServerOmpMaintenancePermit(ServerOmpMaintenancePermitParams),
+    #[serde(rename = "server.omp_maintenance.release")]
+    ServerOmpMaintenanceRelease(ServerOmpMaintenanceReleaseParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.agent_manifests")]
@@ -139,10 +149,16 @@ pub enum Method {
     PaneLayout(PaneLayoutParams),
     #[serde(rename = "pane.process_info")]
     PaneProcessInfo(PaneProcessInfoParams),
+    #[serde(rename = "pane.omp_bridge")]
+    PaneOmpBridge(PaneOmpBridgeParams),
     #[serde(rename = "layout.export")]
     LayoutExport(LayoutExportParams),
     #[serde(rename = "layout.apply")]
     LayoutApply(LayoutApplyParams),
+    #[serde(rename = "layout.apply_idempotent")]
+    LayoutApplyIdempotent(LayoutIdempotentParams),
+    #[serde(rename = "layout.reconcile_idempotent")]
+    LayoutReconcileIdempotent(LayoutIdempotentParams),
     #[serde(rename = "layout.set_split_ratio")]
     LayoutSetSplitRatio(LayoutSetSplitRatioParams),
     #[serde(rename = "pane.neighbor")]

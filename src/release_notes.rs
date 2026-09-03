@@ -79,6 +79,24 @@ fn load_latest_from_path(path: &Path, current_version: &str) -> Option<ReleaseNo
     release_notes_from_stored(stored, current_version)
 }
 
+fn normalize_pending_bootstrap_version(stored_version: &str, current_version: &str) -> String {
+    let Some((base_version, canonical_build_id)) = current_version.split_once("-preview.") else {
+        return stored_version.to_string();
+    };
+    if base_version.is_empty() || canonical_build_id.is_empty() {
+        return stored_version.to_string();
+    }
+    let bootstrap_version = format!(
+        "{base_version}-preview.{}",
+        crate::update::windows_bootstrap_build_alias(canonical_build_id)
+    );
+    if stored_version == bootstrap_version {
+        current_version.to_string()
+    } else {
+        stored_version.to_string()
+    }
+}
+
 fn release_notes_from_stored(
     stored: StoredReleaseNotes,
     current_version: &str,
@@ -88,8 +106,9 @@ fn release_notes_from_stored(
         return None;
     }
 
+    let version = normalize_pending_bootstrap_version(&stored.version, current_version);
     let preview = match (
-        crate::update::Version::parse(&stored.version),
+        crate::update::Version::parse(&version),
         crate::update::Version::parse(current_version),
     ) {
         (Some(stored_version), Some(current_version)) => stored_version > current_version,
@@ -98,7 +117,7 @@ fn release_notes_from_stored(
 
     Some(ReleaseNotes {
         preview,
-        version: stored.version,
+        version,
         body,
     })
 }
@@ -111,6 +130,7 @@ fn mark_current_version_seen_at(path: &Path, current_version: &str) -> std::io::
     let Some(mut stored) = load_stored_from_path(path) else {
         return Ok(());
     };
+    stored.version = normalize_pending_bootstrap_version(&stored.version, current_version);
     if stored.version != current_version || !stored.show_on_startup {
         return Ok(());
     }
@@ -244,6 +264,58 @@ mod tests {
         let latest = load_latest_from_path(&path, "0.3.1").expect("latest notes");
         assert_eq!(latest.version, "0.3.1");
         assert!(!latest.preview);
+
+        clear_pending_at(&path).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_alias_notes_normalize_to_the_matching_canonical_build() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-release-notes-{}-{}",
+            std::process::id(),
+            "bootstrap-alias"
+        ));
+        let canonical_build_id = "canonical-build";
+        let current_version = format!("0.3.1-preview.{canonical_build_id}");
+        let bootstrap_version = format!(
+            "0.3.1-preview.{}",
+            crate::update::windows_bootstrap_build_alias(canonical_build_id)
+        );
+        let _ = clear_pending_at(&path);
+        save_pending_to_path(&path, &bootstrap_version, "### Changed\n- One").unwrap();
+
+        let notes = load_latest_from_path(&path, &current_version).expect("latest notes");
+        assert_eq!(notes.version, current_version);
+        assert!(!notes.preview);
+
+        mark_current_version_seen_at(&path, &current_version).unwrap();
+        let stored = load_stored_from_path(&path).expect("stored notes");
+        assert_eq!(stored.version, current_version);
+        assert!(!stored.show_on_startup);
+
+        clear_pending_at(&path).unwrap();
+    }
+
+    #[test]
+    fn unrelated_bootstrap_alias_notes_remain_distinct() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-release-notes-{}-{}",
+            std::process::id(),
+            "other-bootstrap-alias"
+        ));
+        let current_version = "0.3.1-preview.canonical-build";
+        let bootstrap_version = format!(
+            "0.3.1-preview.{}",
+            crate::update::windows_bootstrap_build_alias("other-canonical-build")
+        );
+        let _ = clear_pending_at(&path);
+        save_pending_to_path(&path, &bootstrap_version, "### Changed\n- One").unwrap();
+
+        let notes = load_latest_from_path(&path, current_version).expect("latest notes");
+        assert_eq!(notes.version, bootstrap_version);
+        mark_current_version_seen_at(&path, current_version).unwrap();
+        let stored = load_stored_from_path(&path).expect("stored notes");
+        assert!(stored.show_on_startup);
 
         clear_pending_at(&path).unwrap();
     }

@@ -115,12 +115,22 @@ pub(crate) fn status_commands_supported() -> bool {
     false
 }
 
-pub(crate) fn configure_status_command(_process: &mut std::process::Command) {}
+pub(crate) fn configure_process_tree_command(_process: &mut std::process::Command) {}
 
-pub(crate) struct StatusCommandGuard;
+pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+    configure_process_tree_command(process);
+}
 
-impl StatusCommandGuard {
+pub(crate) struct ProcessTreeGuard;
+
+pub(crate) type StatusCommandGuard = ProcessTreeGuard;
+
+impl ProcessTreeGuard {
     pub(crate) fn new(_child: &tokio::process::Child) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn new_std(_child: &std::process::Child) -> std::io::Result<Self> {
         Ok(Self)
     }
 
@@ -227,6 +237,14 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
 }
 
 /// Unsupported platform stub.
-pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
+pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+    show_desktop_notification_with_action(title, body, None)
+}
+
+pub fn show_desktop_notification_with_action(
+    _title: &str,
+    _body: Option<&str>,
+    _action: Option<&super::DesktopNotificationAction>,
+) -> std::io::Result<bool> {
     Ok(false)
 }

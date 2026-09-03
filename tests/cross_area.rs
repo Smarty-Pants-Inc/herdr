@@ -90,20 +90,39 @@ fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) 
     spawn_server_with_path(config_home, runtime_dir, api_socket_path, None)
 }
 
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
+fn write_test_identity(config_home: &Path) {
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("identity.toml"),
+        concat!(
+            "display_name = \"Test\"\n",
+            "frontend_profile_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+            "renderer_binding_token = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+        ),
+    )
+    .unwrap();
+}
+
 fn spawn_server_with_path(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    let config_dir = config_home.join(app_dir_name());
+    fs::create_dir_all(&config_dir).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
-    fs::write(
-        config_home.join("herdr/config.toml"),
-        "onboarding = false\n",
-    )
-    .unwrap();
+    fs::write(config_dir.join("config.toml"), "onboarding = false\n").unwrap();
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -122,6 +141,7 @@ fn spawn_server_with_path(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -142,6 +162,7 @@ fn spawn_client_process(
     api_socket_path: &Path,
 ) -> SpawnedHerdr {
     register_runtime_dir(runtime_dir);
+    write_test_identity(config_home);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -160,6 +181,7 @@ fn spawn_client_process(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -196,7 +218,7 @@ fn workspace_create(socket_path: &Path, label: &str) -> Value {
         socket_path,
         "workspace_create",
         "workspace.create",
-        json!({ "label": label }),
+        json!({ "label": label, "focus": true }),
     )
 }
 
@@ -429,6 +451,18 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // RenderEncoding::SemanticFrame
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientKeybindings::Server
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
+    static NEXT_CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for value in [
+        "Test".to_owned(),
+        format!("{client_id:043}"),
+        format!("r{client_id:042}"),
+    ] {
+        payload.extend_from_slice(&encode_varint_u32(1));
+        payload.extend_from_slice(&encode_varint_u32(value.len() as u32));
+        payload.extend_from_slice(value.as_bytes());
+    }
+    payload.extend_from_slice(&encode_varint_u32(0)); // OmpRendererCapabilities::client_local_native
 
     stream
         .write_all(&frame_message(&payload))
@@ -509,6 +543,29 @@ struct FrameWire {
     cursor: Option<CursorWire>,
     hyperlinks: Vec<String>,
     graphics: Vec<u8>,
+    omp_renderer: Option<OmpRendererFrameWire>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererFrameWire {
+    launch_id: u64,
+    authority_revision: u64,
+    frame_nonce: [u8; 16],
+    pane: Option<OmpRendererPaneWire>,
+    focused: bool,
+    server_owned_overlay: bool,
+    surface_active: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct OmpRendererPaneWire {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    scrollback_limit_bytes: u64,
 }
 
 #[allow(dead_code)]
@@ -635,7 +692,7 @@ fn wait_for_frame_matching(
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_message_payload(stream, slice) {
-            Ok((1, payload)) => {
+            Ok((2, payload)) => {
                 let frame = decode_frame_payload(&payload)?;
                 if predicate(&frame) {
                     return Ok(true);
@@ -657,7 +714,7 @@ fn wait_for_frame(stream: &mut UnixStream, timeout: Duration) -> bool {
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(80));
         match read_server_variant(stream, slice) {
-            Ok(1) => return true, // ServerMessage::Frame
+            Ok(2) => return true, // ServerMessage::Frame
             Ok(_) => {}
             Err(err) if is_timeout(&err) => {}
             Err(_) => return false,
@@ -767,7 +824,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     let bin_dir = base.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_pi = bin_dir.join("pi");
-    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 8\n").unwrap();
+    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 30\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -950,6 +1007,11 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     let server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
+    let created = workspace_create(&api_socket, "shared-view");
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id")
+        .to_string();
 
     let mut client_a = UnixStream::connect(&client_socket).expect("client A should connect");
     client_handshake(&mut client_a, CURRENT_PROTOCOL, 110, 30);
@@ -960,12 +1022,6 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     assert!(wait_for_frame(&mut client_b, Duration::from_secs(2)));
     drain_server_messages(&mut client_a, Duration::from_millis(250));
     drain_server_messages(&mut client_b, Duration::from_millis(250));
-
-    let created = workspace_create(&api_socket, "shared-view");
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .expect("root pane id")
-        .to_string();
 
     // Input from client A should update shared state visible to client B.
     send_client_input(&mut client_a, b"echo SHARED_VIEW\n");

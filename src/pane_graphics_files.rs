@@ -13,6 +13,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 const DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub(crate) struct FileStore {
@@ -185,7 +187,11 @@ fn create_generation(base: &Path) -> io::Result<Generation> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = base.join(format!("server-{}-{nonce}", std::process::id()));
+        let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
+        let root = base.join(format!(
+            "server-{}-{nonce}-{generation_id}",
+            std::process::id()
+        ));
         fs::create_dir(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(DIRECTORY_MODE))?;
         let source = root.join("source");

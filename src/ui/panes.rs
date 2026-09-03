@@ -10,7 +10,7 @@ use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
 #[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
-use super::widgets::panel_contrast_fg;
+use super::widgets::{panel_contrast_fg, render_panel_separator};
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
 use crate::layout::PaneInfo;
@@ -356,6 +356,9 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in pane_infos {
+        if info.inner_rect.is_empty() {
+            continue;
+        }
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             let show_cursor = info.is_focused
                 && terminal_active
@@ -376,6 +379,7 @@ pub(super) fn render_panes(
                 }
             }
 
+            render_findr_highlights(app, frame, info, rt);
             let (copy_search_top, copy_search_bottom, copy_search_matches) =
                 validated_copy_mode_search_matches(app, info, rt);
             render_copy_mode_search_highlights(
@@ -406,6 +410,7 @@ pub(super) fn render_panes(
                 true,
             );
             render_copy_mode_cursor(app, frame, info);
+            render_hovered_link(app, frame, info);
         }
     }
 
@@ -443,6 +448,123 @@ pub(super) fn resize_popup_pane(
     }
 }
 
+pub(super) fn resize_workspace_plugin_pane(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    inner: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    if inner.is_empty() {
+        return;
+    }
+    let Some((_, pane)) = app.active_workspace_plugin_pane() else {
+        return;
+    };
+    if app.direct_attach_resize_locks.contains(&pane.terminal_id) {
+        return;
+    }
+    if let Some(runtime) = terminal_runtimes.get(&pane.terminal_id) {
+        runtime.resize(
+            inner.height,
+            inner.width,
+            cell_size.width_px,
+            cell_size.height_px,
+        );
+    }
+}
+
+pub(crate) fn workspace_plugin_pane_toggle_rect(outer: Rect) -> Rect {
+    if outer.is_empty() {
+        return Rect::default();
+    }
+    Rect::new(
+        outer.x,
+        outer.y.saturating_add(outer.height.saturating_sub(1)),
+        1,
+        1,
+    )
+}
+
+pub(super) fn render_workspace_plugin_pane(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
+    let outer = app.view.workspace_plugin_pane_outer;
+    let inner = app.view.workspace_plugin_pane_inner;
+    if outer.is_empty() {
+        return;
+    }
+    let Some((_, pane)) = app.active_workspace_plugin_pane() else {
+        return;
+    };
+
+    frame.render_widget(Clear, outer);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(app.palette.sidebar_bg)),
+        outer,
+    );
+    let input_active = pane.focused
+        && matches!(
+            app.mode,
+            crate::app::Mode::Terminal | crate::app::Mode::Findr
+        );
+    render_panel_separator(frame, outer, outer.x, input_active, &app.palette);
+    let toggle = workspace_plugin_pane_toggle_rect(outer);
+    if !toggle.is_empty() {
+        frame.buffer_mut()[(toggle.x, toggle.y)]
+            .set_symbol(if pane.collapsed { "«" } else { "»" })
+            .set_style(
+                Style::default()
+                    .fg(app.palette.overlay0)
+                    .bg(app.palette.sidebar_bg),
+            );
+    }
+    if inner.y > outer.y {
+        if let Some(title) = app
+            .terminals
+            .get(&pane.terminal_id)
+            .and_then(|terminal| terminal.manual_label.as_deref())
+        {
+            let title_area = Rect::new(
+                inner.x.saturating_add(1),
+                outer.y,
+                inner.width.saturating_sub(1),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(title).style(
+                    Style::default()
+                        .fg(app.palette.overlay0)
+                        .bg(app.palette.sidebar_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                title_area,
+            );
+        }
+    }
+
+    if let Some(runtime) = (!inner.is_empty())
+        .then(|| terminal_runtimes.get(&pane.terminal_id))
+        .flatten()
+    {
+        runtime.render(
+            frame,
+            inner,
+            input_active && !pane_is_scrolled_back(runtime),
+        );
+        let info = PaneInfo {
+            id: pane.pane_id,
+            rect: outer,
+            inner_rect: inner,
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: pane.focused,
+        };
+        render_findr_highlights(app, frame, &info, runtime);
+    }
+}
+
 pub(super) fn render_popup_pane(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -455,7 +577,7 @@ pub(super) fn render_popup_pane(
     let Some((outer, inner)) = popup_pane_rects(app, area) else {
         return;
     };
-    let Some(rt) = terminal_runtimes.get(&popup.terminal_id) else {
+    let Some(runtime) = terminal_runtimes.get(&popup.terminal_id) else {
         return;
     };
     let title = app
@@ -463,14 +585,25 @@ pub(super) fn render_popup_pane(
         .get(&popup.terminal_id)
         .and_then(|terminal| terminal.manual_label.as_deref())
         .unwrap_or("popup");
+    render_popup_runtime(frame, outer, inner, runtime, title, &app.palette);
+}
+
+pub(crate) fn render_popup_runtime(
+    frame: &mut Frame,
+    outer: Rect,
+    inner: Rect,
+    runtime: &crate::terminal::TerminalRuntime,
+    title: &str,
+    palette: &crate::app::state::Palette,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.palette.accent))
+        .border_style(Style::default().fg(palette.accent))
         .title(pane_border_title(title, outer.width, true).unwrap_or_default())
-        .style(Style::default().bg(app.palette.panel_bg));
+        .style(Style::default().bg(palette.panel_bg));
     frame.render_widget(Clear, outer);
     frame.render_widget(block, outer);
-    rt.render(frame, inner, !pane_is_scrolled_back(rt));
+    runtime.render(frame, inner, !pane_is_scrolled_back(runtime));
 }
 
 #[derive(Clone, Copy, Default)]
@@ -788,6 +921,60 @@ fn validated_copy_mode_search_matches(
     (top, bottom, matches)
 }
 
+fn paint_terminal_text_match(
+    frame: &mut Frame,
+    inner: Rect,
+    top: u32,
+    bottom: u32,
+    text_match: crate::pane::TerminalTextMatch,
+    style: Style,
+) {
+    if inner.is_empty() || text_match.end.row < top || text_match.start.row > bottom {
+        return;
+    }
+
+    for row in text_match.start.row.max(top)..=text_match.end.row.min(bottom) {
+        let viewport_row = row.saturating_sub(top) as u16;
+        let start_col = if row == text_match.start.row {
+            text_match.start.col
+        } else {
+            0
+        };
+        let end_col = if row == text_match.end.row {
+            text_match.end.col
+        } else {
+            inner.width.saturating_sub(1)
+        };
+        for col in start_col..=end_col.min(inner.width.saturating_sub(1)) {
+            frame.buffer_mut()[(
+                inner.x.saturating_add(col),
+                inner.y.saturating_add(viewport_row),
+            )]
+                .set_style(style);
+        }
+    }
+}
+
+fn render_hovered_link(app: &AppState, frame: &mut Frame, info: &PaneInfo) {
+    let Some(link) = app.hovered_link.as_ref() else {
+        return;
+    };
+    if app.mode != Mode::Terminal || link.pane_id != info.id || link.inner_rect != info.inner_rect {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for &(x, y) in &link.cells {
+        if x >= info.inner_rect.x
+            && x < info.inner_rect.x.saturating_add(info.inner_rect.width)
+            && y >= info.inner_rect.y
+            && y < info.inner_rect.y.saturating_add(info.inner_rect.height)
+        {
+            let cell = &mut buf[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+        }
+    }
+}
+
 fn render_copy_mode_search_highlights(
     app: &AppState,
     frame: &mut Frame,
@@ -816,26 +1003,48 @@ fn render_copy_mode_search_highlights(
         if (current == Some(index)) != current_only {
             continue;
         }
-        let start_row = text_match.start.row.max(top);
-        let end_row = text_match.end.row.min(bottom);
-        for absolute_row in start_row..=end_row {
-            let viewport_row = absolute_row.saturating_sub(top) as u16;
-            let start_col = if absolute_row == text_match.start.row {
-                text_match.start.col
-            } else {
-                0
-            };
-            let end_col = if absolute_row == text_match.end.row {
-                text_match.end.col
-            } else {
-                info.inner_rect.width.saturating_sub(1)
-            };
-            for col in start_col..=end_col.min(info.inner_rect.width.saturating_sub(1)) {
-                let x = info.inner_rect.x.saturating_add(col);
-                let y = info.inner_rect.y.saturating_add(viewport_row);
-                frame.buffer_mut()[(x, y)].set_style(style);
-            }
+        paint_terminal_text_match(frame, info.inner_rect, top, bottom, text_match, style);
+    }
+}
+
+fn render_findr_highlights(
+    app: &AppState,
+    frame: &mut Frame,
+    info: &PaneInfo,
+    rt: &crate::terminal::TerminalRuntime,
+) {
+    let Some(findr) = app.findr.as_ref() else {
+        return;
+    };
+    if info.inner_rect.is_empty()
+        || app.mode != Mode::Findr
+        || findr.query.is_empty()
+        || findr.pane_id != info.id
+    {
+        return;
+    }
+    let Some(metrics) = rt.scroll_metrics() else {
+        return;
+    };
+    let top = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom)
+        .min(u32::MAX as usize) as u32;
+    let bottom = top.saturating_add(u32::from(info.inner_rect.height.saturating_sub(1)));
+
+    for y in info.inner_rect.y..info.inner_rect.y.saturating_add(info.inner_rect.height) {
+        for x in info.inner_rect.x..info.inner_rect.x.saturating_add(info.inner_rect.width) {
+            let cell = &mut frame.buffer_mut()[(x, y)];
+            cell.set_style(cell.style().add_modifier(Modifier::DIM));
         }
+    }
+    let match_style = Style::default()
+        .fg(panel_contrast_fg(&app.palette))
+        .bg(app.palette.accent)
+        .add_modifier(Modifier::BOLD)
+        .remove_modifier(Modifier::DIM);
+    for text_match in findr.matches.iter().copied() {
+        paint_terminal_text_match(frame, info.inner_rect, top, bottom, text_match, match_style);
     }
 }
 
@@ -1603,5 +1812,117 @@ mod tests {
             panic!("selection background should resolve to rgb");
         };
         assert!(relative_luminance((r, g, b)) > relative_luminance((12, 14, 16)));
+    }
+    #[tokio::test]
+    async fn workspace_plugin_pane_matches_sidebar_chrome() {
+        let mut app = AppState::test_new();
+        let workspace = Workspace::test_new("plugin-render");
+        let workspace_id = workspace.id.clone();
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.palette.sidebar_bg = Color::Rgb(1, 2, 3);
+        app.palette.overlay0 = Color::Rgb(4, 5, 6);
+        app.view.workspace_plugin_pane_outer = Rect::new(4, 0, 8, 4);
+        app.view.workspace_plugin_pane_inner = Rect::new(5, 1, 7, 3);
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        app.workspace_plugin_panes.insert(
+            workspace_id,
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: PaneId::alloc(),
+                terminal_id: terminal_id.clone(),
+                plugin_id: "example.explorer".into(),
+                entrypoint: "explorer".into(),
+                width: Some(crate::popup_size::PopupSize::Cells(8)),
+                focused: false,
+                collapsed: false,
+            },
+        );
+        let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal_state.set_manual_label("explorer".into());
+        app.terminals.insert(terminal_id.clone(), terminal_state);
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        runtimes.insert(
+            terminal_id,
+            TerminalRuntime::test_with_screen_bytes(7, 3, b"tree"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 4)).unwrap();
+
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(4, 0)].symbol(), "│");
+        assert_eq!(buffer[(4, 0)].style().fg, Some(app.palette.surface_dim));
+        assert_eq!(buffer[(4, 0)].style().bg, Some(app.palette.sidebar_bg));
+        assert_eq!(buffer[(4, 3)].symbol(), "»");
+        assert_eq!(buffer[(6, 0)].symbol(), "e");
+        assert_eq!(buffer[(6, 0)].style().fg, Some(app.palette.overlay0));
+        assert!(buffer[(6, 0)].style().add_modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(5, 1)].symbol(), "t");
+        app.workspace_plugin_panes
+            .values_mut()
+            .next()
+            .expect("workspace plugin pane")
+            .focused = true;
+        app.mode = crate::app::Mode::Terminal;
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(4, 0)].style().fg,
+            Some(app.palette.accent)
+        );
+
+        app.mode = crate::app::Mode::Prefix;
+        terminal
+            .draw(|frame| render_workspace_plugin_pane(&app, &runtimes, frame))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(4, 0)].style().fg,
+            Some(app.palette.surface_dim)
+        );
+        for (_, runtime) in runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn findr_dims_nonmatches_and_highlights_matches() {
+        let pane_id = PaneId::from_raw(1);
+        let runtime = TerminalRuntime::test_with_screen_bytes(20, 2, b"plain needle tail");
+        let mut app = AppState::test_new();
+        app.mode = Mode::Findr;
+        let mut findr = crate::app::state::FindrState::new(pane_id);
+        findr.query = "needle".to_string();
+        findr.matches = runtime.search_text_matches("needle", false);
+        app.findr = Some(findr);
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 20, 2),
+            inner_rect: Rect::new(0, 0, 20, 2),
+            scrollbar_rect: None,
+            borders: Borders::empty(),
+            is_focused: true,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 2)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                runtime.render(frame, info.inner_rect, false);
+                render_findr_highlights(&app, frame, &info, &runtime);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(0, 0)].style().add_modifier.contains(Modifier::DIM));
+        for x in 6..12 {
+            let style = buffer[(x, 0)].style();
+            assert_eq!(style.bg, Some(app.palette.accent));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+            assert!(!style.add_modifier.contains(Modifier::DIM));
+        }
     }
 }

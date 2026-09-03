@@ -127,16 +127,16 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: herdr-linux-x86_64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             name: herdr-linux-aarch64
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             name: herdr-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-14
             name: herdr-macos-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -206,7 +206,7 @@ jobs:
         run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: preview-${{ matrix.target }}
 

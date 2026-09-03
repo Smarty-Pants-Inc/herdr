@@ -8,8 +8,6 @@ use crate::{
 };
 
 struct PreparedPaneInput {
-    ws_idx: usize,
-    pane_id: crate::layout::PaneId,
     target: TerminalInputTarget,
     bytes: Bytes,
 }
@@ -36,11 +34,22 @@ impl App {
         self.handle_terminal_key_headless_from(crate::app::LOCAL_INPUT_SOURCE, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_terminal_key_headless_from(
         &mut self,
         source_id: InputSourceId,
         key: TerminalKey,
     ) -> Option<TerminalInputTarget> {
+        self.handle_terminal_key_headless_from_view(source_id, None, key)
+    }
+
+    pub(crate) fn handle_terminal_key_headless_from_view(
+        &mut self,
+        source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
+        key: TerminalKey,
+    ) -> Option<TerminalInputTarget> {
+        self.clear_hovered_pane_link();
         match self.prepare_popup_key_forward(key.clone()) {
             PreparedPopupInput::NotOpen => {}
             PreparedPopupInput::Consumed => return None,
@@ -53,9 +62,9 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(source_id, key)?;
+        let input = self.prepare_terminal_key_forward(source_id, view_id, key)?;
         let sent = self
-            .lookup_runtime_sender(input.ws_idx, input.pane_id)
+            .terminal_input_runtime(&input.target)
             .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
         sent.then_some(input.target)
     }
@@ -63,6 +72,7 @@ impl App {
     fn prepare_terminal_key_forward(
         &mut self,
         source_id: InputSourceId,
+        view_id: Option<&crate::api::schema::ViewId>,
         key: TerminalKey,
     ) -> Option<PreparedPaneInput> {
         let key_event = key.as_key_event();
@@ -70,8 +80,6 @@ impl App {
             return None;
         }
 
-        self.state.clear_selection();
-        self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
 
         if let Some(action) =
@@ -84,6 +92,10 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct keybinding before forwarding to pane"
             );
+            if action != super::navigate::NavigateAction::Findr {
+                self.state.clear_selection();
+                self.selection_autoscroll_deadline = None;
+            }
             if action == super::navigate::NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
@@ -91,6 +103,9 @@ impl App {
             }
             return None;
         }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
 
         if let Some(binding) = super::navigate::command_for_key(
             &self.state,
@@ -104,7 +119,11 @@ impl App {
                 command = %binding.label,
                 "intercepted terminal direct custom command before forwarding to pane"
             );
-            self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
+            self.launch_custom_command_for_view(
+                binding,
+                super::navigate::ActionContext::Direct,
+                view_id,
+            );
             return None;
         }
 
@@ -116,12 +135,29 @@ impl App {
                 action = ?action,
                 "intercepted terminal direct indexed keybinding before forwarding to pane"
             );
+            self.state.clear_selection();
+            self.selection_autoscroll_deadline = None;
             self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
             return None;
         }
 
+        if matches!(key_event.code, KeyCode::Esc) {
+            if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
+                let workspace_id = workspace_id.to_string();
+                self.state.unfocus_workspace_plugin_pane(&workspace_id);
+                self.state.mode = Mode::Terminal;
+                return None;
+            }
+        }
+
         if self.state.is_prefix_key(&key) {
-            self.state.mode = Mode::Prefix;
+            if let Some((workspace_id, _)) = self.state.focused_workspace_plugin_pane() {
+                let workspace_id = workspace_id.to_string();
+                self.state.unfocus_workspace_plugin_pane(&workspace_id);
+                self.state.mode = Mode::Terminal;
+            } else {
+                self.state.mode = Mode::Prefix;
+            }
             return None;
         }
 
@@ -135,54 +171,62 @@ impl App {
             return None;
         }
 
-        let ws_idx = self.state.active?;
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_id = ws.focused_pane_id()?;
-        let terminal_id = ws.terminal_id(pane_id)?.clone();
-        let rt =
-            self.state
-                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
-
-        // Intercept plain PageUp/PageDown presses for pane scrollback only
-        // when the focused pane looks like a shell transcript. Normal-screen
-        // pagers such as `less -X` keep the primary screen but enter
-        // application cursor mode while they own special keys.
-        // Modified page keys are pane shortcuts, and release events should not
-        // produce a second host-scroll action.
-        // Only intercept when we know the pane state; if input_state is unknown,
-        // fail-open and forward the key to the pane.
-        if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
-            && key_event.modifiers.is_empty()
-        {
-            if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
-                if host_scroll {
-                    if key_event.kind == crossterm::event::KeyEventKind::Release {
-                        return None;
-                    }
-                    if matches!(
-                        key_event.kind,
-                        crossterm::event::KeyEventKind::Press
-                            | crossterm::event::KeyEventKind::Repeat
-                    ) {
-                        let lines = self
-                            .state
-                            .pane_info_by_id(pane_id)
-                            .map(|info| info.inner_rect.height as usize)
-                            .unwrap_or(10)
-                            .max(1);
-                        if key_event.code == KeyCode::PageUp {
-                            self.state
-                                .scroll_pane_up(&self.terminal_runtimes, pane_id, lines);
-                        } else {
-                            self.state
-                                .scroll_pane_down(&self.terminal_runtimes, pane_id, lines);
+        let (terminal_id, pane_id) =
+            if let Some((_, pane)) = self.state.focused_workspace_plugin_pane() {
+                (pane.terminal_id.clone(), None)
+            } else {
+                let ws_idx = self.state.active?;
+                let ws = self.state.workspaces.get(ws_idx)?;
+                let pane_id = ws.focused_pane_id()?;
+                (ws.terminal_id(pane_id)?.clone(), Some(pane_id))
+            };
+        let target = TerminalInputTarget { terminal_id };
+        let rt = self.terminal_input_runtime(&target)?;
+        if let Some(pane_id) = pane_id {
+            // Intercept plain PageUp/PageDown presses for pane scrollback only
+            // when the focused pane looks like a shell transcript. Normal-screen
+            // pagers such as `less -X` keep the primary screen but enter
+            // application cursor mode while they own special keys.
+            // Modified page keys are pane shortcuts, and release events should not
+            // produce a second host-scroll action.
+            // Only intercept when we know the pane state; if input_state is unknown,
+            // fail-open and forward the key to the pane.
+            if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                && key_event.modifiers.is_empty()
+            {
+                if let Some(host_scroll) = rt.plain_page_keys_use_host_scrollback() {
+                    if host_scroll {
+                        if key_event.kind == crossterm::event::KeyEventKind::Release {
+                            return None;
                         }
-                        debug!(
-                            code = ?key_event.code,
-                            lines,
-                            "intercepted page key for pane scrollback"
-                        );
-                        return None;
+                        if matches!(
+                            key_event.kind,
+                            crossterm::event::KeyEventKind::Press
+                                | crossterm::event::KeyEventKind::Repeat
+                        ) {
+                            let lines = self
+                                .state
+                                .pane_info_by_id(pane_id)
+                                .map(|info| info.inner_rect.height as usize)
+                                .unwrap_or(10)
+                                .max(1);
+                            if key_event.code == KeyCode::PageUp {
+                                self.state
+                                    .scroll_pane_up(&self.terminal_runtimes, pane_id, lines);
+                            } else {
+                                self.state.scroll_pane_down(
+                                    &self.terminal_runtimes,
+                                    pane_id,
+                                    lines,
+                                );
+                            }
+                            debug!(
+                                code = ?key_event.code,
+                                lines,
+                                "intercepted page key for pane scrollback"
+                            );
+                            return None;
+                        }
                     }
                 }
             }
@@ -228,9 +272,7 @@ impl App {
         }
 
         Some(PreparedPaneInput {
-            ws_idx,
-            pane_id,
-            target: TerminalInputTarget { terminal_id },
+            target,
             bytes: Bytes::from(bytes),
         })
     }
@@ -389,8 +431,8 @@ impl App {
             }
         }
 
-        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, key)?;
-        let sent = if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
+        let input = self.prepare_terminal_key_forward(crate::app::LOCAL_INPUT_SOURCE, None, key)?;
+        let sent = if let Some(runtime) = self.terminal_input_runtime(&input.target) {
             runtime.send_bytes(input.bytes).await.is_ok()
         } else {
             false
@@ -474,6 +516,16 @@ mod tests {
         app.state.view.pane_infos = pane_infos;
         (app, info)
     }
+    fn rendered_buffer(app: &App) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(106, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                crate::ui::render_with_runtime_registry(&app.state, &app.terminal_runtimes, frame);
+            })
+            .expect("render test frame");
+        terminal.backend().buffer().clone()
+    }
 
     fn double_click(app: &mut App, col: u16, row: u16) {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
@@ -511,7 +563,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn install_test_link_handler(app: &mut App) {
+    fn install_test_link_handler(app: &mut App, handler_id: &str, pattern: &str) {
         let plugin_root = std::env::temp_dir();
         app.state.installed_plugins = std::collections::HashMap::from([(
             "example.links".to_string(),
@@ -527,6 +579,7 @@ mod tests {
                 platforms: None,
                 build: Vec::new(),
                 startup: Vec::new(),
+                execution_providers: Vec::new(),
                 actions: vec![crate::api::schema::PluginManifestAction {
                     id: "open".into(),
                     title: "Open link".into(),
@@ -538,9 +591,9 @@ mod tests {
                 events: Vec::new(),
                 panes: Vec::new(),
                 link_handlers: vec![crate::api::schema::PluginManifestLinkHandler {
-                    id: "github-issue".into(),
-                    title: "Open GitHub issue".into(),
-                    pattern: "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$".into(),
+                    id: handler_id.into(),
+                    title: "Open link".into(),
+                    pattern: pattern.into(),
                     action: "open".into(),
                     platforms: None,
                 }],
@@ -882,7 +935,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn ctrl_click_url_reaps_failed_opener() {
+    async fn open_url_effect_reaps_failed_opener() {
         let opener_dir = unique_temp_path("url-opener");
         let record_path = opener_dir.join("record");
         let opener_path = opener_dir.join("xdg-open");
@@ -894,30 +947,18 @@ mod tests {
         .expect("fake opener script");
 
         let url = "https://example.com/akbash-2903";
-        let line = format!("see {url}");
-        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
-        let col = info.inner_rect.x + line.find("example").expect("url host") as u16;
-        let handled = app.handle_modified_url_click_with(
-            41,
-            modified_mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                col,
-                info.inner_rect.y,
-                KeyModifiers::CONTROL,
-            ),
-            |clicked_url| {
-                std::process::Command::new("/bin/sh")
-                    .arg(&opener_path)
-                    .arg(clicked_url)
-                    .arg(&record_path)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map(Some)
-            },
-        );
-        assert!(handled);
+        let (mut app, _) = app_with_screen_bytes(b"");
+        app.open_safe_url_with(url, |opened_url| {
+            std::process::Command::new("/bin/sh")
+                .arg(&opener_path)
+                .arg(opened_url)
+                .arg(&record_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(Some)
+        });
 
         let record = wait_for_file(&record_path);
         let mut lines = record.lines();
@@ -941,7 +982,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_url_does_not_forward_release_to_mouse_reporting_pane() {
+    async fn single_click_url_does_not_forward_release_to_mouse_reporting_pane() {
         let line = "see https://github.com/herdrdev/herdr/issues/1761";
         let col = line.find("github").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(b"");
@@ -956,7 +997,11 @@ mod tests {
                 4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
-        install_test_link_handler(&mut app);
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         let mut send_mouse = |source_id, kind, column, modifiers| {
             app.handle_mouse_from_input_source(
                 source_id,
@@ -967,7 +1012,7 @@ mod tests {
         let up = MouseEventKind::Up(MouseButton::Left);
         let url_x = info.inner_rect.x + col;
 
-        send_mouse(41, down, url_x, KeyModifiers::CONTROL);
+        send_mouse(41, down, url_x, KeyModifiers::empty());
         send_mouse(42, down, info.inner_rect.x, KeyModifiers::empty());
         send_mouse(42, up, info.inner_rect.x, KeyModifiers::empty());
         send_mouse(41, up, url_x, KeyModifiers::empty());
@@ -989,7 +1034,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn outer_focus_loss_does_not_forward_pending_url_click_release_to_pane() {
+    async fn outer_focus_loss_does_not_forward_pending_single_click_release_to_pane() {
         let line = "see https://github.com/herdrdev/herdr/issues/1761";
         let col = line.find("github").expect("url host") as u16;
         let (mut app, info) = app_with_screen_bytes(b"");
@@ -1004,7 +1049,11 @@ mod tests {
                 4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
-        install_test_link_handler(&mut app);
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
         let url_x = info.inner_rect.x + col;
 
         app.handle_mouse_from_input_source(
@@ -1013,7 +1062,7 @@ mod tests {
                 MouseEventKind::Down(MouseButton::Left),
                 url_x,
                 info.inner_rect.y,
-                KeyModifiers::CONTROL,
+                KeyModifiers::empty(),
             ),
         );
         assert_eq!(app.state.plugin_command_logs.len(), 1);
@@ -1042,90 +1091,187 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn single_click_web_url_queues_open_url_effect() {
+        let url = "https://example.com/issues/21";
+        let col = url.find("example").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            info.inner_rect.x + col,
+            info.inner_rect.y,
+        ));
+
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl {
+                url: opened,
+                source_id,
+            } => {
+                assert_eq!(opened, url);
+                assert_eq!(source_id, 0);
+            }
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_osc8_file_url_invokes_plugin_link_handler() {
+    async fn single_click_osc8_file_url_invokes_plugin_link_handler() {
         let uri = "file:///tmp/herdr-file-repro.txt";
         let screen = format!("\x1b]8;;{uri}\x1b\\FILE\x1b]8;;\x1b\\");
         let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
-        install_test_link_handler(&mut app);
-        app.state
-            .installed_plugins
-            .get_mut("example.links")
-            .expect("test plugin")
-            .link_handlers[0]
-            .pattern = r"^file:///tmp/herdr-file-repro\.txt$".into();
+        install_test_link_handler(&mut app, "file", r"^file:///tmp/herdr-file-repro\.txt$");
 
-        let handled = app.handle_modified_url_click_with(
+        app.handle_mouse_from_input_source(
             41,
-            modified_mouse(
+            mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 info.inner_rect.x + 1,
                 info.inner_rect.y,
-                KeyModifiers::CONTROL,
             ),
-            |_| panic!("matched file link should not use the system URL opener"),
         );
 
-        assert!(handled);
         let log = app
             .state
             .plugin_command_logs
             .last()
-            .expect("ctrl-click should start plugin link handler");
+            .expect("single-click should start plugin link handler");
         assert_eq!(log.plugin_id, "example.links");
         assert_eq!(log.action_id.as_deref(), Some("open"));
 
         let (mut unmatched_app, unmatched_info) = app_with_screen_bytes(screen.as_bytes());
-        install_test_link_handler(&mut unmatched_app);
-        let unmatched_handled = unmatched_app.handle_modified_url_click_with(
+        install_test_link_handler(&mut unmatched_app, "web", r"^https://example\.com/$");
+        unmatched_app.handle_mouse_from_input_source(
             42,
-            modified_mouse(
+            mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 unmatched_info.inner_rect.x + 1,
                 unmatched_info.inner_rect.y,
-                KeyModifiers::CONTROL,
             ),
-            |_| panic!("unmatched file link should not use the system URL opener"),
         );
 
-        assert!(!unmatched_handled);
         assert!(unmatched_app.state.plugin_command_logs.is_empty());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
+    async fn single_click_url_invokes_plugin_link_handler() {
         let line = "see https://github.com/herdrdev/herdr/issues/398";
         let col = line.find("github").expect("url host") as u16;
 
-        let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());
-        install_test_link_handler(&mut ctrl_app);
-        ctrl_app.handle_mouse(modified_mouse(
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
+        app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            ctrl_info.inner_rect.x + col,
-            ctrl_info.inner_rect.y,
-            KeyModifiers::CONTROL,
+            info.inner_rect.x + col,
+            info.inner_rect.y,
         ));
 
-        let ctrl_log = ctrl_app
+        let log = app
             .state
             .plugin_command_logs
             .last()
-            .expect("ctrl-click should start plugin link handler");
-        assert_eq!(ctrl_log.plugin_id, "example.links");
-        assert_eq!(ctrl_log.action_id.as_deref(), Some("open"));
+            .expect("single-click should start plugin link handler");
+        assert_eq!(log.plugin_id, "example.links");
+        assert_eq!(log.action_id.as_deref(), Some("open"));
+    }
 
-        let (mut super_app, super_info) = app_with_screen_bytes(line.as_bytes());
-        install_test_link_handler(&mut super_app);
-        super_app.handle_mouse(modified_mouse(
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pixel_click_url_preserves_view_for_plugin_link_handler() {
+        let line = "see https://github.com/herdrdev/herdr/issues/398";
+        let col = line.find("github").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
+        app.state
+            .installed_plugins
+            .get_mut("example.links")
+            .expect("test plugin")
+            .actions[0]
+            .command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s' \"$HERDR_VIEW_ID\"".into(),
+        ];
+
+        let view_id = crate::api::schema::ViewId::from_opaque("view-pixel").unwrap();
+        let geometry = crate::input::mouse::HostGeometry::new(106, 20, 1_060, 400).unwrap();
+        let x = u32::from(info.inner_rect.x + col) * 10 + 1;
+        let y = u32::from(info.inner_rect.y) * 20 + 1;
+        let report = format!("\x1b[<0;{x};{y}M");
+
+        assert!(app.route_client_pixel_mouse(7, Some(&view_id), report.as_bytes(), geometry,));
+        let log_id = app
+            .state
+            .plugin_command_logs
+            .last()
+            .expect("pixel click should start plugin link handler")
+            .log_id
+            .clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.drain_all_internal_events();
+            if app.state.plugin_command_logs.iter().any(|entry| {
+                entry.log_id == log_id
+                    && entry.status != crate::api::schema::PluginCommandStatus::Running
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let finished = app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log_id)
+            .expect("plugin command log");
+        assert_eq!(
+            finished.status,
+            crate::api::schema::PluginCommandStatus::Succeeded
+        );
+        assert_eq!(finished.stdout.as_deref(), Some("view-pixel"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn double_click_url_invokes_plugin_link_handler_once() {
+        let line = "see https://github.com/herdrdev/herdr/issues/398";
+        let col = line.find("github").expect("url host") as u16;
+        let (mut app, info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(
+            &mut app,
+            "github-issue",
+            "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$",
+        );
+        let x = info.inner_rect.x + col;
+        for kind in [
             MouseEventKind::Down(MouseButton::Left),
-            super_info.inner_rect.x + col,
-            super_info.inner_rect.y,
-            KeyModifiers::SUPER,
-        ));
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_mouse(mouse(kind, x, info.inner_rect.y));
+        }
 
-        assert!(super_app.state.plugin_command_logs.is_empty());
+        assert_eq!(
+            app.state
+                .plugin_command_logs
+                .iter()
+                .filter(|log| log.action_id.as_deref() == Some("open"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1185,6 +1331,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pane_cell_url_resolver_tracks_wide_cell_spacer_at_soft_wrap() {
+        let (_app, info) = app_with_screen_bytes(b"");
+        let url = "https://example.com/wide";
+        let screen = format!("{}界{url}", "x".repeat(info.inner_rect.width as usize - 1));
+        let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let url_col = 2;
+
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 1, url_col)
+                .as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 1, url_col - 1),
+            None
+        );
+
+        let screen_col = info.inner_rect.x + url_col + 8;
+        let screen_row = info.inner_rect.y + 1;
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, screen_col, screen_row)));
+        let hover = app.state.hovered_link.as_ref().expect("hovered URL");
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col, screen_row)));
+        assert!(!hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col - 1, screen_row)));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            screen_col,
+            screen_row,
+        ));
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl { url: opened, .. } => assert_eq!(opened, url),
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_cell_url_resolver_tracks_zwj_grapheme_before_url() {
+        let url = "https://example.com/zwj";
+        let (mut app, info) = app_with_screen_bytes(format!("👩‍💻 {url}").as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let url_col = 3;
+
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, url_col)
+                .as_deref(),
+            Some(url)
+        );
+
+        let screen_col = info.inner_rect.x + url_col + 8;
+        let screen_row = info.inner_rect.y;
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, screen_col, screen_row)));
+        assert!(app.state.hovered_link.as_ref().is_some_and(|hover| hover
+            .cells
+            .contains(&(info.inner_rect.x + url_col, screen_row))));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            screen_col,
+            screen_row,
+        ));
+        match app.event_rx.try_recv().expect("open URL event") {
+            AppEvent::OpenUrl { url: opened, .. } => assert_eq!(opened, url),
+            event => panic!("expected OpenUrl event, got {event:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn pane_cell_url_resolver_handles_hard_newline_after_full_row() {
         let (_app, info) = app_with_screen_bytes(b"");
         let full_row = "x".repeat(info.inner_rect.width as usize);
@@ -1234,6 +1455,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hovered_plain_url_underlines_full_link_and_clears_on_leave() {
+        let url = "https://example.com/hover";
+        let screen = format!("\x1b[38;2;10;220;120m\x1b[48;2;20;30;40m{url}\x1b[0m elsewhere");
+        let (mut app, info) = app_with_screen_bytes(screen.as_bytes());
+        let before = rendered_buffer(&app);
+        let row = info.inner_rect.y;
+        let col = info.inner_rect.x + 8;
+
+        assert!(app.handle_mouse(mouse(MouseEventKind::Moved, col, row)));
+        let hover = app.state.hovered_link.as_ref().expect("hovered link");
+        assert_eq!(hover.cells.len(), url.len());
+        assert!(hover.cells.contains(&(info.inner_rect.x, row)));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + url.len() as u16 - 1, row)));
+
+        let after = rendered_buffer(&app);
+        for x in info.inner_rect.x..info.inner_rect.x + url.len() as u16 {
+            assert_eq!(after[(x, row)].style().fg, before[(x, row)].style().fg);
+            assert_eq!(after[(x, row)].style().bg, before[(x, row)].style().bg);
+            assert!(after[(x, row)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED));
+        }
+
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + url.len() as u16,
+            row,
+        )));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_link_refreshes_after_pty_replaces_its_cell() {
+        let url = "https://example.com/hover";
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+
+        app.state.workspaces[0].test_runtimes[&pane_id].test_process_pty_bytes(b"\rnot-a-link");
+        assert!(app.refresh_hovered_link_for_panes(&std::collections::HashSet::from([pane_id])));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_link_clears_when_scrolling() {
+        let url = "https://example.com/hover";
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            info.inner_rect.x + 8,
+            info.inner_rect.y,
+        )));
+        assert!(app.state.hovered_link.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovered_wrapped_url_tracks_every_visible_cell() {
+        let (_app, info) = app_with_screen_bytes(b"");
+        let prefix = "https://example.com/";
+        let padding = "a".repeat(info.inner_rect.width as usize - prefix.len());
+        let url = format!("{prefix}{padding}tail");
+        let (mut app, info) = app_with_screen_bytes(url.as_bytes());
+
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        )));
+        let hover = app
+            .state
+            .hovered_link
+            .as_ref()
+            .expect("hovered wrapped link");
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x, info.inner_rect.y)));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x + 1, info.inner_rect.y + 1)));
+    }
+
+    #[tokio::test]
     async fn render_stream_does_not_synthesize_hard_newline_plain_url_hyperlinks() {
         let (_app, info) = app_with_screen_bytes(b"");
         let full_row = "x".repeat(info.inner_rect.width as usize);
@@ -1275,6 +1590,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hovered_osc8_link_crosses_only_soft_wrapped_rows() {
+        let uri = "https://example.com/target";
+        let (_app, info) = app_with_screen_bytes(b"");
+        let padding = "x".repeat(info.inner_rect.width as usize - 1);
+        let soft_wrapped = format!(
+            "{padding}\x1b]8;;{uri}\x1b\\a\x1b]8;;\x1b\\\x1b]8;;{uri}\x1b\\b\x1b]8;;\x1b\\"
+        );
+        let (mut app, info) = app_with_screen_bytes(soft_wrapped.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x,
+            info.inner_rect.y + 1,
+        )));
+        let hover = app.state.hovered_link.as_ref().expect("soft-wrapped hover");
+        assert!(hover.cells.contains(&(
+            info.inner_rect.x + info.inner_rect.width - 1,
+            info.inner_rect.y
+        )));
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x, info.inner_rect.y + 1)));
+
+        let hard_newline =
+            format!("\x1b]8;;{uri}\x1b\\a\x1b]8;;\x1b\\\r\n\x1b]8;;{uri}\x1b\\b\x1b]8;;\x1b\\");
+        let (mut app, info) = app_with_screen_bytes(hard_newline.as_bytes());
+        assert!(app.handle_mouse(mouse(
+            MouseEventKind::Moved,
+            info.inner_rect.x,
+            info.inner_rect.y + 1,
+        )));
+        assert_eq!(
+            app.state
+                .hovered_link
+                .as_ref()
+                .expect("hard-newline hover")
+                .cells,
+            vec![(info.inner_rect.x, info.inner_rect.y + 1)]
+        );
+    }
+
+    #[tokio::test]
     async fn pane_cell_url_resolver_prefers_osc8_hyperlink() {
         let (app, _info) = app_with_screen_bytes(
             b"\x1b]8;;https://example.com/hidden-target\x1b\\label\x1b]8;;\x1b\\",
@@ -1287,6 +1643,87 @@ mod tests {
                 .as_deref(),
             Some("https://example.com/hidden-target")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_click_handler_only_osc8_urls_invoke_plugins_and_suppress_release() {
+        for (uri, pattern) in [
+            (
+                "file://build.example/tmp/odd%20file.rs?line=12&col=4",
+                "^file://",
+            ),
+            ("artifact://5776", "^artifact://"),
+        ] {
+            let screen =
+                format!("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b]8;;{uri}\x1b\\label\x1b]8;;\x1b\\");
+            let (mut app, info) = app_with_screen_bytes(b"");
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    info.inner_rect.width,
+                    info.inner_rect.height,
+                    0,
+                    screen.as_bytes(),
+                    4,
+                );
+            app.state.insert_test_runtime(pane_id, runtime);
+            install_test_link_handler(&mut app, "handler-only", pattern);
+
+            assert_eq!(
+                app.state
+                    .url_at_pane_cell(&app.terminal_runtimes, pane_id, 0, 1)
+                    .as_deref(),
+                Some(uri)
+            );
+
+            let x = info.inner_rect.x + 1;
+            app.handle_mouse_from_input_source(
+                41,
+                modified_mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    x,
+                    info.inner_rect.y,
+                    KeyModifiers::empty(),
+                ),
+            );
+            app.handle_mouse_from_input_source(
+                41,
+                modified_mouse(
+                    MouseEventKind::Up(MouseButton::Left),
+                    x,
+                    info.inner_rect.y,
+                    KeyModifiers::empty(),
+                ),
+            );
+
+            let log = app
+                .state
+                .plugin_command_logs
+                .last()
+                .expect("handler-only link should start plugin handler");
+            assert_eq!(log.action_id.as_deref(), Some("open"));
+            assert!(
+                input_rx.try_recv().is_err(),
+                "handled link must not reach pane"
+            );
+            while let Ok(event) = app.event_rx.try_recv() {
+                assert!(
+                    !matches!(event, AppEvent::OpenUrl { .. }),
+                    "plugin-handled link must not queue an OpenUrl event"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_custom_osc8_url_is_not_consumed() {
+        let (mut app, _info) = app_with_screen_bytes(b"");
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        assert!(!app.activate_link_click(41, pane_id, "artifact://5776".into(), None));
+        assert!(!app.pending_url_click_sources.contains(&41));
+        assert!(app.event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1749,6 +2186,64 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn terminal_input_routes_to_focused_workspace_plugin_pane() {
+        let mut app = app_for_mouse_test();
+        let workspace = Workspace::test_new("plugin-input");
+        let workspace_id = workspace.id.clone();
+        let tiled_pane_id = workspace.tabs[0].root_pane;
+        let tiled_terminal_id = workspace
+            .terminal_id(tiled_pane_id)
+            .expect("tiled terminal")
+            .clone();
+        let (tiled_runtime, mut tiled_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(tiled_terminal_id, tiled_runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let plugin_pane_id = crate::layout::PaneId::alloc();
+        let plugin_terminal_id = crate::terminal::TerminalId::alloc();
+        let (plugin_runtime, mut plugin_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(40, 24);
+        app.terminal_runtimes
+            .insert(plugin_terminal_id.clone(), plugin_runtime);
+        app.state.workspace_plugin_panes.insert(
+            workspace_id.clone(),
+            crate::app::state::WorkspacePluginPaneState {
+                pane_id: plugin_pane_id,
+                terminal_id: plugin_terminal_id,
+                plugin_id: "example.input".into(),
+                entrypoint: "explorer".into(),
+                width: None,
+                focused: true,
+                collapsed: false,
+            },
+        );
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.workspace_plugin_pane_inner = Rect::new(80, 1, 38, 22);
+
+        let target = app.handle_terminal_key_headless(TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+
+        assert!(target.is_some());
+        assert_eq!(plugin_rx.try_recv().unwrap().as_ref(), b"x");
+        assert!(plugin_rx.try_recv().is_err());
+        assert!(tiled_rx.try_recv().is_err());
+
+        let target =
+            app.handle_terminal_key_headless(TerminalKey::new(KeyCode::Esc, KeyModifiers::empty()));
+
+        assert!(target.is_none());
+        assert!(!app.state.workspace_plugin_panes[&workspace_id].focused);
+        assert!(plugin_rx.try_recv().is_err());
+    }
+
     fn app_with_plain_scrollback(
         line_count: usize,
     ) -> (App, crate::layout::PaneId, crate::layout::PaneInfo) {
@@ -1789,6 +2284,19 @@ mod tests {
                 repeat_count,
                 virtual_key_code: 0x21,
                 virtual_scan_code: 0x49,
+                unicode: 0,
+                control_key_state: 0x0100,
+            },
+        )
+    }
+
+    fn physical_up(repeat_count: u16) -> TerminalKey {
+        TerminalKey::new(KeyCode::Up, KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count,
+                virtual_key_code: 0x26,
+                virtual_scan_code: 0x48,
                 unicode: 0,
                 control_key_state: 0x0100,
             },
@@ -1839,6 +2347,95 @@ mod tests {
             pane_scroll_offset(&app, pane_id),
             pane_info.inner_rect.height as usize * 5
         );
+    }
+
+    #[tokio::test]
+    async fn findr_scroll_keys_preserve_separate_and_grouped_repeats() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(256);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let up = physical_up(1);
+
+        assert_eq!(
+            app.terminal_input_context(),
+            Some(crate::app::TerminalInputContext::Findr(pane_id))
+        );
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(up.clone())],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 1);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_kind(KeyEventKind::Repeat),
+            )],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 2);
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.clone().with_repeat_count(3),
+            )],
+            false,
+        );
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                up.with_repeat_count(1).with_kind(KeyEventKind::Release),
+            )],
+            false,
+        );
+        assert_eq!(pane_scroll_offset(&app, pane_id), 5);
+        assert!(app.input_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_findr_scroll_keys_preserve_separate_and_grouped_repeats() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(256);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let up = physical_up(1);
+
+        for key in [
+            up.clone(),
+            up.clone().with_kind(KeyEventKind::Repeat),
+            up.clone().with_kind(KeyEventKind::Release),
+            up.clone().with_repeat_count(3),
+            up.with_kind(KeyEventKind::Release),
+        ] {
+            app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+                .await;
+        }
+
+        assert_eq!(pane_scroll_offset(&app, pane_id), 5);
+        assert!(app.input_leases.is_empty());
+    }
+    #[tokio::test]
+    async fn native_grouped_findr_character_repeats_append_query_text() {
+        let (mut app, pane_id, _pane_info) = app_with_plain_scrollback(64);
+        app.state.mode = Mode::Findr;
+        app.state.findr = Some(crate::app::state::FindrState::new(pane_id));
+        let key = TerminalKey::new(KeyCode::Char('a'), KeyModifiers::empty()).with_windows_record(
+            crate::input::WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 3,
+                virtual_key_code: 0x41,
+                virtual_scan_code: 0x1e,
+                unicode: 'a' as u16,
+                control_key_state: 0,
+            },
+        );
+
+        app.handle_raw_input_event(crate::raw_input::RawInputEvent::Key(key))
+            .await;
+
+        assert_eq!(app.state.findr.as_ref().unwrap().query, "aaa");
     }
 
     #[tokio::test]

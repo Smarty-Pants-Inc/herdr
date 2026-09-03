@@ -1,13 +1,20 @@
+#[cfg(test)]
+use parking_lot::{Mutex, MutexGuard};
 use std::io;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::LazyLock;
 
 use portable_pty::CommandBuilder;
 
 pub(crate) const HERDR_PANE_ID_ENV_VAR: &str = "HERDR_PANE_ID";
 pub(crate) const HERDR_TAB_ID_ENV_VAR: &str = "HERDR_TAB_ID";
 pub(crate) const HERDR_WORKSPACE_ID_ENV_VAR: &str = "HERDR_WORKSPACE_ID";
+pub(crate) const HERDR_OMP_BRIDGE_ENV_VARS: [&str; 3] = [
+    "HERDR_OMP_BRIDGE",
+    "HERDR_OMP_BRIDGE_TOKEN",
+    "HERDR_OMP_GUEST_BRIDGE_TOKEN",
+];
 
 pub(crate) const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 pub(crate) const OMP_CONFIG_DIR_ENV_VAR: &str = "PI_CONFIG_DIR";
@@ -216,6 +223,6 @@ pub(crate) fn home_dir() -> io::Result<PathBuf> {
 
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
+    LOCK.lock()
 }

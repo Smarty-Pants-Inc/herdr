@@ -678,12 +678,26 @@ fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a s
     let index = cell.hyperlink? as usize;
     frame.hyperlinks.get(index).map(String::as_str)
 }
+pub(crate) fn frame_has_hyperlink_at(frame: &FrameData, column: u16, row: u16) -> bool {
+    if column >= frame.width || row >= frame.height {
+        return false;
+    }
+    let index = (row as usize)
+        .saturating_mul(frame.width as usize)
+        .saturating_add(column as usize);
+    frame
+        .cells
+        .get(index)
+        .and_then(|cell| cell_hyperlink_uri(frame, cell))
+        .is_some_and(|uri| crate::app::actions::safe_osc8_url(uri).is_some())
+}
+
+fn is_hyperlink_char(ch: char) -> bool {
+    ch != '\x1b' && ch != '\x07' && !ch.is_control()
+}
 
 fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
-    let sanitized: String = uri
-        .chars()
-        .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
-        .collect();
+    let sanitized: String = uri.chars().filter(|ch| is_hyperlink_char(*ch)).collect();
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
@@ -862,6 +876,7 @@ mod tests {
             cursor: None,
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         }
     }
 
@@ -1060,6 +1075,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut changed = visible.clone();
         changed.cells[0] = make_cell("B", 0, 0, 0);
@@ -1127,6 +1143,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1167,6 +1184,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1207,6 +1225,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let drawn = frame_with_drawn_cursor(frame.clone());
 
@@ -1244,6 +1263,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         assert_eq!(frame_with_drawn_cursor(frame.clone()), frame);
@@ -1263,6 +1283,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1310,6 +1331,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let hidden = FrameData {
             cells: vec![make_cell("B", 0, 0, 0); 9],
@@ -1323,6 +1345,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut last_visible_cursor = None;
         let mut last_cursor_shape = 0;
@@ -1379,6 +1402,34 @@ mod tests {
         assert!(output_str.contains("\x1b]8;;https://example.com\x1b\\L"));
         assert!(output_str.contains('i'));
         assert!(output_str.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn hyperlink_hit_testing_accepts_clean_osc8_handler_urls() {
+        for uri in [
+            "https://example.com/docs",
+            "http://example.com/docs",
+            "file:///tmp/report.md?line=7",
+            "file://localhost/tmp/report.md?line=7",
+            "file://attacker/share/report.md",
+            "local://repo/src/main.rs",
+            "memory://artifact/report.md",
+            "mailto:hello@example.com",
+        ] {
+            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
+            frame.hyperlinks.push(uri.to_owned());
+            assert!(frame_has_hyperlink_at(&frame, 0, 0), "rejected {uri}");
+        }
+
+        for uri in [
+            "",
+            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
+            "file:///tmp/report.md\0forged",
+        ] {
+            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
+            frame.hyperlinks.push(uri.to_owned());
+            assert!(!frame_has_hyperlink_at(&frame, 0, 0), "accepted {uri:?}");
+        }
     }
 
     #[test]
@@ -1558,6 +1609,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1584,6 +1636,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1599,6 +1652,7 @@ mod tests {
     #[test]
     fn blit_frame_no_cursor_hides_cursor() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1632,6 +1686,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1654,6 +1709,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1683,6 +1739,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let mut curr = prev.clone();
         curr.cells[0] = make_cell("B", 0, 0, 0);
@@ -1723,8 +1780,10 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let hidden = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0); 9],
             width: 3,
             height: 3,
@@ -1767,6 +1826,7 @@ mod tests {
     #[test]
     fn blit_frame_parks_hidden_cursor_at_bottom_right_without_history() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0); 6],
             width: 3,
             height: 2,
@@ -1808,8 +1868,10 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            omp_renderer: None,
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1830,6 +1892,7 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_wide_graphemes() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1854,6 +1917,7 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_halfwidth_voiced_kana() {
         let frame = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -1878,6 +1942,7 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_wide_graphemes() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1890,6 +1955,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1916,6 +1982,7 @@ mod tests {
     #[test]
     fn diff_redraw_skips_new_trailing_cells_covered_by_wide_graphemes() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell("B", 0, 0, 0),
@@ -1928,6 +1995,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1951,6 +2019,7 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_halfwidth_voiced_kana() {
         let prev = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -1963,6 +2032,7 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
+            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),

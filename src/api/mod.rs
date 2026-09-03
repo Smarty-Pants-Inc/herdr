@@ -41,6 +41,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabMove(_)
             | Method::TabClose(_)
             | Method::LayoutApply(_)
+            | Method::LayoutApplyIdempotent(_)
+            | Method::LayoutReconcileIdempotent(_)
             | Method::LayoutSetSplitRatio(_)
             | Method::AgentRename(_)
             | Method::AgentViewSet(_)
@@ -81,8 +83,18 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
     )
 }
 
+/// Best-effort origin metadata carried alongside an API request.
+///
+/// This is transport-local context, not part of the JSON request schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ApiRequestContext {
+    pub(crate) local_peer_pid: Option<u32>,
+}
+
 pub struct ApiRequestMessage {
     pub request: Request,
+    pub(crate) context: ApiRequestContext,
+
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,

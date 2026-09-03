@@ -87,7 +87,7 @@ impl App {
             self.sync_prefix_input_source(previous_mode);
             return changed | deferred_changed;
         }
-        let response = self.handle_api_request(msg.request);
+        let response = self.handle_api_request_with_context(msg.request, msg.context);
         if let (Some(params), Some(active)) = (stream_open.as_ref(), stream_active) {
             self.attach_pane_graphics_stream_active(params, active, &response);
         }
@@ -190,7 +190,15 @@ impl App {
                 match key.kind {
                     crossterm::event::KeyEventKind::Press => {
                         let initial_context = self.terminal_input_context();
-                        let target = self.handle_key(key.clone()).await;
+                        let target = if matches!(
+                            initial_context,
+                            Some(super::TerminalInputContext::Findr(_))
+                        ) {
+                            self.handle_findr_key(key.clone());
+                            None
+                        } else {
+                            self.handle_key(key.clone()).await
+                        };
                         let resulting_context = self.terminal_input_context();
                         let plan = self.input_leases.complete_press(
                             lease_key,
@@ -232,13 +240,21 @@ impl App {
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
                 let changes_view = !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved)
                     || self.state.mode.mouse_motion_changes_view();
-                if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                    self.handle_mouse(mouse);
+                if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::ScrollUp
+                        | crossterm::event::MouseEventKind::ScrollDown
+                ) {
+                    self.request_scroll_render();
+                }
+                let hover_changed = if self.state.popup_pane.is_some() || self.state.mouse_capture {
+                    self.handle_mouse(mouse)
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
-                }
-                changes_view
+                    false
+                };
+                changes_view || hover_changed
             }
             crate::raw_input::RawInputEvent::OuterFocusGained => {
                 #[cfg(not(windows))]
@@ -335,6 +351,7 @@ impl App {
             let panes = self.state.reconcile_managed_agents_at(now);
             if !panes.is_empty() {
                 for (ws_idx, pane_id) in panes {
+                    self.sync_managed_agent_detection_hint(ws_idx, pane_id);
                     self.emit_pane_updated(ws_idx, pane_id);
                 }
                 self.schedule_session_save();
@@ -360,6 +377,7 @@ impl App {
         }
 
         changed |= self.clear_due_selection_highlight(now);
+        changed |= self.tick_findr_scan(now);
 
         self.start_git_status_refresh_if_due(now);
 
@@ -388,10 +406,11 @@ impl App {
         changed |= self.handle_tab_bar_status_tasks(now);
 
         if geometry_dirty || resized {
-            self.pending_agent_resume_deadline = None;
+            self.pending_agent_resume_retry_at = None;
         } else {
-            self.sync_pending_agent_resume_deadline(now);
-            changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
+            self.sync_pending_agent_resume_retry_at(now);
+            changed |=
+                self.start_pending_agent_resumes(now, self.pending_agent_resume_retry_due(now));
         }
         changed
     }
@@ -527,9 +546,21 @@ impl App {
         self.selection_autoscroll_deadline = None;
     }
 
+    pub(super) fn request_scroll_render(&mut self) {
+        self.scroll_render_pending = true;
+    }
+
+    fn render_interval(&self) -> std::time::Duration {
+        if self.scroll_render_pending {
+            super::SCROLL_RENDER_INTERVAL
+        } else {
+            MIN_RENDER_INTERVAL
+        }
+    }
+
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
-            Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,
+            Some(last_render_at) => now.duration_since(last_render_at) >= self.render_interval(),
             None => true,
         }
     }
@@ -545,6 +576,7 @@ impl App {
 
     pub(crate) fn record_render_attempt(&mut self, now: Instant, presentation: bool) {
         self.last_render_at = Some(now);
+        self.scroll_render_pending = false;
         if presentation {
             self.last_presentation_at = Some(now);
         }
@@ -604,7 +636,7 @@ impl App {
     ) -> Option<Instant> {
         let render_deadline = if needs_render {
             self.last_render_at
-                .map(|last_render_at| last_render_at + MIN_RENDER_INTERVAL)
+                .map(|last_render_at| last_render_at + self.render_interval())
                 .filter(|deadline| *deadline > now)
         } else {
             None
@@ -623,9 +655,10 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
-            self.pending_agent_resume_deadline,
+            self.next_pending_agent_resume_deadline(),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
+            self.findr_scan_deadline,
             self.selection_highlight_clear_deadline,
             self.next_tab_bar_status_deadline(),
             render_deadline,
@@ -963,7 +996,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
         });
-        app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
+        app.pending_agent_resume_retry_at = Some(Instant::now() - Duration::from_millis(1));
 
         assert!(!app.handle_scheduled_tasks(Instant::now(), true));
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -974,6 +1007,39 @@ mod tests {
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
             .is_some());
-        assert!(app.pending_agent_resume_deadline.is_none());
+        assert!(app.pending_agent_resume_retry_at.is_none());
+    }
+    #[test]
+    fn wheel_input_uses_fast_render_cadence_once() {
+        let (mut app, _) = test_app_with_pane();
+        let rendered_at = Instant::now();
+        app.last_render_at = Some(rendered_at);
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::ScrollUp,
+                    column: 10,
+                    row: 5,
+                    modifiers: crossterm::event::KeyModifiers::empty(),
+                },
+            )],
+            true,
+        );
+
+        assert!(!app.can_render_now(rendered_at + Duration::from_millis(7)));
+        assert!(app.can_render_now(rendered_at + Duration::from_millis(8)));
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(
+                rendered_at + Duration::from_millis(1),
+                true,
+                false,
+            ),
+            Some(rendered_at + Duration::from_millis(8))
+        );
+
+        app.record_render_attempt(rendered_at + Duration::from_millis(8), true);
+        assert!(!app.can_render_now(rendered_at + MIN_RENDER_INTERVAL));
+        assert!(app.can_render_now(rendered_at + Duration::from_millis(8) + MIN_RENDER_INTERVAL));
     }
 }

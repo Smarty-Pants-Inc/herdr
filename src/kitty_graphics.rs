@@ -91,6 +91,14 @@ enum HostSourceKey {
     PaneLayer { pane_id: PaneId, layer_id: String },
 }
 
+impl HostSourceKey {
+    fn pane_id(&self) -> PaneId {
+        match self {
+            Self::Terminal { pane_id, .. } | Self::PaneLayer { pane_id, .. } => *pane_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct ImageSignature {
     image_width: u32,
@@ -172,6 +180,7 @@ pub(crate) fn paint_local_pane_graphics(
             app.view.tab_surface(),
             cell_size,
             None,
+            None,
             &mut cache,
         );
         drop(cache);
@@ -194,6 +203,7 @@ pub(crate) fn paint_local_pane_graphics(
             app.view.tab_surface(),
             cell_size,
             None,
+            None,
             &mut cache,
         );
         if !encoded.bytes.is_empty() {
@@ -213,12 +223,238 @@ pub(crate) struct EncodedGraphics {
     pub(crate) incomplete: bool,
 }
 
+#[cfg(any(unix, test))]
+pub(crate) struct KittyPlacementReplay {
+    terminal: crate::ghostty::Terminal,
+    size: (u16, u16, u32, u32),
+    external_images: HashSet<u32>,
+    external_placements: HashMap<(u32, u32), Vec<u8>>,
+}
+
+#[cfg(any(unix, test))]
+impl KittyPlacementReplay {
+    pub(crate) fn new(size: (u16, u16, u32, u32)) -> Option<Self> {
+        let mut terminal = crate::ghostty::Terminal::new(size.0.max(1), size.1.max(1), 0).ok()?;
+        terminal.enable_kitty_graphics().ok()?;
+        let mut replay = Self {
+            terminal,
+            size: (0, 0, 0, 0),
+            external_images: HashSet::new(),
+            external_placements: HashMap::new(),
+        };
+        replay.resize(size)?;
+        Some(replay)
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8], size: (u16, u16, u32, u32)) -> Option<Vec<u8>> {
+        self.resize(size)?;
+        self.update_external_placements(bytes);
+        self.terminal.write(bytes);
+        self.snapshot()
+    }
+
+    pub(crate) fn register_external_file(
+        &mut self,
+        image_id: u32,
+        leading: &[u8],
+        control: &str,
+        size: (u16, u16, u32, u32),
+    ) -> Option<Vec<u8>> {
+        self.resize(size)?;
+        self.external_images.insert(image_id);
+        if let Some(display) = direct_control_display_command(leading, control, image_id) {
+            self.update_external_placements(&display);
+        }
+        self.snapshot()
+    }
+
+    pub(crate) fn retire_external_file(&mut self, image_id: u32) -> Option<Vec<u8>> {
+        self.external_images.remove(&image_id);
+        self.external_placements
+            .retain(|(placed_image_id, _), _| *placed_image_id != image_id);
+        self.snapshot()
+    }
+
+    fn update_external_placements(&mut self, bytes: &[u8]) {
+        let mut cursor = 0;
+        let mut previous_end = 0;
+        while let Some(relative_start) = bytes[cursor..]
+            .windows(3)
+            .position(|window| window == b"\x1b_G")
+        {
+            let start = cursor + relative_start;
+            let command_body = start + 3;
+            let Some(relative_end) = bytes[command_body..]
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+            else {
+                break;
+            };
+            let end = command_body + relative_end + 2;
+            let header_end = bytes[command_body..end]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map(|offset| command_body + offset)
+                .unwrap_or(end - 2);
+            let header = &bytes[command_body..header_end];
+            let action = kitty_control_value(header, b"a");
+            let image_id = kitty_control_value(header, b"i")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| value.parse::<u32>().ok());
+            if let Some(image_id) = image_id.filter(|id| self.external_images.contains(id)) {
+                if matches!(action, Some(b"t" | b"T")) {
+                    self.external_images.remove(&image_id);
+                    self.external_placements
+                        .retain(|(placed_image_id, _), _| *placed_image_id != image_id);
+                }
+                match action {
+                    Some(b"p") => {
+                        let placement_id = kitty_control_value(header, b"p")
+                            .and_then(|value| std::str::from_utf8(value).ok())
+                            .and_then(|value| value.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        let leading = last_graphics_cursor(&bytes[previous_end..start]);
+                        let mut command = Vec::with_capacity(leading.len() + end - start);
+                        command.extend_from_slice(leading);
+                        command.extend_from_slice(&bytes[start..end]);
+                        self.external_placements
+                            .insert((image_id, placement_id), command);
+                    }
+                    Some(b"d") => match kitty_control_value(header, b"d") {
+                        Some(b"I") => {
+                            self.external_images.remove(&image_id);
+                            self.external_placements
+                                .retain(|(placed_image_id, _), _| *placed_image_id != image_id);
+                        }
+                        Some(b"i") => {
+                            if let Some(placement_id) = kitty_control_value(header, b"p")
+                                .and_then(|value| std::str::from_utf8(value).ok())
+                                .and_then(|value| value.parse::<u32>().ok())
+                            {
+                                self.external_placements.remove(&(image_id, placement_id));
+                            } else {
+                                self.external_placements
+                                    .retain(|(placed_image_id, _), _| *placed_image_id != image_id);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            previous_end = end;
+            cursor = end;
+        }
+    }
+
+    fn resize(&mut self, size: (u16, u16, u32, u32)) -> Option<()> {
+        if self.size == size {
+            return Some(());
+        }
+        self.terminal
+            .resize(size.0.max(1), size.1.max(1), size.2.max(1), size.3.max(1))
+            .ok()?;
+        self.size = size;
+        Some(())
+    }
+
+    fn snapshot(&self) -> Option<Vec<u8>> {
+        let placements = self
+            .terminal
+            .kitty_image_placements_with_data_filter(|_| false)
+            .ok()?;
+        let pane_id = PaneId::from_raw(1);
+        let area = Rect::new(0, 0, self.size.0, self.size.1);
+        let cell_size = HostCellSize {
+            width_px: self.size.2.max(1),
+            height_px: self.size.3.max(1),
+        };
+        let mut bytes = Vec::new();
+        for placement in placements {
+            let image_id = placement.image_id;
+            let placement_id = placement.placement_id;
+            let z = placement.z;
+            let host = HostPlacement {
+                pane_id,
+                host_image_id: Some(image_id),
+                area,
+                cell_size,
+                source_key: HostSourceKey::Terminal { pane_id, image_id },
+                placement,
+                scrollback_offset: 0,
+            };
+            if let Some((clipped, _)) = clipped_placement(&host) {
+                encode_display_placement(&mut bytes, clipped, image_id, placement_id, z);
+            }
+        }
+        let mut external = self.external_placements.iter().collect::<Vec<_>>();
+        external.sort_by_key(|(key, _)| **key);
+        for (_, placement) in external {
+            bytes.extend_from_slice(placement);
+        }
+        Some(bytes)
+    }
+}
+
+#[cfg(any(unix, test))]
+fn kitty_control_value<'a>(header: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    header.split(|byte| *byte == b',').find_map(|field| {
+        let equals = field.iter().position(|byte| *byte == b'=')?;
+        (field.get(..equals) == Some(key)).then(|| &field[equals + 1..])
+    })
+}
+
+#[cfg(any(unix, test))]
+fn last_graphics_cursor(segment: &[u8]) -> &[u8] {
+    let Some(start) = segment.windows(2).rposition(|window| window == b"\x1b[") else {
+        return &[];
+    };
+    let candidate = &segment[start..];
+    if candidate.ends_with(b"H") {
+        candidate
+    } else {
+        &[]
+    }
+}
+
+#[cfg(any(unix, test))]
+fn direct_control_display_command(leading: &[u8], control: &str, image_id: u32) -> Option<Vec<u8>> {
+    let header = control.as_bytes();
+    if kitty_control_value(header, b"a") != Some(b"T")
+        || kitty_control_value(header, b"i")? != image_id.to_string().as_bytes()
+        || kitty_control_value(header, b"p").is_none()
+    {
+        return None;
+    }
+    let mut display = String::from("a=p");
+    for field in header.split(|byte| *byte == b',') {
+        let Some(equals) = field.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let name = &field[..equals];
+        if matches!(
+            name,
+            b"i" | b"p" | b"c" | b"r" | b"z" | b"C" | b"x" | b"y" | b"w" | b"h" | b"X" | b"Y"
+        ) {
+            display.push(',');
+            display.push_str(std::str::from_utf8(field).ok()?);
+        }
+    }
+    display.push_str(",q=2");
+    let mut bytes = Vec::with_capacity(leading.len() + display.len() + 7);
+    bytes.extend_from_slice(leading);
+    bytes.extend_from_slice(b"\x1b_G");
+    bytes.extend_from_slice(display.as_bytes());
+    bytes.extend_from_slice(b";\x1b\\");
+    Some(bytes)
+}
 pub(crate) fn encode_local_pane_graphics(
     app: &AppState,
     graphics: &crate::app::pane_graphics::Runtime,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
+    excluded_pane: Option<PaneId>,
     transaction_budget: Option<usize>,
     cache: &mut HostGraphicsCache,
 ) -> EncodedGraphics {
@@ -241,6 +477,7 @@ pub(crate) fn encode_local_pane_graphics(
             terminal_runtimes,
             surface,
             cell_size,
+            excluded_pane,
             &cache.images,
             &cache.oversized,
         );
@@ -270,6 +507,7 @@ pub(crate) fn encode_local_pane_graphics(
             terminal_runtimes,
             surface,
             cell_size,
+            excluded_pane,
             &cache.images,
             &cache.oversized,
         )
@@ -911,6 +1149,43 @@ impl HostGraphicsCache {
         bytes
     }
 
+    pub(crate) fn clear_pane_bytes(&mut self, pane_id: PaneId) -> Vec<u8> {
+        let pane_sources = self
+            .sources
+            .keys()
+            .filter(|source| source.pane_id() == pane_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_images = HashSet::new();
+        for source in pane_sources {
+            if let Some(image_id) = self.sources.remove(&source) {
+                removed_images.insert(image_id);
+            }
+            self.oversized.remove(&source);
+        }
+        self.oversized
+            .retain(|source, _| source.pane_id() != pane_id);
+
+        let mut bytes = Vec::new();
+        for image_id in removed_images {
+            if self.sources.values().any(|id| *id == image_id) {
+                continue;
+            }
+            encode_delete_image(&mut bytes, image_id);
+            self.images.remove(&image_id);
+            self.placements.retain(|(id, _), _| *id != image_id);
+            self.replayed_placements.retain(|(id, _)| *id != image_id);
+        }
+        if self
+            .continuation
+            .as_ref()
+            .is_some_and(|(source, _, _)| source.pane_id() == pane_id)
+        {
+            self.continuation = None;
+        }
+        bytes
+    }
+
     fn has_pane_sources(&self) -> bool {
         self.sources
             .keys()
@@ -984,6 +1259,13 @@ impl HostGraphicsCache {
     #[cfg(test)]
     pub(crate) fn test_image_count(&self) -> usize {
         self.images.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_has_pane_source(&self, pane_id: PaneId) -> bool {
+        self.sources
+            .keys()
+            .any(|source| source.pane_id() == pane_id)
     }
 
     #[cfg(test)]
@@ -1064,6 +1346,7 @@ fn collect_visible_placements(
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
+    excluded_pane: Option<PaneId>,
     uploaded_images: &HashMap<u32, ImageSignature>,
     oversized_images: &HashMap<HostSourceKey, ImageSignature>,
 ) -> Vec<HostPlacement> {
@@ -1092,6 +1375,9 @@ fn collect_visible_placements(
     );
     let mut placements = Vec::new();
     for info in surface.pane_infos {
+        if excluded_pane == Some(info.id) {
+            continue;
+        }
         let mut pane_layers = graphics
             .slots
             .iter()
@@ -1308,9 +1594,13 @@ pub(crate) fn prepare_direct_file(
     let layer = slot.layer.as_ref()?;
     layer.direct_lease()?;
 
-    let info = allow_placement
-        .then(|| surface.pane_infos.iter().find(|info| info.id == key.0))
-        .flatten()
+    if !allow_placement {
+        return Some(direct_file_upload_command(layer, slot.host_image_id));
+    }
+    let info = surface
+        .pane_infos
+        .iter()
+        .find(|info| info.id == key.0)
         .filter(|_| app.mode == Mode::Terminal && cell_size.is_known() && app.active.is_some());
     if let Some(command) = info
         .map(|info| {
@@ -1389,7 +1679,7 @@ pub(crate) fn encode_kitty_regular_file(
     out.extend_from_slice(b"\x1b8");
 }
 
-fn encode_delete_image(out: &mut Vec<u8>, id: u32) {
+pub(crate) fn encode_delete_image(out: &mut Vec<u8>, id: u32) {
     let _ = write!(out, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\");
 }
 
@@ -1720,6 +2010,116 @@ mod tests {
             }
         );
         assert!(!HostCellSize::fallback_for_area(Rect::default()).is_known());
+    }
+
+    #[test]
+    fn placement_replay_tracks_sibling_transactions_moves_and_deletes() {
+        let size = (20, 10, 10, 20);
+        let mut replay = KittyPlacementReplay::new(size).unwrap();
+        let first = replay
+            .update(
+                b"\x1b_Ga=t,t=d,f=32,s=1,v=1,i=41,q=2,m=0;/wAA/w==\x1b\\\x1b[2;3H\x1b_Ga=p,i=41,p=6,c=1,r=1,z=0,C=1,q=2;\x1b\\",
+                size,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("a=p,i=41,p=6"));
+        assert!(!String::from_utf8_lossy(&first).contains("a=t"));
+
+        let siblings = replay
+            .update(
+                b"\x1b[4;5H\x1b_Ga=T,t=d,f=32,s=1,v=1,i=42,p=7,c=1,r=1,z=-1,C=1,q=2,m=0;AAAAAA==\x1b\\",
+                size,
+            )
+            .unwrap();
+        let siblings = String::from_utf8_lossy(&siblings);
+        assert!(siblings.contains("a=p,i=41,p=6"), "{siblings:?}");
+        assert!(siblings.contains("a=p,i=42,p=7"), "{siblings:?}");
+
+        let moved = replay
+            .update(
+                b"\x1b_Ga=d,d=i,i=41,p=6,q=2;\x1b\\\x1b[5;6H\x1b_Ga=p,i=41,p=6,c=1,r=1,z=0,C=1,q=2;\x1b\\",
+                size,
+            )
+            .unwrap();
+        let moved = String::from_utf8_lossy(&moved);
+        assert!(moved.contains("\x1b[5;6H"), "{moved:?}");
+        assert!(moved.contains("a=p,i=42,p=7"), "{moved:?}");
+
+        let deleted = replay
+            .update(b"\x1b_Ga=d,d=i,i=41,p=6,q=2;\x1b\\", size)
+            .unwrap();
+        let deleted = String::from_utf8_lossy(&deleted);
+        assert!(!deleted.contains("i=41"), "{deleted:?}");
+        assert!(deleted.contains("a=p,i=42,p=7"), "{deleted:?}");
+    }
+
+    #[test]
+    fn placement_replay_tracks_external_direct_files_without_loading_pixels() {
+        let size = (20, 10, 10, 20);
+        let mut replay = KittyPlacementReplay::new(size).unwrap();
+        let uploaded = replay
+            .register_external_file(77, &[], "a=t,f=32,s=2048,v=2049,i=77,q=0", size)
+            .unwrap();
+        assert!(uploaded.is_empty());
+
+        let placed = replay
+            .update(
+                b"\x1b[3;4H\x1b_Ga=p,i=77,p=9,c=4,r=5,z=1,C=1,q=2;\x1b\\",
+                size,
+            )
+            .unwrap();
+        let placed = String::from_utf8(placed).unwrap();
+        assert!(placed.contains("\x1b[3;4H"), "{placed:?}");
+        assert!(placed.contains("a=p,i=77,p=9"), "{placed:?}");
+
+        let resized = String::from_utf8(replay.update(&[], (21, 10, 10, 20)).unwrap()).unwrap();
+        assert!(resized.contains("a=p,i=77,p=9"), "{resized:?}");
+
+        let retired = replay.retire_external_file(77).unwrap();
+        assert!(!String::from_utf8_lossy(&retired).contains("i=77"));
+    }
+
+    #[test]
+    fn placement_replay_retires_external_placement_before_inline_replacement() {
+        let size = (20, 10, 10, 20);
+        let mut replay = KittyPlacementReplay::new(size).unwrap();
+        replay
+            .register_external_file(77, &[], "a=t,f=32,s=1,v=1,i=77,q=0", size)
+            .unwrap();
+        replay
+            .update(b"\x1b[3;4H\x1b_Ga=p,i=77,p=9,c=1,r=1,C=1,q=2;\x1b\\", size)
+            .unwrap();
+        assert!(replay.external_images.contains(&77));
+        assert!(replay.external_placements.contains_key(&(77, 9)));
+
+        replay
+            .update(b"\x1b_Ga=t,f=32,s=1,v=1,i=77,q=2;AAAAAA==\x1b\\", size)
+            .unwrap();
+
+        assert!(!replay.external_images.contains(&77));
+        assert!(!replay
+            .external_placements
+            .keys()
+            .any(|(image_id, _)| *image_id == 77));
+    }
+
+    #[test]
+    fn placement_replay_converts_direct_transmit_and_display_to_display_only() {
+        let size = (20, 10, 10, 20);
+        let mut replay = KittyPlacementReplay::new(size).unwrap();
+        let replayed = replay
+            .register_external_file(
+                78,
+                b"\x1b[6;7H",
+                "a=T,f=32,s=10,v=20,i=78,p=11,c=2,r=3,z=-1,C=1,q=0,x=1,w=8,h=9",
+                size,
+            )
+            .unwrap();
+        let replayed = String::from_utf8(replayed).unwrap();
+        assert!(replayed.contains("\x1b[6;7H"), "{replayed:?}");
+        assert!(replayed.contains("a=p,i=78,p=11"), "{replayed:?}");
+        assert!(!replayed.contains("a=T"), "{replayed:?}");
+        assert!(!replayed.contains("s=10"), "{replayed:?}");
     }
 
     fn test_placement(viewport_col: i32, viewport_row: i32) -> HostPlacement {
@@ -3115,6 +3515,7 @@ mod tests {
                 width_px: 10,
                 height_px: 20,
             },
+            None,
             Some(HEADLESS_GRAPHICS_TRANSACTION_BUDGET),
             &mut cache,
         );

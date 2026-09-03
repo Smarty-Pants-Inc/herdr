@@ -334,7 +334,7 @@ fn navigate_q_detaches_client_and_server_persists() {
     // The client should receive a ServerShutdown with reason "detached"
     // shortly after the quit/detach key. There may be some frames in
     // between from the mode change, so we read multiple messages.
-    let got_shutdown = wait_for_message_variant(&mut stream, Duration::from_secs(2), 2)
+    let got_shutdown = wait_for_message_variant(&mut stream, Duration::from_secs(2), 5)
         .expect("wait for shutdown message")
         || wait_for_disconnect(&mut stream, Duration::from_secs(1)).expect("wait for disconnect");
     assert!(
@@ -482,7 +482,7 @@ fn reattach_after_detach_shows_current_state() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream_b) {
             Ok((variant, _payload)) => {
-                if variant == 1 {
+                if variant == 2 {
                     // ServerMessage::Frame
                     received_frame = true;
                     break;
@@ -594,7 +594,7 @@ fn processes_survive_during_and_after_detach() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream_b) {
             Ok((variant, _)) => {
-                if variant == 1 {
+                if variant == 2 {
                     received_frame = true;
                     break;
                 }
@@ -928,7 +928,7 @@ fn output_accumulated_while_detached_visible_on_reattach() {
     while Instant::now() < deadline {
         match read_server_message(&mut stream_b) {
             Ok((variant, _)) => {
-                if variant == 1 {
+                if variant == 2 {
                     received_frame = true;
                     break;
                 }
