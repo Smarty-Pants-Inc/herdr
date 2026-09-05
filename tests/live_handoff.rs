@@ -17,6 +17,8 @@ use support::{
     cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_herdr_pid,
     send_input, unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_socket,
 };
+const TEST_HANDOFF_OWNER_PID_ENV: &str = "HERDR_TEST_HANDOFF_OWNER_PID";
+
 fn fresh_omp_maintenance_owner() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("generate maintenance test capability");
@@ -95,6 +97,22 @@ fn spawn_server_with_env(
     api_socket: &Path,
     extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
+    spawn_server_with_env_and_owner(
+        config_home,
+        runtime_dir,
+        api_socket,
+        std::process::id(),
+        extra_env,
+    )
+}
+
+fn spawn_server_with_env_and_owner(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    owner_pid: u32,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -116,6 +134,7 @@ fn spawn_server_with_env(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, owner_pid.to_string());
     cmd.env(
         "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
         runtime_dir.join("maintenance-state"),
@@ -268,6 +287,7 @@ fn spawn_named_session_server(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env(
         "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
         runtime_dir.join("maintenance-state"),
@@ -307,6 +327,7 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env(
         "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
         runtime_dir.join("maintenance-state"),
@@ -356,6 +377,7 @@ fn spawn_server_with_args_and_socket_env(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env(
         "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
         runtime_dir.join("maintenance-state"),
@@ -685,6 +707,67 @@ fn wait_for_http_contains(port: u16, needle: &str, timeout: Duration) -> String 
     panic!(
         "http server on port {port} did not return {needle:?}; last response was {last_response:?}"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_import_exits_when_its_test_owner_dies() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let mut owner = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn separate live-handoff test owner");
+
+    let spawned =
+        spawn_server_with_env_and_owner(&config_home, &runtime_dir, &api_socket, owner.id(), &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let source_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    // A successful API response requires the importer to connect with the
+    // one-time token, validate the manifest, and acknowledge state ownership.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:owner-watchdog","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, source_pid, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert!(
+        support::herdr_server_pids_for_runtime_dir(&runtime_dir)
+            .expect("enumerate imported test server")
+            .contains(&replacement_pid),
+        "replacement server should be live before its owner exits"
+    );
+
+    owner
+        .kill()
+        .expect("terminate separate live-handoff test owner");
+    owner.wait().expect("reap separate live-handoff test owner");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remaining = Vec::new();
+    while Instant::now() < deadline {
+        remaining = support::herdr_server_pids_for_runtime_dir(&runtime_dir)
+            .expect("enumerate imported test server after owner exit");
+        if remaining.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        remaining.is_empty(),
+        "imported test server survived owner exit: {remaining:?}"
+    );
+
+    drop(spawned);
+    cleanup_test_base(&base);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
