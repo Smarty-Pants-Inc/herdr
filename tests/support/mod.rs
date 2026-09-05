@@ -13,6 +13,7 @@ static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
+#[cfg(target_os = "linux")]
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
 pub const CURRENT_PROTOCOL: u32 = 27;
@@ -62,7 +63,7 @@ pub fn unregister_runtime_dir(path: &Path) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {
@@ -411,6 +412,7 @@ pub fn cleanup_registered_herdr_pids() {
 fn ensure_cleanup_hooks() {
     INIT.call_once(|| {
         let _ = cleanup_servers_with_missing_runtime_dir();
+        #[cfg(target_os = "linux")]
         start_global_watchdog();
 
         let _ = CLEANUP_GUARD.set(CleanupGuard);
@@ -472,6 +474,7 @@ fn should_terminate_runtime_dir(
     !runtime_dir_owner_alive(runtime_dir)
 }
 
+#[cfg(target_os = "linux")]
 fn start_global_watchdog() {
     thread::spawn(|| loop {
         thread::sleep(WATCHDOG_SCAN_INTERVAL);
@@ -525,6 +528,7 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
     let mut pids = Vec::new();
@@ -554,8 +558,39 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     Ok(pids)
 }
 
+#[cfg(target_os = "macos")]
+fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
+    let binary = current_checkout_root().join("target/debug/herdr");
+    let pattern = binary
+        .to_str()
+        .ok_or_else(|| std::io::Error::other("test Herdr binary path is not UTF-8"))?;
+    let pattern = regex::escape(pattern);
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", &pattern])
+        .output()?;
+    if !output.status.success() {
+        return if output.status.code() == Some(1) {
+            Ok(Vec::new())
+        } else {
+            Err(std::io::Error::other(
+                "pgrep failed to enumerate test Herdr servers",
+            ))
+        };
+    }
+
+    let own_pid = std::process::id();
+    let mut pids = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != own_pid && is_test_herdr_server_process(*pid))
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
 fn is_test_herdr_server_process(pid: u32) -> bool {
-    let Some(exe_path) = proc_link_target(pid, "exe") else {
+    let Some(exe_path) = process_executable(pid) else {
         return false;
     };
 
@@ -570,10 +605,26 @@ fn is_test_herdr_server_process(pid: u32) -> bool {
     cmdline.iter().any(|arg| arg == "server")
 }
 
-fn proc_link_target(pid: u32, link: &str) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/{link}")).ok()
+#[cfg(target_os = "linux")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+}
+
+#[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     let cmdline = fs::read(format!("/proc/{pid}/cmdline"))?;
     Ok(cmdline
@@ -583,6 +634,23 @@ fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "ps failed to read test Herdr command line",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
 fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
     let environ = fs::read(format!("/proc/{pid}/environ"))?;
 
@@ -604,6 +672,22 @@ fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
     }
 
     Ok(socket_path.and_then(|path| path.parent().map(Path::to_path_buf)))
+}
+
+#[cfg(target_os = "macos")]
+fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
+    Ok(handoff_runtime_dir_from_cmdline(&read_cmdline(pid)?))
+}
+
+fn handoff_runtime_dir_from_cmdline(cmdline: &[String]) -> Option<PathBuf> {
+    let socket_path = cmdline
+        .windows(2)
+        .find(|pair| pair[0] == "--handoff-import")
+        .map(|pair| Path::new(&pair[1]))?;
+    let config_home = socket_path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "config"))?;
+    Some(config_home.parent()?.join("runtime"))
 }
 
 fn runtime_dir_owner_alive(runtime_dir: &Path) -> bool {
@@ -761,5 +845,31 @@ mod tests {
             !is_test_herdr_binary(Path::new("/home/can/.local/bin/herdr")),
             "installed binaries must not be considered test-owned"
         );
+    }
+
+    #[test]
+    fn handoff_command_maps_to_sibling_runtime_dir() {
+        let cmdline = vec![
+            current_checkout_root()
+                .join("target/debug/herdr")
+                .display()
+                .to_string(),
+            "server".to_owned(),
+            "--handoff-import".to_owned(),
+            "/tmp/hlh-42/config/herdr/sessions/work/herdr-handoff-7.sock".to_owned(),
+            "token".to_owned(),
+        ];
+
+        assert_eq!(
+            handoff_runtime_dir_from_cmdline(&cmdline),
+            Some(PathBuf::from("/tmp/hlh-42/runtime"))
+        );
+    }
+
+    #[test]
+    fn non_handoff_command_has_no_derived_runtime_dir() {
+        let cmdline = vec!["herdr".to_owned(), "server".to_owned()];
+
+        assert_eq!(handoff_runtime_dir_from_cmdline(&cmdline), None);
     }
 }
