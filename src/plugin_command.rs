@@ -44,7 +44,30 @@ const EXECUTION_PROVIDER_INHERITED_ENV_REMOVALS: &[&str] = &[
     crate::integration::HERDR_PANE_ID_ENV_VAR,
     "HERDR_VIEW_ID",
     "HERDR_BUILD_BIN_PATH",
+    "HERDR_OMP_BRIDGE",
+    "HERDR_OMP_BRIDGE_TOKEN",
+    "HERDR_OMP_GUEST_BRIDGE_TOKEN",
 ];
+#[cfg(not(unix))]
+const EXECUTION_PROVIDER_INHERITED_ENV_REMOVALS: &[&str] = &[];
+
+pub(crate) fn execution_provider_inherited_env_removals() -> Vec<String> {
+    EXECUTION_PROVIDER_INHERITED_ENV_REMOVALS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect()
+}
+
+#[cfg(all(test, unix))]
+mod inherited_env_tests {
+    #[test]
+    fn execution_provider_removals_include_omp_bridge_capabilities() {
+        let removals = super::execution_provider_inherited_env_removals();
+        for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
+            assert!(removals.iter().any(|removed| removed == key));
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedExecutionProvider {

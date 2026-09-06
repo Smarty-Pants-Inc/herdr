@@ -253,6 +253,18 @@ fn restore_with_imports_and_failures(
     runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
 ) -> RestoreFailures<RestoredSession> {
+    let history = history.filter(|history| {
+        if history.version == snapshot.version {
+            true
+        } else {
+            warn!(
+                session_version = snapshot.version,
+                history_version = history.version,
+                "discarding session history with a mismatched snapshot version"
+            );
+            false
+        }
+    });
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
@@ -799,6 +811,7 @@ fn restore_tab(
             crate::workspace::Tab {
                 custom_name: snap.custom_name.clone(),
                 number,
+                layout_effect_nonce: snap.layout_effect_nonce.clone(),
                 root_pane,
                 layout,
                 panes,
@@ -876,18 +889,24 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    persisted
+        .resume_policy
+        .is_native()
+        .then(|| crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref))
+        .flatten()
 }
 
 fn persisted_agent_session_from_snapshot(
     session: &PaneAgentSessionSnapshot,
 ) -> Option<crate::agent_resume::PersistedAgentSession> {
-    crate::agent_resume::session_ref_from_snapshot(
+    let mut persisted = crate::agent_resume::session_ref_from_snapshot(
         &session.source,
         &session.agent,
         session.kind,
         &session.value,
-    )
+    )?;
+    persisted.resume_policy = session.resume_policy;
+    Some(persisted)
 }
 
 fn restored_terminal_agent_session(
@@ -1041,6 +1060,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -1064,6 +1084,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         }
@@ -1238,12 +1259,18 @@ mod tests {
     #[test]
     fn restore_plan_respects_opt_in_and_allowlist() {
         let pi_session_path = test_session_path("pi-session.jsonl");
-        let session = super::super::snapshot::PaneAgentSessionSnapshot {
-            source: "herdr:pi".into(),
-            agent: "pi".into(),
-            kind: crate::agent_resume::AgentSessionRefKind::Path,
-            value: pi_session_path.clone(),
-        };
+        let session: super::super::snapshot::PaneAgentSessionSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "source": "herdr:pi",
+                "agent": "pi",
+                "kind": "path",
+                "value": pi_session_path.clone(),
+            }))
+            .expect("legacy native session snapshot should parse");
+        assert_eq!(
+            session.resume_policy,
+            crate::agent_resume::AgentResumePolicy::Native
+        );
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
         assert_eq!(
@@ -1256,8 +1283,32 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+    }
+
+    #[test]
+    fn external_omp_session_is_persisted_without_native_resume_plan() {
+        let session = serde_json::from_value(serde_json::json!({
+            "source": "herdr:omp",
+            "agent": "omp",
+            "kind": "path",
+            "value": test_session_path("omp-session.jsonl"),
+            "resume_policy": "external",
+        }))
+        .expect("external OMP session snapshot should parse");
+
+        let persisted = restored_terminal_agent_session(Some(&session), false)
+            .expect("external OMP session should remain persisted after cold restore");
+        assert_eq!(
+            persisted.resume_policy,
+            crate::agent_resume::AgentResumePolicy::External
+        );
+        assert!(
+            restore_plan_for_snapshot(&session, true).is_none(),
+            "externally owned OMP sessions must not run omp --resume during cold restore"
+        );
     }
 
     #[test]
@@ -1268,6 +1319,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let mut resumed = HashSet::new();
         let execution_target = crate::execution::ExecutionTarget::Local;
@@ -1297,6 +1349,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let primary = crate::execution::ExecutionTarget::ssh("primary").unwrap();
         let secondary = crate::execution::ExecutionTarget::ssh("secondary").unwrap();
@@ -1314,6 +1367,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1345,6 +1399,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1384,6 +1439,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1416,6 +1472,7 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1432,6 +1489,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         };
         let mut resumed = HashSet::new();
         let execution_target = crate::execution::ExecutionTarget::Local;
@@ -1464,6 +1522,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -1478,6 +1537,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                             }),
                             launch_argv: None,
                         },
@@ -1491,6 +1551,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         };
@@ -1547,6 +1608,7 @@ mod tests {
                 next_public_tab_number: 6,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Split {
                         direction: super::super::snapshot::DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -1588,6 +1650,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         };
@@ -1645,6 +1708,7 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             }),
             launch_argv: None,
         };
@@ -1663,6 +1727,7 @@ mod tests {
                 tabs: vec![
                     TabSnapshot {
                         custom_name: None,
+                        layout_effect_nonce: None,
                         layout: LayoutSnapshot::Pane(10),
                         panes: HashMap::from([pane_snap("10")]),
                         zoomed: false,
@@ -1671,6 +1736,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        layout_effect_nonce: None,
                         layout: LayoutSnapshot::Pane(11),
                         panes: HashMap::from([pane_snap("11")]),
                         zoomed: false,
@@ -1679,6 +1745,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        layout_effect_nonce: None,
                         layout: LayoutSnapshot::Pane(12),
                         panes: HashMap::from([pane_snap("12")]),
                         zoomed: false,
@@ -1687,6 +1754,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        layout_effect_nonce: None,
                         layout: LayoutSnapshot::Pane(13),
                         panes: HashMap::from([(13, final_pane)]),
                         zoomed: false,
@@ -1699,6 +1767,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         };
@@ -1747,6 +1816,7 @@ mod tests {
             next_public_tab_number: 0,
             tabs: vec![TabSnapshot {
                 custom_name: None,
+                layout_effect_nonce: None,
                 layout: LayoutSnapshot::Split {
                     direction: super::super::snapshot::DirectionSnapshot::Horizontal,
                     ratio: 0.5,
@@ -1774,6 +1844,7 @@ mod tests {
     async fn failed_remote_shell_restore_keeps_pane_pending_for_retry() {
         let snapshot = TabSnapshot {
             custom_name: Some("remote".into()),
+            layout_effect_nonce: None,
             layout: LayoutSnapshot::Pane(0),
             panes: HashMap::from([(
                 0,
@@ -1931,6 +2002,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -1945,6 +2017,7 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
                             }),
                             launch_argv: None,
                         },
@@ -1958,6 +2031,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: None,
+            idempotency_epoch: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         };
@@ -2099,6 +2173,36 @@ mod tests {
         let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
     }
 
+    #[tokio::test]
+    async fn restore_discards_history_from_a_different_snapshot_version() {
+        let (mut snapshot, mut history) = snapshot_with_saved_pane_history();
+        snapshot.version = 3;
+        history.version = 4;
+        let (events, _events_rx) = mpsc::channel(8);
+
+        let (_workspaces, _terminals, runtimes) = restore(
+            &snapshot,
+            Some(&history),
+            5,
+            40,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let runtime = runtimes
+            .values()
+            .next()
+            .expect("restored runtime should exist");
+        assert!(!runtime
+            .recent_unwrapped_text(10)
+            .contains("RESTORED_HISTORY"));
+        let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+    }
     #[cfg(not(windows))]
     #[tokio::test]
     async fn restored_shell_inherits_omp_bridge() {
@@ -2203,6 +2307,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,
                     zoomed: false,
@@ -2214,6 +2319,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
+            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
         };

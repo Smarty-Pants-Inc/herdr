@@ -8,8 +8,14 @@ use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
-/// Current snapshot format version. Version 4 adds persisted pane execution targets; version 5 adds workspace identity execution targets.
-pub(super) const SNAPSHOT_VERSION: u32 = 5;
+const REMOTE_WORKSPACE_SNAPSHOT_VERSION: u32 = 5;
+pub(crate) const EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION: u32 = 6;
+
+/// Current snapshot format version. Version 4 adds persisted pane execution
+/// targets; version 5 adds workspace identity execution targets; version 6
+/// fences externally owned sessions from readers that do not understand their
+/// resume policy.
+pub(crate) const SNAPSHOT_VERSION: u32 = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -22,6 +28,8 @@ pub struct SessionSnapshot {
     pub selected: usize,
     #[serde(default)]
     pub sidebar_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_epoch: Option<String>,
     #[serde(default)]
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
@@ -87,6 +95,8 @@ struct LegacyWorkspaceSnapshot {
 pub struct TabSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_effect_nonce: Option<String>,
     pub layout: LayoutSnapshot,
     pub panes: HashMap<u32, PaneSnapshot>,
     pub zoomed: bool,
@@ -119,6 +129,11 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::agent_resume::AgentResumePolicy::is_native"
+    )]
+    pub resume_policy: crate::agent_resume::AgentResumePolicy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,6 +165,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
             custom_name: None,
+            layout_effect_nonce: None,
             layout: snap.layout,
             panes: snap.panes,
             zoomed: snap.zoomed,
@@ -184,6 +200,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     selected: usize,
     #[serde(default)]
+    idempotency_epoch: Option<String>,
+    #[serde(default)]
     sidebar_width: Option<u16>,
     #[serde(default)]
     sidebar_section_split: Option<f32>,
@@ -199,6 +217,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
             .into_iter()
             .map(migrate_workspace)
             .collect::<Result<Vec<_>, _>>()?,
+        idempotency_epoch: raw.idempotency_epoch,
         active: raw.active,
         selected: raw.selected,
         sidebar_width: raw.sidebar_width,
@@ -345,15 +364,41 @@ pub fn capture(
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
 ) -> SessionSnapshot {
+    let workspaces: Vec<_> = workspaces
+        .iter()
+        .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+        .collect();
+    let mut version = 3;
+    if workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .any(|pane| !pane.execution_target.is_local())
+    {
+        version = 4;
+    }
+    if workspaces
+        .iter()
+        .any(|workspace| !workspace.identity_execution_target.is_local())
+    {
+        version = REMOTE_WORKSPACE_SNAPSHOT_VERSION;
+    }
+    if workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .filter_map(|pane| pane.agent_session.as_ref())
+        .any(|session| !session.resume_policy.is_native())
+    {
+        version = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
+    }
     SessionSnapshot {
-        version: SNAPSHOT_VERSION,
-        workspaces: workspaces
-            .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
-            .collect(),
+        version,
+        workspaces,
         active,
         selected,
         sidebar_width: Some(sidebar_width),
+        idempotency_epoch: None,
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
     }
@@ -442,6 +487,16 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        resume_policy: terminal
+                            .persisted_agent_session
+                            .as_ref()
+                            .filter(|session| {
+                                session.source == authority.source
+                                    && session.agent == authority.agent_label
+                                    && session.session_ref == *session_ref
+                            })
+                            .map(|session| session.resume_policy)
+                            .unwrap_or_default(),
                     });
                 }
             }
@@ -453,6 +508,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    resume_policy: session.resume_policy,
                 })
         });
         panes.insert(
@@ -472,6 +528,7 @@ fn capture_tab(
     }
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
+        layout_effect_nonce: tab.layout_effect_nonce.clone(),
         layout: capture_node(tab.layout.root()),
         panes,
         zoomed: tab.zoomed,
@@ -484,9 +541,10 @@ fn capture_tab(
 pub fn capture_history(
     workspaces: &[Workspace],
     terminal_runtimes: &TerminalRuntimeRegistry,
+    version: u32,
 ) -> SessionHistorySnapshot {
     SessionHistorySnapshot {
-        version: SNAPSHOT_VERSION,
+        version,
         workspaces: workspaces
             .iter()
             .map(|workspace| WorkspaceHistorySnapshot {
@@ -547,23 +605,75 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 }
 
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
+    parse_snapshot_with_supported_version(content, SNAPSHOT_VERSION)
+}
+
+fn parse_snapshot_with_supported_version(
+    content: &str,
+    supported_version: u32,
+) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > SNAPSHOT_VERSION {
+    if raw.version > supported_version {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, SNAPSHOT_VERSION
+            raw.version, supported_version
         ));
     }
-    migrate_snapshot(raw)
+    let snapshot = migrate_snapshot(raw)?;
+    if snapshot.version < EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        && has_external_resume_policy(&snapshot)
+    {
+        return Err(format!(
+            "external agent resume policy requires snapshot version {} or newer",
+            EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
+        ));
+    }
+    Ok(snapshot)
+}
+
+pub(crate) fn has_external_resume_policy(snapshot: &SessionSnapshot) -> bool {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .filter_map(|pane| pane.agent_session.as_ref())
+        .any(|session| !session.resume_policy.is_native())
+}
+
+fn value_has_external_resume_policy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object
+                .get("resume_policy")
+                .is_some_and(|value| value.as_str() != Some("native"))
+                || object.values().any(value_has_external_resume_policy)
+        }
+        serde_json::Value::Array(values) => values.iter().any(value_has_external_resume_policy),
+        _ => false,
+    }
+}
+
+pub(super) fn content_has_external_resume_policy(content: &str) -> bool {
+    serde_json::from_str::<RawSessionSnapshot>(content)
+        .ok()
+        .is_some_and(|raw| raw.workspaces.iter().any(value_has_external_resume_policy))
 }
 
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
+    parse_history_snapshot_with_supported_version(content, SNAPSHOT_VERSION)
+}
+
+fn parse_history_snapshot_with_supported_version(
+    content: &str,
+    supported_version: u32,
+) -> Result<SessionHistorySnapshot, String> {
     let snapshot =
         serde_json::from_str::<SessionHistorySnapshot>(content).map_err(|e| e.to_string())?;
-    if snapshot.version > SNAPSHOT_VERSION {
+    if snapshot.version > supported_version {
         return Err(format!(
             "history snapshot version {} is newer than supported {}",
-            snapshot.version, SNAPSHOT_VERSION
+            snapshot.version, supported_version
         ));
     }
     Ok(snapshot)
@@ -646,8 +756,9 @@ mod tests {
     fn capture_history_from_state_with_runtimes(
         state: &AppState,
         terminal_runtimes: &TerminalRuntimeRegistry,
+        version: u32,
     ) -> SessionHistorySnapshot {
-        capture_history(&state.workspaces, terminal_runtimes)
+        capture_history(&state.workspaces, terminal_runtimes, version)
     }
 
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
@@ -702,6 +813,7 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: Some(26),
+            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         };
@@ -776,6 +888,7 @@ mod tests {
                 next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -792,9 +905,10 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
+            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
-            version: SNAPSHOT_VERSION,
+            version: REMOTE_WORKSPACE_SNAPSHOT_VERSION,
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
@@ -1091,6 +1205,7 @@ mod tests {
             snapshot.workspaces[0].identity_execution_target,
             crate::execution::ExecutionTarget::ssh("build.example").unwrap()
         );
+        assert_eq!(snapshot.version, REMOTE_WORKSPACE_SNAPSHOT_VERSION);
     }
 
     #[test]
@@ -1341,7 +1456,8 @@ mod tests {
         assert!(!encoded.contains("alpha"));
         assert!(!encoded.contains("\"history\""));
 
-        let history_snapshot = capture_history_from_state_with_runtimes(&state, &terminal_runtimes);
+        let history_snapshot =
+            capture_history_from_state_with_runtimes(&state, &terminal_runtimes, snapshot.version);
         let history = &history_snapshot.workspaces[0].tabs[0].panes[&root.raw()];
 
         assert!(history.ansi.contains("alpha"));
@@ -1385,7 +1501,8 @@ mod tests {
         assert!(!encoded.contains("first-pane-history"));
         assert!(!encoded.contains("second-pane-history"));
 
-        let history_snapshot = capture_history_from_state_with_runtimes(&state, &terminal_runtimes);
+        let history_snapshot =
+            capture_history_from_state_with_runtimes(&state, &terminal_runtimes, snapshot.version);
         let tab = &history_snapshot.workspaces[0].tabs[0];
         let first_history = &tab.panes[&first.raw()];
         let second_history = &tab.panes[&second.raw()];
@@ -1395,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_tracks_hook_authority_agent_session() {
+    fn capture_contract_versions_native_only_agent_session_as_v3() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("pi-session.jsonl");
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1412,6 +1529,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1423,6 +1541,11 @@ mod tests {
         );
 
         let snapshot = capture_from_state(&state);
+        let history = capture_history_from_state_with_runtimes(
+            &state,
+            &TerminalRuntimeRegistry::new(),
+            snapshot.version,
+        );
         let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
             .agent_session
             .as_ref()
@@ -1435,6 +1558,127 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
+        assert_eq!(
+            agent_session.resume_policy,
+            crate::agent_resume::AgentResumePolicy::Native
+        );
+        assert_eq!(snapshot.version, 3);
+        assert_eq!(history.version, snapshot.version);
+        let encoded = serde_json::to_string(&snapshot).expect("native snapshot should serialize");
+        let encoded_history =
+            serde_json::to_string(&history).expect("native history should serialize");
+        assert!(!encoded.contains("\"resume_policy\""));
+        assert!(
+            parse_snapshot_with_supported_version(&encoded, 3).is_ok(),
+            "v3 readers must accept native-only snapshots"
+        );
+        assert!(
+            parse_history_snapshot_with_supported_version(&encoded_history, 3).is_ok(),
+            "v3 readers must accept native-only history"
+        );
+    }
+
+    #[test]
+    fn capture_contract_versions_external_resume_policy_under_hook_authority() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.workspaces[0].identity_execution_target =
+            crate::execution::ExecutionTarget::ssh("build.example").unwrap();
+        let session_path = test_session_path("omp-session.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Omp),
+            crate::detect::AgentState::Idle,
+        );
+        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone());
+        terminal
+            .set_agent_session_ref_for_session_start_with_resume_policy(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref.clone(),
+                Some(1),
+                Some("startup".into()),
+                crate::agent_resume::AgentResumePolicy::External,
+            )
+            .expect("external OMP session should persist");
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::detect::AgentState::Working,
+                None,
+                session_ref,
+                Some(2),
+            )
+            .expect("OMP lifecycle report should remain active");
+
+        let snapshot = capture_from_state(&state);
+        let history = capture_history_from_state_with_runtimes(
+            &state,
+            &TerminalRuntimeRegistry::new(),
+            snapshot.version,
+        );
+        assert_eq!(snapshot.version, EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION);
+        assert_eq!(history.version, snapshot.version);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("external OMP session should remain visible in the snapshot");
+        assert_eq!(
+            agent_session.resume_policy,
+            crate::agent_resume::AgentResumePolicy::External
+        );
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        assert!(encoded.contains("\"resume_policy\":\"external\""));
+        let restored = parse_snapshot(&encoded).expect("external snapshot should parse");
+        assert_eq!(
+            restored.workspaces[0].tabs[0].panes[&root.raw()]
+                .agent_session
+                .as_ref()
+                .expect("external OMP session should restore from the snapshot")
+                .resume_policy,
+            crate::agent_resume::AgentResumePolicy::External
+        );
+        let mut downgraded: serde_json::Value =
+            serde_json::from_str(&encoded).expect("snapshot JSON should parse");
+        downgraded["version"] = serde_json::json!(REMOTE_WORKSPACE_SNAPSHOT_VERSION);
+        let downgraded_encoded =
+            serde_json::to_string(&downgraded).expect("downgraded snapshot should serialize");
+        let Err(error) = parse_snapshot_with_supported_version(
+            &downgraded_encoded,
+            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
+        ) else {
+            panic!("v5 readers must reject external-policy payloads even at version 5");
+        };
+        assert_eq!(
+            error,
+            "external agent resume policy requires snapshot version 6 or newer"
+        );
+        let Err(error) =
+            parse_snapshot_with_supported_version(&encoded, REMOTE_WORKSPACE_SNAPSHOT_VERSION)
+        else {
+            panic!(
+                "v5 readers must reject external-policy snapshots rather than ignore the policy"
+            );
+        };
+        assert_eq!(error, "snapshot version 6 is newer than supported 5");
+        let encoded_history =
+            serde_json::to_string(&history).expect("external history should serialize");
+        let Err(error) = parse_history_snapshot_with_supported_version(
+            &encoded_history,
+            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
+        ) else {
+            panic!("v5 readers must reject history paired with external-policy snapshots");
+        };
+        assert_eq!(
+            error,
+            "history snapshot version 6 is newer than supported 5"
+        );
     }
 
     #[test]
@@ -1453,6 +1697,7 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
 
         let snapshot = capture_from_state(&state);
@@ -1478,12 +1723,20 @@ mod tests {
     }
 
     #[test]
-    fn v6_snapshot_is_rejected() {
-        let json = r#"{"version":6,"workspaces":[],"active":null,"selected":0}"#;
+    fn v7_snapshot_is_rejected() {
+        let json = r#"{"version":7,"workspaces":[],"active":null,"selected":0}"#;
         let Err(error) = parse_snapshot(json) else {
-            panic!("v6 snapshots must be rejected");
+            panic!("v7 snapshots must be rejected");
         };
-        assert_eq!(error, "snapshot version 6 is newer than supported 5");
+        assert_eq!(error, "snapshot version 7 is newer than supported 6");
+    }
+
+    #[test]
+    fn future_snapshot_and_history_versions_are_rejected() {
+        let snapshot = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
+        let history = r#"{"version":999,"workspaces":[]}"#;
+        assert!(parse_snapshot(snapshot).is_err());
+        assert!(parse_history_snapshot(history).is_err());
     }
 
     #[test]
@@ -1537,6 +1790,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -1553,6 +1807,7 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
+            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         };

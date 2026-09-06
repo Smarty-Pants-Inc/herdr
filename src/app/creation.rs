@@ -588,6 +588,16 @@ fn terminal_agent_session_info(
                 agent: authority.agent_label.clone(),
                 kind: session_ref.kind,
                 value: session_ref.value.clone(),
+                resume_policy: terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .filter(|session| {
+                        session.source == authority.source
+                            && session.agent == authority.agent_label
+                            && session.session_ref == *session_ref
+                    })
+                    .map(|session| session.resume_policy)
+                    .filter(|policy| !policy.is_native()),
             });
         }
     }
@@ -600,5 +610,6 @@ fn terminal_agent_session_info(
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
+            resume_policy: (!session.resume_policy.is_native()).then_some(session.resume_policy),
         })
 }

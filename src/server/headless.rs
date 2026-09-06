@@ -1485,6 +1485,10 @@ impl HeadlessServer {
         // events. Reconcile only the queued snapshot before capturing terminal state;
         // private runtimes remain live and must not keep handoff draining forever.
         self.drain_internal_event_snapshot_with_forwarding();
+        // Join any in-flight autosave before the target can persist the committed
+        // handoff. Do not rewrite source-owned session bytes here: a failed handoff
+        // must preserve them exactly. Event-loop scheduling is fenced until return.
+        self.app.join_background_session_save();
         let omp_maintenance = match self.authorize_live_handoff() {
             Ok(state) => state,
             Err(err) => {
@@ -1493,7 +1497,7 @@ impl HeadlessServer {
             }
         };
 
-        let snapshot = crate::persist::capture(
+        let mut snapshot = crate::persist::capture(
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -1503,6 +1507,7 @@ impl HeadlessServer {
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
         );
+        snapshot.idempotency_epoch = Some(self.app.layout_apply_epoch.clone());
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
@@ -7411,6 +7416,7 @@ impl HeadlessServer {
             result: api::schema::ResponseResult::PaneOmpBridge {
                 token: bridge.token(&pane_id),
                 address: bridge.address().to_string(),
+                route_generation: self.omp_service.expected_host_generation(&pane_id),
                 pane_id,
             },
         })
@@ -9610,6 +9616,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.api_window_title = received.manifest.api_window_title.take();
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        match server.app.save_layout_apply_session_snapshot_now() {
+            Ok(()) => {
+                let restored_epoch = server.app.layout_apply_epoch.clone();
+                server
+                    .app
+                    .initialize_layout_apply_idempotency_after_handoff(Some(Some(&restored_epoch)));
+            }
+            Err(error) => {
+                warn!(%error, "handoff ownership committed but immediate session persistence failed; continuing with in-memory owner");
+                server.app.mark_layout_apply_idempotency_unavailable(format!(
+                    "layout idempotency is unavailable because committed handoff persistence failed: {error}"
+                ));
+                server.app.state.session_dirty = true;
+                server.app.sync_session_save_schedule();
+            }
+        }
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
@@ -10620,6 +10642,7 @@ mod tests {
             pane_id,
             address,
             token,
+            route_generation,
         } = response.result
         else {
             panic!("expected pane OMP bridge response");
@@ -10628,6 +10651,7 @@ mod tests {
         assert_ne!(pane_id, target_pane_id);
         assert_eq!(address, server.omp_service.bridge().address());
         assert!(server.omp_service.bridge().validates(&pane_id, &token));
+        assert_eq!(route_generation, 1);
 
         for (id, requested_pane, peer_pid) in [
             ("missing-peer", source_pane_id.as_str(), None),
@@ -13250,7 +13274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_stop_reconciles_private_guest_to_started_replacement() {
+    async fn host_stop_allows_private_guest_replacement_at_next_generation() {
         let mut server = test_headless_server();
         let workspace = crate::workspace::Workspace::test_new("private-omp-replacement");
         let route = crate::workspace::public_pane_id_for_number(&workspace.id, 1);
@@ -13301,15 +13325,18 @@ mod tests {
                 .route()
                 .omp_session_id,
             "old",
-            "deterministic ordering keeps the selected route while both are live"
+            "a live pane route rejects a different session"
         );
 
         assert!(server.handle_server_event(ServerEvent::OmpHostStopped {
-            pane_id: route,
+            pane_id: route.clone(),
             omp_session_id: "old".into(),
             route_generation: 1,
             host_id: 1,
+            ready: true,
         }));
+        assert!(server.clients[&1].private_omp_guest.is_none());
+        assert!(server.handle_server_event(host_started(3, "replacement")));
         assert_eq!(
             server.clients[&1]
                 .private_omp_guest
@@ -13318,7 +13345,16 @@ mod tests {
                 .route()
                 .omp_session_id,
             "replacement",
-            "stopping the selected live route immediately attaches its replacement"
+            "a new host attaches after the old route and its guests stop"
+        );
+        assert_eq!(
+            server.clients[&1]
+                .private_omp_guest
+                .as_ref()
+                .unwrap()
+                .route()
+                .route_generation,
+            2
         );
     }
     fn pane_updated_events(event_hub: &api::EventHub) -> usize {
@@ -21363,6 +21399,7 @@ next_tab = ""
                         .to_string(),
                 )
                 .unwrap(),
+                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
         server
             .app

@@ -154,8 +154,13 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
+    pub(crate) layout_apply_epoch: String,
+    pub(crate) layout_apply_receipts: crate::persist::LayoutApplyReceipts,
+    pub(crate) layout_apply_receipts_error: Option<String>,
+    pub(crate) layout_apply_quarantined: bool,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
+    pub(crate) session_persistence_blocked: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) config_diagnostic_deadline: Option<Instant>,
@@ -470,6 +475,21 @@ impl App {
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
         // Try to restore previous session
+        let session_load = if no_session {
+            crate::persist::SessionLoad::Missing
+        } else {
+            crate::persist::load()
+        };
+        let session_persistence_blocked = match &session_load {
+            crate::persist::SessionLoad::Unsupported { version } => {
+                tracing::warn!(
+                    file_version = version,
+                    "refusing to mutate or overwrite unsupported session snapshot"
+                );
+                true
+            }
+            _ => false,
+        };
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (
@@ -490,12 +510,13 @@ impl App {
                 0.5_f32,
                 std::collections::HashSet::new(),
             )
-        } else if let Some(snap) = crate::persist::load() {
+        } else if let crate::persist::SessionLoad::Loaded(snap) = session_load {
             let history = config
                 .experimental
                 .pane_history
                 .then(crate::persist::load_history)
-                .flatten();
+                .flatten()
+                .filter(|history| history.version == snap.version);
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
                 &snap,
                 history.as_ref(),
@@ -881,8 +902,13 @@ impl App {
             input_leases: input::InputLeaseTable::default(),
             api_rx,
             event_hub,
+            layout_apply_epoch: String::new(),
+            layout_apply_receipts: Default::default(),
+            layout_apply_receipts_error: None,
+            layout_apply_quarantined: false,
             last_focus,
             no_session,
+            session_persistence_blocked,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
             render_notify,
@@ -895,7 +921,11 @@ impl App {
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
+        if app.session_persistence_blocked {
+            app.state.should_quit = true;
+        }
         app.configure_window_title(&config.ui.window_title);
+        app.initialize_layout_apply_idempotency(None);
         app
     }
 
@@ -967,6 +997,10 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        app.layout_apply_epoch = match &snapshot.idempotency_epoch {
+            Some(epoch) => epoch.clone(),
+            None => crate::persist::new_layout_session_epoch().map_err(io::Error::other)?,
+        };
         Ok(app)
     }
 
@@ -4345,6 +4379,61 @@ mod tests {
         assert_eq!(tab.workspace_id, root_pane.workspace_id);
         assert_eq!(root_pane.tab_id, tab.tab_id);
         assert_eq!(tab.pane_count, 1);
+    }
+
+    #[test]
+    fn pane_info_exposes_external_resume_policy_without_changing_native_shape() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("api-agent-session-policy")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path("/tmp/omp-session.jsonl").unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::External,
+        });
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Idle,
+                None,
+                Some(session_ref),
+                Some(1),
+            )
+            .is_some());
+
+        let external = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(
+            external.agent_session.as_ref().unwrap().resume_policy,
+            Some(crate::agent_resume::AgentResumePolicy::External)
+        );
+        assert_eq!(
+            serde_json::to_value(&external).unwrap()["agent_session"]["resume_policy"],
+            "external"
+        );
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session
+            .as_mut()
+            .unwrap()
+            .resume_policy = crate::agent_resume::AgentResumePolicy::Native;
+
+        let native = app.pane_info(0, pane_id).unwrap();
+        assert_eq!(native.agent_session.as_ref().unwrap().resume_policy, None);
+        assert!(serde_json::to_value(&native).unwrap()["agent_session"]
+            .get("resume_policy")
+            .is_none());
     }
 
     #[test]

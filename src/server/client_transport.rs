@@ -418,7 +418,7 @@ impl ClientWriterQueue {
 
 #[derive(Debug)]
 pub(crate) enum OmpHostAdmission {
-    Accepted,
+    Accepted { route_generation: u64 },
     Rejected { code: String, message: String },
 }
 
@@ -628,6 +628,7 @@ pub(crate) enum ServerEvent {
         omp_session_id: String,
         route_generation: u64,
         host_id: u64,
+        ready: bool,
     },
     /// A client writer popped a control record and can accept another control record.
     ClientWriterControlDrained { client_id: u64 },

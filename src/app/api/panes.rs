@@ -1442,6 +1442,7 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            resume_policy: params.resume_policy.unwrap_or_default(),
         });
 
         encode_success(id, ResponseResult::Ok {})

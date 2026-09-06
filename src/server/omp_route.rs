@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::protocol::{validate_omp_frame, OmpControlAction, OmpFrameDirection, OmpPaneState};
 
+const INITIAL_ROUTE_GENERATION: u64 = 1;
+
 fn validate_route_frame(frame: &[u8], direction: OmpFrameDirection) -> Result<(), OmpRouteError> {
     let payload = validate_omp_frame(frame, direction)
         .map_err(|err| OmpRouteError::InvalidFrame(err.to_string()))?;
@@ -127,45 +129,107 @@ impl OmpRoute {
 #[derive(Debug, Default)]
 pub(crate) struct OmpRouteRegistry {
     routes: HashMap<(String, String), OmpRoute>,
+    /// Last server-assigned generation per durable pane slot, retained after pruning.
+    route_generations: HashMap<String, u64>,
 }
 impl OmpRouteRegistry {
-    pub(crate) fn host_started(
-        &mut self,
-        key: OmpRouteKey,
-    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
-        use std::collections::hash_map::Entry;
+    pub(crate) fn expected_host_generation(&self, pane_id: &str) -> u64 {
+        self.route_generations
+            .get(pane_id)
+            .copied()
+            .unwrap_or(INITIAL_ROUTE_GENERATION)
+    }
 
-        let route = match self
-            .routes
-            .entry((key.pane_id.clone(), key.omp_session_id.clone()))
-        {
-            Entry::Vacant(entry) => entry.insert(OmpRoute {
-                key,
+    /// Validates an expected-current host claim and returns the server-assigned key.
+    /// The announcement never chooses the next generation.
+    pub(crate) fn prepare_host_start(
+        &self,
+        announced: &OmpRouteKey,
+    ) -> Result<OmpRouteKey, OmpRouteError> {
+        let mut key = announced.clone();
+        if key.route_generation == 0 {
+            return Err(OmpRouteError::StaleGeneration);
+        }
+        key.route_generation = match self.route_generations.get(&key.pane_id).copied() {
+            None if announced.route_generation == INITIAL_ROUTE_GENERATION => {
+                INITIAL_ROUTE_GENERATION
+            }
+            None => return Err(OmpRouteError::StaleGeneration),
+            Some(current) if announced.route_generation == current => current
+                .checked_add(1)
+                .ok_or(OmpRouteError::StaleGeneration)?,
+            Some(_) => return Err(OmpRouteError::StaleGeneration),
+        };
+        if self.routes.iter().any(|((pane_id, _), route)| {
+            pane_id == &key.pane_id && (route.live || !route.attachments.is_empty())
+        }) {
+            return Err(OmpRouteError::RouteBusy);
+        }
+        Ok(key)
+    }
+
+    pub(crate) fn commit_host_start(&mut self, key: OmpRouteKey) -> Vec<OmpRouteDelivery> {
+        let pane_id = key.pane_id.clone();
+        let map_key = (pane_id.clone(), key.omp_session_id.clone());
+        debug_assert!(self.routes.iter().all(|((current_pane_id, _), route)| {
+            current_pane_id != &pane_id || route.attachments.is_empty()
+        }));
+        self.routes
+            .retain(|(current_pane_id, _), _| current_pane_id != &pane_id);
+        self.routes.insert(
+            map_key,
+            OmpRoute {
+                key: key.clone(),
                 live: true,
                 failed: false,
                 next_attachment_epoch: 1,
                 attachments: BTreeMap::new(),
                 controller: None,
-            }),
-            Entry::Occupied(entry) => {
-                let route = entry.into_mut();
-                // The first authenticated host pins this route's incarnation for
-                // the server lifetime. Pane descendants may choose a session name,
-                // but cannot replace that session with a caller-chosen generation.
-                if key.route_generation != route.key.route_generation {
-                    return Err(OmpRouteError::StaleGeneration);
-                }
-                // A fresh CollabHost has no peer hello/snapshot state. Only allow
-                // restart after the old host stopped and every guest detached.
-                if route.live || !route.attachments.is_empty() {
-                    return Err(OmpRouteError::RouteBusy);
-                }
-                route.live = true;
-                route.failed = false;
-                route
-            }
+            },
+        );
+        self.route_generations.insert(pane_id, key.route_generation);
+        Vec::new()
+    }
+
+    pub(crate) fn abort_host_start(
+        &mut self,
+        key: &OmpRouteKey,
+        announced_generation: u64,
+    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        let previous_generation = if key.route_generation == INITIAL_ROUTE_GENERATION
+            && announced_generation == INITIAL_ROUTE_GENERATION
+        {
+            None
+        } else if announced_generation.checked_add(1) == Some(key.route_generation) {
+            Some(announced_generation)
+        } else {
+            return Err(OmpRouteError::StaleGeneration);
         };
-        Ok(route.pane_deliveries())
+        if self.route_generations.get(&key.pane_id).copied() != Some(key.route_generation) {
+            return Err(OmpRouteError::StaleGeneration);
+        }
+        self.route_mut(&key.pane_id, &key.omp_session_id, key.route_generation)?
+            .require_live()?;
+        let deliveries = self.host_stopped(key)?;
+        match previous_generation {
+            Some(generation) => {
+                self.route_generations
+                    .insert(key.pane_id.clone(), generation);
+            }
+            None => {
+                self.route_generations.remove(&key.pane_id);
+            }
+        }
+        Ok(deliveries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_started(
+        &mut self,
+        announced: OmpRouteKey,
+    ) -> Result<Vec<OmpRouteDelivery>, OmpRouteError> {
+        let key = self.prepare_host_start(&announced)?;
+        Ok(self.commit_host_start(key))
     }
 
     pub(crate) fn host_stopped(
@@ -352,7 +416,7 @@ mod tests {
         OmpRouteKey {
             pane_id: "p".into(),
             omp_session_id: "s".into(),
-            route_generation: 4,
+            route_generation: 1,
         }
     }
     fn guest(payload: &[u8]) -> Vec<u8> {
@@ -510,7 +574,7 @@ mod tests {
         let a = epoch(&routes.attach(1, &key()).unwrap(), 1);
         let b = epoch(&routes.attach(2, &key()).unwrap(), 2);
         let stale = OmpRouteKey {
-            route_generation: 3,
+            route_generation: 2,
             ..key()
         };
         assert!(matches!(
@@ -748,27 +812,34 @@ mod tests {
     }
 
     #[test]
-    fn host_admission_rejects_duplicate_and_caller_chosen_generation() {
+    fn host_admission_rejects_busy_replacement_and_stale_or_forged_claims() {
         let mut routes = OmpRouteRegistry::default();
         routes.host_started(key()).unwrap();
         let attached = routes.attach(1, &key()).unwrap();
         let epoch = epoch(&attached, 1);
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
-        let newer = OmpRouteKey {
+        assert_eq!(
+            routes.host_started(OmpRouteKey {
+                omp_session_id: "other-session".into(),
+                ..key()
+            }),
+            Err(OmpRouteError::RouteBusy)
+        );
+        let forged = OmpRouteKey {
             route_generation: key().route_generation + 1,
             ..key()
         };
         assert_eq!(
-            routes.host_started(newer),
+            routes.host_started(forged),
             Err(OmpRouteError::StaleGeneration)
         );
-        let older = OmpRouteKey {
-            route_generation: key().route_generation - 1,
+        let stale = OmpRouteKey {
+            route_generation: 0,
             ..key()
         };
         assert_eq!(
-            routes.host_started(older),
+            routes.host_started(stale),
             Err(OmpRouteError::StaleGeneration)
         );
         assert!(routes
@@ -777,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_host_restarts_only_after_all_guests_detach() {
+    fn stopped_host_restarts_at_the_next_generation_after_all_guests_detach() {
         let mut routes = OmpRouteRegistry::default();
         routes.host_started(key()).unwrap();
         let attached = routes.attach(1, &key()).unwrap();
@@ -785,25 +856,80 @@ mod tests {
         routes.host_stopped(&key()).unwrap();
 
         assert_eq!(routes.host_started(key()), Err(OmpRouteError::RouteBusy));
+        assert_eq!(
+            routes.host_started(OmpRouteKey {
+                omp_session_id: "other-session".into(),
+                ..key()
+            }),
+            Err(OmpRouteError::RouteBusy)
+        );
         routes.detach(1, &key(), epoch).unwrap();
         assert_eq!(routes.host_started(key()), Ok(Vec::new()));
+        let replacement = OmpRouteKey {
+            route_generation: 2,
+            ..key()
+        };
+        assert!(matches!(
+            routes.attach(2, &key()),
+            Err(OmpRouteError::StaleGeneration)
+        ));
+        assert!(routes.attach(2, &replacement).is_ok());
     }
 
     #[test]
-    fn inactive_empty_route_can_be_pruned() {
+    fn inactive_empty_route_retains_generation_history_after_pruning() {
         let mut routes = OmpRouteRegistry::default();
         routes.host_started(key()).unwrap();
         let attached = routes.attach(1, &key()).unwrap();
         let epoch = epoch(&attached, 1);
         routes.host_stopped(&key()).unwrap();
         routes.detach(1, &key(), epoch).unwrap();
-
         routes.remove_if_inactive_and_empty(&key());
 
         assert!(matches!(
             routes.attach(1, &key()),
             Err(OmpRouteError::UnknownRoute)
         ));
+        let caller_chosen_next = OmpRouteKey {
+            route_generation: 2,
+            ..key()
+        };
+        assert_eq!(
+            routes.host_started(caller_chosen_next),
+            Err(OmpRouteError::StaleGeneration)
+        );
         assert_eq!(routes.host_started(key()), Ok(Vec::new()));
+        let replacement = OmpRouteKey {
+            route_generation: 2,
+            ..key()
+        };
+        assert!(matches!(
+            routes.attach(1, &key()),
+            Err(OmpRouteError::StaleGeneration)
+        ));
+        assert!(routes.attach(1, &replacement).is_ok());
+    }
+
+    #[test]
+    fn changed_session_in_the_same_pane_advances_the_generation() {
+        let mut routes = OmpRouteRegistry::default();
+        routes.host_started(key()).unwrap();
+        routes.host_stopped(&key()).unwrap();
+        routes.remove_if_inactive_and_empty(&key());
+
+        let announced = OmpRouteKey {
+            omp_session_id: "replacement-session".into(),
+            ..key()
+        };
+        assert_eq!(routes.host_started(announced.clone()), Ok(Vec::new()));
+        let replacement = OmpRouteKey {
+            route_generation: 2,
+            ..announced
+        };
+        assert!(matches!(
+            routes.attach(1, &key()),
+            Err(OmpRouteError::UnknownRoute)
+        ));
+        assert!(routes.attach(1, &replacement).is_ok());
     }
 }

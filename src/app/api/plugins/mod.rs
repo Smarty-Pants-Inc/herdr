@@ -1273,6 +1273,15 @@ action = "open"
             .unwrap_or(0);
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
     }
+    #[cfg(unix)]
+    struct KillProcessOnDrop(i32);
+
+    #[cfg(unix)]
+    impl Drop for KillProcessOnDrop {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
 
     fn canonical_path_string(path: &std::path::Path) -> String {
         path.canonicalize()
@@ -3114,6 +3123,192 @@ platforms = ["linux", "macos"]
                 Some(libc::ESRCH)
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_shutdown_does_not_wait_for_setsid_descendant_output_pipes() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-setsid-output");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.setsid-output"
+name = "Setsid Output"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.setsid-output"].clone();
+        let escaped_pid_path = root.join("escaped-child.pid");
+        let python_pid_path = format!("{escaped_pid_path:?}");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("setsid-output".into()),
+                None,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "python3 -c 'import os,time; child=os.fork(); child and os._exit(0); os.setsid(); open({python_pid_path}, \"w\").write(str(os.getpid())); time.sleep(30)' & while [ ! -s {} ]; do sleep 0.01; done; exit 0",
+                        escaped_pid_path.display()
+                    ),
+                ],
+                &app.current_plugin_context("setsid-output-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !escaped_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its escaped child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let escaped_pid: i32 = std::fs::read_to_string(&escaped_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _escaped_child = KillProcessOnDrop(escaped_pid);
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, 0);
+        assert!(app.plugin_command_runtimes.contains_key(&log.log_id));
+
+        let started = std::time::Instant::now();
+        app.shutdown_plugin_commands();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "shutdown waited for an escaped descendant to close plugin output pipes"
+        );
+        assert!(app.plugin_command_runtimes.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_completion_joins_readers_and_closes_escaped_output_pipes() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-command-escaped-output-close");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.escaped-output-close"
+name = "Escaped Output Close"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+"#,
+        );
+        link_manifest(&mut app, &root);
+        let plugin = app.state.installed_plugins["example.escaped-output-close"].clone();
+        let escaped_pid_path = root.join("escaped-child.pid");
+        let release_path = root.join("release-child");
+        let stdout_closed_path = root.join("stdout-closed");
+        let stderr_closed_path = root.join("stderr-closed");
+        let escaped_script_path = root.join("escaped-child.py");
+        let python_pid_path = format!("{escaped_pid_path:?}");
+        let python_release_path = format!("{release_path:?}");
+        let python_stdout_closed_path = format!("{stdout_closed_path:?}");
+        let python_stderr_closed_path = format!("{stderr_closed_path:?}");
+        std::fs::write(
+            &escaped_script_path,
+            format!(
+                r#"import os
+import signal
+import time
+
+child = os.fork()
+if child:
+    os._exit(0)
+os.setsid()
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+open({python_pid_path}, "w").write(str(os.getpid()))
+while not os.path.exists({python_release_path}):
+    time.sleep(0.01)
+for fd, marker in ((1, {python_stdout_closed_path}), (2, {python_stderr_closed_path})):
+    try:
+        os.write(fd, b"late output\n")
+    except BrokenPipeError:
+        open(marker, "w").write("closed\n")
+"#
+            ),
+        )
+        .unwrap();
+        let shell_script_path = format!("{escaped_script_path:?}");
+        let shell_pid_path = format!("{escaped_pid_path:?}");
+        let log = app
+            .start_plugin_command(
+                &plugin,
+                Some("escaped-output-close".into()),
+                None,
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(
+                        "printf 'stdout-before-escape'; printf 'stderr-before-escape' >&2; python3 {shell_script_path} & while [ ! -s {shell_pid_path} ]; do sleep 0.01; done; exit 0"
+                    ),
+                ],
+                &app.current_plugin_context("escaped-output-close-test"),
+                crate::execution::ExecutionTarget::Local,
+                None,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !escaped_pid_path.is_file() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not publish its escaped child pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let escaped_pid: i32 = std::fs::read_to_string(&escaped_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _escaped_child = KillProcessOnDrop(escaped_pid);
+
+        while app.plugin_command_runtimes.contains_key(&log.log_id) {
+            app.drain_all_internal_events();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command completion remained blocked on escaped output pipes"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = app
+            .state
+            .plugin_command_logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .expect("plugin command log should remain available");
+        assert_eq!(finished.status, PluginCommandStatus::Succeeded);
+        assert_eq!(finished.exit_code, Some(0));
+        assert!(finished
+            .stdout
+            .as_deref()
+            .is_some_and(|stdout| stdout.contains("stdout-before-escape")));
+        assert!(finished
+            .stderr
+            .as_deref()
+            .is_some_and(|stderr| stderr.contains("stderr-before-escape")));
+
+        std::fs::write(&release_path, "release\n").unwrap();
+        assert_eq!(
+            read_capture_when_ready(&stdout_closed_path, 1, || {}).trim(),
+            "closed"
+        );
+        assert_eq!(
+            read_capture_when_ready(&stderr_closed_path, 1, || {}).trim(),
+            "closed"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

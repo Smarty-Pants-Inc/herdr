@@ -39,6 +39,13 @@
     },
     "event": {
       "$defs": {
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSessionInfo": {
           "properties": {
             "agent": {
@@ -46,6 +53,16 @@
             },
             "kind": {
               "$ref": "#/schemas/event/$defs/AgentSessionRefKind"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "source": {
               "type": "string"
@@ -1376,6 +1393,13 @@
           ],
           "type": "object"
         },
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSendKeysParams": {
           "properties": {
             "allow_cross_pane": {
@@ -2308,6 +2332,43 @@
           },
           "type": "object"
         },
+        "LayoutIdempotentParams": {
+          "properties": {
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "idempotency_key": {
+              "type": "string"
+            },
+            "root": {
+              "$ref": "#/schemas/request/$defs/LayoutNode"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tab_label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "idempotency_key",
+            "root"
+          ],
+          "type": "object"
+        },
         "LayoutNode": {
           "oneOf": [
             {
@@ -3003,6 +3064,16 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "seq": {
               "format": "uint64",
@@ -5599,6 +5670,38 @@
         {
           "properties": {
             "method": {
+              "const": "layout.apply_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.reconcile_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "layout.set_split_ratio",
               "type": "string"
             },
@@ -6666,6 +6769,13 @@
           ],
           "type": "object"
         },
+        "AgentResumePolicy": {
+          "enum": [
+            "native",
+            "external"
+          ],
+          "type": "string"
+        },
         "AgentSessionInfo": {
           "properties": {
             "agent": {
@@ -6673,6 +6783,16 @@
             },
             "kind": {
               "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "resume_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentResumePolicy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "source": {
               "type": "string"
@@ -9684,6 +9804,11 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "route_generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "token": {
                   "type": "string"
                 },
@@ -9696,7 +9821,8 @@
                 "type",
                 "pane_id",
                 "address",
-                "token"
+                "token",
+                "route_generation"
               ],
               "type": "object"
             },

@@ -5,6 +5,7 @@ mod agents;
 mod env;
 mod input_guard;
 mod integrations;
+mod layout_idempotency;
 mod layouts;
 mod pane_graphics;
 mod panes;
@@ -644,12 +645,64 @@ impl App {
             return false;
         };
         // SO_PEERCRED identifies the local SSH client process that owns the
-        // reverse-forwarded connection. A pending resume report is authoritative
-        // only while that exact child PID is the live attempt; accepted requests
-        // from a retired connection remain stale even between retries.
+        // reverse-forwarded connection. SSH reports are authoritative only while
+        // that exact child PID is the live attempt; retired connections remain
+        // stale between retries. Extension provider descendants are handled below.
         !terminal.execution_target.is_local()
             && terminal.pending_agent_resume_plan.is_some()
             && !terminal.pending_agent_resume_attempt_matches_peer(context.local_peer_pid)
+    }
+    fn external_pending_remote_resume_report_matches_plan(
+        &self,
+        params: &crate::api::schema::PaneReportAgentSessionParams,
+        context: crate::api::ApiRequestContext,
+    ) -> bool {
+        if params.resume_policy != Some(crate::agent_resume::AgentResumePolicy::External) {
+            return false;
+        }
+        let Some((workspace_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return false;
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_runtime_pane(pane_id) else {
+            return false;
+        };
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return false;
+        };
+        let Some(agent_label) = super::api_helpers::normalize_reported_agent_label(&params.agent)
+        else {
+            return false;
+        };
+        let Some(session_ref) = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id.clone(),
+            params.agent_session_path.clone(),
+        ) else {
+            return false;
+        };
+        let extension_attempt_matches_peer = matches!(
+            &terminal.execution_target,
+            crate::execution::ExecutionTarget::Extension { .. }
+        ) && context.local_peer_pid.is_some_and(|peer_pid| {
+            self.terminal_target_for_peer_pid(peer_pid)
+                .is_some_and(|target| target.ws_idx == workspace_idx && target.pane_id == pane_id)
+                && self
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(crate::terminal::TerminalRuntime::child_pid)
+                    .is_some_and(|child_pid| {
+                        terminal.pending_agent_resume_attempt_matches_peer(Some(child_pid))
+                    })
+        });
+        let unattributed_remote_report =
+            context.local_peer_pid.is_none() && !terminal.has_pending_agent_resume_attempt();
+        (extension_attempt_matches_peer || unattributed_remote_report)
+            && terminal.pending_agent_resume_plan_matches_report(
+                &params.source,
+                &agent_label,
+                &session_ref,
+            )
     }
 
     fn confirm_remote_execution_ready(
@@ -1141,6 +1194,17 @@ impl App {
         context: crate::api::ApiRequestContext,
     ) -> String {
         self.sync_pending_terminal_titles();
+        if self.session_persistence_blocked && crate::api::request_changes_ui(&request) {
+            let response = crate::api::schema::ErrorResponse {
+                id: request.id,
+                error: crate::api::schema::ErrorBody {
+                    code: "session_snapshot_unsupported".into(),
+                    message: "the persisted session snapshot was written by a newer Herdr version"
+                        .into(),
+                },
+            };
+            return serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        }
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             return response;
         }
@@ -1308,6 +1372,12 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutApplyIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, false)
+            }
+            Method::LayoutReconcileIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, true)
+            }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
             }
@@ -1364,7 +1434,9 @@ impl App {
                 return self.handle_pane_report_agent(request.id, params);
             }
             Method::PaneReportAgentSession(params) => {
-                if self.stale_pending_remote_resume_report(&params.pane_id, context) {
+                if self.stale_pending_remote_resume_report(&params.pane_id, context)
+                    && !self.external_pending_remote_resume_report_matches_plan(&params, context)
+                {
                     tracing::debug!(
                         pane = %params.pane_id,
                         peer_pid = context.local_peer_pid,
@@ -2674,6 +2746,7 @@ mod tests {
             agent_session_id: Some("codex-session".into()),
             agent_session_path: None,
             session_start_source: Some("startup".into()),
+            resume_policy: None,
         };
 
         app.handle_api_request_after_internal_events_drained_with_context(
@@ -2726,6 +2799,226 @@ mod tests {
             .is_none());
         test_support::shutdown_test_runtimes(&mut app);
     }
+    #[tokio::test]
+    async fn retired_external_local_report_cannot_confirm_but_remote_api_report_can() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("external-remote-resume");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let session_path = std::env::temp_dir().join("herdr-api-external-omp-session.jsonl");
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(session_path.display().to_string()).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target = crate::execution::ExecutionTarget::ssh("dev1").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
+        });
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        assert!(terminal.mark_pending_agent_resume_attempt_live(202, Instant::now()));
+        terminal.retire_pending_agent_resume_attempt();
+        assert_eq!(terminal.pending_agent_resume_attempt_pid(), None);
+        assert_eq!(terminal.pending_agent_resume_retired_pids(), &[202]);
+
+        let params = |path: String, seq| crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            seq: Some(seq),
+            agent_session_id: None,
+            agent_session_path: Some(path),
+            session_start_source: Some("startup".into()),
+            resume_policy: Some(crate::agent_resume::AgentResumePolicy::External),
+        };
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "late-external-attempt-a".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(
+                    session_path.display().to_string(),
+                    1,
+                )),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(202),
+            },
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert_eq!(
+            app.state.terminals[&terminal_id].pending_agent_resume_retired_pids(),
+            &[202]
+        );
+
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "external-mismatch".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(
+                    session_path.with_extension("other").display().to_string(),
+                    2,
+                )),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: None,
+            },
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some());
+
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "external-remote-api-match".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(
+                    session_path.display().to_string(),
+                    3,
+                )),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: None,
+            },
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_retired_pids()
+            .is_empty());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn external_extension_descendant_reports_confirm_active_attempt_but_not_ssh_or_retired_attempts(
+    ) {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("extension-resume-attempt");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let session_path = std::env::temp_dir().join("herdr-api-extension-omp-session.jsonl");
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(session_path.display().to_string()).unwrap();
+        let provider_pid = std::process::id();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
+        });
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        let extension_attempt_started =
+            terminal.mark_pending_agent_resume_attempt_live(provider_pid, Instant::now());
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(provider_pid);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let mut reporter = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let reporter_pid = reporter.id();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_pending_agent_resume_handoff(
+                crate::agent_resume::plan("herdr:omp", "omp", &session_ref),
+                Some(provider_pid),
+                vec![reporter_pid],
+                Instant::now(),
+            );
+        let descendant_is_unambiguous = app
+            .terminal_target_for_peer_pid(reporter_pid)
+            .is_some_and(|target| target.ws_idx == 0 && target.pane_id == pane_id);
+        let params = |seq| crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            seq: Some(seq),
+            agent_session_id: None,
+            agent_session_path: Some(session_path.display().to_string()),
+            session_start_source: Some("startup".into()),
+            resume_policy: Some(crate::agent_resume::AgentResumePolicy::External),
+        };
+
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "extension-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(1)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let extension_report_confirmed = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none();
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target = crate::execution::ExecutionTarget::ssh("dev1").unwrap();
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+        let ssh_attempt_started =
+            terminal.mark_pending_agent_resume_attempt_live(provider_pid, Instant::now());
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "ssh-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(2)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let ssh_descendant_is_fenced = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some();
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.execution_target =
+            crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
+        terminal.retire_pending_agent_resume_attempt();
+        app.handle_api_request_after_internal_events_drained_with_context(
+            crate::api::schema::Request {
+                id: "retired-extension-descendant".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(params(3)),
+            },
+            crate::api::ApiRequestContext {
+                local_peer_pid: Some(reporter_pid),
+            },
+        );
+        let retired_descendant_is_fenced = app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some()
+            && app.state.terminals[&terminal_id]
+                .pending_agent_resume_retired_pids()
+                .contains(&provider_pid);
+
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_set_child_pid(0);
+        let _ = reporter.kill();
+        let _ = reporter.wait();
+        test_support::shutdown_test_runtimes(&mut app);
+
+        assert!(extension_attempt_started);
+        assert!(ssh_attempt_started);
+        assert!(descendant_is_unambiguous);
+        assert!(extension_report_confirmed);
+        assert!(ssh_descendant_is_fenced);
+        assert!(retired_descendant_is_fenced);
+    }
 
     #[tokio::test]
     async fn pane_died_respawns_shell_and_clears_restored_agent_session() {
@@ -2754,6 +3047,7 @@ mod tests {
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session")
                 .expect("test session id should be valid"),
+            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
 
         app.handle_internal_event(AppEvent::PaneDied {

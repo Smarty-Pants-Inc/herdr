@@ -102,7 +102,10 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
+        // The foreground gate protects shells left after local agents exit. Hook authority owns
+        // remote liveness and releases on exit; its agent is absent from this host's process table.
         if !provider_execution
+            && !terminal.agent_identity_from_hook_authority()
             && !super::super::agents::runtime_hosts_agent(runtime, expected_agent)
         {
             return encode_error(
@@ -272,13 +275,19 @@ impl App {
             &terminal.execution_target,
             crate::execution::ExecutionTarget::Extension { .. }
         );
-        let Some(expected_agent) = terminal.effective_known_agent() else {
+        let Some((expected_agent, identity_from_hook_authority)) = terminal
+            .effective_known_agent()
+            .map(|agent| (agent, terminal.agent_identity_from_hook_authority()))
+        else {
             return agent_not_ready(id, &params.target);
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
+        // The foreground gate protects shells left after local agents exit. Hook authority owns
+        // remote liveness and releases on exit; its agent is absent from this host's process table.
         if !provider_execution
+            && !identity_from_hook_authority
             && !super::super::agents::runtime_hosts_agent(runtime, expected_agent)
         {
             return agent_not_ready(id, &params.target);
@@ -340,6 +349,43 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    #[cfg(unix)]
+    fn app_with_non_agent_runtime() -> (App, crate::terminal::TerminalId) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (events, _) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn_shell_command_on(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            &crate::execution::ExecutionTarget::Local,
+            "env -u HERDR_AGENT sleep 30",
+            &crate::pane::PaneLaunchEnv::default(),
+            crate::pane::AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        (app, terminal_id)
+    }
+
+    #[cfg(unix)]
+    fn shutdown_runtime(app: &mut App, terminal_id: &crate::terminal::TerminalId) {
+        app.terminal_runtimes
+            .remove(terminal_id)
+            .unwrap()
+            .shutdown();
     }
 
     #[cfg(unix)]
@@ -766,6 +812,82 @@ process_command = ["bin/provider", "exec"]
                 .unwrap(),
             Bytes::from_static(b"\r")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_authority_agent_accepts_prompt_and_send_keys_without_local_agent_process() {
+        let (mut app, terminal_id) = app_with_non_agent_runtime();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("remote-omp".into());
+        terminal.set_hook_authority(
+            "custom:remote-omp".into(),
+            "omp".into(),
+            AgentState::Idle,
+            None,
+            Some(1),
+        );
+        let runtime = app.lookup_runtime_sender(0, pane_id).unwrap();
+        assert!(runtime.child_pid().is_some());
+        assert!(!super::super::super::agents::runtime_hosts_agent(
+            runtime,
+            Agent::Omp
+        ));
+
+        let prompted = app.handle_agent_prompt(
+            "prompt".into(),
+            AgentPromptParams {
+                target: "remote-omp".into(),
+                text: "remote prompt".into(),
+                wait: None,
+                allow_cross_pane: false,
+            },
+        );
+        assert!(matches!(
+            serde_json::from_str::<SuccessResponse>(&prompted)
+                .expect("hook-authority prompt must bypass the local foreground gate")
+                .result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+
+        let sent = app.handle_agent_send_keys(
+            "keys".into(),
+            AgentSendKeysParams {
+                target: "remote-omp".into(),
+                keys: vec!["enter".into()],
+                allow_cross_pane: false,
+            },
+        );
+        assert!(matches!(
+            serde_json::from_str::<SuccessResponse>(&sent)
+                .expect("hook-authority send-keys must bypass the local foreground gate")
+                .result,
+            ResponseResult::Ok {}
+        ));
+        shutdown_runtime(&mut app, &terminal_id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_detected_agent_rejects_input_when_foreground_no_longer_matches() {
+        let (mut app, terminal_id) = app_with_non_agent_runtime();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+
+        let response = app.handle_agent_prompt(
+            "prompt".into(),
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "must not send".into(),
+                wait: None,
+                allow_cross_pane: false,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        shutdown_runtime(&mut app, &terminal_id);
     }
 
     #[tokio::test]

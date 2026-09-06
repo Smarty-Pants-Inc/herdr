@@ -164,6 +164,13 @@ pub struct LayoutApplyParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LayoutIdempotentParams {
+    pub idempotency_key: String,
+    #[serde(flatten)]
+    pub layout: LayoutApplyParams,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LayoutSetSplitRatioParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
@@ -416,6 +423,8 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_policy: Option<crate::agent_resume::AgentResumePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

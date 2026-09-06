@@ -1936,9 +1936,7 @@ fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
             ))
         })?;
         let asset = remote_asset_info(asset);
-        if crate::build_info::update_manifest_url().is_some() {
-            validate_remote_asset_checksum(asset_key, &asset)?;
-        }
+        validate_remote_asset_checksum(asset_key, &asset)?;
         return Ok(asset);
     }
 

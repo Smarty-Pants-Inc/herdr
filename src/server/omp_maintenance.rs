@@ -3,6 +3,7 @@
 //! The JSON API owns this state. OMP hosts only consult it at the existing
 //! admission boundary, and live handoff only carries the active lease proof.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::{CStr, CString, OsString};
@@ -27,6 +28,8 @@ const STATE_VERSION: u32 = 1;
 const STATUS_SCHEMA: &str = "herdr.omp_maintenance.v1";
 const OPERATION_ID_BYTES: usize = 32;
 const ENCODED_TOKEN_BYTES: usize = 43;
+const MAX_COMPLETED_OPERATIONS: usize = 64;
+const MAX_STATE_FILE_BYTES: usize = 64 * 1024;
 const INSTANCE_DIRECTORY: &str = "omp-maintenance-v1.instances";
 const INSTANCE_CREATE_ATTEMPTS: usize = 8;
 
@@ -144,6 +147,12 @@ impl PersistedRoute {
             route_generation: key.route_generation,
             proof,
         }
+    }
+
+    fn same_slot(&self, instance_id: &str, session: &str, key: &OmpRouteKey) -> bool {
+        self.server_instance_id == instance_id
+            && self.session == session
+            && self.pane_id == key.pane_id
     }
 
     fn matches(&self, instance_id: &str, session: &str, key: &OmpRouteKey) -> bool {
@@ -307,6 +316,9 @@ pub(crate) struct OmpMaintenance {
     session: String,
     backend: Backend,
     instance: ServerInstance,
+    state_commit_uncertain: Cell<bool>,
+    #[cfg(test)]
+    post_replace_sync_failures: Cell<usize>,
 }
 
 impl OmpMaintenance {
@@ -337,6 +349,9 @@ impl OmpMaintenance {
                 instance_dir,
             },
             instance,
+            state_commit_uncertain: Cell::new(false),
+            #[cfg(test)]
+            post_replace_sync_failures: Cell::new(0),
         })
     }
 
@@ -346,12 +361,38 @@ impl OmpMaintenance {
             session: session.to_owned(),
             backend: Backend::Memory(TestBackend { store: store.0 }),
             instance: ServerInstance::memory(),
+            state_commit_uncertain: Cell::new(false),
+            post_replace_sync_failures: Cell::new(0),
         }
     }
 
     #[cfg(test)]
     fn file_for_test(session: &str, state_path: PathBuf) -> Result<Self, OmpMaintenanceError> {
         Self::file(session.to_owned(), state_path)
+    }
+
+    #[cfg(test)]
+    fn fail_next_post_replace_syncs(&self, count: usize) {
+        self.post_replace_sync_failures.set(count);
+    }
+
+    fn sync_state_parent_directory(&self, directory: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let remaining = self.post_replace_sync_failures.get();
+            if remaining != 0 {
+                self.post_replace_sync_failures.set(remaining - 1);
+                self.state_commit_uncertain.set(true);
+                return Err(io::Error::other(
+                    "injected OMP maintenance post-replace sync failure",
+                ));
+            }
+        }
+        let result = sync_parent_directory(directory);
+        if result.is_err() {
+            self.state_commit_uncertain.set(true);
+        }
+        result
     }
 
     pub(crate) fn status(&self) -> Result<ServerOmpMaintenanceStatus, OmpMaintenanceError> {
@@ -384,10 +425,10 @@ impl OmpMaintenance {
             } => inspect_file_state(state_root, state_path, lock_path),
             #[cfg(test)]
             Backend::Memory(backend) => {
-                let backend = backend.store.lock().map_err(|_| {
+                let mut backend = backend.store.lock().map_err(|_| {
                     OmpMaintenanceError::StateIo("OMP maintenance state lock is poisoned".into())
                 })?;
-                backend.state.validate()?;
+                backend.state.validate_and_compact_legacy()?;
                 Ok(backend.state.status())
             }
         }
@@ -400,6 +441,13 @@ impl OmpMaintenance {
         validate_operation_id(operation_id)?;
         let owner_hash = operation_owner_hash(operation_id);
         self.with_state(|state, dirty| {
+            if state
+                .completed_operations
+                .iter()
+                .any(|completed| owner_matches(completed, &owner_hash))
+            {
+                return Ok(state.status());
+            }
             if let Some(lease) = &state.lease {
                 if !owner_matches(&lease.owner_hash, &owner_hash) {
                     return Err(OmpMaintenanceError::Conflict(
@@ -408,13 +456,7 @@ impl OmpMaintenance {
                 }
                 return Ok(state.status());
             }
-            if state
-                .completed_operations
-                .iter()
-                .any(|completed| owner_matches(completed, &owner_hash))
-            {
-                return Ok(state.status());
-            }
+
             state.lease = Some(PersistedLease {
                 owner_hash,
                 permit: None,
@@ -483,14 +525,14 @@ impl OmpMaintenance {
         validate_operation_id(operation_id)?;
         let owner_hash = operation_owner_hash(operation_id);
         self.with_state(|state, dirty| {
+            if state
+                .completed_operations
+                .iter()
+                .any(|completed| owner_matches(completed, &owner_hash))
+            {
+                return Ok(state.status());
+            }
             let Some(lease) = &state.lease else {
-                if state
-                    .completed_operations
-                    .iter()
-                    .any(|completed| owner_matches(completed, &owner_hash))
-                {
-                    return Ok(state.status());
-                }
                 return Err(OmpMaintenanceError::NotOwner(
                     "OMP maintenance ownership proof is invalid".into(),
                 ));
@@ -508,16 +550,31 @@ impl OmpMaintenance {
                     "OMP maintenance lease disappeared during release".into(),
                 ));
             };
+            if state.completed_operations.len() == MAX_COMPLETED_OPERATIONS {
+                state.completed_operations.remove(0);
+            }
             state.completed_operations.push(released.owner_hash);
             *dirty = true;
             Ok(state.status())
         })?
     }
 
+    #[cfg(test)]
     pub(crate) fn admit<T, E>(
         &self,
         key: &OmpRouteKey,
         admit_route: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, OmpMaintenanceAdmissionError<E>> {
+        let admitted_key = key.clone();
+        self.admit_replacement(key, || {
+            admit_route().map(|admitted| (admitted_key, admitted))
+        })
+    }
+
+    pub(crate) fn admit_replacement<T, E>(
+        &self,
+        announced_key: &OmpRouteKey,
+        admit_route: impl FnOnce() -> Result<(OmpRouteKey, T), E>,
     ) -> Result<T, OmpMaintenanceAdmissionError<E>> {
         self.with_state(|state, dirty| {
             let proof = match state.lease.as_mut() {
@@ -526,30 +583,68 @@ impl OmpMaintenance {
                     let Some(permit) = lease.permit.as_ref() else {
                         return Err(OmpMaintenanceAdmissionError::Active);
                     };
-                    if permit.session != self.session || permit.pane_id != key.pane_id {
+                    if permit.session != self.session || permit.pane_id != announced_key.pane_id {
                         return Err(OmpMaintenanceAdmissionError::Active);
                     }
                     true
                 }
             };
 
-            let admitted = admit_route().map_err(OmpMaintenanceAdmissionError::Route)?;
+            let (key, admitted) = admit_route().map_err(OmpMaintenanceAdmissionError::Route)?;
+            if key.pane_id != announced_key.pane_id {
+                return Err(OmpMaintenanceAdmissionError::State(
+                    OmpMaintenanceError::StateInvalid(
+                        "OMP route admission changed its durable pane slot".into(),
+                    ),
+                ));
+            }
             if proof {
                 if let Some(lease) = state.lease.as_mut() {
                     lease.permit = None;
                 }
             }
-            state.routes.push(PersistedRoute::new(
-                &self.instance.id,
-                &self.session,
-                key,
-                proof,
-            ));
+            let route = PersistedRoute::new(&self.instance.id, &self.session, &key, proof);
+            if let Some(current) = state
+                .routes
+                .iter_mut()
+                .find(|current| current.same_slot(&self.instance.id, &self.session, &key))
+            {
+                *current = route;
+            } else {
+                state.routes.push(route);
+            }
             *dirty = true;
             Ok(admitted)
         })
         .map_err(OmpMaintenanceAdmissionError::State)?
     }
+
+    pub(crate) fn abort_route_admission(
+        &self,
+        key: &OmpRouteKey,
+    ) -> Result<(), OmpMaintenanceError> {
+        self.with_state(|state, dirty| {
+            let Some(index) = state
+                .routes
+                .iter()
+                .position(|route| route.matches(&self.instance.id, &self.session, key))
+            else {
+                return;
+            };
+            let route = state.routes.remove(index);
+            if route.proof {
+                if let Some(lease) = state.lease.as_mut() {
+                    debug_assert!(lease.permit.is_none());
+                    lease.permit = Some(ServerOmpMaintenancePermit {
+                        session: route.session,
+                        pane_id: route.pane_id,
+                    });
+                }
+            }
+            *dirty = true;
+        })
+    }
+
     pub(crate) fn unregister_route(&self, key: &OmpRouteKey) -> Result<(), OmpMaintenanceError> {
         #[cfg(test)]
         if let Backend::Memory(backend) = &self.backend {
@@ -640,6 +735,13 @@ impl OmpMaintenance {
     }
 
     pub(crate) fn retire_instance(&mut self) {
+        if self.state_commit_uncertain.get() {
+            tracing::warn!(
+                instance_id = %self.instance.id,
+                "retaining OMP maintenance server-instance identity after uncertain state commit"
+            );
+            return;
+        }
         self.instance.retire();
     }
 
@@ -659,6 +761,7 @@ impl OmpMaintenance {
                 lock_path,
                 instance_dir,
                 &self.instance.id,
+                |directory| self.sync_state_parent_directory(directory),
                 apply,
             ),
             #[cfg(test)]
@@ -672,8 +775,7 @@ impl OmpMaintenance {
                         "injected OMP maintenance state failure".into(),
                     ));
                 }
-                backend.state.validate()?;
-                let mut dirty = false;
+                let mut dirty = backend.state.validate_and_compact_legacy()?;
                 let result = apply(&mut backend.state, &mut dirty);
                 if dirty {
                     backend.state.validate()?;
@@ -714,7 +816,26 @@ impl PersistedState {
         }
     }
 
+    fn validate_and_compact_legacy(&mut self) -> Result<bool, OmpMaintenanceError> {
+        if self.completed_operations.len() <= MAX_COMPLETED_OPERATIONS {
+            self.validate()?;
+            return Ok(false);
+        }
+        self.validate_with_completed_operation_limit(false)?;
+        let retain_from = self.completed_operations.len() - MAX_COMPLETED_OPERATIONS;
+        self.completed_operations = self.completed_operations.split_off(retain_from);
+        self.validate()?;
+        Ok(true)
+    }
+
     fn validate(&self) -> Result<(), OmpMaintenanceError> {
+        self.validate_with_completed_operation_limit(true)
+    }
+
+    fn validate_with_completed_operation_limit(
+        &self,
+        enforce_completed_operation_limit: bool,
+    ) -> Result<(), OmpMaintenanceError> {
         if self.version != STATE_VERSION {
             return Err(OmpMaintenanceError::StateInvalid(format!(
                 "unsupported OMP maintenance state version {}",
@@ -745,6 +866,13 @@ impl PersistedState {
             }
         }
 
+        if enforce_completed_operation_limit
+            && self.completed_operations.len() > MAX_COMPLETED_OPERATIONS
+        {
+            return Err(OmpMaintenanceError::StateInvalid(format!(
+                "OMP maintenance contains more than {MAX_COMPLETED_OPERATIONS} completed operations"
+            )));
+        }
         let mut completed = HashSet::new();
         for owner_hash in &self.completed_operations {
             validate_owner_hash(owner_hash)?;
@@ -922,8 +1050,11 @@ fn inspect_file_state(
         .map_err(|error| state_io(&lock_path, "open state lock", error))?;
     lock.lock()
         .map_err(|error| state_io(&lock_path, "lock state", error))?;
-    let state = load_state(&state_path)?;
-    state.validate()?;
+    let mut state = load_state(&state_path)?;
+    let migrated = state.validate_and_compact_legacy()?;
+    if migrated {
+        save_state(&state_path, &state, sync_parent_directory)?;
+    }
     Ok(state.status())
 }
 
@@ -933,6 +1064,7 @@ fn with_file_state<T>(
     lock_path: &Path,
     instance_dir: &Path,
     current_instance_id: &str,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
     apply: impl FnOnce(&mut PersistedState, &mut bool) -> T,
 ) -> Result<T, OmpMaintenanceError> {
     if state_path.parent() != Some(state_root)
@@ -957,12 +1089,12 @@ fn with_file_state<T>(
         .map_err(|error| state_io(lock_path, "lock state", error))?;
 
     let mut state = load_state(state_path)?;
-    state.validate()?;
-    let mut dirty = reconcile_stale_routes(&mut state, instance_dir, current_instance_id)?;
+    let mut dirty = state.validate_and_compact_legacy()?;
+    dirty |= reconcile_stale_routes(&mut state, instance_dir, current_instance_id)?;
     let result = apply(&mut state, &mut dirty);
     if dirty {
         state.validate()?;
-        save_state(state_path, &state)?;
+        save_state(state_path, &state, sync_parent)?;
     }
     Ok(result)
 }
@@ -1022,24 +1154,51 @@ fn reconcile_stale_routes(
     if stale.is_empty() {
         return Ok(false);
     }
+    let restored_permit = state
+        .routes
+        .iter()
+        .find(|route| route.proof && stale.contains(&route.server_instance_id))
+        .map(|route| ServerOmpMaintenancePermit {
+            session: route.session.clone(),
+            pane_id: route.pane_id.clone(),
+        });
     state
         .routes
         .retain(|route| !stale.contains(&route.server_instance_id));
+    if let (Some(lease), Some(permit)) = (state.lease.as_mut(), restored_permit) {
+        lease.permit = Some(permit);
+    }
     Ok(true)
 }
 
 fn load_state(path: &Path) -> Result<PersistedState, OmpMaintenanceError> {
-    let mut file = match open_private(path, false, false) {
+    let file = match open_private(path, false, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(PersistedState::default());
         }
         Err(error) => return Err(state_io(path, "open state", error)),
     };
-    let mut content = String::new();
-    file.read_to_string(&mut content)
+    let metadata = file
+        .metadata()
+        .map_err(|error| state_io(path, "inspect state", error))?;
+    if metadata.len() > MAX_STATE_FILE_BYTES as u64 {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state {} exceeds {MAX_STATE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_STATE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut content)
         .map_err(|error| state_io(path, "read state", error))?;
-    serde_json::from_str(&content).map_err(|error| {
+    if content.len() > MAX_STATE_FILE_BYTES {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state {} exceeds {MAX_STATE_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&content).map_err(|error| {
         OmpMaintenanceError::StateInvalid(format!(
             "failed to parse OMP maintenance state {}: {error}",
             path.display()
@@ -1047,20 +1206,39 @@ fn load_state(path: &Path) -> Result<PersistedState, OmpMaintenanceError> {
     })
 }
 
-fn save_state(path: &Path, state: &PersistedState) -> Result<(), OmpMaintenanceError> {
-    save_state_with_hook(path, state, |_| Ok(()))
+fn save_state(
+    path: &Path,
+    state: &PersistedState,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), OmpMaintenanceError> {
+    save_state_with_hooks(path, state, |_| Ok(()), sync_parent)
 }
 
+#[cfg(test)]
 fn save_state_with_hook(
     path: &Path,
     state: &PersistedState,
     before_replace: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), OmpMaintenanceError> {
+    save_state_with_hooks(path, state, before_replace, sync_parent_directory)
+}
+
+fn save_state_with_hooks(
+    path: &Path,
+    state: &PersistedState,
+    before_replace: impl FnOnce(&Path) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), OmpMaintenanceError> {
     let content = serde_json::to_vec(state).map_err(|error| {
         OmpMaintenanceError::StateInvalid(format!(
             "failed to encode OMP maintenance state: {error}"
         ))
     })?;
+    if content.len() >= MAX_STATE_FILE_BYTES {
+        return Err(OmpMaintenanceError::StateInvalid(format!(
+            "OMP maintenance state exceeds {MAX_STATE_FILE_BYTES} bytes"
+        )));
+    }
     let parent = path.parent().ok_or_else(|| {
         OmpMaintenanceError::StateIo("OMP maintenance state path has no parent".into())
     })?;
@@ -1095,7 +1273,7 @@ fn save_state_with_hook(
     replace_state_file(temporary.path(), path)
         .map_err(|error| state_io(path, "replace state", error))?;
     temporary.persist();
-    sync_parent_directory(parent).map_err(|error| state_io(parent, "sync state directory", error))
+    sync_parent(parent).map_err(|error| state_io(parent, "sync state directory", error))
 }
 
 struct TemporaryStateFile {
@@ -1872,6 +2050,34 @@ mod tests {
             ))
     }
 
+    #[test]
+    fn canonical_replacement_updates_the_public_route_in_place() {
+        let store = TestOmpMaintenanceStore::new();
+        let host = OmpMaintenance::for_test("host", store.clone());
+        let inspector = OmpMaintenance::for_test("inspector", store);
+        let announced = route("w1:p1");
+        host.admit(&announced, || Ok::<_, ()>(())).unwrap();
+        let canonical = OmpRouteKey {
+            pane_id: announced.pane_id.clone(),
+            omp_session_id: "replacement-session".into(),
+            route_generation: 2,
+        };
+
+        let admitted_generation = host
+            .admit_replacement(&announced, || {
+                Ok::<_, ()>((canonical.clone(), canonical.route_generation))
+            })
+            .unwrap();
+        let status = inspector.inspect().unwrap();
+
+        assert_eq!(admitted_generation, 2);
+        assert_eq!(status.route_count, 1);
+        assert_eq!(status.routes[0].omp_session_id, canonical.omp_session_id);
+        assert_eq!(
+            status.routes[0].route_generation,
+            canonical.route_generation
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn ambient_environment_cannot_partition_the_account_maintenance_root() {
@@ -2106,6 +2312,58 @@ mod tests {
         assert_eq!(status.routes[0].session, "second");
         drop(second);
         assert_eq!(controller.status().unwrap().route_count, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn post_replace_sync_failure_keeps_committed_replacement_recoverable() {
+        let dir = test_dir("post-replace-sync");
+        let _ = fs::remove_dir_all(&dir);
+        let state_path = dir.join("state.json");
+        let owner = operation_id(26);
+        let announced = route("w1:p1");
+        let replacement = OmpRouteKey {
+            route_generation: 2,
+            ..announced.clone()
+        };
+        let mut host = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+
+        host.acquire(&owner).unwrap();
+        host.grant_permit(&owner, "default", &announced.pane_id)
+            .unwrap();
+        host.fail_next_post_replace_syncs(1);
+
+        assert!(matches!(
+            host.admit_replacement(&announced, || {
+                Ok::<_, ()>((replacement.clone(), replacement.route_generation))
+            }),
+            Err(OmpMaintenanceAdmissionError::State(
+                OmpMaintenanceError::StateIo(_)
+            ))
+        ));
+        host.retire_instance();
+        drop(host);
+        let reopened = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let reconciled = reopened.status().unwrap();
+        assert!(reconciled.held);
+        assert_eq!(reconciled.route_count, 0);
+        assert_eq!(
+            reconciled.permit,
+            Some(ServerOmpMaintenancePermit {
+                session: "default".into(),
+                pane_id: announced.pane_id.clone(),
+            })
+        );
+        assert!(!reopened.release(&owner).unwrap().held);
+
+        let retry = route("w2:p1");
+        reopened.admit(&retry, || Ok::<_, ()>(())).unwrap();
+        assert_eq!(reopened.status().unwrap().route_count, 1);
+        reopened.unregister_route(&retry).unwrap();
+        let final_status = reopened.status().unwrap();
+        assert!(!final_status.held);
+        assert_eq!(final_status.route_count, 0);
+        drop(reopened);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2407,6 +2665,171 @@ mod tests {
             Err(OmpMaintenanceError::NotOwner(_))
         ));
         assert!(maintenance.acquire(&next).unwrap().held);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lost_response_acquire_retry_replays_after_later_lease_operation() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store);
+        let original = operation_id(8);
+        let later = operation_id(9);
+
+        maintenance.acquire(&original).unwrap();
+        maintenance.release(&original).unwrap();
+        let current = maintenance.acquire(&later).unwrap();
+
+        assert_eq!(maintenance.acquire(&original).unwrap(), current);
+    }
+
+    #[test]
+    fn lost_response_release_retry_replays_after_later_lease_operation() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store);
+        let original = operation_id(10);
+        let later = operation_id(11);
+
+        maintenance.acquire(&original).unwrap();
+        maintenance.release(&original).unwrap();
+        let current = maintenance.acquire(&later).unwrap();
+
+        assert_eq!(maintenance.release(&original).unwrap(), current);
+    }
+
+    #[test]
+    fn completed_operations_are_bounded_to_recent_retries() {
+        let store = TestOmpMaintenanceStore::new();
+        let maintenance = OmpMaintenance::for_test("default", store.clone());
+
+        for seed in 0..=MAX_COMPLETED_OPERATIONS as u8 {
+            let operation = operation_id(seed);
+            maintenance.acquire(&operation).unwrap();
+            maintenance.release(&operation).unwrap();
+        }
+
+        {
+            let state = store.0.lock().unwrap();
+            assert_eq!(
+                state.state.completed_operations.len(),
+                MAX_COMPLETED_OPERATIONS
+            );
+            assert!(!state
+                .state
+                .completed_operations
+                .contains(&operation_owner_hash(&operation_id(0))));
+            assert!(state
+                .state
+                .completed_operations
+                .contains(&operation_owner_hash(&operation_id(
+                    MAX_COMPLETED_OPERATIONS as u8
+                ))));
+        }
+
+        assert!(
+            !maintenance
+                .acquire(&operation_id(MAX_COMPLETED_OPERATIONS as u8))
+                .unwrap()
+                .held
+        );
+    }
+
+    #[test]
+    fn legacy_completed_operations_are_compacted_before_file_state_use() {
+        let dir = test_dir("legacy-compaction");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let legacy = PersistedState {
+            version: STATE_VERSION,
+            lease: None,
+            completed_operations: (0..=MAX_COMPLETED_OPERATIONS as u8)
+                .map(|seed| operation_owner_hash(&operation_id(seed)))
+                .collect(),
+            routes: Vec::new(),
+        };
+        fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        make_private(&state_path);
+        make_private(&lock_path);
+
+        let maintenance = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let inspected = maintenance.inspect().unwrap();
+        assert!(!inspected.held);
+
+        let compacted: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            compacted.completed_operations,
+            (1..=MAX_COMPLETED_OPERATIONS as u8)
+                .map(|seed| operation_owner_hash(&operation_id(seed)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(maintenance.status().unwrap(), inspected);
+
+        let reacquired = maintenance.acquire(&operation_id(0)).unwrap();
+        assert!(reacquired.held);
+        assert!(!maintenance.release(&operation_id(0)).unwrap().held);
+        assert_eq!(
+            serde_json::from_slice::<PersistedState>(&fs::read(&state_path).unwrap())
+                .unwrap()
+                .completed_operations
+                .len(),
+            MAX_COMPLETED_OPERATIONS
+        );
+        drop(maintenance);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_compaction_rejects_an_invalid_entry_before_dropping_it() {
+        let dir = test_dir("legacy-invalid-compaction");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let lock_path = state_path.with_extension("lock");
+        let mut completed_operations = (0..=MAX_COMPLETED_OPERATIONS as u8)
+            .map(|seed| operation_owner_hash(&operation_id(seed)))
+            .collect::<Vec<_>>();
+        completed_operations[0] = "invalid-owner-hash".into();
+        let legacy = PersistedState {
+            version: STATE_VERSION,
+            lease: None,
+            completed_operations,
+            routes: Vec::new(),
+        };
+        fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        make_private(&state_path);
+        make_private(&lock_path);
+
+        let maintenance = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        assert!(matches!(
+            maintenance.inspect(),
+            Err(OmpMaintenanceError::StateInvalid(message))
+                if message.contains("owner hash")
+        ));
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        drop(maintenance);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_state_is_rejected_before_parsing() {
+        let dir = test_dir("oversized-state");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        fs::write(&state_path, vec![b'{'; MAX_STATE_FILE_BYTES + 1]).unwrap();
+        make_private(&state_path);
+
+        let error = load_state(&state_path).unwrap_err();
+        assert!(matches!(
+            error,
+            OmpMaintenanceError::StateInvalid(message) if message.contains("exceeds")
+        ));
         let _ = fs::remove_dir_all(dir);
     }
     #[test]

@@ -18,7 +18,6 @@ use support::{
     send_input, unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_socket,
 };
 const TEST_HANDOFF_OWNER_PID_ENV: &str = "HERDR_TEST_HANDOFF_OWNER_PID";
-
 fn fresh_omp_maintenance_owner() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("generate maintenance test capability");
@@ -54,6 +53,37 @@ fn unique_test_dir() -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
+}
+fn write_versioned_handoff_importer(path: &Path, accepted_version: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::write(
+        path,
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import socket
+import sys
+
+socket_path, token = sys.argv[-2:]
+stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+stream.connect(socket_path)
+stream.sendall(token.encode() + b"\n")
+line = b""
+while not line.endswith(b"\n"):
+    chunk = stream.recv(4096)
+    if not chunk:
+        sys.exit(20)
+    line += chunk
+manifest = json.loads(line)
+if manifest.get("version") != {accepted_version}:
+    sys.exit(21)
+stream.sendall(b"validated\n")
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
@@ -821,6 +851,72 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     cleanup_test_base(&base);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_preserves_layout_apply_idempotency_epoch() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    assert_ok(created.clone());
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace create should return an id")
+        .to_owned();
+    let layout_request = serde_json::json!({
+        "id": "test:layout:apply",
+        "method": "layout.apply_idempotent",
+        "params": {
+            "idempotency_key": "handoff-layout-epoch",
+            "workspace_id": workspace_id,
+            "tab_label": "handoff-idempotency",
+            "focus": false,
+            "root": {
+                "type": "pane",
+                "command": ["/bin/sh", "-c", "sleep 30"]
+            }
+        }
+    });
+    let applied = request(&api_socket, layout_request.clone());
+    assert_ok(applied.clone());
+    let tab_id = applied["result"]["layout"]["tab_id"]
+        .as_str()
+        .expect("layout apply should return a tab id")
+        .to_owned();
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let mut replay_request = layout_request;
+    replay_request["id"] = serde_json::json!("test:layout:replay");
+    let replayed = request(&api_socket, replay_request);
+    assert_ok(replayed.clone());
+    assert_eq!(replayed["result"]["layout"]["tab_id"], tab_id);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
     let _lock = test_lock();
@@ -906,8 +1002,6 @@ fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
 
 #[test]
 fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let _lock = test_lock();
     let base = unique_test_dir();
     let owner = fresh_omp_maintenance_owner();
@@ -916,31 +1010,7 @@ fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
     let api_socket = runtime_dir.join("herdr.sock");
     let legacy_import = base.join("legacy-herdr");
     fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &legacy_import,
-        r#"#!/usr/bin/env python3
-import json
-import socket
-import sys
-
-socket_path, token = sys.argv[-2:]
-stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-stream.connect(socket_path)
-stream.sendall(token.encode() + b"\n")
-line = b""
-while not line.endswith(b"\n"):
-    chunk = stream.recv(4096)
-    if not chunk:
-        sys.exit(20)
-    line += chunk
-manifest = json.loads(line)
-if manifest.get("version") != 1:
-    sys.exit(21)
-stream.sendall(b"validated\n")
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&legacy_import, fs::Permissions::from_mode(0o700)).unwrap();
+    write_versioned_handoff_importer(&legacy_import, 1);
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -996,6 +1066,201 @@ stream.sendall(b"validated\n")
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_rejects_pre_epoch_importer_without_replacing_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let previous_import = base.join("previous-herdr");
+    fs::create_dir_all(&base).unwrap();
+    write_versioned_handoff_importer(&previous_import, 2);
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let response = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff:pre-epoch",
+            "method": "server.live_handoff",
+            "params": {"import_exe": previous_import.to_string_lossy()}
+        }),
+    );
+    assert_eq!(response["error"]["code"], "handoff_failed");
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert!(
+        spawned.child.try_wait().unwrap().is_none(),
+        "the current server must remain alive after importer rejection"
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    ));
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn failed_external_handoff_preserves_v5_session_for_restart() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let session_dir = config_home.join(if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    });
+    let session_path = session_dir.join("session.json");
+    let ledger_path = session_dir.join("api-idempotency.json");
+    fs::create_dir_all(&base).unwrap();
+    let fake_omp = base.join("omp");
+    let started_marker = base.join("omp-started");
+    fs::write(
+        &fake_omp,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=omp\necho started > {}\nsleep 30\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    assert_ok(created.clone());
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let applied = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:layout:apply",
+            "method": "layout.apply_idempotent",
+            "params": {
+                "idempotency_key": "handoff-precommit-ledger",
+                "workspace_id": workspace_id,
+                "tab_label": "handoff-precommit",
+                "focus": false,
+                "root": {"type": "pane", "command": ["/bin/sh", "-c", "sleep 30"]}
+            }
+        }),
+    );
+    assert_ok(applied.clone());
+    let tab_id = applied["result"]["layout"]["tab_id"].as_str().unwrap();
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+    ledger["layout_apply"]["handoff-precommit-ledger"]["outcome"] =
+        serde_json::json!({"state": "pending", "expected_tab_id": tab_id});
+    let pending_ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
+    fs::write(&ledger_path, &pending_ledger_bytes).unwrap();
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-omp",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": fake_omp, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&started_marker, Duration::from_secs(5));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:external-session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:omp",
+                "agent": "omp",
+                "seq": 1,
+                "agent_session_id": "external-handoff-session",
+                "session_start_source": "startup",
+                "resume_policy": "external"
+            }
+        }),
+    ));
+    let pane = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:get-external","method":"pane.get","params":{"pane_id":pane_id}}),
+    );
+    assert_eq!(
+        pane["result"]["pane"]["agent_session"]["resume_policy"], "external",
+        "external report did not reach pane state: {pane}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut observed_version = serde_json::Value::Null;
+    let mut persisted = loop {
+        if let Ok(bytes) = fs::read(&session_path) {
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            observed_version = value["version"].clone();
+            if value["version"] == 6 {
+                break value;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "external v6 session was not persisted; observed version {observed_version} at {}",
+            session_path.display()
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    persisted["version"] = serde_json::json!(5);
+    let v5_bytes = serde_json::to_vec_pretty(&persisted).unwrap();
+    fs::write(&session_path, &v5_bytes).unwrap();
+
+    let response = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff:fail-after-restore","method":"server.live_handoff","params":{}}),
+    );
+    assert_eq!(response["error"]["code"], "handoff_failed");
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(fs::read(&session_path).unwrap(), v5_bytes);
+    assert_eq!(fs::read(&ledger_path).unwrap(), pending_ledger_bytes);
+    assert!(spawned.child.try_wait().unwrap().is_none());
+
+    drop(spawned);
+    let _ = fs::remove_file(&api_socket);
+    let _ = fs::remove_file(runtime_dir.join("herdr-client.sock"));
+    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:restart:ping","method":"ping","params":{}}),
+    ));
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(restarted);
     cleanup_test_base(&base);
 }
 
@@ -1077,6 +1342,7 @@ fn live_handoff_preserved_shell_discovers_replacement_omp_bridge() {
 import json
 import os
 import socket
+import time
 
 marker = __MARKER__
 omp_build_id = __OMP_BUILD_ID__
@@ -1113,27 +1379,66 @@ def start():
         raise RuntimeError("bridge discovery address missing")
     if not isinstance(token, str) or not token:
         raise RuntimeError("bridge discovery credential missing")
+    announced_generation = result.get("route_generation")
+    if type(announced_generation) is not int or announced_generation != 1:
+        raise RuntimeError("bridge discovery did not return initial generation 1")
 
     host, port = address.rsplit(":", 1)
-    bridge = socket.create_connection((host, int(port)), timeout=5)
-    announcement = {
-        "t": "host",
-        "paneId": pane_id,
-        "ompSessionId": "handoff-discovery",
-        "routeGeneration": 1,
-        "token": token,
-        "ompBuildId": omp_build_id,
-    }
-    bridge.sendall((json.dumps(announcement, separators=(",", ":")) + "\n").encode())
-    ready_line = bridge.makefile("r", encoding="utf-8").readline()
-    if not ready_line or json.loads(ready_line).get("t") != "ready":
-        raise RuntimeError("replacement OMP bridge did not accept host")
+    def announce(session, generation):
+        connection = socket.create_connection((host, int(port)), timeout=5)
+        announcement = {
+            "t": "host",
+            "paneId": pane_id,
+            "ompSessionId": session,
+            "routeGeneration": generation,
+            "token": token,
+            "ompBuildId": omp_build_id,
+        }
+        connection.sendall((json.dumps(announcement, separators=(",", ":")) + "\n").encode())
+        with connection.makefile("r", encoding="utf-8") as reader:
+            response = json.loads(reader.readline())
+        return connection, response
+
+    bridge, ready = announce("handoff-discovery", announced_generation)
+    if ready != {"t": "ready", "routeGeneration": 1}:
+        raise RuntimeError("replacement OMP bridge did not assign generation 1")
+    busy_bridge, busy = announce("other-session", announced_generation)
+    busy_bridge.close()
+    if busy.get("code") != "route_busy":
+        raise RuntimeError("live pane accepted another OMP session")
+    bridge.close()
+
+    deadline = time.monotonic() + 5
+    while True:
+        replacement, ready = announce("replacement-session", announced_generation)
+        if ready.get("t") == "ready":
+            break
+        replacement.close()
+        if ready.get("code") != "route_busy" or time.monotonic() >= deadline:
+            raise RuntimeError("stopped host route did not become replaceable")
+        time.sleep(0.01)
+    if ready.get("routeGeneration") != 2:
+        raise RuntimeError("server did not advance the replacement generation")
+    stale_bridge, stale = announce("stale-session", announced_generation)
+    stale_bridge.close()
+    if stale.get("code") != "stale_generation":
+        raise RuntimeError("server accepted a stale generation")
+    api.close()
+    api = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    api.settimeout(5)
+    api.connect(os.environ["HERDR_SOCKET_PATH"])
+    api.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+    current = json.loads(api.makefile("r", encoding="utf-8").readline())
+    if current.get("result", {}).get("route_generation") != 2:
+        raise RuntimeError("bridge discovery did not expose the canonical generation")
+    replacement.close()
     return {
         "inherited_pane_id": inherited_pane_id,
         "stale_pane_id": stale_pane_id,
         "pane_id": pane_id,
         "inherited_address": inherited_address,
         "address": address,
+        "assigned_generations": [announced_generation, ready["routeGeneration"]],
     }
 
 try:
@@ -1200,6 +1505,7 @@ if "error" in payload:
     let payload: serde_json::Value = serde_json::from_str(&marker_text).unwrap();
     assert!(payload.get("error").is_none(), "fake OMP failed: {payload}");
     assert_eq!(payload["inherited_pane_id"], pane_id);
+    assert_eq!(payload["assigned_generations"], serde_json::json!([1, 2]));
     assert_ne!(
         payload["pane_id"], payload["stale_pane_id"],
         "bridge discovery trusted the stale public pane ID"

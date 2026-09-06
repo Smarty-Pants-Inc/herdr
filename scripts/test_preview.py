@@ -16,41 +16,6 @@ from unittest import mock
 import scripts.conventional_commits as conventional_commits
 import scripts.preview as preview
 
-CI_WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
-PR_GATE_PATH = Path(__file__).resolve().parents[1] / ".github/workflows/pr-gate.yml"
-
-
-def pr_gate_source() -> str:
-    return PR_GATE_PATH.read_text(encoding="utf-8")
-
-
-def ci_workflow_source() -> str:
-    return CI_WORKFLOW_PATH.read_text(encoding="utf-8")
-
-
-class CiWorkflowTests(unittest.TestCase):
-    def test_mergify_queue_ci_uses_exact_identity_and_non_cancelling_runs(self):
-        source = ci_workflow_source()
-        self.assertIn("github.event.pull_request.user.id == 37929162", source)
-        self.assertIn("github.event.pull_request.user.id != 37929162", source)
-        self.assertIn(
-            "startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') && github.run_id",
-            source,
-        )
-        self.assertIn("cancel-in-progress: ${{ github.event_name != 'pull_request'", source)
-
-class PrGateWorkflowTests(unittest.TestCase):
-    def test_mergify_queue_exemption_requires_bot_id_prefix_and_allowed_base(self):
-        source = pr_gate_source()
-        self.assertIn("const MERGIFY_BOT_USER_ID = 37929162;", source)
-        self.assertIn(
-            "const MERGIFY_QUEUE_BASES = new Set(['master', 'smarty-preview-source']);",
-            source,
-        )
-        self.assertIn("pr.user.id === MERGIFY_BOT_USER_ID", source)
-        self.assertIn("pr.head.ref.startsWith('mergify/merge-queue/')", source)
-        self.assertIn("MERGIFY_QUEUE_BASES.has(pr.base.ref)", source)
-
 OMP_SOURCE = {
     "repository": "Smarty-Pants-Inc/oh-my-pi",
     "commit": "a" * 40,
@@ -151,6 +116,7 @@ class PrGateWorkflowTests(unittest.TestCase):
         self.assertIn("pr.user.id === MERGIFY_BOT_USER_ID", source)
         self.assertIn("pr.head.ref.startsWith('mergify/merge-queue/')", source)
         self.assertIn("MERGIFY_QUEUE_BASES.has(pr.base.ref)", source)
+
 
 class PreviewNotesTests(unittest.TestCase):
     def test_humanize_groups_conventional_subjects(self):
@@ -1091,19 +1057,7 @@ file: ../../../public/assets/logo.svg
         self.assertIn("workflow_run:\n    workflows: [\"Smarty Preview\"]\n    types: [completed]", trusted)
         self.assertEqual(
             list(jobs),
-            [
-                "validate-seal",
-                "trusted-source",
-                "trusted-build",
-                "trusted-omp-build",
-                "trusted-assemble",
-                "attest-and-seal",
-                "publish-release",
-                "phase-a-channel",
-                "phase-a-commit",
-                "phase-b-promotion",
-                "phase-b-commit",
-            ],
+            ["validate-seal", "trusted-source", "trusted-build", "trusted-omp-build", "trusted-assemble", "attest-and-seal", "publish-release", "phase-a-channel", "phase-a-commit", "phase-b-promotion", "phase-b-commit"],
         )
         for required in (
             "github.event.workflow_run.id",
@@ -1125,11 +1079,11 @@ file: ../../../public/assets/logo.svg
             trusted,
         )
         self.assertIn(
-            "trusted-channel-bridge-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
+            "trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
             trusted,
         )
-        self.assertIn(
-            "trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}-${{ github.run_attempt }}",
+        self.assertNotIn(
+            "name: trusted-channel-promotion-authorization-${{ needs.validate-seal.outputs.tag }}-${{ needs.validate-seal.outputs.run_attempt }}\n",
             trusted,
         )
         for pool in (
@@ -1177,13 +1131,12 @@ file: ../../../public/assets/logo.svg
         self.assertIn("setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6", trusted)
         self.assertIn("bun-version: 1.4.0", trusted)
         self.assertIn("Build trusted OMP and native assets", trusted)
-        self.assertIn("scripts/preview.py spdx", trusted)
-        self.assertIn("scripts/preview.py pair-manifest", trusted)
+        self.assertIn("smarty_preview_release.py spdx", trusted)
+        self.assertIn("smarty_preview_release.py pair-manifest", trusted)
         self.assertIn("actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6", trusted)
         self.assertIn("smarty-provenance-", trusted)
         self.assertIn("trusted-final-release-", trusted)
-        self.assertIn("release(tagName: $tag) { databaseId }", trusted)
-        self.assertIn('gh api "repos/$REPOSITORY/releases/$release_id"', trusted)
+        self.assertIn("Resolve existing exact release", trusted)
         self.assertIn("gh release upload", trusted)
         self.assertIn("smarty_preview_trusted.py seal", trusted)
         self.assertIn('export HERDR_BUILD_UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/Smarty-Pants-Inc/herdr/smarty-channel/preview.json"', trusted)
@@ -1193,21 +1146,37 @@ file: ../../../public/assets/logo.svg
             self.assertIn("trusted-herdr-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
             self.assertIn("trusted-omp-" + platform + "-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
         self.assertIn("trusted-herdr-windows-x86_64-${{ needs.validate-seal.outputs.run_attempt }}", trusted)
+        self.assertIn("Validate exact protected promotion target", trusted)
+        self.assertIn("Promote canonical channel and consume both authorizations atomically", trusted)
+        self.assertIn("smarty_preview_promotion.py review", trusted)
         self.assertEqual(len(preview.FULL_RELEASE_ASSET_NAMES), 37)
         self.assertEqual(len(set(preview.FULL_RELEASE_ASSET_NAMES)), 37)
-        self.assertEqual(preview.SEMANTIC_VERIFICATION_SCHEMA, "smarty.semantic-verification.v2")
-        self.assertEqual(preview.SOURCE_ARCHIVE_NAMES, ("herdr-source.tar",))
+        self.assertEqual(preview.SEMANTIC_VERIFICATION_SCHEMA, "smarty.semantic-verification.v3")
+        self.assertEqual(preview.SEMANTIC_VERIFICATION_V3_CUTOFF_DAY, "2026-08-31")
+        self.assertEqual(
+            preview.SOURCE_ARCHIVE_NAMES,
+            ("herdr-source.tar", "omp-source.tar"),
+        )
         jobs = workflow_jobs(trusted)
-        self.assertNotIn("omp-source.tar", trusted)
-        self.assertNotIn("tarfile.open", jobs["trusted-source"])
+        self.assertIn("validate-git-archive", jobs["trusted-source"])
+        self.assertIn("validate-sources", jobs["trusted-source"])
         self.assertIn("trusted-source-record.json", jobs["trusted-source"])
+        self.assertNotIn("tarfile.open", jobs["trusted-source"])
+        self.assertIn(
+            "cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar",
+            jobs["trusted-assemble"],
+        )
+        self.assertLess(
+            trusted.index("cp validation/producer/source-archives/herdr-source.tar source-archives/herdr-source.tar"),
+            trusted.index("smarty_preview_release.py pair-manifest"),
+        )
         self.assertNotIn("publisher-source", jobs["trusted-build"])
         self.assertIn("source\\scripts\\package_windows_conpty.ps1", jobs["trusted-build"])
         for job in ("trusted-omp-build", "trusted-assemble", "attest-and-seal"):
-            self.assertIn("Checkout exact private OMP source", jobs[job])
-            self.assertIn("ref: ${{ needs.trusted-source.outputs.omp_commit }}", jobs[job])
+            self.assertIn("Checkout exact validated private OMP source", jobs[job])
+            self.assertIn("ref: ${{ needs.validate-seal.outputs.omp }}", jobs[job])
             self.assertIn("token: ${{ secrets.SMARTY_SOURCE_READ_TOKEN }}", jobs[job])
-            self.assertIn('git -C omp-source rev-parse HEAD^{commit}', jobs[job])
+            self.assertIn('git", "-C", "omp-source", "rev-parse", "HEAD"', jobs[job])
         self.assertNotIn("extract-tar", jobs["trusted-omp-build"])
         self.assertNotIn("HERDR_BUILD_OMP", jobs["trusted-omp-build"])
 
@@ -1841,12 +1810,16 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             )
         return herdr_root, omp_root, bazel_graph, metadata_dir, rules_rust_toolchains
 
-    def _write_semantic_verification_inputs(self, root: Path) -> tuple[Path, Path]:
+    def _write_semantic_verification_inputs(
+        self,
+        root: Path,
+        schema: str = preview.SEMANTIC_VERIFICATION_SCHEMA,
+    ) -> tuple[Path, Path]:
         verifier = root / "trusted-release-verifier.py"
         verifier.write_bytes(Path(preview.__file__).read_bytes())
         archives = root / "source-archives"
         archives.mkdir()
-        for name in preview.SOURCE_ARCHIVE_NAMES:
+        for name in preview.SEMANTIC_VERIFICATION_SOURCE_ARCHIVES[schema]:
             (archives / name).write_bytes(f"fixture {name}\n".encode("ascii"))
         return verifier, archives
 
@@ -1881,8 +1854,17 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
 
         self._rewrite_pair(asset_dir, update)
 
-    def _build_release(self, root: Path, *, built_at: str | None = None) -> Path:
+    def _build_release(
+        self,
+        root: Path,
+        *,
+        built_at: str | None = None,
+        build_id: str | None = None,
+        semantic_verification_schema: str = preview.SEMANTIC_VERIFICATION_SCHEMA,
+    ) -> Path:
         built_at = built_at or self.built_at
+        build_id = build_id or self.build_id
+        tag = f"smarty-preview-{build_id}"
         root.mkdir(parents=True, exist_ok=True)
         asset_dir = root / "assets"
         asset_dir.mkdir()
@@ -1894,7 +1876,7 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             rules_rust_toolchains,
         ) = self._write_lock_inputs(root)
         trusted_verifier, source_archive_dir = self._write_semantic_verification_inputs(
-            root
+            root, semantic_verification_schema
         )
         self._write_payloads(asset_dir, herdr_root)
         payload_digests = {
@@ -1908,7 +1890,7 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
                 parent_commit=self.parent_commit,
                 herdr_commit=self.herdr_commit,
                 omp_commit=OMP_SOURCE["commit"],
-                herdr_version=f"0.8.2-preview.{self.build_id}",
+                herdr_version=f"0.8.2-preview.{build_id}",
                 omp_version=OMP_SOURCE["version"],
                 herdr_root=herdr_root,
                 omp_root=omp_root,
@@ -1943,8 +1925,8 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             preview.build_pair_manifest(
                 asset_dir=asset_dir,
                 repo="Smarty-Pants-Inc/herdr",
-                tag=self.tag,
-                build_id=self.build_id,
+                tag=tag,
+                build_id=build_id,
                 built_at=built_at,
                 parent_repo="Smarty-Pants-Inc/smarty-dev",
                 parent_commit=self.parent_commit,
@@ -1963,6 +1945,7 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
                 cargo_metadata_dir=cargo_metadata_dir,
                 bun_version="1.4.0",
                 zig_version="0.15.2",
+                semantic_verification_schema=semantic_verification_schema,
             ),
             encoding="utf-8",
         )
@@ -1973,9 +1956,11 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
         self,
         asset_dir: Path,
         *,
+        expected_build_id: str | None = None,
         rules_rust_toolchains: Path | None = None,
     ) -> dict:
         root = asset_dir.parent
+        expected_build_id = expected_build_id or self.build_id
         return preview.verify_pair(
             asset_dir=asset_dir,
             expected_parent=self.parent_commit,
@@ -1984,8 +1969,8 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             expected_parent_tree=self.parent_tree,
             expected_source_tree=self.herdr_tree,
             expected_omp_tree=OMP_SOURCE["tree"],
-            expected_tag=self.tag,
-            expected_build_id=self.build_id,
+            expected_tag=f"smarty-preview-{expected_build_id}",
+            expected_build_id=expected_build_id,
             herdr_root=root / "herdr",
             omp_root=root / "omp",
             omp_bazel_graph=root / "omp-bazel-graph.json",
@@ -2634,6 +2619,91 @@ checksum = "5555555555555555555555555555555555555555555555555555555555555555"
             self.assertEqual(verified["schema"], preview.PAIR_MANIFEST_SCHEMA)
             self.assertEqual(verified["pair_id"], expected_pair_id)
 
+    def test_verify_pair_accepts_historical_v2_with_only_herdr_source_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            built_at = "2026-08-30T23:59:59Z"
+            build_id = preview.paired_build_id(
+                built_at, self.parent_commit, self.herdr_commit, OMP_SOURCE["commit"]
+            )
+            asset_dir = self._build_release(
+                Path(tmp),
+                built_at=built_at,
+                build_id=build_id,
+                semantic_verification_schema=preview.SEMANTIC_VERIFICATION_V2_SCHEMA,
+            )
+            document = json.loads(
+                (asset_dir / preview.PAIR_MANIFEST_ASSET_NAME).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                document["verification"]["schema"],
+                preview.SEMANTIC_VERIFICATION_V2_SCHEMA,
+            )
+            self.assertEqual(
+                set(document["verification"]["source_archives"]),
+                {"herdr-source.tar"},
+            )
+            self.assertEqual(
+                self._verify(asset_dir, expected_build_id=build_id)["verification"][
+                    "schema"
+                ],
+                preview.SEMANTIC_VERIFICATION_V2_SCHEMA,
+            )
+
+    def test_verify_pair_rejects_v2_at_or_after_v3_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for day in (
+                preview.SEMANTIC_VERIFICATION_V3_CUTOFF_DAY,
+                "2026-09-01",
+                "2026-09-02",
+            ):
+                with self.subTest(day=day):
+                    built_at = f"{day}T03:00:00Z"
+                    build_id = preview.paired_build_id(
+                        built_at,
+                        self.parent_commit,
+                        self.herdr_commit,
+                        OMP_SOURCE["commit"],
+                    )
+                    asset_dir = self._build_release(
+                        root / day,
+                        built_at=built_at,
+                        build_id=build_id,
+                        semantic_verification_schema=preview.SEMANTIC_VERIFICATION_V2_SCHEMA,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "v2 is only accepted before the 2026-08-31 v3 cutoff",
+                    ):
+                        self._verify(asset_dir, expected_build_id=build_id)
+
+    def test_verify_pair_v3_requires_both_exact_source_archives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.subTest("missing manifest record"):
+                asset_dir = self._build_release(root / "missing")
+                self._rewrite_pair(
+                    asset_dir,
+                    lambda document: document["verification"]["source_archives"].pop(
+                        "omp-source.tar"
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "semantic source archives must contain exactly"
+                ):
+                    self._verify(asset_dir)
+
+            with self.subTest("extra archive"):
+                asset_dir = self._build_release(root / "extra")
+                (asset_dir.parent / "source-archives" / "unexpected.tar").write_bytes(
+                    b"unexpected\n"
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "trusted source archives file set mismatch"
+                ):
+                    self._verify(asset_dir)
     def test_legacy_manifest_stays_schema_one_without_pair_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             content = preview.build_manifest(

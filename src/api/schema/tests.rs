@@ -587,11 +587,13 @@ fn pane_omp_bridge_request_and_response_round_trip() {
             pane_id: "w1:p1".into(),
             address: "127.0.0.1:1234".into(),
             token: "opaque".into(),
+            route_generation: 7,
         },
     };
     let json = serde_json::to_value(&response).unwrap();
     assert_eq!(json["result"]["type"], "pane_omp_bridge");
     assert_eq!(json["result"]["pane_id"], "w1:p1");
+    assert_eq!(json["result"]["route_generation"], 7);
     let restored: SuccessResponse = serde_json::from_value(json).unwrap();
     assert_eq!(restored, response);
 }
@@ -1174,20 +1176,42 @@ fn layout_export_apply_round_trip() {
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, export);
 
+    let layout = LayoutApplyParams {
+        workspace_id: Some("w1".into()),
+        tab_id: None,
+        tab_label: Some("dev".into()),
+        focus: true,
+        root: root.clone(),
+    };
     let apply = Request {
         id: "layout_apply".into(),
-        method: Method::LayoutApply(LayoutApplyParams {
-            workspace_id: Some("w1".into()),
-            tab_id: None,
-            tab_label: Some("dev".into()),
-            focus: true,
-            root: root.clone(),
-        }),
+        method: Method::LayoutApply(layout.clone()),
     };
     let json = serde_json::to_string(&apply).unwrap();
     assert!(json.contains("\"method\":\"layout.apply\""));
+    assert!(!json.contains("idempotency_key"));
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, apply);
+
+    for method in [
+        Method::LayoutApplyIdempotent(LayoutIdempotentParams {
+            idempotency_key: "layout-operation-1".into(),
+            layout: layout.clone(),
+        }),
+        Method::LayoutReconcileIdempotent(LayoutIdempotentParams {
+            idempotency_key: "layout-operation-1".into(),
+            layout: layout.clone(),
+        }),
+    ] {
+        let request = Request {
+            id: "layout_idempotent".into(),
+            method,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"idempotency_key\":\"layout-operation-1\""));
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, request);
+    }
 
     let response = SuccessResponse {
         id: "layout_export".into(),

@@ -764,7 +764,7 @@ Integrations report agent state with `pane.report_agent`.
 `state` carries semantic agent state and affects waits, notifications, and
 rollups. Report display-only values separately through metadata.
 
-Session-only official integrations report native session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
+Session-only official integrations report agent session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
 
 ```json
 {
@@ -777,22 +777,29 @@ Session-only official integrations report native session references with `pane.r
     "agent_session_id": "..."
   }
 }
+
 ```
 
-`pane.get`, `pane.list`, `agent.get`, and `agent.list` expose a read-only `agent_session` object when Herdr has a stored native session reference:
+`resume_policy` is optional and defaults to `native`, which preserves the existing
+cold-restore behavior. Set it to `external` when another runtime owns session
+lifecycle: Herdr persists and exposes the session reference but never creates a
+native resume plan for it.
+
+`pane.get`, `pane.list`, `agent.get`, and `agent.list` expose a read-only `agent_session` object when Herdr has a stored agent session reference:
 
 ```json
 {
   "agent_session": {
-    "source": "herdr:codex",
-    "agent": "codex",
-    "kind": "id",
-    "value": "..."
+    "source": "herdr:omp",
+    "agent": "omp",
+    "kind": "path",
+    "value": "...",
+    "resume_policy": "external"
   }
 }
 ```
 
-If no native session reference is stored, the field is omitted.
+If no session reference is stored, the field is omitted. Native session entries omit `resume_policy` to preserve the existing response shape; externally owned entries report `"resume_policy": "external"`.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 

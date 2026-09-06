@@ -155,6 +155,10 @@ pub enum Method {
     LayoutExport(LayoutExportParams),
     #[serde(rename = "layout.apply")]
     LayoutApply(LayoutApplyParams),
+    #[serde(rename = "layout.apply_idempotent")]
+    LayoutApplyIdempotent(LayoutIdempotentParams),
+    #[serde(rename = "layout.reconcile_idempotent")]
+    LayoutReconcileIdempotent(LayoutIdempotentParams),
     #[serde(rename = "layout.set_split_ratio")]
     LayoutSetSplitRatio(LayoutSetSplitRatioParams),
     #[serde(rename = "pane.neighbor")]

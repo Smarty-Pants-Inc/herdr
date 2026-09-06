@@ -13,7 +13,6 @@ static NEXT_HOST_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
 const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const ROUTE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const INITIAL_ROUTE_GENERATION: u64 = 1;
 const HOST_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
 const MAX_UNAUTHENTICATED_HANDSHAKES: usize = 32;
@@ -166,7 +165,7 @@ fn spawn_host(
         let Ok(HostRecord::Host {
             pane_id,
             omp_session_id,
-            route_generation,
+            mut route_generation,
             token,
             omp_build_id,
         }) = serde_json::from_str(&line)
@@ -178,25 +177,13 @@ fn spawn_host(
             );
             return;
         };
+        let announced_generation = route_generation;
         if !bridge.validates(&pane_id, &token) {
             tracing::warn!(pane_id, "rejected unauthenticated OMP bridge host");
             write_host_error(
                 &mut stream,
                 "host-authentication-failed",
                 "OMP host bridge token was rejected",
-            );
-            return;
-        }
-        if route_generation != INITIAL_ROUTE_GENERATION {
-            tracing::warn!(
-                pane_id,
-                route_generation,
-                "rejected caller-chosen OMP route generation"
-            );
-            write_host_error(
-                &mut stream,
-                "route-generation-invalid",
-                "OMP host route generation must be 1",
             );
             return;
         }
@@ -260,15 +247,19 @@ fn spawn_host(
             return;
         }
         match admitted.recv_timeout(ROUTE_ADMISSION_TIMEOUT) {
-            Ok(OmpHostAdmission::Accepted) => {
-                if write_host_ready(&mut stream).is_err() {
+            Ok(OmpHostAdmission::Accepted {
+                route_generation: assigned_generation,
+            }) => {
+                route_generation = assigned_generation;
+                if write_host_ready(&mut stream, route_generation).is_err() {
                     let _ = stream.shutdown(Shutdown::Both);
                     notify_host_stopped(
                         &event_tx,
                         &pane_id,
                         &omp_session_id,
-                        route_generation,
+                        announced_generation,
                         host_id,
+                        false,
                     );
                     return;
                 }
@@ -279,8 +270,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -294,8 +286,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -309,8 +302,9 @@ fn spawn_host(
                     &event_tx,
                     &pane_id,
                     &omp_session_id,
-                    route_generation,
+                    announced_generation,
                     host_id,
+                    false,
                 );
                 return;
             }
@@ -372,6 +366,7 @@ fn spawn_host(
             &omp_session_id,
             route_generation,
             host_id,
+            true,
         );
     });
 }
@@ -382,19 +377,23 @@ fn notify_host_stopped(
     omp_session_id: &str,
     route_generation: u64,
     host_id: u64,
+    ready: bool,
 ) {
     let _ = event_tx.blocking_send(ServerEvent::OmpHostStopped {
         pane_id: pane_id.to_owned(),
         omp_session_id: omp_session_id.to_owned(),
         route_generation,
         host_id,
+        ready,
     });
 }
 
-fn write_host_ready(stream: &mut TcpStream) -> io::Result<()> {
-    stream
-        .write_all(b"{\"t\":\"ready\"}\n")
-        .and_then(|_| stream.flush())
+fn write_host_ready(stream: &mut TcpStream, route_generation: u64) -> io::Result<()> {
+    let record = serde_json::json!({
+        "t": "ready",
+        "routeGeneration": route_generation,
+    });
+    writeln!(stream, "{record}").and_then(|_| stream.flush())
 }
 
 fn write_host_error(stream: &mut TcpStream, code: &str, message: &str) {
@@ -515,7 +514,11 @@ mod tests {
             Some(ServerEvent::OmpHostStarted { admission, .. }) => admission,
             event => panic!("expected OMP host start, got {event:?}"),
         };
-        admission.send(OmpHostAdmission::Accepted).unwrap();
+        admission
+            .send(OmpHostAdmission::Accepted {
+                route_generation: 1,
+            })
+            .unwrap();
         later
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
@@ -523,10 +526,9 @@ mod tests {
         BufReader::new(later.try_clone().unwrap())
             .read_line(&mut ready)
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["t"],
-            "ready"
-        );
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        assert_eq!(ready["t"], "ready");
+        assert_eq!(ready["routeGeneration"], 1);
     }
 
     #[test]
@@ -661,14 +663,22 @@ mod tests {
 
         writeln!(
             client,
-            r#"{{"t":"host","paneId":"pane","ompSessionId":"session","routeGeneration":1,"token":"{token}"}}"#
+            r#"{{"t":"host","paneId":"pane","ompSessionId":"session","routeGeneration":2,"token":"{token}"}}"#
         )
         .unwrap();
         let admission = match event_rx.blocking_recv() {
-            Some(ServerEvent::OmpHostStarted { admission, .. }) => admission,
+            Some(ServerEvent::OmpHostStarted {
+                route_generation: 2,
+                admission,
+                ..
+            }) => admission,
             event => panic!("expected OMP host start, got {event:?}"),
         };
-        admission.send(OmpHostAdmission::Accepted).unwrap();
+        admission
+            .send(OmpHostAdmission::Accepted {
+                route_generation: 3,
+            })
+            .unwrap();
         let mut ready = String::new();
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -676,10 +686,9 @@ mod tests {
         BufReader::new(client.try_clone().unwrap())
             .read_line(&mut ready)
             .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["t"],
-            "ready"
-        );
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        assert_eq!(ready["t"], "ready");
+        assert_eq!(ready["routeGeneration"], 3);
 
         let payload = "x".repeat(crate::protocol::MAX_OMP_FRAME_PAYLOAD);
         let _ = writeln!(
@@ -688,7 +697,10 @@ mod tests {
         );
         assert!(matches!(
             event_rx.blocking_recv(),
-            Some(ServerEvent::OmpHostStopped { .. })
+            Some(ServerEvent::OmpHostStopped {
+                route_generation: 3,
+                ..
+            })
         ));
     }
 }

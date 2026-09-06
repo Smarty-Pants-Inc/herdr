@@ -2,7 +2,7 @@ name: PR Gate
 
 on:
   pull_request_target:
-    types: [opened, closed, reopened, ready_for_review]
+    types: [opened, closed, reopened]
 
 concurrency:
   group: pr-gate-${{ github.event.pull_request.number }}
@@ -29,7 +29,7 @@ jobs:
             ]);
             const MERGIFY_BOT_USER_ID = 37929162;
             const MERGIFY_QUEUE_BASES = new Set(['master', 'smarty-preview-source']);
-            const REVIEW_TRIGGER_MARKER = '<!-- herdr:ai-review-trigger -->';
+            const REVIEW_LABEL = 'ai-review';
             const COMMENT_MARKER = '<!-- herdr:pr-gate -->';
 
             const pullNumber = context.payload.pull_request.number;
@@ -93,6 +93,16 @@ jobs:
               return ['admin', 'maintain', 'write'].includes(await getPermission(username));
             }
 
+            async function currentLabels() {
+              const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pullNumber,
+                per_page: 100,
+              });
+              return new Set(labels.map(label => label.name));
+            }
+
             async function hasVerifiedRecovery() {
               const events = await github.paginate(github.rest.issues.listEventsForTimeline, {
                 owner: context.repo.owner,
@@ -106,31 +116,28 @@ jobs:
                 await isVerifiedMaintainer(latestStateEvent.actor?.login);
             }
 
-            async function requestAiReviews() {
-              if (pr.draft) {
-                core.info(`PR #${pullNumber} is a draft; deferring AI reviews until ready`);
-                return;
-              }
-
-              const marker = REVIEW_TRIGGER_MARKER;
-              const comments = await github.paginate(github.rest.issues.listComments, {
+            async function addReviewLabel() {
+              if ((await currentLabels()).has(REVIEW_LABEL)) return;
+              await github.rest.issues.addLabels({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: pullNumber,
-                per_page: 100,
+                labels: [REVIEW_LABEL],
               });
-              if (comments.some(comment =>
-                comment.user?.id === KANGAL_USER_ID && comment.body?.includes(marker))) {
-                core.info(`AI reviews already requested for PR #${pullNumber}`);
-                return;
-              }
+            }
 
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: pullNumber,
-                body: [marker, '@coderabbitai review', '@greptileai'].join('\n'),
-              });
+            async function removeReviewLabel() {
+              if (!(await currentLabels()).has(REVIEW_LABEL)) return;
+              try {
+                await github.request('DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{name}', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pullNumber,
+                  name: REVIEW_LABEL,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
             }
 
             async function upsertGateComment(message) {
@@ -164,9 +171,10 @@ jobs:
             async function closePullRequest(reason) {
               if (await hasVerifiedRecovery()) {
                 core.info(`PR #${pullNumber} was recovered by a verified maintainer; leaving it open`);
-                await requestAiReviews();
+                await addReviewLabel();
                 return;
               }
+              await removeReviewLabel();
               const message = [
                 `Hi @${prAuthor}, thanks for your interest in contributing.`,
                 '',
@@ -185,7 +193,7 @@ jobs:
               await upsertGateComment(message);
               if (await hasVerifiedRecovery()) {
                 core.info(`PR #${pullNumber} was recovered while the gate was running; leaving it open`);
-                await requestAiReviews();
+                await addReviewLabel();
                 return;
               }
               await github.rest.pulls.update({
@@ -196,27 +204,32 @@ jobs:
               });
             }
 
-            if (pr.state === 'closed') return;
+            if (pr.state === 'closed') {
+              await removeReviewLabel();
+              return;
+            }
 
             if (isMergifyQueuePullRequest()) {
               core.info(`Leaving scoped Mergify queue PR open: ${pr.head.ref} -> ${pr.base.ref}`);
+              await removeReviewLabel();
               return;
             }
 
             if (CI_ONLY_PR_AUTHOR_IDS.has(pr.user.id)) {
               core.info(`Leaving CI-only bot PR open without automated AI review: ${prAuthor}`);
+              await removeReviewLabel();
               return;
             }
 
             if (await isVerifiedMaintainer(prAuthor)) {
               core.info(`${prAuthor} is a verified maintainer`);
-              await requestAiReviews();
+              await addReviewLabel();
               return;
             }
 
             if (approvedContributors.has(prAuthor.toLowerCase())) {
               core.info(`${prAuthor} is in the approved contributors list`);
-              await requestAiReviews();
+              await addReviewLabel();
               return;
             }
 
