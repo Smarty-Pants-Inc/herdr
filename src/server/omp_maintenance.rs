@@ -105,6 +105,9 @@ struct PersistedState {
     completed_operations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     routes: Vec<PersistedRoute>,
+    /// Retained for same-account servers that poll persisted route membership changes.
+    #[serde(default)]
+    route_revision: u64,
 }
 
 impl Default for PersistedState {
@@ -114,6 +117,7 @@ impl Default for PersistedState {
             lease: None,
             completed_operations: Vec::new(),
             routes: Vec::new(),
+            route_revision: 0,
         }
     }
 }
@@ -613,6 +617,7 @@ impl OmpMaintenance {
             } else {
                 state.routes.push(route);
             }
+            state.route_revision = state.route_revision.saturating_add(1);
             *dirty = true;
             Ok(admitted)
         })
@@ -641,6 +646,7 @@ impl OmpMaintenance {
                     });
                 }
             }
+            state.route_revision = state.route_revision.saturating_add(1);
             *dirty = true;
         })
     }
@@ -664,7 +670,10 @@ impl OmpMaintenance {
             state
                 .routes
                 .retain(|route| !route.matches(&self.instance.id, &self.session, key));
-            *dirty |= state.routes.len() != before;
+            if state.routes.len() != before {
+                state.route_revision = state.route_revision.saturating_add(1);
+                *dirty = true;
+            }
         })
     }
 
@@ -1168,6 +1177,7 @@ fn reconcile_stale_routes(
     if let (Some(lease), Some(permit)) = (state.lease.as_mut(), restored_permit) {
         lease.permit = Some(permit);
     }
+    state.route_revision = state.route_revision.saturating_add(1);
     Ok(true)
 }
 
@@ -2077,6 +2087,12 @@ mod tests {
             status.routes[0].route_generation,
             canonical.route_generation
         );
+        assert_eq!(
+            inspector
+                .with_state(|state, _| state.route_revision)
+                .unwrap(),
+            2
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -2236,11 +2252,13 @@ mod tests {
         let crashed = OmpMaintenance::file_for_test("crashed", state_path.clone()).unwrap();
         crashed.admit(&route("w1:p1"), || Ok::<_, ()>(())).unwrap();
         assert_eq!(crashed.status().unwrap().route_count, 1);
+        assert_eq!(load_state(&state_path).unwrap().route_revision, 1);
         drop(crashed);
 
-        let reopened = OmpMaintenance::file_for_test("controller", state_path).unwrap();
+        let reopened = OmpMaintenance::file_for_test("controller", state_path.clone()).unwrap();
         assert_eq!(reopened.status().unwrap().route_count, 0);
         assert!(reopened.acquire(&operation_id(2)).unwrap().held);
+        assert_eq!(load_state(&state_path).unwrap().route_revision, 2);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2734,6 +2752,96 @@ mod tests {
     }
 
     #[test]
+    fn persisted_route_revision_survives_shared_account_operations() {
+        let dir = test_dir("route-revision-compatibility");
+        let state_path = dir.join("state.json");
+        let maintenance = OmpMaintenance::file_for_test("default", state_path.clone()).unwrap();
+        let original = br#"{"version":1,"route_revision":41}"#;
+        fs::write(&state_path, original).unwrap();
+        make_private(&state_path);
+        fs::write(state_path.with_extension("lock"), b"").unwrap();
+        make_private(&state_path.with_extension("lock"));
+
+        assert!(!maintenance.inspect().unwrap().held);
+        assert_eq!(fs::read(&state_path).unwrap(), original);
+        let owner = operation_id(31);
+        maintenance.acquire(&owner).unwrap();
+        maintenance
+            .grant_permit(&owner, "default", "w1:p1")
+            .unwrap();
+        let armed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(armed["route_revision"], 41);
+        assert_eq!(armed["lease"]["owner_hash"], operation_owner_hash(&owner));
+        assert_eq!(armed["lease"]["permit"]["pane_id"], "w1:p1");
+
+        let key = route("w1:p1");
+        maintenance.admit(&key, || Ok::<_, ()>(())).unwrap();
+        assert_eq!(maintenance.status().unwrap().route_count, 1);
+        let admitted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(admitted["route_revision"], 42);
+        assert_eq!(
+            admitted["lease"]["owner_hash"],
+            armed["lease"]["owner_hash"]
+        );
+        assert!(admitted["lease"].get("permit").is_none());
+        maintenance.abort_route_admission(&key).unwrap();
+        assert_eq!(load_state(&state_path).unwrap().route_revision, 43);
+        assert!(maintenance.status().unwrap().permit.is_some());
+        maintenance.abort_route_admission(&key).unwrap();
+        assert_eq!(load_state(&state_path).unwrap().route_revision, 43);
+        maintenance.admit(&key, || Ok::<_, ()>(())).unwrap();
+
+        maintenance.unregister_route(&key).unwrap();
+        maintenance.unregister_route(&key).unwrap();
+        maintenance.release(&owner).unwrap();
+        let released: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(released["route_revision"], 45);
+        assert!(released.get("lease").is_none());
+        assert_eq!(
+            released["completed_operations"][0],
+            operation_owner_hash(&owner)
+        );
+        drop(maintenance);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_route_revision_is_typed_optional_and_saturating() {
+        let absent: PersistedState = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert_eq!(absent.route_revision, 0);
+        for invalid in [
+            r#"{"version":1,"route_revision":-1}"#,
+            r#"{"version":1,"route_revision":1.5}"#,
+            r#"{"version":1,"route_revision":"1"}"#,
+            r#"{"version":1,"route_revision":null}"#,
+            r#"{"version":1,"route_revision":18446744073709551616}"#,
+            r#"{"version":1,"route_revision":1,"unknown":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PersistedState>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        let store = TestOmpMaintenanceStore::new();
+        let host = OmpMaintenance::for_test("default", store);
+        host.with_state(|state, dirty| {
+            state.route_revision = u64::MAX;
+            *dirty = true;
+        })
+        .unwrap();
+        let key = route("w1:p1");
+        host.admit(&key, || Ok::<_, ()>(())).unwrap();
+        host.unregister_route(&key).unwrap();
+        assert_eq!(
+            host.with_state(|state, _| state.route_revision).unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
     fn legacy_completed_operations_are_compacted_before_file_state_use() {
         let dir = test_dir("legacy-compaction");
         let _ = fs::remove_dir_all(&dir);
@@ -2747,6 +2855,7 @@ mod tests {
                 .map(|seed| operation_owner_hash(&operation_id(seed)))
                 .collect(),
             routes: Vec::new(),
+            route_revision: 0,
         };
         fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         fs::write(&lock_path, b"").unwrap();
@@ -2797,6 +2906,7 @@ mod tests {
             lease: None,
             completed_operations,
             routes: Vec::new(),
+            route_revision: 0,
         };
         fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         fs::write(&lock_path, b"").unwrap();
