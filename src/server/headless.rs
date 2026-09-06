@@ -9541,6 +9541,8 @@ fn take_startup_cwd() -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+    #[cfg(debug_assertions)]
+    crate::server::handoff::start_test_owner_watchdog();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());

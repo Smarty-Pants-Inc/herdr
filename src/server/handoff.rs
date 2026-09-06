@@ -24,6 +24,8 @@ const HANDOFF_VERSION: u32 = 2;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(all(unix, debug_assertions))]
+const TEST_HANDOFF_OWNER_PID_ENV: &str = "HERDR_TEST_HANDOFF_OWNER_PID";
 #[cfg(unix)]
 pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
 #[cfg(unix)]
@@ -111,6 +113,25 @@ pub(crate) fn spawn_handoff_import(
             ),
         )
     })
+}
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn start_test_owner_watchdog() {
+    let Some(owner_pid) = std::env::var_os(TEST_HANDOFF_OWNER_PID_ENV)
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
+        .filter(|owner_pid| *owner_pid != 0 && *owner_pid != std::process::id())
+    else {
+        return;
+    };
+
+    std::thread::Builder::new()
+        .name("herdr-test-owner-watchdog".to_string())
+        .spawn(move || loop {
+            if !crate::platform::process_exists(owner_pid) {
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .expect("spawn Herdr test owner watchdog");
 }
 
 #[cfg(unix)]
