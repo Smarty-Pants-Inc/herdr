@@ -803,7 +803,7 @@ mod tests {
 
         shutting_down.store(true, Ordering::Release);
         socket.shutdown(Shutdown::Both).unwrap();
-        outbound.send(OutboundRecord::Shutdown).unwrap();
+        let _ = outbound.try_send(OutboundRecord::Shutdown);
     }
 
     #[test]
