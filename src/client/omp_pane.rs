@@ -78,6 +78,7 @@ fn encode_guest_payload(payload: &[u8]) -> io::Result<Vec<u8>> {
 
 fn validate_guest_record(record: &GuestRecord) -> io::Result<()> {
     match record.t.as_str() {
+        "replica-ready" => Ok(()),
         "frame" if record.frame.is_some() => Ok(()),
         "frame" => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -305,6 +306,80 @@ fn omp_pane_socket_path() -> PathBuf {
     )
 }
 
+fn forward_guest_records(
+    guest_reader: &mut io::BufReader<std::net::TcpStream>,
+    server_writer: &mut crate::ipc::LocalStream,
+    pane_id: &str,
+    omp_session_id: &str,
+    route_generation: u64,
+    attachment_epoch: &AtomicU64,
+) -> io::Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = guest_reader
+            .by_ref()
+            .take(MAX_RECORD_BYTES + 1)
+            .read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        if read as u64 > MAX_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OMP guest bridge record too large",
+            ));
+        }
+        let record: GuestRecord = serde_json::from_str(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid OMP guest bridge record: {error}"),
+            )
+        })?;
+        validate_guest_record(&record)?;
+        // Replay acknowledgment is local; the App still owns renderer readiness.
+        if record.t == "replica-ready" {
+            continue;
+        }
+        let message = if record.t == "control" {
+            let action = match record.action.as_deref() {
+                Some("request-controller") => OmpControlAction::RequestController,
+                Some("release-controller") => OmpControlAction::ReleaseController,
+                _ => unreachable!("guest record validated above"),
+            };
+            ClientMessage::OmpControl {
+                pane_id: pane_id.to_owned(),
+                omp_session_id: omp_session_id.to_owned(),
+                route_generation,
+                attachment_epoch: attachment_epoch.load(Ordering::Acquire),
+                action,
+            }
+        } else {
+            let frame = record.frame.expect("guest record validated above");
+            let envelope = encode_guest_payload(frame.get().as_bytes())?;
+            if record.mutation {
+                ClientMessage::OmpControl {
+                    pane_id: pane_id.to_owned(),
+                    omp_session_id: omp_session_id.to_owned(),
+                    route_generation,
+                    attachment_epoch: attachment_epoch.load(Ordering::Acquire),
+                    action: OmpControlAction::Mutation { frame: envelope },
+                }
+            } else {
+                ClientMessage::OmpFrame {
+                    pane_id: pane_id.to_owned(),
+                    omp_session_id: omp_session_id.to_owned(),
+                    route_generation,
+                    attachment_epoch: attachment_epoch.load(Ordering::Acquire),
+                    frame: envelope,
+                }
+            }
+        };
+        write_to_server(server_writer, &message)?;
+    }
+    Ok(())
+}
+
 pub(super) fn run(
     pane_id: String,
     omp_session_id: String,
@@ -404,67 +479,15 @@ pub(super) fn run(
     let write_pane = pane_id.clone();
     let write_session = omp_session_id.clone();
     let write_epoch = Arc::clone(&attachment_epoch);
-    let mut guest_to_server = Some(std::thread::spawn(move || -> io::Result<()> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = guest_reader
-                .by_ref()
-                .take(MAX_RECORD_BYTES + 1)
-                .read_line(&mut line)?;
-            if read == 0 {
-                break;
-            }
-            if read as u64 > MAX_RECORD_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "OMP guest bridge record too large",
-                ));
-            }
-            let record: GuestRecord = serde_json::from_str(&line).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid OMP guest bridge record: {error}"),
-                )
-            })?;
-            validate_guest_record(&record)?;
-            let message = if record.t == "control" {
-                let action = match record.action.as_deref() {
-                    Some("request-controller") => OmpControlAction::RequestController,
-                    Some("release-controller") => OmpControlAction::ReleaseController,
-                    _ => unreachable!("guest record validated above"),
-                };
-                ClientMessage::OmpControl {
-                    pane_id: write_pane.clone(),
-                    omp_session_id: write_session.clone(),
-                    route_generation,
-                    attachment_epoch: write_epoch.load(Ordering::Acquire),
-                    action,
-                }
-            } else {
-                let frame = record.frame.expect("guest record validated above");
-                let envelope = encode_guest_payload(frame.get().as_bytes())?;
-                if record.mutation {
-                    ClientMessage::OmpControl {
-                        pane_id: write_pane.clone(),
-                        omp_session_id: write_session.clone(),
-                        route_generation,
-                        attachment_epoch: write_epoch.load(Ordering::Acquire),
-                        action: OmpControlAction::Mutation { frame: envelope },
-                    }
-                } else {
-                    ClientMessage::OmpFrame {
-                        pane_id: write_pane.clone(),
-                        omp_session_id: write_session.clone(),
-                        route_generation,
-                        attachment_epoch: write_epoch.load(Ordering::Acquire),
-                        frame: envelope,
-                    }
-                }
-            };
-            write_to_server(&mut server_writer, &message)?;
-        }
-        Ok(())
+    let mut guest_to_server = Some(std::thread::spawn(move || {
+        forward_guest_records(
+            &mut guest_reader,
+            &mut server_writer,
+            &write_pane,
+            &write_session,
+            route_generation,
+            &write_epoch,
+        )
     }));
 
     let (server_tx, server_rx) = mpsc::sync_channel(SERVER_TO_GUEST_QUEUE_CAPACITY);
@@ -748,6 +771,75 @@ mod tests {
         let server: crate::ipc::LocalStream =
             interprocess::os::unix::uds_local_socket::Stream::from(server).into();
         (client, server)
+    }
+
+    #[test]
+    fn native_guest_replica_ready_preserves_forwarding_without_product_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut guest = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = io::BufReader::new(stream);
+        let (mut client, mut server) = local_socket_pair();
+        guest
+            .write_all(
+                concat!(
+                    "{\"t\":\"replica-ready\"}\n",
+                    "{\"t\":\"frame\",\"frame\":{\"x\": 1}}\n",
+                    "{\"t\":\"control\",\"action\":\"request-controller\"}\n",
+                    "{\"t\":\"frame\",\"mutation\":true,\"frame\":{\"x\": 2}}\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        guest.shutdown(Shutdown::Write).unwrap();
+
+        forward_guest_records(
+            &mut reader,
+            &mut client,
+            "pane",
+            "session",
+            3,
+            &AtomicU64::new(7),
+        )
+        .expect("replica-ready must not close the native bridge");
+        write_to_server(&mut client, &ClientMessage::Detach).unwrap();
+
+        let expected = [
+            ClientMessage::OmpFrame {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 3,
+                attachment_epoch: 7,
+                frame: encode_guest_payload(br#"{"x": 1}"#).unwrap(),
+            },
+            ClientMessage::OmpControl {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 3,
+                attachment_epoch: 7,
+                action: OmpControlAction::RequestController,
+            },
+            ClientMessage::OmpControl {
+                pane_id: "pane".into(),
+                omp_session_id: "session".into(),
+                route_generation: 3,
+                attachment_epoch: 7,
+                action: OmpControlAction::Mutation {
+                    frame: encode_guest_payload(br#"{"x": 2}"#).unwrap(),
+                },
+            },
+            ClientMessage::Detach,
+        ];
+        for expected in expected {
+            assert_eq!(
+                protocol::read_message::<_, ClientMessage>(&mut server, MAX_FRAME_SIZE).unwrap(),
+                expected,
+                "replica-ready is not a host frame or an App-owned renderer-ready event",
+            );
+        }
     }
 
     #[test]

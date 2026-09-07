@@ -503,7 +503,10 @@ fn read_guest_records(
                 "private OMP guest record too large",
             ));
         }
-        inbound.try_send(parse_guest_record(&line)?).map_err(|_| {
+        let Some(record) = parse_guest_record(&line)? else {
+            continue;
+        };
+        inbound.try_send(record).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "private OMP guest queue unavailable",
@@ -513,13 +516,17 @@ fn read_guest_records(
     Ok(())
 }
 
-fn parse_guest_record(line: &str) -> io::Result<PrivateOmpGuestRecord> {
+fn parse_guest_record(line: &str) -> io::Result<Option<PrivateOmpGuestRecord>> {
     let record = serde_json::from_str::<GuestRecordWire>(line).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid private OMP guest record: {error}"),
         )
     })?;
+    // Replay acknowledgment is local; authentication still owns bridge readiness.
+    if record.t == "replica-ready" {
+        return Ok(None);
+    }
     match record.t.as_str() {
         "frame" => record
             .frame
@@ -550,6 +557,7 @@ fn parse_guest_record(line: &str) -> io::Result<PrivateOmpGuestRecord> {
             "unknown private OMP guest record type",
         )),
     }
+    .map(Some)
 }
 
 fn write_guest_records(
@@ -686,17 +694,116 @@ mod tests {
     fn parses_control_and_preserves_frame_json() {
         assert!(matches!(
             parse_guest_record(r#"{"t":"control","action":"request-controller"}"#),
-            Ok(PrivateOmpGuestRecord::Control(
+            Ok(Some(PrivateOmpGuestRecord::Control(
                 PrivateOmpGuestControl::RequestController
-            ))
+            )))
         ));
-        let Ok(PrivateOmpGuestRecord::Frame { frame, mutation }) =
+        let Ok(Some(PrivateOmpGuestRecord::Frame { frame, mutation })) =
             parse_guest_record(r#"{"t":"frame","mutation":true,"frame":{"x": 1}}"#)
         else {
             panic!("expected frame")
         };
         assert!(mutation);
         assert_eq!(frame.get(), r#"{"x": 1}"#);
+    }
+
+    #[test]
+    fn private_guest_replica_ready_preserves_authenticated_bridge_and_traffic() {
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let guest = Arc::new(Mutex::new(None));
+        let (outbound, outbound_rx) = mpsc::sync_channel(8);
+        let (inbound_tx, inbound) = mpsc::sync_channel(8);
+        let ready = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        spawn_bridge_thread(
+            listener,
+            "secret".into(),
+            Arc::clone(&guest),
+            outbound_rx,
+            inbound_tx,
+            Arc::clone(&ready),
+            Arc::clone(&failed),
+            Arc::clone(&shutting_down),
+        );
+        let mut socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        assert!(!ready.load(Ordering::Acquire));
+        socket
+            .write_all(b"{\"t\":\"guest\",\"token\":\"secret\"}\n")
+            .unwrap();
+        outbound
+            .send(OutboundRecord::Raw("authenticated".into()))
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "authenticated\n");
+        assert!(
+            ready.load(Ordering::Acquire),
+            "authentication still owns bridge readiness"
+        );
+
+        socket
+            .write_all(
+                concat!(
+                    "{\"t\":\"replica-ready\"}\n",
+                    "{\"t\":\"frame\",\"frame\":{\"x\": 1}}\n",
+                    "{\"t\":\"control\",\"action\":\"release-controller\"}\n",
+                    "{\"t\":\"frame\",\"mutation\":true,\"frame\":{\"x\": 2}}\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        for expected in [
+            PrivateOmpGuestRecord::Frame {
+                frame: RawValue::from_string(r#"{"x": 1}"#.into()).unwrap(),
+                mutation: false,
+            },
+            PrivateOmpGuestRecord::Control(PrivateOmpGuestControl::ReleaseController),
+            PrivateOmpGuestRecord::Frame {
+                frame: RawValue::from_string(r#"{"x": 2}"#.into()).unwrap(),
+                mutation: true,
+            },
+        ] {
+            let record = inbound
+                .recv_timeout(Duration::from_secs(2))
+                .expect("replica-ready must not close the private bridge");
+            match (record, expected) {
+                (
+                    PrivateOmpGuestRecord::Frame { frame, mutation },
+                    PrivateOmpGuestRecord::Frame {
+                        frame: expected,
+                        mutation: expected_mutation,
+                    },
+                ) => {
+                    assert_eq!(frame.get(), expected.get());
+                    assert_eq!(mutation, expected_mutation);
+                }
+                (
+                    PrivateOmpGuestRecord::Control(action),
+                    PrivateOmpGuestRecord::Control(expected),
+                ) => assert_eq!(action, expected),
+                _ => panic!("replica-ready must not replace or reorder ordinary traffic"),
+            }
+        }
+        assert!(matches!(inbound.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(ready.load(Ordering::Acquire));
+        assert!(!failed.load(Ordering::Acquire));
+        outbound
+            .send(OutboundRecord::Raw("still-connected".into()))
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "still-connected\n");
+
+        shutting_down.store(true, Ordering::Release);
+        socket.shutdown(Shutdown::Both).unwrap();
+        outbound.send(OutboundRecord::Shutdown).unwrap();
     }
 
     #[test]
