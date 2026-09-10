@@ -625,6 +625,9 @@ mod tests {
                     "-Command",
                     script,
                 ])
+                // Let Windows PowerShell use its own modules, not inherited
+                // PowerShell 7 paths (same boundary as the Windows updater).
+                .env_remove("PSModulePath")
                 .env("HERDR_TEST_ACL_DIRECTORY", parent)
                 .env("HERDR_TEST_ACL_FILE", &path)
                 .output()
