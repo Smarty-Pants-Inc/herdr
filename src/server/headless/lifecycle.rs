@@ -88,8 +88,8 @@ impl HeadlessServer {
             self.app.state.selected,
         );
 
-        snapshot.idempotency_epoch = (!self.app.layout_apply_epoch.is_empty())
-            .then(|| self.app.layout_apply_epoch.clone());
+        snapshot.idempotency_epoch =
+            (!self.app.layout_apply_epoch.is_empty()).then(|| self.app.layout_apply_epoch.clone());
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {

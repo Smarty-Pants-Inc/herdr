@@ -575,11 +575,20 @@ mod tests {
         let restored = parse_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(restored.version, 3);
         assert_eq!(restored.idempotency_epoch, snapshot.idempotency_epoch);
-        assert_eq!(restored.workspaces[0].tabs[0].layout_effect_nonce, Some("cd".repeat(16)));
-        assert_eq!(restored.workspaces[0].public_tab_numbers, snapshot.workspaces[0].public_tab_numbers);
+        assert_eq!(
+            restored.workspaces[0].tabs[0].layout_effect_nonce,
+            Some("cd".repeat(16))
+        );
+        assert_eq!(
+            restored.workspaces[0].public_tab_numbers,
+            snapshot.workspaces[0].public_tab_numbers
+        );
         let legacy = parse_snapshot(session_fixture("current-herdr")).unwrap();
         assert!(legacy.idempotency_epoch.is_none());
-        assert!(legacy.workspaces.iter().flat_map(|workspace| &workspace.tabs)
+        assert!(legacy
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
             .all(|tab| tab.layout_effect_nonce.is_none()));
     }
 

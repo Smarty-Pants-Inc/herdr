@@ -94,7 +94,10 @@ fn idempotent_layout_params(
 }
 
 fn error_code(response: &str) -> String {
-    serde_json::from_str::<ErrorResponse>(response).unwrap().error.code
+    serde_json::from_str::<ErrorResponse>(response)
+        .unwrap()
+        .error
+        .code
 }
 
 fn pending_receipt(app: &App, params: &LayoutIdempotentParams, nonce: &str) -> LayoutApplyReceipt {
@@ -113,14 +116,17 @@ async fn reconcile_without_receipt_does_not_fence_later_apply() {
         let mut app = persistent_empty_app();
         let params = idempotent_layout_params(None, "cleanup-first", "cleanup");
         let absent: ErrorResponse = serde_json::from_str(&app.handle_layout_apply_idempotent(
-            "cleanup".into(), params.clone(), true,
-        )).unwrap();
+            "cleanup".into(),
+            params.clone(),
+            true,
+        ))
+        .unwrap();
         assert_eq!(absent.error.code, "idempotency_no_effect");
         assert!(app.layout_apply_receipts.is_empty());
         add_workspace(&mut app);
-        let applied: SuccessResponse = serde_json::from_str(
-            &app.handle_layout_apply_idempotent("late".into(), params, false),
-        ).unwrap();
+        let applied: SuccessResponse =
+            serde_json::from_str(&app.handle_layout_apply_idempotent("late".into(), params, false))
+                .unwrap();
         assert!(matches!(applied.result, ResponseResult::LayoutApply { .. }));
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         app.state.assert_invariants_for_test();
@@ -132,25 +138,43 @@ async fn reconcile_without_receipt_does_not_fence_later_apply() {
 async fn layout_apply_replays_same_key_and_rejects_divergent_payload() {
     with_test_config_home("replay-conflict", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "operation", "applied");
-        let first: SuccessResponse = serde_json::from_str(
-            &app.handle_layout_apply_idempotent("first".into(), params.clone(), false),
-        ).unwrap();
+        let params =
+            idempotent_layout_params(Some(app.public_workspace_id(0)), "operation", "applied");
+        let first: SuccessResponse = serde_json::from_str(&app.handle_layout_apply_idempotent(
+            "first".into(),
+            params.clone(),
+            false,
+        ))
+        .unwrap();
         let ResponseResult::LayoutApply { layout } = first.result else {
             panic!("expected layout apply response");
         };
         let tab_count = app.state.workspaces[0].tabs.len();
-        for operation in [LayoutOperation::Apply, LayoutOperation::Reconcile, LayoutOperation::Cancel] {
-            let replay: SuccessResponse = serde_json::from_str(
-                &app.handle_layout_operation("replay".into(), params.clone(), operation),
-            ).unwrap();
-            assert_eq!(replay.result, ResponseResult::LayoutApply { layout: layout.clone() });
+        for operation in [
+            LayoutOperation::Apply,
+            LayoutOperation::Reconcile,
+            LayoutOperation::Cancel,
+        ] {
+            let replay: SuccessResponse = serde_json::from_str(&app.handle_layout_operation(
+                "replay".into(),
+                params.clone(),
+                operation,
+            ))
+            .unwrap();
+            assert_eq!(
+                replay.result,
+                ResponseResult::LayoutApply {
+                    layout: layout.clone()
+                }
+            );
             assert_eq!(app.state.workspaces[0].tabs.len(), tab_count);
         }
         let mut divergent = params;
         divergent.layout.tab_label = Some("different".into());
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("conflict".into(), divergent)),
-            "idempotency_conflict");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("conflict".into(), divergent)),
+            "idempotency_conflict"
+        );
         assert_eq!(app.state.workspaces[0].tabs.len(), tab_count);
         app.state.assert_invariants_for_test();
         shutdown_test_runtimes(&mut app);
@@ -163,15 +187,27 @@ async fn fresh_reconcile_keys_do_not_exhaust_idempotency_capacity() {
         let mut app = persistent_app_with_workspace();
         let workspace_id = app.public_workspace_id(0);
         for index in 0..=crate::persist::MAX_LAYOUT_IDEMPOTENCY_RECEIPTS {
-            let params = idempotent_layout_params(Some(workspace_id.clone()),
-                &format!("reconcile-miss-{index}"), "reconcile");
-            assert_eq!(error_code(&app.handle_layout_apply_idempotent(
-                format!("reconcile-{index}"), params, true)), "idempotency_no_effect");
+            let params = idempotent_layout_params(
+                Some(workspace_id.clone()),
+                &format!("reconcile-miss-{index}"),
+                "reconcile",
+            );
+            assert_eq!(
+                error_code(&app.handle_layout_apply_idempotent(
+                    format!("reconcile-{index}"),
+                    params,
+                    true
+                )),
+                "idempotency_no_effect"
+            );
         }
         assert!(app.layout_apply_receipts.is_empty());
         let applied: SuccessResponse = serde_json::from_str(&app.handle_layout_apply_idempotent(
-            "apply".into(), idempotent_layout_params(Some(workspace_id), "real-apply", "applied"), false,
-        )).unwrap();
+            "apply".into(),
+            idempotent_layout_params(Some(workspace_id), "real-apply", "applied"),
+            false,
+        ))
+        .unwrap();
         assert!(matches!(applied.result, ResponseResult::LayoutApply { .. }));
         assert_eq!(app.layout_apply_receipts.len(), 1);
         shutdown_test_runtimes(&mut app);
@@ -183,12 +219,20 @@ fn absent_cancel_is_durable_payload_bound_and_fences_late_apply_after_restart() 
     with_test_config_home("cancel-restart", |_| {
         let params = idempotent_layout_params(None, "cancelled", "late");
         let mut app = persistent_empty_app();
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone())),
-            "idempotency_no_effect");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone())),
+            "idempotency_no_effect"
+        );
         let ledger = crate::persist::load_layout_apply_ledger().unwrap().unwrap();
-        assert!(matches!(ledger.receipts["cancelled"].outcome, LayoutApplyOutcome::Cancelled));
+        assert!(matches!(
+            ledger.receipts["cancelled"].outcome,
+            LayoutApplyOutcome::Cancelled
+        ));
         let snapshot = crate::persist::load_checked().unwrap().unwrap();
-        assert_eq!(snapshot.idempotency_epoch.as_deref(), Some(ledger.session_epoch.as_str()));
+        assert_eq!(
+            snapshot.idempotency_epoch.as_deref(),
+            Some(ledger.session_epoch.as_str())
+        );
         let receipt = ledger.receipts["cancelled"].clone();
         // An empty session checkpoint must retain the cancellation, not rotate the epoch.
         app.save_session_now();
@@ -196,18 +240,40 @@ fn absent_cancel_is_durable_payload_bound_and_fences_late_apply_after_restart() 
         let mut app = persistent_empty_app();
         assert_eq!(app.layout_apply_epoch, ledger.session_epoch);
         add_workspace(&mut app);
-        for operation in [LayoutOperation::Cancel, LayoutOperation::Apply, LayoutOperation::Reconcile] {
-            assert_eq!(error_code(&app.handle_layout_operation("late".into(), params.clone(), operation)),
-                "idempotency_no_effect");
+        for operation in [
+            LayoutOperation::Cancel,
+            LayoutOperation::Apply,
+            LayoutOperation::Reconcile,
+        ] {
+            assert_eq!(
+                error_code(&app.handle_layout_operation("late".into(), params.clone(), operation)),
+                "idempotency_no_effect"
+            );
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
             assert!(app.terminal_runtimes.is_empty());
         }
-        assert_eq!(crate::persist::load_layout_apply_ledger().unwrap().unwrap().receipts["cancelled"], receipt);
+        assert_eq!(
+            crate::persist::load_layout_apply_ledger()
+                .unwrap()
+                .unwrap()
+                .receipts["cancelled"],
+            receipt
+        );
         let mut divergent = params.clone();
         divergent.layout.focus = true;
-        for operation in [LayoutOperation::Cancel, LayoutOperation::Apply, LayoutOperation::Reconcile] {
-            assert_eq!(error_code(&app.handle_layout_operation("conflict".into(), divergent.clone(), operation)),
-                "idempotency_conflict");
+        for operation in [
+            LayoutOperation::Cancel,
+            LayoutOperation::Apply,
+            LayoutOperation::Reconcile,
+        ] {
+            assert_eq!(
+                error_code(&app.handle_layout_operation(
+                    "conflict".into(),
+                    divergent.clone(),
+                    operation
+                )),
+                "idempotency_conflict"
+            );
         }
         app.state.assert_invariants_for_test();
         drop(app);
@@ -219,15 +285,25 @@ fn absent_cancel_is_durable_payload_bound_and_fences_late_apply_after_restart() 
         std::fs::remove_file(&ledger_path).unwrap();
         let mut restarted = persistent_empty_app();
         add_workspace(&mut restarted);
-        for operation in [LayoutOperation::Cancel, LayoutOperation::Apply, LayoutOperation::Reconcile] {
+        for operation in [
+            LayoutOperation::Cancel,
+            LayoutOperation::Apply,
+            LayoutOperation::Reconcile,
+        ] {
             assert_eq!(
-                error_code(&restarted.handle_layout_operation("lost-history".into(), params.clone(), operation)),
+                error_code(&restarted.handle_layout_operation(
+                    "lost-history".into(),
+                    params.clone(),
+                    operation
+                )),
                 "idempotency_unavailable"
             );
             assert_eq!(restarted.state.workspaces[0].tabs.len(), 1);
             assert!(restarted.terminal_runtimes.is_empty());
         }
-        assert!(crate::persist::load_layout_apply_ledger().unwrap().is_none());
+        assert!(crate::persist::load_layout_apply_ledger()
+            .unwrap()
+            .is_none());
         assert!(!ledger_path.exists());
         assert_eq!(std::fs::read(snapshot_path).unwrap(), before);
         restarted.state.assert_invariants_for_test();
@@ -253,7 +329,11 @@ fn fresh_empty_history_is_durable_before_epoch_binding() {
         let before = std::fs::read(&path).unwrap();
         let params = idempotent_layout_params(None, "fresh-cancel", "late");
         assert_eq!(
-            error_code(&restarted.handle_layout_apply_idempotent("read".into(), params.clone(), true)),
+            error_code(&restarted.handle_layout_apply_idempotent(
+                "read".into(),
+                params.clone(),
+                true
+            )),
             "idempotency_no_effect"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -275,15 +355,25 @@ fn failed_first_history_write_does_not_publish_a_bound_epoch() {
         assert!(app.layout_apply_receipts.is_empty());
         app.save_session_now();
         app.save_layout_apply_session_snapshot_now().unwrap();
-        assert!(crate::persist::load_checked().unwrap().unwrap().idempotency_epoch.is_none());
-        assert!(crate::persist::load_layout_apply_ledger().unwrap().is_none());
+        assert!(crate::persist::load_checked()
+            .unwrap()
+            .unwrap()
+            .idempotency_epoch
+            .is_none());
+        assert!(crate::persist::load_layout_apply_ledger()
+            .unwrap()
+            .is_none());
         drop(app);
 
         std::fs::remove_dir(obstruction).unwrap();
         let restarted = persistent_empty_app();
         assert!(restarted.layout_apply_receipts_error.is_none());
         assert!(!restarted.layout_apply_epoch.is_empty());
-        assert!(crate::persist::load_layout_apply_ledger().unwrap().unwrap().receipts.is_empty());
+        assert!(crate::persist::load_layout_apply_ledger()
+            .unwrap()
+            .unwrap()
+            .receipts
+            .is_empty());
     });
 }
 
@@ -315,9 +405,17 @@ fn epoch_free_handoff_load_failure_does_not_publish_a_temporary_epoch() {
         imported.assume_handoff_ownership();
         imported.initialize_layout_apply_idempotency_after_handoff(Some(None));
         imported.save_layout_apply_session_snapshot_now().unwrap();
-        assert!(crate::persist::load_checked().unwrap().unwrap().idempotency_epoch.is_none());
+        assert!(crate::persist::load_checked()
+            .unwrap()
+            .unwrap()
+            .idempotency_epoch
+            .is_none());
         imported.save_session_now();
-        assert!(crate::persist::load_checked().unwrap().unwrap().idempotency_epoch.is_none());
+        assert!(crate::persist::load_checked()
+            .unwrap()
+            .unwrap()
+            .idempotency_epoch
+            .is_none());
         assert!(imported.layout_apply_epoch.is_empty());
         assert!(imported.layout_apply_receipts_error.is_some());
         assert!(!imported.layout_apply_quarantined);
@@ -381,7 +479,10 @@ fn cancelled_receipts_require_durable_revalidation_after_restart() {
         let visible = crate::persist::load_layout_apply_ledger().unwrap().unwrap();
         assert_eq!(error_code(&failed), "idempotency_persist_failed");
         assert_ne!(std::fs::read(&path).unwrap(), before);
-        assert!(matches!(visible.receipts["uncertain-cancel"].outcome, LayoutApplyOutcome::Cancelled));
+        assert!(matches!(
+            visible.receipts["uncertain-cancel"].outcome,
+            LayoutApplyOutcome::Cancelled
+        ));
         assert!(visible.receipts.contains_key("older-cancel"));
         drop(app);
 
@@ -392,9 +493,17 @@ fn cancelled_receipts_require_durable_revalidation_after_restart() {
         assert!(!restarted.state.should_quit);
         add_workspace(&mut restarted);
         for request in [&old, &params] {
-            for operation in [LayoutOperation::Cancel, LayoutOperation::Apply, LayoutOperation::Reconcile] {
+            for operation in [
+                LayoutOperation::Cancel,
+                LayoutOperation::Apply,
+                LayoutOperation::Reconcile,
+            ] {
                 assert_eq!(
-                    error_code(&restarted.handle_layout_operation("unconfirmed".into(), request.clone(), operation)),
+                    error_code(&restarted.handle_layout_operation(
+                        "unconfirmed".into(),
+                        request.clone(),
+                        operation
+                    )),
                     "idempotency_unavailable"
                 );
             }
@@ -408,11 +517,18 @@ fn cancelled_receipts_require_durable_revalidation_after_restart() {
         assert!(confirmed.layout_apply_receipts_error.is_none());
         for request in [old, params] {
             assert_eq!(
-                error_code(&confirmed.handle_layout_apply_idempotent("confirmed".into(), request, false)),
+                error_code(&confirmed.handle_layout_apply_idempotent(
+                    "confirmed".into(),
+                    request,
+                    false
+                )),
                 "idempotency_no_effect"
             );
         }
-        assert_eq!(crate::persist::load_layout_apply_ledger().unwrap(), Some(visible));
+        assert_eq!(
+            crate::persist::load_layout_apply_ledger().unwrap(),
+            Some(visible)
+        );
     });
 }
 
@@ -452,20 +568,26 @@ fn cancellation_failure_never_returns_authoritative_no_effect() {
             let mut app = persistent_app_with_workspace();
             let params = idempotent_layout_params(None, "cancel-failed", "late");
             std::fs::create_dir_all(crate::session::data_dir().join(obstruction)).unwrap();
-            let code = error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone()));
-            assert_eq!(code, if obstruction == "session.json.tmp" {
-                "session_persist_failed"
-            } else {
-                "idempotency_persist_failed"
-            });
+            let code =
+                error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone()));
+            assert_eq!(
+                code,
+                if obstruction == "session.json.tmp" {
+                    "session_persist_failed"
+                } else {
+                    "idempotency_persist_failed"
+                }
+            );
             assert!(app.layout_apply_receipts.is_empty());
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
             assert!(app.terminal_runtimes.is_empty());
             if obstruction == "api-idempotency.json.tmp" {
                 // A sidecar failure can occur after rename. Fail closed in memory
                 // rather than using a stale absent-key observation for a late apply.
-                assert_eq!(error_code(&app.handle_layout_apply_idempotent("late".into(), params, false)),
-                    "idempotency_unavailable");
+                assert_eq!(
+                    error_code(&app.handle_layout_apply_idempotent("late".into(), params, false)),
+                    "idempotency_unavailable"
+                );
             }
         });
     }
@@ -476,19 +598,36 @@ fn cancellation_capacity_never_evicts_spent_keys() {
     with_test_config_home("cancel-capacity", |_| {
         let mut app = persistent_empty_app();
         let params = idempotent_layout_params(None, "spent-0", "cancel");
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("first".into(), params.clone())),
-            "idempotency_no_effect");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("first".into(), params.clone())),
+            "idempotency_no_effect"
+        );
         let receipt = app.layout_apply_receipts["spent-0"].clone();
         let receipts = (0..crate::persist::MAX_LAYOUT_IDEMPOTENCY_RECEIPTS)
-            .map(|index| (format!("spent-{index}"), receipt.clone())).collect();
+            .map(|index| (format!("spent-{index}"), receipt.clone()))
+            .collect();
         app.store_layout_apply_receipts(receipts).unwrap();
-        let before = std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap();
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("full".into(),
-            idempotent_layout_params(None, "new-key", "cancel"))), "idempotency_capacity");
-        assert_eq!(app.layout_apply_receipts.len(), crate::persist::MAX_LAYOUT_IDEMPOTENCY_RECEIPTS);
-        assert_eq!(std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap(), before);
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("spent".into(), params, false)),
-            "idempotency_no_effect");
+        let before =
+            std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap();
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent(
+                "full".into(),
+                idempotent_layout_params(None, "new-key", "cancel")
+            )),
+            "idempotency_capacity"
+        );
+        assert_eq!(
+            app.layout_apply_receipts.len(),
+            crate::persist::MAX_LAYOUT_IDEMPOTENCY_RECEIPTS
+        );
+        assert_eq!(
+            std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("spent".into(), params, false)),
+            "idempotency_no_effect"
+        );
     });
 }
 
@@ -505,11 +644,18 @@ fn future_session_snapshot_blocks_mutation_and_preserves_bytes() {
         assert!(app.state.workspaces.is_empty());
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "blocked".into(),
-            method: crate::api::schema::Method::LayoutApply(idempotent_layout_params(None, "unused", "blocked").layout),
+            method: crate::api::schema::Method::LayoutApply(
+                idempotent_layout_params(None, "unused", "blocked").layout,
+            ),
         });
         assert_eq!(error_code(&response), "session_snapshot_unsupported");
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("cancel".into(),
-            idempotent_layout_params(None, "unused", "blocked"))), "session_snapshot_unsupported");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent(
+                "cancel".into(),
+                idempotent_layout_params(None, "unused", "blocked")
+            )),
+            "session_snapshot_unsupported"
+        );
         app.save_session_now();
         assert_eq!(std::fs::read(path).unwrap(), content);
     });
@@ -520,9 +666,15 @@ fn no_session_rejects_idempotent_layout_methods() {
     let mut app = empty_app(false);
     add_workspace(&mut app);
     let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "unsupported", "keyed");
-    for operation in [LayoutOperation::Apply, LayoutOperation::Reconcile, LayoutOperation::Cancel] {
-        assert_eq!(error_code(&app.handle_layout_operation("request".into(), params.clone(), operation)),
-            "unsupported_in_no_session");
+    for operation in [
+        LayoutOperation::Apply,
+        LayoutOperation::Reconcile,
+        LayoutOperation::Cancel,
+    ] {
+        assert_eq!(
+            error_code(&app.handle_layout_operation("request".into(), params.clone(), operation)),
+            "unsupported_in_no_session"
+        );
     }
     assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     assert!(app.layout_apply_receipts.is_empty());
@@ -532,24 +684,37 @@ fn no_session_rejects_idempotent_layout_methods() {
 fn failed_layout_apply_no_effect_is_payload_bound() {
     with_test_config_home("failed-apply-payload-binding", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some("missing-workspace".into()), "failed-apply", "failed");
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("first".into(), params.clone(), false)),
-            "workspace_not_found");
-        assert!(matches!(app.layout_apply_receipts["failed-apply"].outcome, LayoutApplyOutcome::NoEffect));
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("replay".into(), params.clone(), false)),
-            "idempotency_no_effect");
+        let params =
+            idempotent_layout_params(Some("missing-workspace".into()), "failed-apply", "failed");
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("first".into(), params.clone(), false)),
+            "workspace_not_found"
+        );
+        assert!(matches!(
+            app.layout_apply_receipts["failed-apply"].outcome,
+            LayoutApplyOutcome::NoEffect
+        ));
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("replay".into(), params.clone(), false)),
+            "idempotency_no_effect"
+        );
         let mut divergent = params;
         divergent.layout.tab_label = Some("different".into());
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("conflict".into(), divergent, false)),
-            "idempotency_conflict");
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("conflict".into(), divergent, false)),
+            "idempotency_conflict"
+        );
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     });
 }
 
 #[test]
 fn keyed_layout_methods_fail_closed_after_unknown_ledger_load() {
-    for content in ["{not-json", r#"{"version":1,"layout_apply":{"spent":{}}}"#,
-        r#"{"version":4294967295,"layout_apply":{}}"#] {
+    for content in [
+        "{not-json",
+        r#"{"version":1,"layout_apply":{"spent":{}}}"#,
+        r#"{"version":4294967295,"layout_apply":{}}"#,
+    ] {
         with_test_config_home("unavailable-load", |_| {
             let path = crate::session::data_dir().join("api-idempotency.json");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -557,10 +722,24 @@ fn keyed_layout_methods_fail_closed_after_unknown_ledger_load() {
             let mut app = persistent_empty_app();
             assert!(app.layout_apply_receipts_error.is_some());
             add_workspace(&mut app);
-            let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "spent", "must-not-apply");
-            for operation in [LayoutOperation::Apply, LayoutOperation::Reconcile, LayoutOperation::Cancel] {
-                assert_eq!(error_code(&app.handle_layout_operation("req".into(), params.clone(), operation)),
-                    "idempotency_unavailable");
+            let params = idempotent_layout_params(
+                Some(app.public_workspace_id(0)),
+                "spent",
+                "must-not-apply",
+            );
+            for operation in [
+                LayoutOperation::Apply,
+                LayoutOperation::Reconcile,
+                LayoutOperation::Cancel,
+            ] {
+                assert_eq!(
+                    error_code(&app.handle_layout_operation(
+                        "req".into(),
+                        params.clone(),
+                        operation
+                    )),
+                    "idempotency_unavailable"
+                );
             }
             app.save_session_now();
             assert_eq!(std::fs::read_to_string(path).unwrap(), content);
@@ -579,8 +758,12 @@ fn pre_effect_session_checkpoint_restores_pending_save_on_failure() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         app.session_save_deadline = Some(deadline);
         app.persist_pane_history = true;
-        std::fs::create_dir_all(crate::session::data_dir().join("session-history.json.tmp")).unwrap();
-        assert!(!app.save_layout_apply_session_snapshot_now().unwrap_err().is_empty());
+        std::fs::create_dir_all(crate::session::data_dir().join("session-history.json.tmp"))
+            .unwrap();
+        assert!(!app
+            .save_layout_apply_session_snapshot_now()
+            .unwrap_err()
+            .is_empty());
         assert_eq!(app.session_save_deadline, Some(deadline));
         assert_eq!(std::fs::read(path).unwrap(), before);
     });
@@ -591,14 +774,26 @@ fn baseline_session_save_failure_has_no_effect_or_receipt() {
     with_test_config_home("session-save-failure", |_| {
         let mut app = persistent_app_with_workspace();
         std::fs::create_dir_all(crate::session::data_dir().join("session.json.tmp")).unwrap();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "session-save-failure", "durable");
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("req".into(), params, false)),
-            "session_persist_failed");
+        let params = idempotent_layout_params(
+            Some(app.public_workspace_id(0)),
+            "session-save-failure",
+            "durable",
+        );
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("req".into(), params, false)),
+            "session_persist_failed"
+        );
         assert!(!app.layout_apply_quarantined);
         assert!(!app.state.should_quit);
         assert!(app.policy.persist_session);
-        assert!(!app.layout_apply_receipts.contains_key("session-save-failure"));
-        assert!(crate::persist::load_layout_apply_ledger().unwrap().unwrap().receipts.is_empty());
+        assert!(!app
+            .layout_apply_receipts
+            .contains_key("session-save-failure"));
+        assert!(crate::persist::load_layout_apply_ledger()
+            .unwrap()
+            .unwrap()
+            .receipts
+            .is_empty());
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
         assert!(!crate::session::data_dir().join("session.json").exists());
     });
@@ -609,9 +804,8 @@ fn baseline_session_save_failure_has_no_effect_or_receipt() {
 async fn post_effect_receipt_failure_preserves_pending_and_quarantines() {
     with_test_config_home("commit-sidecar-failure", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(
-            Some(app.public_workspace_id(0)), "commit-failed", "durable",
-        );
+        let params =
+            idempotent_layout_params(Some(app.public_workspace_id(0)), "commit-failed", "durable");
         std::env::set_var("HERDR_TEST_LAYOUT_IDEMPOTENCY_FAIL_WRITE_AT", "2");
         let response = app.handle_layout_apply_idempotent("apply".into(), params.clone(), false);
         std::env::remove_var("HERDR_TEST_LAYOUT_IDEMPOTENCY_FAIL_WRITE_AT");
@@ -621,13 +815,24 @@ async fn post_effect_receipt_failure_preserves_pending_and_quarantines() {
         assert!(!app.policy.persist_session);
         let ledger = crate::persist::load_layout_apply_ledger().unwrap().unwrap();
         let pending = &ledger.receipts["commit-failed"];
-        assert!(matches!(pending.outcome, LayoutApplyOutcome::Pending { .. }));
+        assert!(matches!(
+            pending.outcome,
+            LayoutApplyOutcome::Pending { .. }
+        ));
         let snapshot = crate::persist::load_checked().unwrap().unwrap();
-        assert_eq!(snapshot.idempotency_epoch.as_deref(), Some(ledger.session_epoch.as_str()));
-        assert!(snapshot.workspaces.iter().flat_map(|workspace| &workspace.tabs)
+        assert_eq!(
+            snapshot.idempotency_epoch.as_deref(),
+            Some(ledger.session_epoch.as_str())
+        );
+        assert!(snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
             .any(|tab| tab.layout_effect_nonce.as_deref() == Some(pending.effect_nonce.as_str())));
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params)),
-            "server_unavailable");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params)),
+            "server_unavailable"
+        );
         app.state.assert_invariants_for_test();
         shutdown_test_runtimes(&mut app);
     });
@@ -641,14 +846,19 @@ fn startup_pending_reconciliation_failure_uses_quarantine() {
         let nonce = "ab".repeat(16);
         app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce.clone());
         let receipt = pending_receipt(&app, &params, &nonce);
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
         let epoch = app.layout_apply_epoch.clone();
-        std::fs::create_dir_all(crate::session::data_dir().join("api-idempotency.json.tmp")).unwrap();
+        std::fs::create_dir_all(crate::session::data_dir().join("api-idempotency.json.tmp"))
+            .unwrap();
         app.initialize_layout_apply_idempotency(Some(Some(&epoch)));
         assert!(app.layout_apply_quarantined);
         assert!(app.state.should_quit);
         assert!(!app.policy.persist_session);
-        assert!(matches!(app.layout_apply_receipts["startup-pending"].outcome, LayoutApplyOutcome::Pending { .. }));
+        assert!(matches!(
+            app.layout_apply_receipts["startup-pending"].outcome,
+            LayoutApplyOutcome::Pending { .. }
+        ));
     });
 }
 
@@ -656,15 +866,33 @@ fn startup_pending_reconciliation_failure_uses_quarantine() {
 fn pending_receipt_without_matching_live_nonce_stays_pending() {
     with_test_config_home("pending-without-nonce", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "pending-without-nonce", "pending");
+        let params = idempotent_layout_params(
+            Some(app.public_workspace_id(0)),
+            "pending-without-nonce",
+            "pending",
+        );
         let receipt = pending_receipt(&app, &params, &"ab".repeat(16));
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
         let before = crate::persist::load_layout_apply_ledger().unwrap();
-        for operation in [LayoutOperation::Reconcile, LayoutOperation::Cancel, LayoutOperation::Apply] {
-            assert_eq!(error_code(&app.handle_layout_operation("pending".into(), params.clone(), operation)),
-                "idempotency_pending");
+        for operation in [
+            LayoutOperation::Reconcile,
+            LayoutOperation::Cancel,
+            LayoutOperation::Apply,
+        ] {
+            assert_eq!(
+                error_code(&app.handle_layout_operation(
+                    "pending".into(),
+                    params.clone(),
+                    operation
+                )),
+                "idempotency_pending"
+            );
         }
-        assert!(matches!(app.layout_apply_receipts["pending-without-nonce"].outcome, LayoutApplyOutcome::Pending { .. }));
+        assert!(matches!(
+            app.layout_apply_receipts["pending-without-nonce"].outcome,
+            LayoutApplyOutcome::Pending { .. }
+        ));
         assert_eq!(crate::persist::load_layout_apply_ledger().unwrap(), before);
     });
 }
@@ -673,18 +901,28 @@ fn pending_receipt_without_matching_live_nonce_stays_pending() {
 fn pending_reconciliation_snapshot_failure_quarantines() {
     with_test_config_home("pending-snapshot-failure", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "pending-snapshot-failure", "pending");
+        let params = idempotent_layout_params(
+            Some(app.public_workspace_id(0)),
+            "pending-snapshot-failure",
+            "pending",
+        );
         let nonce = "ef".repeat(16);
         app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce.clone());
         let receipt = pending_receipt(&app, &params, &nonce);
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
         std::fs::create_dir_all(crate::session::data_dir().join("session.json.tmp")).unwrap();
-        assert_eq!(error_code(&app.handle_layout_apply_idempotent("reconcile".into(), params, true)),
-            "session_persist_failed");
+        assert_eq!(
+            error_code(&app.handle_layout_apply_idempotent("reconcile".into(), params, true)),
+            "session_persist_failed"
+        );
         assert!(app.layout_apply_quarantined);
         assert!(app.state.should_quit);
         assert!(!app.policy.persist_session);
-        assert!(matches!(app.layout_apply_receipts["pending-snapshot-failure"].outcome, LayoutApplyOutcome::Pending { .. }));
+        assert!(matches!(
+            app.layout_apply_receipts["pending-snapshot-failure"].outcome,
+            LayoutApplyOutcome::Pending { .. }
+        ));
         shutdown_test_runtimes(&mut app);
     });
 }
@@ -694,13 +932,19 @@ fn pending_reconciliation_snapshot_failure_quarantines() {
 fn post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable() {
     with_test_config_home("post-commit-reconciliation-failure", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "post-commit-reconciliation-failure", "pending");
+        let params = idempotent_layout_params(
+            Some(app.public_workspace_id(0)),
+            "post-commit-reconciliation-failure",
+            "pending",
+        );
         let nonce = "ab".repeat(16);
         app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce.clone());
         let receipt = pending_receipt(&app, &params, &nonce);
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
         let epoch = app.layout_apply_epoch.clone();
-        std::fs::create_dir_all(crate::session::data_dir().join("api-idempotency.json.tmp")).unwrap();
+        std::fs::create_dir_all(crate::session::data_dir().join("api-idempotency.json.tmp"))
+            .unwrap();
         app.initialize_layout_apply_idempotency_after_handoff(Some(Some(&epoch)));
         assert!(app.layout_apply_receipts_error.is_some());
         assert!(!app.layout_apply_quarantined);
@@ -708,7 +952,10 @@ fn post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable() {
         assert!(app.policy.persist_session);
         assert!(!app.state.session_dirty);
         assert!(app.session_save_deadline.is_some());
-        assert!(matches!(app.layout_apply_receipts[&params.idempotency_key].outcome, LayoutApplyOutcome::Pending { .. }));
+        assert!(matches!(
+            app.layout_apply_receipts[&params.idempotency_key].outcome,
+            LayoutApplyOutcome::Pending { .. }
+        ));
         app.state.assert_invariants_for_test();
     });
 }
@@ -717,18 +964,28 @@ fn post_commit_pending_reconciliation_failure_keeps_handoff_owner_usable() {
 fn pending_receipt_commits_only_for_matching_live_nonce() {
     with_test_config_home("pending-matching-nonce", |_| {
         let mut app = persistent_app_with_workspace();
-        let params = idempotent_layout_params(Some(app.public_workspace_id(0)), "pending-matching-nonce", "pending");
+        let params = idempotent_layout_params(
+            Some(app.public_workspace_id(0)),
+            "pending-matching-nonce",
+            "pending",
+        );
         let nonce = "cd".repeat(16);
         app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce.clone());
         let tab_id = app.public_tab_id(0, 0).unwrap();
         let receipt = pending_receipt(&app, &params, &nonce);
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
-        let success: SuccessResponse = serde_json::from_str(
-            &app.handle_layout_cancel_idempotent("recover".into(), params),
-        ).unwrap();
-        let ResponseResult::LayoutApply { layout } = success.result else { panic!("expected reconciled layout"); };
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
+        let success: SuccessResponse =
+            serde_json::from_str(&app.handle_layout_cancel_idempotent("recover".into(), params))
+                .unwrap();
+        let ResponseResult::LayoutApply { layout } = success.result else {
+            panic!("expected reconciled layout");
+        };
         assert_eq!(layout.tab_id, tab_id);
-        assert!(matches!(app.layout_apply_receipts["pending-matching-nonce"].outcome, LayoutApplyOutcome::Committed { .. }));
+        assert!(matches!(
+            app.layout_apply_receipts["pending-matching-nonce"].outcome,
+            LayoutApplyOutcome::Committed { .. }
+        ));
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
     });
 }
@@ -740,15 +997,27 @@ fn committed_recovery_rejects_missing_duplicate_and_wrong_tab_nonce() {
         let params = idempotent_layout_params(None, "committed", "recover");
         let nonce = "cd".repeat(16);
         let mut receipt = pending_receipt(&app, &params, &nonce);
-        receipt.outcome = LayoutApplyOutcome::Committed { tab_id: app.public_tab_id(0, 0).unwrap() };
-        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt).unwrap();
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("missing".into(), params.clone())), "idempotency_pending");
+        receipt.outcome = LayoutApplyOutcome::Committed {
+            tab_id: app.public_tab_id(0, 0).unwrap(),
+        };
+        app.store_layout_apply_receipt(params.idempotency_key.clone(), receipt)
+            .unwrap();
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("missing".into(), params.clone())),
+            "idempotency_pending"
+        );
         let second = app.state.workspaces[0].test_add_tab(None);
         app.state.ensure_test_terminals();
         app.state.workspaces[0].tabs[second].layout_effect_nonce = Some(nonce.clone());
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("wrong-tab".into(), params.clone())), "idempotency_pending");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("wrong-tab".into(), params.clone())),
+            "idempotency_pending"
+        );
         app.state.workspaces[0].tabs[0].layout_effect_nonce = Some(nonce);
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("duplicate".into(), params)), "idempotency_pending");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("duplicate".into(), params)),
+            "idempotency_pending"
+        );
         app.state.assert_invariants_for_test();
     });
 }
@@ -759,17 +1028,35 @@ fn cancellation_survives_epoch_bound_handoff_initialization() {
     with_test_config_home("cancel-handoff", |_| {
         let mut source = persistent_empty_app();
         let params = idempotent_layout_params(None, "handoff-cancel", "late");
-        assert_eq!(error_code(&source.handle_layout_cancel_idempotent("cancel".into(), params.clone())), "idempotency_no_effect");
+        assert_eq!(
+            error_code(&source.handle_layout_cancel_idempotent("cancel".into(), params.clone())),
+            "idempotency_no_effect"
+        );
         let snapshot = crate::persist::load_checked().unwrap().unwrap();
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut imported = App::new_from_handoff(&Config::default(), None, rx,
-            crate::api::EventHub::default(), &snapshot, &mut std::collections::HashMap::new()).unwrap();
+        let mut imported = App::new_from_handoff(
+            &Config::default(),
+            None,
+            rx,
+            crate::api::EventHub::default(),
+            &snapshot,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(imported.layout_apply_epoch, source.layout_apply_epoch);
-        assert!(imported.layout_apply_receipts.is_empty(), "no ledger write before ownership commit");
+        assert!(
+            imported.layout_apply_receipts.is_empty(),
+            "no ledger write before ownership commit"
+        );
         imported.assume_handoff_ownership();
-        imported.initialize_layout_apply_idempotency_after_handoff(Some(snapshot.idempotency_epoch.as_deref()));
+        imported.initialize_layout_apply_idempotency_after_handoff(Some(
+            snapshot.idempotency_epoch.as_deref(),
+        ));
         add_workspace(&mut imported);
-        assert_eq!(error_code(&imported.handle_layout_apply_idempotent("late".into(), params, false)), "idempotency_no_effect");
+        assert_eq!(
+            error_code(&imported.handle_layout_apply_idempotent("late".into(), params, false)),
+            "idempotency_no_effect"
+        );
         assert_eq!(imported.state.workspaces[0].tabs.len(), 1);
         assert!(imported.terminal_runtimes.is_empty());
     });
@@ -780,13 +1067,26 @@ fn epoch_mismatch_and_missing_snapshot_cannot_reopen_spent_keys() {
     with_test_config_home("epoch-mismatch", |_| {
         let mut app = persistent_empty_app();
         let params = idempotent_layout_params(None, "cancelled", "late");
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone())), "idempotency_no_effect");
-        let before = std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap();
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("cancel".into(), params.clone())),
+            "idempotency_no_effect"
+        );
+        let before =
+            std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap();
         app.initialize_layout_apply_idempotency(Some(Some(&"ff".repeat(16))));
-        assert_eq!(error_code(&app.handle_layout_cancel_idempotent("mismatch".into(), params.clone())), "idempotency_unavailable");
+        assert_eq!(
+            error_code(&app.handle_layout_cancel_idempotent("mismatch".into(), params.clone())),
+            "idempotency_unavailable"
+        );
         std::fs::remove_file(crate::session::data_dir().join("session.json")).unwrap();
         let mut restarted = persistent_empty_app();
-        assert_eq!(error_code(&restarted.handle_layout_apply_idempotent("missing".into(), params, false)), "idempotency_unavailable");
-        assert_eq!(std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap(), before);
+        assert_eq!(
+            error_code(&restarted.handle_layout_apply_idempotent("missing".into(), params, false)),
+            "idempotency_unavailable"
+        );
+        assert_eq!(
+            std::fs::read(crate::session::data_dir().join("api-idempotency.json")).unwrap(),
+            before
+        );
     });
 }

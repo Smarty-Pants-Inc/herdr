@@ -52,7 +52,9 @@ pub fn run_server() -> io::Result<()> {
             event_hub,
         );
         if app.session_persistence_blocked || app.layout_apply_quarantined {
-            return Err(io::Error::other("session persistence is unavailable at startup"));
+            return Err(io::Error::other(
+                "session persistence is unavailable at startup",
+            ));
         }
         seed_startup_workspace_if_empty(&mut app);
 
@@ -188,13 +190,17 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         // Ownership is already committed: receipt failure must not tear down
         // the imported runtimes or take the startup quarantine path.
-        server.app.initialize_layout_apply_idempotency_after_handoff(Some(
-            received.manifest.snapshot.idempotency_epoch.as_deref(),
-        ));
-        if let Err(err) = server.app.save_layout_apply_session_snapshot_now() {
-            server.app.mark_layout_apply_idempotency_unavailable(format!(
-                "failed to checkpoint the imported session: {err}"
+        server
+            .app
+            .initialize_layout_apply_idempotency_after_handoff(Some(
+                received.manifest.snapshot.idempotency_epoch.as_deref(),
             ));
+        if let Err(err) = server.app.save_layout_apply_session_snapshot_now() {
+            server
+                .app
+                .mark_layout_apply_idempotency_unavailable(format!(
+                    "failed to checkpoint the imported session: {err}"
+                ));
             server.app.state.session_dirty = true;
             server.app.sync_session_save_schedule();
         }

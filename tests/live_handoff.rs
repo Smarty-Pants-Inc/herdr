@@ -990,9 +990,12 @@ fn live_handoff_preserves_pane_process_io() {
             "root": { "type": "pane", "command": ["/usr/bin/touch", late_effect_marker] }
         }
     });
-    let cancelled = request(&api_socket, serde_json::json!({
-        "id": "test:cancel", "method": "layout.cancel_idempotent", "params": cancelled_layout
-    }));
+    let cancelled = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:cancel", "method": "layout.cancel_idempotent", "params": cancelled_layout
+        }),
+    );
     assert_eq!(cancelled["error"]["code"], "idempotency_no_effect");
 
     assert_ok(request(
@@ -1024,16 +1027,25 @@ fn live_handoff_preserves_pane_process_io() {
     );
     wait_for_output(&api_socket, &pane_id, "got:before_replay");
     for method in ["layout.apply_idempotent", "layout.cancel_idempotent"] {
-        let late = request(&api_socket, serde_json::json!({
-            "id": "test:late", "method": method, "params": cancelled_layout
-        }));
+        let late = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:late", "method": method, "params": cancelled_layout
+            }),
+        );
         assert_eq!(late["error"]["code"], "idempotency_no_effect");
     }
-    assert!(!late_effect_marker.exists(), "cancelled command ran after handoff");
-    let workspace = request(&api_socket, serde_json::json!({
-        "id": "test:cancelled:workspace", "method": "workspace.get",
-        "params": { "workspace_id": created["result"]["workspace"]["workspace_id"] }
-    }));
+    assert!(
+        !late_effect_marker.exists(),
+        "cancelled command ran after handoff"
+    );
+    let workspace = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:cancelled:workspace", "method": "workspace.get",
+            "params": { "workspace_id": created["result"]["workspace"]["workspace_id"] }
+        }),
+    );
     assert_eq!(workspace["result"]["workspace"]["tab_count"], 1);
     assert_eq!(workspace["result"]["workspace"]["pane_count"], 2);
 

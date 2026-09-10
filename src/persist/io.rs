@@ -52,14 +52,19 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
 
 fn write_bytes_to_path(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
-    let parent = target.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
     let tmp_path = target.with_extension("json.tmp");
     let result = (|| {
         let mut tmp = std::fs::OpenOptions::new()
-            .create(true).truncate(true).write(true).open(&tmp_path)?;
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
         tmp.write_all(bytes)?;
         tmp.sync_all()?;
         drop(tmp);
@@ -79,7 +84,9 @@ fn existing_file_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     let target = resolve_write_target(path)?;
     match std::fs::symlink_metadata(&target) {
         Ok(metadata) if !metadata.file_type().is_file() => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput, "persistence target is not a regular file")),
+            std::io::ErrorKind::InvalidInput,
+            "persistence target is not a regular file",
+        )),
         Ok(_) => std::fs::read(target).map(Some),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
@@ -119,7 +126,10 @@ pub(super) fn save_to_paths(
         return if restore_errors.is_empty() {
             Err(error)
         } else {
-            Err(std::io::Error::other(format!("{error}; {}", restore_errors.join("; "))))
+            Err(std::io::Error::other(format!(
+                "{error}; {}",
+                restore_errors.join("; ")
+            )))
         };
     }
     Ok(())

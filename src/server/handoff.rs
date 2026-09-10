@@ -277,27 +277,37 @@ fn validate_manifest_compatibility(manifest: &HandoffManifest) -> io::Result<()>
     if manifest.snapshot.version > crate::persist::SNAPSHOT_VERSION {
         return Err(io::Error::other(format!(
             "handoff snapshot version {} is newer than supported {}",
-            manifest.snapshot.version, crate::persist::SNAPSHOT_VERSION,
+            manifest.snapshot.version,
+            crate::persist::SNAPSHOT_VERSION,
         )));
     }
     let epoch = manifest.snapshot.idempotency_epoch.as_deref();
     match manifest.version {
         LEGACY_HANDOFF_VERSION if epoch.is_none() => {}
         LEGACY_HANDOFF_VERSION => {
-            return Err(io::Error::other("legacy handoff manifests cannot carry an idempotency epoch"));
+            return Err(io::Error::other(
+                "legacy handoff manifests cannot carry an idempotency epoch",
+            ));
         }
         HANDOFF_VERSION => {
-            let epoch = epoch.ok_or_else(|| io::Error::other(
-                "handoff version 3 requires an idempotency epoch"))?;
+            let epoch = epoch.ok_or_else(|| {
+                io::Error::other("handoff version 3 requires an idempotency epoch")
+            })?;
             crate::persist::validate_layout_session_epoch(epoch).map_err(io::Error::other)?;
         }
-        version => return Err(io::Error::other(format!("unsupported handoff version {version}"))),
+        version => {
+            return Err(io::Error::other(format!(
+                "unsupported handoff version {version}"
+            )))
+        }
     }
     for workspace in &manifest.snapshot.workspaces {
         for tab in &workspace.tabs {
             if let Some(nonce) = tab.layout_effect_nonce.as_deref() {
                 if epoch.is_none() {
-                    return Err(io::Error::other("layout effect nonce requires an idempotency epoch"));
+                    return Err(io::Error::other(
+                        "layout effect nonce requires an idempotency epoch",
+                    ));
                 }
                 crate::persist::validate_layout_session_epoch(nonce).map_err(io::Error::other)?;
             }
@@ -530,7 +540,10 @@ mod tests {
         snapshot.idempotency_epoch = Some("ab".repeat(16));
         let manifest = manifest_for(snapshot, Vec::new(), None, None, None);
         assert_eq!(manifest.version, 3);
-        assert_ne!(manifest.version, 1, "the published base must reject before FD transfer");
+        assert_ne!(
+            manifest.version, 1,
+            "the published base must reject before FD transfer"
+        );
         assert_eq!(manifest.snapshot.idempotency_epoch, Some("ab".repeat(16)));
         validate_manifest_compatibility(&manifest).unwrap();
     }
@@ -546,11 +559,15 @@ mod tests {
     fn handoff_rejects_legacy_epoch_missing_epoch_and_unknown_versions() {
         let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
         manifest.snapshot.idempotency_epoch = Some("ab".repeat(16));
-        assert!(validate_manifest_compatibility(&manifest).unwrap_err().to_string()
+        assert!(validate_manifest_compatibility(&manifest)
+            .unwrap_err()
+            .to_string()
             .contains("legacy handoff manifests cannot carry an idempotency epoch"));
         manifest.version = 3;
         manifest.snapshot.idempotency_epoch = None;
-        assert!(validate_manifest_compatibility(&manifest).unwrap_err().to_string()
+        assert!(validate_manifest_compatibility(&manifest)
+            .unwrap_err()
+            .to_string()
             .contains("requires an idempotency epoch"));
         manifest.snapshot.idempotency_epoch = Some("invalid".into());
         assert!(validate_manifest_compatibility(&manifest).is_err());
@@ -561,25 +578,32 @@ mod tests {
         }
         manifest.version = 3;
         manifest.snapshot.version = crate::persist::SNAPSHOT_VERSION + 1;
-        assert!(validate_manifest_compatibility(&manifest).unwrap_err().to_string()
+        assert!(validate_manifest_compatibility(&manifest)
+            .unwrap_err()
+            .to_string()
             .contains("newer than supported"));
     }
 
     #[test]
     fn receive_rejects_incompatible_manifest_before_validated_or_fds() {
-        let path = std::env::temp_dir().join(format!("herdr-c1-handoff-{}-{}.sock",
-            std::process::id(), std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "herdr-c1-handoff-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let listener = UnixListener::bind(&path).unwrap();
         let client_path = path.clone();
-        let client = std::thread::spawn(move || {
-            match receive(&client_path, "test-token") {
-                Err(error) => assert!(error.to_string().contains("requires an idempotency epoch")),
-                Ok(_) => panic!("incompatible handoff must not reach FD receipt"),
-            }
+        let client = std::thread::spawn(move || match receive(&client_path, "test-token") {
+            Err(error) => assert!(error.to_string().contains("requires an idempotency epoch")),
+            Ok(_) => panic!("incompatible handoff must not reach FD receipt"),
         });
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         assert_eq!(read_line_unbuffered(&mut stream).unwrap(), "test-token\n");
         let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
         manifest.version = 3;

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 
 use crate::api::schema::{
-    ErrorBody, EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
+    ErrorBody, EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription,
+    LayoutExportParams, LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult,
+    SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
@@ -69,7 +70,10 @@ impl App {
             Some(tab_id) => match self.parse_tab_id(tab_id) {
                 Some(target) => Some(target),
                 None => {
-                    return Err(layout_apply_error("tab_not_found", format!("tab {tab_id} not found")))
+                    return Err(layout_apply_error(
+                        "tab_not_found",
+                        format!("tab {tab_id} not found"),
+                    ))
                 }
             },
             None => None,
@@ -94,11 +98,17 @@ impl App {
         } else if let Some(active) = self.state.active {
             active
         } else {
-            return Err(layout_apply_error("workspace_not_found", "no active workspace"));
+            return Err(layout_apply_error(
+                "workspace_not_found",
+                "no active workspace",
+            ));
         };
         validate_layout_tree(&params.root)
             .map_err(|message| layout_apply_error("invalid_layout", message))?;
-        Ok(LayoutApplyTarget { ws_idx, replace_target })
+        Ok(LayoutApplyTarget {
+            ws_idx,
+            replace_target,
+        })
     }
 
     pub(super) fn expected_layout_apply_tab_id(&self, target: LayoutApplyTarget) -> String {
@@ -150,7 +160,10 @@ impl App {
 
         let created = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                return Err(layout_apply_error("workspace_not_found", "workspace not found"));
+                return Err(layout_apply_error(
+                    "workspace_not_found",
+                    "workspace not found",
+                ));
             };
             if let Some(argv) = command.as_deref() {
                 ws.create_tab_argv_command(
@@ -232,7 +245,10 @@ impl App {
             .iter()
             .position(|tab| tab.root_pane == new_root_pane)
         else {
-            return Err(layout_apply_error("layout_apply_failed", "new layout tab disappeared"));
+            return Err(layout_apply_error(
+                "layout_apply_failed",
+                "new layout tab disappeared",
+            ));
         };
 
         if params.focus || replace_was_active {
@@ -316,7 +332,11 @@ impl App {
         }
     }
 
-    pub(super) fn layout_description(&self, ws_idx: usize, tab_idx: usize) -> Option<LayoutDescription> {
+    pub(super) fn layout_description(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+    ) -> Option<LayoutDescription> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
         Some(LayoutDescription {

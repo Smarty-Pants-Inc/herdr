@@ -272,7 +272,9 @@ pub(crate) fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::other("random byte request is too large"))?;
     // SAFETY: the slice is writable for exactly length bytes.
     if unsafe { rtl_gen_random(bytes.as_mut_ptr().cast(), length) } == 0 {
-        Err(std::io::Error::other("system random byte generation failed"))
+        Err(std::io::Error::other(
+            "system random byte generation failed",
+        ))
     } else {
         Ok(())
     }
@@ -288,7 +290,10 @@ pub(crate) fn create_remote_ssh_config_file(
 }
 
 pub(crate) fn create_private_state_directory(path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     match create_remote_private_dir(path) {

@@ -11,7 +11,10 @@ pub(crate) fn create_private_state_directory(path: &Path) -> std::io::Result<()>
     if path.is_dir() {
         return Ok(());
     }
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     super::create_remote_private_dir(path)

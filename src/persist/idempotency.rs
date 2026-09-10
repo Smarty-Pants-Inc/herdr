@@ -175,11 +175,16 @@ fn load_from_path(path: &Path) -> io::Result<Option<LayoutApplyLedger>> {
         ));
     }
     let mut content = Vec::new();
-    std::io::Read::take(std::fs::File::open(path)?, MAX_LAYOUT_IDEMPOTENCY_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut content)?;
+    std::io::Read::take(
+        std::fs::File::open(path)?,
+        MAX_LAYOUT_IDEMPOTENCY_FILE_BYTES as u64 + 1,
+    )
+    .read_to_end(&mut content)?;
     if content.len() > MAX_LAYOUT_IDEMPOTENCY_FILE_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData,
-            "API idempotency ledger exceeds the size limit"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "API idempotency ledger exceeds the size limit",
+        ));
     }
     let value: serde_json::Value = serde_json::from_slice(&content)?;
     let version = value
@@ -445,11 +450,15 @@ mod tests {
         variants.push(changed);
         for field in ["cwd", "command", "env", "pane_id", "label"] {
             let mut changed = original.clone();
-            let LayoutNode::Pane { pane } = &mut changed.root else { panic!("pane fixture"); };
+            let LayoutNode::Pane { pane } = &mut changed.root else {
+                panic!("pane fixture");
+            };
             match field {
                 "cwd" => pane.cwd = Some("/other".into()),
                 "command" => pane.command = Some(vec!["other".into()]),
-                "env" => { pane.env.insert("TOKEN".into(), "other".into()); }
+                "env" => {
+                    pane.env.insert("TOKEN".into(), "other".into());
+                }
                 "pane_id" => pane.pane_id = Some("w1:p2".into()),
                 _ => pane.label = Some("other".into()),
             }
@@ -467,18 +476,29 @@ mod tests {
         let epoch = "cd".repeat(NONCE_BYTES);
         let ledger = LayoutApplyLedger {
             session_epoch: epoch.clone(),
-            receipts: LayoutApplyReceipts::from([("spent".into(), receipt(&epoch, "ab".repeat(32)))]),
+            receipts: LayoutApplyReceipts::from([(
+                "spent".into(),
+                receipt(&epoch, "ab".repeat(32)),
+            )]),
         };
         save_to_path(&path, &ledger).unwrap();
-        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for defect in ["version", "outcome", "missing_receipts", "extra", "epoch"] {
             let mut value = original.clone();
             match defect {
                 "version" => value["version"] = serde_json::json!(99),
-                "outcome" => value["layout_apply"]["spent"]["outcome"]["state"] = serde_json::json!("future"),
-                "missing_receipts" => { value.as_object_mut().unwrap().remove("layout_apply"); }
+                "outcome" => {
+                    value["layout_apply"]["spent"]["outcome"]["state"] = serde_json::json!("future")
+                }
+                "missing_receipts" => {
+                    value.as_object_mut().unwrap().remove("layout_apply");
+                }
                 "extra" => value["unknown_state"] = serde_json::json!({}),
-                _ => value["layout_apply"]["spent"]["session_epoch"] = serde_json::json!("ef".repeat(16)),
+                _ => {
+                    value["layout_apply"]["spent"]["session_epoch"] =
+                        serde_json::json!("ef".repeat(16))
+                }
             }
             let bytes = serde_json::to_vec(&value).unwrap();
             std::fs::write(&path, &bytes).unwrap();
@@ -490,7 +510,10 @@ mod tests {
 
     #[test]
     fn request_and_ledger_byte_limits_fail_closed() {
-        let large = params(HashMap::from([("LARGE".into(), "x".repeat(MAX_LAYOUT_IDEMPOTENCY_REQUEST_BYTES))]));
+        let large = params(HashMap::from([(
+            "LARGE".into(),
+            "x".repeat(MAX_LAYOUT_IDEMPOTENCY_REQUEST_BYTES),
+        )]));
         assert!(layout_apply_request_digest(&large).is_err());
         let path = temp_path("oversized");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -563,7 +586,10 @@ mod tests {
         let target = path.with_file_name("missing-ledger-target");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert_eq!(load_from_path(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            load_from_path(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert_eq!(std::fs::read_link(&path).unwrap(), target);
         assert!(!target.exists());
         cleanup(&path);
@@ -592,14 +618,25 @@ mod tests {
         // runner. No global environment or host ACL outside this fixture changes.
         let powershell = |script: &str| {
             let output = std::process::Command::new("powershell.exe")
-                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])
                 .env("HERDR_TEST_ACL_DIRECTORY", parent)
                 .env("HERDR_TEST_ACL_FILE", &path)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
-        powershell(r#"
+        powershell(
+            r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:HERDR_TEST_ACL_DIRECTORY
 $acl = Get-Acl -LiteralPath $path
@@ -614,9 +651,11 @@ $world = @((Get-Acl -LiteralPath $path).Access | Where-Object {
     $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0'
 })
 if ($world.Count -eq 0) { throw 'fixture must start with Everyone access' }
-"#);
+"#,
+        );
         save_to_path(&path, &ledger).unwrap();
-        powershell(r#"
+        powershell(
+            r#"
 $ErrorActionPreference = 'Stop'
 $directory = Get-Acl -LiteralPath $env:HERDR_TEST_ACL_DIRECTORY
 if (-not $directory.AreAccessRulesProtected) { throw 'directory still inherits its DACL' }
@@ -632,7 +671,8 @@ foreach ($path in @($env:HERDR_TEST_ACL_DIRECTORY, $env:HERDR_TEST_ACL_FILE)) {
         }
     }
 }
-"#);
+"#,
+        );
         assert_eq!(load_from_path(&path).unwrap(), Some(ledger));
         cleanup(&path);
     }

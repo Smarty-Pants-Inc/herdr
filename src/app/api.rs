@@ -888,11 +888,18 @@ impl App {
         request: crate::api::schema::Request,
     ) -> String {
         if self.layout_apply_quarantined {
-            return responses::encode_error(request.id, "server_unavailable", "server is shutting down");
+            return responses::encode_error(
+                request.id,
+                "server_unavailable",
+                "server is shutting down",
+            );
         }
         if self.session_persistence_blocked && crate::api::request_changes_ui(&request) {
-            return responses::encode_error(request.id, "session_snapshot_unsupported",
-                "session persistence is blocked by an unsupported snapshot");
+            return responses::encode_error(
+                request.id,
+                "session_snapshot_unsupported",
+                "session persistence is blocked by an unsupported snapshot",
+            );
         }
         self.sync_pending_terminal_titles();
         use crate::api::schema::{

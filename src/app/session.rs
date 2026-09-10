@@ -52,8 +52,8 @@ impl App {
                 self.state.active,
                 self.state.selected,
             );
-            snapshot.idempotency_epoch = (!self.layout_apply_epoch.is_empty())
-                .then(|| self.layout_apply_epoch.clone());
+            snapshot.idempotency_epoch =
+                (!self.layout_apply_epoch.is_empty()).then(|| self.layout_apply_epoch.clone());
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
             });

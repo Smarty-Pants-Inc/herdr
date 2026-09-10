@@ -47,7 +47,11 @@ fn protocol_schema_document() -> serde_json::Value {
 
 #[test]
 fn managed_layout_methods_are_explicit_and_unknown_effect_fields_are_rejected() {
-    for method in ["layout.apply_idempotent", "layout.reconcile_idempotent", "layout.cancel_idempotent"] {
+    for method in [
+        "layout.apply_idempotent",
+        "layout.reconcile_idempotent",
+        "layout.cancel_idempotent",
+    ] {
         let value = serde_json::json!({
             "id": "keyed", "method": method,
             "params": { "idempotency_key": "operation", "layout": {
@@ -57,7 +61,10 @@ fn managed_layout_methods_are_explicit_and_unknown_effect_fields_are_rejected() 
         });
         let request: Request = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(crate::api::api_method_name(&request.method), method);
-        assert_eq!(serde_json::to_value(&request).unwrap()["params"], value["params"]);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["params"],
+            value["params"]
+        );
         for path in ["params", "layout", "root"] {
             let mut unknown = value.clone();
             let object = match path {

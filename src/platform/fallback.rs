@@ -20,8 +20,10 @@ pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
 
 #[cfg(not(unix))]
 pub(crate) fn fill_random_bytes(_bytes: &mut [u8]) -> std::io::Result<()> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-        "secure random bytes are unavailable on this platform"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure random bytes are unavailable on this platform",
+    ))
 }
 
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {

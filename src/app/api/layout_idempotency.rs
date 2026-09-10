@@ -45,11 +45,15 @@ impl App {
         params: LayoutIdempotentParams,
         reconcile_only: bool,
     ) -> String {
-        self.handle_layout_operation(id, params, if reconcile_only {
-            LayoutOperation::Reconcile
-        } else {
-            LayoutOperation::Apply
-        })
+        self.handle_layout_operation(
+            id,
+            params,
+            if reconcile_only {
+                LayoutOperation::Reconcile
+            } else {
+                LayoutOperation::Apply
+            },
+        )
     }
 
     pub(super) fn handle_layout_cancel_idempotent(
@@ -70,14 +74,23 @@ impl App {
             return encode_error(id, "server_unavailable", "server is shutting down");
         }
         if self.session_persistence_blocked {
-            return encode_error(id, "session_snapshot_unsupported",
-                "session persistence is blocked by an unsupported snapshot");
+            return encode_error(
+                id,
+                "session_snapshot_unsupported",
+                "session persistence is blocked by an unsupported snapshot",
+            );
         }
         if !self.policy.persist_session {
-            return encode_error(id, "unsupported_in_no_session",
-                "idempotent layout methods require session persistence");
+            return encode_error(
+                id,
+                "unsupported_in_no_session",
+                "idempotent layout methods require session persistence",
+            );
         }
-        let LayoutIdempotentParams { idempotency_key, layout } = params;
+        let LayoutIdempotentParams {
+            idempotency_key,
+            layout,
+        } = params;
         if let Err(message) = self.validate_layout_idempotency_key(&idempotency_key) {
             return encode_error(id, "invalid_request", message);
         }
@@ -87,13 +100,21 @@ impl App {
         };
         let receipt = match self.layout_apply_receipt(&idempotency_key) {
             Ok(receipt) => receipt,
-            Err(err) => return encode_error(id, "idempotency_unavailable",
-                format!("layout idempotency ledger is unavailable: {err}")),
+            Err(err) => {
+                return encode_error(
+                    id,
+                    "idempotency_unavailable",
+                    format!("layout idempotency ledger is unavailable: {err}"),
+                )
+            }
         };
         if let Some(receipt) = receipt {
             if receipt.request_digest != request_digest {
-                return encode_error(id, "idempotency_conflict",
-                    "idempotency_key was already used with a different layout request");
+                return encode_error(
+                    id,
+                    "idempotency_conflict",
+                    "idempotency_key was already used with a different layout request",
+                );
             }
             return self.replay_layout_apply_receipt(id, idempotency_key, receipt);
         }
@@ -106,8 +127,11 @@ impl App {
             Err(err) => return encode_error(id, "idempotency_unavailable", err),
         };
         if let Err(err) = self.save_layout_apply_session_snapshot_now() {
-            return encode_error(id, "session_persist_failed",
-                format!("failed to bind the idempotency epoch to the current session: {err}"));
+            return encode_error(
+                id,
+                "session_persist_failed",
+                format!("failed to bind the idempotency epoch to the current session: {err}"),
+            );
         }
         if operation == LayoutOperation::Cancel {
             let receipt = LayoutApplyReceipt {
@@ -142,27 +166,38 @@ impl App {
             effect_nonce: effect_nonce.clone(),
             outcome: LayoutApplyOutcome::pending(self.expected_layout_apply_tab_id(target)),
         };
-        if let Err(err) = self.store_layout_apply_receipt(idempotency_key.clone(), pending.clone()) {
+        if let Err(err) = self.store_layout_apply_receipt(idempotency_key.clone(), pending.clone())
+        {
             return encode_layout_idempotency_store_error(id, err);
         }
         let layout = match self.apply_layout_once(&layout, target, Some(&effect_nonce)) {
             Ok(layout) => layout,
-            Err(error) => return encode_error(id, "idempotency_pending", format!(
+            Err(error) => {
+                return encode_error(
+                    id,
+                    "idempotency_pending",
+                    format!(
                 "{IDEMPOTENCY_PENDING_MESSAGE}: layout effect may have started before {}: {}",
-                error.code, error.message)),
+                error.code, error.message),
+                )
+            }
         };
         if let Err(err) = self.save_layout_apply_session_snapshot_now() {
             let message = self.quarantine_layout_apply_after_effect(format!(
-                "failed to persist idempotent layout session snapshot: {err}"));
+                "failed to persist idempotent layout session snapshot: {err}"
+            ));
             return encode_error(id, "session_persist_failed", message);
         }
         let committed = LayoutApplyReceipt {
-            outcome: LayoutApplyOutcome::Committed { tab_id: layout.tab_id.clone() },
+            outcome: LayoutApplyOutcome::Committed {
+                tab_id: layout.tab_id.clone(),
+            },
             ..pending
         };
         if let Err(err) = self.store_layout_apply_receipt(idempotency_key, committed) {
             let message = self.quarantine_layout_apply_after_effect(format!(
-                "failed to commit idempotent layout receipt: {err}"));
+                "failed to commit idempotent layout receipt: {err}"
+            ));
             return encode_error(id, "idempotency_persist_failed", message);
         }
         encode_success(id, ResponseResult::LayoutApply { layout })
@@ -178,27 +213,36 @@ impl App {
             LayoutApplyOutcome::Cancelled | LayoutApplyOutcome::NoEffect => {
                 return encode_error(id, "idempotency_no_effect", IDEMPOTENCY_NO_EFFECT_MESSAGE);
             }
-            LayoutApplyOutcome::Committed { .. } => self.replay_committed_layout_apply_receipt(&receipt),
+            LayoutApplyOutcome::Committed { .. } => {
+                self.replay_committed_layout_apply_receipt(&receipt)
+            }
             LayoutApplyOutcome::Pending { .. } => self.reconcile_layout_apply_receipt(&receipt),
         };
         match resolution {
-            PendingResolution::Ambiguous(reason) => encode_error(id, "idempotency_pending",
-                format!("{IDEMPOTENCY_PENDING_MESSAGE}: {reason}")),
+            PendingResolution::Ambiguous(reason) => encode_error(
+                id,
+                "idempotency_pending",
+                format!("{IDEMPOTENCY_PENDING_MESSAGE}: {reason}"),
+            ),
             PendingResolution::Committed(layout) => {
                 let layout = *layout;
                 if matches!(receipt.outcome, LayoutApplyOutcome::Pending { .. }) {
                     if let Err(err) = self.save_layout_apply_session_snapshot_now() {
                         let message = self.quarantine_layout_apply_after_effect(format!(
-                            "failed to persist a reconciled idempotent layout session: {err}"));
+                            "failed to persist a reconciled idempotent layout session: {err}"
+                        ));
                         return encode_error(id, "session_persist_failed", message);
                     }
                     let committed = LayoutApplyReceipt {
-                        outcome: LayoutApplyOutcome::Committed { tab_id: layout.tab_id.clone() },
+                        outcome: LayoutApplyOutcome::Committed {
+                            tab_id: layout.tab_id.clone(),
+                        },
                         ..receipt
                     };
                     if let Err(err) = self.store_layout_apply_receipt(idempotency_key, committed) {
                         let message = self.quarantine_layout_apply_after_effect(format!(
-                            "failed to commit reconciled layout receipt: {err}"));
+                            "failed to commit reconciled layout receipt: {err}"
+                        ));
                         return encode_error(id, "idempotency_persist_failed", message);
                     }
                 }
@@ -425,13 +469,10 @@ impl App {
             self.state.active,
             self.state.selected,
         );
-        snapshot.idempotency_epoch = (!self.layout_apply_epoch.is_empty())
-            .then(|| self.layout_apply_epoch.clone());
+        snapshot.idempotency_epoch =
+            (!self.layout_apply_epoch.is_empty()).then(|| self.layout_apply_epoch.clone());
         let history = self.persist_pane_history.then(|| {
-            crate::persist::capture_history(
-                &self.state.workspaces,
-                &self.terminal_runtimes,
-            )
+            crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
         });
         let result =
             crate::persist::save_layout_apply_session_snapshot(&snapshot, history.as_ref())
@@ -560,8 +601,7 @@ impl App {
         // after an unconfirmed rename. It also makes first-use empty history durable
         // before a snapshot binds its epoch; do not skip this write for an empty map.
         if let Err(err) = self.store_layout_apply_receipts(candidate) {
-            let message =
-                format!("failed to durably restore layout idempotency receipts: {err}");
+            let message = format!("failed to durably restore layout idempotency receipts: {err}");
             return if changed && quarantine_on_failure {
                 Err(self.quarantine_layout_apply_after_effect(message))
             } else {
