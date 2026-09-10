@@ -250,7 +250,7 @@ fn absent_cancel_is_durable_payload_bound_and_fences_late_apply_after_restart() 
                 "idempotency_no_effect"
             );
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-            assert!(app.terminal_runtimes.is_empty());
+            assert_eq!(app.terminal_runtimes.len(), 0);
         }
         assert_eq!(
             crate::persist::load_layout_apply_ledger()
@@ -299,7 +299,7 @@ fn absent_cancel_is_durable_payload_bound_and_fences_late_apply_after_restart() 
                 "idempotency_unavailable"
             );
             assert_eq!(restarted.state.workspaces[0].tabs.len(), 1);
-            assert!(restarted.terminal_runtimes.is_empty());
+            assert_eq!(restarted.terminal_runtimes.len(), 0);
         }
         assert!(crate::persist::load_layout_apply_ledger()
             .unwrap()
@@ -422,7 +422,7 @@ fn epoch_free_handoff_load_failure_does_not_publish_a_temporary_epoch() {
         assert!(!imported.state.should_quit);
         assert!(imported.policy.persist_session);
         assert!(imported.state.workspaces.is_empty());
-        assert!(imported.terminal_runtimes.is_empty());
+        assert_eq!(imported.terminal_runtimes.len(), 0);
         let params = idempotent_layout_params(None, "first-after-repair", "unused");
         assert_eq!(
             error_code(&imported.handle_layout_cancel_idempotent("blocked".into(), params.clone())),
@@ -439,7 +439,7 @@ fn epoch_free_handoff_load_failure_does_not_publish_a_temporary_epoch() {
             "idempotency_no_effect"
         );
         assert!(restarted.state.workspaces.is_empty());
-        assert!(restarted.terminal_runtimes.is_empty());
+        assert_eq!(restarted.terminal_runtimes.len(), 0);
         restarted.state.assert_invariants_for_test();
     });
 }
@@ -509,7 +509,7 @@ fn cancelled_receipts_require_durable_revalidation_after_restart() {
             }
         }
         assert_eq!(restarted.state.workspaces[0].tabs.len(), 1);
-        assert!(restarted.terminal_runtimes.is_empty());
+        assert_eq!(restarted.terminal_runtimes.len(), 0);
         drop(restarted);
         std::env::remove_var("HERDR_TEST_LAYOUT_IDEMPOTENCY_FAIL_DIRECTORY_SYNC");
 
@@ -580,7 +580,7 @@ fn cancellation_failure_never_returns_authoritative_no_effect() {
             );
             assert!(app.layout_apply_receipts.is_empty());
             assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-            assert!(app.terminal_runtimes.is_empty());
+            assert_eq!(app.terminal_runtimes.len(), 0);
             if obstruction == "api-idempotency.json.tmp" {
                 // A sidecar failure can occur after rename. Fail closed in memory
                 // rather than using a stale absent-key observation for a late apply.
@@ -1058,7 +1058,7 @@ fn cancellation_survives_epoch_bound_handoff_initialization() {
             "idempotency_no_effect"
         );
         assert_eq!(imported.state.workspaces[0].tabs.len(), 1);
-        assert!(imported.terminal_runtimes.is_empty());
+        assert_eq!(imported.terminal_runtimes.len(), 0);
     });
 }
 
