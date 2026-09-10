@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -46,18 +47,50 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    write_bytes_to_path(path, &serde_json::to_vec_pretty(snapshot)?)
+}
+
+fn write_bytes_to_path(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
-    if let Some(parent) = target.parent() {
+    let parent = target.parent().filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
-    if let Err(err) = std::fs::rename(&tmp_path, &target) {
+    let result = (|| {
+        let mut tmp = std::fs::OpenOptions::new()
+            .create(true).truncate(true).write(true).open(&tmp_path)?;
+        tmp.write_all(bytes)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        crate::platform::replace_file(&tmp_path, &target)?;
+        if let Some(parent) = parent {
+            crate::platform::sync_parent_directory(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
     }
-    Ok(())
+    result
+}
+
+fn existing_file_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let target = resolve_write_target(path)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "persistence target is not a regular file")),
+        Ok(_) => std::fs::read(target).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_bytes_to_path(path, bytes),
+        None => clear_path(&resolve_write_target(path)?),
+    }
 }
 
 pub(super) fn save_to_paths(
@@ -66,11 +99,28 @@ pub(super) fn save_to_paths(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
 ) -> std::io::Result<()> {
-    save_to_path(session_path, snapshot)?;
-    if let Some(history) = history {
-        save_json_to_path(history_path, history)?;
-    } else {
-        clear_path(history_path)?;
+    let session_before = existing_file_bytes(session_path)?;
+    let history_before = existing_file_bytes(history_path)?;
+    let result = save_to_path(session_path, snapshot).and_then(|_| {
+        if let Some(history) = history {
+            save_json_to_path(history_path, history)
+        } else {
+            clear_path(&resolve_write_target(history_path)?)
+        }
+    });
+    if let Err(error) = result {
+        let mut restore_errors = Vec::new();
+        if let Err(err) = restore_file(session_path, session_before.as_deref()) {
+            restore_errors.push(format!("session restore failed: {err}"));
+        }
+        if let Err(err) = restore_file(history_path, history_before.as_deref()) {
+            restore_errors.push(format!("history restore failed: {err}"));
+        }
+        return if restore_errors.is_empty() {
+            Err(error)
+        } else {
+            Err(std::io::Error::other(format!("{error}; {}", restore_errors.join("; "))))
+        };
     }
     Ok(())
 }
@@ -110,35 +160,25 @@ pub fn clear_history() {
     }
 }
 
+#[cfg(test)]
 pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
-    if !path.exists() {
-        return None;
-    }
-    let content = match std::fs::read_to_string(&path) {
+    load_checked().unwrap_or_else(|err| {
+        warn!(err = %err, "session persistence is unavailable");
+        None
+    })
+}
+
+pub(crate) fn load_checked() -> Result<Option<SessionSnapshot>, String> {
+    load_from_path(&session_path())
+}
+
+fn load_from_path(path: &Path) -> Result<Option<SessionSnapshot>, String> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
-        Err(err) => {
-            warn!(err = %err, "failed to read session file");
-            return None;
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
     };
-    match parse_snapshot(&content) {
-        Ok(snapshot) => Some(snapshot),
-        Err(err) => {
-            if let Some(version) = snapshot_file_version(&content) {
-                if version > SNAPSHOT_VERSION {
-                    warn!(
-                        file_version = version,
-                        supported = SNAPSHOT_VERSION,
-                        "session file is from a newer herdr version, ignoring"
-                    );
-                    return None;
-                }
-            }
-            warn!(err = %err, "failed to parse session file, ignoring");
-            None
-        }
-    }
+    parse_snapshot(&content).map(Some)
 }
 
 pub fn load_history() -> Option<SessionHistorySnapshot> {
@@ -200,6 +240,7 @@ mod tests {
 
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
+            idempotency_epoch: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
@@ -225,6 +266,23 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn unknown_and_malformed_snapshots_are_not_absent_or_rewritten() {
+        let path = temp_session_path("unsupported");
+        assert!(matches!(load_from_path(&path), Ok(None)));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for content in [
+            r#"{"version":4294967295,"workspaces":[],"active":null,"selected":0}"#,
+            "{broken",
+            r#"{"version":3,"idempotency_epoch":"invalid","workspaces":[]}"#,
+        ] {
+            std::fs::write(&path, content).unwrap();
+            assert!(load_from_path(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

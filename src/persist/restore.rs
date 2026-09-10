@@ -716,6 +716,7 @@ fn restore_tab(
     (
         Some((
             crate::workspace::Tab {
+                layout_effect_nonce: snap.layout_effect_nonce.clone(),
                 custom_name: snap.custom_name.clone(),
                 number,
                 root_pane,
@@ -1171,6 +1172,7 @@ mod tests {
     async fn restore_carries_persisted_agent_session_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
+            idempotency_epoch: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1182,6 +1184,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    layout_effect_nonce: None,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1251,6 +1254,7 @@ mod tests {
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
+            idempotency_epoch: Some("ab".repeat(16)),
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
@@ -1296,6 +1300,7 @@ mod tests {
                     zoomed: false,
                     focused: Some(10),
                     root_pane: Some(10),
+                    layout_effect_nonce: Some("cd".repeat(16)),
                 }],
                 active_tab: 0,
             }],
@@ -1328,6 +1333,8 @@ mod tests {
         assert_eq!(workspace.next_public_pane_number, 4);
         assert_eq!(workspace.tabs[0].number, 5);
         assert_eq!(workspace.next_public_tab_number, 6);
+        assert_eq!(workspace.tabs[0].layout_effect_nonce, Some("cd".repeat(16)));
+        workspace.assert_invariants_for_test();
     }
 
     #[tokio::test]
@@ -1360,6 +1367,7 @@ mod tests {
             launch_argv: None,
         };
         let snapshot = SessionSnapshot {
+            idempotency_epoch: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
@@ -1378,6 +1386,7 @@ mod tests {
                         zoomed: false,
                         focused: Some(10),
                         root_pane: Some(10),
+                        layout_effect_nonce: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1386,6 +1395,7 @@ mod tests {
                         zoomed: false,
                         focused: Some(11),
                         root_pane: Some(11),
+                        layout_effect_nonce: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1394,6 +1404,7 @@ mod tests {
                         zoomed: false,
                         focused: Some(12),
                         root_pane: Some(12),
+                        layout_effect_nonce: None,
                     },
                     TabSnapshot {
                         custom_name: None,
@@ -1402,6 +1413,7 @@ mod tests {
                         zoomed: false,
                         focused: Some(13),
                         root_pane: Some(13),
+                        layout_effect_nonce: None,
                     },
                 ],
                 active_tab: 3,
@@ -1465,6 +1477,7 @@ mod tests {
                 zoomed: false,
                 focused: Some(10),
                 root_pane: Some(10),
+                layout_effect_nonce: None,
             }],
             active_tab: 0,
         };
@@ -1482,6 +1495,7 @@ mod tests {
     async fn native_agent_restore_defers_runtime_launch() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
+            idempotency_epoch: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1493,6 +1507,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    layout_effect_nonce: None,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1691,6 +1706,7 @@ mod tests {
             }],
         };
         let snapshot = SessionSnapshot {
+            idempotency_epoch: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1708,6 +1724,7 @@ mod tests {
                     zoomed: false,
                     focused: Some(0),
                     root_pane: Some(0),
+                    layout_effect_nonce: None,
                 }],
                 active_tab: 0,
             }],

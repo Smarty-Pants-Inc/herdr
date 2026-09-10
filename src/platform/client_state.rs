@@ -1,5 +1,19 @@
 use std::path::Path;
 
+#[cfg(unix)]
+pub(crate) use super::unix_common::create_private_state_directory;
+
+#[cfg(not(unix))]
+pub(crate) fn create_private_state_directory(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::create_remote_private_dir(path)
+}
+
 #[cfg(not(windows))]
 pub(crate) fn create_private_state_file(path: &Path) -> std::io::Result<std::fs::File> {
     super::create_remote_ssh_config_file(path)

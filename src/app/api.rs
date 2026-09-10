@@ -4,6 +4,7 @@ mod agent_view;
 mod agents;
 mod env;
 mod integrations;
+mod layout_idempotency;
 mod layouts;
 mod pane_graphics;
 mod panes;
@@ -886,6 +887,13 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        if self.layout_apply_quarantined {
+            return responses::encode_error(request.id, "server_unavailable", "server is shutting down");
+        }
+        if self.session_persistence_blocked && crate::api::request_changes_ui(&request) {
+            return responses::encode_error(request.id, "session_snapshot_unsupported",
+                "session persistence is blocked by an unsupported snapshot");
+        }
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
@@ -1091,6 +1099,15 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutApplyIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, false);
+            }
+            Method::LayoutReconcileIdempotent(params) => {
+                return self.handle_layout_apply_idempotent(request.id, params, true);
+            }
+            Method::LayoutCancelIdempotent(params) => {
+                return self.handle_layout_cancel_idempotent(request.id, params);
+            }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
             }

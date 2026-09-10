@@ -165,6 +165,68 @@ pub struct LayoutApplyParams {
     pub root: LayoutNode,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct LayoutIdempotentParams {
+    pub idempotency_key: String,
+    pub layout: LayoutApplyParams,
+}
+
+impl<'de> Deserialize<'de> for LayoutIdempotentParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            idempotency_key: String,
+            layout: serde_json::Value,
+        }
+        fn check_fields(value: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
+            let object = value.as_object().ok_or("layout value must be an object")?;
+            if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+                return Err(format!("unsupported idempotent layout field: {key}"));
+            }
+            Ok(())
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        // Ordinary layout.apply keeps its published decoding contract. Keyed
+        // requests must reject unknown effect-bearing fields, including fields
+        // hidden by LayoutNode's flattened pane representation.
+        check_fields(
+            &raw.layout,
+            &["workspace_id", "tab_id", "tab_label", "focus", "root"],
+        )
+        .map_err(D::Error::custom)?;
+        let mut nodes = vec![raw
+            .layout
+            .get("root")
+            .ok_or_else(|| D::Error::custom("layout root is required"))?];
+        while let Some(node) = nodes.pop() {
+            match node.get("type").and_then(serde_json::Value::as_str) {
+                Some("pane") => {
+                    check_fields(node, &["type", "pane_id", "label", "cwd", "command", "env"])
+                        .map_err(D::Error::custom)?;
+                }
+                Some("split") => {
+                    check_fields(node, &["type", "direction", "ratio", "first", "second"])
+                        .map_err(D::Error::custom)?;
+                    for key in ["first", "second"] {
+                        nodes.push(
+                            node.get(key)
+                                .ok_or_else(|| D::Error::custom("split children are required"))?,
+                        );
+                    }
+                }
+                _ => return Err(D::Error::custom("invalid layout node type")),
+            }
+        }
+        Ok(Self {
+            idempotency_key: raw.idempotency_key,
+            layout: serde_json::from_value(raw.layout).map_err(D::Error::custom)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LayoutSetSplitRatioParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3,17 +3,30 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
+    ErrorBody, EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
     LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
 use crate::workspace::NewPane;
 
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 const MAX_LAYOUT_PANES: usize = 24;
 const MAX_LAYOUT_DEPTH: usize = 16;
+
+#[derive(Clone, Copy)]
+pub(super) struct LayoutApplyTarget {
+    ws_idx: usize,
+    replace_target: Option<(usize, usize)>,
+}
+
+fn layout_apply_error(code: impl Into<String>, message: impl Into<String>) -> ErrorBody {
+    ErrorBody {
+        code: code.into(),
+        message: message.into(),
+    }
+}
 
 impl App {
     pub(super) fn handle_layout_export(
@@ -32,43 +45,75 @@ impl App {
     }
 
     pub(super) fn handle_layout_apply(&mut self, id: String, params: LayoutApplyParams) -> String {
+        if self.layout_apply_quarantined {
+            return encode_error(id, "server_unavailable", "server is shutting down");
+        }
+        let target = match self.prepare_layout_apply(&params) {
+            Ok(target) => target,
+            Err(error) => return encode_error_body(id, error),
+        };
+        match self.apply_layout_once(&params, target, None) {
+            Ok(layout) => {
+                self.schedule_session_save();
+                encode_success(id, ResponseResult::LayoutApply { layout })
+            }
+            Err(error) => encode_error_body(id, error),
+        }
+    }
+
+    pub(super) fn prepare_layout_apply(
+        &self,
+        params: &LayoutApplyParams,
+    ) -> Result<LayoutApplyTarget, ErrorBody> {
         let replace_target = match params.tab_id.as_deref() {
             Some(tab_id) => match self.parse_tab_id(tab_id) {
                 Some(target) => Some(target),
                 None => {
-                    return encode_error(id, "tab_not_found", format!("tab {tab_id} not found"))
+                    return Err(layout_apply_error("tab_not_found", format!("tab {tab_id} not found")))
                 }
             },
             None => None,
         };
         if replace_target.is_some() && params.workspace_id.is_some() {
-            return encode_error(
-                id,
+            return Err(layout_apply_error(
                 "invalid_target",
                 "use either tab_id or workspace_id, not both",
-            );
+            ));
         }
 
         let ws_idx = if let Some((ws_idx, _)) = replace_target {
             ws_idx
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
             let Some(ws_idx) = self.parse_workspace_id(workspace_id) else {
-                return encode_error(
-                    id,
+                return Err(layout_apply_error(
                     "workspace_not_found",
                     format!("workspace {workspace_id} not found"),
-                );
+                ));
             };
             ws_idx
         } else if let Some(active) = self.state.active {
             active
         } else {
-            return encode_error(id, "workspace_not_found", "no active workspace");
+            return Err(layout_apply_error("workspace_not_found", "no active workspace"));
         };
-        if let Err(message) = validate_layout_tree(&params.root) {
-            return encode_error(id, "invalid_layout", message);
-        }
+        validate_layout_tree(&params.root)
+            .map_err(|message| layout_apply_error("invalid_layout", message))?;
+        Ok(LayoutApplyTarget { ws_idx, replace_target })
+    }
 
+    pub(super) fn expected_layout_apply_tab_id(&self, target: LayoutApplyTarget) -> String {
+        let workspace = &self.state.workspaces[target.ws_idx];
+        crate::workspace::public_tab_id_for_number(&workspace.id, workspace.next_public_tab_number)
+    }
+
+    pub(super) fn apply_layout_once(
+        &mut self,
+        params: &LayoutApplyParams,
+        target: LayoutApplyTarget,
+        effect_nonce: Option<&str>,
+    ) -> Result<LayoutDescription, ErrorBody> {
+        let ws_idx = target.ws_idx;
+        let replace_target = target.replace_target;
         let replacement_label = params.tab_label.clone().or_else(|| {
             let (_, tab_idx) = replace_target?;
             self.state
@@ -96,16 +141,16 @@ impl App {
         let host_terminal_appearance = self.state.host_terminal_appearance;
         let extra_env = match super::env::normalize_launch_env(root_leaf.env.clone()) {
             Ok(env) => env,
-            Err((code, message)) => return encode_error(id, &code, message),
+            Err((code, message)) => return Err(layout_apply_error(code, message)),
         };
         let command = match layout_command(root_leaf) {
             Ok(command) => command,
-            Err(message) => return encode_error(id, "invalid_layout", message),
+            Err(message) => return Err(layout_apply_error("invalid_layout", message)),
         };
 
         let created = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                return encode_error(id, "workspace_not_found", "workspace not found");
+                return Err(layout_apply_error("workspace_not_found", "workspace not found"));
             };
             if let Some(argv) = command.as_deref() {
                 ws.create_tab_argv_command(
@@ -134,8 +179,10 @@ impl App {
 
         let (new_tab_idx, terminal, runtime) = match created {
             Ok(result) => result,
-            Err(err) => return encode_error(id, "layout_apply_failed", err.to_string()),
+            Err(err) => return Err(layout_apply_error("layout_apply_failed", err.to_string())),
         };
+        self.state.workspaces[ws_idx].tabs[new_tab_idx].layout_effect_nonce =
+            effect_nonce.map(str::to_owned);
         let new_root_pane = self.state.workspaces[ws_idx].tabs[new_tab_idx].root_pane;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.remove_alias_shadowed_by_new_pane(new_root_pane);
@@ -147,7 +194,7 @@ impl App {
 
         if let Err(message) = self.apply_layout_node_to_pane(ws_idx, new_root_pane, &params.root) {
             self.rollback_layout_tab(ws_idx, new_root_pane);
-            return encode_error(id, "layout_apply_failed", message);
+            return Err(layout_apply_error("layout_apply_failed", message));
         }
 
         if let Some((target_ws_idx, target_tab_idx)) = replace_target {
@@ -164,7 +211,7 @@ impl App {
                 .terminal_ids_for_tab(target_ws_idx, target_tab_idx);
             let plugin_pane_ids = self.state.pane_ids_for_tab(target_ws_idx, target_tab_idx);
             let Some(ws) = self.state.workspaces.get_mut(target_ws_idx) else {
-                return encode_error(id, "tab_not_found", "tab not found");
+                return Err(layout_apply_error("tab_not_found", "tab not found"));
             };
             if ws.close_tab(target_tab_idx) {
                 self.state.remove_plugin_pane_records(plugin_pane_ids);
@@ -185,14 +232,13 @@ impl App {
             .iter()
             .position(|tab| tab.root_pane == new_root_pane)
         else {
-            return encode_error(id, "layout_apply_failed", "new layout tab disappeared");
+            return Err(layout_apply_error("layout_apply_failed", "new layout tab disappeared"));
         };
 
         if params.focus || replace_was_active {
             self.state.switch_workspace_tab(ws_idx, new_tab_idx);
             self.state.mode = Mode::Terminal;
         }
-        self.schedule_session_save();
         if let Some(tab) = self.tab_info(ws_idx, new_tab_idx) {
             self.emit_event(EventEnvelope {
                 event: EventKind::TabCreated,
@@ -212,10 +258,8 @@ impl App {
         }
         self.emit_layout_updated_event(ws_idx, new_tab_idx);
 
-        let Some(layout) = self.layout_description(ws_idx, new_tab_idx) else {
-            return encode_error(id, "layout_apply_failed", "new layout unavailable");
-        };
-        encode_success(id, ResponseResult::LayoutApply { layout })
+        self.layout_description(ws_idx, new_tab_idx)
+            .ok_or_else(|| layout_apply_error("layout_apply_failed", "new layout unavailable"))
     }
 
     pub(super) fn handle_layout_set_split_ratio(
@@ -272,7 +316,7 @@ impl App {
         }
     }
 
-    fn layout_description(&self, ws_idx: usize, tab_idx: usize) -> Option<LayoutDescription> {
+    pub(super) fn layout_description(&self, ws_idx: usize, tab_idx: usize) -> Option<LayoutDescription> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
         Some(LayoutDescription {

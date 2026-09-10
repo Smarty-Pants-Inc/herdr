@@ -12,7 +12,7 @@ enum SessionSaveJob {
 
 impl App {
     pub(super) fn schedule_session_save(&mut self) {
-        if self.policy.persist_session {
+        if self.policy.persist_session && !self.session_persistence_blocked {
             self.pane_exit_checkpoint_pending = false;
             self.session_save_deadline = Some(Instant::now() + SESSION_SAVE_DEBOUNCE);
         }
@@ -38,16 +38,22 @@ impl App {
     }
 
     fn capture_session_save_job(&self) -> SessionSaveJob {
-        if self.state.workspaces.is_empty() {
+        // Closing the last workspace must not erase spent operation keys.
+        if self.state.workspaces.is_empty()
+            && self.layout_apply_receipts.is_empty()
+            && self.layout_apply_receipts_error.is_none()
+        {
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let mut snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
             );
+            snapshot.idempotency_epoch = (!self.layout_apply_epoch.is_empty())
+                .then(|| self.layout_apply_epoch.clone());
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
             });
@@ -56,7 +62,7 @@ impl App {
     }
 
     pub(crate) fn start_background_session_save(&mut self) {
-        if !self.policy.persist_session {
+        if !self.policy.persist_session || self.session_persistence_blocked {
             self.session_save_deadline = None;
             return;
         }
@@ -82,12 +88,16 @@ impl App {
         }
     }
 
-    pub(crate) fn save_session_now(&mut self) {
+    pub(crate) fn join_background_session_save(&mut self) {
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }
+    }
 
-        if !self.policy.persist_session {
+    pub(crate) fn save_session_now(&mut self) {
+        self.join_background_session_save();
+
+        if !self.policy.persist_session || self.session_persistence_blocked {
             self.session_save_deadline = None;
             return;
         }
@@ -99,6 +109,7 @@ impl App {
 
     pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
         if !self.policy.persist_session
+            || self.session_persistence_blocked
             || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)
         {
             return;

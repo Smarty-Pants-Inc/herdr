@@ -27,6 +27,7 @@ impl HeadlessServer {
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
         info!("starting live handoff");
+        self.app.join_background_session_save();
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
@@ -79,13 +80,16 @@ impl HeadlessServer {
             }
         }
 
-        let snapshot = crate::persist::capture(
+        let mut snapshot = crate::persist::capture(
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
             self.app.state.active,
             self.app.state.selected,
         );
+
+        snapshot.idempotency_epoch = (!self.app.layout_apply_epoch.is_empty())
+            .then(|| self.app.layout_apply_epoch.clone());
 
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {

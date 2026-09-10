@@ -107,6 +107,17 @@ pub(crate) fn create_remote_ssh_config_dir(control_socket_name: &str) -> std::io
     ))
 }
 
+pub(crate) fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read as _;
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+pub(crate) fn create_private_state_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 pub(crate) fn create_remote_ssh_config_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 

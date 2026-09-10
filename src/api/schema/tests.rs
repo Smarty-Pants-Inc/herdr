@@ -46,6 +46,35 @@ fn protocol_schema_document() -> serde_json::Value {
 }
 
 #[test]
+fn managed_layout_methods_are_explicit_and_unknown_effect_fields_are_rejected() {
+    for method in ["layout.apply_idempotent", "layout.reconcile_idempotent", "layout.cancel_idempotent"] {
+        let value = serde_json::json!({
+            "id": "keyed", "method": method,
+            "params": { "idempotency_key": "operation", "layout": {
+                "workspace_id": "w1", "focus": false,
+                "root": { "type": "pane", "command": ["program"], "env": { "A": "value" } }
+            } }
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(crate::api::api_method_name(&request.method), method);
+        assert_eq!(serde_json::to_value(&request).unwrap()["params"], value["params"]);
+        for path in ["params", "layout", "root"] {
+            let mut unknown = value.clone();
+            let object = match path {
+                "params" => &mut unknown["params"],
+                "layout" => &mut unknown["params"]["layout"],
+                _ => &mut unknown["params"]["layout"]["root"],
+            };
+            object["execution_target"] = serde_json::json!({ "type": "ssh", "host": "other" });
+            assert!(serde_json::from_value::<Request>(unknown).is_err());
+        }
+        let mut unknown_method = value;
+        unknown_method["method"] = serde_json::json!("layout.cancel_idempotent_future");
+        assert!(serde_json::from_value::<Request>(unknown_method).is_err());
+    }
+}
+
+#[test]
 fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),

@@ -261,6 +261,23 @@ pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::i
     ))
 }
 
+pub(crate) fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    // Use the native system RNG without adding a second crypto dependency.
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        #[link_name = "SystemFunction036"]
+        fn rtl_gen_random(buffer: *mut std::ffi::c_void, length: u32) -> u8;
+    }
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| std::io::Error::other("random byte request is too large"))?;
+    // SAFETY: the slice is writable for exactly length bytes.
+    if unsafe { rtl_gen_random(bytes.as_mut_ptr().cast(), length) } == 0 {
+        Err(std::io::Error::other("system random byte generation failed"))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn create_remote_ssh_config_file(
     path: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
