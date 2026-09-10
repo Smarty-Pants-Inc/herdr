@@ -252,11 +252,30 @@ impl App {
                 return;
             }
         }
-        if let Some(Some(epoch)) = &restored_epoch {
-            self.layout_apply_epoch = epoch.clone();
+        match &restored_epoch {
+            Some(Some(epoch)) => self.layout_apply_epoch = epoch.clone(),
+            // An epoch-free import can carry a constructor-generated temporary
+            // epoch. Clear it before any ledger-load/allocation failure returns.
+            _ => self.layout_apply_epoch.clear(),
         }
-        let mut ledger = match crate::persist::load_layout_apply_ledger() {
-            Ok(ledger) => ledger,
+        let has_bound_epoch = restored_epoch.as_ref().is_some_and(Option::is_some);
+        let ledger = match crate::persist::load_layout_apply_ledger() {
+            Ok(Some(ledger)) => ledger,
+            Ok(None) if has_bound_epoch => {
+                self.mark_layout_apply_idempotency_unavailable(
+                    "layout idempotency ledger is missing for the restored session epoch".into(),
+                );
+                return;
+            }
+            Ok(None) => match LayoutApplyLedger::empty() {
+                Ok(ledger) => ledger,
+                Err(err) => {
+                    self.mark_layout_apply_idempotency_unavailable(format!(
+                        "failed to initialize layout idempotency receipts: {err}"
+                    ));
+                    return;
+                }
+            },
             Err(err) => {
                 self.mark_layout_apply_idempotency_unavailable(format!(
                     "failed to load layout idempotency receipts: {err}"
@@ -265,7 +284,6 @@ impl App {
             }
         };
         match restored_epoch {
-            Some(Some(epoch)) if ledger.receipts.is_empty() => ledger.session_epoch = epoch,
             Some(Some(epoch)) if epoch == ledger.session_epoch => {}
             Some(Some(_)) => {
                 self.mark_layout_apply_idempotency_unavailable(
@@ -292,9 +310,12 @@ impl App {
         self.layout_apply_epoch = ledger.session_epoch;
         self.layout_apply_receipts = ledger.receipts;
         self.layout_apply_receipts_error = None;
-        if let Err(err) =
-            self.reconcile_pending_layout_apply_receipts(quarantine_on_reconcile_failure)
-        {
+        if let Err(err) = self.revalidate_layout_apply_receipts(quarantine_on_reconcile_failure) {
+            if !has_bound_epoch {
+                // No receipts can exist in this branch. Do not let an ordinary
+                // save bind an epoch whose initial empty ledger was not durable.
+                self.layout_apply_epoch.clear();
+            }
             self.mark_layout_apply_idempotency_unavailable(err);
             if !quarantine_on_reconcile_failure {
                 self.state.session_dirty = true;
@@ -404,7 +425,8 @@ impl App {
             self.state.active,
             self.state.selected,
         );
-        snapshot.idempotency_epoch = Some(self.layout_apply_epoch.clone());
+        snapshot.idempotency_epoch = (!self.layout_apply_epoch.is_empty())
+            .then(|| self.layout_apply_epoch.clone());
         let history = self.persist_pane_history.then(|| {
             crate::persist::capture_history(
                 &self.state.workspaces,
@@ -509,7 +531,7 @@ impl App {
         PendingResolution::Committed(Box::new(layout))
     }
 
-    fn reconcile_pending_layout_apply_receipts(
+    fn revalidate_layout_apply_receipts(
         &mut self,
         quarantine_on_failure: bool,
     ) -> Result<(), String> {
@@ -534,13 +556,13 @@ impl App {
             }
         }
 
-        if !changed {
-            return Ok(());
-        }
+        // ponytail: one bounded startup write revalidates even unchanged receipts
+        // after an unconfirmed rename. It also makes first-use empty history durable
+        // before a snapshot binds its epoch; do not skip this write for an empty map.
         if let Err(err) = self.store_layout_apply_receipts(candidate) {
             let message =
-                format!("failed to persist reconciled layout idempotency receipts: {err}");
-            return if quarantine_on_failure {
+                format!("failed to durably restore layout idempotency receipts: {err}");
+            return if changed && quarantine_on_failure {
                 Err(self.quarantine_layout_apply_after_effect(message))
             } else {
                 Err(message)

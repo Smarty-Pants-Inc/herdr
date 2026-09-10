@@ -133,7 +133,7 @@ pub(crate) fn validate_layout_session_epoch(epoch: &str) -> Result<(), String> {
     validate_hex(epoch, NONCE_HEX_LEN, "session epoch").map_err(|err| err.to_string())
 }
 
-pub(crate) fn load_layout_apply_ledger() -> io::Result<LayoutApplyLedger> {
+pub(crate) fn load_layout_apply_ledger() -> io::Result<Option<LayoutApplyLedger>> {
     load_from_path(&idempotency_path())
 }
 
@@ -154,12 +154,20 @@ pub(crate) fn save_layout_apply_session_snapshot(
     )
 }
 
-fn load_from_path(path: &Path) -> io::Result<LayoutApplyLedger> {
-    let metadata = match std::fs::metadata(path) {
+fn load_from_path(path: &Path) -> io::Result<Option<LayoutApplyLedger>> {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return LayoutApplyLedger::empty(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    // A dangling link (or an entry lost after inspection) is unavailable history,
+    // not permission to initialize an empty ledger.
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "API idempotency ledger is not a regular file",
+        ));
+    }
     if metadata.len() > MAX_LAYOUT_IDEMPOTENCY_FILE_BYTES as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -195,7 +203,7 @@ fn load_from_path(path: &Path) -> io::Result<LayoutApplyLedger> {
         receipts: file.layout_apply,
     };
     validate_ledger(&ledger)?;
-    Ok(ledger)
+    Ok(Some(ledger))
 }
 
 fn validate_ledger(ledger: &LayoutApplyLedger) -> io::Result<()> {
@@ -352,6 +360,15 @@ fn save_to_path(path: &Path, ledger: &LayoutApplyLedger) -> io::Result<()> {
     if let Err(err) = crate::platform::replace_file(&temp_path, path) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(err);
+    }
+    // Exercise the uncertain state after rename, not a pre-write failure.
+    #[cfg(test)]
+    if path == idempotency_path()
+        && std::env::var_os("HERDR_TEST_LAYOUT_IDEMPOTENCY_FAIL_DIRECTORY_SYNC").is_some()
+    {
+        return Err(io::Error::other(
+            "injected layout idempotency directory sync failure after rename",
+        ));
     }
     crate::platform::sync_parent_directory(parent)?;
     Ok(())
@@ -524,7 +541,99 @@ mod tests {
         ] {
             assert!(!saved.contains(raw));
         }
-        assert_eq!(load_from_path(&path).unwrap(), ledger);
+        assert_eq!(load_from_path(&path).unwrap(), Some(ledger));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ledger_absence_is_distinct_from_valid_empty_history() {
+        let path = temp_path("missing-history");
+        assert_eq!(load_from_path(&path).unwrap(), None);
+        assert!(!path.exists());
+        let ledger = LayoutApplyLedger::empty().unwrap();
+        save_to_path(&path, &ledger).unwrap();
+        assert_eq!(load_from_path(&path).unwrap(), Some(ledger));
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_ledger_symlink_is_unavailable_and_unchanged() {
+        let path = temp_path("dangling-history");
+        let target = path.with_file_name("missing-ledger-target");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(load_from_path(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
+        cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_is_owner_private_after_snapshot_creates_existing_windows_directory() {
+        let path = temp_path("existing-windows-permissions");
+        let parent = path.parent().unwrap();
+        let ledger = LayoutApplyLedger::empty().unwrap();
+        let mut snapshot = super::super::snapshot::parse_snapshot(
+            r#"{"version":3,"workspaces":[],"active":null,"selected":0}"#,
+        )
+        .unwrap();
+        snapshot.idempotency_epoch = Some(ledger.session_epoch.clone());
+        super::super::io::save_to_paths(
+            &parent.join("session.json"),
+            &parent.join("session-history.json"),
+            &snapshot,
+            None,
+        )
+        .unwrap();
+
+        // Child-scoped PowerShell inspects native ACLs on the admitted Windows
+        // runner. No global environment or host ACL outside this fixture changes.
+        let powershell = |script: &str| {
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
+                .env("HERDR_TEST_ACL_DIRECTORY", parent)
+                .env("HERDR_TEST_ACL_FILE", &path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        powershell(r#"
+$ErrorActionPreference = 'Stop'
+$path = $env:HERDR_TEST_ACL_DIRECTORY
+$acl = Get-Acl -LiteralPath $path
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRuleSpecific($rule) }
+$everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $everyone, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $path -AclObject $acl
+$world = @((Get-Acl -LiteralPath $path).Access | Where-Object {
+    $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0'
+})
+if ($world.Count -eq 0) { throw 'fixture must start with Everyone access' }
+"#);
+        save_to_path(&path, &ledger).unwrap();
+        powershell(r#"
+$ErrorActionPreference = 'Stop'
+$directory = Get-Acl -LiteralPath $env:HERDR_TEST_ACL_DIRECTORY
+if (-not $directory.AreAccessRulesProtected) { throw 'directory still inherits its DACL' }
+foreach ($path in @($env:HERDR_TEST_ACL_DIRECTORY, $env:HERDR_TEST_ACL_FILE)) {
+    $acl = Get-Acl -LiteralPath $path
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    $allowed = @('S-1-5-18', 'S-1-3-4', $owner)
+    if (@($acl.Access).Count -eq 0) { throw 'missing private access rules' }
+    foreach ($rule in $acl.Access) {
+        $sid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($rule.AccessControlType -ne 'Allow' -or $allowed -notcontains $sid) {
+            throw "unexpected private-state access: $sid"
+        }
+    }
+}
+"#);
+        assert_eq!(load_from_path(&path).unwrap(), Some(ledger));
         cleanup(&path);
     }
 

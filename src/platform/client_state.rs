@@ -3,7 +3,10 @@ use std::path::Path;
 #[cfg(unix)]
 pub(crate) use super::unix_common::create_private_state_directory;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) use super::windows::create_private_state_directory;
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn create_private_state_directory(path: &Path) -> std::io::Result<()> {
     if path.is_dir() {
         return Ok(());
