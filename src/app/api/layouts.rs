@@ -390,7 +390,7 @@ impl App {
             label: terminal.and_then(|terminal| terminal.manual_label.clone()),
             cwd: tab
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
+                .map(|cwd| cwd.components().as_path().display().to_string()),
             command: terminal.and_then(|terminal| terminal.launch_argv.clone()),
             env: Default::default(),
         })
@@ -736,6 +736,39 @@ mod tests {
         };
         assert_eq!(pane.label.as_deref(), Some("tests"));
         assert_eq!(pane.pane_id, Some(app.public_pane_id(0, right).unwrap()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn layout_description_preserves_windows_cwd_roots_and_components() {
+        let mut app = app_with_workspace();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(root)
+            .cloned()
+            .unwrap();
+        for (input, expected) in [
+            (r"D:\work\repo\", r"D:\work\repo"),
+            (r"D:\", r"D:\"),
+            (r"D:", r"D:"),
+            (r"D:work\repo\", r"D:work\repo"),
+            (r"\", r"\"),
+            (r"\\server\share\", r"\\server\share\"),
+            (r"\\server\share\repo\", r"\\server\share\repo"),
+            (r"\\?\D:\", r"\\?\D:\"),
+            (r"\\?\D:\work\repo\", r"\\?\D:\work\repo"),
+            (r"\\?\UNC\server\share\", r"\\?\UNC\server\share\"),
+            (r"D:\work\..\repo\", r"D:\work\..\repo"),
+            (r"\\?\D:\work\..\repo\", r"\\?\D:\work\..\repo"),
+        ] {
+            app.state.terminals.get_mut(&terminal_id).unwrap().cwd = PathBuf::from(input);
+            let layout = app.layout_description(0, 0).unwrap();
+            let LayoutNode::Pane { pane } = layout.root else {
+                panic!("expected pane layout root");
+            };
+            assert_eq!(pane.cwd.as_deref(), Some(expected), "{input:?}");
+            assert_eq!(PathBuf::from(expected), PathBuf::from(input));
+        }
     }
 
     #[test]
