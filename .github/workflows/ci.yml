@@ -143,6 +143,63 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: just check
 
+      - name: Archive tested Linux conformance binary
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          CANDIDATE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test -z "${CARGO_TARGET_DIR:-}${CARGO_BUILD_TARGET:-}" || {
+            echo "Unsupported Cargo output override; no conformance artifact exported" >&2
+            exit 1
+          }
+          binary=target/debug/herdr
+          test -f "$binary" && test ! -L "$binary" && test -x "$binary" || {
+            echo "Tested standalone executable unavailable: $binary; no rebuild or fallback" >&2
+            exit 1
+          }
+          git diff --exit-code HEAD --
+          stage="$RUNNER_TEMP/herdr-native-conformance"
+          mkdir "$stage"
+          binary_sha=$(sha256sum "$binary" | cut -d ' ' -f 1)
+          {
+            echo "kind=herdr-linux-debug-conformance-not-release"
+            git show -s --format='commit=%H%ntree=%T%nparents=%P' HEAD
+            printf 'candidate_head=%s\nrepository=%s\nrun_id=%s\nattempt=%s\njob=%s\nevent=%s\n' \
+              "$CANDIDATE_HEAD" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" "$GITHUB_EVENT_NAME"
+            printf 'runner_os=%s\nrunner_arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            echo "linux_just_check=success; other_jobs=not_attested"
+            echo "binary=herdr; build_path=$binary; sha256=$binary_sha"
+            stat --format='mode=%a size=%s' "$binary"
+            sha256sum .github/workflows/ci.yml Cargo.lock build.rs
+            uname -srmo
+            rustc --version --verbose
+            cargo --version
+            just --version
+            cargo nextest --version
+            bun --version
+            zig version
+            readelf --file-header --program-headers --dynamic --version-info "$binary"
+          } > "$stage/RECEIPT.txt"
+          tar --create --gzip --file="$stage/herdr-linux-conformance.tar.gz" \
+            --owner=0 --group=0 --numeric-owner \
+            -C "$GITHUB_WORKSPACE/target/debug" herdr -C "$stage" RECEIPT.txt
+          test "$(tar -xOf "$stage/herdr-linux-conformance.tar.gz" herdr | sha256sum | cut -d ' ' -f 1)" = "$binary_sha"
+          (cd "$stage" && sha256sum herdr-linux-conformance.tar.gz > SHA256SUMS)
+
+      - name: Upload tested Linux conformance binary
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-linux-conformance-${{ runner.arch }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/herdr-native-conformance/herdr-linux-conformance.tar.gz
+            ${{ runner.temp }}/herdr-native-conformance/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
       - name: Run macOS CI checks
         if: matrix.os == 'macos-latest'
         run: just ci '${{ matrix.nextest_filter }}'
