@@ -140,7 +140,12 @@ fn explicit_adoption_preserves_four_panes_and_replay_keeps_path_lookup_ambiguous
     let active = fixture.app.state.active;
     for _ in 0..2 {
         let reply = fixture.adopt();
-        assert_eq!(reply["result"]["type"], "worktree_opened");
+        assert_eq!(reply["result"]["type"], "worktree_opened", "{reply}");
+        let path = reply["result"]["worktree"]["path"].as_str().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(path).unwrap(),
+            PathBuf::from(&fixture.params.path)
+        );
         assert_eq!(reply["result"]["already_open"], true);
         assert_eq!(
             reply["result"]["workspace"]["workspace_id"],
@@ -382,10 +387,16 @@ fn explicit_verification_allows_only_the_expected_live_pi_and_its_tool_descendan
                     .parent_pid = 151
             }
             _ => {
-                observations[1][0].worker.as_mut().unwrap().processes[1]
-                    .2
-                    .processes[0]
-                    .name = "pi".into()
+                let worker = observations[1][0].worker.as_mut().unwrap();
+                let mut second_agent = worker.processes[0].2.clone();
+                second_agent.process_group_id = 151;
+                second_agent.processes[0].pid = 151;
+                assert_eq!(
+                    crate::detect::identify_agent_in_job(&second_agent).map(|(agent, _)| agent),
+                    Some(crate::detect::Agent::Pi)
+                );
+                worker.processes[1].1.executable = PathBuf::from("/installed/pi");
+                worker.processes[1].2 = second_agent;
             }
         }
         fixture.app.state.session_dirty = false;
@@ -396,7 +407,11 @@ fn explicit_verification_allows_only_the_expected_live_pi_and_its_tool_descendan
                 Ok(observations[index].clone())
             });
         let reply: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(reply.get("result").is_some(), change == 0, "{reply}");
+        assert_eq!(
+            reply.get("result").is_some(),
+            change == 0,
+            "case {change}: {reply}"
+        );
         assert!(!fixture.app.state.session_dirty);
         assert_eq!(fixture.app.event_hub.events_after(0).len(), events);
     }
@@ -404,6 +419,28 @@ fn explicit_verification_allows_only_the_expected_live_pi_and_its_tool_descendan
         fixture.adopt()["error"]["code"],
         "worktree_adoption_unavailable"
     );
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn unsupported_explicit_methods_refuse_before_native_observation() {
+    let mut fixture = Fixture::new();
+    let adopt = fixture
+        .app
+        .handle_worktree_adopt("unsupported".into(), fixture.params.clone());
+    let verify = fixture.app.handle_worktree_verify_adoption(
+        "unsupported".into(),
+        WorktreeVerifyAdoptionParams {
+            binding: fixture.params.clone(),
+            agent_session_id: None,
+        },
+    );
+    for response in [adopt, verify] {
+        let reply: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(reply["error"]["code"], "worktree_adoption_unavailable");
+        assert!(fixture.app.state.workspaces[1].worktree_space.is_none());
+    }
+    fixture.app.state.assert_invariants_for_test();
 }
 
 #[test]

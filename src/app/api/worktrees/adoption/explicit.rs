@@ -195,7 +195,7 @@ impl App {
             self.validate_adoption_membership(target, &checkout, &root, &git.key, true)?;
         }
         let entry = self.find_worktree_entry(&source, Some(params.path.clone()), None, false)?;
-        if entry.is_bare || entry.is_prunable || entry.path != checkout {
+        if entry.is_bare || entry.is_prunable || physical(&entry.path)? != checkout {
             return Err(unavailable());
         }
         let [tab] = self.state.workspaces[target].tabs.as_slice() else {
