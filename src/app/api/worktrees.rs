@@ -8,8 +8,10 @@ use crate::app::App;
 
 use super::responses::{encode_error, encode_success};
 
+mod adoption;
 mod deferred;
 
+#[derive(Debug)]
 struct ApiFailure {
     code: &'static str,
     message: String,
@@ -67,8 +69,19 @@ impl App {
         };
         let worktrees = entries
             .into_iter()
-            .map(|entry| self.worktree_info_for_entry(&source, entry))
-            .collect();
+            .map(|entry| {
+                let open = if entry.is_bare || entry.is_prunable {
+                    self.open_workspace_idx_for_checkout(&entry.path)
+                } else {
+                    self.lookup_worktree_checkout(&source, &entry.path)?
+                };
+                Ok(self.worktree_info_for_entry(&source, entry, open))
+            })
+            .collect::<Result<Vec<_>, ApiFailure>>();
+        let worktrees = match worktrees {
+            Ok(worktrees) => worktrees,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
 
         encode_success(
             id,
@@ -110,7 +123,10 @@ impl App {
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
         let canonical_source = crate::worktree::canonical_or_original(&source.source_checkout_path);
         let target_is_source = canonical_path == canonical_source;
-        let already_open = self.open_workspace_idx_for_checkout(&canonical_path);
+        let already_open = match self.lookup_worktree_checkout(&source, &canonical_path) {
+            Ok(open) => open,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let defer_source_created_event = target_is_source && already_open.is_none();
         let created_source_workspace =
             match self.ensure_source_parent_membership(&mut source, !defer_source_created_event) {
@@ -165,7 +181,7 @@ impl App {
         }
 
         let tab_idx = self.state.workspaces[ws_idx].active_tab;
-        let worktree = self.worktree_info_for_entry(&source, entry);
+        let worktree = self.worktree_info_for_entry(&source, entry, Some(ws_idx));
         self.emit_worktree_opened_event(ws_idx, worktree.clone(), already_open.is_some());
         encode_success(
             id,
@@ -557,6 +573,7 @@ impl App {
         &self,
         source: &WorktreeSource,
         entry: crate::worktree::ExistingWorktree,
+        open_workspace_idx: Option<usize>,
     ) -> WorktreeInfo {
         let canonical_path = crate::worktree::canonical_or_original(&entry.path);
         let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
@@ -567,9 +584,7 @@ impl App {
             is_detached: entry.is_detached,
             is_prunable: entry.is_prunable,
             is_linked_worktree: canonical_path != repo_root,
-            open_workspace_id: self
-                .open_workspace_idx_for_checkout(&canonical_path)
-                .map(|idx| self.public_workspace_id(idx)),
+            open_workspace_id: open_workspace_idx.map(|idx| self.public_workspace_id(idx)),
             label: source.repo_name.clone(),
         }
     }
@@ -596,31 +611,39 @@ impl App {
     pub(crate) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
-        self.state.workspaces.iter().position(|ws| {
-            if ws.worktree_space().is_some_and(|space| {
-                crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
-            }) {
-                return true;
-            }
+        self.state
+            .workspaces
+            .iter()
+            .position(|ws| self.workspace_matches_checkout(ws, &canonical_checkout, &checkout_key))
+    }
 
-            let git_space = ws.git_space().cloned().or_else(|| {
-                ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                    .as_deref()
-                    .and_then(crate::workspace::git_space_metadata)
-            });
-            if git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.checkout_key == checkout_key)
-            {
-                return true;
-            }
+    fn workspace_matches_checkout(
+        &self,
+        ws: &crate::workspace::Workspace,
+        canonical_checkout: &Path,
+        checkout_key: &str,
+    ) -> bool {
+        if ws.worktree_space().is_some_and(|space| {
+            crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
+        }) {
+            return true;
+        }
 
+        let git_space = ws.git_space().cloned().or_else(|| {
             ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
                 .as_deref()
-                .is_some_and(|cwd| {
-                    crate::worktree::canonical_or_original(cwd) == canonical_checkout
-                })
-        })
+                .and_then(crate::workspace::git_space_metadata)
+        });
+        if git_space
+            .as_ref()
+            .is_some_and(|metadata| metadata.checkout_key == checkout_key)
+        {
+            return true;
+        }
+
+        ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+            .as_deref()
+            .is_some_and(|cwd| crate::worktree::canonical_or_original(cwd) == canonical_checkout)
     }
 
     pub(crate) fn worktree_info_for_workspace(&self, ws_idx: usize) -> Option<WorktreeInfo> {
@@ -761,7 +784,7 @@ mod tests {
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
     }
 
-    fn run_git(repo: &Path, args: &[&str]) {
+    pub(super) fn run_git(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
@@ -776,7 +799,7 @@ mod tests {
         );
     }
 
-    fn create_committed_repo(name: &str) -> PathBuf {
+    pub(super) fn create_committed_repo(name: &str) -> PathBuf {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
@@ -815,7 +838,7 @@ mod tests {
         "/usr/bin/true"
     }
 
-    fn app_with_parent(repo: &Path) -> App {
+    pub(super) fn app_with_parent(repo: &Path) -> App {
         let mut app = test_app();
         let mut parent = Workspace::test_new("main");
         parent.identity_cwd = repo.to_path_buf();

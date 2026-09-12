@@ -459,7 +459,12 @@ mod tests {
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("sound media failed"),
-            "stderr should identify a MediaFailed error"
+            "stderr should identify a MediaFailed error; player diagnostic (first 4096 chars): {:?}",
+            playback_error(&output)
+                .replace(std::env::temp_dir().to_string_lossy().as_ref(), "<temp>")
+                .chars()
+                .take(4096)
+                .collect::<String>()
         );
     }
 }

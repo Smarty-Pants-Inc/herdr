@@ -9,11 +9,13 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(crate) const SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_epoch: Option<String>,
     /// Format version — used to detect incompatible changes.
     #[serde(default)]
     pub version: u32,
@@ -83,6 +85,8 @@ struct LegacyWorkspaceSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct TabSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_effect_nonce: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
     pub layout: LayoutSnapshot,
@@ -145,6 +149,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
     fn from(snap: LegacyWorkspaceSnapshot) -> Self {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
+            layout_effect_nonce: None,
             custom_name: None,
             layout: snap.layout,
             panes: snap.panes,
@@ -171,6 +176,8 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
 #[derive(Deserialize)]
 struct RawSessionSnapshot {
     #[serde(default)]
+    idempotency_epoch: Option<String>,
+    #[serde(default)]
     version: u32,
     #[serde(default)]
     workspaces: Vec<serde_json::Value>,
@@ -188,6 +195,7 @@ struct RawSessionSnapshot {
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
     Ok(SessionSnapshot {
+        idempotency_epoch: raw.idempotency_epoch,
         version: raw.version,
         workspaces: raw
             .workspaces
@@ -260,6 +268,7 @@ pub fn capture(
     selected: usize,
 ) -> SessionSnapshot {
     SessionSnapshot {
+        idempotency_epoch: None,
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
@@ -369,6 +378,7 @@ fn capture_tab(
         );
     }
     TabSnapshot {
+        layout_effect_nonce: tab.layout_effect_nonce.clone(),
         custom_name: tab.custom_name.clone(),
         layout: capture_node(tab.layout.root()),
         panes,
@@ -451,6 +461,9 @@ pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
             "snapshot version {} is newer than supported {}",
             raw.version, SNAPSHOT_VERSION
         ));
+    }
+    if let Some(epoch) = raw.idempotency_epoch.as_deref() {
+        super::idempotency::validate_layout_session_epoch(epoch)?;
     }
     migrate_snapshot(raw)
 }
@@ -553,6 +566,33 @@ mod tests {
     }
 
     #[test]
+    fn layout_nonce_and_epoch_round_trip_without_changing_snapshot_version() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.workspaces[0].tabs[0].layout_effect_nonce = Some("cd".repeat(16));
+        state.assert_invariants_for_test();
+        let mut snapshot = capture_from_state(&state);
+        snapshot.idempotency_epoch = Some("ab".repeat(16));
+        let restored = parse_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(restored.version, 3);
+        assert_eq!(restored.idempotency_epoch, snapshot.idempotency_epoch);
+        assert_eq!(
+            restored.workspaces[0].tabs[0].layout_effect_nonce,
+            Some("cd".repeat(16))
+        );
+        assert_eq!(
+            restored.workspaces[0].public_tab_numbers,
+            snapshot.workspaces[0].public_tab_numbers
+        );
+        let legacy = parse_snapshot(session_fixture("current-herdr")).unwrap();
+        assert!(legacy.idempotency_epoch.is_none());
+        assert!(legacy
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .all(|tab| tab.layout_effect_nonce.is_none()));
+    }
+
+    #[test]
     fn managed_agent_snapshot_omits_pending_and_persists_active_ownership() {
         let mut state = state_with_workspaces(&["managed-snapshot"]);
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -592,6 +632,7 @@ mod tests {
     #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
+            idempotency_epoch: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
             active: None,
@@ -657,6 +698,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            idempotency_epoch: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
@@ -667,6 +709,7 @@ mod tests {
                 public_tab_numbers: vec![1],
                 next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
+                    layout_effect_nonce: None,
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -1223,6 +1266,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            idempotency_epoch: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
@@ -1234,6 +1278,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    layout_effect_nonce: None,
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,

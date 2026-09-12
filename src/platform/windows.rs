@@ -261,6 +261,25 @@ pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::i
     ))
 }
 
+pub(crate) fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    // Use the native system RNG without adding a second crypto dependency.
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        #[link_name = "SystemFunction036"]
+        fn rtl_gen_random(buffer: *mut std::ffi::c_void, length: u32) -> u8;
+    }
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| std::io::Error::other("random byte request is too large"))?;
+    // SAFETY: the slice is writable for exactly length bytes.
+    if unsafe { rtl_gen_random(bytes.as_mut_ptr().cast(), length) } == 0 {
+        Err(std::io::Error::other(
+            "system random byte generation failed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn create_remote_ssh_config_file(
     path: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
@@ -270,13 +289,64 @@ pub(crate) fn create_remote_ssh_config_file(
         .open(path)
 }
 
+pub(crate) fn create_private_state_directory(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    match create_remote_private_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+            use interprocess::os::windows::security_descriptor::{
+                AsSecurityDescriptorExt as _, SecurityDescriptor,
+            };
+            use widestring::U16CString;
+            use windows_sys::Win32::Security::{
+                SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+
+            // Snapshot saving can create this directory first. Replace its DACL
+            // rather than trust inherited permissions; new ledger files inherit it.
+            let sddl = U16CString::from_str(PRIVATE_STATE_SDDL)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+            let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+            let mut attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+                lpSecurityDescriptor: null_mut(),
+                bInheritHandle: 0,
+            };
+            descriptor.write_to_security_attributes(&mut attributes);
+            let path = extended_length_path(path)?;
+            // SAFETY: the path is NUL-terminated and descriptor owns the DACL
+            // referenced by attributes for the duration of this call.
+            if unsafe {
+                SetFileSecurityW(
+                    path.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    attributes.lpSecurityDescriptor,
+                )
+            } == 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+const PRIVATE_STATE_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;OW)";
+
 pub(crate) fn create_remote_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     use interprocess::os::windows::security_descriptor::{
         AsSecurityDescriptorExt as _, SecurityDescriptor,
     };
     use widestring::U16CString;
 
-    let sddl = U16CString::from_str("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;OW)")
+    let sddl = U16CString::from_str(PRIVATE_STATE_SDDL)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
     let mut security_attributes = SECURITY_ATTRIBUTES {

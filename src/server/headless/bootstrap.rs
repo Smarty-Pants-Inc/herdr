@@ -51,6 +51,11 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        if app.session_persistence_blocked || app.layout_apply_quarantined {
+            return Err(io::Error::other(
+                "session persistence is unavailable at startup",
+            ));
+        }
         seed_startup_workspace_if_empty(&mut app);
 
         // Create the headless server.
@@ -182,6 +187,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             warn!(err = %err, "failed to report handoff ownership; continuing as owner");
+        }
+        // Ownership is already committed: receipt failure must not tear down
+        // the imported runtimes or take the startup quarantine path.
+        server
+            .app
+            .initialize_layout_apply_idempotency_after_handoff(Some(
+                received.manifest.snapshot.idempotency_epoch.as_deref(),
+            ));
+        if let Err(err) = server.app.save_layout_apply_session_snapshot_now() {
+            server
+                .app
+                .mark_layout_apply_idempotency_unavailable(format!(
+                    "failed to checkpoint the imported session: {err}"
+                ));
+            server.app.state.session_dirty = true;
+            server.app.sync_session_save_schedule();
         }
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());

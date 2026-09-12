@@ -27,6 +27,26 @@ export function normalizeVersion(value) {
   return match[1];
 }
 
+export function publishedTagFetchArgs(versions) {
+  const refspecs = versions.filter((entry) => entry.commit).map((entry) => {
+    const tag = `v${normalizeVersion(entry.version)}`;
+    if (entry.tag !== tag || !/^[0-9a-f]{40}$/.test(entry.commit)) {
+      throw new Error(`invalid published tag provenance for ${entry.version}`);
+    }
+    return `refs/tags/${tag}:refs/tags/${tag}`;
+  });
+  return refspecs.length
+    ? [
+      'fetch',
+      '--atomic',
+      '--no-tags',
+      '--no-recurse-submodules',
+      'https://github.com/herdrdev/herdr.git',
+      ...refspecs,
+    ]
+    : null;
+}
+
 export function sortVersionsNewestFirst(versions) {
   return [...versions].sort((left, right) => compareVersions(right.version, left.version));
 }
@@ -264,6 +284,11 @@ async function main() {
     await publishVersion(value);
     return;
   }
+  if (command === 'fetch-tags' && !value) {
+    const args = publishedTagFetchArgs((await readManifest()).versions);
+    if (args) git(args);
+    return;
+  }
   if (command === 'check' && !value) {
     await checkVersions();
     return;
@@ -274,7 +299,7 @@ async function main() {
     return;
   }
   throw new Error(
-    'usage: node scripts/docs/versions.mjs backfill | check | current | publish <tag>',
+    'usage: node scripts/docs/versions.mjs backfill | check | current | fetch-tags | publish <tag>',
   );
 }
 

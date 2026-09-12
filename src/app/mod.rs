@@ -138,6 +138,11 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) layout_apply_epoch: String,
+    pub(crate) layout_apply_receipts: crate::persist::LayoutApplyReceipts,
+    pub(crate) layout_apply_receipts_error: Option<String>,
+    pub(crate) layout_apply_quarantined: bool,
+    pub(crate) session_persistence_blocked: bool,
     pane_exit_checkpoint_pending: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
@@ -367,12 +372,22 @@ impl App {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
-        // Try to restore previous session
+        // Read failures and unsupported snapshots must not become a fresh session.
+        // Handoff imports defer ledger reconciliation until ownership is committed.
+        let session_load = if policy.restore_session {
+            crate::persist::load_checked()
+        } else {
+            Ok(None)
+        };
+        let session_persistence_blocked = session_load.is_err();
+        if let Err(err) = &session_load {
+            tracing::warn!(err = %err, "session persistence is blocked");
+        }
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (workspaces, active, selected) = if !policy.restore_session {
             (Vec::new(), None, 0)
-        } else if let Some(snap) = crate::persist::load() {
+        } else if let Ok(Some(snap)) = session_load {
             let history = config
                 .experimental
                 .pane_history
@@ -600,6 +615,11 @@ impl App {
             session_save_deadline: None,
             session_save_thread: None,
             pane_exit_checkpoint_pending: false,
+            layout_apply_epoch: String::new(),
+            layout_apply_receipts: Default::default(),
+            layout_apply_receipts_error: None,
+            layout_apply_quarantined: false,
+            session_persistence_blocked,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
@@ -623,6 +643,12 @@ impl App {
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
+        if app.session_persistence_blocked {
+            app.state.should_quit = true;
+        }
+        if policy.restore_session && policy.persist_session {
+            app.initialize_layout_apply_idempotency(None);
+        }
         app
     }
 
@@ -656,6 +682,13 @@ impl App {
             app.render_dirty.clone(),
         )?;
         let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
+        app.layout_apply_epoch = match &snapshot.idempotency_epoch {
+            Some(epoch) => {
+                crate::persist::validate_layout_session_epoch(epoch).map_err(io::Error::other)?;
+                epoch.clone()
+            }
+            None => crate::persist::new_layout_session_epoch().map_err(io::Error::other)?,
+        };
 
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;

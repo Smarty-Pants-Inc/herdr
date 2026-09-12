@@ -18,6 +18,12 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+// These platforms do not expose the Unix foreground-shell adoption contract.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_birth_identity(_pid: u32) -> Option<(u64, u64)> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -106,6 +112,7 @@ fn configure_background_command_platform(_command: &mut std::process::Command) {
 pub(crate) struct PlatformCapabilities {
     pub(crate) live_handoff: bool,
     pub(crate) direct_terminal_attach: bool,
+    pub(crate) foreground_worktree_adoption: bool,
     pub(crate) preserve_legacy_doubled_escape_input: bool,
 }
 
@@ -113,6 +120,7 @@ pub(crate) const fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         live_handoff: cfg!(unix),
         direct_terminal_attach: cfg!(unix),
+        foreground_worktree_adoption: cfg!(any(target_os = "linux", target_os = "macos")),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
     }
 }
@@ -264,10 +272,12 @@ pub(crate) struct RemoteSshConfigPaths {
 #[cfg(unix)]
 mod unix_common;
 #[cfg(unix)]
-pub(crate) use unix_common::{begin_cli_output, end_cli_output};
+pub(crate) use unix_common::{begin_cli_output, end_cli_output, fill_random_bytes};
 
 mod client_state;
-pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
+pub(crate) use client_state::{
+    create_private_state_directory, create_private_state_file, replace_file, sync_parent_directory,
+};
 
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}

@@ -2239,6 +2239,21 @@
           },
           "type": "object"
         },
+        "LayoutIdempotentParams": {
+          "properties": {
+            "idempotency_key": {
+              "type": "string"
+            },
+            "layout": {
+              "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "idempotency_key",
+            "layout"
+          ],
+          "type": "object"
+        },
         "LayoutNode": {
           "oneOf": [
             {
@@ -5603,6 +5618,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.apply_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.reconcile_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "layout.cancel_idempotent",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutIdempotentParams"
             }
           },
           "required": [

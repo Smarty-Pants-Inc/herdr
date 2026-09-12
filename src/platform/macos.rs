@@ -268,6 +268,12 @@ pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
 }
 
+/// Kernel process birth identity, used only by explicit worktree adoption.
+pub(crate) fn process_birth_identity(pid: u32) -> Option<(u64, u64)> {
+    let info = process_bsdinfo(pid)?;
+    Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
+}
+
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     if child_pid == 0 {

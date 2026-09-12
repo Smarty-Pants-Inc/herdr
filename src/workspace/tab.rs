@@ -36,6 +36,7 @@ enum SplitCommand<'a> {
 }
 
 pub struct Tab {
+    pub(crate) layout_effect_nonce: Option<String>,
     pub custom_name: Option<String>,
     pub number: usize,
     /// Identity source for this tab's pane tree.
@@ -180,6 +181,7 @@ impl Tab {
 
         Ok((
             Self {
+                layout_effect_nonce: None,
                 custom_name: None,
                 number,
                 root_pane: root_id,
@@ -443,6 +445,7 @@ impl Tab {
         let pane_id = moved.pane_id;
         panes.insert(pane_id, moved.pane_state);
         Self {
+            layout_effect_nonce: None,
             custom_name,
             number,
             root_pane: pane_id,
