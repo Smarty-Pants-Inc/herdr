@@ -915,6 +915,26 @@ mod tests {
                 .join("work")
                 .join("herdr.sock")
         );
+        for method in ["adopt", "verify-adoption"] {
+            std::env::set_var(SESSION_ENV_VAR, "caller-session");
+            let args = [
+                "herdr",
+                "worktree",
+                method,
+                "--params",
+                "params.json",
+                "--session",
+                "work",
+            ]
+            .map(str::to_string);
+            let cleaned = configure_from_args(&args).unwrap();
+            assert_eq!(
+                cleaned,
+                vec!["herdr", "worktree", method, "--params", "params.json"]
+            );
+            assert_eq!(active_api_socket_path(), path);
+            assert_eq!(active_name().as_deref(), Some("work"));
+        }
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var(SESSION_ENV_VAR);
         clear_explicit_session_for_test();

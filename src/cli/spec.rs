@@ -258,6 +258,16 @@ fn worktree_command() -> Command {
                 .arg(flag("trust-repository")),
         )
         .subcommand(
+            Command::new("adopt")
+                .about("Adopt one explicitly bound existing checkout view")
+                .arg(path_option("params", "FILE").required(true)),
+        )
+        .subcommand(
+            Command::new("verify-adoption")
+                .about("Verify an adopted checkout view without mutation")
+                .arg(path_option("params", "FILE").required(true)),
+        )
+        .subcommand(
             Command::new("remove")
                 .about("Remove a worktree checkout")
                 .arg(option("workspace", "ID"))
@@ -1207,8 +1217,18 @@ mod tests {
     #[test]
     fn worktree_json_compatibility_flag_stays_out_of_public_spec() {
         let cmd = super::command();
-        for subcommand in ["list", "create", "open", "remove"] {
+        for subcommand in [
+            "list",
+            "create",
+            "open",
+            "remove",
+            "adopt",
+            "verify-adoption",
+        ] {
             let worktree_command = command_path(&cmd, &["worktree", subcommand]);
+            if matches!(subcommand, "adopt" | "verify-adoption") {
+                assert!(has_option(worktree_command, "params"));
+            }
             assert!(
                 !has_option(worktree_command, "json"),
                 "herdr worktree {subcommand} should not advertise --json"

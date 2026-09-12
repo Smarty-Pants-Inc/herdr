@@ -340,6 +340,20 @@ pub(crate) fn process_birth_identity(pid: u32) -> Option<(u64, u64)> {
     process_birth_identity_from_stat(&stat)
 }
 
+pub(crate) fn worktree_process_identity(pid: u32) -> Option<super::WorktreeProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<_> = rest.split_whitespace().collect();
+    Some(super::WorktreeProcessIdentity {
+        parent_pid: fields.get(1)?.parse().ok()?,
+        process_group: fields.get(2)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        terminal: fields.get(4)?.parse().ok()?,
+        birth: process_birth_identity_from_stat(&stat)?,
+        executable: std::fs::read_link(format!("/proc/{pid}/exe")).ok()?,
+    })
+}
+
 fn process_birth_identity_from_stat(stat: &str) -> Option<(u64, u64)> {
     let rest = stat.get(stat.rfind(')')? + 2..)?;
     // Field 22; field 3 (state) starts the suffix after comm.

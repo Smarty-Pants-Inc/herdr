@@ -1053,6 +1053,10 @@ impl App {
                 );
             }
             Method::WorktreeOpen(params) => return self.handle_worktree_open(request.id, params),
+            Method::WorktreeAdopt(params) => return self.handle_worktree_adopt(request.id, params),
+            Method::WorktreeVerifyAdoption(params) => {
+                return self.handle_worktree_verify_adoption(request.id, params);
+            }
             Method::WorktreeRemove(params) => {
                 let _ = params;
                 return responses::encode_error(

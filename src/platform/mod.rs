@@ -18,6 +18,22 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// Native process facts used only by explicit foreground-worktree adoption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeProcessIdentity {
+    pub parent_pid: u32,
+    pub process_group: u32,
+    pub session: u32,
+    pub terminal: u64,
+    pub birth: (u64, u64),
+    pub executable: std::path::PathBuf,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn worktree_process_identity(_pid: u32) -> Option<WorktreeProcessIdentity> {
+    None
+}
+
 // These platforms do not expose the Unix foreground-shell adoption contract.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn process_birth_identity(_pid: u32) -> Option<(u64, u64)> {

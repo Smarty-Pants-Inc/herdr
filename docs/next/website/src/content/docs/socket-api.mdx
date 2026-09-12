@@ -411,9 +411,46 @@ Remove a linked checkout:
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Herdr worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
-On Linux and macOS, explicit `worktree.list` and `worktree.open` can also recognize one unregistered workspace whose root shell remains at the repository parent while a nested foreground shell is in the linked checkout. This requires one tab and pane, matching physical paths and Git identity, and stable shell/process/terminal identity with no extra jobs or agents. Listing reports that workspace without changing membership. Opening it returns `already_open: true` and records membership without replacing its workspace, tab, pane, terminal, or processes.
+On Linux and macOS, explicit `worktree.list` and `worktree.open` can also recognize one unregistered workspace whose root shell remains at the repository parent while a nested foreground shell is in the linked checkout. This requires one tab and pane, matching physical paths and Git identity, and stable shell/process/terminal identity with no extra jobs or agents. The nested shell may be a direct child or use the observed Treehouse 2.3.0 `get` shape: exactly one installed Treehouse process between the pane shell and foreground shell. That intermediary must match an absolute executable found through the server's PATH, run only `get`, remain at the parent checkout, and retain the exact parent chain, process groups, session, and terminal. Unrelated helpers, command arguments, or additional session processes are refused. Listing reports that workspace without changing membership. Opening it returns `already_open: true` and records membership without replacing its workspace, tab, pane, terminal, or processes.
 
 This lookup fails with `worktree_adoption_ambiguous` for multiple matches, or `worktree_adoption_unavailable` for missing or conflicting identity. On Linux and macOS, an unregistered parent-cwd workspace with no live foreground evidence can therefore prevent allocation. Platforms without foreground adoption skip that observation and refusal, while retaining registered/preallocated identity checks and duplicate-match rejection. Do not treat either error as permission to create a replacement workspace. Registered and directly preallocated workspaces remain supported, including their active agents.
+
+### Explicit adoption of a second existing view
+
+On Linux and macOS, `worktree.adopt` binds an existing one-pane workspace to a linked checkout while preserving one explicitly named other workspace at that checkout. It does not move or create panes, change focus, clear the other membership, or change path-only lookup. Its request is closed: unknown fields and missing identity fields are rejected.
+
+```json
+{
+  "id": "adopt_1",
+  "method": "worktree.adopt",
+  "params": {
+    "parent_workspace_id": "w1",
+    "workspace_id": "w3",
+    "path": "/repo/linked",
+    "repo_root": "/repo",
+    "repo_key": "/repo/.git",
+    "target": {
+      "pane_id": "w3:p1", "tab_id": "w3:t1", "terminal_id": "target-terminal",
+      "shell_pid": 100, "shell_birth": [12345, 0]
+    },
+    "known_workspace_id": "w2",
+    "known_panes": [
+      {
+        "pane_id": "w2:p1", "tab_id": "w2:t1", "terminal_id": "known-terminal",
+        "shell_pid": 200, "shell_birth": [12300, 0]
+      }
+    ]
+  }
+}
+```
+
+The values above are examples, not discovered identities. Supply every pane in the known workspace. `shell_birth` contains Linux `/proc/PID/stat` starttime ticks and zero, or macOS BSD start seconds and microseconds. Paths must already be physical and absolute; IDs must be the current native IDs, not aliases or labels. The parent and known workspace must already have matching native membership. Each admitted pane must have one agent-free shell process in its own terminal session. Missing or conflicting identity, extra processes, an incomplete roster, another matching workspace, or changes between two observations refuse adoption. Success uses the existing `worktree_opened` result with `already_open: true`; a repeat revalidates all facts without replacing the endpoint.
+
+`worktree.verify_adoption` is a separate read-only method. Its params are `{"binding": <the complete adoption params>}`. It requires both memberships to exist, rechecks native identities and the exact matching set, and reads the current Git worktree entry before and after observation. Success uses `worktree_list`, with the canonical parent in `source` and exactly two `worktrees` entries in target-then-known order. Each entry names its explicit workspace in `open_workspace_id` and reports current branch, linked, bare and prunable facts. This is a qualified result for this request, not a successful path-only lookup. Verification never adds membership, changes focus, emits events, or marks the session dirty.
+
+For later validation of an already managed Pi, verification also accepts `agent_session_id`, taken from that task's existing expected native session ID. The target may then contain that same reported Pi session and its tool descendants. The foreground Pi must be a direct child of the retained shell; all observed session processes must belong to that worker's ancestry. An unrelated sibling, helper tree, second agent, changed process incarnation, or different reported session refuses verification. The known workspace remains agent-free. Omitting `agent_session_id` retains the agent-free check. This does not establish task/history ownership: callers must retain their own exclusive claims, source and native-history validation, including stricter admission/relaunch checks.
+
+The CLI exposes `herdr --session SESSION worktree adopt --params FILE` and `herdr --session SESSION worktree verify-adoption --params FILE`. Select `SESSION` from the target's authoritative receipt on every admission and later verification/control call, not from the caller's inherited session. The global explicit selector overrides inherited session/socket settings. These methods inspect only the selected server; they neither accept an in-server `session` field nor search another server. A missing target returns `pane_not_found`; coincident IDs with different expected identity still refuse. Files contain the respective params object, not a full request or another product's receipt. Success JSON is printed to stdout with exit 0. API errors are printed to stderr with exit 1; usage errors return 2, and transport/file/JSON errors are nonzero. Missing support must not fall back to path-only selection or allocation. Endpoint welcome `methods` advertises the two method names; a version string alone is not feature proof. Both methods use the existing `worktree_adoption_unavailable` refusal for unsupported native observation or conflicting identities; request parsing and Git lookup can also return their existing errors.
 
 Worktree commands also emit lifecycle events. `worktree.create` emits `workspace.created`, `tab.created`, `pane.created`, and `worktree.created`. `worktree.open` emits `worktree.opened`, and it also emits workspace/tab/pane creation events when it opens a new Herdr workspace. `worktree.remove` emits `worktree.removed`; if the linked workspace is still open, it also emits `workspace.closed`.
 

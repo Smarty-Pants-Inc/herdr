@@ -47,10 +47,12 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "workspace.move",
     "workspace.move_block",
     "workspace.rename",
+    "worktree.adopt",
     "worktree.create",
     "worktree.list",
     "worktree.open",
     "worktree.remove",
+    "worktree.verify_adoption",
 ];
 
 pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {
@@ -285,7 +287,19 @@ mod tests {
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
         .expect("endpoint method shape fixture");
-        let actual = endpoint_method_shape_digests();
+        let additions: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/endpoint-method-shapes-worktree-adopt-v1.json"
+        )))
+        .expect("explicit adoption method shape fixture");
+        let mut actual = endpoint_method_shape_digests();
+        for (method, digest) in additions {
+            assert!(
+                !expected.contains_key(&method),
+                "baseline methods are immutable"
+            );
+            assert_eq!(actual.remove(&method), Some(digest));
+        }
 
         assert_eq!(
             actual,

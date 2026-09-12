@@ -274,6 +274,37 @@ pub(crate) fn process_birth_identity(pid: u32) -> Option<(u64, u64)> {
     Some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
+pub(crate) fn worktree_process_identity(pid: u32) -> Option<super::WorktreeProcessIdentity> {
+    let info = process_bsdinfo(pid)?;
+    let session = unsafe { libc::getsid(pid as libc::pid_t) };
+    if session <= 0 {
+        return None;
+    }
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let size = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            path.as_mut_ptr().cast(),
+            path.len() as u32,
+        )
+    };
+    if size <= 0 {
+        return None;
+    }
+    let end = path.iter().position(|byte| *byte == 0)?;
+    if end == 0 {
+        return None;
+    }
+    Some(super::WorktreeProcessIdentity {
+        parent_pid: info.pbi_ppid,
+        process_group: info.pbi_pgid,
+        session: session as u32,
+        terminal: info.e_tdev as u64,
+        birth: (info.pbi_start_tvsec, info.pbi_start_tvusec),
+        executable: PathBuf::from(OsStr::from_bytes(&path[..end])),
+    })
+}
+
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     if child_pid == 0 {

@@ -4631,6 +4631,87 @@
           ],
           "type": "object"
         },
+        "WorktreeAdoptPane": {
+          "additionalProperties": false,
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "shell_birth": {
+              "description": "Linux starttime ticks and zero; macOS start seconds and microseconds.",
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "shell_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "tab_id",
+            "terminal_id",
+            "shell_pid",
+            "shell_birth"
+          ],
+          "type": "object"
+        },
+        "WorktreeAdoptParams": {
+          "additionalProperties": false,
+          "properties": {
+            "known_panes": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/WorktreeAdoptPane"
+              },
+              "type": "array"
+            },
+            "known_workspace_id": {
+              "type": "string"
+            },
+            "parent_workspace_id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "repo_key": {
+              "type": "string"
+            },
+            "repo_root": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/schemas/request/$defs/WorktreeAdoptPane"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "parent_workspace_id",
+            "workspace_id",
+            "path",
+            "repo_root",
+            "repo_key",
+            "target",
+            "known_workspace_id",
+            "known_panes"
+          ],
+          "type": "object"
+        },
         "WorktreeCreateParams": {
           "properties": {
             "base": {
@@ -4756,6 +4837,24 @@
           },
           "required": [
             "workspace_id"
+          ],
+          "type": "object"
+        },
+        "WorktreeVerifyAdoptionParams": {
+          "additionalProperties": false,
+          "properties": {
+            "agent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "binding": {
+              "$ref": "#/schemas/request/$defs/WorktreeAdoptParams"
+            }
+          },
+          "required": [
+            "binding"
           ],
           "type": "object"
         }
@@ -5170,6 +5269,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorktreeOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worktree.adopt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeAdoptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worktree.verify_adoption",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorktreeVerifyAdoptionParams"
             }
           },
           "required": [

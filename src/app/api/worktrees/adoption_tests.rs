@@ -58,6 +58,7 @@ impl Fixture {
             foreground_cwd: self.checkout.clone(),
             foreground_birth: (20, 0),
             session_processes: vec![100, 200],
+            treehouse: None,
             job: shell_job(200),
         }
     }
@@ -249,6 +250,187 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
         Some(before)
     );
     fixture.app.state.assert_invariants_for_test();
+}
+
+fn treehouse_observation(fixture: &Fixture) -> ForegroundCheckout {
+    let mut observed = fixture.observation(1);
+    let root = crate::platform::WorktreeProcessIdentity {
+        parent_pid: 1,
+        process_group: 100,
+        session: 100,
+        terminal: 42,
+        birth: observed.shell_birth,
+        executable: PathBuf::from("/bin/bash"),
+    };
+    let mut process = root.clone();
+    process.parent_pid = 100;
+    process.process_group = 150;
+    process.birth = (15, 0);
+    process.executable = PathBuf::from("/installed/treehouse");
+    let mut child = root.clone();
+    child.parent_pid = 150;
+    child.process_group = 200;
+    child.birth = observed.foreground_birth;
+    observed.session_processes = vec![100, 150, 200];
+    observed.treehouse = Some(TreehouseIntermediary {
+        pid: 150,
+        root,
+        process,
+        child,
+        job: ForegroundJob {
+            process_group_id: 150,
+            processes: vec![ForegroundProcess {
+                pid: 150,
+                name: "treehouse".into(),
+                argv0: Some("/installed/treehouse".into()),
+                argv: Some(vec!["/installed/treehouse".into(), "get".into()]),
+                cmdline: Some("/installed/treehouse get".into()),
+            }],
+        },
+        invoked_executable: PathBuf::from("/installed/treehouse"),
+        cwd: fixture.repo.clone(),
+    });
+    observed
+}
+
+#[test]
+fn treehouse_get_ancestry_preserves_existing_checkout_identity() {
+    let fixture = Fixture::new();
+    let before = treehouse_observation(&fixture);
+    assert!(supported_session_shape(&before));
+    assert_eq!(fixture.lookup(before).unwrap(), Some(1));
+    assert_eq!(fixture.app.state.workspaces.len(), 2);
+    assert!(fixture.app.state.workspaces[1].worktree_space().is_none());
+    fixture.app.state.assert_invariants_for_test();
+}
+
+#[test]
+fn treehouse_get_rejects_unrelated_ancestry_helpers_agents_and_extra_processes() {
+    let fixture = Fixture::new();
+    let before = treehouse_observation(&fixture);
+    let mut invalid = Vec::new();
+    for change in 0..14 {
+        let mut item = before.clone();
+        let helper = item.treehouse.as_mut().unwrap();
+        match change {
+            0 => helper.process.parent_pid = 999,
+            1 => helper.child.parent_pid = item.shell,
+            2 => helper.process.session = 999,
+            3 => helper.child.session = 999,
+            4 => helper.process.terminal += 1,
+            5 => helper.child.terminal += 1,
+            6 => helper.process.process_group = item.shell,
+            7 => helper.job.processes[0].name = "pi".into(),
+            8 => helper.job.processes[0].argv.as_mut().unwrap()[1] = "run".into(),
+            9 => helper.job.processes[0]
+                .argv
+                .as_mut()
+                .unwrap()
+                .push("pi".into()),
+            10 => helper.invoked_executable = PathBuf::from("/other/treehouse"),
+            11 => helper.cwd = fixture.checkout.clone(),
+            12 => item.session_processes.push(300),
+            _ => item.treehouse = None,
+        }
+        invalid.push(item);
+    }
+    for item in invalid {
+        assert_eq!(
+            fixture.lookup(item).unwrap_err().code,
+            "worktree_adoption_unavailable"
+        );
+    }
+    fixture.app.state.assert_invariants_for_test();
+}
+
+#[test]
+fn treehouse_intermediary_must_remain_identical_on_second_observation() {
+    let fixture = Fixture::new();
+    let before = treehouse_observation(&fixture);
+    for change in 0..5 {
+        let mut after = before.clone();
+        let helper = after.treehouse.as_mut().unwrap();
+        match change {
+            0 => helper.process.birth.0 += 1,
+            1 => helper.child.parent_pid = 999,
+            2 => helper.process.executable = PathBuf::from("/replaced/treehouse"),
+            3 => helper.job.processes[0].argv = None,
+            _ => after.treehouse = None,
+        }
+        let mut calls = 0;
+        let result = fixture.app.lookup_worktree_checkout_with(
+            &fixture.source,
+            &fixture.checkout,
+            |_, index, _| {
+                if index != 1 {
+                    return Ok(None);
+                }
+                calls += 1;
+                Ok(Some(if calls == 1 {
+                    before.clone()
+                } else {
+                    after.clone()
+                }))
+            },
+        );
+        assert_eq!(result.unwrap_err().code, "worktree_adoption_unavailable");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn treehouse_executable_requires_exact_installed_path_not_a_name_or_wrapper() {
+    let fixture = Fixture::new();
+    let installed = fixture.repo.join("installed");
+    let wrappers = fixture.repo.join("wrappers");
+    let unrelated = fixture.repo.join("unrelated");
+    for directory in [&installed, &wrappers, &unrelated] {
+        std::fs::create_dir(directory).unwrap();
+        std::fs::write(directory.join("treehouse"), "fixture, never executed").unwrap();
+    }
+    let executable = installed.join("treehouse");
+    let path = std::env::join_paths([&wrappers, &installed]).unwrap();
+    assert!(treehouse_executable_on_path(&executable, &path));
+    assert!(!treehouse_executable_on_path(
+        &unrelated.join("treehouse"),
+        &path
+    ));
+    assert!(!treehouse_executable_on_path(Path::new("treehouse"), &path));
+    assert!(!treehouse_executable_on_path(
+        &executable,
+        std::ffi::OsStr::new(".")
+    ));
+    let links = fixture.repo.join("links");
+    std::fs::create_dir(&links).unwrap();
+    std::os::unix::fs::symlink(&executable, links.join("treehouse")).unwrap();
+    let path = std::env::join_paths([&wrappers, &links]).unwrap();
+    assert!(treehouse_executable_on_path(&executable, &path));
+    std::fs::remove_file(links.join("treehouse")).unwrap();
+    std::os::unix::fs::symlink(unrelated.join("treehouse"), links.join("treehouse")).unwrap();
+    assert!(!treehouse_executable_on_path(&executable, &path));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn native_worktree_process_identity_matches_current_executable_and_birth() {
+    let pid = std::process::id();
+    let before = crate::platform::worktree_process_identity(pid).unwrap();
+    assert!(before.parent_pid > 0);
+    assert!(before.session > 0);
+    assert!(before.process_group > 0);
+    assert_eq!(
+        Some(before.birth),
+        crate::platform::process_birth_identity(pid)
+    );
+    assert_eq!(
+        before.executable,
+        std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+    );
+    assert_eq!(
+        Some(before),
+        crate::platform::worktree_process_identity(pid)
+    );
+    assert!(crate::platform::worktree_process_identity(u32::MAX).is_none());
 }
 
 #[test]
