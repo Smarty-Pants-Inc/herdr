@@ -1088,7 +1088,8 @@ mod tests {
 
     #[test]
     fn process_birth_identity_uses_starttime_after_the_last_comm_parenthesis() {
-        let stat = "123 (shell with ) parentheses) S 1 123 123 0 123 0 0 0 0 0 0 0 0 0 0 0 0 4242";
+        let stat =
+            "123 (shell with ) parentheses) S 1 123 123 0 123 0 0 0 0 0 0 0 0 0 0 0 0 0 4242";
         assert_eq!(process_birth_identity_from_stat(stat), Some((4242, 0)));
         assert_eq!(process_birth_identity_from_stat("123 (sh) S 1"), None);
         assert_eq!(process_birth_identity_from_stat("missing comm"), None);

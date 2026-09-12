@@ -65,6 +65,10 @@ jobs:
       - name: Test documentation lifecycle
         run: bun test scripts/docs/*.test.ts
 
+      - name: Fetch published documentation tags from upstream
+        if: github.repository != 'herdrdev/herdr'
+        run: node scripts/docs/versions.mjs fetch-tags
+
       - name: Validate published contract
         run: |
           python3 scripts/agent_detection_manifest_check.py --require-published
