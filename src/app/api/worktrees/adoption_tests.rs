@@ -63,11 +63,10 @@ impl Fixture {
     }
 
     fn lookup(&self, observed: ForegroundCheckout) -> Result<Option<usize>, ApiFailure> {
-        self.app.lookup_worktree_checkout_with(
-            &self.source,
-            &self.checkout,
-            |_, index, _| Ok((index == 1).then(|| observed.clone())),
-        )
+        self.app
+            .lookup_worktree_checkout_with(&self.source, &self.checkout, |_, index, _| {
+                Ok((index == 1).then(|| observed.clone()))
+            })
     }
 }
 
@@ -97,7 +96,12 @@ fn nested_shell_lookup_uses_foreground_checkout_without_changing_endpoint() {
     let before = fixture.observation(1);
     let count = fixture.app.state.workspaces.len();
     // Characterize the retained failure: root-shell cwd is still the parent.
-    assert_eq!(fixture.app.open_workspace_idx_for_checkout(&fixture.checkout), None);
+    assert_eq!(
+        fixture
+            .app
+            .open_workspace_idx_for_checkout(&fixture.checkout),
+        None
+    );
     assert_eq!(fixture.lookup(before.clone()).unwrap(), Some(1));
     assert_eq!(fixture.observation(1), before);
     assert_eq!(fixture.app.state.workspaces.len(), count);
@@ -158,7 +162,12 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
     assert_eq!(before.shell_cwd, fixture.repo);
     assert_eq!(before.reported_cwd, fixture.repo);
     assert_ne!(before.shell, before.job.process_group_id);
-    assert_eq!(fixture.app.open_workspace_idx_for_checkout(&fixture.checkout), None);
+    assert_eq!(
+        fixture
+            .app
+            .open_workspace_idx_for_checkout(&fixture.checkout),
+        None
+    );
     let workspace_id = fixture.app.public_workspace_id(index);
     let pane_id = fixture.app.public_pane_id(index, before.pane).unwrap();
     let tab_id = fixture.app.public_tab_id(index, 0).unwrap();
@@ -183,7 +192,9 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
             .as_ref(),
         Some(&workspace_id)
     );
-    assert!(fixture.app.state.workspaces[index].worktree_space().is_none());
+    assert!(fixture.app.state.workspaces[index]
+        .worktree_space()
+        .is_none());
     let opened = fixture.app.handle_worktree_open(
         "open".into(),
         crate::api::schema::WorktreeOpenParams {
@@ -231,7 +242,9 @@ fn preallocated_checkout_keeps_existing_lookup_without_foreground_evidence() {
     let terminal = fixture.observation(1).terminal;
     fixture.app.state.terminals.get_mut(&terminal).unwrap().cwd = fixture.checkout.clone();
     assert_eq!(
-        fixture.app.open_workspace_idx_for_checkout(&fixture.checkout),
+        fixture
+            .app
+            .open_workspace_idx_for_checkout(&fixture.checkout),
         Some(1)
     );
     let result = fixture.app.lookup_worktree_checkout_with(
@@ -335,7 +348,10 @@ fn foreground_adoption_rejects_wrong_git_paths_and_endpoint_claims() {
     item.job.processes[0].name = "pi".into();
     invalid.push(item);
     for item in invalid {
-        assert_eq!(fixture.lookup(item).unwrap_err().code, "worktree_adoption_unavailable");
+        assert_eq!(
+            fixture.lookup(item).unwrap_err().code,
+            "worktree_adoption_unavailable"
+        );
     }
     let _ = std::fs::remove_dir_all(other);
 }
@@ -359,13 +375,14 @@ fn foreground_observation_must_use_the_physical_checkout_not_a_symlink_alias() {
 fn foreground_adoption_rejects_membership_and_agent_conflicts() {
     let mut fixture = Fixture::new();
     let observation = fixture.observation(1);
-    fixture.app.state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
-        key: fixture.source.repo_key.clone(),
-        label: "parent".into(),
-        repo_root: fixture.repo.clone(),
-        checkout_path: fixture.repo.clone(),
-        is_linked_worktree: false,
-    });
+    fixture.app.state.workspaces[1].worktree_space =
+        Some(crate::workspace::WorktreeSpaceMembership {
+            key: fixture.source.repo_key.clone(),
+            label: "parent".into(),
+            repo_root: fixture.repo.clone(),
+            checkout_path: fixture.repo.clone(),
+            is_linked_worktree: false,
+        });
     assert!(fixture.lookup(observation.clone()).is_err());
     fixture.app.state.workspaces[1].worktree_space = None;
     fixture.app.state.workspaces[1].identity_cwd = fixture.checkout.clone();
@@ -529,7 +546,11 @@ fn mismatched_repository_source_and_reused_terminal_are_rejected() {
         .key;
     let mut other = Workspace::test_new("other-attachment");
     let root = other.tabs[0].root_pane;
-    other.tabs[0].panes.get_mut(&root).unwrap().attached_terminal_id = before.terminal.clone();
+    other.tabs[0]
+        .panes
+        .get_mut(&root)
+        .unwrap()
+        .attached_terminal_id = before.terminal.clone();
     fixture.app.state.workspaces.push(other);
     assert!(fixture.lookup(before).is_err());
 }

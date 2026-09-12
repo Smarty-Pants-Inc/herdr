@@ -611,9 +611,10 @@ impl App {
     pub(crate) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
-        self.state.workspaces.iter().position(|ws| {
-            self.workspace_matches_checkout(ws, &canonical_checkout, &checkout_key)
-        })
+        self.state
+            .workspaces
+            .iter()
+            .position(|ws| self.workspace_matches_checkout(ws, &canonical_checkout, &checkout_key))
     }
 
     fn workspace_matches_checkout(
@@ -642,9 +643,7 @@ impl App {
 
         ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
             .as_deref()
-            .is_some_and(|cwd| {
-                crate::worktree::canonical_or_original(cwd) == canonical_checkout
-            })
+            .is_some_and(|cwd| crate::worktree::canonical_or_original(cwd) == canonical_checkout)
     }
 
     pub(crate) fn worktree_info_for_workspace(&self, ws_idx: usize) -> Option<WorktreeInfo> {

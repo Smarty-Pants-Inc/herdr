@@ -211,7 +211,8 @@ impl App {
                 .filter(|(pane_id, pane)| {
                     **pane_id == observed.pane || pane.attached_terminal_id == *terminal_id
                 })
-                .count() != 1
+                .count()
+                != 1
         {
             return Err(unavailable());
         }
@@ -279,8 +280,9 @@ impl App {
                 {
                     return Err(unavailable());
                 }
-                let foreground_birth = crate::platform::process_birth_identity(job.process_group_id)
-                    .ok_or_else(unavailable)?;
+                let foreground_birth =
+                    crate::platform::process_birth_identity(job.process_group_id)
+                        .ok_or_else(unavailable)?;
                 let actual_cwd =
                     crate::platform::process_cwd(job.process_group_id).ok_or_else(unavailable)?;
                 if actual_cwd != cwd {
