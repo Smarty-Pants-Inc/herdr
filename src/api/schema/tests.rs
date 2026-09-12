@@ -95,7 +95,10 @@ fn explicit_worktree_adoption_requires_all_bindings_and_rejects_unknown_fields()
         }
     });
     let request: Request = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!(crate::api::api_method_name(&request.method), "worktree.adopt");
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "worktree.adopt"
+    );
     assert!(crate::api::request_changes_ui(&request));
     assert_eq!(serde_json::to_value(request).unwrap(), value);
     let verify = serde_json::json!({
@@ -103,7 +106,10 @@ fn explicit_worktree_adoption_requires_all_bindings_and_rejects_unknown_fields()
         "params": { "binding": value["params"], "agent_session_id": "retained-pi" }
     });
     let request: Request = serde_json::from_value(verify.clone()).unwrap();
-    assert_eq!(crate::api::api_method_name(&request.method), "worktree.verify_adoption");
+    assert_eq!(
+        crate::api::api_method_name(&request.method),
+        "worktree.verify_adoption"
+    );
     assert!(!crate::api::request_changes_ui(&request));
     assert_eq!(serde_json::to_value(request).unwrap(), verify);
     let mut unknown = verify;

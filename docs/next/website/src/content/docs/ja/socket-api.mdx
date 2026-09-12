@@ -97,7 +97,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | クライアント | `client.window_title.set`、`client.window_title.clear` |
 | セッション | `session.snapshot` |
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
-| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
+| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.adopt`、`worktree.verify_adoption`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
@@ -296,6 +296,43 @@ Worktree メソッドは Git チェックアウトを Herdr ワークスペー�
 ```
 
 `worktree.list`、`worktree.create`、`worktree.open` では `workspace_id` と `cwd` は最大どちらか一方だけを使い、両方省略するとアクティブなワークスペースを使います。`worktree.open` では `path` と `branch` のちょうど一方を使います。生のソケットの `cwd` と `path` の値は絶対パスでなければなりません。CLI は相対の `--cwd` と `--path` の値をリクエスト送信前に展開します。ワークスペースが Herdr の worktree グループに属している場合、ワークスペースのレスポンスには任意の `worktree` 出自情報が含まれます。既存のワークスペースが worktree の出自情報を獲得または変更したとき、worktree コマンドは `workspace.updated` を発行することがあります。
+
+### 2 つ目の既存ビューの明示的な登録
+
+Linux と macOS では、`worktree.adopt` は既存の 1 ペインのワークスペースをリンクされたチェックアウトに登録し、同じチェックアウトにある明示指定の別ワークスペースを維持します。ペインの移動や作成、フォーカス変更、別ワークスペースの登録解除は行わず、パスだけによる検索も変更しません。リクエストは未知のフィールドと必須の識別情報の欠落を拒否します。
+
+```json
+{
+  "id": "adopt_1",
+  "method": "worktree.adopt",
+  "params": {
+    "parent_workspace_id": "w1",
+    "workspace_id": "w3",
+    "path": "/repo/linked",
+    "repo_root": "/repo",
+    "repo_key": "/repo/.git",
+    "target": {
+      "pane_id": "w3:p1", "tab_id": "w3:t1", "terminal_id": "target-terminal",
+      "shell_pid": 100, "shell_birth": [12345, 0]
+    },
+    "known_workspace_id": "w2",
+    "known_panes": [
+      {
+        "pane_id": "w2:p1", "tab_id": "w2:t1", "terminal_id": "known-terminal",
+        "shell_pid": 200, "shell_birth": [12300, 0]
+      }
+    ]
+  }
+}
+```
+
+これらは例であり、検出済みの識別情報ではありません。既知の別ワークスペースの全ペインを指定してください。`shell_birth` は Linux では `/proc/PID/stat` の開始時刻の tick 値と 0、macOS では BSD の開始時刻の秒とマイクロ秒です。パスは物理的な絶対パス、ID は別名やラベルではなく現在のネイティブ ID を使います。親と既知のワークスペースには一致する登録情報が必要です。各ペインには独自の端末セッション内のエージェントなしのシェルが 1 つだけ必要です。識別情報の欠落や不一致、余分なプロセス、不完全なペイン一覧、別の一致するワークスペース、2 回の観測間の変化は拒否されます。成功時は既存の `worktree_opened` 結果を `already_open: true` とともに返します。再実行時も全条件を検証し、エンドポイントを置き換えません。
+
+`worktree.verify_adoption` は別の読み取り専用メソッドです。params は `{"binding": <登録時の完全な params>}` です。両ワークスペースの登録済み状態を要求し、ネイティブの識別情報と一致する集合を再検証し、観測の前後に Git worktree 情報を読みます。成功時の `worktree_list` は正規の親を `source` に、対象、既知の別ワークスペースの順でちょうど 2 件を `worktrees` に返します。各項目の `open_workspace_id` は明示指定したワークスペースを示し、現在の branch、linked、bare、prunable 情報を報告します。このリクエストに限定した結果であり、パスだけの検索成功ではありません。登録追加、フォーカス変更、イベント発行、セッションの dirty 化は行いません。
+
+管理済み Pi の後続検証では、タスクが保持する期待ネイティブセッション ID を `agent_session_id` に指定できます。対象には、その報告済み Pi セッションとツールの子孫プロセスだけを許可します。前景 Pi は保持されたシェルの直接の子でなければならず、観測した全セッションプロセスがそのワーカーの系統に属する必要があります。無関係な兄弟プロセスやヘルパー、第 2 のエージェント、プロセスの再生成、セッションの不一致は拒否します。既知の別ワークスペースは引き続きエージェントなしが必要です。`agent_session_id` を省略すると対象もエージェントなしを要求します。これはタスクや履歴の所有権を証明しません。呼び出し側は排他的な所有権、ソース、ネイティブ履歴、および初回登録や再起動時のより厳しい検査を維持してください。
+
+CLI は `herdr --session SESSION worktree adopt --params FILE` と `herdr --session SESSION worktree verify-adoption --params FILE` です。初回登録および後続の検証・制御ごとに、呼び出し側の継承セッションではなく対象の正式な記録から `SESSION` を選択します。明示セレクターは継承されたセッションとソケット設定に優先します。選択したサーバーだけを調べ、params の `session` フィールドや別サーバーの検索は許可しません。対象がなければ `pane_not_found`、ID が偶然一致しても期待する識別情報が違えば拒否します。ファイルには params オブジェクトだけを入れ、完全なリクエストや他製品の記録は入れません。成功 JSON は標準出力で終了コード 0、API エラーは標準エラーで 1、使用法エラーは 2、通信・ファイル・JSON エラーは非ゼロです。未対応時にパスだけの選択や新規割り当てへフォールバックしてはいけません。endpoint welcome の `methods` が両メソッドを広告します。バージョン文字列だけでは対応の証明になりません。未対応のネイティブ観測や識別情報の競合は `worktree_adoption_unavailable`、リクエスト解析と Git 検索は既存のエラーを返すことがあります。
 
 worktree コマンドはライフサイクルイベントも発行します。`worktree.create` は `workspace.created`、`tab.created`、`pane.created`、`worktree.created` を発行します。`worktree.open` は `worktree.opened` を発行し、新しい Herdr ワークスペースを開いた場合はワークスペース/タブ/ペインの作成イベントも発行します。`worktree.remove` は `worktree.removed` を発行し、リンクされたワークスペースがまだ開いている場合は `workspace.closed` も発行します。
 

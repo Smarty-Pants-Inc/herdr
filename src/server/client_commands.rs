@@ -294,7 +294,10 @@ mod tests {
         .expect("explicit adoption method shape fixture");
         let mut actual = endpoint_method_shape_digests();
         for (method, digest) in additions {
-            assert!(!expected.contains_key(&method), "baseline methods are immutable");
+            assert!(
+                !expected.contains_key(&method),
+                "baseline methods are immutable"
+            );
             assert_eq!(actual.remove(&method), Some(digest));
         }
 

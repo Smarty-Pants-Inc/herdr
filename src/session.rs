@@ -918,7 +918,13 @@ mod tests {
         for method in ["adopt", "verify-adoption"] {
             std::env::set_var(SESSION_ENV_VAR, "caller-session");
             let args = [
-                "herdr", "worktree", method, "--params", "params.json", "--session", "work",
+                "herdr",
+                "worktree",
+                method,
+                "--params",
+                "params.json",
+                "--session",
+                "work",
             ]
             .map(str::to_string);
             let cleaned = configure_from_args(&args).unwrap();

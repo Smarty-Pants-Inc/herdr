@@ -97,7 +97,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 客户端 | `client.window_title.set`、`client.window_title.clear` |
 | 会话 | `session.snapshot` |
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
-| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
+| Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.adopt`、`worktree.verify_adoption`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
 | 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
@@ -296,6 +296,43 @@ Worktree 方法把 Git 检出作为 Herdr 工作区管理。`worktree.create` �
 ```
 
 `worktree.list`、`worktree.create` 和 `worktree.open` 中,`workspace_id` 和 `cwd` 最多用一个;两个都省略则使用活动工作区。`worktree.open` 中,`path` 和 `branch` 恰好用一个。原始 socket 的 `cwd` 和 `path` 值必须是绝对路径;CLI 在发送请求前会展开相对的 `--cwd` 和 `--path` 值。当工作区属于某个 Herdr worktree 组时,工作区响应包含可选的 `worktree` 来源信息。当已有工作区获得或改变 worktree 来源信息时,worktree 命令可能发出 `workspace.updated`。
+
+### 显式登记第二个已有视图
+
+在 Linux 和 macOS 上，`worktree.adopt` 将已有的单窗格工作区登记到关联检出，同时保留同一检出中显式指定的另一个工作区。它不会移动或创建窗格、改变焦点、清除另一个工作区的登记，也不会改变仅按路径查询的行为。请求拒绝未知字段和缺失的必需身份字段。
+
+```json
+{
+  "id": "adopt_1",
+  "method": "worktree.adopt",
+  "params": {
+    "parent_workspace_id": "w1",
+    "workspace_id": "w3",
+    "path": "/repo/linked",
+    "repo_root": "/repo",
+    "repo_key": "/repo/.git",
+    "target": {
+      "pane_id": "w3:p1", "tab_id": "w3:t1", "terminal_id": "target-terminal",
+      "shell_pid": 100, "shell_birth": [12345, 0]
+    },
+    "known_workspace_id": "w2",
+    "known_panes": [
+      {
+        "pane_id": "w2:p1", "tab_id": "w2:t1", "terminal_id": "known-terminal",
+        "shell_pid": 200, "shell_birth": [12300, 0]
+      }
+    ]
+  }
+}
+```
+
+以上数值只是示例，不是已发现的身份。必须列出已知工作区中的全部窗格。`shell_birth` 在 Linux 上包含 `/proc/PID/stat` 的启动时刻 tick 值和零，在 macOS 上包含 BSD 启动时刻的秒和微秒。路径必须已是物理绝对路径，ID 必须是当前原生 ID，而非别名或标签。父工作区和已知工作区必须已有匹配的原生登记。每个被接纳的窗格必须在自己的终端会话中仅有一个不含智能体的 shell。身份缺失或冲突、额外进程、窗格列表不完整、其他匹配工作区，以及两次观察之间的变化都会被拒绝。成功使用已有的 `worktree_opened` 结果并返回 `already_open: true`。重复请求仍会验证所有事实，不会替换端点。
+
+`worktree.verify_adoption` 是单独的只读方法，params 为 `{"binding": <完整的登记 params>}`。它要求两个工作区均已登记，重新检查原生身份和精确匹配集合，并在观察前后读取当前 Git worktree 条目。成功返回 `worktree_list`，`source` 为规范父工作区，`worktrees` 恰有两项，顺序为目标、已知的另一个工作区。各项的 `open_workspace_id` 指向显式指定的工作区，并报告当前 branch、linked、bare 和 prunable 信息。这是本次请求的限定结果，不表示仅按路径查询成功。验证不会增加登记、改变焦点、发出事件或将会话标为 dirty。
+
+后续验证已受管理的 Pi 时，还可指定 `agent_session_id`，其值必须来自该任务已有的预期原生会话 ID。此时目标只允许该已报告的 Pi 会话及其工具后代进程。前台 Pi 必须是保留 shell 的直接子进程，所有观察到的会话进程必须属于该工作进程的谱系。无关的同级进程、辅助进程树、第二个智能体、进程重新生成或不同的已报告会话均会被拒绝。已知工作区仍必须没有智能体。省略 `agent_session_id` 时，目标也必须没有智能体。这不证明任务或历史的所有权；调用方必须保留自己的排他声明、源代码和原生历史验证，包括初次接纳和重新启动时更严格的检查。
+
+CLI 为 `herdr --session SESSION worktree adopt --params FILE` 和 `herdr --session SESSION worktree verify-adoption --params FILE`。每次接纳以及后续验证或控制都必须从目标的权威记录选择 `SESSION`，不能使用调用方继承的会话。显式全局选择器优先于继承的会话和 socket 设置。这些方法只检查所选服务器，不接受 params 中的 `session` 字段，也不搜索其他服务器。目标缺失返回 `pane_not_found`；即使 ID 恰好相同，预期身份不同仍会被拒绝。文件只包含相应的 params 对象，而不是完整请求或其他产品的记录。成功 JSON 写到 stdout，退出码为 0；API 错误写到 stderr，退出码为 1；用法错误为 2；通信、文件和 JSON 错误为非零。缺少支持时不得退回仅按路径选择或新建工作区。endpoint welcome 的 `methods` 广告这两个方法；版本字符串本身不能证明功能支持。不支持原生观察或身份冲突时，两者均使用已有的 `worktree_adoption_unavailable` 错误；请求解析和 Git 查询也可能返回其已有错误。
 
 Worktree 命令也发出生命周期事件。`worktree.create` 发出 `workspace.created`、`tab.created`、`pane.created` 和 `worktree.created`。`worktree.open` 发出 `worktree.opened`,并在打开新的 Herdr 工作区时同时发出工作区/标签页/窗格创建事件。`worktree.remove` 发出 `worktree.removed`;如果关联的工作区仍然打开,还会发出 `workspace.closed`。
 

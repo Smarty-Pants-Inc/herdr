@@ -1217,7 +1217,14 @@ mod tests {
     #[test]
     fn worktree_json_compatibility_flag_stays_out_of_public_spec() {
         let cmd = super::command();
-        for subcommand in ["list", "create", "open", "remove", "adopt", "verify-adoption"] {
+        for subcommand in [
+            "list",
+            "create",
+            "open",
+            "remove",
+            "adopt",
+            "verify-adoption",
+        ] {
             let worktree_command = command_path(&cmd, &["worktree", subcommand]);
             if matches!(subcommand, "adopt" | "verify-adoption") {
                 assert!(has_option(worktree_command, "params"));

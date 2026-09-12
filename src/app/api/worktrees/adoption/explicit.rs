@@ -30,9 +30,10 @@ impl App {
         params: WorktreeVerifyAdoptionParams,
     ) -> String {
         if !crate::platform::capabilities().foreground_worktree_adoption
-            || params.agent_session_id.as_ref().is_some_and(|id| {
-                crate::agent_resume::AgentSessionRef::id(id.clone()).is_none()
-            })
+            || params
+                .agent_session_id
+                .as_ref()
+                .is_some_and(|id| crate::agent_resume::AgentSessionRef::id(id.clone()).is_none())
         {
             return encode_error(
                 id,
@@ -230,7 +231,9 @@ impl App {
                     !membership.is_linked_worktree && membership.key == git.key
                 }) || self.workspace_matches_checkout(workspace, &checkout, &params.path)
                     || self.workspace_matches_checkout(workspace, &root, &params.repo_root)
-                    || self.foreground_checkout(&source, index, &checkout)?.is_some()
+                    || self
+                        .foreground_checkout(&source, index, &checkout)?
+                        .is_some()
                 {
                     return Err(unavailable());
                 }
@@ -268,7 +271,10 @@ impl App {
 
     fn exact_adoption_target(&self, params: &WorktreeAdoptParams) -> Result<usize, ApiFailure> {
         let (index, pane) = self.parse_pane_id(&params.target.pane_id).ok_or_else(|| {
-            ApiFailure::new("pane_not_found", "target pane not found in the selected server")
+            ApiFailure::new(
+                "pane_not_found",
+                "target pane not found in the selected server",
+            )
         })?;
         if index != self.exact_adoption_workspace(&params.workspace_id)?
             || self.public_pane_id(index, pane).as_deref() != Some(params.target.pane_id.as_str())
@@ -396,9 +402,13 @@ impl App {
                         return Err(unavailable());
                     }
                     let mut processes = Vec::new();
-                    for child in session_processes.iter().copied().filter(|child| *child != pid) {
-                        let identity =
-                            crate::platform::worktree_process_identity(child).ok_or_else(unavailable)?;
+                    for child in session_processes
+                        .iter()
+                        .copied()
+                        .filter(|child| *child != pid)
+                    {
+                        let identity = crate::platform::worktree_process_identity(child)
+                            .ok_or_else(unavailable)?;
                         let job = crate::platform::foreground_group_leader_job(child)
                             .ok_or_else(unavailable)?;
                         if crate::platform::process_agent_hint(child)
@@ -420,14 +430,19 @@ impl App {
                     crate::platform::worktree_process_identity(pid).ok_or_else(unavailable)?;
                 observed.push(PlainCheckout {
                     binding: WorktreeAdoptPane {
-                        pane_id: self.public_pane_id(index, *pane_id).ok_or_else(unavailable)?,
-                        tab_id: self.public_tab_id(index, tab_index).ok_or_else(unavailable)?,
+                        pane_id: self
+                            .public_pane_id(index, *pane_id)
+                            .ok_or_else(unavailable)?,
+                        tab_id: self
+                            .public_tab_id(index, tab_index)
+                            .ok_or_else(unavailable)?,
                         terminal_id: pane.attached_terminal_id.to_string(),
                         shell_pid: pid,
                         shell_birth: [native.birth.0, native.birth.1],
                     },
                     native,
-                    job: crate::platform::foreground_group_leader_job(pid).ok_or_else(unavailable)?,
+                    job: crate::platform::foreground_group_leader_job(pid)
+                        .ok_or_else(unavailable)?,
                     cwd: crate::platform::process_cwd(pid).ok_or_else(unavailable)?,
                     reported_cwd: runtime.cwd().ok_or_else(unavailable)?,
                     foreground_cwd: runtime.foreground_cwd().ok_or_else(unavailable)?,

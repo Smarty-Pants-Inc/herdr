@@ -282,7 +282,11 @@ pub(crate) fn worktree_process_identity(pid: u32) -> Option<super::WorktreeProce
     }
     let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let size = unsafe {
-        libc::proc_pidpath(pid as libc::c_int, path.as_mut_ptr().cast(), path.len() as u32)
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            path.as_mut_ptr().cast(),
+            path.len() as u32,
+        )
     };
     if size <= 0 {
         return None;

@@ -322,7 +322,11 @@ fn treehouse_get_rejects_unrelated_ancestry_helpers_agents_and_extra_processes()
             6 => helper.process.process_group = item.shell,
             7 => helper.job.processes[0].name = "pi".into(),
             8 => helper.job.processes[0].argv.as_mut().unwrap()[1] = "run".into(),
-            9 => helper.job.processes[0].argv.as_mut().unwrap().push("pi".into()),
+            9 => helper.job.processes[0]
+                .argv
+                .as_mut()
+                .unwrap()
+                .push("pi".into()),
             10 => helper.invoked_executable = PathBuf::from("/other/treehouse"),
             11 => helper.cwd = fixture.checkout.clone(),
             12 => item.session_processes.push(300),
@@ -422,7 +426,10 @@ fn native_worktree_process_identity_matches_current_executable_and_birth() {
         before.executable,
         std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
     );
-    assert_eq!(Some(before), crate::platform::worktree_process_identity(pid));
+    assert_eq!(
+        Some(before),
+        crate::platform::worktree_process_identity(pid)
+    );
     assert!(crate::platform::worktree_process_identity(u32::MAX).is_none());
 }
 

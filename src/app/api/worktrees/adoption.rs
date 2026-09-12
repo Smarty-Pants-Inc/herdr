@@ -378,13 +378,14 @@ fn observe_treehouse_intermediary(
 }
 
 fn installed_treehouse_executable(executable: &Path) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| treehouse_executable_on_path(executable, &path))
+    std::env::var_os("PATH").is_some_and(|path| treehouse_executable_on_path(executable, &path))
 }
 
 fn treehouse_executable_on_path(executable: &Path, path: &std::ffi::OsStr) -> bool {
     executable.is_absolute()
-        && executable.file_name().is_some_and(|name| name == "treehouse")
+        && executable
+            .file_name()
+            .is_some_and(|name| name == "treehouse")
         && std::env::split_paths(path)
             .filter(|directory| directory.is_absolute())
             .any(|directory| {
