@@ -334,6 +334,19 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
+/// Kernel process birth identity, used only by explicit worktree adoption.
+pub(crate) fn process_birth_identity(pid: u32) -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_birth_identity_from_stat(&stat)
+}
+
+fn process_birth_identity_from_stat(stat: &str) -> Option<(u64, u64)> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    // Field 22; field 3 (state) starts the suffix after comm.
+    let start = rest.split_whitespace().nth(19)?.parse().ok()?;
+    Some((start, 0))
+}
+
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.
@@ -1071,6 +1084,14 @@ mod tests {
         assert_eq!(discover(), vec![200]);
         children.borrow_mut().insert((100, 100), vec![200, 201]);
         assert_eq!(discover(), vec![200, 201]);
+    }
+
+    #[test]
+    fn process_birth_identity_uses_starttime_after_the_last_comm_parenthesis() {
+        let stat = "123 (shell with ) parentheses) S 1 123 123 0 123 0 0 0 0 0 0 0 0 0 0 0 0 4242";
+        assert_eq!(process_birth_identity_from_stat(stat), Some((4242, 0)));
+        assert_eq!(process_birth_identity_from_stat("123 (sh) S 1"), None);
+        assert_eq!(process_birth_identity_from_stat("missing comm"), None);
     }
 
     #[test]
