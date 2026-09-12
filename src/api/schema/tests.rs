@@ -82,6 +82,58 @@ fn managed_layout_methods_are_explicit_and_unknown_effect_fields_are_rejected() 
 }
 
 #[test]
+fn explicit_worktree_adoption_requires_all_bindings_and_rejects_unknown_fields() {
+    let value = serde_json::json!({
+        "id": "adopt", "method": "worktree.adopt", "params": {
+            "parent_workspace_id": "w1", "workspace_id": "w3", "path": "/repo/linked",
+            "repo_root": "/repo", "repo_key": "/repo/.git",
+            "target": { "pane_id": "w3:p1", "tab_id": "w3:t1", "terminal_id": "target",
+                "shell_pid": 100, "shell_birth": [10, 0] },
+            "known_workspace_id": "w2",
+            "known_panes": [{ "pane_id": "w2:p1", "tab_id": "w2:t1", "terminal_id": "known",
+                "shell_pid": 200, "shell_birth": [20, 0] }]
+        }
+    });
+    let request: Request = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(crate::api::api_method_name(&request.method), "worktree.adopt");
+    assert!(crate::api::request_changes_ui(&request));
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+    let verify = serde_json::json!({
+        "id": "verify", "method": "worktree.verify_adoption",
+        "params": { "binding": value["params"], "agent_session_id": "retained-pi" }
+    });
+    let request: Request = serde_json::from_value(verify.clone()).unwrap();
+    assert_eq!(crate::api::api_method_name(&request.method), "worktree.verify_adoption");
+    assert!(!crate::api::request_changes_ui(&request));
+    assert_eq!(serde_json::to_value(request).unwrap(), verify);
+    let mut unknown = verify;
+    unknown["params"]["allow_any_agent"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<Request>(unknown).is_err());
+    for key in [
+        "parent_workspace_id",
+        "workspace_id",
+        "path",
+        "repo_root",
+        "repo_key",
+        "target",
+        "known_workspace_id",
+        "known_panes",
+    ] {
+        let mut missing = value.clone();
+        missing["params"].as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<Request>(missing).is_err());
+    }
+    for path in ["/params", "/params/target", "/params/known_panes/0"] {
+        let mut unknown = value.clone();
+        unknown.pointer_mut(path).unwrap()["force"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Request>(unknown).is_err());
+    }
+    let mut short_birth = value;
+    short_birth["params"]["target"]["shell_birth"] = serde_json::json!([10]);
+    assert!(serde_json::from_value::<Request>(short_birth).is_err());
+}
+
+#[test]
 fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),

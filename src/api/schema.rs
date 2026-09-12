@@ -97,6 +97,10 @@ pub enum Method {
     WorktreeCreate(WorktreeCreateParams),
     #[serde(rename = "worktree.open")]
     WorktreeOpen(WorktreeOpenParams),
+    #[serde(rename = "worktree.adopt")]
+    WorktreeAdopt(WorktreeAdoptParams),
+    #[serde(rename = "worktree.verify_adoption")]
+    WorktreeVerifyAdoption(WorktreeVerifyAdoptionParams),
     #[serde(rename = "worktree.remove")]
     WorktreeRemove(WorktreeRemoveParams),
     #[serde(rename = "tab.create")]

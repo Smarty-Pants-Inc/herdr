@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    Method, Request, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
+    WorktreeRemoveParams,
 };
 
 // Worktree output is always JSON. The parsers retain `--json` as a hidden compatibility no-op.
@@ -14,6 +15,8 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
         "create" => worktree_create(&args[1..]),
         "open" => worktree_open(&args[1..]),
         "remove" => worktree_remove(&args[1..]),
+        "adopt" => worktree_explicit(&args[1..], false),
+        "verify-adoption" => worktree_explicit(&args[1..], true),
         "help" | "--help" | "-h" => {
             print_worktree_help();
             Ok(0)
@@ -23,6 +26,27 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn worktree_explicit(args: &[String], verify: bool) -> std::io::Result<i32> {
+    let [flag, path] = args else {
+        eprintln!("usage: herdr worktree <adopt|verify-adoption> --params FILE");
+        return Ok(2);
+    };
+    if flag != "--params" {
+        eprintln!("expected --params FILE");
+        return Ok(2);
+    }
+    let bytes = std::fs::read(path)?;
+    let method = if verify {
+        Method::WorktreeVerifyAdoption(serde_json::from_slice(&bytes)?)
+    } else {
+        Method::WorktreeAdopt(serde_json::from_slice(&bytes)?)
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:worktree:explicit".into(),
+        method,
+    })?)
 }
 
 fn worktree_list(args: &[String]) -> std::io::Result<i32> {
@@ -312,6 +336,8 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
 
 fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
+    eprintln!("  herdr worktree adopt --params FILE");
+    eprintln!("  herdr worktree verify-adoption --params FILE");
     eprintln!("  herdr worktree list [--workspace ID | --cwd PATH] [--trust-repository]");
     eprintln!(
         "  herdr worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--trust-repository]"

@@ -5,6 +5,8 @@ use crate::platform::ForegroundJob;
 
 use super::{ApiFailure, WorktreeSource};
 
+mod explicit;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForegroundCheckout {
     workspace: String,
@@ -19,7 +21,19 @@ struct ForegroundCheckout {
     foreground_cwd: PathBuf,
     foreground_birth: (u64, u64),
     session_processes: Vec<u32>,
+    treehouse: Option<TreehouseIntermediary>,
     job: ForegroundJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreehouseIntermediary {
+    pid: u32,
+    root: crate::platform::WorktreeProcessIdentity,
+    process: crate::platform::WorktreeProcessIdentity,
+    child: crate::platform::WorktreeProcessIdentity,
+    job: ForegroundJob,
+    invoked_executable: PathBuf,
+    cwd: PathBuf,
 }
 
 fn unavailable() -> ApiFailure {
@@ -192,7 +206,7 @@ impl App {
             || observed.job.process_group_id == observed.shell
             || !single_shell(&observed.root_job)
             || !single_shell(&observed.job)
-            || observed.session_processes.len() != 2
+            || !supported_session_shape(observed)
             || !observed.session_processes.contains(&observed.shell)
             || !observed
                 .session_processes
@@ -288,10 +302,13 @@ impl App {
                 if actual_cwd != cwd {
                     return Err(unavailable());
                 }
-                // ponytail: reuse the session inventory only for this explicit adoption.
-                // Extra jobs/helpers are refused; broader shell shapes need native proof.
                 let mut session_processes = crate::platform::session_processes(shell);
                 session_processes.sort_unstable();
+                let treehouse = observe_treehouse_intermediary(
+                    shell,
+                    job.process_group_id,
+                    &session_processes,
+                )?;
                 selected = Some(ForegroundCheckout {
                     workspace: workspace.id.clone(),
                     tab: tab.number,
@@ -305,12 +322,113 @@ impl App {
                     foreground_cwd: cwd,
                     foreground_birth,
                     session_processes,
+                    treehouse,
                     job,
                 });
             }
         }
         Ok(selected)
     }
+}
+
+fn observe_treehouse_intermediary(
+    shell: u32,
+    foreground: u32,
+    session: &[u32],
+) -> Result<Option<TreehouseIntermediary>, ApiFailure> {
+    if session.len() != 3 {
+        return Ok(None);
+    }
+    let extra: Vec<_> = session
+        .iter()
+        .copied()
+        .filter(|pid| *pid != shell && *pid != foreground)
+        .collect();
+    let [pid] = extra.as_slice() else {
+        return Err(unavailable());
+    };
+    let process = crate::platform::worktree_process_identity(*pid).ok_or_else(unavailable)?;
+    // ponytail: trust the installed executable selected through the server's PATH,
+    // not comm/argv alone. Exec wrappers may precede the real binary on PATH.
+    // This admits the observed Treehouse 2.3.0 get shape, not arbitrary helpers.
+    if !installed_treehouse_executable(&process.executable)
+        || crate::platform::process_agent_hint(*pid).is_some()
+    {
+        return Err(unavailable());
+    }
+    let job = crate::platform::foreground_group_leader_job(*pid).ok_or_else(unavailable)?;
+    let invoked = job
+        .processes
+        .first()
+        .and_then(|process| process.argv.as_ref())
+        .and_then(|argv| argv.first())
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(unavailable)?;
+    let invoked_executable = physical(invoked)?;
+    Ok(Some(TreehouseIntermediary {
+        pid: *pid,
+        root: crate::platform::worktree_process_identity(shell).ok_or_else(unavailable)?,
+        process,
+        child: crate::platform::worktree_process_identity(foreground).ok_or_else(unavailable)?,
+        job,
+        invoked_executable,
+        cwd: crate::platform::process_cwd(*pid).ok_or_else(unavailable)?,
+    }))
+}
+
+fn installed_treehouse_executable(executable: &Path) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| treehouse_executable_on_path(executable, &path))
+}
+
+fn treehouse_executable_on_path(executable: &Path, path: &std::ffi::OsStr) -> bool {
+    executable.is_absolute()
+        && executable.file_name().is_some_and(|name| name == "treehouse")
+        && std::env::split_paths(path)
+            .filter(|directory| directory.is_absolute())
+            .any(|directory| {
+                std::fs::canonicalize(directory.join("treehouse"))
+                    .ok()
+                    .as_deref()
+                    == Some(executable)
+            })
+}
+
+fn supported_session_shape(observed: &ForegroundCheckout) -> bool {
+    let Some(helper) = &observed.treehouse else {
+        return observed.session_processes.len() == 2;
+    };
+    let [process] = helper.job.processes.as_slice() else {
+        return false;
+    };
+    let Some(argv) = process.argv.as_deref() else {
+        return false;
+    };
+    observed.session_processes.len() == 3
+        && observed.session_processes.contains(&helper.pid)
+        && helper.pid != observed.shell
+        && helper.pid != observed.job.process_group_id
+        && helper.job.process_group_id == helper.pid
+        && process.pid == helper.pid
+        && process.name == "treehouse"
+        && argv.len() == 2
+        && helper.invoked_executable == helper.process.executable
+        && argv[1] == "get"
+        && helper.root.session == observed.shell
+        && helper.root.process_group == observed.shell
+        && helper.root.birth == observed.shell_birth
+        && helper.process.parent_pid == observed.shell
+        && helper.process.session == observed.shell
+        && helper.process.process_group == helper.pid
+        && helper.child.parent_pid == helper.pid
+        && helper.child.session == observed.shell
+        && helper.child.process_group == observed.job.process_group_id
+        && helper.child.birth == observed.foreground_birth
+        && helper.root.terminal != 0
+        && helper.process.terminal == helper.root.terminal
+        && helper.child.terminal == helper.root.terminal
+        && helper.cwd == observed.shell_cwd
 }
 
 #[cfg(test)]
