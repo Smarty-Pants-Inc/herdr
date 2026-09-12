@@ -126,6 +126,19 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
         .create_workspace_with_options(fixture.repo.clone(), false)
         .unwrap();
     assert_eq!(index, 1);
+    // Real workspaces discover Git identity at creation; test_new does not.
+    // A cold parent fixture otherwise makes --cwd select the nested workspace
+    // as its source parent, which adoption must refuse.
+    let parent_space = crate::workspace::git_space_metadata(&fixture.repo).unwrap();
+    assert_eq!(
+        fixture.app.find_parent_workspace_for_space(&parent_space),
+        Some(index)
+    );
+    fixture.app.state.workspaces[0].cached_git_space = Some(parent_space.clone());
+    assert_eq!(
+        fixture.app.find_parent_workspace_for_space(&parent_space),
+        Some(0)
+    );
     let tab = &fixture.app.state.workspaces[index].tabs[0];
     let terminal = tab.terminal_id(tab.root_pane).unwrap().clone();
     // Quote the nested shell body as one POSIX argument; paths may contain apostrophes.
@@ -179,7 +192,8 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
             trust_repository: false,
         },
     );
-    let listed: crate::api::schema::SuccessResponse = serde_json::from_str(&listed).unwrap();
+    let listed: crate::api::schema::SuccessResponse = serde_json::from_str(&listed)
+        .unwrap_or_else(|error| panic!("worktree.list: {error}; response: {listed}"));
     let crate::api::schema::ResponseResult::WorktreeList { worktrees, .. } = listed.result else {
         panic!("expected list");
     };
@@ -207,7 +221,8 @@ async fn nested_shell_native_list_and_open_preserve_process_and_terminal() {
             trust_repository: false,
         },
     );
-    let opened: crate::api::schema::SuccessResponse = serde_json::from_str(&opened).unwrap();
+    let opened: crate::api::schema::SuccessResponse = serde_json::from_str(&opened)
+        .unwrap_or_else(|error| panic!("worktree.open: {error}; response: {opened}"));
     let crate::api::schema::ResponseResult::WorktreeOpened {
         workspace,
         tab,
