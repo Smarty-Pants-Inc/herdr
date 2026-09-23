@@ -13,6 +13,8 @@ env:
 
 jobs:
   close:
+    # Smarty fork: the issue-closing token and release labels exist only upstream.
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
 
     steps:
