@@ -82,8 +82,16 @@ impl App {
     pub(crate) fn handle_deferred_agent_api_request(
         &mut self,
         request: crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
+        if !matches!(request.method, crate::api::schema::Method::AgentPrompt(_)) {
+            return false;
+        }
+        if let Some(response) = self.cross_pane_input_denial(&request, context) {
+            let _ = respond_to.send(response);
+            return true;
+        }
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
@@ -428,6 +436,7 @@ mod tests {
                 id: id.into(),
                 method: crate::api::schema::Method::AgentPrompt(params),
             },
+            crate::api::ApiRequestContext::default(),
             respond_to,
         ));
         response_rx

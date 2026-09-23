@@ -7675,106 +7675,174 @@ fn no_handle_internal_event_bypass_in_module() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+struct CrossPaneGuardFixture {
+    server: HeadlessServer,
+    source_terminal_id: crate::terminal::TerminalId,
+    target_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    target_pane_id: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CrossPaneGuardFixture {
+    /// Two idle Pi agents; this test process is attributed to the source pane.
+    fn new() -> Self {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("headless-input-guard");
+        let source_pane = workspace.tabs[0].root_pane;
+        let target_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let terminal_id = |server: &HeadlessServer, pane| {
+            server.app.state.workspaces[0]
+                .terminal_id(pane)
+                .cloned()
+                .expect("terminal")
+        };
+        let source_terminal_id = terminal_id(&server, source_pane);
+        let target_terminal_id = terminal_id(&server, target_pane);
+        for (id, name) in [
+            (&source_terminal_id, "source-agent"),
+            (&target_terminal_id, "target-agent"),
+        ] {
+            let terminal = server
+                .app
+                .state
+                .terminals
+                .get_mut(id)
+                .expect("terminal state");
+            terminal.set_agent_name(name.into());
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::Pi),
+                crate::detect::AgentState::Idle,
+            );
+        }
+
+        let (source_runtime, _source_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        source_runtime.test_set_child_pid(std::process::id());
+        server
+            .app
+            .terminal_runtimes
+            .insert(source_terminal_id.clone(), source_runtime);
+        let (target_runtime, target_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(target_terminal_id, target_runtime);
+
+        let workspace_id = server.app.state.workspaces[0].id.clone();
+        let pane_number = server.app.state.workspaces[0]
+            .public_pane_number(target_pane)
+            .expect("target pane number");
+        Self {
+            server,
+            source_terminal_id,
+            target_rx,
+            target_pane_id: crate::workspace::public_pane_id_for_number(&workspace_id, pane_number),
+        }
+    }
+
+    /// Dispatches through the production headless path with this process as the peer.
+    fn send_attributed(&mut self, id: &str, method: api::schema::Method) -> String {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        self.server
+            .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: id.into(),
+                    method,
+                },
+                context: api::ApiRequestContext {
+                    local_peer_pid: Some(std::process::id()),
+                },
+                respond_to,
+                response_write_complete: None,
+                stream_active: None,
+            });
+        response_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("headless response")
+    }
+
+    fn shutdown(mut self) {
+        self.server
+            .app
+            .terminal_runtimes
+            .get(&self.source_terminal_id)
+            .expect("source runtime")
+            .test_set_child_pid(0);
+        shutdown_test_runtimes(&mut self.server);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_cross_pane_denied(response: &str) {
+    let response: api::schema::ErrorResponse =
+        serde_json::from_str(response).expect("denial response");
+    assert_eq!(response.error.code, "cross_pane_input_denied");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_agent_prompted(response: &str) {
+    let response: api::schema::SuccessResponse =
+        serde_json::from_str(response).unwrap_or_else(|err| panic!("{err}: {response}"));
+    assert!(matches!(
+        response.result,
+        api::schema::ResponseResult::AgentPrompted { .. }
+    ));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn headless_api_dispatch_uses_origin_context_for_cross_pane_guard() {
-    let mut server = test_headless_server();
-    let mut workspace = crate::workspace::Workspace::test_new("headless-input-guard");
-    let source_pane = workspace.tabs[0].root_pane;
-    let target_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
-    server.app.state.workspaces = vec![workspace];
-    server.app.state.ensure_test_terminals();
-    server.app.state.active = Some(0);
-    server.app.state.selected = 0;
-    server.app.state.mode = crate::app::Mode::Terminal;
+    let mut fixture = CrossPaneGuardFixture::new();
+    let target_pane_id = fixture.target_pane_id.clone();
+    let response = fixture.send_attributed(
+        "headless-cross-pane",
+        api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
+            pane_id: target_pane_id,
+            text: "blocked".into(),
+            allow_cross_pane: false,
+        }),
+    );
 
-    let source_terminal_id = server.app.state.workspaces[0]
-        .terminal_id(source_pane)
-        .cloned()
-        .expect("source terminal");
-    let target_terminal_id = server.app.state.workspaces[0]
-        .terminal_id(target_pane)
-        .cloned()
-        .expect("target terminal");
-    server
-        .app
-        .state
-        .terminals
-        .get_mut(&source_terminal_id)
-        .expect("source state")
-        .set_agent_name("source-agent".into());
-    server
-        .app
-        .state
-        .terminals
-        .get_mut(&source_terminal_id)
-        .expect("source state")
-        .set_detected_state(
-            Some(crate::detect::Agent::Pi),
-            crate::detect::AgentState::Idle,
-        );
-    server
-        .app
-        .state
-        .terminals
-        .get_mut(&target_terminal_id)
-        .expect("target state")
-        .set_agent_name("target-agent".into());
-    server
-        .app
-        .state
-        .terminals
-        .get_mut(&target_terminal_id)
-        .expect("target state")
-        .set_detected_state(
-            Some(crate::detect::Agent::Pi),
-            crate::detect::AgentState::Idle,
-        );
+    assert_cross_pane_denied(&response);
+    assert!(fixture.target_rx.try_recv().is_err());
+    fixture.shutdown();
+}
 
-    let (source_runtime, _source_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-    source_runtime.test_set_child_pid(std::process::id());
-    server
-        .app
-        .terminal_runtimes
-        .insert(source_terminal_id.clone(), source_runtime);
-    let (target_runtime, mut target_rx) =
-        crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-    server
-        .app
-        .terminal_runtimes
-        .insert(target_terminal_id, target_runtime);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn headless_deferred_agent_prompt_enforces_cross_pane_guard() {
+    let prompt = |target: &str, allow_cross_pane| {
+        api::schema::Method::AgentPrompt(api::schema::AgentPromptParams {
+            target: target.into(),
+            text: "hello".into(),
+            wait: None,
+            allow_cross_pane,
+        })
+    };
+    let mut fixture = CrossPaneGuardFixture::new();
 
-    let workspace_id = server.app.state.workspaces[0].id.clone();
-    let pane_number = server.app.state.workspaces[0]
-        .public_pane_number(target_pane)
-        .expect("target pane number");
-    let target_pane_id = crate::workspace::public_pane_id_for_number(&workspace_id, pane_number);
-    let (respond_to, response_rx) = std::sync::mpsc::channel();
-    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-        request: api::schema::Request {
-            id: "headless-cross-pane".into(),
-            method: api::schema::Method::PaneSendText(api::schema::PaneSendTextParams {
-                pane_id: target_pane_id,
-                text: "blocked".into(),
-                allow_cross_pane: false,
-            }),
-        },
-        context: api::ApiRequestContext {
-            local_peer_pid: Some(std::process::id()),
-        },
-        respond_to,
-        response_write_complete: None,
-        stream_active: None,
-    });
+    let denied = fixture.send_attributed("prompt-denied", prompt("target-agent", false));
+    assert_cross_pane_denied(&denied);
+    assert!(fixture.target_rx.try_recv().is_err());
 
-    let response: api::schema::ErrorResponse =
-        serde_json::from_str(&response_rx.recv().expect("headless response")).unwrap();
-    assert_eq!(response.error.code, "cross_pane_input_denied");
-    assert!(target_rx.try_recv().is_err());
-    server
-        .app
-        .terminal_runtimes
-        .get(&source_terminal_id)
-        .expect("source runtime")
-        .test_set_child_pid(0);
-    shutdown_test_runtimes(&mut server);
+    let allowed = fixture.send_attributed("prompt-allowed", prompt("target-agent", true));
+    assert_agent_prompted(&allowed);
+    assert!(fixture.target_rx.try_recv().is_ok());
+
+    // The guard passes; later readiness checks may still reject this synthetic source pane,
+    // whose attributed PID is the test process rather than a Pi foreground process.
+    let own_pane = fixture.send_attributed("prompt-own-pane", prompt("source-agent", false));
+    assert!(
+        !own_pane.contains("cross_pane_input_denied"),
+        "own-pane prompt must pass the guard: {own_pane}"
+    );
+
+    fixture.shutdown();
 }
