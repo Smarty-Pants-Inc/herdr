@@ -18,6 +18,12 @@ use tracing::{info, warn};
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+// ponytail: the Smarty fork's 0.9.0 line (d86f0976, managed layout idempotency) sends
+// version 3. Its manifest only adds optional snapshot fields that this build ignores, and
+// the socket handshake is unchanged, so accept it to move running fork servers onto this
+// build without ending pane processes. Remove once no fork 0.9.0 server remains.
+#[cfg(unix)]
+const FORK_MANAGED_LAYOUT_HANDOFF_VERSION: u32 = 3;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -235,12 +241,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     let manifest_line = read_line_unbuffered(&mut stream)?;
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
-    if manifest.version != HANDOFF_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported handoff version {}",
-            manifest.version
-        )));
-    }
+    validate_manifest_version(&manifest)?;
     if manifest
         .expected_protocol
         .is_some_and(|protocol| protocol != crate::protocol::PROTOCOL_VERSION)
@@ -270,6 +271,16 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
         fds,
         stream,
     })
+}
+
+#[cfg(unix)]
+fn validate_manifest_version(manifest: &HandoffManifest) -> io::Result<()> {
+    match manifest.version {
+        HANDOFF_VERSION | FORK_MANAGED_LAYOUT_HANDOFF_VERSION => Ok(()),
+        version => Err(io::Error::other(format!(
+            "unsupported handoff version {version}"
+        ))),
+    }
 }
 
 #[cfg(unix)]
@@ -573,5 +584,27 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[test]
+    fn a_fork_managed_layout_manifest_is_accepted() {
+        // Shape sent by the fork 0.9.0 line: version 3 plus layout idempotency fields.
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value["version"] = serde_json::json!(3);
+        value["snapshot"]["idempotency_epoch"] = serde_json::json!("ab".repeat(16));
+        let fork: HandoffManifest =
+            serde_json::from_value(value).expect("a fork manifest should load");
+
+        assert!(validate_manifest_version(&fork).is_ok());
+    }
+
+    #[test]
+    fn unknown_handoff_versions_are_rejected() {
+        let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
+        for version in [0, 2, 4] {
+            manifest.version = version;
+            assert!(validate_manifest_version(&manifest).is_err());
+        }
     }
 }
