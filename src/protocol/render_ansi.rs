@@ -31,7 +31,9 @@ use std::io::Write;
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::protocol::{underline_style_from_modifier, CellData, FrameData};
+use crate::protocol::{
+    underline_style_from_modifier, CellData, CursorState, FrameData, PaneSurfacePatchRow,
+};
 
 const REVERSED_MODIFIER: u16 = 1 << 6;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
@@ -135,8 +137,101 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
-    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
-        self.last_frame.as_ref()
+    pub(crate) fn encode_patch(
+        &self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<CursorState>,
+        suppress_visible_cursor: bool,
+    ) -> Option<EncodedBlit> {
+        let frame = self.last_frame.as_ref()?;
+        if rows.iter().any(|row| !patch_row_fits(frame, row)) || patch_rows_overlap(rows) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        let mut next_last_visible_cursor = self.last_visible_cursor;
+        let mut next_last_cursor_shape = self.last_cursor_shape;
+        blit_patch_to(
+            &mut bytes,
+            frame,
+            rows,
+            cursor,
+            &mut next_last_visible_cursor,
+            &mut next_last_cursor_shape,
+            repeat_ime_anchor_after_sync(),
+            suppress_visible_cursor,
+        );
+        Some(EncodedBlit {
+            bytes,
+            full: false,
+            next_last_visible_cursor,
+            next_last_cursor_shape,
+        })
+    }
+
+    pub(crate) fn patch_rows_with_drawn_cursor(
+        &self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<&CursorState>,
+    ) -> Option<Vec<PaneSurfacePatchRow>> {
+        let frame = self.last_frame.as_ref()?;
+        let mut rows = rows.to_vec();
+        let previous = frame
+            .cursor
+            .as_ref()
+            .filter(|cursor| cursor.visible)
+            .map(|cursor| clamp_cursor_position(frame, cursor.x, cursor.y));
+        let next = cursor
+            .filter(|cursor| cursor.visible)
+            .map(|cursor| clamp_cursor_position(frame, cursor.x, cursor.y));
+
+        if let Some((x, y)) = previous.filter(|position| Some(*position) != next) {
+            if patch_cell_mut(&mut rows, x, y).is_none() {
+                let mut cell = frame.cells.get(frame_cell_index(frame, x, y)?)?.clone();
+                cell.modifier ^= REVERSED_MODIFIER;
+                rows.push(PaneSurfacePatchRow {
+                    x,
+                    y,
+                    cells: vec![cell],
+                });
+            }
+        }
+        if let Some((x, y)) = next {
+            if let Some(cell) = patch_cell_mut(&mut rows, x, y) {
+                cell.modifier ^= REVERSED_MODIFIER;
+            } else if previous != next {
+                let mut cell = frame.cells.get(frame_cell_index(frame, x, y)?)?.clone();
+                cell.modifier ^= REVERSED_MODIFIER;
+                rows.push(PaneSurfacePatchRow {
+                    x,
+                    y,
+                    cells: vec![cell],
+                });
+            }
+        }
+        Some(rows)
+    }
+
+    pub(crate) fn commit_patch(
+        &mut self,
+        rows: &[PaneSurfacePatchRow],
+        cursor: Option<CursorState>,
+        encoded: EncodedBlit,
+    ) -> bool {
+        let Some(frame) = self.last_frame.as_mut() else {
+            return false;
+        };
+        for row in rows {
+            let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
+            let end = start + row.cells.len();
+            let Some(target) = frame.cells.get_mut(start..end) else {
+                return false;
+            };
+            target.clone_from_slice(&row.cells);
+        }
+        frame.cursor = cursor;
+        self.last_visible_cursor = encoded.next_last_visible_cursor;
+        self.last_cursor_shape = encoded.next_last_cursor_shape;
+        true
     }
 }
 
@@ -373,7 +468,6 @@ fn build_sgr(fg: u32, bg: u32, modifier: u16) -> String {
 // ---------------------------------------------------------------------------
 
 /// Checks if two cells are visually identical.
-#[cfg(test)]
 fn cells_equal(a: &CellData, b: &CellData) -> bool {
     a.symbol == b.symbol
         && a.fg == b.fg
@@ -442,6 +536,116 @@ fn blit_frame_to_with_cursor_memory_and_policy(
         true,
         suppress_visible_cursor,
     );
+}
+
+fn frame_cell_index(frame: &FrameData, x: u16, y: u16) -> Option<usize> {
+    (x < frame.width && y < frame.height)
+        .then(|| usize::from(y) * usize::from(frame.width) + usize::from(x))
+}
+
+fn patch_cell_mut(rows: &mut [PaneSurfacePatchRow], x: u16, y: u16) -> Option<&mut CellData> {
+    rows.iter_mut().rev().find_map(|row| {
+        if row.y != y || x < row.x {
+            return None;
+        }
+        row.cells.get_mut(usize::from(x - row.x))
+    })
+}
+
+fn patch_rows_overlap(rows: &[PaneSurfacePatchRow]) -> bool {
+    rows.iter().enumerate().any(|(index, left)| {
+        let left_end = left.x.saturating_add(left.cells.len() as u16);
+        rows[index + 1..].iter().any(|right| {
+            if left.y != right.y {
+                return false;
+            }
+            let right_end = right.x.saturating_add(right.cells.len() as u16);
+            left.x < right_end && right.x < left_end
+        })
+    })
+}
+
+fn patch_row_fits(frame: &FrameData, row: &PaneSurfacePatchRow) -> bool {
+    let Ok(len) = u16::try_from(row.cells.len()) else {
+        return false;
+    };
+    if row.y >= frame.height
+        || row.x.saturating_add(len) > frame.width
+        || row.cells.iter().any(|cell| cell.hyperlink.is_some())
+    {
+        return false;
+    }
+    let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
+    let end = start + row.cells.len();
+    frame
+        .cells
+        .get(start..end)
+        .is_some_and(|cells| cells.iter().all(|cell| cell.hyperlink.is_none()))
+}
+
+fn blit_patch_to(
+    mut writer: impl Write,
+    frame: &FrameData,
+    rows: &[PaneSurfacePatchRow],
+    cursor: Option<CursorState>,
+    last_visible_cursor: &mut Option<(u16, u16)>,
+    last_cursor_shape: &mut u8,
+    repeat_ime_anchor: bool,
+    suppress_visible_cursor: bool,
+) {
+    let _ = writer.write_all(b"\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\");
+    let mut last_sgr = String::new();
+    let mut active_hyperlink = None;
+    for row in rows {
+        let mut invalidated = 0usize;
+        let mut to_skip = 0usize;
+        let mut next_inline_col = None;
+        for (offset, cell) in row.cells.iter().enumerate() {
+            let col = row.x + offset as u16;
+            let idx = usize::from(row.y) * usize::from(frame.width) + usize::from(col);
+            let prev_cell = &frame.cells[idx];
+            if !cell.skip && (!cells_equal(cell, prev_cell) || invalidated > 0) && to_skip == 0 {
+                let cursor_position =
+                    (next_inline_col != Some(col) || invalidated > 0).then_some((col, row.y));
+                write_cell(
+                    &mut writer,
+                    cursor_position,
+                    cell,
+                    &mut last_sgr,
+                    &mut active_hyperlink,
+                    frame,
+                );
+                next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
+                    .then_some(col.saturating_add(1));
+            }
+            to_skip = cell_width(cell).saturating_sub(1);
+            let affected_width = cmp::max(cell_width(cell), cell_width(prev_cell));
+            invalidated = cmp::max(affected_width, invalidated).saturating_sub(1);
+        }
+    }
+    close_hyperlink(&mut writer, &mut active_hyperlink);
+    if !last_sgr.is_empty() {
+        let _ = writer.write_all(b"\x1b[0m");
+    }
+
+    let cursor_frame = FrameData {
+        cells: Vec::new(),
+        width: frame.width,
+        height: frame.height,
+        cursor,
+        hyperlinks: Vec::new(),
+        graphics: Vec::new(),
+    };
+    let mut host_cursor = resolve_host_cursor_state(&cursor_frame, last_visible_cursor);
+    if suppress_visible_cursor && host_cursor.visible {
+        host_cursor.visible = false;
+    }
+    write_host_cursor_state(&mut writer, host_cursor, last_cursor_shape);
+    let _ = writer.write_all(b"\x1b[?2026l");
+    if repeat_ime_anchor {
+        write_ime_anchor_cursor_state(&mut writer, host_cursor);
+    }
+    let _ = writer.flush();
 }
 
 fn blit_frame_to_with_cursor_memory_and_clear_policy(
@@ -678,26 +882,12 @@ fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a s
     let index = cell.hyperlink? as usize;
     frame.hyperlinks.get(index).map(String::as_str)
 }
-pub(crate) fn frame_has_hyperlink_at(frame: &FrameData, column: u16, row: u16) -> bool {
-    if column >= frame.width || row >= frame.height {
-        return false;
-    }
-    let index = (row as usize)
-        .saturating_mul(frame.width as usize)
-        .saturating_add(column as usize);
-    frame
-        .cells
-        .get(index)
-        .and_then(|cell| cell_hyperlink_uri(frame, cell))
-        .is_some_and(|uri| crate::app::actions::safe_osc8_url(uri).is_some())
-}
-
-fn is_hyperlink_char(ch: char) -> bool {
-    ch != '\x1b' && ch != '\x07' && !ch.is_control()
-}
 
 fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
-    let sanitized: String = uri.chars().filter(|ch| is_hyperlink_char(*ch)).collect();
+    let sanitized: String = uri
+        .chars()
+        .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
+        .collect();
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
@@ -876,7 +1066,6 @@ mod tests {
             cursor: None,
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         }
     }
 
@@ -1075,7 +1264,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let mut changed = visible.clone();
         changed.cells[0] = make_cell("B", 0, 0, 0);
@@ -1143,7 +1331,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1184,7 +1371,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1225,7 +1411,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let drawn = frame_with_drawn_cursor(frame.clone());
 
@@ -1263,7 +1448,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         assert_eq!(frame_with_drawn_cursor(frame.clone()), frame);
@@ -1283,7 +1467,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut last_visible_cursor = None;
@@ -1331,7 +1514,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let hidden = FrameData {
             cells: vec![make_cell("B", 0, 0, 0); 9],
@@ -1345,7 +1527,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let mut last_visible_cursor = None;
         let mut last_cursor_shape = 0;
@@ -1402,34 +1583,6 @@ mod tests {
         assert!(output_str.contains("\x1b]8;;https://example.com\x1b\\L"));
         assert!(output_str.contains('i'));
         assert!(output_str.contains("\x1b]8;;\x1b\\"));
-    }
-
-    #[test]
-    fn hyperlink_hit_testing_accepts_clean_osc8_handler_urls() {
-        for uri in [
-            "https://example.com/docs",
-            "http://example.com/docs",
-            "file:///tmp/report.md?line=7",
-            "file://localhost/tmp/report.md?line=7",
-            "file://attacker/share/report.md",
-            "local://repo/src/main.rs",
-            "memory://artifact/report.md",
-            "mailto:hello@example.com",
-        ] {
-            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
-            frame.hyperlinks.push(uri.to_owned());
-            assert!(frame_has_hyperlink_at(&frame, 0, 0), "rejected {uri}");
-        }
-
-        for uri in [
-            "",
-            "artifact://5776\nHERDR_PLUGIN_CLICKED_URL=forged",
-            "file:///tmp/report.md\0forged",
-        ] {
-            let mut frame = make_frame(1, 1, vec![linked_cell("L", 0)]);
-            frame.hyperlinks.push(uri.to_owned());
-            assert!(!frame_has_hyperlink_at(&frame, 0, 0), "accepted {uri:?}");
-        }
     }
 
     #[test]
@@ -1596,6 +1749,169 @@ mod tests {
     }
 
     #[test]
+    fn retained_patch_matches_full_diff_and_updates_the_encoder_baseline() {
+        let previous = make_frame(
+            4,
+            2,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+                make_cell("d", 0, 0, 0),
+                make_cell("e", 0, 0, 0),
+                make_cell("f", 0, 0, 0),
+                make_cell("g", 0, 0, 0),
+                make_cell("h", 0, 0, 0),
+            ],
+        );
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&previous, false);
+        encoder.commit(previous.clone(), initial);
+
+        let rows = vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 1,
+            cells: vec![
+                make_cell("E", 0, 0, 0),
+                make_cell("f", 0, 0, 0),
+                make_cell("G", 0, 0, 0),
+                make_cell("h", 0, 0, 0),
+            ],
+        }];
+        let cursor = Some(CursorState {
+            x: 3,
+            y: 1,
+            visible: true,
+            shape: 2,
+        });
+        let mut expected = previous;
+        expected.cells[4..8].clone_from_slice(&rows[0].cells);
+        expected.cursor = cursor.clone();
+
+        let full_diff = encoder.encode(&expected, false);
+        let patch = encoder
+            .encode_patch(&rows, cursor.clone(), false)
+            .expect("valid retained patch");
+        assert_eq!(patch.bytes, full_diff.bytes);
+        assert!(encoder.commit_patch(&rows, cursor, patch));
+        assert!(encoder.is_current(&expected));
+    }
+
+    #[test]
+    fn retained_patch_width_transition_matches_full_diff_with_following_cell() {
+        let previous = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("界", 0, 0, 0),
+                make_cell("z", 0, 0, 0),
+                make_cell("q", 0, 0, 0),
+            ],
+        );
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&previous, false);
+        encoder.commit(previous.clone(), initial);
+
+        let rows = vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![make_cell("x", 0, 0, 0), make_cell("z", 0, 0, 0)],
+        }];
+        let mut expected = previous;
+        expected.cells[0..2].clone_from_slice(&rows[0].cells);
+
+        let full_diff = encoder.encode(&expected, false);
+        let patch = encoder
+            .encode_patch(&rows, None, false)
+            .expect("valid retained patch");
+        assert_eq!(patch.bytes, full_diff.bytes);
+    }
+
+    #[test]
+    fn retained_patch_rejects_overlapping_rows() {
+        let frame = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+            ],
+        );
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&frame, false);
+        encoder.commit(frame, initial);
+        let rows = vec![
+            PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: vec![make_cell("A", 0, 0, 0), make_cell("B", 0, 0, 0)],
+            },
+            PaneSurfacePatchRow {
+                x: 1,
+                y: 0,
+                cells: vec![make_cell("C", 0, 0, 0)],
+            },
+        ];
+
+        assert!(encoder.encode_patch(&rows, None, false).is_none());
+    }
+
+    #[test]
+    fn retained_patch_preserves_the_client_drawn_cursor_overlay() {
+        let mut previous = make_frame(
+            3,
+            1,
+            vec![
+                make_cell("a", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+            ],
+        );
+        previous.cursor = Some(CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+            shape: 0,
+        });
+        let previous_drawn = frame_with_drawn_cursor(previous.clone());
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode_with_suppressed_visible_cursor(&previous_drawn, false);
+        encoder.commit(previous_drawn, initial);
+
+        let rows = vec![PaneSurfacePatchRow {
+            x: 0,
+            y: 0,
+            cells: vec![
+                make_cell("A", 0, 0, 0),
+                make_cell("b", 0, 0, 0),
+                make_cell("c", 0, 0, 0),
+            ],
+        }];
+        let cursor = Some(CursorState {
+            x: 1,
+            y: 0,
+            visible: true,
+            shape: 0,
+        });
+        let drawn_rows = encoder
+            .patch_rows_with_drawn_cursor(&rows, cursor.as_ref())
+            .expect("drawn cursor patch rows");
+        let mut expected = previous;
+        expected.cells[0..3].clone_from_slice(&rows[0].cells);
+        expected.cursor = cursor.clone();
+        let expected = frame_with_drawn_cursor(expected);
+
+        let full_diff = encoder.encode_with_suppressed_visible_cursor(&expected, false);
+        let patch = encoder
+            .encode_patch(&drawn_rows, cursor.clone(), true)
+            .expect("valid drawn cursor patch");
+        assert_eq!(patch.bytes, full_diff.bytes);
+        assert!(encoder.commit_patch(&drawn_rows, cursor, patch));
+        assert!(encoder.is_current(&expected));
+    }
+
+    #[test]
     fn blit_frame_positions_cursor() {
         let frame = FrameData {
             cells: vec![make_cell("A", 0, 0, 0)],
@@ -1609,7 +1925,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1636,7 +1951,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1652,7 +1966,6 @@ mod tests {
     #[test]
     fn blit_frame_no_cursor_hides_cursor() {
         let frame = FrameData {
-            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1686,7 +1999,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1709,7 +2021,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
 
         let mut output = Vec::new();
@@ -1739,7 +2050,6 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let mut curr = prev.clone();
         curr.cells[0] = make_cell("B", 0, 0, 0);
@@ -1780,10 +2090,8 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let hidden = FrameData {
-            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0); 9],
             width: 3,
             height: 3,
@@ -1826,7 +2134,6 @@ mod tests {
     #[test]
     fn blit_frame_parks_hidden_cursor_at_bottom_right_without_history() {
         let frame = FrameData {
-            omp_renderer: None,
             cells: vec![make_cell("A", 0, 0, 0); 6],
             width: 3,
             height: 2,
@@ -1868,10 +2175,8 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
-            omp_renderer: None,
         };
         let curr = FrameData {
-            omp_renderer: None,
             cells: vec![make_cell("B", 0, 0, 0)],
             width: 1,
             height: 1,
@@ -1892,7 +2197,6 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_wide_graphemes() {
         let frame = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1917,7 +2221,6 @@ mod tests {
     #[test]
     fn full_redraw_skips_trailing_cells_covered_by_halfwidth_voiced_kana() {
         let frame = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -1942,7 +2245,6 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_wide_graphemes() {
         let prev = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1955,7 +2257,6 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -1982,7 +2283,6 @@ mod tests {
     #[test]
     fn diff_redraw_skips_new_trailing_cells_covered_by_wide_graphemes() {
         let prev = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell("B", 0, 0, 0),
@@ -1995,7 +2295,6 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell(WIDE_GRAPHEME, 0, 0, 0),
                 make_cell(" ", 0, 0, 0),
@@ -2019,7 +2318,6 @@ mod tests {
     #[test]
     fn diff_redraw_reveals_cells_hidden_by_previous_halfwidth_voiced_kana() {
         let prev = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell(HALFWIDTH_VOICED_KANA, 0, 0, 0),
                 make_skip_cell(" ", 0, 0, 0),
@@ -2032,7 +2330,6 @@ mod tests {
             graphics: Vec::new(),
         };
         let curr = FrameData {
-            omp_renderer: None,
             cells: vec![
                 make_cell("A", 0, 0, 0),
                 make_cell(" ", 0, 0, 0),

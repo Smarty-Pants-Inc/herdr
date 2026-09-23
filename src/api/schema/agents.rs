@@ -40,6 +40,9 @@ pub struct AgentPromptWaitOptions {
     pub until: Vec<AgentStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) submission_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -224,6 +227,9 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// The current idle transition completed work, independently of who has viewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +243,4 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_policy: Option<crate::agent_resume::AgentResumePolicy>,
 }

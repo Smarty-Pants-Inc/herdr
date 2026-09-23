@@ -12,7 +12,8 @@ enum SessionSaveJob {
 
 impl App {
     pub(super) fn schedule_session_save(&mut self) {
-        if !self.no_session && !self.session_persistence_blocked {
+        if self.policy.persist_session {
+            self.pane_exit_checkpoint_pending = false;
             self.session_save_deadline = Some(Instant::now() + SESSION_SAVE_DEBOUNCE);
         }
     }
@@ -36,27 +37,22 @@ impl App {
         }
     }
 
-    fn capture_session_save_job(&mut self) -> SessionSaveJob {
+    fn capture_session_save_job(&self) -> SessionSaveJob {
         if self.state.workspaces.is_empty() {
-            self.reset_layout_apply_idempotency_for_session_clear();
             SessionSaveJob::Clear
         } else {
-            let mut snapshot = crate::persist::capture(
+            let snapshot = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
-                self.state.sidebar_width,
-                self.state.sidebar_section_split,
-                self.state.collapsed_space_keys.clone(),
             );
-            snapshot.idempotency_epoch = Some(self.layout_apply_epoch.clone());
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(
+                    &snapshot,
                     &self.state.workspaces,
                     &self.terminal_runtimes,
-                    snapshot.version,
                 )
             });
             SessionSaveJob::Save { snapshot, history }
@@ -64,7 +60,7 @@ impl App {
     }
 
     pub(crate) fn start_background_session_save(&mut self) {
-        if self.no_session || self.session_persistence_blocked {
+        if !self.policy.persist_session {
             self.session_save_deadline = None;
             return;
         }
@@ -76,43 +72,76 @@ impl App {
         }
 
         let job = self.capture_session_save_job();
+        self.pane_exit_checkpoint_pending = false;
         self.session_save_deadline = None;
+        let writer = self.session_writer.clone();
         match std::thread::Builder::new()
             .name("herdr-session-save".into())
-            .spawn(move || run_session_save_job(job))
+            .spawn(move || run_session_save_job(job, &writer))
         {
             Ok(thread) => self.session_save_thread = Some(thread),
             Err(err) => {
                 tracing::warn!(err = %err, "failed to spawn session save thread; saving inline");
-                run_session_save_job(self.capture_session_save_job());
+                run_session_save_job(self.capture_session_save_job(), &self.session_writer);
             }
         }
     }
 
-    pub(crate) fn join_background_session_save(&mut self) {
+    pub(crate) fn save_session_now(&mut self) {
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }
-    }
 
-    pub(crate) fn save_session_now(&mut self) {
-        self.join_background_session_save();
-
-        if self.no_session || self.session_persistence_blocked {
+        if !self.policy.persist_session {
             self.session_save_deadline = None;
             return;
         }
 
-        run_session_save_job(self.capture_session_save_job());
+        run_session_save_job(self.capture_session_save_job(), &self.session_writer);
+        self.pane_exit_checkpoint_pending = false;
         self.session_save_deadline = None;
+    }
+
+    pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
+        if !self.policy.persist_session
+            || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)
+        {
+            return;
+        }
+        self.save_session_now();
+        self.pane_exit_checkpoint_pending = true;
+        self.state.session_dirty = false;
+    }
+
+    pub(crate) fn finish_checkpointed_pane_exit(&mut self) {
+        if self.pane_exit_checkpoint_pending {
+            self.state.session_dirty = false;
+            self.session_save_deadline = Some(Instant::now() + SESSION_SAVE_DEBOUNCE);
+        }
+    }
+
+    pub(crate) fn save_session_on_shutdown(&mut self) {
+        if self.pane_exit_checkpoint_pending && !self.state.session_dirty {
+            self.session_save_deadline = None;
+            return;
+        }
+        self.save_session_now();
     }
 }
 
-fn run_session_save_job(job: SessionSaveJob) {
-    match job {
-        SessionSaveJob::Clear => crate::persist::clear(),
-        SessionSaveJob::Save { snapshot, history } => {
-            crate::persist::save(&snapshot, history.as_ref());
+fn run_session_save_job(
+    job: SessionSaveJob,
+    writer: &std::sync::Mutex<crate::persist::SessionWriter>,
+) {
+    let mut writer = match writer.lock() {
+        Ok(writer) => writer,
+        Err(err) => {
+            tracing::warn!(err = %err, "session writer is poisoned; refusing to modify session");
+            return;
         }
+    };
+    match job {
+        SessionSaveJob::Clear => writer.clear(),
+        SessionSaveJob::Save { snapshot, history } => writer.save(&snapshot, history.as_ref()),
     }
 }

@@ -1,8 +1,7 @@
 use crate::api::schema::{
     InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
-    PluginManifestExecutionProvider, PluginManifestLinkHandler, PluginManifestPane,
-    PluginManifestStartup, PluginPanePlacement, PluginPaneScope, PluginPlatform, PluginSourceInfo,
-    PluginSourceKind,
+    PluginManifestLinkHandler, PluginManifestPane, PluginManifestStartup, PluginPanePlacement,
+    PluginPlatform, PluginSourceInfo, PluginSourceKind,
 };
 use crate::popup_size::PopupSize;
 
@@ -24,8 +23,6 @@ struct RawPluginManifest {
     build: Vec<RawPluginManifestBuild>,
     #[serde(default)]
     startup: Vec<RawPluginManifestStartup>,
-    #[serde(default)]
-    execution_providers: Vec<RawPluginManifestExecutionProvider>,
     #[serde(default)]
     actions: Vec<RawPluginManifestAction>,
     #[serde(default)]
@@ -50,15 +47,6 @@ struct RawPluginManifestStartup {
     command: Vec<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct RawPluginManifestExecutionProvider {
-    scheme: String,
-    protocol: u32,
-    #[serde(default)]
-    platforms: Option<Vec<RawPlatform>>,
-    pty_command: Vec<String>,
-    process_command: Vec<String>,
-}
 #[derive(serde::Deserialize)]
 struct RawPluginManifestAction {
     id: String,
@@ -90,8 +78,6 @@ struct RawPluginManifestPane {
     platforms: Option<Vec<RawPlatform>>,
     #[serde(default)]
     placement: PluginPanePlacement,
-    #[serde(default)]
-    scope: PluginPaneScope,
     #[serde(default)]
     width: Option<PopupSize>,
     #[serde(default)]
@@ -142,15 +128,13 @@ pub(crate) fn load_plugin_manifest(
     let manifest_path = manifest_path
         .canonicalize()
         .map_err(|err| ("plugin_manifest_not_found", err.to_string()))?;
-    let plugin_root = manifest_path
-        .parent()
-        .ok_or_else(|| {
+    let plugin_root =
+        crate::platform::plugin_runtime_path(manifest_path.parent().ok_or_else(|| {
             (
                 "invalid_plugin_manifest_path",
                 "manifest path has no parent directory".to_string(),
             )
-        })?
-        .to_path_buf();
+        })?);
     let content = std::fs::read_to_string(&manifest_path)
         .map_err(|err| ("plugin_manifest_read_failed", err.to_string()))?;
     let raw: RawPluginManifest = toml::from_str(&content)
@@ -179,13 +163,6 @@ pub(crate) fn load_plugin_manifest(
         .into_iter()
         .map(normalize_manifest_startup)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut execution_providers = raw
-        .execution_providers
-        .into_iter()
-        .map(normalize_manifest_execution_provider)
-        .collect::<Result<Vec<_>, _>>()?;
-    reject_duplicate_execution_provider_schemes(&execution_providers)?;
-    execution_providers.sort_by(|a, b| a.scheme.cmp(&b.scheme));
     let mut actions = raw
         .actions
         .into_iter()
@@ -239,7 +216,6 @@ pub(crate) fn load_plugin_manifest(
         build,
         startup,
         actions,
-        execution_providers,
         events,
         panes,
         link_handlers,
@@ -295,31 +271,6 @@ fn normalize_manifest_startup(
     Ok(PluginManifestStartup { platforms, command })
 }
 
-fn normalize_manifest_execution_provider(
-    provider: RawPluginManifestExecutionProvider,
-) -> Result<PluginManifestExecutionProvider, (&'static str, String)> {
-    let scheme = normalize_execution_provider_scheme(&provider.scheme).ok_or_else(|| {
-        (
-            "invalid_execution_provider_scheme",
-            "execution provider scheme must match [a-z][a-z0-9+.-]* and must not be local or ssh"
-                .to_string(),
-        )
-    })?;
-    if provider.protocol == 0 {
-        return Err((
-            "invalid_execution_provider_protocol",
-            "execution provider protocol must be greater than zero".to_string(),
-        ));
-    }
-    Ok(PluginManifestExecutionProvider {
-        scheme,
-        protocol: provider.protocol,
-        platforms: normalize_platforms(provider.platforms)?,
-        pty_command: normalize_command(provider.pty_command)?,
-        process_command: normalize_command(provider.process_command)?,
-    })
-}
-
 pub(super) fn normalize_plugin_source(
     plugin: &InstalledPluginInfo,
     source: PluginSourceInfo,
@@ -366,21 +317,6 @@ fn reject_duplicate_action_ids(
             return Err((
                 "duplicate_plugin_action_id",
                 format!("duplicate action id '{}'", action.id),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn reject_duplicate_execution_provider_schemes(
-    providers: &[PluginManifestExecutionProvider],
-) -> Result<(), (&'static str, String)> {
-    let mut seen = std::collections::HashSet::new();
-    for provider in providers {
-        if !seen.insert(provider.scheme.as_str()) {
-            return Err((
-                "duplicate_execution_provider_scheme",
-                format!("duplicate execution provider scheme '{}'", provider.scheme),
             ));
         }
     }
@@ -484,23 +420,12 @@ fn normalize_manifest_pane(
         .filter(|description| !description.is_empty());
     let platforms = normalize_platforms(pane.platforms)?;
     let command = normalize_command(pane.command)?;
-    let invalid_size = match pane.placement {
-        PluginPanePlacement::Popup => false,
-        PluginPanePlacement::WorkspaceRight => pane.height.is_some(),
-        _ => pane.width.is_some() || pane.height.is_some(),
-    };
-    if invalid_size {
-        return Err((
-            "invalid_plugin_pane_size",
-            "pane width is supported for popup and workspace_right placements; height is popup-only"
-                .to_string(),
-        ));
-    }
-    if pane.scope == PluginPaneScope::ClientPrivate && pane.placement != PluginPanePlacement::Popup
+    if pane.placement != PluginPanePlacement::Popup
+        && (pane.width.is_some() || pane.height.is_some())
     {
         return Err((
-            "invalid_plugin_pane_scope",
-            "client-private panes require popup placement".to_string(),
+            "invalid_plugin_pane_size",
+            "pane width and height are only supported when placement is popup".to_string(),
         ));
     }
     Ok(PluginManifestPane {
@@ -509,7 +434,6 @@ fn normalize_manifest_pane(
         description,
         platforms,
         placement: pane.placement,
-        scope: pane.scope,
         width: pane.width,
         height: pane.height,
         command,
@@ -594,7 +518,7 @@ fn current_platform() -> PluginPlatform {
 /// Resolve the effective platforms for an action or event: use the item's own
 /// platforms if declared, otherwise inherit from the plugin-level platforms.
 /// Returns a reference to whichever `Option<Vec<PluginPlatform>>` applies.
-pub(crate) fn effective_platforms<'a>(
+pub(super) fn effective_platforms<'a>(
     item_platforms: &'a Option<Vec<PluginPlatform>>,
     plugin_platforms: &'a Option<Vec<PluginPlatform>>,
 ) -> &'a Option<Vec<PluginPlatform>> {
@@ -605,7 +529,7 @@ pub(crate) fn effective_platforms<'a>(
     }
 }
 
-pub(crate) fn ensure_platform_supported(
+pub(super) fn ensure_platform_supported(
     platforms: &Option<Vec<PluginPlatform>>,
     subject: &str,
 ) -> Result<(), (&'static str, String)> {
@@ -655,19 +579,6 @@ fn non_empty_trimmed(
     }
 }
 
-pub(crate) fn normalize_execution_provider_scheme(value: &str) -> Option<String> {
-    let value = value.trim();
-    let mut bytes = value.bytes();
-    let first = bytes.next()?;
-    (value.len() <= 32
-        && first.is_ascii_lowercase()
-        && bytes.all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'.' | b'-')
-        })
-        && !matches!(value, "local" | "ssh"))
-    .then(|| value.to_string())
-}
-
 pub(crate) fn normalize_plugin_id(value: &str) -> Option<String> {
     normalize_identifier(value, PLUGIN_ID_MAX_CHARS)
 }
@@ -694,74 +605,4 @@ fn normalize_local_identifier(value: &str, max_chars: usize) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')))
     .then(|| value.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn manifest_fixture(name: &str, provider_sections: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "herdr-provider-manifest-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time after Unix epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("create manifest fixture");
-        std::fs::write(
-            root.join("herdr-plugin.toml"),
-            format!(
-                "id = 'example.provider'\nname = 'Provider'\nversion = '0.1.0'\nmin_herdr_version = '{}'\nplatforms = ['linux', 'macos']\n{provider_sections}",
-                crate::build_info::BASE_VERSION
-            ),
-        )
-        .expect("write manifest fixture");
-        root
-    }
-
-    #[test]
-    fn loads_execution_provider_contract() {
-        let root = manifest_fixture(
-            "valid",
-            "[[execution_providers]]\nscheme = 'runtime'\nprotocol = 1\npty_command = ['bin/runtime', 'connect']\nprocess_command = ['bin/runtime', 'exec']\n",
-        );
-
-        let plugin = load_plugin_manifest(&root.display().to_string(), true).unwrap();
-
-        assert_eq!(plugin.execution_providers.len(), 1);
-        let provider = &plugin.execution_providers[0];
-        assert_eq!(provider.scheme, "runtime");
-        assert_eq!(provider.protocol, 1);
-        assert_eq!(provider.pty_command, ["bin/runtime", "connect"]);
-        assert_eq!(provider.process_command, ["bin/runtime", "exec"]);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rejects_duplicate_execution_provider_schemes() {
-        let root = manifest_fixture(
-            "duplicate",
-            "[[execution_providers]]\nscheme = 'runtime'\nprotocol = 1\npty_command = ['one']\nprocess_command = ['one']\n[[execution_providers]]\nscheme = 'runtime'\nprotocol = 1\npty_command = ['two']\nprocess_command = ['two']\n",
-        );
-
-        let error = load_plugin_manifest(&root.display().to_string(), true).unwrap_err();
-
-        assert_eq!(error.0, "duplicate_execution_provider_scheme");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rejects_reserved_execution_provider_schemes() {
-        let root = manifest_fixture(
-            "reserved",
-            "[[execution_providers]]\nscheme = 'ssh'\nprotocol = 1\npty_command = ['one']\nprocess_command = ['one']\n",
-        );
-
-        let error = load_plugin_manifest(&root.display().to_string(), true).unwrap_err();
-
-        assert_eq!(error.0, "invalid_execution_provider_scheme");
-        std::fs::remove_dir_all(root).unwrap();
-    }
 }

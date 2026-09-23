@@ -12,11 +12,11 @@ impl App {
             .find_map(|(ws_idx, ws)| ws.pane_state(pane_id).map(|pane| (ws_idx, pane)))
     }
 
-    pub(super) fn public_workspace_id(&self, ws_idx: usize) -> String {
+    pub(crate) fn public_workspace_id(&self, ws_idx: usize) -> String {
         self.state.workspaces[ws_idx].id.clone()
     }
 
-    pub(super) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
+    pub(crate) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab_number = ws.public_tab_number(tab_idx)?;
         Some(crate::workspace::public_tab_id_for_number(
@@ -24,7 +24,7 @@ impl App {
         ))
     }
 
-    pub(super) fn public_pane_id(
+    pub(crate) fn public_pane_id(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -37,7 +37,7 @@ impl App {
         ))
     }
 
-    pub(crate) fn pane_launch_env(
+    pub(super) fn pane_launch_env(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -49,13 +49,15 @@ impl App {
         let tab_id = self.public_tab_id(ws_idx, tab_idx)?;
         let pane_id = self.public_pane_id(ws_idx, pane_id)?;
         Some(
-            crate::pane::PaneLaunchEnv::from_extra(extra_env)
-                .with_omp_bridge(self.omp_bridge.clone())
-                .with_identity(workspace_id, tab_id, pane_id),
+            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_identity(
+                workspace_id,
+                tab_id,
+                pane_id,
+            ),
         )
     }
 
-    pub(super) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
+    pub(crate) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
         self.state
             .workspaces
             .iter()
@@ -64,7 +66,7 @@ impl App {
             .or_else(|| id.parse::<usize>().ok()?.checked_sub(1))
     }
 
-    pub(super) fn parse_tab_id(&self, id: &str) -> Option<(usize, usize)> {
+    pub(crate) fn parse_tab_id(&self, id: &str) -> Option<(usize, usize)> {
         if let Some(rest) = id.strip_prefix("t_") {
             let (ws_raw, tab_raw) = rest.rsplit_once('_')?;
             let ws_idx = self.parse_workspace_id(ws_raw)?;

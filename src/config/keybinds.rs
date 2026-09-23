@@ -169,6 +169,18 @@ pub struct ActionKeybinds {
 }
 
 impl ActionKeybinds {
+    pub(crate) fn from_labels(labels: &[String]) -> Result<Self, String> {
+        let mut bindings = Vec::new();
+        for label in labels {
+            match parse_binding_string(label) {
+                Some(ParsedBinding::Single(binding)) => bindings.push(binding),
+                Some(ParsedBinding::Range(range)) => bindings.extend(range),
+                None => return Err(format!("invalid endpoint command binding: {label}")),
+            }
+        }
+        Ok(Self { bindings })
+    }
+
     #[cfg(test)]
     pub fn prefix(label: &str) -> Self {
         let raw = if label.starts_with("prefix+") {
@@ -335,8 +347,8 @@ pub struct Keybinds {
     pub close_tab: ActionKeybinds,
     pub rename_pane: ActionKeybinds,
     pub edit_scrollback: ActionKeybinds,
+    pub clear_pane: ActionKeybinds,
     pub copy_mode: ActionKeybinds,
-    pub findr: ActionKeybinds,
     pub focus_pane_left: ActionKeybinds,
     pub focus_pane_down: ActionKeybinds,
     pub focus_pane_up: ActionKeybinds,
@@ -504,8 +516,8 @@ impl Config {
             close_tab: empty_action!(),
             rename_pane: empty_action!(),
             edit_scrollback: empty_action!(),
+            clear_pane: empty_action!(),
             copy_mode: empty_action!(),
-            findr: empty_action!(),
             focus_pane_left: empty_action!(),
             focus_pane_down: empty_action!(),
             focus_pane_up: empty_action!(),
@@ -652,8 +664,8 @@ impl Config {
             apply_action!(keybinds.close_tab, close_tab, source);
             apply_action!(keybinds.rename_pane, rename_pane, source);
             apply_action!(keybinds.edit_scrollback, edit_scrollback, source);
+            apply_action!(keybinds.clear_pane, clear_pane, source);
             apply_action!(keybinds.copy_mode, copy_mode, source);
-            apply_action!(keybinds.findr, findr, source);
             apply_action!(keybinds.focus_pane_left, focus_pane_left, source);
             apply_action!(keybinds.focus_pane_down, focus_pane_down, source);
             apply_action!(keybinds.focus_pane_up, focus_pane_up, source);
@@ -1609,44 +1621,6 @@ next_tab = "prefix+n"
                 KeyCode::Char('['),
                 KeyModifiers::empty()
             ))]
-        );
-    }
-
-    #[test]
-    fn findr_uses_platform_direct_default() {
-        let keybinds = Config::default().keybinds();
-        assert_eq!(
-            binding_triggers(&keybinds.findr),
-            vec![BindingTrigger::Direct((
-                KeyCode::Char('f'),
-                if cfg!(target_os = "macos") {
-                    KeyModifiers::SUPER
-                } else {
-                    KeyModifiers::CONTROL | KeyModifiers::ALT
-                },
-            ))]
-        );
-    }
-
-    #[test]
-    fn findr_accepts_direct_and_prefix_bindings() {
-        let config: Config = toml::from_str(
-            r#"
-[keys]
-findr = ["ctrl+alt+f", "prefix+f"]
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            binding_triggers(&config.keybinds().findr),
-            vec![
-                BindingTrigger::Direct((
-                    KeyCode::Char('f'),
-                    KeyModifiers::CONTROL | KeyModifiers::ALT,
-                )),
-                BindingTrigger::Prefix((KeyCode::Char('f'), KeyModifiers::empty())),
-            ]
         );
     }
 
