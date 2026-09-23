@@ -1,7 +1,7 @@
 //! Thin client mode — connects to the server's client socket.
 //!
 //! The client:
-//! - Connects to `herdr-client.sock`, sends Hello with terminal size and protocol version
+//! - Connects to `herdr-client.sock`, sends TerminalHello with terminal size and protocol version
 //! - Sets up the real terminal (raw mode, mouse capture, keyboard enhancements)
 //! - Receives Frame messages and blits them to the terminal (diff against last frame)
 //! - Reads stdin events (keystrokes, mouse, paste) and sends them as ClientMessage::Input
@@ -12,2022 +12,135 @@
 //! - Forwards OSC 52 clipboard writes from server to its own stdout
 //! - Displays sound/toast notifications forwarded from server
 
+mod attach;
+mod catalog_reload;
+mod clipboard_forwarding;
+mod clipboard_images;
+mod config_reload;
 #[cfg(unix)]
 mod direct_graphics;
+pub(crate) mod endpoint;
+mod endpoint_commands;
+mod errors;
+mod events;
+mod frame_output;
+mod handshake;
 mod input;
-#[cfg(unix)]
-mod omp_pane;
-#[cfg(unix)]
-mod omp_renderer;
+mod loop_config;
+mod notifications;
+mod shell;
+mod shell_runtime;
+mod startup;
+mod state;
+mod terminal_geometry;
+mod terminal_sessions;
+mod terminal_setup;
+mod timer;
+mod transport;
 
-use std::collections::HashSet;
-#[cfg(unix)]
-use std::collections::VecDeque;
-use std::io::IsTerminal as _;
-use std::io::{self, BufRead as _, Write as _};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+#[cfg(test)]
+use clipboard_forwarding::decode_clipboard_payload;
+use clipboard_forwarding::forward_clipboard;
+#[cfg(test)]
+use config_reload::reload_local_client_config;
+use config_reload::{apply_reload, init_logging};
+use events::ClientLoopEvent;
+use loop_config::ClientLoopConfig;
+use shell_runtime::*;
+use state::ClientState;
+use transport::*;
 
-use base64::Engine;
-use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture,
+#[cfg(test)]
+pub(crate) use shell::{ClientShellConfig, ClientShellState};
+pub use startup::{run_client, run_terminal_attach};
+pub use terminal_sessions::{run_terminal_session_control, run_terminal_session_observe};
+
+#[cfg(not(windows))]
+use terminal_geometry::query_host_terminal_appearance;
+#[cfg(test)]
+use terminal_geometry::{
+    cell_size_fallback, current_terminal_geometry_with, ioctl_cell_size, pack_cell_size,
+    resize_report_required, should_query_host_cell_size, write_host_cell_size_query,
+    write_host_terminal_appearance_query, write_host_terminal_theme_query,
+};
+use terminal_geometry::{
+    host_cell_size_query_required, initial_terminal_geometry, query_host_cell_size,
+    query_host_terminal_theme, resize_poll_loop, should_query_host_terminal_theme,
 };
 #[cfg(unix)]
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-#[cfg(not(windows))]
-use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crossterm::execute;
-use crossterm::terminal::{DisableLineWrap, EnableLineWrap};
+use terminal_geometry::{reported_cell_size_from_events, store_reported_cell_size};
+use terminal_setup::{
+    effective_mouse_capture, effective_sgr_pixel_mouse, set_mouse_capture,
+    setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
+};
+
+fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
+    if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
+        warn!(err = %err, "failed to re-assert host mouse capture");
+    }
+}
+
+#[cfg(windows)]
+use terminal_setup::{is_ssh_session, windows_vti_input_backend_enabled};
+#[cfg(test)]
+use terminal_setup::{
+    should_enable_host_color_scheme_reports, windows_virtual_terminal_input_mode,
+    windows_win32_input_mode_enabled, write_host_color_scheme_report_mode,
+    write_terminal_restore_postlude,
+};
+
+#[cfg(unix)]
+use attach::direct_attach_pixel_mouse;
+use attach::AttachEscapeState;
+#[cfg(unix)]
+use attach::{write_attach_semantic_action, AttachInputAction};
+use clipboard_images::{
+    client_remote_image_paste_key, endpoint_accepts_local_images, write_remote_image_to_server,
+};
+#[cfg(windows)]
+use clipboard_images::{read_image_file_from_client_events, should_bridge_clipboard_image_events};
+#[cfg(unix)]
+use clipboard_images::{read_image_file_from_terminal_drop, should_bridge_clipboard_image_paste};
+pub use errors::ClientError;
+#[cfg(test)]
+use frame_output::{clear_received_kitty_graphics, kitty_graphics_image_ids};
+use frame_output::{
+    contains_kitty_graphics_bytes, record_received_kitty_graphics,
+    write_encoded_frame_with_graphics,
+};
+pub(crate) use handshake::probe_endpoint_negotiation;
+use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_process};
+#[cfg(test)]
+use handshake::{
+    direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
+};
+use notifications::{handle_notify, handle_shell_notification_effects};
+#[cfg(test)]
+use notifications::{handle_notify_with_notifiers, sound_from_notify_message};
+#[cfg(test)]
+use terminal_sessions::terminal_control_command_from_json;
+
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::io::{self, Write as _};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
+use std::time::Duration;
+
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use tracing::{debug, info, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::render_ansi;
-use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
-use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotificationActivation, NotifyKind, RenderEncoding, ServerMessage,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
-};
+use crate::protocol::{self, ClientMessage, FrameData, ServerMessage, MAX_GRAPHICS_FRAME_SIZE};
+#[cfg(test)]
+use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
-static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-const MOUSE_SHAPE_POINTER_SEQUENCE: &[u8] = b"\x1b]22;pointer\x1b\\";
-const MOUSE_SHAPE_DEFAULT_SEQUENCE: &[u8] = b"\x1b]22;default\x1b\\";
-
-// ---------------------------------------------------------------------------
-// Client state
-// ---------------------------------------------------------------------------
-
-struct ClientLoopConfig {
-    sound_config: crate::config::SoundConfig,
-    mouse_scroll_lines: usize,
-    redraw_on_focus_gained: bool,
-    host_cursor: crate::config::HostCursorModeConfig,
-    kitty_graphics_enabled: bool,
-    mouse_capture_active: bool,
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-    #[cfg(unix)]
-    omp_executable: Option<crate::update::OmpExecutable>,
-}
-#[derive(Default)]
-struct MousePointerState {
-    cell: Option<(u16, u16)>,
-    link_active: Option<bool>,
-}
-
-#[cfg(unix)]
-const HOST_INPUT_CAPTURE: u64 = 0b01;
-#[cfg(unix)]
-const HOST_INPUT_SGR_PIXELS: u64 = 0b10;
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HostInputSnapshot {
-    packed: u64,
-    stable: bool,
-}
-
-#[cfg(unix)]
-impl HostInputSnapshot {
-    fn from_parts(generation: u64, capture_active: bool, sgr_pixels_active: bool) -> Self {
-        let mut packed = generation << 2;
-        if capture_active {
-            packed |= HOST_INPUT_CAPTURE;
-            if sgr_pixels_active {
-                packed |= HOST_INPUT_SGR_PIXELS;
-            }
-        }
-        Self {
-            packed,
-            stable: true,
-        }
-    }
-
-    fn continued_with(mut self, next: Self) -> Self {
-        self.stable &= next.stable && self.packed == next.packed;
-        self
-    }
-
-    fn generation(self) -> u64 {
-        self.packed >> 2
-    }
-    fn capture_active(self) -> bool {
-        self.packed & HOST_INPUT_CAPTURE != 0
-    }
-    fn sgr_pixels_active(self) -> bool {
-        self.packed & HOST_INPUT_SGR_PIXELS != 0
-    }
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
-struct HostInputSegment {
-    bytes: usize,
-    snapshot: HostInputSnapshot,
-    geometry: Option<crate::input::mouse::HostGeometry>,
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct HostInputBoundary {
-    segments: VecDeque<HostInputSegment>,
-    geometry: Option<crate::input::mouse::HostGeometry>,
-}
-
-#[cfg(unix)]
-impl Default for HostInputBoundary {
-    fn default() -> Self {
-        Self {
-            segments: VecDeque::new(),
-            geometry: crate::input::mouse::HostGeometry::current(),
-        }
-    }
-}
-
-#[cfg(unix)]
-struct HostInputState {
-    // Serializes input-boundary capture, packed-state mutations, and input-event publication.
-    // Every `packed` mutation must hold this lock so generations remain monotonic.
-    packed: AtomicU64,
-    event_order: Mutex<HostInputBoundary>,
-    input_fd: Option<RawFd>,
-    wake_reader: Option<crate::pty::fd::WakeWriter>,
-}
-
-#[cfg(unix)]
-impl HostInputState {
-    fn new(capture_active: bool, sgr_pixels_active: bool) -> Self {
-        let snapshot = HostInputSnapshot::from_parts(0, capture_active, sgr_pixels_active);
-        Self {
-            packed: AtomicU64::new(snapshot.packed),
-            event_order: Mutex::new(HostInputBoundary::default()),
-            input_fd: None,
-            wake_reader: None,
-        }
-    }
-
-    fn with_input_fd(
-        capture_active: bool,
-        sgr_pixels_active: bool,
-        input_fd: RawFd,
-    ) -> io::Result<(Self, OwnedFd)> {
-        let wake = crate::pty::fd::create_wake_pipe()?;
-        let mut state = Self::new(capture_active, sgr_pixels_active);
-        state.input_fd = Some(input_fd);
-        state.wake_reader = Some(wake.writer);
-        Ok((state, wake.read_fd))
-    }
-
-    fn load(&self) -> HostInputSnapshot {
-        HostInputSnapshot {
-            packed: self.packed.load(Ordering::Acquire),
-            stable: true,
-        }
-    }
-    fn load_context(&self) -> (HostInputSnapshot, Option<crate::input::mouse::HostGeometry>) {
-        let boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (self.load(), boundary.geometry)
-    }
-
-    fn assigned_input_bytes(boundary: &HostInputBoundary) -> usize {
-        boundary.segments.iter().map(|segment| segment.bytes).sum()
-    }
-
-    fn push_input_segment(
-        boundary: &mut HostInputBoundary,
-        bytes: usize,
-        snapshot: HostInputSnapshot,
-        geometry: Option<crate::input::mouse::HostGeometry>,
-    ) {
-        if bytes == 0 {
-            return;
-        }
-        if let Some(last) = boundary
-            .segments
-            .back_mut()
-            .filter(|last| last.snapshot == snapshot && last.geometry == geometry)
-        {
-            last.bytes = last.bytes.saturating_add(bytes);
-        } else {
-            boundary.segments.push_back(HostInputSegment {
-                bytes,
-                snapshot,
-                geometry,
-            });
-        }
-    }
-
-    fn capture_input_boundary(&self, boundary: &mut HostInputBoundary) -> io::Result<()> {
-        let pending = self
-            .input_fd
-            .map(input::pending_input_bytes)
-            .transpose()?
-            .unwrap_or(0);
-        let unassigned = pending.saturating_sub(Self::assigned_input_bytes(boundary));
-        let geometry = boundary.geometry;
-        Self::push_input_segment(boundary, unassigned, self.load(), geometry);
-        Ok(())
-    }
-
-    fn wake_input_reader(&self) -> io::Result<()> {
-        self.wake_reader
-            .as_ref()
-            .map(crate::pty::fd::WakeWriter::wake)
-            .transpose()
-            .map(|_| ())
-    }
-
-    fn read_input_locked(
-        &self,
-        boundary: &mut HostInputBoundary,
-        scratch: &mut [u8],
-    ) -> io::Result<(
-        usize,
-        HostInputSnapshot,
-        Option<crate::input::mouse::HostGeometry>,
-    )> {
-        let segment = boundary.segments.front().copied();
-        let input_state = segment.map_or_else(|| self.load(), |segment| segment.snapshot);
-        let assigned_geometry = segment.map(|segment| segment.geometry);
-        let limit = segment.map_or(scratch.len(), |segment| segment.bytes.min(scratch.len()));
-        let input_fd = self.input_fd.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "stdin reader is not configured")
-        })?;
-        let read = unsafe { libc::read(input_fd, scratch.as_mut_ptr().cast(), limit) };
-        if read < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let read = read as usize;
-        if let Some(segment) = boundary.segments.front_mut() {
-            segment.bytes = segment.bytes.saturating_sub(read);
-            if segment.bytes == 0 {
-                boundary.segments.pop_front();
-            }
-        }
-        let geometry = match assigned_geometry {
-            Some(geometry) => geometry,
-            None => crate::input::mouse::HostGeometry::current(),
-        };
-        Ok((read, input_state, geometry))
-    }
-
-    #[cfg(test)]
-    fn read_input(
-        &self,
-        scratch: &mut [u8],
-    ) -> io::Result<(
-        usize,
-        HostInputSnapshot,
-        Option<crate::input::mouse::HostGeometry>,
-    )> {
-        let mut boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.read_input_locked(&mut boundary, scratch)
-    }
-
-    fn read_input_and_send(
-        &self,
-        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-        scratch: &mut [u8],
-        build: impl FnOnce(
-            &[u8],
-            HostInputSnapshot,
-            Option<crate::input::mouse::HostGeometry>,
-        ) -> Option<ClientLoopEvent>,
-    ) -> io::Result<usize> {
-        let permit = Self::reserve_event_slot(event_tx)?;
-        let mut boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (read, input_state, geometry) = self.read_input_locked(&mut boundary, scratch)?;
-        if read > 0 {
-            if let Some(event) = build(&scratch[..read], input_state, geometry) {
-                permit.send(event);
-            }
-        }
-        Ok(read)
-    }
-
-    fn advance_generation(&self) -> HostInputSnapshot {
-        let previous = self.packed.fetch_add(1 << 2, Ordering::AcqRel);
-        HostInputSnapshot {
-            packed: previous.wrapping_add(1 << 2),
-            stable: true,
-        }
-    }
-
-    fn transition_mouse_mode(
-        &self,
-        capture_active: bool,
-        sgr_pixels_active: bool,
-        apply: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<HostInputSnapshot> {
-        let mut boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = self.load();
-        let snapshot = HostInputSnapshot::from_parts(
-            previous.generation().wrapping_add(1),
-            capture_active,
-            sgr_pixels_active,
-        );
-        self.capture_input_boundary(&mut boundary)?;
-        apply()?;
-        // Bytes captured after apply but before this store crossed the mode boundary.
-        // Keep them unstable even though the next generation has not been published yet.
-        let pending = self
-            .input_fd
-            .map(input::pending_input_bytes)
-            .transpose()?
-            .unwrap_or(0);
-        let during_apply = pending.saturating_sub(Self::assigned_input_bytes(&boundary));
-        let geometry = boundary.geometry;
-        Self::push_input_segment(
-            &mut boundary,
-            during_apply,
-            previous.continued_with(snapshot),
-            geometry,
-        );
-        self.packed.store(snapshot.packed, Ordering::Release);
-        self.wake_input_reader()?;
-        Ok(snapshot)
-    }
-
-    fn reserve_event_slot(
-        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    ) -> io::Result<tokio::sync::mpsc::Permit<'_, ClientLoopEvent>> {
-        loop {
-            match event_tx.try_reserve() {
-                Ok(permit) => return Ok(permit),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
-                    std::thread::sleep(Duration::from_millis(1))
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "client event loop closed",
-                    ))
-                }
-            }
-        }
-    }
-
-    fn send_event(
-        &self,
-        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-        event: ClientLoopEvent,
-    ) -> io::Result<()> {
-        let permit = Self::reserve_event_slot(event_tx)?;
-        let _guard = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        permit.send(event);
-        Ok(())
-    }
-
-    fn send_resize(
-        &self,
-        event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
-        new_size: (u16, u16, u32, u32),
-        host_geometry: Option<crate::input::mouse::HostGeometry>,
-    ) -> io::Result<()> {
-        let permit = Self::reserve_event_slot(event_tx)?;
-        let mut boundary = self
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.capture_input_boundary(&mut boundary)?;
-        let generation = self.advance_generation().generation();
-        boundary.geometry = host_geometry;
-        permit.send(ClientLoopEvent::Resize(
-            new_size.0,
-            new_size.1,
-            new_size.2,
-            new_size.3,
-            generation,
-            host_geometry,
-        ));
-        self.wake_input_reader()
-    }
-}
-
-#[cfg(unix)]
-fn mouse_input_is_current(
-    input: HostInputSnapshot,
-    current: HostInputSnapshot,
-    applied_generation: u64,
-    require_capture: bool,
-) -> bool {
-    input.stable
-        && input.generation() == applied_generation
-        && (!require_capture || current.capture_active())
-}
-
-#[cfg(unix)]
-fn pixel_input_is_current(
-    input: HostInputSnapshot,
-    current: HostInputSnapshot,
-    applied_generation: u64,
-    input_geometry: crate::input::mouse::HostGeometry,
-    applied_geometry: Option<crate::input::mouse::HostGeometry>,
-) -> bool {
-    mouse_input_is_current(input, current, applied_generation, true)
-        && applied_geometry == Some(input_geometry)
-}
-#[cfg(unix)]
-fn apply_resize_input_boundary(
-    applied_generation: &mut u64,
-    applied_geometry: &mut Option<crate::input::mouse::HostGeometry>,
-    resize_generation: u64,
-    resize_geometry: Option<crate::input::mouse::HostGeometry>,
-) {
-    *applied_generation = (*applied_generation).max(resize_generation);
-    *applied_geometry = resize_geometry;
-}
-
-impl MousePointerState {
-    fn observe_raw_events(
-        &mut self,
-        events: &[crate::raw_input::RawInputEvent],
-    ) -> Option<Option<(u16, u16)>> {
-        let mut update = None;
-        for event in events {
-            match event {
-                crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                    self.cell = Some((mouse.column, mouse.row));
-                    update = Some(self.cell);
-                }
-                crate::raw_input::RawInputEvent::OuterFocusLost => {
-                    self.cell = None;
-                    update = Some(None);
-                }
-                _ => {}
-            }
-        }
-        update
-    }
-
-    fn set_cell(&mut self, cell: Option<(u16, u16)>) {
-        self.cell = cell;
-    }
-
-    fn write_for_frame(
-        &mut self,
-        writer: &mut impl io::Write,
-        frame: Option<&crate::protocol::FrameData>,
-        link_active_override: Option<bool>,
-    ) -> io::Result<()> {
-        let link_active = link_active_override.unwrap_or_else(|| {
-            self.cell.is_some_and(|(column, row)| {
-                frame.is_some_and(|frame| render_ansi::frame_has_hyperlink_at(frame, column, row))
-            })
-        });
-        if self.link_active == Some(link_active) {
-            return Ok(());
-        }
-        writer.write_all(if link_active {
-            MOUSE_SHAPE_POINTER_SEQUENCE
-        } else {
-            MOUSE_SHAPE_DEFAULT_SEQUENCE
-        })?;
-        writer.flush()?;
-        self.link_active = Some(link_active);
-        Ok(())
-    }
-}
-
-/// State tracking for the thin client.
-struct ClientState {
-    /// Stateful semantic-frame encoder used when the server sends FrameData.
-    blit_encoder: render_ansi::BlitEncoder,
-    /// Whether host mouse capture is currently active.
-    mouse_capture_active: bool,
-    /// Whether host reports use SGR pixel coordinates.
-    sgr_pixels_active: bool,
-    /// Mouse capture requested by the server-owned surface.
-    server_mouse_capture_active: bool,
-    /// SGR pixel reporting requested by the server-owned surface.
-    server_sgr_pixels_active: bool,
-    /// Whether the host terminal currently reports all keys as Kitty sequences.
-    keyboard_report_all_active: bool,
-    /// The terminal size we reported to the server in our last Hello/Resize.
-    reported_size: (u16, u16),
-    /// Client-local sound playback config, refreshed on server request.
-    sound_config: crate::config::SoundConfig,
-    /// Whether this client may write Kitty graphics bytes to its host terminal.
-    kitty_graphics_enabled: bool,
-    /// One bounded matcher, inactive unless a direct transmission is armed.
-    #[cfg(unix)]
-    direct_graphics_response: Arc<Mutex<direct_graphics::ResponseMatcher>>,
-    /// One server-retired direct transfer to suppress if it was still queued.
-    #[cfg(unix)]
-    retired_direct_graphics: Option<(u64, u32)>,
-    /// Direct attach prefix escape state. None for full-app clients.
-    attach_escape: Option<AttachEscapeState>,
-    /// Rows scrolled for one direct-attach wheel notch.
-    #[cfg(unix)]
-    mouse_scroll_lines: usize,
-    /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-    /// Whether outer focus gain should force a full host-terminal redraw.
-    redraw_on_focus_gained: bool,
-    /// Whether the next semantic frame must repaint every cell without clearing the surface.
-    repaint_pending: bool,
-    /// Whether this client draws the cursor into frame cells instead of using the host cursor.
-    draw_host_cursor: bool,
-    /// Last physical cell size paired with `reported_size`.
-    reported_cell_size_px: (u32, u32),
-    /// Detached URL opener children owned until they exit.
-    detached_process_children: Vec<std::process::Child>,
-    /// Client-local pointer position and emitted OSC 22 cursor shape.
-    mouse_pointer: MousePointerState,
-    /// App-owned full-surface OMP renderer, when this Unix client advertised support.
-    #[cfg(unix)]
-    omp_renderer: omp_renderer::ClientOmpRenderer,
-}
-
-#[derive(Debug, Default)]
-#[cfg(windows)]
-struct AttachEscapeState;
-
-#[derive(Debug, Default)]
-#[cfg(unix)]
-struct AttachEscapeState {
-    pending_prefix: bool,
-}
-
-#[derive(Debug)]
-#[cfg(unix)]
-enum AttachInputAction {
-    Forward(Vec<u8>),
-    ForwardAfterPendingPrefix(Vec<u8>),
-    Scroll {
-        source: AttachScrollSource,
-        direction: AttachScrollDirection,
-        lines: u16,
-        column: Option<u16>,
-        row: Option<u16>,
-        modifiers: u8,
-    },
-    Detach,
-    None,
-}
-
-impl AttachEscapeState {
-    #[cfg(unix)]
-    fn filter_input(
-        &mut self,
-        data: Vec<u8>,
-        viewport_rows: u16,
-        mouse_scroll_lines: usize,
-    ) -> AttachInputAction {
-        const PREFIX: u8 = 0x02; // Ctrl+B
-
-        if crate::raw_input::is_complete_text_bracketed_paste(&data) {
-            return if std::mem::take(&mut self.pending_prefix) {
-                AttachInputAction::ForwardAfterPendingPrefix(data)
-            } else {
-                AttachInputAction::Forward(data)
-            };
-        }
-
-        let mut output = Vec::with_capacity(data.len());
-        for byte in data {
-            if self.pending_prefix {
-                self.pending_prefix = false;
-                match byte {
-                    b'q' => return AttachInputAction::Detach,
-                    PREFIX => output.push(PREFIX),
-                    other => {
-                        output.push(PREFIX);
-                        output.push(other);
-                    }
-                }
-                continue;
-            }
-
-            if byte == PREFIX {
-                self.pending_prefix = true;
-            } else {
-                output.push(byte);
-            }
-        }
-
-        if output.is_empty() {
-            AttachInputAction::None
-        } else if let Some(action) =
-            attach_scroll_action(&output, viewport_rows, mouse_scroll_lines)
-        {
-            action
-        } else {
-            AttachInputAction::Forward(output)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn attach_scroll_action(
-    data: &[u8],
-    viewport_rows: u16,
-    mouse_scroll_lines: usize,
-) -> Option<AttachInputAction> {
-    let mut events = crate::raw_input::parse_raw_input_bytes_sync(data);
-    if events.len() != 1 {
-        return None;
-    }
-
-    match events.pop()? {
-        crate::raw_input::RawInputEvent::Mouse(mouse) => {
-            let direction = match mouse.kind {
-                MouseEventKind::ScrollUp => AttachScrollDirection::Up,
-                MouseEventKind::ScrollDown => AttachScrollDirection::Down,
-                _ => return Some(AttachInputAction::None),
-            };
-            Some(AttachInputAction::Scroll {
-                source: AttachScrollSource::Wheel,
-                direction,
-                lines: mouse_scroll_lines.max(1).min(u16::MAX as usize) as u16,
-                column: Some(mouse.column),
-                row: Some(mouse.row),
-                modifiers: mouse.modifiers.bits(),
-            })
-        }
-        crate::raw_input::RawInputEvent::Key(key)
-            if key.modifiers.is_empty()
-                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-        {
-            let direction = match key.code {
-                KeyCode::PageUp => AttachScrollDirection::Up,
-                KeyCode::PageDown => AttachScrollDirection::Down,
-                _ => return None,
-            };
-            Some(AttachInputAction::Scroll {
-                source: AttachScrollSource::PageKey {
-                    input: data.to_vec(),
-                },
-                direction,
-                lines: viewport_rows.saturating_sub(1).max(1),
-                column: None,
-                row: None,
-                modifiers: KeyModifiers::empty().bits(),
-            })
-        }
-        crate::raw_input::RawInputEvent::Key(key)
-            if key.modifiers.is_empty()
-                && key.kind == KeyEventKind::Release
-                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) =>
-        {
-            Some(AttachInputAction::None)
-        }
-        _ => None,
-    }
-}
-
-impl ClientState {
-    fn request_repaint(&mut self) {
-        self.repaint_pending = true;
-    }
-    #[cfg(unix)]
-    fn desired_host_mouse_mode(&self) -> (bool, bool) {
-        let (local_capture, local_sgr_pixels) = self.omp_renderer.local_mouse_mode();
-        let capture = self.server_mouse_capture_active || local_capture;
-        let sgr_pixels =
-            (self.server_mouse_capture_active && self.server_sgr_pixels_active) || local_sgr_pixels;
-        (capture, capture && sgr_pixels)
-    }
-
-    fn write_mouse_pointer_shape(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
-        #[cfg(unix)]
-        let native_link_active = self.omp_renderer.native_link_active();
-        #[cfg(not(unix))]
-        let native_link_active = None;
-        self.mouse_pointer.write_for_frame(
-            writer,
-            self.blit_encoder.last_frame(),
-            native_link_active,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
-
-/// Errors that can occur during client operation.
-#[derive(Debug)]
-pub enum ClientError {
-    /// Could not connect to the server's client socket.
-    ConnectionFailed(io::Error),
-    /// Server rejected our handshake.
-    HandshakeRejected { version: u32, error: String },
-    /// Server shut down.
-    ServerShutdown { reason: Option<String> },
-    /// Server is handing live state to a replacement build.
-    ServerHandoff { reason: String },
-    /// Lost connection to the server.
-    ConnectionLost(io::Error),
-    /// Protocol error (framing, deserialization).
-    Protocol(protocol::FramingError),
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientError::ConnectionFailed(err) => {
-                write!(f, "failed to connect to server: {err}")?;
-                let path = client_socket_path();
-                write!(
-                    f,
-                    "\nIs herdr server running? Start it with `herdr server`."
-                )?;
-                write!(f, "\nSocket path: {}", path.display())
-            }
-            ClientError::HandshakeRejected { version, error } => {
-                write!(f, "server rejected handshake (version {version}): {error}")
-            }
-            ClientError::ServerShutdown { reason } => {
-                match reason.as_deref() {
-                    Some("detached") => {
-                        if let Ok(reattach_command) =
-                            std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
-                        {
-                            write!(f, "detached from remote server")?;
-                            write!(f, "\nRun `{reattach_command}` to reattach")?;
-                        } else {
-                            write!(f, "detached from server")?;
-                            write!(
-                                f,
-                                "\nRun `{}` to reattach",
-                                crate::session::local_attach_command()
-                            )?;
-                        }
-                    }
-                    _ => {
-                        write!(f, "server shut down")?;
-                        if let Some(reason) = reason {
-                            write!(f, ": {reason}")?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            ClientError::ServerHandoff { reason } => {
-                write!(f, "server handoff in progress: {reason}")
-            }
-            ClientError::ConnectionLost(err) => {
-                if let Ok(reattach_command) = std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
-                {
-                    write!(f, "lost connection to remote Herdr: {err}")?;
-                    write!(f, "\nIf the remote server survived the SSH or network drop, its panes may still be running.")?;
-                    write!(f, "\nRun `{reattach_command}` to reattach")
-                } else {
-                    write!(f, "lost connection to server: {err}")
-                }
-            }
-            ClientError::Protocol(err) => {
-                write!(f, "protocol error: {err}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ClientError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ClientError::ConnectionFailed(err) => Some(err),
-            ClientError::ConnectionLost(err) => Some(err),
-            ClientError::Protocol(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<protocol::FramingError> for ClientError {
-    fn from(err: protocol::FramingError) -> Self {
-        match err {
-            protocol::FramingError::UnexpectedEof => ClientError::ConnectionLost(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "server closed connection",
-            )),
-            protocol::FramingError::Io(err) => ClientError::ConnectionLost(err),
-            err => ClientError::Protocol(err),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Terminal setup / restore
-// ---------------------------------------------------------------------------
-
-/// Sets up the terminal for client mode (raw mode, optional mouse, keyboard enhancements).
-///
-/// Returns a guard that restores the terminal when dropped.
-fn setup_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(true, mouse_capture)
-}
-
-/// Sets up a direct attach terminal.
-///
-/// Direct attach forwards stdin to the attached PTY. When configured, mouse
-/// capture lets wheel events drive the attached viewport or reach child
-/// programs that requested mouse input.
-fn setup_direct_attach_terminal(mouse_capture: bool) -> io::Result<TerminalGuard> {
-    setup_terminal_with_capabilities(false, mouse_capture)
-}
-
-fn setup_terminal_with_capabilities(
-    enable_client_protocols: bool,
-    mouse_capture: bool,
-) -> io::Result<TerminalGuard> {
-    ratatui::init();
-    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    let host_color_scheme_reports =
-        should_enable_host_color_scheme_reports(enable_client_protocols);
-
-    if enable_client_protocols {
-        if mouse_capture {
-            set_mouse_capture(true, false)?;
-        } else {
-            set_mouse_capture(false, false)?;
-        }
-        execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
-        if host_color_scheme_reports {
-            write_host_color_scheme_report_mode(&mut io::stdout(), true)?;
-        }
-        push_keyboard_enhancement_flags()?;
-    } else {
-        if should_query_host_terminal_theme() {
-            write_host_color_scheme_report_mode(&mut io::stdout(), false)?;
-        }
-        if mouse_capture {
-            set_mouse_capture(true, false)?;
-        } else {
-            set_mouse_capture(false, false)?;
-        }
-        execute!(io::stdout(), EnableBracketedPaste)?;
-    }
-
-    #[cfg(windows)]
-    let windows_virtual_terminal_input =
-        if enable_client_protocols && windows_vti_input_backend_enabled() {
-            enable_windows_virtual_terminal_input()
-        } else {
-            WindowsVirtualTerminalInputSetup::default()
-        };
-
-    #[cfg(windows)]
-    if enable_client_protocols
-        && windows_vti_input_backend_enabled()
-        && windows_virtual_terminal_input.active
-        && windows_win32_input_mode_enabled()
-    {
-        if let Err(err) = enable_windows_win32_input_mode(&mut io::stdout()) {
-            if let Some(mode) = windows_virtual_terminal_input.restore_mode {
-                restore_windows_input_mode_value(mode);
-            }
-            return Err(err);
-        }
-    }
-
-    let modify_other_keys_mode = enable_client_protocols
-        .then(crate::input::host_modify_other_keys_mode)
-        .flatten();
-    if let Some(mode) = modify_other_keys_mode {
-        io::stdout().write_all(mode.set_sequence())?;
-        io::stdout().flush()?;
-    }
-
-    execute!(io::stdout(), DisableLineWrap)?;
-
-    Ok(TerminalGuard {
-        reset_modify_other_keys: modify_other_keys_mode.is_some(),
-        reset_host_color_scheme_reports: host_color_scheme_reports,
-        restored: false,
-        #[cfg(windows)]
-        restore_windows_input_mode: windows_virtual_terminal_input.restore_mode,
-    })
-}
-
-fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> bool {
-    enable_client_protocols && should_query_host_terminal_theme()
-}
-
-/// Guard that restores the terminal when dropped.
-struct TerminalGuard {
-    reset_modify_other_keys: bool,
-    reset_host_color_scheme_reports: bool,
-    restored: bool,
-    #[cfg(windows)]
-    restore_windows_input_mode: Option<u32>,
-}
-
-fn write_host_color_scheme_report_mode(
-    writer: &mut impl io::Write,
-    enabled: bool,
-) -> io::Result<()> {
-    let sequence = if enabled {
-        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE
-    } else {
-        crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE
-    };
-    writer.write_all(sequence.as_bytes())?;
-    writer.flush()
-}
-
-fn write_terminal_restore_postlude(
-    writer: &mut impl io::Write,
-    reset_host_color_scheme_reports: bool,
-) -> io::Result<()> {
-    if reset_host_color_scheme_reports {
-        writer.write_all(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        )?;
-    }
-    // Restore the terminal-default pointer, a visible cursor, and default DECSCUSR shape.
-    writer.write_all(MOUSE_SHAPE_DEFAULT_SEQUENCE)?;
-    writer.write_all(b"\x1b[?25h\x1b[0 q")?;
-    writer.flush()
-}
-
-fn should_draw_host_cursor(mode: crate::config::HostCursorModeConfig) -> bool {
-    match mode {
-        crate::config::HostCursorModeConfig::Auto => {
-            crate::platform::should_draw_host_cursor_by_default()
-        }
-        crate::config::HostCursorModeConfig::Native => false,
-        crate::config::HostCursorModeConfig::Drawn => true,
-    }
-}
-
-#[cfg(windows)]
-#[derive(Default)]
-struct WindowsVirtualTerminalInputSetup {
-    active: bool,
-    restore_mode: Option<u32>,
-}
-
-#[cfg(windows)]
-fn enable_windows_virtual_terminal_input() -> WindowsVirtualTerminalInputSetup {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_INPUT,
-        STD_INPUT_HANDLE,
-    };
-
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        tracing::warn!("failed to get Windows console input handle for VT input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let mut mode = 0;
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        tracing::warn!("failed to read Windows console input mode for VT input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let desired = windows_virtual_terminal_input_mode(mode);
-    if desired == mode {
-        return WindowsVirtualTerminalInputSetup {
-            active: true,
-            restore_mode: None,
-        };
-    }
-
-    if unsafe { SetConsoleMode(handle, desired) } == 0 {
-        tracing::warn!("failed to enable Windows virtual terminal input");
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    let mut applied = 0;
-    if unsafe { GetConsoleMode(handle, &mut applied) } == 0 {
-        tracing::warn!("failed to verify Windows virtual terminal input mode");
-        let _ = unsafe { SetConsoleMode(handle, mode) };
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-    if applied & ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
-        tracing::warn!("Windows virtual terminal input bit did not stick");
-        let _ = unsafe { SetConsoleMode(handle, mode) };
-        return WindowsVirtualTerminalInputSetup::default();
-    }
-
-    WindowsVirtualTerminalInputSetup {
-        active: true,
-        restore_mode: Some(mode),
-    }
-}
-
-#[cfg(windows)]
-fn windows_vti_input_backend_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_BACKEND")
-        .map(|backend| !backend.eq_ignore_ascii_case("crossterm"))
-        .unwrap_or(true)
-}
-
-#[cfg(any(windows, test))]
-fn windows_virtual_terminal_input_mode(mode: u32) -> u32 {
-    mode | 0x0200
-}
-
-#[cfg(windows)]
-fn restore_windows_input_mode_value(mode: u32) {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE};
-
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return;
-    }
-    if unsafe { SetConsoleMode(handle, mode) } == 0 {
-        tracing::warn!("failed to restore Windows console input mode");
-    }
-}
-
-fn set_mouse_capture(enabled: bool, sgr_pixels: bool) -> io::Result<()> {
-    crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    if enabled {
-        execute!(io::stdout(), EnableMouseCapture)?;
-        if sgr_pixels {
-            io::stdout().write_all(b"\x1b[?1016h")?;
-            io::stdout().flush()?;
-        }
-        Ok(())
-    } else {
-        match execute!(io::stdout(), DisableMouseCapture) {
-            Ok(()) => Ok(()),
-            #[cfg(windows)]
-            Err(err) if err.to_string() == "Initial console modes not set" => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_host_mouse_mode(
-    state: &mut ClientState,
-    host_input_state: &HostInputState,
-    applied_host_input_generation: &mut u64,
-) -> Result<(), ClientError> {
-    let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
-    if enabled != state.mouse_capture_active || sgr_pixels != state.sgr_pixels_active {
-        state.omp_renderer.finish_local_mouse_gesture();
-        let (enabled, sgr_pixels) = state.desired_host_mouse_mode();
-        if enabled == state.mouse_capture_active && sgr_pixels == state.sgr_pixels_active {
-            return Ok(());
-        }
-        *applied_host_input_generation = host_input_state
-            .transition_mouse_mode(enabled, sgr_pixels, || {
-                set_mouse_capture(enabled, sgr_pixels)
-            })
-            .map_err(ClientError::ConnectionFailed)?
-            .generation();
-        state.mouse_capture_active = enabled;
-        state.sgr_pixels_active = sgr_pixels;
-        if !enabled {
-            state.mouse_pointer.set_cell(None);
-            state.omp_renderer.observe_pointer_cell(None);
-        }
-    }
-    Ok(())
-}
-
-fn restore_terminal_state(
-    reset_modify_other_keys: bool,
-    reset_host_color_scheme_reports: bool,
-    #[cfg(windows)] restore_windows_input_mode: Option<u32>,
-) -> io::Result<()> {
-    let _ = clear_received_kitty_graphics(&mut io::stdout());
-
-    // Reset modifyOtherKeys if we enabled it.
-    if reset_modify_other_keys {
-        let _ = io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = io::stdout().flush();
-    }
-
-    let _ = pop_keyboard_enhancement_flags();
-
-    let _ = execute!(
-        io::stdout(),
-        EnableLineWrap,
-        DisableFocusChange,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    );
-    let _ = crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout());
-    #[cfg(windows)]
-    if let Some(mode) = restore_windows_input_mode {
-        restore_windows_input_mode_value(mode);
-    }
-
-    let restore_result = ratatui::try_restore();
-    let postlude_result =
-        write_terminal_restore_postlude(&mut io::stdout(), reset_host_color_scheme_reports);
-
-    #[cfg(windows)]
-    if windows_vti_input_backend_enabled() && windows_win32_input_mode_enabled() {
-        let _ = disable_windows_win32_input_mode(&mut io::stdout());
-    }
-
-    restore_result.and(postlude_result)
-}
-
-#[cfg(not(windows))]
-fn push_keyboard_enhancement_flags() -> io::Result<()> {
-    execute!(
-        io::stdout(),
-        PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
-    )
-}
-
-#[cfg(windows)]
-fn push_keyboard_enhancement_flags() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn pop_keyboard_enhancement_flags() -> io::Result<()> {
-    execute!(io::stdout(), PopKeyboardEnhancementFlags)
-}
-
-#[cfg(windows)]
-fn pop_keyboard_enhancement_flags() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn windows_win32_input_mode_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_PROBE")
-        .map(|probe| probe.eq_ignore_ascii_case("win32"))
-        .unwrap_or(true)
-}
-
-#[cfg(windows)]
-fn enable_windows_win32_input_mode(writer: &mut impl std::io::Write) -> io::Result<()> {
-    writer.write_all(b"\x1b[?9001h")?;
-    writer.flush()
-}
-
-#[cfg(windows)]
-fn disable_windows_win32_input_mode(writer: &mut impl std::io::Write) -> io::Result<()> {
-    writer.write_all(b"\x1b[?9001l")?;
-    writer.flush()
-}
-
-impl TerminalGuard {
-    fn restore(mut self) -> io::Result<()> {
-        self.restored = true;
-        restore_terminal_state(
-            self.reset_modify_other_keys,
-            self.reset_host_color_scheme_reports,
-            #[cfg(windows)]
-            self.restore_windows_input_mode,
-        )
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if !self.restored {
-            let _ = restore_terminal_state(
-                self.reset_modify_other_keys,
-                self.reset_host_color_scheme_reports,
-                #[cfg(windows)]
-                self.restore_windows_input_mode,
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Handshake
-// ---------------------------------------------------------------------------
-
-fn requested_render_encoding() -> RenderEncoding {
-    match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
-        Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
-        _ => RenderEncoding::SemanticFrame,
-    }
-}
-
-fn is_remote_client_process() -> bool {
-    std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
-}
-
-/// Time to wait for the server's Welcome reply during the handshake.
-///
-/// A local client talks to an already-connected server, so 5s is plenty. The
-/// remote bridge client (`herdr --remote`) sits behind a fresh per-attach ssh
-/// connection whose cold-connect (TCP + key exchange + auth) happens inside this
-/// window; on a high-latency link that easily exceeds 5s, so it gets a far
-/// larger budget. See issue #753.
-const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn handshake_read_timeout() -> Duration {
-    if is_remote_client_process() {
-        return REMOTE_HANDSHAKE_READ_TIMEOUT;
-    }
-    LOCAL_HANDSHAKE_READ_TIMEOUT
-}
-
-#[cfg(any(unix, test))]
-fn direct_graphics_profile_values(
-    term_program: &str,
-    term: &str,
-    kitty_window: bool,
-    blocked_transport: bool,
-    terminals: bool,
-) -> bool {
-    let supported = term_program.eq_ignore_ascii_case("ghostty")
-        || term_program.eq_ignore_ascii_case("wezterm")
-        || matches!(term, "xterm-ghostty" | "xterm-kitty" | "xterm-wezterm")
-        || kitty_window;
-    supported && !blocked_transport && terminals
-}
-
-#[cfg(unix)]
-fn direct_graphics_profile_allowed(direct_attach: bool) -> bool {
-    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    let term = std::env::var("TERM").unwrap_or_default();
-    direct_graphics_profile_values(
-        &term_program,
-        &term,
-        std::env::var_os("KITTY_WINDOW_ID").is_some(),
-        direct_attach
-            || is_remote_client_process()
-            || std::env::var_os("SSH_CONNECTION").is_some()
-            || std::env::var_os("SSH_TTY").is_some()
-            || std::env::var_os("TMUX").is_some()
-            || std::env::var_os("STY").is_some(),
-        io::stdin().is_terminal() && io::stdout().is_terminal(),
-    )
-}
-
-#[cfg(not(unix))]
-fn direct_graphics_profile_allowed(_direct_attach: bool) -> bool {
-    false
-}
-
-fn requested_keybindings() -> ClientKeybindings {
-    match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
-        .ok()
-        .as_deref()
-    {
-        Some("local") => crate::config::Config::load()
-            .config
-            .local_keybindings_profile_toml()
-            .map(|keys_toml| ClientKeybindings::Local { keys_toml })
-            .unwrap_or(ClientKeybindings::Server),
-        _ => ClientKeybindings::Server,
-    }
-}
-
-#[cfg(windows)]
-fn set_handshake_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    context: &'static str,
-) -> Result<(), ClientError> {
-    match stream.set_recv_timeout(timeout) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-            debug!(err = %err, context, "client socket receive timeout unavailable");
-            Ok(())
-        }
-        Err(err) => Err(ClientError::ConnectionFailed(err)),
-    }
-}
-
-#[cfg(not(windows))]
-fn set_handshake_recv_timeout(
-    stream: &LocalStream,
-    timeout: Option<Duration>,
-    _context: &'static str,
-) -> Result<(), ClientError> {
-    stream
-        .set_recv_timeout(timeout)
-        .map_err(ClientError::ConnectionFailed)
-}
-
-fn client_launch_mode(
-    direct_attach_requested: bool,
-    exact_cell_size: bool,
-    cell_width_px: u32,
-    cell_height_px: u32,
-) -> ClientLaunchMode {
-    if direct_attach_requested {
-        ClientLaunchMode::TerminalAttach
-    } else if exact_cell_size
-        && cell_width_px > 0
-        && cell_height_px > 0
-        && direct_graphics_profile_allowed(false)
-    {
-        ClientLaunchMode::AppDirectGraphics
-    } else {
-        ClientLaunchMode::App
-    }
-}
-
-#[cfg(unix)]
-fn client_omp_renderer_eligible(
-    requested_encoding: RenderEncoding,
-    launch_mode: ClientLaunchMode,
-    stdin_tty: bool,
-    stdout_tty: bool,
-) -> bool {
-    let app_surface = matches!(
-        launch_mode,
-        ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
-    );
-    omp_renderer::capabilities(requested_encoding, app_surface, stdin_tty, stdout_tty, true)
-        .client_local_native
-}
-
-fn client_omp_renderer_capabilities(
-    requested_encoding: RenderEncoding,
-    launch_mode: ClientLaunchMode,
-    stdin_tty: bool,
-    stdout_tty: bool,
-    omp_executable: Option<&crate::update::OmpExecutable>,
-) -> crate::protocol::OmpRendererCapabilities {
-    #[cfg(unix)]
-    {
-        let app_surface = matches!(
-            launch_mode,
-            ClientLaunchMode::App | ClientLaunchMode::AppDirectGraphics
-        );
-        omp_renderer::capabilities(
-            requested_encoding,
-            app_surface,
-            stdin_tty,
-            stdout_tty,
-            omp_executable.is_some(),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (
-            requested_encoding,
-            launch_mode,
-            stdin_tty,
-            stdout_tty,
-            omp_executable,
-        );
-        crate::protocol::OmpRendererCapabilities::default()
-    }
-}
-
-#[cfg(unix)]
-fn resolve_client_omp_executable(eligible: bool) -> Option<crate::update::OmpExecutable> {
-    resolve_client_omp_executable_with(eligible, crate::update::native_omp_executable, |error| {
-        eprintln!("herdr: native OMP renderer unavailable ({error}); using server-side rendering");
-    })
-}
-
-#[cfg(unix)]
-fn client_omp_resolution_is_benign(error: &str) -> bool {
-    matches!(
-        error,
-        "managed OMP companion is disabled for this client attach"
-            | "managed OMP companion is unavailable for this platform"
-            | "this Herdr build has no paired OMP companion"
-    )
-}
-
-#[cfg(unix)]
-fn resolve_client_omp_executable_with(
-    eligible: bool,
-    resolve: impl FnOnce() -> Result<crate::update::OmpExecutable, String>,
-    report_failure: impl FnOnce(&str),
-) -> Option<crate::update::OmpExecutable> {
-    if !eligible {
-        return None;
-    }
-    match resolve().and_then(|executable| executable.verify().map(|()| executable)) {
-        Ok(executable) => Some(executable),
-        Err(error) if client_omp_resolution_is_benign(&error) => None,
-        Err(error) => {
-            report_failure(&error);
-            None
-        }
-    }
-}
-#[cfg(unix)]
-fn probe_connect_then_resolve_client_omp_and_handshake_with<T, H>(
-    eligible: bool,
-    probe_connect: impl FnOnce() -> io::Result<T>,
-    resolve: impl FnOnce(bool) -> Option<crate::update::OmpExecutable>,
-    connect: impl FnOnce() -> io::Result<T>,
-    handshake: impl FnOnce(&mut T, Option<&crate::update::OmpExecutable>) -> Result<H, ClientError>,
-) -> Result<(T, Option<crate::update::OmpExecutable>, H), ClientError> {
-    if eligible {
-        drop(probe_connect().map_err(ClientError::ConnectionFailed)?);
-    }
-    let omp_executable = resolve(eligible);
-    let mut stream = connect().map_err(|error| {
-        if eligible {
-            ClientError::ConnectionLost(error)
-        } else {
-            ClientError::ConnectionFailed(error)
-        }
-    })?;
-    let handshake_result = handshake(&mut stream, omp_executable.as_ref()).map_err(|error| {
-        if !eligible {
-            return error;
-        }
-        match error {
-            ClientError::ConnectionFailed(error) => ClientError::ConnectionLost(error),
-            ClientError::Protocol(protocol::FramingError::UnexpectedEof) => {
-                ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server connection closed during handshake",
-                ))
-            }
-            ClientError::Protocol(protocol::FramingError::Io(error))
-                if error.kind() != io::ErrorKind::InvalidData =>
-            {
-                ClientError::ConnectionLost(error)
-            }
-            error => error,
-        }
-    })?;
-    Ok((stream, omp_executable, handshake_result))
-}
-fn load_client_identity_or_exit() -> crate::config::ClientIdentity {
-    match crate::config::load_or_create_identity() {
-        Ok(identity) => identity,
-        Err(error) => {
-            eprintln!("herdr: unable to load client identity: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Performs the client→server handshake.
-///
-/// Sends Hello with the terminal size and protocol version, reads the Welcome
-/// response. Returns Ok(()) on success, or an error if the server rejects us.
-fn do_handshake(
-    stream: &mut LocalStream,
-    cols: u16,
-    rows: u16,
-    cell_width_px: u32,
-    cell_height_px: u32,
-    requested_encoding: RenderEncoding,
-    launch_mode: ClientLaunchMode,
-    identity: &crate::config::ClientIdentity,
-) -> Result<RenderEncoding, ClientError> {
-    do_handshake_with_renderer_capabilities(
-        stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        launch_mode,
-        crate::protocol::OmpRendererCapabilities::default(),
-        identity,
-    )
-}
-
-fn do_handshake_with_renderer_capabilities(
-    stream: &mut LocalStream,
-    cols: u16,
-    rows: u16,
-    cell_width_px: u32,
-    cell_height_px: u32,
-    requested_encoding: RenderEncoding,
-    launch_mode: ClientLaunchMode,
-    renderer_capabilities: crate::protocol::OmpRendererCapabilities,
-    identity: &crate::config::ClientIdentity,
-) -> Result<RenderEncoding, ClientError> {
-    stream
-        .set_nonblocking(false)
-        .map_err(ClientError::ConnectionFailed)?;
-
-    // Send Hello.
-    let hello = ClientMessage::Hello {
-        version: PROTOCOL_VERSION,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        keybindings: requested_keybindings(),
-        launch_mode,
-        display_name: (launch_mode != ClientLaunchMode::OmpPane)
-            .then(|| identity.display_name.clone())
-            .flatten(),
-        frontend_profile_id: Some(identity.frontend_profile_id.clone()),
-        renderer_binding_token: Some(identity.renderer_binding_token.clone()),
-        renderer_capabilities,
-    };
-    protocol::write_message(stream, &hello)
-        .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
-
-    // Read Welcome.
-    set_handshake_recv_timeout(
-        stream,
-        Some(handshake_read_timeout()),
-        "client handshake read timeout unavailable",
-    )?;
-    let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
-    set_handshake_recv_timeout(
-        stream,
-        None,
-        "failed to clear client handshake read timeout",
-    )?;
-
-    match welcome {
-        ServerMessage::Welcome {
-            version,
-            encoding,
-            error,
-        } => {
-            if let Some(error) = error {
-                return Err(ClientError::HandshakeRejected { version, error });
-            }
-            info!(version, ?encoding, "handshake succeeded");
-            Ok(encoding)
-        }
-        _ => Err(ClientError::Protocol(protocol::FramingError::Io(
-            io::Error::new(io::ErrorKind::InvalidData, "expected Welcome message"),
-        ))),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Client event loop
-// ---------------------------------------------------------------------------
-
-/// Internal events for the client event loop.
-enum ClientLoopEvent {
-    /// Raw input bytes from stdin with the host-input state at their boundary.
-    #[cfg(unix)]
-    StdinInput(Vec<u8>, HostInputSnapshot),
-    /// Framed events from one stdin read, published as one ordering unit.
-    #[cfg(unix)]
-    OrderedInput(Vec<ClientLoopEvent>),
-    /// One confirmed SGR pixel report with geometry and input snapshot captured by the reader.
-    #[cfg(unix)]
-    PixelMouse(
-        Vec<u8>,
-        crate::input::mouse::HostGeometry,
-        HostInputSnapshot,
-    ),
-    #[cfg(unix)]
-    DirectGraphicsResponse(direct_graphics::Response),
-    /// Structured input events from platforms without Unix-style stdin bytes.
-    #[cfg(windows)]
-    StdinEvents(Vec<crate::protocol::ClientInputEvent>),
-    /// Terminal resize detected.
-    Resize(
-        u16,
-        u16,
-        u32,
-        u32,
-        u64,
-        Option<crate::input::mouse::HostGeometry>,
-    ),
-    /// Server message received.
-    ServerMessage(ServerMessage),
-    /// Server reader thread exited (connection lost).
-    ServerDisconnected,
-    /// Timer tick.
-    Timer,
-}
-
-#[cfg(unix)]
-#[derive(Debug)]
-struct ClientExecutableIdentity {
-    path: std::path::PathBuf,
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-impl ClientExecutableIdentity {
-    fn capture() -> Option<Self> {
-        Self::capture_at(std::env::current_exe().ok()?)
-    }
-
-    fn capture_at(path: std::path::PathBuf) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let metadata = std::fs::metadata(&path).ok()?;
-        Some(Self {
-            path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-
-    fn was_replaced(&self) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
-
-        std::fs::metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() != self.device || metadata.ino() != self.inode)
-    }
-
-    fn exec_replacement(&self) -> io::Error {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut command = std::process::Command::new(&self.path);
-        command.args(std::env::args_os().skip(1));
-        command.exec()
-    }
-}
-
-#[cfg(unix)]
-fn should_relaunch_updated_client_during_startup(
-    direct_attach_requested: bool,
-    remote_client: bool,
-    executable_replaced: bool,
-) -> bool {
-    !direct_attach_requested && !remote_client && executable_replaced
-}
-
-#[cfg(unix)]
-fn should_relaunch_updated_client(
-    error: &ClientError,
-    direct_attach_requested: bool,
-    remote_client: bool,
-    executable_replaced: bool,
-) -> bool {
-    if direct_attach_requested || remote_client || !executable_replaced {
-        return false;
-    }
-
-    match error {
-        ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. } => true,
-        ClientError::ServerShutdown { reason } => reason.as_deref() != Some("detached"),
-        _ => false,
-    }
-}
-fn should_request_remote_reconnect(error: &ClientError, remote_client: bool) -> bool {
-    remote_client
-        && matches!(
-            error,
-            ClientError::ConnectionLost(_) | ClientError::ServerHandoff { .. }
-        )
-}
-
-#[cfg(unix)]
-fn client_error_exit_code(error: &ClientError, remote_client: bool) -> i32 {
-    if should_request_remote_reconnect(error, remote_client) {
-        crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
-    } else {
-        1
-    }
-}
-
-/// Runs the thin client: connects to the server, performs the handshake,
-/// and enters the main event loop.
-///
-/// Runs the hidden OMP logical-pane client.
-#[cfg(unix)]
-pub fn run_omp_pane(
-    pane_id: String,
-    omp_session_id: String,
-    route_generation: u64,
-    target_app_client_id: Option<u64>,
-) -> io::Result<()> {
-    omp_pane::run(
-        pane_id,
-        omp_session_id,
-        route_generation,
-        target_app_client_id,
-    )
-}
-
-#[cfg(not(unix))]
-pub fn run_omp_pane(
-    _pane_id: String,
-    _omp_session_id: String,
-    _route_generation: u64,
-    _target_app_client_id: Option<u64>,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "OMP pane POC is Unix-only",
-    ))
-}
-/// This is the entry point called from `main.rs` when running in client mode.
-pub fn run_client() -> io::Result<()> {
-    run_client_with_mode(
-        requested_render_encoding(),
-        None,
-        None,
-        "connecting to server",
-    )
-}
-
-/// Runs a direct terminal attach client.
-#[cfg(unix)]
-pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
-    run_client_with_mode(
-        RenderEncoding::TerminalAnsi,
-        Some((terminal_id, takeover)),
-        Some(AttachEscapeState::default()),
-        "attaching to terminal",
-    )
-}
-
-/// Direct terminal attach is Unix raw-byte input only until Windows gets a semantic attach path.
-#[cfg(windows)]
-pub fn run_terminal_attach(_terminal_id: String, _takeover: bool) -> io::Result<()> {
-    debug_assert!(!crate::platform::capabilities().direct_terminal_attach);
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "direct terminal attach is not supported on Windows yet",
-    ))
-}
-
-/// Runs a read-only terminal session observer and prints one JSON envelope per frame.
-pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
-    let mut stream =
-        connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
-    write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
-    write_terminal_session_output(stream)
-}
-
-/// Runs a writable terminal session controller.
-pub fn run_terminal_session_control(
-    target: String,
-    takeover: bool,
-    cols: u16,
-    rows: u16,
-) -> io::Result<()> {
-    let mut stream = connect_terminal_session_stream(
-        target.clone(),
-        cols,
-        rows,
-        "controlling terminal session",
-    )?;
-    write_to_server(
-        &mut stream,
-        &ClientMessage::ControlTerminal { target, takeover },
-    )?;
-
-    let mut write_stream = stream.try_clone()?;
-    let _input_thread = std::thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match terminal_control_command_from_json(&line) {
-                Ok(message) => {
-                    let release = matches!(message, ClientMessage::Detach);
-                    if write_to_server(&mut write_stream, &message).is_err() {
-                        return;
-                    }
-                    if release {
-                        return;
-                    }
-                }
-                Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
-            }
-        }
-        let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
-    });
-
-    write_terminal_session_output(stream)
-}
-
-fn connect_terminal_session_stream(
-    target: String,
-    cols: u16,
-    rows: u16,
-    log_message: &'static str,
-) -> io::Result<LocalStream> {
-    init_logging();
-
-    let socket_path = client_socket_path();
-    crate::logging::startup("client");
-    info!(path = %socket_path.display(), target = %target, cols, rows, "{log_message}");
-
-    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(stream) => stream,
-        Err(err) => {
-            eprintln!("herdr: {}", ClientError::ConnectionFailed(err));
-            std::process::exit(1);
-        }
-    };
-
-    match do_handshake(
-        &mut stream,
-        cols,
-        rows,
-        0,
-        0,
-        RenderEncoding::TerminalAnsi,
-        ClientLaunchMode::TerminalAttach,
-        &load_client_identity_or_exit(),
-    ) {
-        Ok(RenderEncoding::TerminalAnsi) => {}
-        Ok(encoding) => {
-            eprintln!(
-                "herdr: terminal session observe negotiated unsupported encoding {encoding:?}"
-            );
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    stream.set_nonblocking(false)?;
-    Ok(stream)
-}
-
-fn write_terminal_session_closed(
-    stdout: &mut impl io::Write,
-    reason: Option<String>,
-) -> io::Result<()> {
-    let line = serde_json::json!({
-        "type": "terminal.closed",
-        "reason": reason,
-    });
-    serde_json::to_writer(&mut *stdout, &line)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()
-}
-
-fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    loop {
-        match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
-            Ok(ServerMessage::Terminal(frame)) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
-                let line = serde_json::json!({
-                    "type": "terminal.frame",
-                    "seq": frame.seq,
-                    "encoding": "ansi",
-                    "width": frame.width,
-                    "height": frame.height,
-                    "full": frame.full,
-                    "bytes": encoded,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-            }
-            Ok(ServerMessage::ServerShutdown { reason }) => {
-                return write_terminal_session_closed(&mut stdout, reason)
-            }
-            Ok(ServerMessage::ServerHandoff { reason }) => {
-                return write_terminal_session_closed(&mut stdout, Some(reason))
-            }
-            Ok(ServerMessage::Graphics { .. }) => {}
-            Ok(_) => {}
-            Err(protocol::FramingError::UnexpectedEof) => return Ok(()),
-            Err(err) => return Err(io::Error::other(err.to_string())),
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "type")]
-enum TerminalControlCommand {
-    #[serde(rename = "terminal.input")]
-    Input {
-        text: Option<String>,
-        bytes: Option<String>,
-    },
-    #[serde(rename = "terminal.resize")]
-    Resize {
-        cols: u16,
-        rows: u16,
-        #[serde(default)]
-        cell_width_px: u32,
-        #[serde(default)]
-        cell_height_px: u32,
-    },
-    #[serde(rename = "terminal.scroll")]
-    Scroll {
-        direction: TerminalControlScrollDirection,
-        lines: u16,
-        #[serde(default)]
-        source: TerminalControlScrollSource,
-        #[serde(default)]
-        column: Option<u16>,
-        #[serde(default)]
-        row: Option<u16>,
-        #[serde(default)]
-        modifiers: u8,
-    },
-    #[serde(rename = "terminal.release")]
-    Release {},
-}
-
-#[derive(Clone, Copy, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalControlScrollDirection {
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Default, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TerminalControlScrollSource {
-    #[default]
-    Wheel,
-    PageKey,
-}
-
-fn terminal_control_command_from_json(raw: &str) -> Result<ClientMessage, String> {
-    let command = serde_json::from_str::<TerminalControlCommand>(raw)
-        .map_err(|err| format!("invalid json command: {err}"))?;
-    match command {
-        TerminalControlCommand::Input { text, bytes } => {
-            let data = match (text, bytes) {
-                (Some(_), Some(_)) => {
-                    return Err("terminal.input accepts text or bytes, not both".into())
-                }
-                (Some(text), None) => text.into_bytes(),
-                (None, Some(bytes)) => base64::engine::general_purpose::STANDARD
-                    .decode(bytes)
-                    .map_err(|err| format!("invalid terminal.input bytes: {err}"))?,
-                (None, None) => Vec::new(),
-            };
-            Ok(ClientMessage::Input { data })
-        }
-        TerminalControlCommand::Resize {
-            cols,
-            rows,
-            cell_width_px,
-            cell_height_px,
-        } => {
-            if cols == 0 || rows == 0 {
-                return Err("terminal.resize cols and rows must be greater than 0".into());
-            }
-            Ok(ClientMessage::Resize {
-                cols,
-                rows,
-                cell_width_px,
-                cell_height_px,
-            })
-        }
-        TerminalControlCommand::Scroll {
-            direction,
-            lines,
-            source,
-            column,
-            row,
-            modifiers,
-        } => {
-            if lines == 0 {
-                return Err("terminal.scroll lines must be greater than 0".into());
-            }
-            let direction = match direction {
-                TerminalControlScrollDirection::Up => AttachScrollDirection::Up,
-                TerminalControlScrollDirection::Down => AttachScrollDirection::Down,
-            };
-            let source = match source {
-                TerminalControlScrollSource::Wheel => AttachScrollSource::Wheel,
-                TerminalControlScrollSource::PageKey => AttachScrollSource::PageKey {
-                    input: match direction {
-                        AttachScrollDirection::Up => b"\x1b[5~".to_vec(),
-                        AttachScrollDirection::Down => b"\x1b[6~".to_vec(),
-                    },
-                },
-            };
-            Ok(ClientMessage::AttachScroll {
-                source,
-                direction,
-                lines,
-                column,
-                row,
-                modifiers,
-            })
-        }
-        TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),
-    }
-}
-
 fn run_client_with_mode(
-    requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
@@ -2035,174 +148,140 @@ fn run_client_with_mode(
     init_logging();
 
     let loaded_config = crate::config::Config::load();
-    let identity = load_client_identity_or_exit();
+    // Windows may not have virtual terminal processing enabled until the rendered
+    // client initializes the terminal, so defer the host mouse reset to
+    // `setup_terminal_with_capabilities` instead of emitting raw escapes early.
+    #[cfg(not(windows))]
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
+    let client_rendered_shell = attach_request.is_none();
+    let socket_path = client_socket_path();
+    let keybinding_source = client_shell_keybinding_source();
+    let startup_config_diagnostic =
+        if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
+            crate::config::config_diagnostic_summary_without_keybindings(&loaded_config.diagnostics)
+        } else {
+            crate::config::config_diagnostic_summary(&loaded_config.diagnostics)
+        };
+    let shell_config = client_rendered_shell.then(|| {
+        shell::ClientShellConfig::from_config(&loaded_config.config)
+            .with_startup_config_diagnostic(startup_config_diagnostic)
+            .with_startup_onboarding(loaded_config.config.should_show_onboarding())
+            .with_keybinding_source(keybinding_source)
+            .with_local_endpoint(&socket_path)
+    });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
-    let direct_attach_requested = attach_request.is_some();
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
-    #[cfg(unix)]
-    let client_executable = ClientExecutableIdentity::capture();
-    let remote_client = std::env::var_os(crate::remote::REATTACH_COMMAND_ENV_VAR).is_some();
-
     let kitty_graphics_enabled =
-        loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
-
-    let socket_path = client_socket_path();
-    crate::logging::startup("client");
-    info!(path = %socket_path.display(), "{log_message}");
-
-    // Get the terminal geometry before handshake (before raw mode).
-    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
-        initial_terminal_geometry(kitty_graphics_enabled);
-    let launch_mode = client_launch_mode(
-        direct_attach_requested,
-        exact_cell_size,
-        cell_width_px,
-        cell_height_px,
-    );
-    let stdin_tty = io::stdin().is_terminal();
-    let stdout_tty = io::stdout().is_terminal();
-    #[cfg(unix)]
-    let omp_eligible =
-        client_omp_renderer_eligible(requested_encoding, launch_mode, stdin_tty, stdout_tty);
-    #[cfg(unix)]
-    let (mut stream, omp_executable, (renderer_capabilities, negotiated_encoding)) =
-        match probe_connect_then_resolve_client_omp_and_handshake_with(
-            omp_eligible,
-            || crate::ipc::connect_local_stream(&socket_path),
-            resolve_client_omp_executable,
-            || crate::ipc::connect_local_stream(&socket_path),
-            |stream, omp_executable| {
-                let renderer_capabilities = client_omp_renderer_capabilities(
-                    requested_encoding,
-                    launch_mode,
-                    stdin_tty,
-                    stdout_tty,
-                    omp_executable,
-                );
-                let negotiated_encoding = do_handshake_with_renderer_capabilities(
-                    stream,
-                    cols,
-                    rows,
-                    cell_width_px,
-                    cell_height_px,
-                    requested_encoding,
-                    launch_mode,
-                    renderer_capabilities,
-                    &identity,
-                )?;
-                Ok((renderer_capabilities, negotiated_encoding))
-            },
-        ) {
-            Ok(values) => values,
-            Err(err) => {
-                #[cfg(unix)]
-                if let Some(executable) = client_executable.as_ref().filter(|executable| {
-                    should_relaunch_updated_client_during_startup(
-                        direct_attach_requested,
-                        remote_client,
-                        executable.was_replaced(),
-                    )
-                }) {
-                    info!(path = %executable.path.display(), "relaunching updated client during startup");
-                    let relaunch_error = executable.exec_replacement();
-                    eprintln!("herdr: {err}");
-                    eprintln!(
-                        "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
-                    );
-                    std::process::exit(1);
-                }
-                eprintln!("herdr: {err}");
-                std::process::exit(client_error_exit_code(&err, remote_client));
-            }
-        };
-    #[cfg(unix)]
-    if let Some(executable) = client_executable.as_ref().filter(|executable| {
-        should_relaunch_updated_client_during_startup(
-            direct_attach_requested,
-            remote_client,
-            executable.was_replaced(),
-        )
-    }) {
-        info!(path = %executable.path.display(), "relaunching updated client during startup");
-        let relaunch_error = executable.exec_replacement();
-        eprintln!(
-            "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
-        );
-        std::process::exit(1);
-    }
-
-    #[cfg(not(unix))]
-    let omp_executable: Option<crate::update::OmpExecutable> = None;
-    #[cfg(not(unix))]
-    let renderer_capabilities = client_omp_renderer_capabilities(
-        requested_encoding,
-        launch_mode,
-        stdin_tty,
-        stdout_tty,
-        omp_executable.as_ref(),
-    );
-    #[cfg(not(unix))]
-    let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
-        Ok(stream) => stream,
-        Err(err) => {
-            eprintln!("herdr: {}", ClientError::ConnectionFailed(err));
-            std::process::exit(1);
-        }
-    };
-    #[cfg(not(unix))]
-    let negotiated_encoding = match do_handshake_with_renderer_capabilities(
-        &mut stream,
-        cols,
-        rows,
-        cell_width_px,
-        cell_height_px,
-        requested_encoding,
-        launch_mode,
-        renderer_capabilities,
-        &identity,
-    ) {
-        Ok(encoding) => encoding,
-        Err(err) => {
-            eprintln!("herdr: {err}");
-            std::process::exit(1);
-        }
-    };
-    #[cfg(unix)]
-    let renderer_omp_executable = renderer_capabilities
-        .client_local_native
-        .then_some(omp_executable)
-        .flatten();
-    let loop_config = ClientLoopConfig {
+        loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
+    let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
+    let endpoint_keybindings = shell_config
+        .as_ref()
+        .is_some_and(shell::ClientShellConfig::uses_endpoint_keybindings);
+    let mut loop_config = ClientLoopConfig {
         sound_config: loaded_config.config.ui.sound,
         mouse_scroll_lines,
         redraw_on_focus_gained,
         host_cursor,
         kitty_graphics_enabled,
+        pixel_geometry_enabled,
+        pixel_geometry_fallback: kitty_graphics_enabled,
         mouse_capture_active: mouse_capture,
+        host_escape_disambiguation_active: false,
+        initial_host_input: Vec::new(),
+        endpoint_keybindings,
         remote_image_paste_key,
-        #[cfg(unix)]
-        omp_executable: renderer_omp_executable,
+        shell_config,
     };
 
-    if let Some((terminal_id, takeover)) = attach_request {
-        let attach = ClientMessage::AttachTerminal {
-            terminal_id,
-            takeover,
-        };
-        if let Err(err) = write_to_server(&mut stream, &attach) {
-            eprintln!("herdr: failed to request terminal attach: {err}");
-            std::process::exit(1);
-        }
-    }
+    crate::logging::startup("client");
+    info!(path = %socket_path.display(), "{log_message}");
 
-    // Now set up the terminal. This must happen AFTER the handshake succeeds,
-    // so we don't leave the terminal in raw mode if the server rejects us.
+    let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
+        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
+            warn!(%error, "saved SSH endpoint catalog is unavailable");
+            endpoint::EndpointCatalog::default()
+        })
+    } else {
+        endpoint::EndpointCatalog::default()
+    };
+    let federated = endpoint_catalog.has_enabled_ssh();
+
+    let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
+        Ok(stream) => Some(stream),
+        Err(error) if federated => {
+            warn!(%error, "Local is unavailable; keeping saved machines available");
+            None
+        }
+        Err(error) => {
+            return Err(io::Error::other(
+                ClientError::ConnectionFailed(error).to_string(),
+            ));
+        }
+    };
+
+    // Get the terminal geometry before handshake (before raw mode).
+    let (cols, rows, cell_width_px, cell_height_px, exact_cell_size) =
+        initial_terminal_geometry(pixel_geometry_enabled, kitty_graphics_enabled)?;
+
+    let shell_surface_size = loop_config
+        .shell_config
+        .as_ref()
+        .map(|shell| shell.initial_surface_size(cols, rows));
+    // Healthy Local attaches directly; only an actual failure enters background recovery.
+    let initial = initial_stream
+        .map(|mut stream| {
+            let handshake = do_handshake(
+                &mut stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                exact_cell_size,
+                shell_surface_size,
+                endpoint_keybindings,
+                loop_config.mouse_capture_active,
+                true,
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+            if federated
+                && !endpoint::EndpointNegotiation::new(
+                    handshake.endpoint_methods.clone().unwrap_or_default(),
+                    handshake.endpoint_capabilities.clone().unwrap_or_default(),
+                )
+                .supports_surface_interest()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Local needs a server update before it can participate in multi-machine viewing",
+                ));
+            }
+            if let Some((terminal_id, takeover)) = attach_request {
+                write_to_server(
+                    &mut stream,
+                    &ClientMessage::AttachTerminal {
+                        terminal_id,
+                        takeover,
+                    },
+                )?;
+            }
+            Ok((stream, handshake))
+        })
+        .transpose();
+    let initial = match initial {
+        Ok(initial) => initial,
+        Err(error) if federated => {
+            warn!(%error, "Local handshake failed; keeping saved machines available");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+
+    // The federated shell can show connection notices without any server snapshot.
     let direct_attach = attach_escape.is_some();
-    let terminal_guard = if direct_attach {
+    let mut terminal_guard = if direct_attach {
         setup_direct_attach_terminal(mouse_capture)
     } else {
         setup_terminal(mouse_capture)
@@ -2211,20 +290,15 @@ fn run_client_with_mode(
         eprintln!("herdr: failed to set up terminal: {err}");
         err
     })?;
+    loop_config.host_escape_disambiguation_active =
+        terminal_guard.host_escape_disambiguation_active();
+    loop_config.initial_host_input = terminal_guard.take_buffered_host_input();
 
-    // Install a panic hook to restore the terminal on panic (same as monolithic).
-    let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
-    let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
-    #[cfg(windows)]
-    let panic_restore_windows_input_mode = terminal_guard.restore_windows_input_mode;
+    // Install a panic hook so the foreground client always restores its terminal.
+    let panic_restore = terminal_guard.panic_restore();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal_state(
-            panic_resets_modify_other_keys,
-            panic_resets_host_color_scheme_reports,
-            #[cfg(windows)]
-            panic_restore_windows_input_mode,
-        );
+        panic_restore();
         original_hook(info);
     }));
 
@@ -2247,15 +321,17 @@ fn run_client_with_mode(
 
     let result = rt.block_on(async {
         run_client_loop(
-            stream,
+            initial,
+            endpoint_catalog,
             cols,
             rows,
             cell_width_px,
             cell_height_px,
+            exact_cell_size,
             should_quit,
             loop_config,
-            negotiated_encoding,
             attach_escape,
+            &terminal_guard,
         )
         .await
     });
@@ -2264,32 +340,9 @@ fn run_client_with_mode(
     let terminal_restore_failed = terminal_guard.restore().is_err();
 
     if let Err(err) = result {
+        let _ = writeln!(io::stderr(), "herdr: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
-
-        #[cfg(unix)]
-        if let Some(executable) = client_executable.as_ref().filter(|executable| {
-            should_relaunch_updated_client(
-                &err,
-                direct_attach_requested,
-                remote_client,
-                executable.was_replaced(),
-            )
-        }) {
-            info!(path = %executable.path.display(), "relaunching updated client");
-            let relaunch_error = executable.exec_replacement();
-            let _ = writeln!(io::stderr(), "herdr: {err}");
-            let _ = writeln!(
-                io::stderr(),
-                "herdr: updated client was installed but could not be relaunched: {relaunch_error}"
-            );
-            std::process::exit(1);
-        }
-
-        let _ = writeln!(io::stderr(), "herdr: {err}");
-        if should_request_remote_reconnect(&err, remote_client) {
-            std::process::exit(crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE);
-        }
 
         let detached = matches!(
             &err,
@@ -2308,84 +361,6 @@ fn run_client_with_mode(
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
-
-    Ok(())
-}
-fn display_semantic_surface(
-    state: &mut ClientState,
-    frame_data: crate::protocol::FrameData,
-    force_repaint: bool,
-) {
-    state.repaint_pending |= force_repaint;
-    let frame_data = if state.draw_host_cursor {
-        render_ansi::frame_with_drawn_cursor(frame_data)
-    } else {
-        frame_data
-    };
-    let encoded = if state.draw_host_cursor {
-        state
-            .blit_encoder
-            .encode_with_suppressed_visible_cursor(&frame_data, state.repaint_pending)
-    } else {
-        state
-            .blit_encoder
-            .encode(&frame_data, state.repaint_pending)
-    };
-    let mut stdout = io::stdout();
-    let graphics = if state.kitty_graphics_enabled {
-        frame_data.graphics.as_slice()
-    } else {
-        &[]
-    };
-    let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-    state.blit_encoder.commit(frame_data, encoded);
-    let _ = state.write_mouse_pointer_shape(&mut stdout);
-    let _ = stdout.flush();
-    state.repaint_pending = false;
-}
-
-#[cfg(unix)]
-fn display_pending_omp_surface(
-    state: &mut ClientState,
-    write_stream: &mut LocalStream,
-    host_input_state: &HostInputState,
-    applied_host_input_generation: &mut u64,
-    sync_mouse_mode: bool,
-) -> Result<(), ClientError> {
-    if let Some(surface) = state
-        .omp_renderer
-        .next_frame(Instant::now(), state.reported_size)
-    {
-        display_semantic_surface(state, surface.frame, surface.force_repaint);
-    }
-    if sync_mouse_mode {
-        sync_host_mouse_mode(state, host_input_state, applied_host_input_generation)?;
-    }
-    for effect in state.omp_renderer.take_effects() {
-        match effect {
-            omp_renderer::LocalEffect::Bell(count) => {
-                if let Err(err) =
-                    crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
-                {
-                    warn!(err = %err, "failed to emit local OMP terminal bell");
-                }
-            }
-            omp_renderer::LocalEffect::ClipboardWrite(content) => {
-                crate::selection::write_osc52_bytes(&content);
-                let _ = io::stdout().flush();
-            }
-            omp_renderer::LocalEffect::OpenUrl(url) => {
-                open_safe_url(
-                    &url,
-                    &mut state.detached_process_children,
-                    crate::platform::open_url,
-                );
-            }
-        }
-    }
-    for message in state.omp_renderer.take_outbound_messages() {
-        write_to_server(write_stream, &message).map_err(ClientError::ConnectionLost)?;
-    }
     Ok(())
 }
 
@@ -2397,80 +372,104 @@ fn display_pending_omp_surface(
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
 async fn run_client_loop(
-    stream: LocalStream,
+    initial: Option<(LocalStream, handshake::HandshakeResult)>,
+    mut endpoint_catalog: endpoint::EndpointCatalog,
     cols: u16,
     rows: u16,
     initial_cell_width_px: u32,
     initial_cell_height_px: u32,
+    initial_pixel_geometry_exact: bool,
     should_quit: Arc<AtomicBool>,
-    config: ClientLoopConfig,
-    negotiated_encoding: RenderEncoding,
+    mut config: ClientLoopConfig,
     attach_escape: Option<AttachEscapeState>,
+    _terminal_guard: &TerminalGuard,
 ) -> Result<(), ClientError> {
     #[cfg(windows)]
     let _ = config.mouse_scroll_lines;
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
     let is_remote_client = is_remote_client_process();
+    let local_unavailable = initial.is_none();
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
-        sgr_pixels_active: false,
-        server_mouse_capture_active: config.mouse_capture_active,
-        server_sgr_pixels_active: false,
+        endpoint_mouse_capture_requested: false,
+        endpoint_sgr_pixels_requested: false,
+        host_theme_updates: Vec::new(),
+        direct_mouse_capture_preference: attach_escape.is_some() && config.mouse_capture_active,
+        shell_mouse_capture_preference: config.mouse_capture_active,
+        direct_keyboard_protocol: crate::terminal_modes::DirectHostKeyboardState::default(),
+        pane_keyboard_report_all: false,
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
+        reported_cell_size: (initial_cell_width_px, initial_cell_height_px),
         sound_config: config.sound_config,
         kitty_graphics_enabled: config.kitty_graphics_enabled,
+        pixel_geometry_enabled: config.pixel_geometry_enabled,
+        pixel_geometry_exact: initial_pixel_geometry_exact,
         #[cfg(unix)]
         direct_graphics_response: Arc::new(Mutex::new(direct_graphics::ResponseMatcher::default())),
         #[cfg(unix)]
         retired_direct_graphics: None,
+        #[cfg(unix)]
+        pending_surface_graphics: HashMap::new(),
         attach_escape,
         #[cfg(unix)]
         mouse_scroll_lines: config.mouse_scroll_lines,
         remote_image_paste_key: config.remote_image_paste_key,
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
+        presentation_frozen: false,
+        deferred_local_activation: None,
         draw_host_cursor,
-        reported_cell_size_px: (initial_cell_width_px, initial_cell_height_px),
         detached_process_children: Vec::new(),
-        mouse_pointer: MousePointerState::default(),
-        #[cfg(unix)]
-        omp_renderer: omp_renderer::ClientOmpRenderer::new(config.omp_executable),
+        shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    #[cfg(unix)]
-    state
-        .omp_renderer
-        .set_server_sgr_pixels_active(state.server_sgr_pixels_active);
-    debug!(?negotiated_encoding, "client render encoding active");
+    let mut federated = endpoint_catalog.has_enabled_ssh();
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
+        shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        shell.set_endpoint_methods_for(
+            &endpoint::ClientEndpointId::Local,
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_methods.clone()),
+        );
+        shell.set_endpoint_agent_view_projection_supported(
+            &endpoint::ClientEndpointId::Local,
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_capabilities.as_ref())
+                .is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| {
+                        capability == crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY
+                    })
+                }),
+        );
+        if local_unavailable {
+            shell.set_endpoint_status(
+                &endpoint::ClientEndpointId::Local,
+                endpoint::ClientEndpointStatus::Connecting,
+            );
+        }
+    }
+    let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
-    #[cfg(unix)]
-    let initial_host_geometry = crate::input::mouse::HostGeometry::current()
-        .filter(|geometry| geometry.cols == cols && geometry.rows == rows);
-    #[cfg(unix)]
-    let (host_input_state, stdin_input_wake) =
-        HostInputState::with_input_fd(state.mouse_capture_active, false, io::stdin().as_raw_fd())
-            .map_err(ClientError::ConnectionFailed)?;
-    #[cfg(unix)]
-    {
-        host_input_state
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .geometry = initial_host_geometry;
-    }
-    #[cfg(unix)]
-    let host_input_state = Arc::new(host_input_state);
-    #[cfg(unix)]
-    let mut applied_host_input_generation = host_input_state.load().generation();
-    #[cfg(unix)]
-    let mut applied_host_geometry = initial_host_geometry;
+    let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
 
-    // Channel for events from the stdin, resize, and server reader threads.
+    // Channel for events from the resize and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let (supervisor_tx, mut supervisor_rx) =
+        tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
+    // Keep Windows console draining independent of server-frame backpressure.
+    #[cfg(windows)]
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    #[cfg(unix)]
+    let stdin_tx = event_tx.clone();
+
+    let mut endpoint_commands = endpoint_commands::EndpointCommands::default();
 
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme =
@@ -2480,9 +479,10 @@ async fn run_client_loop(
     let will_query_host_cell_size = state.attach_escape.is_none()
         && host_cell_size_query_required(state.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
-    let stdin_tx = event_tx.clone();
-    #[cfg(unix)]
-    let stdin_host_input_state = host_input_state.clone();
+    let stdin_mouse_capture_active = host_mouse_capture_active.clone();
+    let stdin_sgr_pixels_active = host_sgr_pixels_active.clone();
+    let stdin_escape_disambiguation_active = config.host_escape_disambiguation_active;
+    let stdin_initial_host_input = std::mem::take(&mut config.initial_host_input);
     #[cfg(unix)]
     let stdin_direct_response = state.direct_graphics_response.clone();
     #[cfg(unix)]
@@ -2496,10 +496,10 @@ async fn run_client_loop(
             &stdin_quit,
             will_query_host_terminal_theme,
             will_query_host_cell_size,
-            #[cfg(unix)]
-            stdin_host_input_state,
-            #[cfg(unix)]
-            stdin_input_wake,
+            stdin_mouse_capture_active,
+            stdin_sgr_pixels_active,
+            stdin_escape_disambiguation_active,
+            stdin_initial_host_input,
             #[cfg(unix)]
             stdin_direct_response,
             #[cfg(unix)]
@@ -2509,6 +509,10 @@ async fn run_client_loop(
 
     if will_query_host_terminal_theme {
         query_host_terminal_theme();
+        #[cfg(not(windows))]
+        if state.shell.is_some() {
+            query_host_terminal_appearance();
+        }
     }
 
     if will_query_host_cell_size {
@@ -2519,9 +523,8 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     let resize_cell_size = reported_cell_size.clone();
-    #[cfg(unix)]
-    let resize_input_state = host_input_state.clone();
-    let kitty_graphics_enabled = state.kitty_graphics_enabled;
+    let pixel_geometry_enabled = state.pixel_geometry_enabled;
+    let pixel_geometry_fallback = config.pixel_geometry_fallback;
     std::thread::spawn(move || {
         resize_poll_loop(
             resize_tx,
@@ -2529,141 +532,344 @@ async fn run_client_loop(
             rows,
             initial_cell_width_px,
             initial_cell_height_px,
-            kitty_graphics_enabled,
+            initial_pixel_geometry_exact,
+            pixel_geometry_enabled,
+            pixel_geometry_fallback,
             &resize_cell_size,
-            #[cfg(unix)]
-            &resize_input_state,
             &resize_quit,
         );
     });
 
-    // Spawn the server reader thread (blocking reads from the socket).
-    // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
+    let mut write_stream = if let Some((stream, handshake)) = initial {
+        let max_frame_size = if state.kitty_graphics_enabled {
             MAX_GRAPHICS_FRAME_SIZE
         } else {
-            MAX_FRAME_SIZE
+            crate::protocol::MAX_FRAME_SIZE
         };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
+        let negotiation = endpoint::EndpointNegotiation::new(
+            handshake.endpoint_methods.unwrap_or_default(),
+            handshake.endpoint_capabilities.unwrap_or_default(),
         );
-    });
-
-    // Use the original stream for writing (blocking is fine since we write
-    // from the async loop).
-    let mut write_stream = stream;
-    write_stream
-        .set_nonblocking(false)
-        .map_err(ClientError::ConnectionFailed)?;
+        let surface_reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
+        let surface_delta = negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+        let surface_decoder = (surface_reuse || surface_delta)
+            .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
+        let transport = start_endpoint_transport(
+            stream,
+            (),
+            &event_tx,
+            endpoint::ClientEndpointId::Local,
+            1,
+            max_frame_size,
+            surface_decoder,
+        )?;
+        let mut registry = endpoint::EndpointRegistry::new(transport, 1, negotiation);
+        if state.shell.is_some() {
+            registry.send(&ClientMessage::ClientShellFocus { focused: true });
+        }
+        registry
+    } else {
+        endpoint::EndpointRegistry::empty()
+    };
+    let mut supervisors =
+        endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    if federated {
+        supervisors.add_local(
+            client_socket_path(),
+            write_stream
+                .connection(&endpoint::ClientEndpointId::Local)
+                .map(|connection| connection.generation),
+            std::time::Instant::now(),
+        );
+    }
+    if local_unavailable {
+        if let Some(frame) = state
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.compose(cols, rows))
+        {
+            state.present_frame(frame);
+        }
+    }
+    let mut next_surface_serial = 1_u64;
+    let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
+    let mut scheduled_activation = None;
+    let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
+        catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
+    }
 
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
-    use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
     // Main event loop.
-    #[cfg(unix)]
-    let mut ordered_input = VecDeque::new();
-    #[cfg(unix)]
-    let mut ordered_input_batch_active = false;
+    let mut client_timer = timer::ClientLoopTimer::new();
+    #[cfg(windows)]
+    let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
-        #[cfg(unix)]
-        if ordered_input_batch_active && ordered_input.is_empty() {
-            sync_host_mouse_mode(
-                &mut state,
-                &host_input_state,
-                &mut applied_host_input_generation,
-            )?;
-            ordered_input_batch_active = false;
-        }
-        let event = {
-            #[cfg(unix)]
-            if let Some(event) = ordered_input.pop_front() {
-                event
-            } else {
-                tokio::select! {
-                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+        if pending_activation.is_none() {
+            if let Some(reload) = pending_catalog.take() {
+                match reload {
+                    Ok(profiles) => {
+                        let now = std::time::Instant::now();
+                        if !federated && profiles.iter().any(|profile| profile.enabled) {
+                            // Keep Local recovery once enabled, even after removing the last SSH profile.
+                            federated = true;
+                            supervisors.add_local(
+                                client_socket_path(),
+                                write_stream
+                                    .connection(&endpoint::ClientEndpointId::Local)
+                                    .map(|connection| connection.generation),
+                                now,
+                            );
+                            if write_stream
+                                .connection(&endpoint::ClientEndpointId::Local)
+                                .is_some_and(|connection| {
+                                    !connection.negotiation.supports_surface_interest()
+                                })
+                            {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.receive_endpoint_unavailable(
+                                        "Update the Local server before switching between machines"
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                        let active_removed = catalog_reload::apply_profiles(
+                            &mut state,
+                            &mut write_stream,
+                            &mut endpoint_commands,
+                            &mut supervisors,
+                            &mut endpoint_catalog,
+                            profiles,
+                            now,
+                        );
+                        if active_removed {
+                            clear_endpoint_host_effects(
+                                &mut state,
+                                &host_mouse_capture_active,
+                                &host_sgr_pixels_active,
+                            );
+                            scheduled_activation = None;
+                            if state.shell.as_ref().is_some_and(|shell| {
+                                shell.endpoint_projection_available(
+                                    &endpoint::ClientEndpointId::Local,
+                                )
+                            }) && write_stream
+                                .connection(&endpoint::ClientEndpointId::Local)
+                                .is_some()
+                            {
+                                scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+                                    endpoint_id: endpoint::ClientEndpointId::Local,
+                                    target: None,
+                                    force: true,
+                                });
+                            } else {
+                                present_handoff_unavailable(
+                                    &mut state,
+                                    "Local is unavailable; reconnecting".into(),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "saved machines could not be reloaded; keeping current connections");
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.receive_endpoint_unavailable(format!(
+                                "Saved machines could not be reloaded; keeping current connections: {error}"
+                            ));
+                        }
+                    }
+                }
+                apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
+                if let Some(shell) = state.shell.as_mut() {
+                    let cleanup = shell.take_pending_graphics_cleanup();
+                    let frame = shell.compose(state.reported_size.0, state.reported_size.1);
+                    let frozen = state.presentation_frozen;
+                    state.presentation_frozen = false;
+                    state.present_graphics(&cleanup);
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    state.presentation_frozen = frozen;
                 }
             }
-            #[cfg(not(unix))]
-            {
-                tokio::select! {
-                    ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
-                }
+        }
+        if let Some(shell) = state.shell.as_ref() {
+            supervisors.spawn_due(
+                std::time::Instant::now(),
+                endpoint::EndpointConnectOptions {
+                    cols: state.reported_size.0,
+                    rows: state.reported_size.1,
+                    cell_width_px: state.reported_cell_size.0,
+                    cell_height_px: state.reported_cell_size.1,
+                    pixel_geometry_exact: state.pixel_geometry_exact,
+                    surface_size: shell.surface_size(state.reported_size.0, state.reported_size.1),
+                    endpoint_keybindings: config.endpoint_keybindings,
+                    mouse_capture: state.shell_mouse_capture_preference,
+                },
+                &supervisor_tx,
+            );
+        }
+        let timer_delay = state
+            .shell
+            .as_ref()
+            .map_or(Duration::from_millis(100), |shell| {
+                shell.timer_delay(std::time::Instant::now())
+            });
+        let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
+        let immediate_event = scheduled_activation.take();
+        #[cfg(windows)]
+        let event = if let Some(event) = immediate_event {
+            event
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+                ev = stdin_rx.recv(), if stdin_open => match ev {
+                    Some(event) => event,
+                    None => {
+                        stdin_open = false;
+                        ClientLoopEvent::Timer
+                    }
+                },
+                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+                ev = supervisor_rx.recv() => ev.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
             }
         };
+        #[cfg(unix)]
+        let event = if let Some(event) = immediate_event {
+            event
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(timer_deadline.into()) => ClientLoopEvent::Timer,
+                ev = supervisor_rx.recv() => ev.map(ClientLoopEvent::EndpointSupervisor).unwrap_or(ClientLoopEvent::Timer),
+                ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+            }
+        };
+        let now = std::time::Instant::now();
+        if let Some(shell) = state.shell.as_mut() {
+            shell.tick_popup_pending(now);
+        }
 
         match event {
+            ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
-            ClientLoopEvent::OrderedInput(events) => {
-                if !events.is_empty() {
-                    ordered_input_batch_active = true;
-                    ordered_input.extend(events);
-                }
-                continue;
-            }
-            #[cfg(unix)]
-            ClientLoopEvent::StdinInput(data, input_state) => {
-                let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-                let has_mouse = events
-                    .iter()
-                    .any(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)));
-                let attach_mode = state.attach_escape.is_some();
-                let current_input_state = host_input_state.load();
-                if has_mouse
-                    && !mouse_input_is_current(
-                        input_state,
-                        current_input_state,
-                        applied_host_input_generation,
-                        !attach_mode,
-                    )
-                {
+            ClientLoopEvent::StdinInput(data) => {
+                let image_bridge_active = endpoint_accepts_local_images(
+                    is_remote_client,
+                    write_stream.active_id(),
+                    write_stream.active_surface_available(),
+                );
+                if state.shell.is_some() {
+                    if will_query_host_cell_size {
+                        let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                        if let Some((width_px, height_px)) = reported_cell_size_from_events(&events)
+                        {
+                            store_reported_cell_size(&reported_cell_size, width_px, height_px);
+                        }
+                    }
+                    let image_target = state
+                        .shell
+                        .as_ref()
+                        .and_then(|shell| shell.clipboard_image_target());
+                    if let Some(target) = image_target.clone() {
+                        if should_bridge_clipboard_image_paste(
+                            &data,
+                            image_bridge_active,
+                            state.remote_image_paste_key,
+                        ) {
+                            if let Some(image) = crate::platform::read_clipboard_image() {
+                                write_remote_image_to_server(
+                                    &mut write_stream,
+                                    target,
+                                    image,
+                                    "clipboard paste",
+                                )?;
+                                continue;
+                            }
+                            info!(
+                                "clipboard image paste trigger received, but local clipboard has no image"
+                            );
+                        }
+                        if let Some(image) =
+                            read_image_file_from_terminal_drop(&data, image_bridge_active)
+                        {
+                            write_remote_image_to_server(
+                                &mut write_stream,
+                                target,
+                                image,
+                                "file drop",
+                            )?;
+                            continue;
+                        }
+                    }
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
+                    if crate::raw_input::events_require_host_mode_refresh(&events) {
+                        refresh_host_mouse_capture(
+                            state.mouse_capture_active,
+                            host_sgr_pixels_active.load(Ordering::Acquire),
+                        );
+                    }
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_raw_events(events);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &mut endpoint_commands,
+                        &mut prefix_input_source,
+                        &mut scheduled_activation,
+                    )? {
+                        return Ok(());
+                    }
                     continue;
                 }
-                if let Some(cell) = state.mouse_pointer.observe_raw_events(&events) {
-                    state.omp_renderer.observe_pointer_cell(cell);
-                }
-                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                let (data, parsed_events) = if let Some(attach_escape) = &mut state.attach_escape {
-                    let data = match attach_escape.filter_input(
+                let data = if let Some(attach_escape) = &mut state.attach_escape {
+                    match attach_escape.filter_input(
                         data,
                         state.reported_size.1,
                         state.mouse_scroll_lines,
                     ) {
                         AttachInputAction::Forward(data) => data,
-                        AttachInputAction::ForwardAfterPendingPrefix(data) => {
-                            let prefix = ClientMessage::Input { data: vec![0x02] };
-                            if let Err(e) = write_to_server(&mut write_stream, &prefix) {
+                        AttachInputAction::ForwardPair(first, second) => {
+                            for data in [first, second] {
+                                if let Err(e) = write_to_server(
+                                    &mut write_stream,
+                                    &ClientMessage::Input { data },
+                                ) {
+                                    return Err(ClientError::ConnectionLost(e));
+                                }
+                            }
+                            continue;
+                        }
+                        AttachInputAction::Semantic(action) => {
+                            if let Err(e) = write_attach_semantic_action(&mut write_stream, action)
+                            {
                                 return Err(ClientError::ConnectionLost(e));
                             }
-                            data
+                            continue;
                         }
-                        AttachInputAction::Scroll {
-                            source,
-                            direction,
-                            lines,
-                            column,
-                            row,
-                            modifiers,
-                        } => {
-                            let msg = ClientMessage::AttachScroll {
-                                source,
-                                direction,
-                                lines,
-                                column,
-                                row,
-                                modifiers,
-                            };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        AttachInputAction::ForwardThenSemantic(prefix, action) => {
+                            if let Err(e) = write_to_server(
+                                &mut write_stream,
+                                &ClientMessage::Input { data: prefix },
+                            ) {
+                                return Err(ClientError::ConnectionLost(e));
+                            }
+                            if let Err(e) = write_attach_semantic_action(&mut write_stream, action)
+                            {
                                 return Err(ClientError::ConnectionLost(e));
                             }
                             continue;
@@ -2673,9 +879,9 @@ async fn run_client_loop(
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
-                    };
-                    (data, None)
+                    }
                 } else {
+                    let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
                     if crate::raw_input::events_require_host_surface_redraw(
                         &events,
                         state.redraw_on_focus_gained,
@@ -2691,45 +897,34 @@ async fn run_client_loop(
                     if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
                         store_reported_cell_size(&reported_cell_size, width_px, height_px);
                     }
-                    (data, Some(events))
+                    data
                 };
-                if state.omp_renderer.owns_input() {
-                    for message in state.omp_renderer.route_input_at_generation(
-                        parsed_events.unwrap_or_default(),
-                        input_state.generation(),
-                    ) {
-                        if let Err(error) = write_to_server(&mut write_stream, &message) {
-                            return Err(ClientError::ConnectionLost(error));
-                        }
-                    }
-                    display_pending_omp_surface(
-                        &mut state,
-                        &mut write_stream,
-                        &host_input_state,
-                        &mut applied_host_input_generation,
-                        !ordered_input_batch_active,
-                    )?;
-                    let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                    continue;
-                }
-                if let Some(events) = parsed_events.as_deref() {
-                    state.omp_renderer.observe_outer_focus(events);
-                }
                 if should_bridge_clipboard_image_paste(
                     &data,
-                    is_remote_client,
+                    image_bridge_active,
                     state.remote_image_paste_key,
                 ) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
-                        write_remote_image_to_server(&mut write_stream, image, "clipboard paste")?;
+                        write_remote_image_to_server(
+                            &mut write_stream,
+                            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                            image,
+                            "clipboard paste",
+                        )?;
                         continue;
                     }
                     info!(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
-                    write_remote_image_to_server(&mut write_stream, image, "file drop")?;
+                if let Some(image) = read_image_file_from_terminal_drop(&data, image_bridge_active)
+                {
+                    write_remote_image_to_server(
+                        &mut write_stream,
+                        crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                        image,
+                        "file drop",
+                    )?;
                     continue;
                 }
                 let msg = ClientMessage::Input { data };
@@ -2739,547 +934,1229 @@ async fn run_client_loop(
             }
             #[cfg(unix)]
             ClientLoopEvent::DirectGraphicsResponse(response) => {
-                state.omp_renderer.complete_direct_graphics(
-                    response.transfer_id,
-                    response.image_id,
-                    response.success,
-                );
+                let pending_key = state
+                    .pending_surface_graphics
+                    .keys()
+                    .find(|(_, transfer_id, image_id)| {
+                        *transfer_id == response.transfer_id && *image_id == response.image_id
+                    })
+                    .cloned();
+                let owner = pending_key
+                    .as_ref()
+                    .map(|(endpoint_id, _, _)| endpoint_id.clone());
+                let composed = pending_key
+                    .and_then(|key| {
+                        state
+                            .pending_surface_graphics
+                            .remove(&key)
+                            .map(|asset| (key, asset))
+                    })
+                    .filter(|_| response.success)
+                    .and_then(|((endpoint_id, _, _), asset)| {
+                        if write_stream.active_id() != &endpoint_id {
+                            return None;
+                        }
+                        let shell = state.shell.as_mut()?;
+                        shell
+                            .trust_direct_graphics_asset(&asset, response.image_id)
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten()
+                    });
                 let message = ClientMessage::GraphicsTransmissionResult {
                     transfer_id: response.transfer_id,
                     image_id: response.image_id,
                     success: response.success,
                 };
-                if let Err(err) = write_to_server(&mut write_stream, &message) {
-                    return Err(ClientError::ConnectionLost(err));
+                if let Some(owner) = owner {
+                    write_stream.send_to(&owner, &message);
+                }
+                if let Some(frame) = composed {
+                    state.present_frame(frame);
                 }
             }
             #[cfg(unix)]
-            ClientLoopEvent::PixelMouse(data, geometry, input_state) => {
-                let current_input_state = host_input_state.load();
-                if !pixel_input_is_current(
-                    input_state,
-                    current_input_state,
-                    applied_host_input_generation,
-                    geometry,
-                    applied_host_geometry,
-                ) || !current_input_state.sgr_pixels_active()
-                {
+            ClientLoopEvent::PixelMouse(data, geometry) => {
+                if state.shell.is_some() {
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_pixel_mouse(&data, geometry);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &mut endpoint_commands,
+                        &mut prefix_input_source,
+                        &mut scheduled_activation,
+                    )? {
+                        return Ok(());
+                    }
                     continue;
                 }
-                let cell =
-                    crate::input::mouse::parse_report(&data).and_then(|(x, y)| geometry.cell(x, y));
-                state.mouse_pointer.set_cell(cell);
-                let message =
-                    state
-                        .omp_renderer
-                        .route_pixel_input(data, geometry, input_state.generation());
-                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                if let Some(message) = message {
-                    if let Err(err) = write_to_server(&mut write_stream, &message) {
-                        return Err(ClientError::ConnectionLost(err));
+                if let Some(attach_escape) = state.attach_escape.as_mut() {
+                    if let Some(prefix) = attach_escape.take_pending_prefix() {
+                        if let Err(err) = write_to_server(
+                            &mut write_stream,
+                            &ClientMessage::Input { data: prefix },
+                        ) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
+                    }
+                    if let Some((kind, position, modifiers)) =
+                        direct_attach_pixel_mouse(&data, geometry)
+                    {
+                        let message = ClientMessage::AttachMouse {
+                            kind,
+                            position,
+                            geometry: Some(crate::protocol::ClientMouseGeometry {
+                                cols: geometry.cols,
+                                rows: geometry.rows,
+                                width_px: geometry.width_px,
+                                height_px: geometry.height_px,
+                            }),
+                            modifiers,
+                            lines: state.mouse_scroll_lines.max(1).min(u16::MAX as usize) as u16,
+                        };
+                        if let Err(err) = write_to_server(&mut write_stream, &message) {
+                            return Err(ClientError::ConnectionLost(err));
+                        }
                     }
                 }
-                display_pending_omp_surface(
-                    &mut state,
-                    &mut write_stream,
-                    &host_input_state,
-                    &mut applied_host_input_generation,
-                    !ordered_input_batch_active,
-                )?;
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
-                if state.attach_escape.is_some() {
-                    continue;
-                }
-                if should_bridge_clipboard_image_events(
-                    &events,
+                let image_bridge_active = endpoint_accepts_local_images(
                     is_remote_client,
-                    state.remote_image_paste_key,
-                ) {
-                    if let Some(image) = crate::platform::read_clipboard_image() {
-                        write_remote_image_to_server(&mut write_stream, image, "clipboard paste")?;
-                        continue;
+                    write_stream.active_id(),
+                    write_stream.active_surface_available(),
+                );
+                if state.shell.is_some() {
+                    if events.iter().any(|event| {
+                        matches!(event, crate::protocol::ClientInputEvent::FocusGained)
+                    }) {
+                        refresh_host_mouse_capture(
+                            state.mouse_capture_active,
+                            host_sgr_pixels_active.load(Ordering::Acquire),
+                        );
                     }
-                    info!(
-                        "clipboard image paste trigger received, but local clipboard has no image"
-                    );
-                }
-                if let Some(image) = read_image_file_from_client_events(&events, is_remote_client) {
-                    write_remote_image_to_server(&mut write_stream, image, "file drop")?;
+                    let image_target = state
+                        .shell
+                        .as_ref()
+                        .and_then(|shell| shell.clipboard_image_target());
+                    if let Some(target) = image_target.clone() {
+                        if should_bridge_clipboard_image_events(
+                            &events,
+                            image_bridge_active,
+                            state.remote_image_paste_key,
+                        ) {
+                            if let Some(image) = crate::platform::read_clipboard_image() {
+                                write_remote_image_to_server(
+                                    &mut write_stream,
+                                    target,
+                                    image,
+                                    "clipboard paste",
+                                )?;
+                                continue;
+                            }
+                            info!(
+                                "clipboard image paste trigger received, but local clipboard has no image"
+                            );
+                        }
+                        if let Some(image) =
+                            read_image_file_from_client_events(&events, image_bridge_active)
+                        {
+                            write_remote_image_to_server(
+                                &mut write_stream,
+                                target,
+                                image,
+                                "file drop",
+                            )?;
+                            continue;
+                        }
+                    }
+                    let (outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let outcome = shell.handle_client_events(&events);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (outcome, frame)
+                    };
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &mut endpoint_commands,
+                        &mut prefix_input_source,
+                        &mut scheduled_activation,
+                    )? {
+                        return Ok(());
+                    }
                     continue;
                 }
-                let raw_events = events
-                    .iter()
-                    .map(crate::protocol::ClientInputEvent::to_raw_input_event)
-                    .collect::<Vec<_>>();
-                let _ = state.mouse_pointer.observe_raw_events(&raw_events);
-                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                if crate::raw_input::events_require_host_surface_redraw(
-                    &raw_events,
-                    state.redraw_on_focus_gained,
-                ) {
-                    state.request_repaint();
-                }
-                let msg = ClientMessage::InputEvents { events };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
-                    return Err(ClientError::ConnectionLost(e));
-                }
+                // Direct terminal attach is Unix-only; every Windows client uses ClientShell.
+            }
+            ClientLoopEvent::TerminalUnavailable(err) => {
+                info!(err = %err, "client terminal unavailable; detaching");
+                let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                return Ok(());
             }
             ClientLoopEvent::Resize(
                 new_cols,
                 new_rows,
                 cell_width_px,
                 cell_height_px,
-                resize_generation,
-                host_geometry,
+                pixel_geometry_exact,
             ) => {
-                #[cfg(unix)]
-                {
-                    apply_resize_input_boundary(
-                        &mut applied_host_input_generation,
-                        &mut applied_host_geometry,
-                        resize_generation,
-                        host_geometry,
+                if !pixel_geometry_exact && host_sgr_pixels_active.load(Ordering::Acquire) {
+                    set_mouse_capture(state.mouse_capture_active, false)
+                        .map_err(ClientError::ConnectionFailed)?;
+                    host_sgr_pixels_active.store(false, Ordering::Release);
+                } else {
+                    refresh_host_mouse_capture(
+                        state.mouse_capture_active,
+                        host_sgr_pixels_active.load(Ordering::Acquire),
                     );
                 }
-                #[cfg(windows)]
-                let _ = (resize_generation, host_geometry);
                 state.reported_size = (new_cols, new_rows);
-                state.reported_cell_size_px = (cell_width_px, cell_height_px);
-                state.mouse_pointer.set_cell(None);
-                // Resizing invalidates both server and local PTY blit baselines.
+                state.reported_cell_size = (cell_width_px, cell_height_px);
+                state.pixel_geometry_exact = pixel_geometry_exact;
+                // Resizing invalidates both the host-side blit baseline and pane hit geometry.
                 state.request_repaint();
-                #[cfg(unix)]
-                {
-                    state.omp_renderer.resize(
-                        (new_cols, new_rows, cell_width_px, cell_height_px),
-                        applied_host_geometry,
-                        applied_host_input_generation,
-                    );
-                    display_pending_omp_surface(
-                        &mut state,
-                        &mut write_stream,
-                        &host_input_state,
-                        &mut applied_host_input_generation,
-                        !ordered_input_batch_active,
-                    )?;
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.set_graphics_cell_size(cell_width_px, cell_height_px);
+                    shell.invalidate_pane_surface();
                 }
-                let _ = state.write_mouse_pointer_shape(&mut io::stdout());
-                let msg = ClientMessage::Resize {
-                    cols: new_cols,
-                    rows: new_rows,
-                    cell_width_px,
-                    cell_height_px,
+                let msg = if let Some(shell) = &state.shell {
+                    client_shell_resize_message(
+                        shell,
+                        new_cols,
+                        new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                        pixel_geometry_exact,
+                    )
+                } else {
+                    ClientMessage::Resize {
+                        cols: new_cols,
+                        rows: new_rows,
+                        cell_width_px,
+                        cell_height_px,
+                        pixel_mouse: pixel_geometry_exact,
+                    }
                 };
-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                if let Some(activation) = pending_activation.as_mut() {
+                    if let Err(error) = activation.update_resize(msg, &mut write_stream) {
+                        rollback_endpoint_activation(
+                            &mut state,
+                            &mut write_stream,
+                            &mut pending_activation,
+                            error,
+                            false,
+                        );
+                    }
+                } else if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
-                    #[cfg(unix)]
-                    {
-                        if let Some(surface) = state.omp_renderer.cache_server_frame(
-                            frame_data,
-                            state.reported_cell_size_px,
-                            applied_host_input_generation,
-                        ) {
-                            display_semantic_surface(
+            ClientLoopEvent::EndpointSupervisor(event) => match event {
+                endpoint::EndpointSupervisorEvent::Status {
+                    endpoint_id,
+                    generation,
+                    status,
+                    message,
+                } => {
+                    if !supervisors.record_status(&endpoint_id, generation, status, now) {
+                        continue;
+                    }
+                    if status == endpoint::ClientEndpointStatus::Attention {
+                        warn!(endpoint = %endpoint_id.storage_key(), generation, error = %message, "endpoint needs attention");
+                    }
+                    let unavailable = state.shell.as_mut().and_then(|shell| {
+                        shell.set_endpoint_status(&endpoint_id, status);
+                        shell.set_machine_diagnostic(&endpoint_id, message.clone());
+                        (status == endpoint::ClientEndpointStatus::Attention
+                            && shell.endpoint_is_active(&endpoint_id))
+                        .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))
+                    });
+                    if let Some(message) = unavailable {
+                        present_handoff_unavailable(&mut state, message);
+                    } else if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    }) {
+                        state.present_frame(frame);
+                    }
+                }
+                endpoint::EndpointSupervisorEvent::Connected {
+                    endpoint_id,
+                    generation,
+                    reader,
+                    writer,
+                    negotiation,
+                } => {
+                    if !supervisors.record_status(
+                        &endpoint_id,
+                        generation,
+                        endpoint::ClientEndpointStatus::Online,
+                        now,
+                    ) {
+                        continue;
+                    }
+                    let surface_reuse =
+                        negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
+                    let surface_delta =
+                        negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
+                    let agent_view_projection_supported = negotiation.supports_capability(
+                        crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY,
+                    );
+                    let frame = state.shell.as_mut().and_then(|shell| {
+                        shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
+                        shell.set_endpoint_agent_view_projection_supported(
+                            &endpoint_id,
+                            agent_view_projection_supported,
+                        );
+                        shell.compose(state.reported_size.0, state.reported_size.1)
+                    });
+                    let reader_quit = writer.stop_handle();
+                    write_stream.insert(
+                        endpoint_id.clone(),
+                        writer,
+                        generation,
+                        negotiation,
+                        false,
+                    );
+                    if let Some(frame) = frame {
+                        state.present_frame(frame);
+                    }
+                    let surface_decoder = (surface_reuse || surface_delta)
+                        .then(|| protocol::surface_reuse::Decoder::new(surface_delta));
+                    let reader_tx = event_tx.clone();
+                    std::thread::spawn(move || {
+                        server_reader_thread(
+                            reader,
+                            reader_tx,
+                            &reader_quit,
+                            MAX_GRAPHICS_FRAME_SIZE,
+                            endpoint_id,
+                            generation,
+                            surface_decoder,
+                        );
+                    });
+                }
+            },
+            ClientLoopEvent::ActivateEndpoint {
+                endpoint_id,
+                target,
+                force,
+            } => {
+                if !endpoint_catalog.select_endpoint(&endpoint_id) {
+                    continue;
+                }
+                if let Err(error) = endpoint_catalog.store_selection() {
+                    warn!(%error, "failed to persist desired endpoint selection");
+                }
+                begin_endpoint_activation(
+                    &mut state,
+                    &mut write_stream,
+                    &mut endpoint_commands,
+                    &mut pending_activation,
+                    &mut next_surface_serial,
+                    endpoint_id,
+                    target,
+                    force,
+                    now,
+                    &mut scheduled_activation,
+                )?;
+            }
+            ClientLoopEvent::ServerMessage {
+                endpoint_id,
+                generation,
+                message,
+            } => {
+                if !write_stream.accepts(&endpoint_id, generation) {
+                    continue;
+                }
+                write_stream.received(&endpoint_id, generation, now);
+                let endpoint_active = write_stream.active_id() == &endpoint_id
+                    && write_stream
+                        .connection(&endpoint_id)
+                        .is_some_and(|connection| connection.surface_active);
+                let activation_message = pending_activation
+                    .as_ref()
+                    .is_some_and(|pending| pending.accepts_endpoint(&endpoint_id, generation));
+                let command_response = match message.as_ref() {
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
+                        request_id,
+                        ..
+                    } => endpoint_commands.accepts_response(
+                        &endpoint_id,
+                        generation,
+                        boot_id,
+                        request_id,
+                    ),
+                    _ => false,
+                };
+                if !endpoint::accepts_endpoint_message(
+                    endpoint_active,
+                    activation_message,
+                    command_response,
+                    message.as_ref(),
+                ) {
+                    continue;
+                }
+                // Target presentation effects may arrive as soon as surface.set(true) is
+                // acknowledged. They cannot be applied while the source frame is frozen; the
+                // target receives one explicit replay after the coherent commit instead.
+                if state.presentation_frozen
+                    && activation_message
+                    && endpoint::is_presentation_effect(message.as_ref())
+                {
+                    continue;
+                }
+                match *message {
+                    ServerMessage::ClientShellSnapshot(_) => {
+                        let message = "server sent an unnegotiated binary endpoint snapshot";
+                        if federated || !endpoint_id.is_local() {
+                            if handle_endpoint_attention(
                                 &mut state,
-                                surface.frame,
-                                surface.force_repaint,
-                            );
-                        }
-                        display_pending_omp_surface(
-                            &mut state,
-                            &mut write_stream,
-                            &host_input_state,
-                            &mut applied_host_input_generation,
-                            !ordered_input_batch_active,
-                        )?;
-                    }
-                    #[cfg(not(unix))]
-                    display_semantic_surface(&mut state, frame_data, false);
-                }
-                ServerMessage::OmpRendererTarget {
-                    launch_id,
-                    authority_revision,
-                    target_app_client_id,
-                    route,
-                    bound,
-                    surface_active,
-                    prefix,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        state.omp_renderer.apply_target(
-                            launch_id,
-                            authority_revision,
-                            target_app_client_id,
-                            route,
-                            bound,
-                            surface_active,
-                            prefix,
-                            (
-                                state.reported_size.0,
-                                state.reported_size.1,
-                                state.reported_cell_size_px.0,
-                                state.reported_cell_size_px.1,
-                            ),
-                            applied_host_input_generation,
-                        );
-                        display_pending_omp_surface(
-                            &mut state,
-                            &mut write_stream,
-                            &host_input_state,
-                            &mut applied_host_input_generation,
-                            !ordered_input_batch_active,
-                        )?;
-                    }
-                    #[cfg(not(unix))]
-                    let _ = (
-                        launch_id,
-                        authority_revision,
-                        target_app_client_id,
-                        route,
-                        bound,
-                        surface_active,
-                        prefix,
-                    );
-                }
-                ServerMessage::OmpLinkActivationResult {
-                    launch_id,
-                    request_id,
-                    activated,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        state.omp_renderer.resolve_link_activation(
-                            launch_id,
-                            request_id,
-                            activated,
-                            applied_host_input_generation,
-                        );
-                        display_pending_omp_surface(
-                            &mut state,
-                            &mut write_stream,
-                            &host_input_state,
-                            &mut applied_host_input_generation,
-                            !ordered_input_batch_active,
-                        )?;
-                    }
-                    #[cfg(not(unix))]
-                    let _ = (launch_id, request_id, activated);
-                }
-                ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-                        record_received_kitty_graphics(&frame.bytes);
-                    }
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
-                    let _ = stdout.flush();
-                }
-                ServerMessage::Graphics { bytes } => {
-                    #[cfg(unix)]
-                    state.omp_renderer.cache_server_graphics(
-                        &bytes,
-                        (
-                            state.reported_size.0,
-                            state.reported_size.1,
-                            state.reported_cell_size_px.0,
-                            state.reported_cell_size_px.1,
-                        ),
-                    );
-                    if state.kitty_graphics_enabled {
-                        record_received_kitty_graphics(&bytes);
-                        let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&bytes);
-                        let _ = stdout.flush();
-                    }
-                }
-                ServerMessage::TerminalBell { count } => {
-                    if let Err(err) =
-                        crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
-                    {
-                        warn!(err = %err, "failed to emit terminal bell");
-                    }
-                }
-                ServerMessage::GraphicsFile {
-                    path,
-                    expected_len,
-                    image_id,
-                    transfer_id,
-                    leading,
-                    control,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        if state.retired_direct_graphics.take() == Some((transfer_id, image_id)) {
+                                &mut write_stream,
+                                &mut endpoint_commands,
+                                &mut supervisors,
+                                &mut pending_activation,
+                                &endpoint_id,
+                                generation,
+                                now,
+                                message.into(),
+                            ) {
+                                clear_endpoint_host_effects(
+                                    &mut state,
+                                    &host_mouse_capture_active,
+                                    &host_sgr_pixels_active,
+                                );
+                            }
                             continue;
                         }
-                        let valid = state.kitty_graphics_enabled
-                            && usize::try_from(expected_len).ok().is_some_and(|len| {
-                                crate::pane_graphics_files::validate_direct_source(
-                                    std::path::Path::new(&path),
-                                    len,
-                                )
-                                .is_ok()
-                                    && direct_graphics::valid_control(&control, image_id, len)
-                            })
-                            && state
-                                .direct_graphics_response
-                                .lock()
-                                .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
-                        if valid {
-                            state.omp_renderer.stage_direct_graphics(
-                                transfer_id,
-                                image_id,
-                                leading.clone(),
-                                control.clone(),
-                                (
-                                    state.reported_size.0,
-                                    state.reported_size.1,
-                                    state.reported_cell_size_px.0,
-                                    state.reported_cell_size_px.1,
-                                ),
-                            );
-                        }
-                        let sent = if valid {
-                            let mut command = Vec::new();
-                            crate::kitty_graphics::encode_kitty_regular_file(
-                                &mut command,
-                                &leading,
-                                &control,
-                                &path,
-                            );
-                            let mut stdout = io::stdout();
-                            let written = stdout
-                                .write_all(&command)
-                                .and_then(|()| stdout.flush())
-                                .is_ok();
-                            if written {
-                                record_received_kitty_graphics(&command);
-                            }
-                            written
-                        } else {
-                            false
-                        };
-                        if sent {
-                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                                matcher.start(transfer_id);
-                            }
-                            let started = ClientMessage::GraphicsTransmissionStarted {
-                                transfer_id,
-                                image_id,
-                            };
-                            if let Err(err) = write_to_server(&mut write_stream, &started) {
-                                return Err(ClientError::ConnectionLost(err));
-                            }
-                        } else {
-                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                                if valid {
-                                    matcher.retire(transfer_id);
-                                } else {
-                                    matcher.cancel(transfer_id);
+                        return Err(ClientError::Protocol(protocol::FramingError::Io(
+                            io::Error::new(io::ErrorKind::InvalidData, message),
+                        )));
+                    }
+                    ServerMessage::PaneSurface(surface) => {
+                        if activation_message {
+                            let progress = pending_activation.as_mut().map(|pending| {
+                                pending.receive_surface(&endpoint_id, generation, surface)
+                            });
+                            if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready))
+                            {
+                                if let Some(event) = complete_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    &mut endpoint_commands,
+                                )? {
+                                    scheduled_activation = Some(event);
                                 }
                             }
-                            state.omp_renderer.complete_direct_graphics(
-                                transfer_id,
-                                image_id,
-                                false,
-                            );
-                            let result = ClientMessage::GraphicsTransmissionResult {
-                                transfer_id,
-                                image_id,
-                                success: false,
+                            continue;
+                        }
+                        if !endpoint_active {
+                            continue;
+                        }
+                        let composed = if let Some(shell) = &mut state.shell {
+                            shell.set_pane_surface(surface);
+                            shell.compose(state.reported_size.0, state.reported_size.1)
+                        } else {
+                            None
+                        };
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
+                        if let Some(frame) = composed {
+                            state.present_frame(frame);
+                        }
+                    }
+                    ServerMessage::PaneSurfacePatch(patch) => {
+                        let patch_started = crate::render_prof::timer();
+                        let apply_started = crate::render_prof::timer();
+                        let outcome = state
+                            .shell
+                            .as_mut()
+                            .map(|shell| shell.apply_pane_surface_patch(patch));
+                        crate::render_prof::duration_since(
+                            "client_surface_patch.apply",
+                            apply_started,
+                        );
+                        let compose_fallback = match outcome {
+                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(Some(patch))) => {
+                                match state.present_surface_patch(patch) {
+                                    Ok(presented) => !presented,
+                                    Err(error) => {
+                                        warn!(%error, "failed to present retained pane surface patch");
+                                        state.request_repaint();
+                                        false
+                                    }
+                                }
+                            }
+                            Some(shell::ClientPaneSurfacePatchOutcome::Applied(None)) => true,
+                            Some(shell::ClientPaneSurfacePatchOutcome::Rejected) | None => false,
+                        };
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
+                        if compose_fallback {
+                            let composed = state.shell.as_mut().and_then(|shell| {
+                                shell.compose(state.reported_size.0, state.reported_size.1)
+                            });
+                            if let Some(frame) = composed {
+                                state.present_frame(frame);
+                            }
+                        }
+                        crate::render_prof::duration_since(
+                            "client_surface_patch.total",
+                            patch_started,
+                        );
+                        crate::render_prof::flush_if_due();
+                    }
+                    ServerMessage::Terminal(frame) => {
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            record_received_kitty_graphics(&frame.bytes);
+                        }
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(&frame.bytes);
+                        let _ = stdout.flush();
+                    }
+                    ServerMessage::Graphics { bytes } => {
+                        if state.kitty_graphics_enabled {
+                            record_received_kitty_graphics(&bytes);
+                            let mut stdout = io::stdout();
+                            let _ = stdout.write_all(&bytes);
+                            let _ = stdout.flush();
+                        }
+                    }
+                    ServerMessage::TerminalBell { count } => {
+                        if let Err(err) =
+                            crate::terminal_effects::write_terminal_bells(&mut io::stdout(), count)
+                        {
+                            warn!(err = %err, "failed to emit terminal bell");
+                        }
+                    }
+                    ServerMessage::GraphicsFile {
+                        path,
+                        expected_len,
+                        image_id,
+                        transfer_id,
+                        leading,
+                        control,
+                        surface_asset,
+                    } => {
+                        #[cfg(unix)]
+                        {
+                            if state.retired_direct_graphics.take()
+                                == Some((endpoint_id.clone(), transfer_id, image_id))
+                            {
+                                continue;
+                            }
+                            let surface_asset_valid = match (state.shell.as_ref(), &surface_asset) {
+                                (Some(shell), Some(asset)) => {
+                                    crate::kitty_graphics::surface::host_image_id(
+                                        shell.graphics_scope(),
+                                        asset,
+                                    ) == image_id
+                                }
+                                (None, None) => true,
+                                _ => false,
                             };
-                            if let Err(err) = write_to_server(&mut write_stream, &result) {
-                                return Err(ClientError::ConnectionLost(err));
+                            let valid = state.kitty_graphics_enabled
+                                && surface_asset_valid
+                                && usize::try_from(expected_len).ok().is_some_and(|len| {
+                                    crate::pane_graphics_files::validate_direct_source(
+                                        std::path::Path::new(&path),
+                                        len,
+                                    )
+                                    .is_ok()
+                                        && direct_graphics::valid_control(&control, image_id, len)
+                                })
+                                && state
+                                    .direct_graphics_response
+                                    .lock()
+                                    .is_ok_and(|mut matcher| matcher.arm(transfer_id, image_id));
+                            let sent = if valid {
+                                let mut command = Vec::new();
+                                crate::kitty_graphics::encode_kitty_regular_file(
+                                    &mut command,
+                                    &leading,
+                                    &control,
+                                    &path,
+                                );
+                                let mut stdout = io::stdout();
+                                let written = stdout
+                                    .write_all(&command)
+                                    .and_then(|()| stdout.flush())
+                                    .is_ok();
+                                if written {
+                                    record_received_kitty_graphics(&command);
+                                }
+                                written
+                            } else {
+                                false
+                            };
+                            if sent {
+                                if let Some(asset) = surface_asset {
+                                    state.pending_surface_graphics.insert(
+                                        (endpoint_id.clone(), transfer_id, image_id),
+                                        asset,
+                                    );
+                                }
+                                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                    matcher.start(transfer_id);
+                                }
+                                let started = ClientMessage::GraphicsTransmissionStarted {
+                                    transfer_id,
+                                    image_id,
+                                };
+                                if let Err(err) = write_to_server(&mut write_stream, &started) {
+                                    return Err(ClientError::ConnectionLost(err));
+                                }
+                            } else {
+                                state.pending_surface_graphics.remove(&(
+                                    endpoint_id.clone(),
+                                    transfer_id,
+                                    image_id,
+                                ));
+                                if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                    if valid {
+                                        matcher.retire(transfer_id);
+                                    } else {
+                                        matcher.cancel(transfer_id);
+                                    }
+                                }
+                                let result = ClientMessage::GraphicsTransmissionResult {
+                                    transfer_id,
+                                    image_id,
+                                    success: false,
+                                };
+                                if let Err(err) = write_to_server(&mut write_stream, &result) {
+                                    return Err(ClientError::ConnectionLost(err));
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        let _ = (
+                            path,
+                            expected_len,
+                            image_id,
+                            transfer_id,
+                            leading,
+                            control,
+                            surface_asset,
+                        );
+                    }
+                    ServerMessage::GraphicsTransmissionRetired {
+                        transfer_id,
+                        image_id,
+                    } => {
+                        #[cfg(unix)]
+                        {
+                            state.retired_direct_graphics =
+                                Some((endpoint_id.clone(), transfer_id, image_id));
+                            state.pending_surface_graphics.remove(&(
+                                endpoint_id.clone(),
+                                transfer_id,
+                                image_id,
+                            ));
+                            let cleanup = state.shell.as_mut().map_or_else(Vec::new, |shell| {
+                                shell.retire_direct_graphics_image(image_id);
+                                shell
+                                    .compose(state.reported_size.0, state.reported_size.1)
+                                    .map(|frame| frame.graphics)
+                                    .unwrap_or_else(|| shell.take_pending_graphics_cleanup())
+                            });
+                            state.present_graphics(&cleanup);
+                            if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+                                matcher.retire(transfer_id);
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        let _ = (transfer_id, image_id);
+                    }
+                    ServerMessage::ServerShutdown { reason } => {
+                        if !federated && endpoint_id.is_local() {
+                            return Err(ClientError::ServerShutdown { reason });
+                        }
+                        write_stream.fail(
+                            &endpoint_id,
+                            io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                reason.unwrap_or_else(|| "server stopped".into()),
+                            ),
+                        );
+                    }
+                    ServerMessage::Notify {
+                        kind,
+                        message,
+                        body,
+                    } => {
+                        if state.shell.is_none() {
+                            handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                        }
+                    }
+                    ServerMessage::SemanticNotification(event) => {
+                        if state.shell.is_some() {
+                            let (effects, frame) = {
+                                let shell = state.shell.as_mut().expect("checked shell mode");
+                                let (effects, repaint) = shell.receive_notification(
+                                    &endpoint_id,
+                                    event,
+                                    std::time::Instant::now(),
+                                );
+                                let frame = repaint
+                                    .then(|| {
+                                        shell.compose(state.reported_size.0, state.reported_size.1)
+                                    })
+                                    .flatten();
+                                (effects, frame)
+                            };
+                            handle_shell_notification_effects(effects, &state.sound_config);
+                            if let Some(frame) = frame {
+                                state.present_frame(frame);
                             }
                         }
                     }
-                    #[cfg(not(unix))]
-                    let _ = (path, expected_len, image_id, transfer_id, leading, control);
-                }
-                ServerMessage::GraphicsTransmissionRetired {
-                    transfer_id,
-                    image_id,
-                } => {
-                    #[cfg(unix)]
-                    {
-                        state.retired_direct_graphics = Some((transfer_id, image_id));
-                        if let Ok(mut matcher) = state.direct_graphics_response.lock() {
-                            matcher.retire(transfer_id);
-                        }
-                        state
-                            .omp_renderer
-                            .retire_direct_graphics(transfer_id, image_id);
-                        let mut cleanup = Vec::new();
-                        crate::kitty_graphics::encode_delete_image(&mut cleanup, image_id);
-                        let mut stdout = io::stdout();
-                        if stdout
-                            .write_all(&cleanup)
-                            .and_then(|()| stdout.flush())
-                            .is_ok()
-                        {
-                            record_received_kitty_graphics(&cleanup);
+                    ServerMessage::ClientShellError { message } => {
+                        if let Some(shell) = state.shell.as_mut() {
+                            if shell.receive_endpoint_error(message) {
+                                let frame =
+                                    shell.compose(state.reported_size.0, state.reported_size.1);
+                                if let Some(frame) = frame {
+                                    state.present_frame(frame);
+                                }
+                            }
                         }
                     }
-                    #[cfg(not(unix))]
-                    let _ = (transfer_id, image_id);
-                }
-                ServerMessage::PersistIdentity {
-                    request_id,
-                    display_name,
-                } => {
-                    let result =
-                        crate::config::load_or_create_identity().and_then(|mut identity| {
-                            identity.display_name = Some(display_name.clone());
-                            crate::config::save_identity(&identity)
-                        });
-                    let acknowledgement = ClientMessage::IdentityPersistenceAck {
+                    ServerMessage::ClientShellEndpointResponseChunk {
+                        boot_id,
                         request_id,
-                        display_name,
-                        success: result.is_ok(),
-                        error: result.err().map(|error| error.to_string()),
-                    };
-                    if let Err(error) = write_to_server(&mut write_stream, &acknowledgement) {
-                        return Err(ClientError::ConnectionLost(error));
+                        final_chunk,
+                        data,
+                    } => {
+                        if pending_activation.as_ref().is_some_and(|pending| {
+                            pending.accepts_response(
+                                &endpoint_id,
+                                generation,
+                                &boot_id,
+                                &request_id,
+                            )
+                        }) {
+                            if !final_chunk {
+                                rollback_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    "endpoint returned a chunked activation acknowledgement".into(),
+                                    false,
+                                );
+                                continue;
+                            }
+                            let progress = pending_activation.as_mut().map(|pending| {
+                                pending.receive_response_for_boot(
+                                    &endpoint_id,
+                                    generation,
+                                    &boot_id,
+                                    &request_id,
+                                    &data,
+                                    &mut write_stream,
+                                )
+                            });
+                            match progress {
+                                Some(endpoint::SurfaceActivationProgress::Ready) => {
+                                    if let Some(event) = complete_endpoint_activation(
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut pending_activation,
+                                        &mut endpoint_commands,
+                                    )? {
+                                        scheduled_activation = Some(event);
+                                    }
+                                }
+                                Some(endpoint::SurfaceActivationProgress::Rejected {
+                                    message,
+                                    source_release_rejected,
+                                }) => {
+                                    rollback_endpoint_activation(
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut pending_activation,
+                                        message,
+                                        source_release_rejected,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        if request_id.starts_with("client-shell-surface:") {
+                            continue;
+                        }
+                        let completed = endpoint_commands
+                            .receive_chunk(
+                                &endpoint_id,
+                                generation,
+                                &boot_id,
+                                &request_id,
+                                final_chunk,
+                                data,
+                            )
+                            .map_err(ClientError::ConnectionLost)?;
+                        let Some(completed) = completed else {
+                            continue;
+                        };
+                        let (repaint, actions) = state.shell.as_mut().map_or_else(
+                            || (false, Vec::new()),
+                            |shell| {
+                                if completed.generation == generation
+                                    && shell.endpoint_is_active(&completed.endpoint_id)
+                                {
+                                    shell.handle_endpoint_result(
+                                        &completed.boot_id,
+                                        &completed.request_id,
+                                        completed.result,
+                                    )
+                                } else {
+                                    (
+                                        shell.cancel_endpoint_request(&completed.request_id),
+                                        Vec::new(),
+                                    )
+                                }
+                            },
+                        );
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.reconcile_input_source();
+                        }
+                        apply_client_shell_input_source_changes(
+                            &mut state,
+                            &mut prefix_input_source,
+                        );
+                        let (replay_mouse, dispatch_repaint) = dispatch_client_shell_actions(
+                            actions,
+                            &mut endpoint_commands,
+                            &mut write_stream,
+                            state.shell.as_mut(),
+                            &mut state.detached_process_children,
+                            &mut scheduled_activation,
+                        )?;
+                        let repaint = repaint || dispatch_repaint;
+                        if replay_mouse.is_empty() {
+                            if repaint {
+                                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                                    shell.compose(state.reported_size.0, state.reported_size.1)
+                                }) {
+                                    state.present_frame(frame);
+                                }
+                            }
+                        } else {
+                            let (outcome, frame) = {
+                                let shell = state.shell.as_mut().expect("shell endpoint response");
+                                let mut outcome = shell.replay_mouse_events(replay_mouse);
+                                outcome.repaint |= repaint;
+                                let frame = outcome
+                                    .repaint
+                                    .then(|| {
+                                        shell.compose(state.reported_size.0, state.reported_size.1)
+                                    })
+                                    .flatten();
+                                (outcome, frame)
+                            };
+                            if finish_client_shell_input(
+                                &mut state,
+                                outcome,
+                                frame,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                                &mut prefix_input_source,
+                                &mut scheduled_activation,
+                            )? {
+                                return Ok(());
+                            }
+                        }
                     }
-                }
-                ServerMessage::ServerShutdown { reason } => {
-                    return Err(ClientError::ServerShutdown { reason });
-                }
-                ServerMessage::ServerHandoff { reason } => {
-                    return Err(ClientError::ServerHandoff { reason });
-                }
-                // OMP traffic is sideband-only in this POC; never render opaque bytes as ANSI.
-                ServerMessage::OmpPane { .. }
-                | ServerMessage::OmpFrame { .. }
-                | ServerMessage::OmpError { .. } => {}
-                ServerMessage::Notify {
-                    kind,
-                    message,
-                    body,
-                    activation,
-                } => {
-                    handle_notify(
-                        kind,
-                        &message,
-                        body.as_deref(),
-                        activation.as_ref(),
-                        &state.sound_config,
-                    );
-                }
-                ServerMessage::Clipboard { data } => {
-                    forward_clipboard(&data);
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::WindowTitle { title } => {
-                    let _ = crate::terminal_effects::write_window_title(
-                        &mut io::stdout(),
-                        title.as_deref(),
-                    );
-                }
-                ServerMessage::ReloadSoundConfig => {
-                    reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                        &mut state.draw_host_cursor,
-                        &mut state.remote_image_paste_key,
-                    );
-                }
-                ServerMessage::MouseCapture {
-                    enabled,
-                    sgr_pixels,
-                } => {
-                    let next_sgr_pixels = enabled && sgr_pixels;
-                    state.server_mouse_capture_active = enabled;
-                    state.server_sgr_pixels_active = next_sgr_pixels;
-                    #[cfg(unix)]
-                    state
-                        .omp_renderer
-                        .set_server_sgr_pixels_active(next_sgr_pixels);
-                    #[cfg(unix)]
-                    sync_host_mouse_mode(
+                    ServerMessage::Clipboard { data } => {
+                        if forward_clipboard(&data) {
+                            let (width, height) = state.reported_size;
+                            let frame = state.shell.as_mut().and_then(|shell| {
+                                shell
+                                    .show_copy_feedback(std::time::Instant::now())
+                                    .then(|| shell.compose(width, height))
+                                    .flatten()
+                            });
+                            if let Some(frame) = frame {
+                                state.present_frame(frame);
+                            }
+                        }
+                        let _ = io::stdout().flush();
+                    }
+                    ServerMessage::WindowTitle { title } => {
+                        let _ = crate::terminal_effects::write_window_title(
+                            &mut io::stdout(),
+                            title.as_deref(),
+                        );
+                    }
+                    ServerMessage::ReloadSoundConfig => apply_reload(
                         &mut state,
-                        &host_input_state,
-                        &mut applied_host_input_generation,
-                    )?;
-                    #[cfg(not(unix))]
-                    {
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &host_mouse_capture_active,
+                        &host_sgr_pixels_active,
+                        &mut prefix_input_source,
+                    )?,
+                    ServerMessage::MouseCapture {
+                        enabled,
+                        sgr_pixels,
+                    } => {
+                        state.endpoint_mouse_capture_requested = enabled;
+                        state.endpoint_sgr_pixels_requested = sgr_pixels;
+                        let enabled =
+                            effective_mouse_capture(enabled, state.direct_mouse_capture_preference);
+                        let next_sgr_pixels = effective_sgr_pixel_mouse(
+                            enabled,
+                            sgr_pixels,
+                            state.pixel_geometry_exact,
+                        );
                         let mouse_mode_changed = enabled != state.mouse_capture_active
-                            || next_sgr_pixels != state.sgr_pixels_active;
+                            || next_sgr_pixels != host_sgr_pixels_active.load(Ordering::Acquire);
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
+                        }
                         if mouse_mode_changed {
                             set_mouse_capture(enabled, next_sgr_pixels)
                                 .map_err(ClientError::ConnectionFailed)?;
-                            #[cfg(windows)]
-                            if enabled && windows_vti_input_backend_enabled() {
-                                let _ = enable_windows_virtual_terminal_input();
-                            }
+                        }
+                        #[cfg(windows)]
+                        if enabled && windows_vti_input_backend_enabled() && !is_ssh_session() {
+                            _terminal_guard
+                                .recover_windows_virtual_terminal_input()
+                                .map_err(ClientError::ConnectionFailed)?;
                         }
                         state.mouse_capture_active = enabled;
-                        state.sgr_pixels_active = next_sgr_pixels;
+                        host_mouse_capture_active.store(enabled, Ordering::Release);
+                        host_sgr_pixels_active.store(next_sgr_pixels, Ordering::Release);
                     }
-                    if !state.mouse_capture_active {
-                        state.mouse_pointer.set_cell(None);
-                        #[cfg(unix)]
-                        state.omp_renderer.observe_pointer_cell(None);
-                        let _ = state.write_mouse_pointer_shape(&mut io::stdout());
+                    ServerMessage::DirectTerminalKeyboardProtocol {
+                        flags,
+                        modify_other_keys_level,
+                    } => {
+                        if state.attach_escape.is_some() {
+                            crate::terminal_modes::set_direct_host_keyboard_protocol(
+                                &mut io::stdout(),
+                                &mut state.direct_keyboard_protocol,
+                                flags,
+                                modify_other_keys_level,
+                            )
+                            .map_err(ClientError::ConnectionFailed)?;
+                        }
+                    }
+                    ServerMessage::ClientShellKeyboardReportAll { enabled } => {
+                        if state.shell.is_some() {
+                            state.pane_keyboard_report_all = enabled;
+                            sync_client_shell_keyboard_report_all(&mut state)?;
+                        }
+                    }
+                    ServerMessage::EndpointControl { kind, data } => {
+                        if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
+                            let progress = pending_activation.as_mut().map(|activation| {
+                                activation.receive_presentation_effects_ready(
+                                    &endpoint_id,
+                                    generation,
+                                    &data,
+                                )
+                            });
+                            if matches!(progress, Some(endpoint::SurfaceActivationProgress::Ready))
+                            {
+                                if let Some(event) = complete_endpoint_activation(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut pending_activation,
+                                    &mut endpoint_commands,
+                                )? {
+                                    scheduled_activation = Some(event);
+                                }
+                            }
+                            continue;
+                        }
+                        let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
+                            Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::AgentViewProjection(
+                                projection,
+                            )) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_agent_view_projection_for_generation(
+                                        &endpoint_id,
+                                        generation,
+                                        projection,
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::AgentCompletions(projection)) => {
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_agent_completions(
+                                        &endpoint_id,
+                                        generation,
+                                        projection,
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::Ignored) => {
+                                debug!(%kind, "ignoring unknown endpoint control message");
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::Snapshot(snapshot)) => snapshot,
+                            Err(message)
+                                if federated
+                                    || !endpoint::protocol_failure_is_fatal(&endpoint_id) =>
+                            {
+                                if handle_endpoint_attention(
+                                    &mut state,
+                                    &mut write_stream,
+                                    &mut endpoint_commands,
+                                    &mut supervisors,
+                                    &mut pending_activation,
+                                    &endpoint_id,
+                                    generation,
+                                    now,
+                                    message,
+                                ) {
+                                    clear_endpoint_host_effects(
+                                        &mut state,
+                                        &host_mouse_capture_active,
+                                        &host_sgr_pixels_active,
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(message) => {
+                                return Err(ClientError::Protocol(protocol::FramingError::Io(
+                                    io::Error::new(io::ErrorKind::InvalidData, message),
+                                )));
+                            }
+                        };
+                        let projection_pending = activation_message;
+                        let activation_progress = activation_message
+                            .then(|| {
+                                pending_activation.as_mut().map(|pending| {
+                                    pending.receive_snapshot(&endpoint_id, generation, &snapshot)
+                                })
+                            })
+                            .flatten();
+                        install_client_shell_snapshot(
+                            &mut state,
+                            &endpoint_id,
+                            snapshot,
+                            projection_pending,
+                            &mut write_stream,
+                            &mut prefix_input_source,
+                        )?;
+                        if matches!(
+                            activation_progress,
+                            Some(endpoint::SurfaceActivationProgress::Ready)
+                        ) {
+                            if let Some(event) = complete_endpoint_activation(
+                                &mut state,
+                                &mut write_stream,
+                                &mut pending_activation,
+                                &mut endpoint_commands,
+                            )? {
+                                scheduled_activation = Some(event);
+                            }
+                        }
+                        write_stream.mark_ready(&endpoint_id, generation);
+                        if endpoint_id.is_local() {
+                            if let Some(event) =
+                                take_ready_local_activation(&mut state, &write_stream)
+                            {
+                                scheduled_activation = Some(event);
+                                continue;
+                            }
+                        }
+                        let selected_endpoint = endpoint_catalog
+                            .selected_profile
+                            .as_ref()
+                            .map_or(endpoint::ClientEndpointId::Local, |profile_id| {
+                                endpoint::ClientEndpointId::Ssh(profile_id.clone())
+                            });
+                        let activation_ready = state.shell.as_ref().is_some_and(|shell| {
+                            shell.endpoint_has_snapshot(&selected_endpoint)
+                                && (!write_stream
+                                    .connection(write_stream.active_id())
+                                    .is_some_and(|connection| connection.surface_active)
+                                    || shell.endpoint_boot_id(write_stream.active_id()).is_some())
+                        });
+                        let needs_surface = write_stream
+                            .connection(&selected_endpoint)
+                            .is_some_and(|connection| !connection.surface_active);
+                        if activation_ready
+                            && needs_surface
+                            && pending_activation.is_none()
+                            && state.deferred_local_activation.is_none()
+                        {
+                            scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+                                endpoint_id: selected_endpoint,
+                                target: None,
+                                force: false,
+                            });
+                        }
+                    }
+                    ServerMessage::Welcome { .. } => {
+                        debug!("received unexpected Welcome in main loop");
                     }
                 }
-                ServerMessage::KittyKeyboardReportAll { enabled } => {
-                    if enabled != state.keyboard_report_all_active {
-                        crate::terminal_modes::set_host_kitty_keyboard_report_all(
-                            &mut io::stdout(),
-                            enabled,
-                        )
-                        .map_err(ClientError::ConnectionFailed)?;
-                        state.keyboard_report_all_active = enabled;
-                    }
+            }
+            ClientLoopEvent::ServerDisconnected {
+                endpoint_id,
+                generation,
+            } => {
+                if !write_stream.accepts(&endpoint_id, generation) {
+                    continue;
                 }
-                ServerMessage::PrefixInputSource { active } => {
-                    if active {
-                        prefix_input_source.switch_to_ascii();
-                    } else {
-                        prefix_input_source.restore();
-                    }
-                }
-                ServerMessage::OpenUrl { url } => {
-                    open_safe_url(
-                        &url,
-                        &mut state.detached_process_children,
-                        crate::platform::open_url,
-                    );
-                }
-                ServerMessage::Welcome { .. } => {
-                    debug!("received unexpected Welcome in main loop");
-                }
-                ServerMessage::NotificationActivationProcessed { .. } => {
-                    debug!("received unexpected notification activation result in main loop");
-                }
-            },
-            ClientLoopEvent::ServerDisconnected => {
-                return Err(ClientError::ConnectionLost(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                )));
+                write_stream.fail(
+                    &endpoint_id,
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "connection was lost"),
+                );
             }
             ClientLoopEvent::Timer => {
-                reap_finished_detached_processes(&mut state.detached_process_children);
+                client_timer.fired();
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();
                 }
-                #[cfg(unix)]
-                display_pending_omp_surface(
-                    &mut state,
-                    &mut write_stream,
-                    &host_input_state,
-                    &mut applied_host_input_generation,
-                    !ordered_input_batch_active,
-                )?;
+                state
+                    .detached_process_children
+                    .retain_mut(|child| child.try_wait().ok().flatten().is_none());
+                write_stream.tick_health(now);
+                for failure in write_stream.take_failures() {
+                    if write_stream.connection(&failure.endpoint_id).is_some()
+                        && !write_stream.accepts(&failure.endpoint_id, failure.generation)
+                    {
+                        continue;
+                    }
+                    warn!(
+                        endpoint = %failure.endpoint_id.storage_key(),
+                        error = %failure.message,
+                        "endpoint transport failed"
+                    );
+                    if !federated && failure.endpoint_id.is_local() {
+                        return Err(ClientError::ConnectionLost(io::Error::new(
+                            failure.kind,
+                            failure.message,
+                        )));
+                    }
+                    if handle_endpoint_disconnect(
+                        &mut state,
+                        &mut write_stream,
+                        &mut endpoint_commands,
+                        &mut supervisors,
+                        &mut pending_activation,
+                        &failure.endpoint_id,
+                        failure.generation,
+                        now,
+                        &format!("{}; reconnecting", failure.message),
+                    ) {
+                        clear_endpoint_host_effects(
+                            &mut state,
+                            &host_mouse_capture_active,
+                            &host_sgr_pixels_active,
+                        );
+                    }
+                }
+                // A revoked transport changes the safe rollback destination. Handle those
+                // failures before applying a timeout to the remaining activation phase.
+                if pending_activation
+                    .as_ref()
+                    .is_some_and(|activation| activation.expired(now))
+                {
+                    let endpoint_id = pending_activation
+                        .as_ref()
+                        .map(|activation| activation.target().clone())
+                        .expect("checked pending activation");
+                    let label = state
+                        .shell
+                        .as_ref()
+                        .map(|shell| shell.endpoint_label(&endpoint_id).to_owned())
+                        .unwrap_or_else(|| "Endpoint".into());
+                    rollback_endpoint_activation(
+                        &mut state,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        format!("{label} did not produce a coherent surface in time"),
+                        false,
+                    );
+                }
+                if state.shell.is_some() {
+                    let expired_endpoints = endpoint_commands
+                        .expire(now)
+                        .into_iter()
+                        .filter(|expired| {
+                            write_stream.accepts(&expired.endpoint_id, expired.generation)
+                        })
+                        .collect::<Vec<_>>();
+                    let (effects, outcome, frame) = {
+                        let shell = state.shell.as_mut().expect("checked shell mode");
+                        let mut outcome = shell.tick_selection_autoscroll(now);
+                        for expired in expired_endpoints {
+                            if !shell.endpoint_is_active(&expired.endpoint_id) {
+                                continue;
+                            }
+                            let (repaint, actions) = shell.handle_endpoint_result(
+                                &expired.boot_id,
+                                &expired.request_id,
+                                expired.result,
+                            );
+                            outcome.repaint |= repaint;
+                            outcome.actions.extend(actions);
+                        }
+                        let (effects, notification_repaint) = shell.tick_notifications(now);
+                        outcome.repaint |= notification_repaint
+                            | shell.tick_copy_feedback(now)
+                            | shell.tick_workspace_highlight(now)
+                            | shell.tick_endpoint_error(now);
+                        let frame = outcome
+                            .repaint
+                            .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
+                            .flatten();
+                        (effects, outcome, frame)
+                    };
+                    handle_shell_notification_effects(effects, &state.sound_config);
+                    if finish_client_shell_input(
+                        &mut state,
+                        outcome,
+                        frame,
+                        &mut write_stream,
+                        &mut pending_activation,
+                        &mut endpoint_commands,
+                        &mut prefix_input_source,
+                        &mut scheduled_activation,
+                    )? {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -3292,2557 +2169,5 @@ async fn run_client_loop(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Server reader thread
-// ---------------------------------------------------------------------------
-
-/// Blocking thread that reads ServerMessages from the server and sends them
-/// to the main event loop.
-fn server_reader_thread(
-    mut stream: LocalStream,
-    event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    should_quit: &Arc<AtomicBool>,
-    max_frame_size: usize,
-) {
-    // Ensure the read stream is in blocking mode to avoid WouldBlock errors
-    // from read_exact inside read_message. The stream should already be
-    // blocking after handshake, but we enforce it here as a safety measure.
-    if stream.set_nonblocking(false).is_err() {
-        // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-        return;
-    }
-
-    loop {
-        if should_quit.load(Ordering::Acquire) {
-            break;
-        }
-
-        match protocol::read_message(&mut stream, max_frame_size) {
-            Ok(msg) => {
-                if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(msg))
-                    .is_err()
-                {
-                    break; // Main loop gone.
-                }
-            }
-            Err(protocol::FramingError::UnexpectedEof) => {
-                // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-                break;
-            }
-            Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
-                // Should not happen with blocking mode, but handle gracefully
-                // in case the stream was set nonblocking by another clone.
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-            Err(err) => {
-                warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
-                break;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Write helper
-// ---------------------------------------------------------------------------
-
-/// Writes a message to the server stream (blocking).
-fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<()> {
-    protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
-}
-
-fn write_remote_image_to_server(
-    stream: &mut LocalStream,
-    image: crate::platform::ClipboardImage,
-    source: &'static str,
-) -> Result<(), ClientError> {
-    if image.bytes.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
-        warn!(
-            bytes = image.bytes.len(),
-            max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
-            source,
-            "local image is too large to bridge"
-        );
-        return Ok(());
-    }
-
-    info!(
-        bytes = image.bytes.len(),
-        extension = image.extension,
-        source,
-        "bridging local image to remote server"
-    );
-    write_to_server(
-        stream,
-        &ClientMessage::ClipboardImage {
-            extension: image.extension.to_owned(),
-            data: image.bytes,
-        },
-    )
-    .map_err(ClientError::ConnectionLost)
-}
-
-// ---------------------------------------------------------------------------
-// Notifications
-// ---------------------------------------------------------------------------
-
-fn client_remote_image_paste_key(
-    config: &crate::config::Config,
-) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
-    if !is_remote_client_process() {
-        return None;
-    }
-
-    match config.remote_image_paste_key() {
-        Ok(key) => key,
-        Err(diagnostic) => {
-            warn!(diagnostic = %diagnostic, "local remote image paste key config diagnostic");
-            None
-        }
-    }
-}
-
-fn reload_local_client_config(
-    sound_config: &mut crate::config::SoundConfig,
-    redraw_on_focus_gained: &mut bool,
-    draw_host_cursor: &mut bool,
-    remote_image_paste_key: &mut Option<(
-        crossterm::event::KeyCode,
-        crossterm::event::KeyModifiers,
-    )>,
-) {
-    match crate::config::load_live_config() {
-        Ok(loaded) => {
-            for diagnostic in loaded.config.ui.sound.diagnostics() {
-                warn!(diagnostic = %diagnostic, "local sound config diagnostic");
-            }
-            let loaded_remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
-            *sound_config = loaded.config.ui.sound;
-            *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
-            *draw_host_cursor = should_draw_host_cursor(loaded.config.ui.host_cursor);
-            *remote_image_paste_key = loaded_remote_image_paste_key;
-            debug!("reloaded local client config");
-        }
-        Err(diagnostics) => {
-            warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
-        }
-    }
-}
-
-fn notification_action_args(
-    socket_path: &std::path::Path,
-    activation: &NotificationActivation,
-) -> Vec<String> {
-    vec![
-        "notification".into(),
-        "activate".into(),
-        socket_path.display().to_string(),
-        activation.recipient_client_id.to_string(),
-        activation.workspace_id.clone(),
-        activation.pane_id.to_string(),
-    ]
-}
-
-fn notification_action(
-    activation: &NotificationActivation,
-) -> Option<crate::platform::DesktopNotificationAction> {
-    Some(crate::platform::DesktopNotificationAction {
-        executable: std::env::current_exe().ok()?,
-        args: notification_action_args(&client_socket_path(), activation),
-    })
-}
-
-fn handle_notify(
-    kind: NotifyKind,
-    message: &str,
-    body: Option<&str>,
-    activation: Option<&NotificationActivation>,
-    sound_config: &crate::config::SoundConfig,
-) {
-    let action = activation.and_then(notification_action);
-    handle_notify_with_notifiers(
-        kind,
-        message,
-        body,
-        sound_config,
-        crate::terminal_notify::show_notification,
-        crate::platform::show_desktop_notification_with_action,
-        action.as_ref(),
-    );
-}
-
-fn handle_notify_with_notifiers(
-    kind: NotifyKind,
-    message: &str,
-    body: Option<&str>,
-    sound_config: &crate::config::SoundConfig,
-    mut show_terminal_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
-    mut show_system_notification: impl FnMut(
-        &str,
-        Option<&str>,
-        Option<&crate::platform::DesktopNotificationAction>,
-    ) -> io::Result<bool>,
-    action: Option<&crate::platform::DesktopNotificationAction>,
-) {
-    match kind {
-        NotifyKind::Sound => {
-            let Some(sound) = sound_from_notify_message(message) else {
-                warn!(
-                    message = message,
-                    "received unknown sound notification from server"
-                );
-                return;
-            };
-            if sound_config.enabled {
-                crate::sound::play(sound, sound_config);
-            }
-        }
-        NotifyKind::Toast => {
-            debug!(
-                message = message,
-                "received terminal toast notification from server"
-            );
-            if let Err(err) = show_terminal_notification(message, body) {
-                warn!(err = %err, "failed to emit terminal notification");
-            }
-        }
-        NotifyKind::SystemToast => {
-            debug!(
-                message = message,
-                "received system toast notification from server"
-            );
-            if let Err(err) = show_system_notification(message, body, action) {
-                warn!(err = %err, "failed to emit system notification");
-            }
-        }
-    }
-}
-
-fn sound_from_notify_message(message: &str) -> Option<crate::sound::Sound> {
-    match message {
-        "agent done" => Some(crate::sound::Sound::Done),
-        "agent attention" => Some(crate::sound::Sound::Request),
-        _ => None,
-    }
-}
-
-#[cfg(unix)]
-fn should_bridge_clipboard_image_paste(
-    data: &[u8],
-    is_remote_client: bool,
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-) -> bool {
-    if data == b"\x1b[200~\x1b[201~" {
-        return is_remote_client;
-    }
-
-    let Some(remote_image_paste_key) = remote_image_paste_key else {
-        return false;
-    };
-
-    let events = crate::raw_input::parse_raw_input_bytes_sync(data);
-    matches!(
-        events.as_slice(),
-        [crate::raw_input::RawInputEvent::Key(key)]
-            if key.kind == crossterm::event::KeyEventKind::Press
-                && crate::config::terminal_key_matches_combo(key, remote_image_paste_key)
-    )
-}
-
-#[cfg(any(windows, test))]
-fn should_bridge_clipboard_image_events(
-    events: &[crate::protocol::ClientInputEvent],
-    is_remote_client: bool,
-    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
-) -> bool {
-    if !is_remote_client {
-        return false;
-    }
-    if matches!(
-        events,
-        [crate::protocol::ClientInputEvent::Paste { text }] if text.is_empty()
-    ) {
-        return true;
-    }
-
-    let Some(remote_image_paste_key) = remote_image_paste_key else {
-        return false;
-    };
-    matches!(
-        events,
-        [event]
-            if matches!(
-                event.to_raw_input_event(),
-                crate::raw_input::RawInputEvent::Key(key)
-                    if key.kind == crossterm::event::KeyEventKind::Press
-                        && crate::config::terminal_key_matches_combo(
-                            &key,
-                            remote_image_paste_key,
-                        )
-            )
-    )
-}
-
-#[cfg(unix)]
-fn read_image_file_from_terminal_drop(
-    data: &[u8],
-    is_remote_client: bool,
-) -> Option<crate::platform::ClipboardImage> {
-    let (path, extension) = image_path_from_terminal_drop(data, is_remote_client)?;
-    read_image_file(path, extension)
-}
-
-#[cfg(any(windows, test))]
-fn read_image_file_from_client_events(
-    events: &[crate::protocol::ClientInputEvent],
-    is_remote_client: bool,
-) -> Option<crate::platform::ClipboardImage> {
-    let [crate::protocol::ClientInputEvent::Paste { text }] = events else {
-        return None;
-    };
-    let text = normalized_terminal_drop_text(text)?;
-    // Windows events already carry native paths; Unix backslash unescaping would corrupt them.
-    let (path, extension) =
-        image_path_from_drop_text(strip_matching_path_quotes(text), is_remote_client)?;
-    read_image_file(path, extension)
-}
-
-fn read_image_file(
-    path: std::path::PathBuf,
-    extension: &'static str,
-) -> Option<crate::platform::ClipboardImage> {
-    let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-
-    let file = std::fs::File::open(&path).ok()?;
-    let bytes =
-        match crate::platform::read_limited_reader(file, MAX_CLIPBOARD_IMAGE_PAYLOAD).ok()? {
-            crate::platform::LimitedRead::Complete(bytes) => bytes,
-            crate::platform::LimitedRead::Empty => return None,
-            crate::platform::LimitedRead::Oversized => {
-                warn!(
-                    max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
-                    "local image file drop is too large to bridge"
-                );
-                return None;
-            }
-        };
-
-    Some(crate::platform::ClipboardImage { bytes, extension })
-}
-
-#[cfg(unix)]
-fn image_path_from_terminal_drop(
-    data: &[u8],
-    is_remote_client: bool,
-) -> Option<(std::path::PathBuf, &'static str)> {
-    let bytes = bracketed_paste_payload(data).unwrap_or(data);
-    let text = std::str::from_utf8(bytes).ok()?;
-    let text = normalized_terminal_drop_text(text)?;
-    let text = unescape_terminal_drop_path(strip_matching_path_quotes(text));
-    image_path_from_drop_text(&text, is_remote_client)
-}
-
-fn normalized_terminal_drop_text(text: &str) -> Option<&str> {
-    let text = text.trim_end_matches(['\r', '\n']);
-    (!text.is_empty() && !text.contains(['\r', '\n'])).then_some(text)
-}
-
-fn image_path_from_drop_text(
-    text: &str,
-    is_remote_client: bool,
-) -> Option<(std::path::PathBuf, &'static str)> {
-    if !is_remote_client {
-        return None;
-    }
-    let path = std::path::PathBuf::from(text);
-    if !path.is_absolute() {
-        return None;
-    }
-    let extension = recognized_image_extension(path.extension()?.to_str()?)?;
-    Some((path, extension))
-}
-
-#[cfg(unix)]
-fn bracketed_paste_payload(data: &[u8]) -> Option<&[u8]> {
-    const START: &[u8] = b"\x1b[200~";
-    const END: &[u8] = b"\x1b[201~";
-    data.strip_prefix(START)?.strip_suffix(END)
-}
-
-fn strip_matching_path_quotes(text: &str) -> &str {
-    if text.len() < 2 {
-        return text;
-    }
-
-    let bytes = text.as_bytes();
-    match (bytes.first(), bytes.last()) {
-        (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"')) => &text[1..text.len() - 1],
-        _ => text,
-    }
-}
-
-#[cfg(unix)]
-fn unescape_terminal_drop_path(text: &str) -> String {
-    let mut unescaped = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(escaped) = chars.next() {
-                unescaped.push(escaped);
-            } else {
-                unescaped.push(ch);
-            }
-        } else {
-            unescaped.push(ch);
-        }
-    }
-    unescaped
-}
-
-fn recognized_image_extension(extension: &str) -> Option<&'static str> {
-    if extension.eq_ignore_ascii_case("png") {
-        Some("png")
-    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
-        Some("jpg")
-    } else if extension.eq_ignore_ascii_case("gif") {
-        Some("gif")
-    } else if extension.eq_ignore_ascii_case("webp") {
-        Some("webp")
-    } else if extension.eq_ignore_ascii_case("bmp") {
-        Some("bmp")
-    } else {
-        None
-    }
-}
-
-fn retain_detached_process_after_wait(
-    pid: u32,
-    result: io::Result<Option<std::process::ExitStatus>>,
-) -> bool {
-    match result {
-        Ok(None) => true,
-        Ok(Some(_)) => false,
-        Err(err) if err.kind() == io::ErrorKind::Interrupted => true,
-        Err(err) => {
-            warn!(pid, err = %err, "failed to reap detached client process");
-            false
-        }
-    }
-}
-
-fn reap_finished_detached_processes(children: &mut Vec<std::process::Child>) {
-    children.retain_mut(|child| retain_detached_process_after_wait(child.id(), child.try_wait()));
-}
-
-/// Opens a server-forwarded URL only when it remains safe on this client.
-fn open_safe_url(
-    url: &str,
-    children: &mut Vec<std::process::Child>,
-    open: impl FnOnce(&str) -> io::Result<Option<std::process::Child>>,
-) {
-    let Some(url) = crate::web_url::safe_web_url(url) else {
-        return;
-    };
-    reap_finished_detached_processes(children);
-    match open(url) {
-        Ok(Some(child)) => children.push(child),
-        Ok(None) => {}
-        Err(err) => warn!(err = %err, url = %url, "failed to open server URL"),
-    }
-}
-// ---------------------------------------------------------------------------
-// Clipboard forwarding
-// ---------------------------------------------------------------------------
-
-/// Decode a clipboard payload forwarded by the server.
-fn decode_clipboard_payload(data: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(data).ok()
-}
-
-/// Forwards a clipboard write from the server to the local client clipboard.
-fn forward_clipboard(data: &str) {
-    let Some(bytes) = decode_clipboard_payload(data) else {
-        warn!("received invalid clipboard payload from server");
-        return;
-    };
-
-    crate::selection::write_osc52_bytes(&bytes);
-}
-
-// ---------------------------------------------------------------------------
-// Frame output
-// ---------------------------------------------------------------------------
-
-fn write_encoded_frame_with_graphics(
-    mut writer: impl io::Write,
-    encoded: &[u8],
-    graphics: &[u8],
-) -> io::Result<()> {
-    if graphics.is_empty() {
-        return writer.write_all(encoded);
-    }
-
-    let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
-
-    writer.write_all(&encoded[..insertion])?;
-    record_received_kitty_graphics(graphics);
-    writer.write_all(b"\x1b7")?;
-    writer.write_all(graphics)?;
-    writer.write_all(b"\x1b8")?;
-    writer.write_all(&encoded[insertion..])
-}
-
-fn contains_kitty_graphics_bytes(bytes: &[u8]) -> bool {
-    bytes.windows(3).any(|window| window == b"\x1b_G")
-}
-
-fn record_received_kitty_graphics(bytes: &[u8]) {
-    let ids = kitty_graphics_image_ids(bytes);
-    if ids.is_empty() {
-        return;
-    }
-    let set = RECEIVED_KITTY_GRAPHICS_IDS.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut set) = set.lock() {
-        set.extend(ids);
-    }
-}
-
-fn clear_received_kitty_graphics(mut writer: impl io::Write) -> io::Result<()> {
-    let Some(set) = RECEIVED_KITTY_GRAPHICS_IDS.get() else {
-        return Ok(());
-    };
-    let Ok(mut set) = set.lock() else {
-        return Ok(());
-    };
-    for id in set.drain() {
-        write!(writer, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")?;
-    }
-    writer.flush()
-}
-
-fn kitty_graphics_image_ids(bytes: &[u8]) -> Vec<u32> {
-    let mut ids = Vec::new();
-    let mut index = 0usize;
-    while let Some(start) = find_subslice(&bytes[index..], b"\x1b_G") {
-        let command_start = index + start + 3;
-        let Some(end) = find_subslice(&bytes[command_start..], b"\x1b\\") else {
-            break;
-        };
-        let command = &bytes[command_start..command_start + end];
-        if let Some(id) = kitty_graphics_command_image_id(command) {
-            ids.push(id);
-        }
-        index = command_start + end + 2;
-    }
-    ids
-}
-
-fn kitty_graphics_command_image_id(command: &[u8]) -> Option<u32> {
-    let header_end = command
-        .iter()
-        .position(|byte| *byte == b';')
-        .unwrap_or(command.len());
-    for part in command[..header_end].split(|byte| *byte == b',') {
-        let Some(value) = part.strip_prefix(b"i=") else {
-            continue;
-        };
-        let text = std::str::from_utf8(value).ok()?;
-        if let Ok(id) = text.parse::<u32>() {
-            return Some(id);
-        }
-    }
-    None
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-const DEFAULT_CELL_WIDTH_PX: u32 = 8;
-const DEFAULT_CELL_HEIGHT_PX: u32 = 16;
-
-/// Cell size derived from the terminal size ioctl, if it reports pixels.
-fn ioctl_cell_size() -> Option<(u32, u32)> {
-    let size = crossterm::terminal::window_size().ok()?;
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return None;
-    }
-    Some((
-        (size.width as u32 / size.columns as u32).max(1),
-        (size.height as u32 / size.rows as u32).max(1),
-    ))
-}
-
-/// Cell size used when the ioctl reports no pixels.
-fn cell_size_fallback(reported: u64, last: Option<(u32, u32)>) -> (u32, u32) {
-    unpack_cell_size(reported)
-        .or(last.filter(|(width, height)| *width > 0 && *height > 0))
-        .unwrap_or((DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX))
-}
-
-#[cfg(any(unix, test))]
-fn pack_cell_size(width_px: u32, height_px: u32) -> u64 {
-    (u64::from(width_px) << 32) | u64::from(height_px)
-}
-
-fn unpack_cell_size(packed: u64) -> Option<(u32, u32)> {
-    let width_px = (packed >> 32) as u32;
-    let height_px = (packed & u64::from(u32::MAX)) as u32;
-    (width_px > 0 && height_px > 0).then_some((width_px, height_px))
-}
-
-fn current_terminal_geometry(
-    kitty_graphics_enabled: bool,
-    reported_cell_size: &AtomicU64,
-    last_cell_size: Option<(u32, u32)>,
-) -> (
-    (u16, u16, u32, u32),
-    Option<crate::input::mouse::HostGeometry>,
-) {
-    #[cfg(unix)]
-    let (cols, rows, host_geometry, ioctl_cell_size) = match crossterm::terminal::window_size() {
-        Ok(size) => {
-            let cell_size =
-                (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0).then(
-                    || {
-                        (
-                            (u32::from(size.width) / u32::from(size.columns)).max(1),
-                            (u32::from(size.height) / u32::from(size.rows)).max(1),
-                        )
-                    },
-                );
-            (
-                size.columns,
-                size.rows,
-                crate::input::mouse::HostGeometry::new(
-                    size.columns,
-                    size.rows,
-                    u32::from(size.width),
-                    u32::from(size.height),
-                ),
-                cell_size,
-            )
-        }
-        Err(_) => {
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            (cols, rows, None, None)
-        }
-    };
-    #[cfg(not(unix))]
-    let (cols, rows, host_geometry, ioctl_cell_size) = {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let host_geometry: Option<crate::input::mouse::HostGeometry> = None;
-        (cols, rows, host_geometry, None)
-    };
-    let (cell_width_px, cell_height_px) = if kitty_graphics_enabled {
-        ioctl_cell_size.unwrap_or_else(|| {
-            cell_size_fallback(reported_cell_size.load(Ordering::Acquire), last_cell_size)
-        })
-    } else {
-        (0, 0)
-    };
-    ((cols, rows, cell_width_px, cell_height_px), host_geometry)
-}
-
-/// Reads terminal geometry before the handshake. Direct graphics is eligible
-/// only when the host supplied exact pixel dimensions through the ioctl.
-fn initial_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32, bool) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0, false);
-    }
-    match ioctl_cell_size() {
-        Some((width, height)) => (cols, rows, width, height, true),
-        None => (
-            cols,
-            rows,
-            DEFAULT_CELL_WIDTH_PX,
-            DEFAULT_CELL_HEIGHT_PX,
-            false,
-        ),
-    }
-}
-
-/// Reports polled changes and signalled resizes that return to the same size.
-fn resize_report_required(
-    signalled: bool,
-    new_size: (u16, u16, u32, u32),
-    last_size: (u16, u16, u32, u32),
-) -> bool {
-    signalled || new_size != last_size
-}
-#[cfg(any(unix, test))]
-fn resize_host_geometry_report_required(
-    current: Option<crate::input::mouse::HostGeometry>,
-    last: Option<crate::input::mouse::HostGeometry>,
-) -> bool {
-    current.is_some() && current != last
-}
-
-#[cfg(windows)]
-fn resize_event(new_size: (u16, u16, u32, u32)) -> ClientLoopEvent {
-    ClientLoopEvent::Resize(new_size.0, new_size.1, new_size.2, new_size.3, 0, None)
-}
-
-/// Watches the terminal size and sends resize events when it changes.
-///
-/// The baseline cell size must match what the handshake sent to the server:
-/// reading a fresh one here would race the host cell size reply and could
-/// swallow the first change.
-fn resize_poll_loop(
-    resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    initial_cols: u16,
-    initial_rows: u16,
-    initial_cell_width: u32,
-    initial_cell_height: u32,
-    kitty_graphics_enabled: bool,
-    reported_cell_size: &AtomicU64,
-    #[cfg(unix)] host_input_state: &HostInputState,
-    should_quit: &Arc<AtomicBool>,
-) {
-    crate::platform::watch_terminal_resize_signal();
-    let mut last_size = (
-        initial_cols,
-        initial_rows,
-        initial_cell_width,
-        initial_cell_height,
-    );
-    #[cfg(unix)]
-    let mut last_host_geometry = host_input_state.load_context().1;
-    while !should_quit.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(100));
-        let signalled = crate::platform::take_terminal_resize_signal();
-        let (new_size, host_geometry) = current_terminal_geometry(
-            kitty_graphics_enabled,
-            reported_cell_size,
-            Some((last_size.2, last_size.3)),
-        );
-        #[cfg(not(unix))]
-        let _ = &host_geometry;
-        #[cfg(unix)]
-        let geometry_changed =
-            resize_host_geometry_report_required(host_geometry, last_host_geometry);
-        #[cfg(not(unix))]
-        let geometry_changed = false;
-        if resize_report_required(signalled, new_size, last_size) || geometry_changed {
-            #[cfg(unix)]
-            let send_result = host_input_state.send_resize(&resize_tx, new_size, host_geometry);
-            #[cfg(windows)]
-            let send_result = resize_tx.blocking_send(resize_event(new_size));
-            if send_result.is_err() {
-                break; // Main loop gone.
-            }
-            last_size = new_size;
-            #[cfg(unix)]
-            {
-                last_host_geometry = host_geometry;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
-
-#[cfg(any(not(windows), test))]
-fn query_host_terminal_appearance() {
-    let _ = write_host_terminal_appearance_query(io::stdout());
-}
-
-#[cfg(any(not(windows), test))]
-fn write_host_terminal_appearance_query(mut writer: impl io::Write) -> io::Result<()> {
-    writer.write_all(crate::terminal_theme::HOST_COLOR_SCHEME_QUERY_SEQUENCE.as_bytes())?;
-    writer.flush()
-}
-
-/// Initialize logging for the client process.
-fn query_host_terminal_theme() {
-    let _ = write_host_terminal_theme_query(io::stdout());
-}
-
-fn should_query_host_terminal_theme() -> bool {
-    !cfg!(windows)
-}
-
-fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
-    let query = crate::terminal_theme::host_terminal_theme_query_sequence(
-        crate::platform::should_query_host_terminal_palette(),
-    );
-    writer.write_all(query.as_bytes())?;
-    writer.flush()
-}
-
-/// XTWINOPS request for the host terminal cell size in pixels.
-const HOST_CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
-
-fn query_host_cell_size() {
-    let _ = write_host_cell_size_query(io::stdout());
-}
-
-fn should_query_host_cell_size() -> bool {
-    !cfg!(windows)
-}
-
-/// Only pane graphics need pixel dimensions, and only when the ioctl cannot
-/// provide them.
-fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
-    kitty_graphics_enabled && should_query_host_cell_size() && ioctl_cell_size().is_none()
-}
-
-fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
-    writer.write_all(HOST_CELL_SIZE_QUERY)?;
-    writer.flush()
-}
-
-#[cfg(any(unix, test))]
-fn store_reported_cell_size(reported_cell_size: &AtomicU64, width_px: u32, height_px: u32) {
-    let packed = pack_cell_size(width_px, height_px);
-    if reported_cell_size.swap(packed, Ordering::AcqRel) != packed {
-        debug!(width_px, height_px, "host terminal reported cell size");
-    }
-}
-
-#[cfg(any(unix, test))]
-fn reported_cell_size_from_events(
-    events: &[crate::raw_input::RawInputEvent],
-) -> Option<(u32, u32)> {
-    events.iter().rev().find_map(|event| match event {
-        crate::raw_input::RawInputEvent::HostCellSizeReport {
-            width_px,
-            height_px,
-        } => Some((*width_px, *height_px)),
-        _ => None,
-    })
-}
-
-fn init_logging() {
-    crate::logging::init_file_logging("herdr-client.log");
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
-
-    #[cfg(unix)]
-    #[test]
-    fn stale_unapplied_and_capture_disabled_mouse_input_is_rejected() {
-        let captured = HostInputSnapshot::from_parts(7, true, false);
-        assert!(mouse_input_is_current(captured, captured, 7, true));
-        assert!(!mouse_input_is_current(captured, captured, 6, true));
-        let capture_disabled = HostInputSnapshot::from_parts(7, false, false);
-        assert!(!mouse_input_is_current(
-            capture_disabled,
-            capture_disabled,
-            7,
-            true
-        ));
-        assert!(mouse_input_is_current(
-            capture_disabled,
-            capture_disabled,
-            7,
-            false
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pixel_mouse_requires_the_exact_applied_host_geometry() {
-        let snapshot = HostInputSnapshot::from_parts(7, true, true);
-        let applied = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        let observed = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
-
-        assert!(!pixel_input_is_current(
-            snapshot,
-            snapshot,
-            7,
-            observed,
-            Some(applied),
-        ));
-        assert!(pixel_input_is_current(
-            snapshot,
-            snapshot,
-            7,
-            observed,
-            Some(observed),
-        ));
-    }
-    #[cfg(unix)]
-    #[test]
-    fn resize_geometry_applies_after_a_newer_mouse_mode_generation() {
-        let old = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        let resized = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
-        let mut generation = 2;
-        let mut geometry = Some(old);
-
-        apply_resize_input_boundary(&mut generation, &mut geometry, 1, Some(resized));
-
-        assert_eq!(generation, 2);
-        assert_eq!(geometry, Some(resized));
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    fn resize_signal_reports_even_when_polled_size_is_unchanged() {
-        let size = (120, 40, 8, 16);
-        assert!(resize_report_required(true, size, size));
-        assert!(!resize_report_required(false, size, size));
-        assert!(resize_report_required(false, (120, 41, 8, 16), size));
-        assert!(resize_report_required(false, (120, 40, 9, 18), size));
-    }
-
-    #[test]
-    fn resize_geometry_reports_only_new_usable_samples() {
-        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        assert!(!resize_host_geometry_report_required(None, Some(geometry)));
-        assert!(!resize_host_geometry_report_required(None, None));
-        assert!(resize_host_geometry_report_required(Some(geometry), None));
-        assert!(!resize_host_geometry_report_required(
-            Some(geometry),
-            Some(geometry)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resize_event_advances_generation_before_dispatch() {
-        let input_state = HostInputState::new(true, true);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let geometry = crate::input::mouse::HostGeometry::new(120, 40, 1200, 800).unwrap();
-        input_state
-            .send_resize(&tx, (120, 40, 8, 16), Some(geometry))
-            .expect("resize dispatch");
-        assert_eq!(input_state.load().generation(), 1);
-        let ClientLoopEvent::Resize(120, 40, 8, 16, generation, sent_geometry) =
-            rx.try_recv().unwrap()
-        else {
-            panic!("expected resize event");
-        };
-        assert_eq!(generation, 1);
-        assert_eq!(sent_geometry, Some(geometry));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resize_is_enqueued_before_new_generation_input() {
-        let input_state = HostInputState::new(true, true);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        input_state
-            .send_resize(&tx, (120, 40, 8, 16), None)
-            .unwrap();
-        let snapshot = input_state.load();
-        input_state
-            .send_event(
-                &tx,
-                ClientLoopEvent::StdinInput(b"mouse".to_vec(), snapshot),
-            )
-            .unwrap();
-
-        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Resize(..))));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(ClientLoopEvent::StdinInput(_, captured)) if captured == snapshot
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn full_event_queue_reserves_capacity_before_input_order_lock() {
-        let input_state = Arc::new(HostInputState::new(true, true));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.blocking_send(ClientLoopEvent::Timer).unwrap();
-        let order_guard = input_state
-            .event_order
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sender_state = input_state.clone();
-        let sender_tx = tx.clone();
-        let sender = std::thread::spawn(move || {
-            sender_state.send_event(
-                &sender_tx,
-                ClientLoopEvent::StdinInput(b"mouse".to_vec(), sender_state.load()),
-            )
-        });
-
-        assert!(matches!(rx.try_recv(), Ok(ClientLoopEvent::Timer)));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while tx.capacity() != 0 && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert_eq!(tx.capacity(), 0, "sender did not reserve queue capacity");
-
-        drop(order_guard);
-        sender.join().unwrap().unwrap();
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(ClientLoopEvent::StdinInput(data, _)) if data == b"mouse"
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mouse_mode_transition_is_one_versioned_snapshot() {
-        let input_state = HostInputState::new(false, false);
-        let pixels = input_state
-            .transition_mouse_mode(true, true, || Ok(()))
-            .unwrap();
-        assert_eq!(pixels.generation(), 1);
-        assert!(pixels.capture_active());
-        assert!(pixels.sgr_pixels_active());
-        assert_eq!(input_state.load(), pixels);
-
-        let cells = input_state
-            .transition_mouse_mode(true, false, || Ok(()))
-            .unwrap();
-        assert_eq!(cells.generation(), 2);
-        assert!(cells.capture_active());
-        assert!(!cells.sgr_pixels_active());
-        assert_eq!(input_state.load(), cells);
-    }
-
-    #[test]
-    fn approximate_cell_size_never_enables_direct_graphics() {
-        assert_eq!(
-            client_launch_mode(false, false, 8, 16),
-            ClientLaunchMode::App
-        );
-        assert_eq!(
-            client_launch_mode(true, false, 8, 16),
-            ClientLaunchMode::TerminalAttach
-        );
-    }
-
-    #[test]
-    fn direct_graphics_profile_is_narrow_and_transport_safe() {
-        for (program, term, kitty, expected) in [
-            ("ghostty", "", false, true),
-            ("WezTerm", "", false, true),
-            ("", "xterm-kitty", false, true),
-            ("", "xterm-256color", true, true),
-            ("", "xterm-256color", false, false),
-        ] {
-            assert_eq!(
-                direct_graphics_profile_values(program, term, kitty, false, true),
-                expected
-            );
-        }
-        assert!(!direct_graphics_profile_values(
-            "ghostty", "", false, true, true
-        ));
-        assert!(!direct_graphics_profile_values(
-            "ghostty", "", false, false, false
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pane_local_omp_resolves_companion_and_advertises_native_capability() {
-        let calls = std::cell::Cell::new(0);
-        let eligible = client_omp_renderer_eligible(
-            RenderEncoding::SemanticFrame,
-            ClientLaunchMode::App,
-            true,
-            true,
-        );
-        assert!(eligible);
-        let executable = crate::update::OmpExecutable::Explicit(
-            std::env::current_exe().expect("current test executable"),
-        );
-        let resolved = resolve_client_omp_executable_with(
-            eligible,
-            || {
-                calls.set(calls.get() + 1);
-                Ok(executable.clone())
-            },
-            |_| {},
-        )
-        .expect("verified native companion");
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(resolved.executable(), executable.executable());
-        assert!(
-            client_omp_renderer_capabilities(
-                RenderEncoding::SemanticFrame,
-                ClientLaunchMode::App,
-                true,
-                true,
-                Some(&resolved),
-            )
-            .client_local_native
-        );
-    }
-    #[cfg(unix)]
-    #[test]
-    fn eligible_native_omp_probes_then_resolves_then_connects_and_handshakes() {
-        let steps = std::cell::RefCell::new(Vec::new());
-        let expected = std::env::current_exe().expect("current test executable");
-
-        let (_, resolved, ()) = probe_connect_then_resolve_client_omp_and_handshake_with(
-            true,
-            || {
-                steps.borrow_mut().push("probe-connect");
-                Ok(())
-            },
-            |eligible| {
-                assert!(eligible);
-                steps.borrow_mut().push("resolve");
-                Some(crate::update::OmpExecutable::Explicit(expected.clone()))
-            },
-            || {
-                steps.borrow_mut().push("connect");
-                Ok(())
-            },
-            |_, executable| {
-                steps.borrow_mut().push("handshake");
-                assert_eq!(
-                    executable.map(|executable| executable.executable()),
-                    Some(expected.as_path())
-                );
-                Ok(())
-            },
-        )
-        .expect("client startup succeeds");
-
-        assert_eq!(resolved.expect("resolved companion").executable(), expected);
-        assert_eq!(
-            steps.into_inner(),
-            vec!["probe-connect", "resolve", "connect", "handshake"]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_native_omp_probe_connect_skips_resolution() {
-        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
-            true,
-            || Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
-            |_| panic!("failed probe must prevent native OMP resolution"),
-            || unreachable!("failed probe must prevent the real connection"),
-            |_, _| unreachable!("failed probe must prevent the handshake"),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ClientError::ConnectionFailed(error))
-                if error.kind() == io::ErrorKind::ConnectionRefused
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn eligible_native_omp_second_connect_loss_requests_remote_reconnect() {
-        let result = probe_connect_then_resolve_client_omp_and_handshake_with::<(), ()>(
-            true,
-            || Ok(()),
-            |_| None,
-            || Err(io::Error::from(io::ErrorKind::ConnectionReset)),
-            |_, _| unreachable!("failed second connect must prevent the handshake"),
-        );
-
-        let error = result.expect_err("second connection should be lost");
-        assert!(matches!(
-            &error,
-            ClientError::ConnectionLost(source)
-                if source.kind() == io::ErrorKind::ConnectionReset
-        ));
-        assert_eq!(
-            client_error_exit_code(&error, true),
-            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
-        );
-        assert_eq!(client_error_exit_code(&error, false), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn eligible_native_omp_handshake_write_loss_requests_remote_reconnect() {
-        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
-            true,
-            || Ok(()),
-            |_| None,
-            || Ok(()),
-            |_, _| {
-                Err::<(), _>(ClientError::ConnectionFailed(io::Error::from(
-                    io::ErrorKind::BrokenPipe,
-                )))
-            },
-        );
-
-        let error = result.expect_err("handshake write should be lost");
-        assert!(matches!(
-            &error,
-            ClientError::ConnectionLost(source) if source.kind() == io::ErrorKind::BrokenPipe
-        ));
-        assert_eq!(
-            client_error_exit_code(&error, true),
-            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn eligible_native_omp_handshake_read_loss_requests_remote_reconnect() {
-        let result = probe_connect_then_resolve_client_omp_and_handshake_with(
-            true,
-            || Ok(()),
-            |_| None,
-            || Ok(()),
-            |_, _| Err::<(), _>(ClientError::Protocol(protocol::FramingError::UnexpectedEof)),
-        );
-
-        let error = result.expect_err("handshake read should be lost");
-        assert!(matches!(
-            &error,
-            ClientError::ConnectionLost(source)
-                if source.kind() == io::ErrorKind::UnexpectedEof
-        ));
-        assert_eq!(
-            client_error_exit_code(&error, true),
-            crate::remote::REMOTE_CLIENT_RECONNECT_EXIT_CODE
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn ineligible_native_omp_clients_skip_resolution() {
-        for (encoding, launch_mode, stdin_tty, stdout_tty) in [
-            (
-                RenderEncoding::TerminalAnsi,
-                ClientLaunchMode::App,
-                true,
-                true,
-            ),
-            (
-                RenderEncoding::SemanticFrame,
-                ClientLaunchMode::TerminalAttach,
-                true,
-                true,
-            ),
-            (
-                RenderEncoding::SemanticFrame,
-                ClientLaunchMode::App,
-                false,
-                true,
-            ),
-            (
-                RenderEncoding::SemanticFrame,
-                ClientLaunchMode::App,
-                true,
-                false,
-            ),
-        ] {
-            let eligible =
-                client_omp_renderer_eligible(encoding, launch_mode, stdin_tty, stdout_tty);
-            assert!(!eligible);
-            let called = std::cell::Cell::new(false);
-            assert!(resolve_client_omp_executable_with(
-                eligible,
-                || {
-                    called.set(true);
-                    panic!("ineligible client must not resolve a native OMP companion")
-                },
-                |_| {},
-            )
-            .is_none());
-            assert!(!called.get());
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_omp_resolution_keeps_expected_unavailability_quiet() {
-        let mut diagnostics = Vec::new();
-
-        for error in [
-            "managed OMP companion is disabled for this client attach",
-            "managed OMP companion is unavailable for this platform",
-            "this Herdr build has no paired OMP companion",
-        ] {
-            assert!(resolve_client_omp_executable_with(
-                true,
-                || Err(error.to_string()),
-                |error| diagnostics.push(error.to_owned()),
-            )
-            .is_none());
-        }
-
-        assert!(diagnostics.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_omp_resolution_reports_invalid_or_unverified_companions() {
-        for error in [
-            "OMP executable path must be absolute: relative-omp",
-            "OMP companion checksum verification failed: mismatch",
-        ] {
-            let mut diagnostic = None;
-            assert!(resolve_client_omp_executable_with(
-                true,
-                || Err(error.to_string()),
-                |error| diagnostic = Some(error.to_owned()),
-            )
-            .is_none());
-            assert_eq!(diagnostic.as_deref(), Some(error));
-        }
-    }
-
-    fn restore_env_var(key: &str, value: Option<OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
-        }
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            restore_env_var(self.key, self.previous.clone());
-        }
-    }
-
-    #[test]
-    fn windows_virtual_terminal_input_mode_sets_only_vti_bit() {
-        assert_eq!(windows_virtual_terminal_input_mode(0x01f0), 0x03f0);
-        assert_eq!(windows_virtual_terminal_input_mode(0x03f0), 0x03f0);
-    }
-
-    struct EnvVarsRemovedGuard {
-        previous: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvVarsRemovedGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            let previous: Vec<_> = keys
-                .iter()
-                .map(|key| (*key, std::env::var_os(key)))
-                .collect();
-            for key in keys {
-                std::env::remove_var(key);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for EnvVarsRemovedGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.clone() {
-                restore_env_var(key, value);
-            }
-        }
-    }
-
-    #[test]
-    fn remote_client_uses_extended_handshake_timeout() {
-        let _guard = env_lock().lock().unwrap();
-        let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
-
-        assert_eq!(handshake_read_timeout(), REMOTE_HANDSHAKE_READ_TIMEOUT);
-    }
-
-    #[test]
-    fn host_cursor_policy_auto_uses_platform_default() {
-        assert_eq!(
-            should_draw_host_cursor(crate::config::HostCursorModeConfig::Auto),
-            crate::platform::should_draw_host_cursor_by_default()
-        );
-    }
-
-    #[test]
-    fn host_cursor_policy_native_and_drawn_override_auto_detection() {
-        let _guard = env_lock().lock().unwrap();
-        let _env = EnvVarGuard::set("TERM_PROGRAM", "WezTerm");
-
-        assert!(!should_draw_host_cursor(
-            crate::config::HostCursorModeConfig::Native
-        ));
-        assert!(should_draw_host_cursor(
-            crate::config::HostCursorModeConfig::Drawn
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn clipboard_image_paste_bridge_triggers_on_configured_key_and_empty_paste() {
-        let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
-        assert!(should_bridge_clipboard_image_paste(
-            &[0x16],
-            true,
-            Some(ctrl_v)
-        ));
-        assert!(should_bridge_clipboard_image_paste(
-            b"\x1b[118;5u",
-            true,
-            Some(ctrl_v)
-        ));
-        assert!(should_bridge_clipboard_image_paste(
-            b"\x1b[200~\x1b[201~",
-            true,
-            None
-        ));
-        assert!(!should_bridge_clipboard_image_paste(
-            b"\x1b[200~\x1b[201~",
-            false,
-            Some(ctrl_v)
-        ));
-        assert!(!should_bridge_clipboard_image_paste(
-            b"\x1b[200~text\x1b[201~",
-            true,
-            Some(ctrl_v)
-        ));
-        assert!(!should_bridge_clipboard_image_paste(&[0x16], true, None));
-        assert!(!should_bridge_clipboard_image_paste(
-            b"v",
-            true,
-            Some(ctrl_v)
-        ));
-    }
-
-    static NEXT_TEMP_IMAGE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-    struct TempImageFile {
-        path: std::path::PathBuf,
-    }
-
-    impl TempImageFile {
-        fn new(extension: &str, bytes: &[u8]) -> Self {
-            Self::with_name_fragment("test", extension, bytes)
-        }
-
-        fn with_name_fragment(name_fragment: &str, extension: &str, bytes: &[u8]) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let id = NEXT_TEMP_IMAGE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "herdr-client-drop-{name_fragment}-{}-{nanos}-{id}.{extension}",
-                std::process::id()
-            ));
-            std::fs::write(&path, bytes).unwrap();
-            Self { path }
-        }
-    }
-
-    impl Drop for TempImageFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    #[test]
-    fn clipboard_image_event_bridge_matches_remote_key_and_empty_paste() {
-        let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
-        let key = crate::protocol::ClientInputEvent::Key {
-            code: crate::protocol::ClientKeyCode::Char('v'),
-            modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
-            kind: crate::protocol::ClientKeyKind::Press,
-            repeat_count: 1,
-            generated_text: None,
-            source: crate::protocol::ClientKeySource::Synthesized,
-        };
-        let empty_paste = crate::protocol::ClientInputEvent::Paste {
-            text: String::new(),
-        };
-
-        assert!(should_bridge_clipboard_image_events(
-            std::slice::from_ref(&key),
-            true,
-            Some(ctrl_v),
-        ));
-        assert!(should_bridge_clipboard_image_events(
-            std::slice::from_ref(&empty_paste),
-            true,
-            None,
-        ));
-        assert!(!should_bridge_clipboard_image_events(
-            &[key],
-            false,
-            Some(ctrl_v),
-        ));
-        assert!(!should_bridge_clipboard_image_events(
-            &[crate::protocol::ClientInputEvent::Paste {
-                text: "text".to_string(),
-            }],
-            true,
-            Some(ctrl_v),
-        ));
-    }
-
-    #[test]
-    fn remote_image_file_drop_bridge_reads_semantic_paste_path() {
-        let file = TempImageFile::new("PNG", b"image-bytes");
-        let events = [crate::protocol::ClientInputEvent::Paste {
-            text: format!("\"{}\"", file.path.display()),
-        }];
-
-        let image = read_image_file_from_client_events(&events, true).unwrap();
-
-        assert_eq!(image.extension, "png");
-        assert_eq!(image.bytes, b"image-bytes");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_image_file_drop_bridge_reads_bracketed_absolute_image_path() {
-        let file = TempImageFile::new("PNG", b"image-bytes");
-        let input = format!("\x1b[200~{}\x1b[201~", file.path.display());
-
-        let image = read_image_file_from_terminal_drop(input.as_bytes(), true).unwrap();
-
-        assert_eq!(image.extension, "png");
-        assert_eq!(image.bytes, b"image-bytes");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_image_file_drop_bridge_reads_plain_quoted_path_with_newline() {
-        let file = TempImageFile::new("jpeg", b"jpeg-bytes");
-        let input = format!("'{}'\n", file.path.display());
-
-        let image = read_image_file_from_terminal_drop(input.as_bytes(), true).unwrap();
-
-        assert_eq!(image.extension, "jpg");
-        assert_eq!(image.bytes, b"jpeg-bytes");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_image_file_drop_bridge_unescapes_spaces_in_paths() {
-        let file = TempImageFile::with_name_fragment("space test", "png", b"image-bytes");
-        let escaped_path = file.path.display().to_string().replace(' ', "\\ ");
-
-        let image = read_image_file_from_terminal_drop(escaped_path.as_bytes(), true).unwrap();
-
-        assert_eq!(image.extension, "png");
-        assert_eq!(image.bytes, b"image-bytes");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_image_file_drop_bridge_ignores_non_remote_and_non_image_input() {
-        let file = TempImageFile::new("png", b"image-bytes");
-        let path = file.path.display().to_string();
-
-        assert!(read_image_file_from_terminal_drop(path.as_bytes(), false).is_none());
-        assert!(read_image_file_from_terminal_drop(b"relative.png\n", true).is_none());
-        assert!(read_image_file_from_terminal_drop(b"/tmp/file.txt\n", true).is_none());
-        assert!(read_image_file_from_terminal_drop(
-            format!("{}\nextra", file.path.display()).as_bytes(),
-            true
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn graphics_bytes_are_written_inside_synchronized_blit_with_saved_cursor() {
-        let mut output = Vec::new();
-        write_encoded_frame_with_graphics(
-            &mut output,
-            b"\x1b[?2026htext\x1b[?2026lcursor",
-            b"graphics",
-        )
-        .unwrap();
-
-        assert_eq!(
-            output,
-            b"\x1b[?2026htext\x1b7graphics\x1b8\x1b[?2026lcursor"
-        );
-    }
-
-    #[test]
-    fn empty_graphics_writes_only_blit_frame() {
-        let mut output = Vec::new();
-        write_encoded_frame_with_graphics(&mut output, b"text", b"").unwrap();
-
-        assert_eq!(output, b"text");
-    }
-
-    #[test]
-    fn terminal_frame_kitty_detection_matches_apc_prefix() {
-        assert!(contains_kitty_graphics_bytes(b"text\x1b_Ga=p;\x1b\\"));
-        assert!(!contains_kitty_graphics_bytes(b"text\x1b[?2026h"));
-    }
-
-    #[test]
-    fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
-        let ids = kitty_graphics_image_ids(
-            b"text\x1b_Ga=t,t=d,f=32,s=1,v=1,i=10023,q=2;AAAA\x1b\\\x1b_Ga=p,i=10023,p=7;\x1b\\",
-        );
-        assert_eq!(ids, vec![10023, 10023]);
-    }
-
-    #[test]
-    fn kitty_graphics_cleanup_deletes_tracked_images_not_all_images() {
-        record_received_kitty_graphics(b"\x1b_Ga=t,i=123,q=2;AAAA\x1b\\");
-        let mut output = Vec::new();
-        clear_received_kitty_graphics(&mut output).unwrap();
-        let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("a=d,d=I,i=123"));
-        assert!(!text.contains("d=A"));
-    }
-
-    #[test]
-    fn write_host_terminal_appearance_query_emits_mode_2031_query() {
-        let mut output = Vec::new();
-        write_host_terminal_appearance_query(&mut output).unwrap();
-        assert_eq!(output, b"\x1b[?996n");
-    }
-
-    #[test]
-    fn write_host_terminal_theme_query_emits_osc_queries() {
-        let mut output = Vec::new();
-        write_host_terminal_theme_query(&mut output).unwrap();
-        assert_eq!(
-            output,
-            crate::terminal_theme::host_terminal_theme_query_sequence(
-                crate::platform::should_query_host_terminal_palette(),
-            )
-            .as_bytes()
-        );
-        assert!(!output
-            .windows(crate::terminal_theme::HOST_COLOR_SCHEME_QUERY_SEQUENCE.len())
-            .any(|window| window
-                == crate::terminal_theme::HOST_COLOR_SCHEME_QUERY_SEQUENCE.as_bytes()));
-    }
-
-    #[test]
-    fn write_host_color_scheme_report_mode_emits_mode_sequences() {
-        let mut output = Vec::new();
-        write_host_color_scheme_report_mode(&mut output, true).unwrap();
-        write_host_color_scheme_report_mode(&mut output, false).unwrap();
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_ENABLE_SEQUENCE.as_bytes(),
-        );
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        );
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn color_scheme_change_event_requests_host_theme_query() {
-        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[?997;1n");
-
-        assert!(crate::raw_input::events_require_host_terminal_theme_query(
-            &events
-        ));
-    }
-
-    #[test]
-    fn host_terminal_theme_query_is_disabled_on_windows() {
-        assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
-    }
-
-    #[test]
-    fn write_host_cell_size_query_emits_xtwinops_request() {
-        let mut output = Vec::new();
-        write_host_cell_size_query(&mut output).unwrap();
-
-        assert_eq!(output, b"\x1b[16t");
-    }
-
-    #[test]
-    fn host_cell_size_query_is_disabled_on_windows() {
-        assert_eq!(should_query_host_cell_size(), !cfg!(windows));
-    }
-
-    #[test]
-    fn cell_size_fallback_prefers_reported_then_previous_size() {
-        assert_eq!(cell_size_fallback(0, None), (8, 16));
-        assert_eq!(cell_size_fallback(0, Some((11, 22))), (11, 22));
-        assert_eq!(
-            cell_size_fallback(pack_cell_size(10, 21), Some((11, 22))),
-            (10, 21)
-        );
-        assert_eq!(cell_size_fallback(pack_cell_size(10, 0), None), (8, 16));
-        assert_eq!(cell_size_fallback(pack_cell_size(0, 21), None), (8, 16));
-    }
-
-    #[test]
-    fn reported_cell_size_is_taken_from_host_cell_size_events() {
-        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[?997;1n");
-        assert_eq!(reported_cell_size_from_events(&events), None);
-
-        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[6;21;10t\x1b[6;18;9t");
-        assert_eq!(reported_cell_size_from_events(&events), Some((9, 18)));
-    }
-
-    #[test]
-    fn color_scheme_reports_are_enabled_only_for_full_clients() {
-        assert_eq!(
-            should_enable_host_color_scheme_reports(true),
-            !cfg!(windows)
-        );
-        assert!(!should_enable_host_color_scheme_reports(false));
-    }
-
-    #[test]
-    fn mouse_pointer_shape_emits_initial_default_and_deduplicates_link_state() {
-        let frame = crate::protocol::FrameData {
-            cells: vec![
-                crate::protocol::CellData {
-                    symbol: " ".into(),
-                    fg: 0,
-                    bg: 0,
-                    modifier: 0,
-                    skip: false,
-                    hyperlink: None,
-                },
-                crate::protocol::CellData {
-                    symbol: "L".into(),
-                    fg: 0,
-                    bg: 0,
-                    modifier: 0,
-                    skip: false,
-                    hyperlink: Some(0),
-                },
-            ],
-            width: 2,
-            height: 1,
-            cursor: None,
-            hyperlinks: vec!["https://example.com".into()],
-            graphics: Vec::new(),
-            omp_renderer: None,
-        };
-        let mut pointer = MousePointerState::default();
-        let mut output = Vec::new();
-
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
-
-        output.clear();
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert!(output.is_empty());
-        pointer.set_cell(Some((1, 0)));
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
-
-        output.clear();
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert!(output.is_empty());
-
-        pointer.set_cell(Some((0, 0)));
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
-
-        output.clear();
-
-        pointer
-            .write_for_frame(&mut output, Some(&frame), Some(true))
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
-
-        output.clear();
-        pointer
-            .write_for_frame(&mut output, Some(&frame), Some(true))
-            .unwrap();
-        assert!(output.is_empty());
-
-        pointer.set_cell(Some((1, 0)));
-        pointer
-            .write_for_frame(&mut output, Some(&frame), Some(false))
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
-
-        output.clear();
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_POINTER_SEQUENCE);
-
-        output.clear();
-        assert_eq!(
-            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
-            Some(None)
-        );
-        pointer
-            .write_for_frame(&mut output, Some(&frame), None)
-            .unwrap();
-        assert_eq!(output, MOUSE_SHAPE_DEFAULT_SEQUENCE);
-    }
-
-    #[test]
-    fn raw_pointer_observation_reports_only_pointer_changes() {
-        let mut pointer = MousePointerState::default();
-        pointer.set_cell(Some((1, 0)));
-
-        let key = crate::raw_input::RawInputEvent::Key(crate::input::TerminalKey::new(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::empty(),
-        ));
-        assert_eq!(pointer.observe_raw_events(&[key]), None);
-        assert_eq!(pointer.cell, Some((1, 0)));
-
-        let mouse = crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Moved,
-            column: 2,
-            row: 0,
-            modifiers: crossterm::event::KeyModifiers::empty(),
-        });
-        assert_eq!(pointer.observe_raw_events(&[mouse]), Some(Some((2, 0))));
-        assert_eq!(
-            pointer.observe_raw_events(&[crate::raw_input::RawInputEvent::OuterFocusLost]),
-            Some(None)
-        );
-    }
-
-    #[test]
-    fn terminal_restore_postlude_restores_default_pointer_and_visible_default_cursor() {
-        let mut output = Vec::new();
-        write_terminal_restore_postlude(&mut output, false).unwrap();
-        assert_eq!(output, b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
-    }
-
-    #[test]
-    fn terminal_restore_postlude_disables_color_scheme_reports_when_enabled() {
-        let mut output = Vec::new();
-        write_terminal_restore_postlude(&mut output, true).unwrap();
-
-        let mut expected = Vec::new();
-        expected.extend_from_slice(
-            crate::terminal_theme::HOST_COLOR_SCHEME_REPORT_DISABLE_SEQUENCE.as_bytes(),
-        );
-        expected.extend_from_slice(b"\x1b]22;default\x1b\\\x1b[?25h\x1b[0 q");
-        assert_eq!(output, expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_detaches_on_prefix_q() {
-        let mut escape = AttachEscapeState::default();
-        assert!(matches!(
-            escape.filter_input(vec![0x02], 24, 3),
-            AttachInputAction::None
-        ));
-        assert!(matches!(
-            escape.filter_input(vec![b'q'], 24, 3),
-            AttachInputAction::Detach
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_sends_literal_prefix_on_double_prefix() {
-        let mut escape = AttachEscapeState::default();
-        assert!(matches!(
-            escape.filter_input(vec![0x02], 24, 3),
-            AttachInputAction::None
-        ));
-        match escape.filter_input(vec![0x02], 24, 3) {
-            AttachInputAction::Forward(bytes) => assert_eq!(bytes, vec![0x02]),
-            other => panic!("expected forwarded prefix, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_does_not_interpret_bracketed_paste_contents() {
-        let mut escape = AttachEscapeState::default();
-        let paste = b"\x1b[200~one\x02q\ntwo\x1b[201~".to_vec();
-
-        match escape.filter_input(paste.clone(), 24, 3) {
-            AttachInputAction::Forward(bytes) => assert_eq!(bytes, paste),
-            other => panic!("expected opaque paste, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_flushes_pending_prefix_before_bracketed_paste() {
-        let mut escape = AttachEscapeState::default();
-        let paste = b"\x1b[200~one\ntwo\x1b[201~".to_vec();
-        assert!(matches!(
-            escape.filter_input(vec![0x02], 24, 3),
-            AttachInputAction::None
-        ));
-
-        assert!(matches!(
-            escape.filter_input(paste.clone(), 24, 3),
-            AttachInputAction::ForwardAfterPendingPrefix(bytes) if bytes == paste
-        ));
-        assert!(matches!(
-            escape.filter_input(vec![b'q'], 24, 3),
-            AttachInputAction::Forward(bytes) if bytes == b"q"
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_forwards_prefix_before_non_escape_key() {
-        let mut escape = AttachEscapeState::default();
-        assert!(matches!(
-            escape.filter_input(vec![b'a', 0x02], 24, 3),
-            AttachInputAction::Forward(bytes) if bytes == b"a"
-        ));
-        match escape.filter_input(vec![b'x'], 24, 3) {
-            AttachInputAction::Forward(bytes) => assert_eq!(bytes, vec![0x02, b'x']),
-            other => panic!("expected forwarded bytes, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_turns_wheel_into_scroll_action() {
-        let mut escape = AttachEscapeState::default();
-        match escape.filter_input(b"\x1b[<64;11;6M".to_vec(), 24, 7) {
-            AttachInputAction::Scroll {
-                source,
-                direction,
-                lines,
-                column,
-                row,
-                ..
-            } => {
-                assert_eq!(source, AttachScrollSource::Wheel);
-                assert_eq!(direction, AttachScrollDirection::Up);
-                assert_eq!(lines, 7);
-                assert_eq!(column, Some(10));
-                assert_eq!(row, Some(5));
-            }
-            other => panic!("expected scroll action, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_swallows_non_wheel_mouse_reports() {
-        let mut escape = AttachEscapeState::default();
-        assert!(matches!(
-            escape.filter_input(b"\x1b[<0;11;6M".to_vec(), 24, 7),
-            AttachInputAction::None
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_turns_plain_page_keys_into_scroll_actions() {
-        let mut escape = AttachEscapeState::default();
-        match escape.filter_input(b"\x1b[5~".to_vec(), 12, 3) {
-            AttachInputAction::Scroll {
-                source,
-                direction,
-                lines,
-                ..
-            } => {
-                assert_eq!(
-                    source,
-                    AttachScrollSource::PageKey {
-                        input: b"\x1b[5~".to_vec()
-                    }
-                );
-                assert_eq!(direction, AttachScrollDirection::Up);
-                assert_eq!(lines, 11);
-            }
-            other => panic!("expected page-up scroll action, got {other:?}"),
-        }
-
-        match escape.filter_input(b"\x1b[6~".to_vec(), 12, 3) {
-            AttachInputAction::Scroll {
-                source,
-                direction,
-                lines,
-                ..
-            } => {
-                assert_eq!(
-                    source,
-                    AttachScrollSource::PageKey {
-                        input: b"\x1b[6~".to_vec()
-                    }
-                );
-                assert_eq!(direction, AttachScrollDirection::Down);
-                assert_eq!(lines, 11);
-            }
-            other => panic!("expected page-down scroll action, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attach_escape_forwards_modified_page_key() {
-        let mut escape = AttachEscapeState::default();
-        match escape.filter_input(b"\x1b[5;5~".to_vec(), 12, 3) {
-            AttachInputAction::Forward(bytes) => assert_eq!(bytes, b"\x1b[5;5~"),
-            other => panic!("expected modified page key to forward, got {other:?}"),
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_identity_detects_atomic_replacement() {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-        let dir = std::env::temp_dir().join(format!(
-            "herdr-client-relaunch-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let executable = dir.join("herdr");
-        let replacement = dir.join("herdr.new");
-        std::fs::write(&executable, b"old").unwrap();
-        let identity = ClientExecutableIdentity::capture_at(executable.clone()).unwrap();
-
-        std::fs::write(&replacement, b"new").unwrap();
-        std::fs::rename(&replacement, &executable).unwrap();
-
-        assert!(identity.was_replaced());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replaced_local_app_client_relaunches_during_startup() {
-        assert!(should_relaunch_updated_client_during_startup(
-            false, false, true
-        ));
-        assert!(!should_relaunch_updated_client_during_startup(
-            true, false, true
-        ));
-        assert!(!should_relaunch_updated_client_during_startup(
-            false, true, true
-        ));
-        assert!(!should_relaunch_updated_client_during_startup(
-            false, false, false
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replaced_local_app_client_relaunches_only_after_server_disconnect() {
-        let lost = ClientError::ConnectionLost(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "server closed connection",
-        ));
-        assert!(should_relaunch_updated_client(&lost, false, false, true));
-        assert!(!should_relaunch_updated_client(&lost, true, false, true));
-        assert!(!should_relaunch_updated_client(&lost, false, true, true));
-        assert!(!should_relaunch_updated_client(&lost, false, false, false));
-
-        let shutdown = ClientError::ServerShutdown {
-            reason: Some("live update in progress".into()),
-        };
-        assert!(should_relaunch_updated_client(
-            &shutdown, false, false, true
-        ));
-        let detached = ClientError::ServerShutdown {
-            reason: Some("detached".into()),
-        };
-        assert!(!should_relaunch_updated_client(
-            &detached, false, false, true
-        ));
-        let rejected = ClientError::HandshakeRejected {
-            version: 1,
-            error: "incompatible".into(),
-        };
-        assert!(!should_relaunch_updated_client(
-            &rejected, false, false, true
-        ));
-    }
-
-    #[test]
-    fn remote_reconnects_only_for_connection_loss_or_server_handoff() {
-        let connection_lost = ClientError::ConnectionLost(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "server closed connection",
-        ));
-        let handoff = ClientError::ServerHandoff {
-            reason: "live update in progress".into(),
-        };
-        let detached = ClientError::ServerShutdown {
-            reason: Some("detached".into()),
-        };
-        let shutdown = ClientError::ServerShutdown {
-            reason: Some("maintenance".into()),
-        };
-
-        for error in [&connection_lost, &handoff] {
-            assert!(should_request_remote_reconnect(error, true));
-            assert!(!should_request_remote_reconnect(error, false));
-        }
-        assert!(!should_request_remote_reconnect(&detached, true));
-        assert!(!should_request_remote_reconnect(&shutdown, true));
-    }
-
-    #[test]
-    fn client_error_display_connection_failed() {
-        let err = ClientError::ConnectionFailed(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "connection refused",
-        ));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to connect to server"),
-            "should mention connection failure: {msg}"
-        );
-        assert!(
-            msg.contains("herdr server"),
-            "should suggest starting server: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_handshake_rejected() {
-        let err = ClientError::HandshakeRejected {
-            version: 1,
-            error: "incompatible".into(),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("rejected handshake"),
-            "should mention rejection: {msg}"
-        );
-        assert!(msg.contains("incompatible"), "should include error: {msg}");
-    }
-
-    #[test]
-    fn client_error_display_server_shutdown() {
-        let err = ClientError::ServerShutdown {
-            reason: Some("maintenance".into()),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("server shut down"),
-            "should mention shutdown: {msg}"
-        );
-        assert!(msg.contains("maintenance"), "should include reason: {msg}");
-    }
-
-    #[test]
-    fn client_error_display_server_shutdown_no_reason() {
-        let err = ClientError::ServerShutdown { reason: None };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("server shut down"),
-            "should mention shutdown: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_detached_default_session_reattach_hint() {
-        let _guard = env_lock().lock().unwrap();
-        let _env = EnvVarsRemovedGuard::new(&[
-            crate::remote::REATTACH_COMMAND_ENV_VAR,
-            crate::session::SESSION_ENV_VAR,
-        ]);
-        let err = ClientError::ServerShutdown {
-            reason: Some("detached".into()),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Run `herdr` to reattach"),
-            "should suggest default reattach command: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_detached_named_session_reattach_hint() {
-        let _guard = env_lock().lock().unwrap();
-        let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
-        let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
-        let err = ClientError::ServerShutdown {
-            reason: Some("detached".into()),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Run `herdr session attach work` to reattach"),
-            "should suggest named session reattach command: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_detached_remote_reattach_hint_takes_precedence() {
-        let _guard = env_lock().lock().unwrap();
-        let _remote_env = EnvVarGuard::set(
-            crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "herdr --remote host --session work",
-        );
-        let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
-        let err = ClientError::ServerShutdown {
-            reason: Some("detached".into()),
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Run `herdr --remote host --session work` to reattach"),
-            "should prefer remote reattach command: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_connection_lost() {
-        let _guard = env_lock().lock().unwrap();
-        let _env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
-        let err =
-            ClientError::ConnectionLost(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("lost connection to server"),
-            "should mention lost connection: {msg}"
-        );
-    }
-
-    #[test]
-    fn client_error_display_remote_connection_lost_has_reattach_hint() {
-        let _guard = env_lock().lock().unwrap();
-        let _remote_env = EnvVarGuard::set(
-            crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "herdr --remote host --session work",
-        );
-        let err =
-            ClientError::ConnectionLost(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("lost connection to remote Herdr"),
-            "should mention remote connection loss: {msg}"
-        );
-        assert!(
-            msg.contains("panes may still be running"),
-            "should explain possible persistence: {msg}"
-        );
-        assert!(
-            msg.contains("Run `herdr --remote host --session work` to reattach"),
-            "should show remote reattach command: {msg}"
-        );
-    }
-
-    #[test]
-    fn sound_from_notify_message_maps_done() {
-        assert_eq!(
-            sound_from_notify_message("agent done"),
-            Some(crate::sound::Sound::Done)
-        );
-    }
-
-    #[test]
-    fn sound_from_notify_message_maps_attention() {
-        assert_eq!(
-            sound_from_notify_message("agent attention"),
-            Some(crate::sound::Sound::Request)
-        );
-    }
-
-    #[test]
-    fn sound_from_notify_message_rejects_unknown_payloads() {
-        assert_eq!(sound_from_notify_message("toast"), None);
-    }
-
-    #[test]
-    fn reload_local_client_config_refreshes_local_client_presentation_state() {
-        let _guard = crate::config::test_config_env_lock().lock();
-        let path = std::env::temp_dir().join(format!(
-            "herdr-client-config-reload-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(
-            &path,
-            "[ui]\nredraw_on_focus_gained = false\nhost_cursor = \"drawn\"\n",
-        )
-        .unwrap();
-        let path_string = path.to_string_lossy().to_string();
-        let _env = EnvVarGuard::set(crate::config::CONFIG_PATH_ENV_VAR, &path_string);
-        let mut sound_config = crate::config::SoundConfig::default();
-        let mut redraw_on_focus_gained = true;
-        let mut draw_host_cursor = false;
-        let mut remote_image_paste_key = None;
-
-        reload_local_client_config(
-            &mut sound_config,
-            &mut redraw_on_focus_gained,
-            &mut draw_host_cursor,
-            &mut remote_image_paste_key,
-        );
-
-        assert!(!redraw_on_focus_gained);
-        assert!(draw_host_cursor);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn toast_notify_from_server_is_emitted_even_when_attach_config_was_off() {
-        let sound_config = crate::config::SoundConfig::default();
-        let mut emitted = None;
-
-        handle_notify_with_notifiers(
-            NotifyKind::Toast,
-            "pi finished",
-            Some("workspace 1"),
-            &sound_config,
-            |title, body| {
-                emitted = Some((title.to_string(), body.map(str::to_string)));
-                Ok(true)
-            },
-            |_, _, _| Ok(false),
-            None,
-        );
-
-        assert_eq!(
-            emitted,
-            Some(("pi finished".to_string(), Some("workspace 1".to_string())))
-        );
-    }
-
-    #[test]
-    fn system_toast_notify_from_server_uses_system_notifier() {
-        let sound_config = crate::config::SoundConfig::default();
-        let mut emitted = None;
-
-        handle_notify_with_notifiers(
-            NotifyKind::SystemToast,
-            "pi finished",
-            Some("workspace 1"),
-            &sound_config,
-            |_, _| Ok(false),
-            |title, body, action| {
-                assert!(action.is_none());
-                emitted = Some((title.to_string(), body.map(str::to_string)));
-                Ok(true)
-            },
-            None,
-        );
-
-        assert_eq!(
-            emitted,
-            Some(("pi finished".to_string(), Some("workspace 1".to_string())))
-        );
-    }
-
-    #[test]
-    fn system_toast_notify_preserves_colon_in_title() {
-        let sound_config = crate::config::SoundConfig::default();
-        let mut emitted = None;
-
-        handle_notify_with_notifiers(
-            NotifyKind::SystemToast,
-            "build: failed",
-            Some("api workspace"),
-            &sound_config,
-            |_, _| Ok(false),
-            |title, body, _| {
-                emitted = Some((title.to_string(), body.map(str::to_string)));
-                Ok(true)
-            },
-            None,
-        );
-
-        assert_eq!(
-            emitted,
-            Some((
-                "build: failed".to_string(),
-                Some("api workspace".to_string())
-            ))
-        );
-    }
-
-    #[test]
-    fn open_safe_url_accepts_http_and_https() {
-        let mut opened = Vec::new();
-        let mut children = Vec::new();
-        for url in ["http://example.com", "https://example.com"] {
-            open_safe_url(url, &mut children, |url| {
-                opened.push(url.to_owned());
-                Ok(None)
-            });
-        }
-        assert_eq!(opened, ["http://example.com", "https://example.com"]);
-        assert!(children.is_empty());
-    }
-
-    #[test]
-    fn open_safe_url_rejects_file_and_custom_schemes() {
-        let mut calls = 0;
-        let mut children = Vec::new();
-        for url in ["file:///tmp/example.rs", "mailto:user@example.com"] {
-            open_safe_url(url, &mut children, |_| {
-                calls += 1;
-                Ok(None)
-            });
-        }
-        assert_eq!(calls, 0);
-        assert!(children.is_empty());
-    }
-
-    #[test]
-    fn system_toast_notify_passes_activation_action_only_to_system_notifier() {
-        let sound_config = crate::config::SoundConfig::default();
-        let activation_action = crate::platform::DesktopNotificationAction {
-            executable: std::path::PathBuf::from("/tmp/herdr"),
-            args: vec!["notification".into(), "activate".into()],
-        };
-        let mut received = false;
-
-        handle_notify_with_notifiers(
-            NotifyKind::SystemToast,
-            "pi finished",
-            None,
-            &sound_config,
-            |_, _| Ok(false),
-            |_, _, action| {
-                received = action == Some(&activation_action);
-                Ok(true)
-            },
-            Some(&activation_action),
-        );
-
-        assert!(received);
-    }
-
-    #[test]
-    fn notification_action_args_preserve_the_explicit_client_socket() {
-        let activation = NotificationActivation {
-            recipient_client_id: 42,
-            workspace_id: "work space;$(bad)".into(),
-            pane_id: 7,
-        };
-
-        assert_eq!(
-            notification_action_args(
-                std::path::Path::new("/tmp/client socket;$(bad)"),
-                &activation,
-            ),
-            vec![
-                "notification".to_owned(),
-                "activate".to_owned(),
-                "/tmp/client socket;$(bad)".to_owned(),
-                "42".to_owned(),
-                "work space;$(bad)".to_owned(),
-                "7".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn decode_clipboard_payload_decodes_base64() {
-        assert_eq!(decode_clipboard_payload("dGVzdA=="), Some(b"test".to_vec()));
-    }
-
-    #[test]
-    fn decode_clipboard_payload_rejects_invalid_base64() {
-        assert_eq!(decode_clipboard_payload("not-base64!!!"), None);
-    }
-
-    #[test]
-    fn terminal_control_input_command_accepts_text() {
-        let action =
-            terminal_control_command_from_json(r#"{"type":"terminal.input","text":"hello"}"#)
-                .unwrap();
-        let ClientMessage::Input { data } = action else {
-            panic!("expected input command");
-        };
-        assert_eq!(data, b"hello");
-    }
-
-    #[test]
-    fn terminal_control_input_command_accepts_base64_bytes() {
-        let action =
-            terminal_control_command_from_json(r#"{"type":"terminal.input","bytes":"G1tB"}"#)
-                .unwrap();
-        let ClientMessage::Input { data } = action else {
-            panic!("expected input command");
-        };
-        assert_eq!(data, b"\x1b[A");
-    }
-
-    #[test]
-    fn terminal_control_resize_command_maps_to_client_resize() {
-        let action = terminal_control_command_from_json(
-            r#"{"type":"terminal.resize","cols":100,"rows":30,"cell_width_px":8,"cell_height_px":16}"#,
-        )
-        .unwrap();
-        let ClientMessage::Resize {
-            cols,
-            rows,
-            cell_width_px,
-            cell_height_px,
-        } = action
-        else {
-            panic!("expected resize command");
-        };
-        assert_eq!(
-            (cols, rows, cell_width_px, cell_height_px),
-            (100, 30, 8, 16)
-        );
-    }
-
-    #[test]
-    fn terminal_control_scroll_command_maps_to_attach_scroll() {
-        let action = terminal_control_command_from_json(
-            r#"{"type":"terminal.scroll","direction":"up","lines":3}"#,
-        )
-        .unwrap();
-        let ClientMessage::AttachScroll {
-            source,
-            direction,
-            lines,
-            ..
-        } = action
-        else {
-            panic!("expected scroll command");
-        };
-        assert_eq!(source, AttachScrollSource::Wheel);
-        assert_eq!(direction, AttachScrollDirection::Up);
-        assert_eq!(lines, 3);
-    }
-
-    #[test]
-    fn forward_clipboard_uses_local_clipboard_path() {
-        unsafe {
-            std::env::set_var("SSH_CONNECTION", "1 2 3 4");
-        }
-        forward_clipboard("dGVzdA==");
-        unsafe {
-            std::env::remove_var("SSH_CONNECTION");
-        }
-    }
-}
+mod tests;

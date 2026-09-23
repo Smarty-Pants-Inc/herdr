@@ -9,8 +9,9 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_timeout, dispatch_to_app_with_timeout_and_context, should_stop_connection,
-    APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
+    dispatch_to_app_with_caller_timeout, dispatch_to_app_with_timeout,
+    dispatch_to_app_with_timeout_and_context, should_stop_connection, APP_RESPONSE_TIMEOUT,
+    CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
@@ -176,7 +177,7 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    params: crate::api::schema::AgentPromptParams,
+    mut params: crate::api::schema::AgentPromptParams,
     context: ApiRequestContext,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
@@ -195,8 +196,14 @@ pub(super) fn prompt_agent(
         )));
     };
 
-    let last_event_sequence = event_hub.current_sequence();
-    let before_prompt = match agent_get(&request_id, &params.target, api_tx) {
+    let wait_started = std::time::Instant::now();
+    let before_prompt = match agent_get_for_prompt(
+        &request_id,
+        &params.target,
+        api_tx,
+        wait.timeout_ms,
+        wait_started,
+    ) {
         Ok(agent) => agent,
         Err(response) => {
             return serde_json::to_string(&response)
@@ -204,16 +211,29 @@ pub(super) fn prompt_agent(
                 .map_err(std::io::Error::other);
         }
     };
+    let prompt_started_working =
+        before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
     let target = params.target.clone();
-    let prompt_response = dispatch_to_app_with_timeout_and_context(
-        Request {
-            id: request_id.clone(),
-            method: Method::AgentPrompt(params),
-        },
+    if let Some(prompt_wait) = params.wait.as_mut() {
+        prompt_wait.submission_deadline = wait
+            .timeout_ms
+            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
+    }
+    let last_event_sequence = event_hub.current_sequence();
+    let prompt_request = Request {
+        id: request_id.clone(),
+        method: Method::AgentPrompt(params),
+    };
+    #[cfg(windows)]
+    let prompt_response = dispatch_to_app_with_caller_timeout(
+        prompt_request,
         api_tx,
-        None,
+        remaining_timeout_ms(wait.timeout_ms, wait_started).map(std::time::Duration::from_millis),
         context,
     );
+    #[cfg(not(windows))]
+    let prompt_response =
+        dispatch_to_app_with_timeout_and_context(prompt_request, api_tx, None, context);
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
@@ -226,39 +246,38 @@ pub(super) fn prompt_agent(
         return agent_wait_not_running(request_id).map(Some);
     }
 
-    let wait_started = std::time::Instant::now();
+    let prompt_activity_observed = prompt_started_working
+        || matches!(
+            prompted.agent_status,
+            crate::api::schema::AgentStatus::Working | crate::api::schema::AgentStatus::Blocked
+        );
     let prompt_state_change_seq = prompted.state_change_seq;
     let until = agent_wait_statuses(wait.until);
     let mut initial = prompted;
-    let mut after_state_change_seq = Some(prompt_state_change_seq);
 
-    if initial.agent_status != crate::api::schema::AgentStatus::Working {
-        let effect_timeout_ms = wait
-            .timeout_ms
-            .map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
-                timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-            });
-        let timeout_kind = if wait
-            .timeout_ms
-            .is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS)
-        {
-            AgentWaitTimeoutKind::Status
-        } else {
-            AgentWaitTimeoutKind::PromptStalled {
-                baseline: prompt_state_change_seq,
-                timeout_ms: effect_timeout_ms,
+    if !prompt_activity_observed {
+        let remaining_timeout_ms = remaining_timeout_ms(wait.timeout_ms, wait_started);
+        let (effect_timeout_ms, timeout_kind) = match remaining_timeout_ms {
+            Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
+                (timeout_ms, AgentWaitTimeoutKind::Status)
             }
+            _ => (
+                AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                AgentWaitTimeoutKind::PromptStalled {
+                    timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+                },
+            ),
         };
         let Some(outcome) = wait_for_resolved_agent(
             request_id.clone(),
             ResolvedAgentWait {
                 target: target.clone(),
-                until: all_agent_statuses(),
+                until: prompt_activity_statuses(),
                 timeout_ms: Some(effect_timeout_ms),
                 initial,
                 last_event_sequence,
-                after_state_change_seq,
-                accept_transient_status: false,
+                after_state_change_seq: Some(prompt_state_change_seq),
+                accept_transient_status: true,
                 timeout_kind,
             },
             stream,
@@ -273,10 +292,9 @@ pub(super) fn prompt_agent(
             AgentWaitOutcome::Matched(agent) => *agent,
             AgentWaitOutcome::Response(response) => return Ok(Some(response)),
         };
-        after_state_change_seq = None;
-        if agent_wait_matches(&initial, &until, None) {
-            return agent_prompt_success(request_id, initial).map(Some);
-        }
+    }
+    if agent_wait_matches(&initial, &until, None) {
+        return agent_prompt_success(request_id, initial).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -289,7 +307,7 @@ pub(super) fn prompt_agent(
             // Replay from before submission so terminal lifecycle events consumed by
             // the activity gate still terminate this settled-state wait.
             last_event_sequence,
-            after_state_change_seq,
+            after_state_change_seq: None,
             accept_transient_status: false,
             timeout_kind: AgentWaitTimeoutKind::Status,
         },
@@ -340,7 +358,7 @@ struct ResolvedAgentWait {
 #[derive(Clone, Copy)]
 enum AgentWaitTimeoutKind {
     Status,
-    PromptStalled { baseline: u64, timeout_ms: u64 },
+    PromptStalled { timeout_ms: u64 },
 }
 
 enum AgentWaitOutcome {
@@ -500,14 +518,10 @@ fn wait_for_resolved_agent(
     }
 }
 
-fn all_agent_statuses() -> Vec<crate::api::schema::AgentStatus> {
-    // Keep this exhaustive: every status is evidence that the sequence advanced.
+fn prompt_activity_statuses() -> Vec<crate::api::schema::AgentStatus> {
     vec![
-        crate::api::schema::AgentStatus::Idle,
         crate::api::schema::AgentStatus::Working,
         crate::api::schema::AgentStatus::Blocked,
-        crate::api::schema::AgentStatus::Done,
-        crate::api::schema::AgentStatus::Unknown,
     ]
 }
 
@@ -567,6 +581,34 @@ fn agent_get(
     agent_from_response(request_id, &response)
 }
 
+fn agent_get_for_prompt(
+    request_id: &str,
+    target: &str,
+    api_tx: &ApiRequestSender,
+    total_timeout_ms: Option<u64>,
+    started: std::time::Instant,
+) -> Result<crate::api::schema::AgentInfo, ErrorResponse> {
+    let request = Request {
+        id: format!("{request_id}:agent"),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: target.to_string(),
+        }),
+    };
+    let remaining_ms = remaining_timeout_ms(total_timeout_ms, started);
+    let response = match remaining_ms {
+        Some(timeout_ms) if timeout_ms <= APP_RESPONSE_TIMEOUT.as_millis() as u64 => {
+            dispatch_to_app_with_caller_timeout(
+                request,
+                api_tx,
+                Some(std::time::Duration::from_millis(timeout_ms)),
+                ApiRequestContext::default(),
+            )
+        }
+        _ => dispatch_to_app_with_timeout(request, api_tx, Some(APP_RESPONSE_TIMEOUT)),
+    };
+    agent_from_response(request_id, &response)
+}
+
 fn agent_from_response(
     request_id: &str,
     response: &str,
@@ -620,15 +662,12 @@ fn agent_wait_timeout(
         AgentWaitTimeoutKind::Status => {
             ("timeout", "timed out waiting for agent status".to_string())
         }
-        AgentWaitTimeoutKind::PromptStalled {
-            baseline,
-            timeout_ms,
-        } => {
+        AgentWaitTimeoutKind::PromptStalled { timeout_ms } => {
             let status = format!("{:?}", current.agent_status).to_ascii_lowercase();
             (
                 "agent_prompt_stalled",
                 format!(
-                    "agent prompt produced no observed state change within {timeout_ms} ms; status is {status} and state_change_seq remained {baseline}"
+                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; current status is {status}"
                 ),
             )
         }

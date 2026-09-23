@@ -608,7 +608,7 @@ contains = ["{contains}"]
     }
 
     fn with_state_dir<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = crate::config::test_config_env_lock().lock();
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let old_config = std::env::var_os("XDG_CONFIG_HOME");
         let old_state = std::env::var_os("XDG_STATE_HOME");
         let dir = std::env::temp_dir().join(format!(
@@ -699,7 +699,14 @@ path = "codex.toml"
             .unwrap();
             std::env::set_var(
                 CATALOG_URL_ENV,
-                format!("file://{}", web_dir.join("index.toml").display()),
+                format!(
+                    "file:///{}",
+                    web_dir
+                        .join("index.toml")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .trim_start_matches('/')
+                ),
             );
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -762,7 +769,14 @@ path = "codex.toml"
             fs::write(remote_manifest_path(Agent::Codex), current).unwrap();
             std::env::set_var(
                 CATALOG_URL_ENV,
-                format!("file://{}", web_dir.join("index.toml").display()),
+                format!(
+                    "file:///{}",
+                    web_dir
+                        .join("index.toml")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .trim_start_matches('/')
+                ),
             );
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -833,7 +847,14 @@ path = "missing-cursor.toml"
             .unwrap();
             std::env::set_var(
                 CATALOG_URL_ENV,
-                format!("file://{}", web_dir.join("index.toml").display()),
+                format!(
+                    "file:///{}",
+                    web_dir
+                        .join("index.toml")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .trim_start_matches('/')
+                ),
             );
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);

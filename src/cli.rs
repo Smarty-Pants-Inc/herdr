@@ -26,6 +26,7 @@ mod agent;
 mod api;
 mod completion;
 mod integration;
+mod machine;
 mod notification;
 mod pane;
 mod plugin;
@@ -36,6 +37,7 @@ mod server_not_running;
 mod spec;
 mod status;
 mod tab;
+mod target;
 mod workspace;
 mod worktree;
 
@@ -92,6 +94,10 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
+pub(crate) fn maybe_run_machine(args: &[String]) -> Option<std::io::Result<CommandOutcome>> {
+    target::maybe_run(args)
+}
+
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
@@ -102,7 +108,6 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     }
 
     let exit_code = match command {
-        "build-info" => run_build_info_command(&args[2..])?,
         "server" => {
             let Some(exit_code) = server::run_server_command(&args[2..])? else {
                 return Ok(CommandOutcome::NotCli);
@@ -114,6 +119,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
+        "machine" => machine::run_machine_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
@@ -130,46 +136,12 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     Ok(CommandOutcome::Handled(exit_code))
 }
 
-fn run_build_info_command(args: &[String]) -> std::io::Result<i32> {
-    if args != ["--json"] {
-        eprintln!("usage: herdr build-info --json");
-        return Ok(2);
-    }
-    let mut value = serde_json::Map::new();
-    value.insert("schema".into(), serde_json::json!(1));
-    value.insert(
-        "channel".into(),
-        serde_json::json!(crate::build_info::channel()),
-    );
-    value.insert(
-        "buildId".into(),
-        serde_json::json!(crate::build_info::build_id()),
-    );
-    value.insert(
-        "ompBuildId".into(),
-        serde_json::json!(crate::build_info::omp_build_id()),
-    );
-    value.insert(
-        "ompCommit".into(),
-        serde_json::json!(crate::build_info::omp_commit()),
-    );
-    value.insert(
-        "ompTree".into(),
-        serde_json::json!(crate::build_info::omp_tree()),
-    );
-    value.insert(
-        "ompVersion".into(),
-        serde_json::json!(crate::build_info::omp_version()),
-    );
-    println!("{}", serde_json::Value::Object(value));
-    Ok(0)
-}
-
 fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("set") => channel_set(&args[1..]),
         Some("show") if args.len() == 1 => {
-            println!("{}", current_channel_name());
+            let config = crate::config::Config::load().config;
+            println!("{}", config.update.channel.as_str());
             Ok(0)
         }
         Some("help" | "--help" | "-h") => {
@@ -182,20 +154,6 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
         }
     }
 }
-fn effective_channel_name(configured: &str, build_scoped_manifest: bool) -> &str {
-    if build_scoped_manifest {
-        "preview"
-    } else {
-        configured
-    }
-}
-fn current_channel_name() -> &'static str {
-    let configured = crate::config::Config::load().config.update.channel.as_str();
-    effective_channel_name(
-        configured,
-        crate::build_info::update_manifest_url().is_some(),
-    )
-}
 
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
@@ -205,7 +163,6 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Some(reason) = channel_set_rejection(
         channel,
-        crate::build_info::update_manifest_url().is_some(),
         crate::update::preview_channel_rejection_for_current_install(),
     ) {
         eprintln!("{reason}.");
@@ -279,14 +236,8 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
 
 fn channel_set_rejection(
     channel: &str,
-    build_scoped_manifest: bool,
     install_rejection: Option<&'static str>,
 ) -> Option<&'static str> {
-    if build_scoped_manifest && channel == "stable" {
-        return Some(
-            "stable channel is not available for this build; its update manifest is fixed to the Smarty preview channel",
-        );
-    }
     if channel == "preview" {
         return install_rejection;
     }
@@ -816,7 +767,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 }
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
-    let client = ApiClient::local();
+    let client = target::api_client()?;
     ensure_server_protocol_compatible(&client, &request.id)?;
     client
         .request_value(request)
@@ -824,24 +775,21 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
-    let client = ApiClient::local();
+    let client = target::api_client()?;
     client
         .request_value(request)
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
 fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
-    let status = client
-        .status()
+    let status = target::server_status(client)
         .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
-    let Some(response) = protocol_guard::mismatch_response(
-        request_id,
-        server_protocol,
-        &crate::session::active_restart_after_update_guidance(),
-    ) else {
+    let Some(response) =
+        protocol_guard::mismatch_response(request_id, server_protocol, &target::restart_guidance())
+    else {
         return Ok(());
     };
 
@@ -888,6 +836,9 @@ fn map_server_not_running_or_io(
     request_id: &str,
     client: &ApiClient,
 ) -> std::io::Error {
+    if target::is_remote() {
+        return target::remote_error(api_client_error_to_io(err));
+    }
     match err {
         ApiClientError::Io(io_err) if server_not_running_error(&io_err) => {
             server_not_running::reported_error(server_not_running::response(
@@ -1020,8 +971,11 @@ fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
 fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), i32> {
     let mut name = None;
     let mut json = false;
+    let mut options_ended = false;
     for arg in args {
-        if arg == "--json" {
+        if !options_ended && arg == "--" {
+            options_ended = true;
+        } else if !options_ended && arg == "--json" {
             json = true;
         } else if name.is_none() {
             name = Some(arg.clone());
@@ -1117,37 +1071,19 @@ mod tests {
     }
 
     #[test]
-    fn effective_channel_uses_build_scoped_preview_manifest() {
-        assert_eq!(super::effective_channel_name("stable", true), "preview");
-        assert_eq!(super::effective_channel_name("stable", false), "stable");
-        assert_eq!(super::effective_channel_name("preview", false), "preview");
-    }
-
-    #[test]
-    fn channel_set_rejects_package_managed_preview_before_config_write() {
+    fn channel_set_only_applies_package_rejection_to_preview() {
         assert_eq!(
-            super::channel_set_rejection("preview", false, Some("no preview")),
+            super::channel_set_rejection("preview", Some("no preview")),
             Some("no preview")
         );
         assert_eq!(
-            super::channel_set_rejection("stable", false, Some("no preview")),
+            super::channel_set_rejection("stable", Some("no preview")),
             None
         );
-        assert_eq!(super::channel_set_rejection("preview", false, None), None);
+        assert_eq!(super::channel_set_rejection("preview", None), None);
     }
 
     #[test]
-    fn channel_set_rejects_stable_for_build_scoped_manifest() {
-        assert_eq!(
-            super::channel_set_rejection("stable", true, None),
-            Some(
-                "stable channel is not available for this build; its update manifest is fixed to the Smarty preview channel",
-            )
-        );
-    }
-
-    #[test]
-
     fn channel_set_skips_self_update_for_package_manager_guidance() {
         assert_eq!(
             super::channel_set_install_action(Some("use package manager")),
@@ -1157,6 +1093,16 @@ mod tests {
             super::channel_set_install_action(None),
             super::ChannelSetInstallAction::RunSelfUpdate
         );
+    }
+
+    #[test]
+    fn session_name_parser_accepts_option_terminator() {
+        for name in ["-h", "--json"] {
+            assert_eq!(
+                super::parse_session_name_and_json(&["--".to_string(), name.to_string()], "usage",),
+                Ok((name.to_string(), false))
+            );
+        }
     }
 
     #[test]
