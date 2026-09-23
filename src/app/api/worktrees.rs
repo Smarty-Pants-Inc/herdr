@@ -639,7 +639,9 @@ mod tests {
     }
 
     fn wait_for_app_event(app: &mut App) -> AppEvent {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // ponytail: the wait returns on the first event, so a generous bound costs passing runs
+        // nothing. 5 s timed out on loaded hosted Windows runners during `git worktree add`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(event) = app.event_rx.try_recv() {
                 return event;
