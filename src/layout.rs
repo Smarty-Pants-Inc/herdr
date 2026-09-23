@@ -70,7 +70,6 @@ pub enum NavDirection {
 }
 
 /// A node in the BSP tree. Public for serialization.
-#[derive(Clone)]
 pub enum Node {
     Pane(PaneId),
     Split {
@@ -82,7 +81,6 @@ pub enum Node {
 }
 
 /// BSP tiling layout. Tracks a tree of splits and a focused pane.
-#[derive(Clone)]
 pub struct TileLayout {
     root: Node,
     focus: PaneId,
@@ -92,9 +90,6 @@ pub struct TileLayout {
     /// focus excursions never corrupt it.
     prev_focus: Option<PaneId>,
 }
-
-// Layout clones are structural snapshots used by transactional pane moves.
-// They preserve split shape, ratios, focus, and close-navigation history.
 
 impl TileLayout {
     /// Create a new layout with a single pane (globally unique ID).
@@ -121,24 +116,6 @@ impl TileLayout {
 
     pub fn focused(&self) -> PaneId {
         self.focus
-    }
-    /// Change projected focus without rewriting close-navigation history.
-    pub(crate) fn project_focus_state(
-        &mut self,
-        focused: PaneId,
-        previous: Option<PaneId>,
-    ) -> bool {
-        let pane_ids = self.pane_ids();
-        if !pane_ids.contains(&focused) {
-            return false;
-        }
-        self.focus = focused;
-        self.prev_focus = previous.filter(|id| *id != focused && pane_ids.contains(id));
-        true
-    }
-
-    pub(crate) fn previous_focus(&self) -> Option<PaneId> {
-        self.prev_focus
     }
 
     pub fn pane_count(&self) -> usize {

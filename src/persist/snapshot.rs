@@ -8,14 +8,8 @@ use crate::layout::Node;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
-const REMOTE_WORKSPACE_SNAPSHOT_VERSION: u32 = 5;
-pub(crate) const EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION: u32 = 6;
-
-/// Current snapshot format version. Version 4 adds persisted pane execution
-/// targets; version 5 adds workspace identity execution targets; version 6
-/// fences externally owned sessions from readers that do not understand their
-/// resume policy.
-pub(crate) const SNAPSHOT_VERSION: u32 = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
+/// Current snapshot format version.
+pub(super) const SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -28,8 +22,6 @@ pub struct SessionSnapshot {
     pub selected: usize,
     #[serde(default)]
     pub sidebar_width: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idempotency_epoch: Option<String>,
     #[serde(default)]
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
@@ -41,6 +33,8 @@ pub struct SessionHistorySnapshot {
     /// Format version follows the matching session snapshot version.
     #[serde(default)]
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_fingerprint: Option<String>,
     pub workspaces: Vec<WorkspaceHistorySnapshot>,
 }
 
@@ -61,8 +55,6 @@ pub struct WorkspaceSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
     pub identity_cwd: PathBuf,
-    #[serde(default)]
-    pub identity_execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
     #[serde(default)]
@@ -95,8 +87,6 @@ struct LegacyWorkspaceSnapshot {
 pub struct TabSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub layout_effect_nonce: Option<String>,
     pub layout: LayoutSnapshot,
     pub panes: HashMap<u32, PaneSnapshot>,
     pub zoomed: bool,
@@ -109,8 +99,6 @@ pub struct TabSnapshot {
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub cwd: PathBuf,
-    #[serde(default)]
-    pub execution_target: crate::execution::ExecutionTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,11 +117,6 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
-    #[serde(
-        default,
-        skip_serializing_if = "crate::agent_resume::AgentResumePolicy::is_native"
-    )]
-    pub resume_policy: crate::agent_resume::AgentResumePolicy,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,7 +148,6 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
             custom_name: None,
-            layout_effect_nonce: None,
             layout: snap.layout,
             panes: snap.panes,
             zoomed: snap.zoomed,
@@ -177,7 +159,6 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             id: None,
             custom_name: snap.custom_name,
             identity_cwd,
-            identity_execution_target: crate::execution::ExecutionTarget::Local,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
@@ -200,8 +181,6 @@ struct RawSessionSnapshot {
     #[serde(default)]
     selected: usize,
     #[serde(default)]
-    idempotency_epoch: Option<String>,
-    #[serde(default)]
     sidebar_width: Option<u16>,
     #[serde(default)]
     sidebar_section_split: Option<f32>,
@@ -217,7 +196,6 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
             .into_iter()
             .map(migrate_workspace)
             .collect::<Result<Vec<_>, _>>()?,
-        idempotency_epoch: raw.idempotency_epoch,
         active: raw.active,
         selected: raw.selected,
         sidebar_width: raw.sidebar_width,
@@ -228,29 +206,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
 
 fn migrate_workspace(raw: serde_json::Value) -> Result<WorkspaceSnapshot, String> {
     if raw.get("identity_cwd").is_some() {
-        let identity_execution_target_missing = raw.get("identity_execution_target").is_none();
-        let mut workspace =
-            serde_json::from_value::<WorkspaceSnapshot>(raw.clone()).map_err(|e| e.to_string())?;
-        if identity_execution_target_missing {
-            workspace.identity_execution_target =
-                workspace_execution_target_from_first_tab(&workspace);
-        }
-
-        let identity_execution_target = workspace.identity_execution_target.clone();
-        let mut raw = raw;
-        if !identity_execution_target.is_local() {
-            let target =
-                serde_json::to_value(&identity_execution_target).map_err(|e| e.to_string())?;
-            if identity_execution_target_missing {
-                if let Some(object) = raw.as_object_mut() {
-                    object.insert("identity_execution_target".into(), target.clone());
-                }
-            }
-            inherit_missing_pane_execution_targets(&mut raw, &target);
-            workspace =
-                serde_json::from_value::<WorkspaceSnapshot>(raw).map_err(|e| e.to_string())?;
-        }
-        return Ok(workspace);
+        return serde_json::from_value(raw).map_err(|e| e.to_string());
     }
 
     if raw.get("layout").is_some() {
@@ -260,53 +216,6 @@ fn migrate_workspace(raw: serde_json::Value) -> Result<WorkspaceSnapshot, String
     }
 
     Err("workspace snapshot is neither current nor legacy format".to_string())
-}
-
-fn workspace_execution_target_from_first_tab(
-    workspace: &WorkspaceSnapshot,
-) -> crate::execution::ExecutionTarget {
-    let Some(tab) = workspace.tabs.first() else {
-        return crate::execution::ExecutionTarget::default();
-    };
-    tab.root_pane
-        .filter(|pane_id| layout_contains_pane_id(&tab.layout, *pane_id))
-        .and_then(|pane_id| tab.panes.get(&pane_id))
-        .or_else(|| {
-            first_pane_id_in_layout(&tab.layout).and_then(|pane_id| tab.panes.get(&pane_id))
-        })
-        .or_else(|| {
-            tab.panes
-                .keys()
-                .min()
-                .and_then(|pane_id| tab.panes.get(pane_id))
-        })
-        .map(|pane| pane.execution_target.clone())
-        .unwrap_or_default()
-}
-
-fn inherit_missing_pane_execution_targets(raw: &mut serde_json::Value, target: &serde_json::Value) {
-    let Some(tabs) = raw
-        .get_mut("tabs")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-    for tab in tabs {
-        let Some(panes) = tab
-            .get_mut("panes")
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-        for pane in panes.values_mut() {
-            let Some(object) = pane.as_object_mut() else {
-                continue;
-            };
-            object
-                .entry("execution_target")
-                .or_insert_with(|| target.clone());
-        }
-    }
 }
 
 fn legacy_identity_cwd(snap: &LegacyWorkspaceSnapshot) -> PathBuf {
@@ -332,15 +241,6 @@ fn legacy_identity_cwd(snap: &LegacyWorkspaceSnapshot) -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()))
 }
 
-fn layout_contains_pane_id(layout: &LayoutSnapshot, pane_id: u32) -> bool {
-    match layout {
-        LayoutSnapshot::Pane(id) => *id == pane_id,
-        LayoutSnapshot::Split { first, second, .. } => {
-            layout_contains_pane_id(first, pane_id) || layout_contains_pane_id(second, pane_id)
-        }
-    }
-}
-
 fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
     match layout {
         LayoutSnapshot::Pane(id) => Some(*id),
@@ -360,47 +260,18 @@ pub fn capture(
     terminal_runtimes: &TerminalRuntimeRegistry,
     active: Option<usize>,
     selected: usize,
-    sidebar_width: u16,
-    sidebar_section_split: f32,
-    collapsed_space_keys: std::collections::HashSet<String>,
 ) -> SessionSnapshot {
-    let workspaces: Vec<_> = workspaces
-        .iter()
-        .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
-        .collect();
-    let mut version = 3;
-    if workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .flat_map(|tab| tab.panes.values())
-        .any(|pane| !pane.execution_target.is_local())
-    {
-        version = 4;
-    }
-    if workspaces
-        .iter()
-        .any(|workspace| !workspace.identity_execution_target.is_local())
-    {
-        version = REMOTE_WORKSPACE_SNAPSHOT_VERSION;
-    }
-    if workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .flat_map(|tab| tab.panes.values())
-        .filter_map(|pane| pane.agent_session.as_ref())
-        .any(|session| !session.resume_policy.is_native())
-    {
-        version = EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION;
-    }
     SessionSnapshot {
-        version,
-        workspaces,
+        version: SNAPSHOT_VERSION,
+        workspaces: workspaces
+            .iter()
+            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+            .collect(),
         active,
         selected,
-        sidebar_width: Some(sidebar_width),
-        idempotency_epoch: None,
-        sidebar_section_split: Some(sidebar_section_split),
-        collapsed_space_keys,
+        sidebar_width: None,
+        sidebar_section_split: None,
+        collapsed_space_keys: std::collections::HashSet::new(),
     }
 }
 
@@ -412,14 +283,20 @@ fn capture_workspace(
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> WorkspaceSnapshot {
-    let identity_cwd = ws
-        .local_git_identity_cwd_from(terminals, terminal_runtimes)
+    let tabs: Vec<_> = ws
+        .tabs
+        .iter()
+        .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
+        .collect();
+    let identity_cwd = tabs
+        .first()
+        .and_then(|tab| tab.root_pane.and_then(|id| tab.panes.get(&id)))
+        .map(|pane| pane.cwd.clone())
         .unwrap_or_else(|| ws.identity_cwd.clone());
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
-        identity_cwd: identity_cwd.clone(),
-        identity_execution_target: ws.identity_execution_target.clone(),
+        identity_cwd,
         worktree_space: ws.worktree_space.clone(),
         public_pane_numbers: ws
             .public_pane_numbers
@@ -429,19 +306,7 @@ fn capture_workspace(
         next_public_pane_number: ws.next_public_pane_number,
         public_tab_numbers: ws.tabs.iter().map(|tab| tab.number).collect(),
         next_public_tab_number: ws.next_public_tab_number,
-        tabs: ws
-            .tabs
-            .iter()
-            .map(|tab| {
-                capture_tab(
-                    tab,
-                    terminals,
-                    terminal_runtimes,
-                    &ws.identity_execution_target,
-                    &identity_cwd,
-                )
-            })
-            .collect(),
+        tabs,
         active_tab: ws.active_tab,
     }
 }
@@ -453,19 +318,16 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
-    identity_execution_target: &crate::execution::ExecutionTarget,
-    identity_cwd: &std::path::Path,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
-    let fallback_cwd = identity_cwd.to_path_buf();
     for id in tab.panes.keys() {
-        let terminal = tab
-            .panes
-            .get(id)
-            .and_then(|pane| terminals.get(&pane.attached_terminal_id));
-        let cwd = tab
-            .cwd_for_pane(*id, terminals, terminal_runtimes)
-            .unwrap_or_else(|| fallback_cwd.clone());
+        let terminal_id = tab.terminal_id(*id);
+        let terminal = terminal_id.and_then(|id| terminals.get(id));
+        let cwd = terminal_id
+            .and_then(|id| terminal_runtimes.get(id))
+            .and_then(|runtime| runtime.cwd_for_persistence())
+            .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -487,16 +349,6 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
-                        resume_policy: terminal
-                            .persisted_agent_session
-                            .as_ref()
-                            .filter(|session| {
-                                session.source == authority.source
-                                    && session.agent == authority.agent_label
-                                    && session.session_ref == *session_ref
-                            })
-                            .map(|session| session.resume_policy)
-                            .unwrap_or_default(),
                     });
                 }
             }
@@ -508,16 +360,12 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
-                    resume_policy: session.resume_policy,
                 })
         });
         panes.insert(
             id.raw(),
             PaneSnapshot {
                 cwd,
-                execution_target: terminal
-                    .map(|terminal| terminal.execution_target.clone())
-                    .unwrap_or_else(|| identity_execution_target.clone()),
                 label,
                 agent_name,
                 managed_agent_kind,
@@ -528,7 +376,6 @@ fn capture_tab(
     }
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
-        layout_effect_nonce: tab.layout_effect_nonce.clone(),
         layout: capture_node(tab.layout.root()),
         panes,
         zoomed: tab.zoomed,
@@ -537,14 +384,27 @@ fn capture_tab(
     }
 }
 
+pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut value = serde_json::to_value(snapshot).ok()?;
+    // Sets serialize as arrays; normalize their order as well as JSON object keys.
+    let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
+    collapsed.sort_unstable();
+    value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
 /// Capture pane screen history separately from the structural session snapshot.
 pub fn capture_history(
+    snapshot: &SessionSnapshot,
     workspaces: &[Workspace],
     terminal_runtimes: &TerminalRuntimeRegistry,
-    version: u32,
 ) -> SessionHistorySnapshot {
     SessionHistorySnapshot {
-        version,
+        version: SNAPSHOT_VERSION,
+        layout_fingerprint: layout_fingerprint(snapshot),
         workspaces: workspaces
             .iter()
             .map(|workspace| WorkspaceHistorySnapshot {
@@ -605,84 +465,36 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 }
 
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
-    parse_snapshot_with_supported_version(content, SNAPSHOT_VERSION)
-}
-
-fn parse_snapshot_with_supported_version(
-    content: &str,
-    supported_version: u32,
-) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > supported_version {
+    if raw.version > SNAPSHOT_VERSION {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, supported_version
+            raw.version, SNAPSHOT_VERSION
         ));
     }
-    let snapshot = migrate_snapshot(raw)?;
-    if snapshot.version < EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
-        && has_external_resume_policy(&snapshot)
-    {
-        return Err(format!(
-            "external agent resume policy requires snapshot version {} or newer",
-            EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION
-        ));
-    }
-    Ok(snapshot)
-}
-
-pub(crate) fn has_external_resume_policy(snapshot: &SessionSnapshot) -> bool {
-    snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.tabs)
-        .flat_map(|tab| tab.panes.values())
-        .filter_map(|pane| pane.agent_session.as_ref())
-        .any(|session| !session.resume_policy.is_native())
-}
-
-fn value_has_external_resume_policy(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(object) => {
-            object
-                .get("resume_policy")
-                .is_some_and(|value| value.as_str() != Some("native"))
-                || object.values().any(value_has_external_resume_policy)
-        }
-        serde_json::Value::Array(values) => values.iter().any(value_has_external_resume_policy),
-        _ => false,
-    }
-}
-
-pub(super) fn content_has_external_resume_policy(content: &str) -> bool {
-    serde_json::from_str::<RawSessionSnapshot>(content)
-        .ok()
-        .is_some_and(|raw| raw.workspaces.iter().any(value_has_external_resume_policy))
+    migrate_snapshot(raw)
 }
 
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
-    parse_history_snapshot_with_supported_version(content, SNAPSHOT_VERSION)
-}
-
-fn parse_history_snapshot_with_supported_version(
-    content: &str,
-    supported_version: u32,
-) -> Result<SessionHistorySnapshot, String> {
     let snapshot =
         serde_json::from_str::<SessionHistorySnapshot>(content).map_err(|e| e.to_string())?;
-    if snapshot.version > supported_version {
+    if snapshot.version > SNAPSHOT_VERSION {
         return Err(format!(
             "history snapshot version {} is newer than supported {}",
-            snapshot.version, supported_version
+            snapshot.version, SNAPSHOT_VERSION
         ));
     }
     Ok(snapshot)
 }
 
 pub(super) fn snapshot_file_version(content: &str) -> Option<u32> {
-    serde_json::from_str::<RawSessionSnapshot>(content)
+    #[derive(Deserialize)]
+    struct Header {
+        version: u32,
+    }
+    serde_json::from_str::<Header>(content)
         .ok()
-        .map(|raw| raw.version)
+        .map(|header| header.version)
 }
 
 #[cfg(test)]
@@ -747,18 +559,15 @@ mod tests {
             terminal_runtimes,
             state.active,
             state.selected,
-            state.sidebar_width,
-            state.sidebar_section_split,
-            state.collapsed_space_keys.clone(),
         )
     }
 
     fn capture_history_from_state_with_runtimes(
         state: &AppState,
         terminal_runtimes: &TerminalRuntimeRegistry,
-        version: u32,
     ) -> SessionHistorySnapshot {
-        capture_history(&state.workspaces, terminal_runtimes, version)
+        let snapshot = capture_from_state_with_runtimes(state, terminal_runtimes);
+        capture_history(&snapshot, &state.workspaces, terminal_runtimes)
     }
 
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
@@ -806,6 +615,28 @@ mod tests {
     }
 
     #[test]
+    fn layout_fingerprint_survives_json_round_trip() {
+        let mut snapshot = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        snapshot.collapsed_space_keys = ["z", "a", "m"].map(String::from).into();
+        let expected = layout_fingerprint(&snapshot).unwrap();
+        for _ in 0..16 {
+            snapshot = parse_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+            assert_eq!(
+                layout_fingerprint(&snapshot).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+        snapshot.workspaces.swap(0, 1);
+        assert_ne!(
+            layout_fingerprint(&snapshot).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -813,7 +644,6 @@ mod tests {
             active: None,
             selected: 0,
             sidebar_width: Some(26),
-            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         };
@@ -854,7 +684,6 @@ mod tests {
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
-                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -866,7 +695,6 @@ mod tests {
             1,
             PaneSnapshot {
                 cwd: PathBuf::from("/home/can/Projects/website"),
-                execution_target: crate::execution::ExecutionTarget::ssh("primary").unwrap(),
                 label: Some("website".into()),
                 agent_name: None,
                 managed_agent_kind: None,
@@ -880,7 +708,6 @@ mod tests {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
-                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
                 next_public_pane_number: 3,
@@ -888,7 +715,6 @@ mod tests {
                 next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
-                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -905,14 +731,12 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
-            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
-            version: REMOTE_WORKSPACE_SNAPSHOT_VERSION,
+            version: SNAPSHOT_VERSION,
         };
 
         let json = serde_json::to_string_pretty(&snap).unwrap();
-        assert_eq!(snapshot_file_version(&json), Some(5));
         let restored = parse_snapshot(&json).unwrap();
 
         assert_eq!(restored.workspaces.len(), 1);
@@ -931,16 +755,12 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&1].label.as_deref(),
             Some("website")
         );
-        assert_eq!(
-            restored.workspaces[0].tabs[0].panes[&1].execution_target,
-            crate::execution::ExecutionTarget::ssh("primary").unwrap()
-        );
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
     }
 
     #[test]
-    fn v3_session_fixture_migrates_missing_execution_target_to_local() {
+    fn current_session_fixture_parses() {
         let snap = parse_snapshot(session_fixture("current-herdr")).unwrap();
 
         assert_eq!(snap.version, 3);
@@ -950,10 +770,6 @@ mod tests {
         assert_eq!(snap.sidebar_width, None);
         assert_eq!(snap.sidebar_section_split, None);
         assert_eq!(snap.workspaces[0].tabs.len(), 2);
-        assert_eq!(
-            snap.workspaces[0].tabs[0].panes[&1].execution_target,
-            crate::execution::ExecutionTarget::Local
-        );
         assert_eq!(
             snap.workspaces[1].identity_cwd,
             PathBuf::from("/home/test/projects/project-b")
@@ -1021,191 +837,6 @@ mod tests {
         let encoded = serde_json::to_string(&restored).unwrap();
         assert!(!encoded.contains("legacy-secret"));
         assert!(!encoded.contains("\"history\""));
-    }
-
-    #[test]
-    fn v4_workspace_without_identity_target_infers_root_pane_target() {
-        let json = serde_json::json!({
-            "version": 4,
-            "workspaces": [{
-                "id": "remote",
-                "identity_cwd": "/srv/project",
-                "tabs": [{
-                    "layout": { "Pane": 7 },
-                    "panes": {
-                        "7": {
-                            "cwd": "/srv/project",
-                            "execution_target": {
-                                "kind": "ssh",
-                                "host": "build.example"
-                            }
-                        }
-                    },
-                    "zoomed": false,
-                    "focused": 7,
-                    "root_pane": 7
-                }],
-                "active_tab": 0
-            }],
-            "active": 0,
-            "selected": 0
-        })
-        .to_string();
-
-        let restored = parse_snapshot(&json).unwrap();
-
-        assert_eq!(
-            restored.workspaces[0].identity_execution_target,
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap()
-        );
-    }
-    #[test]
-    fn v4_identity_target_ignores_orphan_root_pane() {
-        let json = serde_json::json!({
-            "version": 4,
-            "workspaces": [{
-                "identity_cwd": "/srv/project",
-                "tabs": [{
-                    "layout": { "Pane": 8 },
-                    "panes": {
-                        "7": {
-                            "cwd": "/Users/local",
-                            "execution_target": { "kind": "local" }
-                        },
-                        "8": {
-                            "cwd": "/srv/project",
-                            "execution_target": {
-                                "kind": "ssh",
-                                "host": "build.example"
-                            }
-                        }
-                    },
-                    "zoomed": false,
-                    "focused": 8,
-                    "root_pane": 7
-                }],
-                "active_tab": 0
-            }],
-            "active": 0,
-            "selected": 0
-        })
-        .to_string();
-
-        let restored = parse_snapshot(&json).unwrap();
-
-        assert_eq!(
-            restored.workspaces[0].identity_execution_target,
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap()
-        );
-    }
-
-    #[test]
-    fn v5_remote_workspace_inherits_target_for_missing_pane_metadata() {
-        let json = serde_json::json!({
-            "version": 5,
-            "workspaces": [{
-                "identity_cwd": "/srv/project",
-                "identity_execution_target": {
-                    "kind": "ssh",
-                    "host": "build.example"
-                },
-                "tabs": [{
-                    "layout": { "Pane": 8 },
-                    "panes": {
-                        "8": { "cwd": "/srv/project" }
-                    },
-                    "zoomed": false,
-                    "focused": 8,
-                    "root_pane": 8
-                }],
-                "active_tab": 0
-            }],
-            "active": 0,
-            "selected": 0
-        })
-        .to_string();
-
-        let restored = parse_snapshot(&json).unwrap();
-
-        assert_eq!(
-            restored.workspaces[0].tabs[0].panes[&8].execution_target,
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap()
-        );
-    }
-
-    #[test]
-    fn v5_remote_workspace_inherits_missing_targets_without_overwriting_explicit_panes() {
-        let json = serde_json::json!({
-            "version": 5,
-            "workspaces": [{
-                "identity_cwd": "/srv/project",
-                "identity_execution_target": {
-                    "kind": "ssh",
-                    "host": "build.example"
-                },
-                "tabs": [{
-                    "layout": {
-                        "Split": {
-                            "direction": "Horizontal",
-                            "ratio": 0.5,
-                            "first": { "Pane": 8 },
-                            "second": { "Pane": 9 }
-                        }
-                    },
-                    "panes": {
-                        "8": {
-                            "cwd": "/srv/project",
-                            "execution_target": { "kind": "local" }
-                        },
-                        "9": { "cwd": "/srv/project" }
-                    },
-                    "zoomed": false,
-                    "focused": 8,
-                    "root_pane": 8
-                }],
-                "active_tab": 0
-            }],
-            "active": 0,
-            "selected": 0
-        })
-        .to_string();
-
-        let restored = parse_snapshot(&json).unwrap();
-        let panes = &restored.workspaces[0].tabs[0].panes;
-        assert_eq!(
-            panes[&8].execution_target,
-            crate::execution::ExecutionTarget::Local
-        );
-        assert_eq!(
-            panes[&9].execution_target,
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap()
-        );
-    }
-
-    #[test]
-    fn capture_contract_preserves_remote_identity_cwd_when_local_pane_is_first() {
-        let mut state = state_with_workspaces(&["remote"]);
-        state.workspaces[0].identity_cwd = PathBuf::from("/srv/project");
-        state.workspaces[0].identity_execution_target =
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap();
-        state.ensure_test_terminals();
-        let root = state.workspaces[0].tabs[0].root_pane;
-        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
-            .attached_terminal_id
-            .clone();
-        state.terminals.get_mut(&terminal_id).unwrap().cwd = PathBuf::from("/Users/local");
-
-        let snapshot = capture_from_state(&state);
-
-        assert_eq!(
-            snapshot.workspaces[0].identity_cwd,
-            PathBuf::from("/srv/project")
-        );
-        assert_eq!(
-            snapshot.workspaces[0].identity_execution_target,
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap()
-        );
-        assert_eq!(snapshot.version, REMOTE_WORKSPACE_SNAPSHOT_VERSION);
     }
 
     #[test]
@@ -1277,16 +908,13 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_tracks_sidebar_state() {
-        let mut state = state_with_workspaces(&["one"]);
-        state.sidebar_width = 31;
-        state.sidebar_section_split = 0.4;
-        state.collapsed_space_keys.insert("repo-key".into());
+    fn capture_contract_omits_legacy_server_chrome_state() {
+        let state = state_with_workspaces(&["one"]);
 
         let snapshot = capture_from_state(&state);
-        assert_eq!(snapshot.sidebar_width, Some(31));
-        assert_eq!(snapshot.sidebar_section_split, Some(0.4));
-        assert!(snapshot.collapsed_space_keys.contains("repo-key"));
+        assert_eq!(snapshot.sidebar_width, None);
+        assert_eq!(snapshot.sidebar_section_split, None);
+        assert!(snapshot.collapsed_space_keys.is_empty());
     }
 
     #[test]
@@ -1330,7 +958,11 @@ mod tests {
         let mut state = state_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
         let second = state.workspaces[0].test_split(Direction::Horizontal);
-        crate::ui::compute_view(&mut state, Rect::new(0, 0, 106, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 106, 20),
+        );
 
         state.navigate_pane(NavDirection::Right);
 
@@ -1345,7 +977,11 @@ mod tests {
         let root = state.workspaces[0].tabs[0].root_pane;
         state.workspaces[0].test_split(Direction::Horizontal);
         state.workspaces[0].layout.focus_pane(root);
-        crate::ui::compute_view(&mut state, Rect::new(0, 0, 106, 20));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut state,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            Rect::new(0, 0, 106, 20),
+        );
         let before = capture_from_state(&state);
 
         state.resize_pane(NavDirection::Right);
@@ -1409,6 +1045,104 @@ mod tests {
         assert_eq!(workspace.next_public_tab_number, 3);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_prefers_live_shell_cwd_and_keeps_it_after_exit() {
+        let old = std::env::current_dir().unwrap();
+        let new = std::env::temp_dir().join(format!(
+            "herdr-persist-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&new).unwrap();
+        let new = std::fs::canonicalize(new).unwrap();
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("cwd-source")];
+        state.workspaces[0].identity_cwd = old.clone();
+        state.active = Some(0);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(pane_id).unwrap().clone();
+        let (events, _rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            old.clone(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let pid = runtime.child_pid().unwrap();
+        runtime
+            .try_send_bytes(bytes::Bytes::from(format!(
+                "cd '{}'; printf '\\033]7;file://{}\\007'; exec sleep 30\n",
+                new.display(),
+                old.display()
+            )))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (crate::platform::process_cwd(pid).as_ref() != Some(&new)
+            || runtime.cwd().as_ref() != Some(&old))
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(crate::platform::process_cwd(pid), Some(new.clone()));
+        assert_eq!(
+            runtime.cwd(),
+            Some(old.clone()),
+            "existing reported-cwd accessor is unchanged"
+        );
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        runtimes.insert(terminal_id, runtime);
+        let before = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            before.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new
+        );
+        assert_eq!(before.workspaces[0].identity_cwd, new);
+        assert_eq!(runtimes.values().next().unwrap().cwd(), Some(old.clone()));
+        crate::platform::signal_processes(&[pid], crate::platform::Signal::Kill);
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::process_cwd(pid).is_some()
+            && std::time::Instant::now() < exit_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(crate::platform::process_cwd(pid).is_none());
+        let after = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            after.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new
+        );
+        assert_eq!(after.workspaces[0].identity_cwd, new);
+        assert_eq!(runtimes.values().next().unwrap().cwd(), Some(old));
+        for (_, runtime) in runtimes.drain() {
+            runtime.shutdown();
+        }
+        std::fs::remove_dir(new).unwrap();
+    }
+
     #[test]
     fn capture_contract_tracks_workspace_identity_and_pane_cwds() {
         let mut state = state_with_workspaces(&["one"]);
@@ -1456,8 +1190,7 @@ mod tests {
         assert!(!encoded.contains("alpha"));
         assert!(!encoded.contains("\"history\""));
 
-        let history_snapshot =
-            capture_history_from_state_with_runtimes(&state, &terminal_runtimes, snapshot.version);
+        let history_snapshot = capture_history_from_state_with_runtimes(&state, &terminal_runtimes);
         let history = &history_snapshot.workspaces[0].tabs[0].panes[&root.raw()];
 
         assert!(history.ansi.contains("alpha"));
@@ -1501,8 +1234,7 @@ mod tests {
         assert!(!encoded.contains("first-pane-history"));
         assert!(!encoded.contains("second-pane-history"));
 
-        let history_snapshot =
-            capture_history_from_state_with_runtimes(&state, &terminal_runtimes, snapshot.version);
+        let history_snapshot = capture_history_from_state_with_runtimes(&state, &terminal_runtimes);
         let tab = &history_snapshot.workspaces[0].tabs[0];
         let first_history = &tab.panes[&first.raw()];
         let second_history = &tab.panes[&second.raw()];
@@ -1512,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_contract_versions_native_only_agent_session_as_v3() {
+    fn capture_contract_tracks_hook_authority_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let session_path = test_session_path("pi-session.jsonl");
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1529,7 +1261,6 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
-            resume_policy: crate::agent_resume::AgentResumePolicy::Native,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1541,11 +1272,6 @@ mod tests {
         );
 
         let snapshot = capture_from_state(&state);
-        let history = capture_history_from_state_with_runtimes(
-            &state,
-            &TerminalRuntimeRegistry::new(),
-            snapshot.version,
-        );
         let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
             .agent_session
             .as_ref()
@@ -1558,127 +1284,6 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
-        assert_eq!(
-            agent_session.resume_policy,
-            crate::agent_resume::AgentResumePolicy::Native
-        );
-        assert_eq!(snapshot.version, 3);
-        assert_eq!(history.version, snapshot.version);
-        let encoded = serde_json::to_string(&snapshot).expect("native snapshot should serialize");
-        let encoded_history =
-            serde_json::to_string(&history).expect("native history should serialize");
-        assert!(!encoded.contains("\"resume_policy\""));
-        assert!(
-            parse_snapshot_with_supported_version(&encoded, 3).is_ok(),
-            "v3 readers must accept native-only snapshots"
-        );
-        assert!(
-            parse_history_snapshot_with_supported_version(&encoded_history, 3).is_ok(),
-            "v3 readers must accept native-only history"
-        );
-    }
-
-    #[test]
-    fn capture_contract_versions_external_resume_policy_under_hook_authority() {
-        let mut state = state_with_workspaces(&["one"]);
-        state.workspaces[0].identity_execution_target =
-            crate::execution::ExecutionTarget::ssh("build.example").unwrap();
-        let session_path = test_session_path("omp-session.jsonl");
-        let root = state.workspaces[0].tabs[0].root_pane;
-        state.ensure_test_terminals();
-        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
-            .attached_terminal_id
-            .clone();
-        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_detected_state(
-            Some(crate::detect::Agent::Omp),
-            crate::detect::AgentState::Idle,
-        );
-        let session_ref = crate::agent_resume::AgentSessionRef::path(session_path.clone());
-        terminal
-            .set_agent_session_ref_for_session_start_with_resume_policy(
-                "herdr:omp".into(),
-                "omp".into(),
-                session_ref.clone(),
-                Some(1),
-                Some("startup".into()),
-                crate::agent_resume::AgentResumePolicy::External,
-            )
-            .expect("external OMP session should persist");
-        terminal
-            .set_hook_authority_with_session_ref(
-                "herdr:omp".into(),
-                "omp".into(),
-                crate::detect::AgentState::Working,
-                None,
-                session_ref,
-                Some(2),
-            )
-            .expect("OMP lifecycle report should remain active");
-
-        let snapshot = capture_from_state(&state);
-        let history = capture_history_from_state_with_runtimes(
-            &state,
-            &TerminalRuntimeRegistry::new(),
-            snapshot.version,
-        );
-        assert_eq!(snapshot.version, EXTERNAL_RESUME_POLICY_SNAPSHOT_VERSION);
-        assert_eq!(history.version, snapshot.version);
-        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
-            .agent_session
-            .as_ref()
-            .expect("external OMP session should remain visible in the snapshot");
-        assert_eq!(
-            agent_session.resume_policy,
-            crate::agent_resume::AgentResumePolicy::External
-        );
-
-        let encoded = serde_json::to_string(&snapshot).expect("snapshot should serialize");
-        assert!(encoded.contains("\"resume_policy\":\"external\""));
-        let restored = parse_snapshot(&encoded).expect("external snapshot should parse");
-        assert_eq!(
-            restored.workspaces[0].tabs[0].panes[&root.raw()]
-                .agent_session
-                .as_ref()
-                .expect("external OMP session should restore from the snapshot")
-                .resume_policy,
-            crate::agent_resume::AgentResumePolicy::External
-        );
-        let mut downgraded: serde_json::Value =
-            serde_json::from_str(&encoded).expect("snapshot JSON should parse");
-        downgraded["version"] = serde_json::json!(REMOTE_WORKSPACE_SNAPSHOT_VERSION);
-        let downgraded_encoded =
-            serde_json::to_string(&downgraded).expect("downgraded snapshot should serialize");
-        let Err(error) = parse_snapshot_with_supported_version(
-            &downgraded_encoded,
-            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
-        ) else {
-            panic!("v5 readers must reject external-policy payloads even at version 5");
-        };
-        assert_eq!(
-            error,
-            "external agent resume policy requires snapshot version 6 or newer"
-        );
-        let Err(error) =
-            parse_snapshot_with_supported_version(&encoded, REMOTE_WORKSPACE_SNAPSHOT_VERSION)
-        else {
-            panic!(
-                "v5 readers must reject external-policy snapshots rather than ignore the policy"
-            );
-        };
-        assert_eq!(error, "snapshot version 6 is newer than supported 5");
-        let encoded_history =
-            serde_json::to_string(&history).expect("external history should serialize");
-        let Err(error) = parse_history_snapshot_with_supported_version(
-            &encoded_history,
-            REMOTE_WORKSPACE_SNAPSHOT_VERSION,
-        ) else {
-            panic!("v5 readers must reject history paired with external-policy snapshots");
-        };
-        assert_eq!(
-            error,
-            "history snapshot version 6 is newer than supported 5"
-        );
     }
 
     #[test]
@@ -1697,7 +1302,6 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
-                resume_policy: crate::agent_resume::AgentResumePolicy::Native,
             });
 
         let snapshot = capture_from_state(&state);
@@ -1723,20 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn v7_snapshot_is_rejected() {
-        let json = r#"{"version":7,"workspaces":[],"active":null,"selected":0}"#;
-        let Err(error) = parse_snapshot(json) else {
-            panic!("v7 snapshots must be rejected");
-        };
-        assert_eq!(error, "snapshot version 7 is newer than supported 6");
-    }
-
-    #[test]
-    fn future_snapshot_and_history_versions_are_rejected() {
-        let snapshot = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
-        let history = r#"{"version":999,"workspaces":[]}"#;
-        assert!(parse_snapshot(snapshot).is_err());
-        assert!(parse_history_snapshot(history).is_err());
+    fn future_version_is_rejected() {
+        let json = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
+        assert!(parse_snapshot(json).is_err());
     }
 
     #[test]
@@ -1747,13 +1340,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_falls_back_to_home_when_cwd_missing() {
+    fn snapshot_parsing_preserves_missing_cwd() {
         let mut panes = HashMap::new();
         panes.insert(
             0,
             PaneSnapshot {
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
-                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1767,7 +1359,6 @@ mod tests {
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
-                execution_target: crate::execution::ExecutionTarget::Local,
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
@@ -1782,7 +1373,6 @@ mod tests {
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
-                identity_execution_target: crate::execution::ExecutionTarget::Local,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
@@ -1790,7 +1380,6 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
-                    layout_effect_nonce: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -1807,7 +1396,6 @@ mod tests {
             active: Some(0),
             selected: 0,
             sidebar_width: Some(26),
-            idempotency_epoch: None,
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
         };

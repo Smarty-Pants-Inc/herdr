@@ -5,18 +5,17 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INSTALLER = REPO_ROOT / "website" / "install.sh"
-SMARTY_INSTALLER = REPO_ROOT / "scripts" / "install-smarty.sh"
+INSTALLER = REPO_ROOT / "distribution" / "install.sh"
 REQUIRED_COMMANDS = ("awk", "cat", "chmod", "cp", "mkdir", "mktemp", "mv", "rm")
 
 
+@unittest.skipUnless(os.name == "posix", "Unix installer requires a POSIX host")
 class UnixInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="herdr-installer-test-")
@@ -40,6 +39,10 @@ class UnixInstallerTests(unittest.TestCase):
 case "$1" in
   -s) echo Linux ;;
   -m) echo x86_64 ;;
+  -o)
+    [ "${FAKE_UNAME_OS_UNAVAILABLE:-}" != "1" ] || exit 1
+    echo "${FAKE_UNAME_OS:-GNU/Linux}"
+    ;;
   *) exit 1 ;;
 esac
 """,
@@ -47,6 +50,7 @@ esac
         self._write_executable(
             "curl",
             """#!/bin/sh
+: > "$FAKE_CURL_MARKER"
 out=""
 previous=""
 for argument in "$@"; do
@@ -116,7 +120,12 @@ exec {sha256sum} "$@"
         path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return path
 
-    def _run_installer(self, checksum: str | None, tool: str = "sha256sum") -> subprocess.CompletedProcess[str]:
+    def _run_installer(
+        self,
+        checksum: str | None,
+        tool: str = "sha256sum",
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         self._select_checksum_tool(tool)
         manifest = self._write_manifest(checksum)
         env = {
@@ -124,7 +133,9 @@ exec {sha256sum} "$@"
             "PATH": str(self.bin_dir),
             "FAKE_MANIFEST": str(manifest),
             "FAKE_PAYLOAD": str(self.payload),
+            "FAKE_CURL_MARKER": str(self.root / "curl-called"),
             "HERDR_INSTALL_DIR": str(self.install_dir),
+            **(extra_env or {}),
         }
         return subprocess.run(
             ["/bin/sh", str(INSTALLER)],
@@ -145,6 +156,30 @@ exec {sha256sum} "$@"
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((self.install_dir / "herdr").read_bytes(), self.payload.read_bytes())
+
+    def test_android_is_rejected_before_replacing_existing_binary(self) -> None:
+        self.install_dir.mkdir()
+        installed = self.install_dir / "herdr"
+        installed.write_bytes(b"existing-herdr\n")
+
+        result = self._run_installer(
+            self.expected_sha256,
+            extra_env={"FAKE_UNAME_OS": "Android"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Android/Termux is not currently supported", result.stderr)
+        self.assertFalse((self.root / "curl-called").exists())
+        self.assertEqual(installed.read_bytes(), b"existing-herdr\n")
+
+    def test_missing_uname_operating_system_flag_keeps_linux_supported(self) -> None:
+        result = self._run_installer(
+            self.expected_sha256,
+            extra_env={"FAKE_UNAME_OS_UNAVAILABLE": "1"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.install_dir / "herdr").read_bytes(), self.payload.read_bytes())
 
     def test_checksum_mismatch_does_not_replace_existing_binary(self) -> None:
         self.install_dir.mkdir()
@@ -167,183 +202,6 @@ exec {sha256sum} "$@"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("valid SHA-256 checksum", result.stderr)
         self.assertEqual(installed.read_bytes(), b"existing-herdr\n")
-
-
-class SmartyInstallerTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="herdr-smarty-installer-test-")
-        self.root = Path(self.temp_dir.name)
-        self.bin_dir = self.root / "bin"
-        self.bin_dir.mkdir()
-        self.install_dir = self.root / "install"
-        self.launch_agents_dir = self.root / "LaunchAgents"
-        self.launchctl_log = self.root / "launchctl.log"
-        self.payload = self.root / "payload"
-        self.payload.write_bytes(b"fake-smarty-herdr-binary\n")
-        self.expected_sha256 = hashlib.sha256(self.payload.read_bytes()).hexdigest()
-
-        for command in ("awk", "cat", "chmod", "cp", "mkdir", "mktemp", "mv", "rm", "shasum"):
-            path = shutil.which(command)
-            if path is None:
-                self.fail(f"test host is missing required command: {command}")
-            (self.bin_dir / command).symlink_to(path)
-
-        self._write_executable(
-            "uname",
-            """#!/bin/sh
-case "$1" in
-  -s) echo Darwin ;;
-  -m) echo arm64 ;;
-  *) exit 1 ;;
-esac
-""",
-        )
-        self._write_executable(
-            "curl",
-            """#!/bin/sh
-out=""
-previous=""
-for argument in "$@"; do
-  if [ "$previous" = "-o" ]; then
-    out="$argument"
-    break
-  fi
-  previous="$argument"
-done
-if [ -n "$out" ]; then
-  cp "$FAKE_PAYLOAD" "$out"
-else
-  cat "$FAKE_MANIFEST"
-fi
-""",
-        )
-        self._write_executable(
-            "plutil",
-            f"""#!{sys.executable}
-import json
-import sys
-
-value = json.load(sys.stdin)
-try:
-    for key in sys.argv[2].split("."):
-        value = value[key]
-except (KeyError, TypeError):
-    raise SystemExit(1)
-if not isinstance(value, (str, int, float)):
-    raise SystemExit(1)
-print(value)
-""",
-        )
-
-
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
-
-    def _write_executable(self, name: str, content: str) -> None:
-        path = self.bin_dir / name
-        path.write_text(content, encoding="utf-8")
-        path.chmod(0o755)
-
-    def _write_manifest(
-        self,
-        checksum: str,
-        *,
-        top_level_asset: bool = True,
-        archived_asset: bool = False,
-    ) -> Path:
-        asset = {
-            "url": "https://example.invalid/herdr-macos-aarch64",
-            "sha256": checksum,
-        }
-        manifest: dict[str, object] = {
-            "channel": "preview",
-            "assets": {"macos-aarch64": asset} if top_level_asset else {},
-        }
-        if archived_asset:
-            manifest["builds"] = {"old-build": {"assets": {"macos-aarch64": asset}}}
-        path = self.root / "preview.json"
-        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        return path
-
-    def _run_installer(
-        self,
-        checksum: str,
-        *,
-        top_level_asset: bool = True,
-        archived_asset: bool = False,
-        install_dir: str | Path | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        manifest = self._write_manifest(
-            checksum,
-            top_level_asset=top_level_asset,
-            archived_asset=archived_asset,
-        )
-        env = {
-            **os.environ,
-            "PATH": str(self.bin_dir),
-            "FAKE_MANIFEST": str(manifest),
-            "FAKE_PAYLOAD": str(self.payload),
-            "HERDR_INSTALL_DIR": str(self.install_dir if install_dir is None else install_dir),
-            "HERDR_PLUTIL": str(self.bin_dir / "plutil"),
-        }
-        return subprocess.run(
-            ["/bin/sh", str(SMARTY_INSTALLER)],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    def test_installs_direct_self_updating_binary(self) -> None:
-        result = self._run_installer(self.expected_sha256)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        installed = self.install_dir / "herdr"
-        self.assertEqual(installed.read_bytes(), self.payload.read_bytes())
-        self.assertFalse(installed.is_symlink())
-        self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
-        self.assertIn("installed self-updating client", result.stdout)
-        self.assertFalse(self.launch_agents_dir.exists())
-        self.assertFalse(self.launchctl_log.exists())
-
-    def test_rejects_relative_install_path(self) -> None:
-        result = self._run_installer(self.expected_sha256, install_dir="relative")
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be an absolute path", result.stderr)
-        self.assertFalse(self.launch_agents_dir.exists())
-        self.assertFalse(self.launchctl_log.exists())
-
-
-    def test_checksum_mismatch_preserves_existing_install(self) -> None:
-        self.install_dir.mkdir()
-        installed = self.install_dir / "herdr"
-        installed.write_bytes(b"existing-smarty-herdr\n")
-
-        result = self._run_installer("0" * 64)
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("checksum did not match", result.stderr)
-        self.assertEqual(installed.read_bytes(), b"existing-smarty-herdr\n")
-        self.assertFalse(self.launch_agents_dir.exists())
-        self.assertFalse(self.launchctl_log.exists())
-
-    def test_archived_asset_cannot_replace_missing_current_asset(self) -> None:
-        self.install_dir.mkdir()
-        installed = self.install_dir / "herdr"
-        installed.write_bytes(b"existing-smarty-herdr\n")
-
-        result = self._run_installer(
-            self.expected_sha256,
-            top_level_asset=False,
-            archived_asset=True,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not include macos-aarch64", result.stderr)
-        self.assertEqual(installed.read_bytes(), b"existing-smarty-herdr\n")
-        self.assertFalse(self.launch_agents_dir.exists())
-        self.assertFalse(self.launchctl_log.exists())
 
 
 if __name__ == "__main__":

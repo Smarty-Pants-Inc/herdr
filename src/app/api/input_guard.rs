@@ -90,7 +90,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -349,30 +349,5 @@ mod tests {
             fixture.target_rx.try_recv().expect("non-agent input bytes"),
             Bytes::from_static(b"non-agent")
         );
-    }
-
-    #[tokio::test]
-    async fn gui_message_dispatch_uses_the_same_origin_context() {
-        let mut fixture = attributed_agent_fixture();
-        let (respond_to, response_rx) = std::sync::mpsc::channel();
-        fixture
-            .app
-            .handle_api_request_message(crate::api::ApiRequestMessage {
-                request: Request {
-                    id: "gui-cross-pane".into(),
-                    method: Method::PaneSendText(PaneSendTextParams {
-                        pane_id: fixture.target_pane_id.clone(),
-                        text: "blocked".into(),
-                        allow_cross_pane: false,
-                    }),
-                },
-                context: attributed_context(),
-                respond_to,
-                response_write_complete: None,
-                stream_active: None,
-            });
-
-        assert_denied(&response_rx.recv().expect("gui response"));
-        assert!(fixture.target_rx.try_recv().is_err());
     }
 }

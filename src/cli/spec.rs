@@ -2,14 +2,17 @@ use std::io::Write;
 
 use clap::{Arg, ArgAction, ArgGroup, Command, ValueHint};
 
+mod completion;
+mod machine;
+
 pub(super) fn command() -> Command {
     let command = Command::new("herdr")
         .about("terminal workspace manager for AI coding agents")
         .disable_help_flag(true)
         .disable_version_flag(true)
         .arg(help_flag())
-        .arg(flag("no-session").help("Run monolithically without server/client session mode"))
         .arg(option("session", "NAME").help("Use or create a named persistent session"))
+        .arg(option("machine", "LABEL-OR-ID").help("Run an API command on a saved SSH machine"))
         .arg(option("remote", "TARGET").help("Attach through SSH to a remote Herdr server"))
         .arg(
             option("remote-keybindings", "MODE")
@@ -26,11 +29,12 @@ pub(super) fn command() -> Command {
                 .action(ArgAction::SetTrue)
                 .help("Print version and exit"),
         )
-        .subcommand(completion_command())
+        .subcommand(completion::command())
         .subcommand(update_command())
         .subcommand(status_command())
         .subcommand(config_command())
         .subcommand(channel_command())
+        .subcommand(machine::command())
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
@@ -128,19 +132,6 @@ fn write_requested_help(
     Ok(true)
 }
 
-fn completion_command() -> Command {
-    Command::new("completion")
-        .visible_alias("completions")
-        .about("Generate shell completion scripts")
-        .arg(
-            Arg::new("shell")
-                .value_name("SHELL")
-                .required(true)
-                .value_parser(super::completion::SUPPORTED_SHELLS)
-                .help("Shell to generate completions for"),
-        )
-}
-
 fn update_command() -> Command {
     Command::new("update")
         .about("Download and install the latest version")
@@ -189,7 +180,6 @@ fn server_command() -> Command {
         .about("Run or control the headless server")
         .subcommand(Command::new("stop").about("Stop the running server"))
         .subcommand(Command::new("reload-config").about("Reload config in the running server"))
-        .subcommand(omp_maintenance_command())
         .subcommand(
             Command::new("agent-manifests")
                 .about("Show active agent detection manifests")
@@ -204,47 +194,6 @@ fn server_command() -> Command {
             Command::new("reload-agent-manifests")
                 .about("Reload local agent detection manifest overrides"),
         )
-}
-
-fn omp_maintenance_command() -> Command {
-    Command::new("omp-maintenance")
-        .about("Control the host-wide OMP admission lease")
-        .subcommand(
-            Command::new("acquire")
-                .about("Acquire the lease with a private 32-byte operation capability")
-                .arg(omp_maintenance_capability_stdin_arg())
-                .arg(json_flag()),
-        )
-        .subcommand(
-            Command::new("status")
-                .about("Show lease and route status")
-                .arg(json_flag()),
-        )
-        .subcommand(
-            Command::new("inspect")
-                .about("Read host-wide lease and route state without enforcing maintenance")
-                .arg(json_flag()),
-        )
-        .subcommand(
-            Command::new("permit")
-                .about("Permit one exact proof-pane admission")
-                .arg(omp_maintenance_capability_stdin_arg())
-                .arg(option("proof-session", "SESSION").required(true))
-                .arg(option("proof-pane", "PANE").required(true))
-                .arg(json_flag()),
-        )
-        .subcommand(
-            Command::new("release")
-                .about("Release the lease after all routes close")
-                .arg(omp_maintenance_capability_stdin_arg())
-                .arg(json_flag()),
-        )
-}
-
-fn omp_maintenance_capability_stdin_arg() -> Arg {
-    flag("operation-id-stdin")
-        .required(true)
-        .help("Read the private operation capability from stdin")
 }
 
 fn api_command() -> Command {
@@ -437,7 +386,7 @@ fn agent_command() -> Command {
                         .help("Deliberately allow an agent-originated request to target another pane"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait first requires an observed state change within 5000ms; otherwise it returns agent_prompt_stalled. A shorter --timeout returns timeout instead. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match. Without --timeout, the settled-state wait is indefinite.",
+                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
                 ),
         )
         .subcommand(
@@ -628,11 +577,9 @@ fn pane_command() -> Command {
                 .about("Split a pane")
                 .arg(Arg::new("pane_id").value_name("PANE_ID"))
                 .args(current_pane_args())
-                .arg(option("workspace", "ID"))
                 .arg(split_direction_option())
                 .arg(option("ratio", "FLOAT"))
                 .arg(path_option("cwd", "PATH"))
-                .arg(option("target", "TARGET"))
                 .arg(env_option())
                 .arg(option("right-click", "TARGET").value_parser(["herdr", "pane"]))
                 .arg(flag("focus"))
@@ -756,7 +703,6 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
-        .arg(option("resume-policy", "native|external"))
 }
 
 fn release_agent_command() -> Command {
@@ -957,17 +903,10 @@ fn plugin_command() -> Command {
                         .about("Open a plugin pane")
                         .arg(option("plugin", "ID"))
                         .arg(option("entrypoint", "ID"))
-                        .arg(option("placement", "PLACEMENT").value_parser([
-                            "overlay",
-                            "popup",
-                            "workspace-right",
-                            "split",
-                            "tab",
-                            "zoomed",
-                        ]))
-                        .arg(option("scope", "SCOPE").value_parser(["shared", "client-private"]))
-                        .arg(option("width", "SIZE"))
-                        .arg(option("height", "SIZE"))
+                        .arg(
+                            option("placement", "PLACEMENT")
+                                .value_parser(["overlay", "split", "tab", "zoomed"]),
+                        )
                         .arg(option("workspace", "ID"))
                         .arg(option("target-pane", "PANE"))
                         .arg(split_direction_option())
@@ -1001,10 +940,12 @@ fn integration_target_arg() -> Arg {
 }
 
 fn integration_target_values() -> Vec<&'static str> {
-    crate::api::schema::IntegrationTarget::ALL
+    let mut values: Vec<&'static str> = crate::api::schema::IntegrationTarget::ALL
         .into_iter()
         .map(crate::integration::integration_target_label)
-        .collect()
+        .collect();
+    values.extend_from_slice(crate::integration::EXPERIMENTAL_INTEGRATION_TARGET_LABELS);
+    values
 }
 
 fn id_command(name: &'static str, id: &'static str, about: &'static str) -> Command {
@@ -1227,6 +1168,15 @@ mod tests {
     fn spec_matches_all_integration_targets() {
         let cmd = super::command();
         let install = command_path(&cmd, &["integration", "install"]);
+        let mut expected: Vec<String> = crate::api::schema::IntegrationTarget::ALL
+            .map(crate::integration::integration_target_label)
+            .map(str::to_string)
+            .to_vec();
+        expected.extend(
+            crate::integration::EXPERIMENTAL_INTEGRATION_TARGET_LABELS
+                .iter()
+                .map(|label| (*label).to_string()),
+        );
         assert_eq!(
             argument(install, "target")
                 .get_value_parser()
@@ -1234,9 +1184,7 @@ mod tests {
                 .unwrap()
                 .map(|value| value.get_name().to_string())
                 .collect::<Vec<_>>(),
-            crate::api::schema::IntegrationTarget::ALL
-                .map(crate::integration::integration_target_label)
-                .map(str::to_string)
+            expected
         );
     }
 
@@ -1330,10 +1278,7 @@ mod tests {
         assert!(open
             .get_arguments()
             .any(|arg| arg.get_long() == Some("entrypoint")));
-        assert!(option_values(open, "placement").contains(&"workspace-right".to_string()));
-        assert!(has_option(open, "scope"));
-        assert!(has_option(open, "width"));
-        assert!(has_option(open, "height"));
+        assert!(option_values(open, "placement").contains(&"zoomed".to_string()));
     }
 
     #[test]
@@ -1370,32 +1315,6 @@ mod tests {
         assert!(pane
             .get_subcommands()
             .any(|subcommand| subcommand.get_name() == "wait-output"));
-    }
-
-    #[test]
-    fn spec_includes_stdin_only_omp_maintenance_controls() {
-        let cmd = super::command();
-        let maintenance = command_path(&cmd, &["server", "omp-maintenance"]);
-        assert_eq!(maintenance.get_subcommands().count(), 5);
-        for action in ["acquire", "status", "inspect", "permit", "release"] {
-            assert!(maintenance
-                .get_subcommands()
-                .any(|subcommand| subcommand.get_name() == action));
-        }
-        for action in ["acquire", "permit", "release"] {
-            let command = command_path(&cmd, &["server", "omp-maintenance", action]);
-            assert!(has_option(command, "operation-id-stdin"));
-            assert!(!has_option(command, "operation-id"));
-        }
-        for action in ["status", "inspect"] {
-            let command = command_path(&cmd, &["server", "omp-maintenance", action]);
-            assert!(!has_option(command, "operation-id-stdin"));
-            assert!(!has_option(command, "operation-id"));
-        }
-        let permit = command_path(&cmd, &["server", "omp-maintenance", "permit"]);
-        for option in ["operation-id-stdin", "proof-session", "proof-pane", "json"] {
-            assert!(has_option(permit, option));
-        }
     }
 
     #[test]

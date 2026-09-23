@@ -120,7 +120,7 @@ impl App {
             .iter()
             .filter_map(|ws| {
                 let cwd =
-                    ws.local_git_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
+                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
                 let cache_key_hint = (!refresh_repo_discovery && ws.cached_identity_cwd == cwd)
                     .then(|| ws.cached_git_status_key.clone());
                 Some(WorkspaceGitRefreshItem {
@@ -529,7 +529,7 @@ mod tests {
     fn test_app(config: &crate::config::Config) -> super::super::App {
         super::super::App::new(
             config,
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
