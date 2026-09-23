@@ -7,8 +7,8 @@ mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
-pub(crate) use server::start_server_with_stop_control;
-pub use server::{start_server_with_capabilities, ServerHandle};
+pub use server::ServerHandle;
+pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;
@@ -25,6 +25,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
         Method::ServerReloadConfig(_)
             | Method::ServerReloadAgentManifests(_)
             | Method::NotificationShow(_)
+            | Method::ProductAnnouncementDismiss(_)
+            | Method::ReleaseNotesDismiss(_)
+            | Method::CommandInvoke(_)
             | Method::WorkspaceCreate(_)
             | Method::WorkspaceFocus(_)
             | Method::WorkspaceRename(_)
@@ -41,8 +44,6 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::TabMove(_)
             | Method::TabClose(_)
             | Method::LayoutApply(_)
-            | Method::LayoutApplyIdempotent(_)
-            | Method::LayoutReconcileIdempotent(_)
             | Method::LayoutSetSplitRatio(_)
             | Method::AgentRename(_)
             | Method::AgentViewSet(_)
@@ -57,6 +58,9 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneZoom(_)
             | Method::PaneFocusDirection(_)
             | Method::PaneResize(_)
+            | Method::PaneScroll(_)
+            | Method::PaneClear(_)
+            | Method::PaneEditScrollback(_)
             | Method::PaneFocus(_)
             | Method::PaneInputSet(_)
             | Method::PaneRename(_)
@@ -83,18 +87,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
     )
 }
 
-/// Best-effort origin metadata carried alongside an API request.
-///
-/// This is transport-local context, not part of the JSON request schema.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ApiRequestContext {
-    pub(crate) local_peer_pid: Option<u32>,
-}
-
 pub struct ApiRequestMessage {
     pub request: Request,
-    pub(crate) context: ApiRequestContext,
-
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,

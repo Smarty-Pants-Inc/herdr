@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,18 +15,17 @@ use crate::api::schema::{
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
-use crate::api::{
-    request_changes_ui, socket_path, ApiRequestContext, ApiRequestMessage, ApiRequestSender,
-    EventHub,
-};
+use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
-    bind_private_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
-    set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
-    SocketFileIdentity,
+    bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
+    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
+    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
 mod pane_graphics_stream;
+
+#[cfg(test)]
+mod subscription_socket_tests;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -34,28 +33,6 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-
-struct ConnectionAdmission {
-    active: Arc<AtomicUsize>,
-}
-
-impl Drop for ConnectionAdmission {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn try_admit_connection(active: &Arc<AtomicUsize>) -> Option<ConnectionAdmission> {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < MAX_CONCURRENT_CONNECTIONS).then_some(count + 1)
-        })
-        .ok()
-        .map(|_| ConnectionAdmission {
-            active: Arc::clone(active),
-        })
-}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -90,88 +67,83 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
 }
 
-pub fn start_server_with_capabilities(
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
-) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, capabilities, None)
-}
-
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-        omp_maintenance: cfg!(any(target_os = "linux", target_os = "macos")),
+        endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        surface_interest: true,
+        health_check: true,
+        ssh_agent_registration: false,
     })
-}
-
-#[cfg(test)]
-mod capability_tests {
-    use super::*;
-
-    #[test]
-    fn default_capabilities_advertise_omp_maintenance_only_on_supported_platforms() {
-        assert_eq!(
-            default_capabilities()
-                .expect("default capabilities")
-                .omp_maintenance,
-            cfg!(any(target_os = "linux", target_os = "macos"))
-        );
-    }
 }
 
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
+    mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
 
-    let listener = bind_private_local_listener(&path)?;
+    let listener = bind_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
 
+    #[cfg(unix)]
+    let ssh_agents = match crate::platform::ssh_agent::SshAgentRegistry::new(
+        crate::platform::ssh_agent::socket_path(),
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+    ) {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            warn!(%error, "SSH agent refresh unavailable; retaining inherited pane environment");
+            None
+        }
+    };
+
+    if let Some(capabilities) = capabilities.as_mut() {
+        capabilities.ssh_agent_registration = {
+            #[cfg(unix)]
+            {
+                ssh_agents.is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
-    let active_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let Some(admission) = try_admit_connection(&active_connections) else {
-                        warn!(
-                            max = MAX_CONCURRENT_CONNECTIONS,
-                            "rejecting api connection: concurrent connection limit reached"
-                        );
-                        continue;
-                    };
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    if let Err(err) = std::thread::Builder::new()
-                        .name("herdr-api-connection".into())
-                        .spawn(move || {
-                            let _admission = admission;
-                            if let Err(err) = handle_connection_with_stop(
-                                stream,
-                                &api_tx,
-                                &event_hub,
-                                &connection_running,
-                                capabilities,
-                                server_stop.as_ref(),
-                            ) {
-                                warn!(err = %err, "api connection failed");
-                            }
-                        })
-                    {
-                        warn!(err = %err, "failed to spawn api connection thread");
-                    }
+                    #[cfg(unix)]
+                    let ssh_agents = ssh_agents.clone();
+                    std::thread::spawn(move || {
+                        if let Err(err) = handle_connection_with_stop(
+                            stream,
+                            &api_tx,
+                            &event_hub,
+                            &connection_running,
+                            capabilities,
+                            server_stop.as_ref(),
+                            #[cfg(unix)]
+                            ssh_agents.as_ref(),
+                        ) {
+                            warn!(err = %err, "api connection failed");
+                        }
+                    });
                 }
                 Err(err) => {
                     error!(err = %err, "api listener accept failed");
@@ -211,7 +183,16 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
+    handle_connection_with_stop(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        None,
+        #[cfg(unix)]
+        None,
+    )
 }
 
 fn handle_connection_with_stop(
@@ -221,14 +202,11 @@ fn handle_connection_with_stop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
-
-    let context = ApiRequestContext {
-        local_peer_pid: local_stream_peer_pid(&stream),
-    };
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -242,10 +220,23 @@ fn handle_connection_with_stop(
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
+            // Recover correlation without relaxing typed request validation or accepting
+            // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
+            #[derive(serde::Deserialize)]
+            struct RequestId {
+                id: String,
+            }
+            let id = if line.starts_with('{') {
+                serde_json::from_str::<RequestId>(line)
+                    .map(|request| request.id)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
-                    id: String::new(),
+                    id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
@@ -262,6 +253,49 @@ fn handle_connection_with_stop(
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
+        #[cfg(unix)]
+        Method::ServerSshAgentRegister(params) => {
+            let lease = ssh_agents
+                .ok_or_else(|| io::Error::other("SSH agent registration is unavailable"))
+                .and_then(|registry| registry.register(PathBuf::from(params.socket_path)));
+            let lease = match lease {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return write_text_line_allow_disconnect(
+                        &mut stream,
+                        &error_response_json(
+                            request_id,
+                            if error.kind() == io::ErrorKind::InvalidInput {
+                                "invalid_ssh_agent"
+                            } else {
+                                "ssh_agent_unavailable"
+                            },
+                            error.to_string(),
+                        ),
+                    )
+                }
+            };
+            write_json_line(
+                &mut stream,
+                &SuccessResponse {
+                    id: request_id,
+                    result: ResponseResult::Ok {},
+                },
+            )?;
+            set_local_stream_polling(&mut stream, true)?;
+            let mut byte = [0];
+            while running.load(Ordering::Relaxed) {
+                match poll_local_stream_read(&mut stream, &mut byte)? {
+                    LocalStreamRead::Pending => {
+                        // SSH can unlink an inherited socket after its bridge's lease closes.
+                        lease.refresh()?;
+                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    }
+                    _ => break,
+                }
+            }
+            Ok(())
+        }
         Method::PaneGraphicsStream(params) => {
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
@@ -315,7 +349,6 @@ fn handle_connection_with_stop(
             let response = prompt_agent(
                 request_id.clone(),
                 params,
-                context,
                 &mut stream,
                 api_tx,
                 event_hub,
@@ -341,12 +374,11 @@ fn handle_connection_with_stop(
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
-            let response = handle_request_with_context(
+            let response = handle_request(
                 Request {
                     id: request_id.clone(),
                     method: method_body,
                 },
-                context,
                 api_tx,
                 capabilities,
                 server_stop,
@@ -399,27 +431,8 @@ fn finish_wait_response(
     result
 }
 
-#[cfg(test)]
 fn handle_request(
     request: Request,
-    api_tx: &ApiRequestSender,
-    capabilities: Option<ServerCapabilities>,
-    server_stop: Option<&Arc<AtomicBool>>,
-    response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
-) -> String {
-    handle_request_with_context(
-        request,
-        ApiRequestContext::default(),
-        api_tx,
-        capabilities,
-        server_stop,
-        response_write_complete,
-    )
-}
-
-fn handle_request_with_context(
-    request: Request,
-    context: ApiRequestContext,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
@@ -432,13 +445,20 @@ fn handle_request_with_context(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
-                build: crate::build_info::server_build_identity(),
             },
         })
         .unwrap_or_else(|_| {
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         });
+    }
+
+    if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
+        return error_response_json(
+            request.id,
+            "connection_local_only",
+            "client_shell.surface.set is only available through a client shell endpoint".into(),
+        );
     }
 
     if matches!(&request.method, Method::ServerStop(_)) {
@@ -458,32 +478,25 @@ fn handle_request_with_context(
         );
     }
 
-    dispatch_to_app(
-        request,
-        api_tx,
-        None,
-        context,
-        response_write_complete,
-        None,
-    )
+    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
 }
 
-fn api_method_name(method: &Method) -> &'static str {
+pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
-        Method::ServerOmpMaintenanceAcquire(_) => "server.omp_maintenance.acquire",
-        Method::ServerOmpMaintenanceStatus(_) => "server.omp_maintenance.status",
-        Method::ServerOmpMaintenanceInspect(_) => "server.omp_maintenance.inspect",
-        Method::ServerOmpMaintenancePermit(_) => "server.omp_maintenance.permit",
-        Method::ServerOmpMaintenanceRelease(_) => "server.omp_maintenance.release",
         Method::ServerReloadConfig(_) => "server.reload_config",
+        Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::NotificationShow(_) => "notification.show",
+        Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
+        Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
+        Method::CommandInvoke(_) => "command.invoke",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
+        Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
@@ -523,21 +536,26 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneZoom(_) => "pane.zoom",
         Method::PaneLayout(_) => "pane.layout",
         Method::PaneProcessInfo(_) => "pane.process_info",
-        Method::PaneOmpBridge(_) => "pane.omp_bridge",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
-        Method::LayoutApplyIdempotent(_) => "layout.apply_idempotent",
-        Method::LayoutReconcileIdempotent(_) => "layout.reconcile_idempotent",
         Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
         Method::PaneEdges(_) => "pane.edges",
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
+        Method::PaneScroll(_) => "pane.scroll",
+        Method::PaneClear(_) => "pane.clear",
+        Method::PaneEditScrollback(_) => "pane.edit_scrollback",
+        Method::PaneSelectionRead(_) => "pane.selection.read",
+        Method::PaneCopyMotion(_) => "pane.copy_motion",
+        Method::PaneCopySearch(_) => "pane.copy_search",
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
+        Method::PaneLinkActivate(_) => "pane.link.activate",
+        Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
@@ -561,6 +579,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
+        Method::IntegrationList(_) => "integration.list",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
         Method::PluginLink(_) => "plugin.link",
@@ -778,45 +797,6 @@ mod windows_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(path);
     }
-
-    #[test]
-    fn named_pipe_dispatch_preserves_client_pid_context() {
-        let (mut client, server, path) = local_stream_pair("peer-pid-context");
-        client
-            .write_all(b"{\"id\":\"peer_pid\",\"method\":\"workspace.list\",\"params\":{}}\n")
-            .expect("write API request");
-        client.flush().expect("flush API request");
-
-        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
-        let running = Arc::new(AtomicBool::new(true));
-        let server_running = Arc::clone(&running);
-        let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &EventHub::default(), &server_running, None)
-        });
-
-        let msg = api_rx.blocking_recv().expect("API request dispatch");
-        assert_eq!(msg.context.local_peer_pid, Some(std::process::id()));
-        msg.respond_to
-            .send(
-                serde_json::to_string(&SuccessResponse {
-                    id: msg.request.id,
-                    result: ResponseResult::Ok {},
-                })
-                .expect("encode API response"),
-            )
-            .expect("send API response");
-
-        let mut response = String::new();
-        BufReader::new(&mut client)
-            .read_line(&mut response)
-            .expect("read API response");
-        assert!(serde_json::from_str::<SuccessResponse>(&response).is_ok());
-        server_thread
-            .join()
-            .expect("server thread")
-            .expect("serve API");
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 fn stream_subscriptions(
@@ -839,7 +819,8 @@ fn stream_subscriptions(
             event_start_sequence,
         ) {
             Ok(active) => active,
-            Err(response) => {
+            Err(mut response) => {
+                response.id = request_id;
                 if let Err(err) = write_json_line(&mut stream, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -855,7 +836,7 @@ fn stream_subscriptions(
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
+            id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted {},
         },
     ) {
@@ -871,7 +852,23 @@ fn stream_subscriptions(
         }
 
         for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
+            let events = match subscription.poll_batch(api_tx, event_hub) {
+                Ok(events) => events,
+                Err(error) => {
+                    write_json_line_allow_disconnect(
+                        &mut stream,
+                        &ErrorResponse {
+                            id: request_id,
+                            error,
+                        },
+                    )?;
+                    return Ok(());
+                }
+            };
+            for event in events {
+                if should_stop_connection(&mut stream, running)? {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -931,23 +928,22 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
+    dispatch_to_app(request, api_tx, timeout, None, None, None)
+}
+
+pub(super) fn dispatch_to_app_with_caller_timeout(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+) -> String {
     dispatch_to_app(
         request,
         api_tx,
         timeout,
-        ApiRequestContext::default(),
         None,
         None,
+        Some(("timeout", "timed out waiting for agent status")),
     )
-}
-
-pub(super) fn dispatch_to_app_with_timeout_and_context(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    timeout: Option<Duration>,
-    context: ApiRequestContext,
-) -> String {
-    dispatch_to_app(request, api_tx, timeout, context, None, None)
 }
 
 pub(super) fn dispatch_stream_open(
@@ -956,14 +952,7 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(
-        request,
-        api_tx,
-        Some(timeout),
-        ApiRequestContext::default(),
-        None,
-        Some(active),
-    )
+    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), None)
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -975,9 +964,9 @@ pub(super) fn dispatch_stream_frame(
         request,
         api_tx,
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
-        ApiRequestContext::default(),
         None,
         Some(active),
+        None,
     )
 }
 
@@ -985,16 +974,15 @@ fn dispatch_to_app(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
-    context: ApiRequestContext,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
+    timeout_response: Option<(&str, &str)>,
 ) -> String {
     let request_id = request.id.clone();
     let request_active = stream_active.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
-        context,
         respond_to,
         response_write_complete,
         stream_active,
@@ -1034,6 +1022,11 @@ fn dispatch_to_app(
             if let Some(active) = request_active {
                 active.store(false, Ordering::Release);
             }
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                if let Some((code, message)) = timeout_response {
+                    return error_response_json(request_id, code, message.into());
+                }
+            }
             error_response_json(
                 request_id,
                 "server_unavailable",
@@ -1041,6 +1034,26 @@ fn dispatch_to_app(
             )
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn caller_timeout_dispatch_uses_timeout_error() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = dispatch_to_app_with_caller_timeout(
+        Request {
+            id: "prompt-timeout".into(),
+            method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                target: "reviewer".into(),
+                text: "review this".into(),
+                wait: None,
+            }),
+        },
+        &tx,
+        Some(Duration::ZERO),
+    );
+    let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(error.error.code, "timeout");
 }
 
 fn error_response_json(id: String, code: &str, message: String) -> String {
@@ -1062,7 +1075,7 @@ mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{Mutex, OnceLock};
@@ -1071,17 +1084,6 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[test]
-    fn connection_admission_is_bounded_and_released() {
-        let active = Arc::new(AtomicUsize::new(0));
-        let mut admissions = (0..MAX_CONCURRENT_CONNECTIONS)
-            .map(|_| try_admit_connection(&active).expect("connection should be admitted"))
-            .collect::<Vec<_>>();
-        assert!(try_admit_connection(&active).is_none());
-        admissions.pop();
-        assert!(try_admit_connection(&active).is_some());
     }
 
     fn unique_test_path(name: &str) -> PathBuf {
@@ -1107,6 +1109,53 @@ mod tests {
         (client, server, path)
     }
 
+    #[test]
+    fn ssh_agent_registration_lasts_only_for_the_api_connection() {
+        let directory = unique_test_path("agent-lease");
+        fs::create_dir(&directory).unwrap();
+        let agent = directory.join("upstream");
+        let _agent = UnixListener::bind(&agent).unwrap();
+        let stable = directory.join("stable");
+        let registry =
+            crate::platform::ssh_agent::SshAgentRegistry::new(stable.clone(), None).unwrap();
+        let (mut client, server, api_path) = local_stream_pair("agent-api");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker_registry = registry.clone();
+        let worker = std::thread::spawn(move || {
+            handle_connection_with_stop(
+                server,
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                None,
+                Some(&worker_registry),
+            )
+            .unwrap();
+        });
+        write_json_line(
+            &mut client,
+            &Request {
+                id: "agent-lease".into(),
+                method: Method::ServerSshAgentRegister(
+                    crate::api::schema::ServerSshAgentRegisterParams {
+                        socket_path: agent.to_string_lossy().into_owned(),
+                    },
+                ),
+            },
+        )
+        .unwrap();
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+        assert_eq!(fs::read_link(&stable).unwrap(), agent);
+        drop(client);
+        worker.join().unwrap();
+        assert!(!stable.exists());
+        drop(registry);
+        fs::remove_file(api_path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn pane_info(
         pane_id: &str,
         agent_status: crate::api::schema::AgentStatus,
@@ -1118,8 +1167,8 @@ mod tests {
             tab_id: "tab_1".into(),
             focused: true,
             cwd: None,
-            execution_target: crate::execution::ExecutionTarget::Local,
             foreground_cwd: None,
+            restore_error: None,
             label: None,
             agent: Some("pi".into()),
             title: None,
@@ -1262,7 +1311,12 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
-                omp_maintenance: true,
+                endpoint_protocol_generation: Some(
+                    crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
+                ),
+                surface_interest: true,
+                health_check: true,
+                ssh_agent_registration: false,
             }),
             None,
             None,
@@ -1551,6 +1605,95 @@ mod tests {
     }
 
     #[test]
+    fn invalid_requests_preserve_only_unambiguous_string_ids() {
+        let cases = [
+            (
+                r#"{"id":"mine","method":"pane.report_agent","params":{"pane_id":"w1:p1","status":"working","source":"x"}}"#,
+                "mine",
+            ),
+            (r#"{"id":"escaped\"id","method":"unknown"}"#, "escaped\"id"),
+            (r#"{"method":"unknown","params":{"id":"nested"}}"#, ""),
+            (r#"{"id":123,"method":"unknown"}"#, ""),
+            (
+                r#"{"id":"first","id":"second","method":"ping","params":{}}"#,
+                "",
+            ),
+            (r#"{"id":"truncated","method":"ping""#, ""),
+            (r#"["not-an-object"]"#, ""),
+        ];
+        for (request, expected_id) in cases {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+            let (mut client, server, path) = local_stream_pair("invalid-request-id");
+            writeln!(client, "{request}").unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+
+            let mut response = String::new();
+            BufReader::new(client)
+                .read_to_string(&mut response)
+                .unwrap();
+            let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.id, expected_id, "{request}");
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(response.error.message.starts_with("invalid request: "));
+            assert!(
+                api_rx.try_recv().is_err(),
+                "invalid requests must not dispatch"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_setup_errors_preserve_request_id_and_reject_entire_stream() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::default();
+        let responder_event_hub = event_hub.clone();
+        let responder = std::thread::spawn(move || {
+            let msg = api_rx.blocking_recv().unwrap();
+            let Method::PaneGet(params) = msg.request.method else {
+                panic!("unexpected request: {:?}", msg.request.method);
+            };
+            assert_eq!(params.pane_id, "w999:p9");
+            responder_event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneClosed,
+                data: crate::api::schema::EventData::PaneClosed {
+                    pane_id: "w999:p9".into(),
+                    workspace_id: "w999".into(),
+                },
+            });
+            msg.respond_to
+                .send(error_response_json(
+                    msg.request.id,
+                    "pane_not_found",
+                    "pane w999:p9 not found".into(),
+                ))
+                .unwrap();
+            assert!(
+                api_rx.blocking_recv().is_none(),
+                "rejection must not start polling"
+            );
+        });
+        let (mut client, server, path) = local_stream_pair("subscription-error-id");
+        let request = r#"{"id":"panefold:events","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"},{"type":"pane.closed"},{"type":"pane.agent_status_changed","pane_id":"w999:p9"}]}}"#;
+        writeln!(client, "{request}").unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+
+        let mut response = String::new();
+        BufReader::new(client)
+            .read_to_string(&mut response)
+            .unwrap();
+        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.id, "panefold:events");
+        assert_eq!(response.error.code, "pane_not_found");
+        assert_eq!(response.error.message, "pane w999:p9 not found");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn subscriptions_stop_when_client_disconnects() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
@@ -1574,6 +1717,7 @@ mod tests {
         let ack = read_line(&mut client);
         let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["id"], "sub_1");
 
         drop(client);
 
@@ -1612,86 +1756,6 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn agent_prompt_wait_preserves_local_peer_context() {
-        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (mut client, server, path) = local_stream_pair("agent-prompt-context");
-        client
-            .write_all(
-                br#"{"id":"prompt_wait","method":"agent.prompt","params":{"target":"target","text":"hello","wait":{"timeout_ms":100}}}"#,
-            )
-            .unwrap();
-        client.write_all(b"\n").unwrap();
-        client.flush().unwrap();
-
-        let running = Arc::new(AtomicBool::new(true));
-        let server_running = Arc::clone(&running);
-        let event_hub = EventHub::default();
-        let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
-        });
-
-        let agent_get = api_rx.blocking_recv().expect("agent.get dispatch");
-        assert!(matches!(agent_get.request.method, Method::AgentGet(_)));
-        agent_get
-            .respond_to
-            .send(
-                serde_json::to_string(&SuccessResponse {
-                    id: agent_get.request.id,
-                    result: ResponseResult::AgentInfo {
-                        agent: crate::api::schema::AgentInfo {
-                            terminal_id: "term_1".into(),
-                            name: Some("target".into()),
-                            agent: Some("pi".into()),
-                            title: None,
-                            terminal_title: None,
-                            terminal_title_stripped: None,
-                            display_agent: None,
-                            agent_status: crate::api::schema::AgentStatus::Idle,
-                            screen_detection_skipped: false,
-                            state_labels: HashMap::new(),
-                            tokens: HashMap::new(),
-                            agent_session: None,
-                            workspace_id: "ws_1".into(),
-                            tab_id: "tab_1".into(),
-                            pane_id: "pane_1".into(),
-                            focused: true,
-                            launch_pending: false,
-                            interactive_ready: true,
-                            state_change_seq: 1,
-                            cwd: None,
-                            foreground_cwd: None,
-                            revision: 0,
-                        },
-                    },
-                })
-                .unwrap(),
-            )
-            .unwrap();
-
-        let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
-        assert_eq!(
-            prompt.context.local_peer_pid,
-            Some(std::process::id()),
-            "wait-mode prompt must retain the socket origin"
-        );
-        assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
-        let prompt_id = prompt.request.id.clone();
-        prompt
-            .respond_to
-            .send(error_response_json(
-                prompt_id,
-                "cross_pane_input_denied",
-                "agent-originated input cannot target a different pane".into(),
-            ))
-            .unwrap();
-
-        let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
-        assert_eq!(response["error"]["code"], "cross_pane_input_denied");
-        server_thread.join().unwrap().unwrap();
-        let _ = std::fs::remove_file(path);
     }
 }
 

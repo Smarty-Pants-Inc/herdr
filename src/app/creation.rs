@@ -1,13 +1,10 @@
 use std::path::PathBuf;
 
-use crate::api::schema::{EventData, EventEnvelope, EventKind};
-#[cfg(test)]
-use tracing::error;
-
 use super::{
     api_helpers::{pane_agent_status, tab_attention_priority},
     App, Mode,
 };
+use crate::api::schema::{EventData, EventEnvelope, EventKind};
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 
 pub(crate) fn resolve_new_terminal_cwd(
@@ -38,38 +35,25 @@ pub(super) fn launch_cwd_for_terminal(
     >,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> Option<PathBuf> {
-    let terminal = terminals.get(terminal_id)?;
-    if !terminal.execution_target.is_local() {
-        return Some(terminal.cwd.clone());
-    }
     terminal_runtimes
         .get(terminal_id)
         .and_then(|runtime| runtime.follow_cwd())
-        .or_else(|| Some(terminal.cwd.clone()))
+        .or_else(|| {
+            terminals
+                .get(terminal_id)
+                .map(|terminal| terminal.cwd.clone())
+        })
 }
 
 impl App {
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
-        let workspace = self.state.workspaces.get(ws_idx)?;
-        if !workspace.identity_execution_target.is_local() {
-            return None;
-        }
-        if let Some(root_pane) = workspace.tabs.first().map(|tab| tab.root_pane) {
-            if let Some(terminal_id) = workspace.terminal_id(root_pane) {
-                if self
-                    .state
-                    .terminals
-                    .get(terminal_id)
-                    .is_some_and(|terminal| !terminal.execution_target.is_local())
-                {
-                    return None;
-                }
-            }
-        }
-        workspace.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        self.state
+            .workspaces
+            .get(ws_idx)?
+            .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
     }
 
-    pub(crate) fn launch_cwd_for_pane_in_workspace(
+    pub(super) fn launch_cwd_for_pane_in_workspace(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -85,56 +69,35 @@ impl App {
         )
     }
 
-    pub(crate) fn launch_cwd_for_pane_in_workspace_on(
-        &self,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        execution_target: &crate::execution::ExecutionTarget,
-    ) -> Option<PathBuf> {
-        if self
-            .execution_target_for_pane_in_workspace(ws_idx, pane_id)
-            .as_ref()
-            != Some(execution_target)
-        {
-            return None;
-        }
-        self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
-    }
-
-    pub(super) fn execution_target_for_pane_in_workspace(
-        &self,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-    ) -> Option<crate::execution::ExecutionTarget> {
-        let workspace = self.state.workspaces.get(ws_idx)?;
-        let tab = workspace
-            .tabs
-            .get(workspace.find_tab_index_for_pane(pane_id)?)?;
-        let terminal_id = tab.terminal_id(pane_id)?;
-        self.state
-            .terminals
-            .get(terminal_id)
-            .map(|terminal| terminal.execution_target.clone())
-    }
-    pub(super) fn focused_pane_execution_target_in_workspace(
-        &self,
-        ws_idx: usize,
-    ) -> Option<crate::execution::ExecutionTarget> {
-        let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
-        self.execution_target_for_pane_in_workspace(ws_idx, pane_id)
-    }
-
     pub(super) fn focused_pane_cwd_in_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
-        self.launch_cwd_for_pane_in_workspace_on(
-            ws_idx,
-            pane_id,
-            &crate::execution::ExecutionTarget::Local,
-        )
+        self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
     }
 
     pub(super) fn resolve_new_terminal_cwd(&self, follow_cwd: Option<PathBuf>) -> PathBuf {
         resolve_new_terminal_cwd(&self.state.new_terminal_cwd, follow_cwd)
+    }
+
+    pub(crate) fn resolved_new_workspace_cwd_from(&self, ws_idx: usize) -> PathBuf {
+        let tab_idx = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .map(crate::workspace::Workspace::active_tab_index);
+        self.resolved_new_workspace_cwd_from_tab(ws_idx, tab_idx)
+    }
+
+    pub(crate) fn resolved_new_workspace_cwd_from_tab(
+        &self,
+        ws_idx: usize,
+        tab_idx: Option<usize>,
+    ) -> PathBuf {
+        let follow_cwd = tab_idx
+            .and_then(|tab_idx| self.state.workspaces.get(ws_idx)?.tabs.get(tab_idx))
+            .map(|tab| tab.layout.focused())
+            .and_then(|pane_id| self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id))
+            .or_else(|| self.seed_cwd_from_workspace(ws_idx));
+        self.resolve_new_terminal_cwd(follow_cwd)
     }
 
     pub(super) fn workspace_creation_source(&self) -> Option<usize> {
@@ -152,145 +115,12 @@ impl App {
         })
     }
 
-    pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
-        if self.state.prompt_new_workspace_name {
-            let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
-                self.focused_pane_cwd_in_workspace(ws_idx)
-                    .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-            });
-            let cwd = self.resolve_new_terminal_cwd(follow_cwd);
-            super::input::open_new_workspace_dialog(&mut self.state, cwd);
-            return;
-        }
-
-        self.runtime_workspace_create(
-            request_id,
-            crate::api::schema::WorkspaceCreateParams {
-                cwd: None,
-                focus: true,
-                label: None,
-                env: Default::default(),
-            },
-        );
-        self.state.mode = if self.state.active.is_some() {
-            Mode::Terminal
-        } else {
-            Mode::Navigate
-        };
-    }
-
-    /// Create a workspace with a real PTY (needs event_tx).
-    #[cfg(test)]
-    pub(crate) fn create_workspace(&mut self) {
-        let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
-            self.focused_pane_cwd_in_workspace(ws_idx)
-                .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-        });
-        let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
-        if let Err(e) = self.create_workspace_with_events(initial_cwd, true) {
-            error!(err = %e, "failed to create workspace");
-            self.state.mode = Mode::Navigate;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn create_tab(&mut self) {
-        let custom_name = self.state.requested_new_tab_name.take();
-        let active_before = self.state.active;
-        let follow_cwd = self.state.active.and_then(|ws_idx| {
-            self.focused_pane_cwd_in_workspace(ws_idx)
-                .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-        });
-        let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
-        match self.create_tab_with_options(initial_cwd, true) {
-            Ok(created_idx) => {
-                let created_workspace = active_before.is_none();
-                let ws_idx = if created_workspace {
-                    Some(created_idx)
-                } else {
-                    self.state.active
-                };
-                let tab_idx = if created_workspace { 0 } else { created_idx };
-                if let Some(name) = custom_name {
-                    if let Some(ws) =
-                        ws_idx.and_then(|ws_idx| self.state.workspaces.get_mut(ws_idx))
-                    {
-                        if let Some(tab) = ws.tabs.get_mut(tab_idx) {
-                            tab.set_custom_name(name);
-                        }
-                        self.schedule_session_save();
-                    }
-                }
-                if let Some(ws_idx) = ws_idx {
-                    if created_workspace {
-                        self.emit_workspace_open_events(ws_idx);
-                    } else {
-                        self.emit_tab_created_events(ws_idx, tab_idx);
-                    }
-                }
-            }
-            Err(e) => {
-                error!(err = %e, "failed to create tab");
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn create_tab_with_options(
-        &mut self,
-        initial_cwd: PathBuf,
-        focus: bool,
-    ) -> std::io::Result<usize> {
-        let Some(ws_idx) = self.state.active else {
-            return self.create_workspace_with_options(initial_cwd, focus);
-        };
-        let (rows, cols) = self.state.estimate_pane_size();
-        let ws = &mut self.state.workspaces[ws_idx];
-        let (idx, terminal, runtime) = ws.create_tab(
-            rows,
-            cols,
-            initial_cwd,
-            self.state.pane_scrollback_limit_bytes,
-            self.state.host_terminal_theme,
-            self.state.host_terminal_appearance,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
-            Vec::new(),
-        )?;
-        let root_pane = ws.tabs[idx].root_pane;
-        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
-        self.state.terminals.insert(terminal.id.clone(), terminal);
-        self.state.remove_alias_shadowed_by_new_pane(root_pane);
-        if focus {
-            self.state.switch_workspace_tab(ws_idx, idx);
-            self.state.mode = Mode::Terminal;
-        }
-        let workspace_id = self.state.workspaces[ws_idx].id.clone();
-        let tab_id = self
-            .public_tab_id(ws_idx, idx)
-            .unwrap_or_else(|| crate::workspace::public_tab_id_for_number(&workspace_id, idx + 1));
-        let root_pane = self.state.workspaces[ws_idx].tabs[idx].root_pane.raw();
-        crate::logging::tab_created(&workspace_id, &tab_id, root_pane);
-        self.schedule_session_save();
-        Ok(idx)
-    }
-
     pub(crate) fn create_workspace_with_options(
         &mut self,
         initial_cwd: PathBuf,
         focus: bool,
     ) -> std::io::Result<usize> {
         self.create_workspace_with_launch_env(initial_cwd, focus, Vec::new())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn create_workspace_with_events(
-        &mut self,
-        initial_cwd: PathBuf,
-        focus: bool,
-    ) -> std::io::Result<()> {
-        let ws_idx = self.create_workspace_with_options(initial_cwd, focus)?;
-        self.emit_workspace_open_events(ws_idx);
-        Ok(())
     }
 
     pub(crate) fn create_workspace_with_launch_env(
@@ -312,7 +142,6 @@ impl App {
             self.render_notify.clone(),
             self.render_dirty.clone(),
             extra_env,
-            self.omp_bridge.clone(),
         )?;
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
@@ -508,13 +337,10 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            execution_target: terminal.execution_target.clone(),
-            foreground_cwd: terminal
-                .execution_target
-                .is_local()
-                .then(|| ws.tabs[tab_idx].foreground_cwd_for_pane(pane_id, &self.terminal_runtimes))
-                .flatten()
+            foreground_cwd: ws.tabs[tab_idx]
+                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
+            restore_error: terminal.restore_error.clone(),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,
@@ -588,16 +414,6 @@ fn terminal_agent_session_info(
                 agent: authority.agent_label.clone(),
                 kind: session_ref.kind,
                 value: session_ref.value.clone(),
-                resume_policy: terminal
-                    .persisted_agent_session
-                    .as_ref()
-                    .filter(|session| {
-                        session.source == authority.source
-                            && session.agent == authority.agent_label
-                            && session.session_ref == *session_ref
-                    })
-                    .map(|session| session.resume_policy)
-                    .filter(|policy| !policy.is_native()),
             });
         }
     }
@@ -610,6 +426,5 @@ fn terminal_agent_session_info(
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
-            resume_policy: (!session.resume_policy.is_native()).then_some(session.resume_policy),
         })
 }

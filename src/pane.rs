@@ -1,11 +1,9 @@
 use std::cell::Cell;
 use std::io;
 use std::path::Path;
-#[cfg(unix)]
-use std::sync::atomic::AtomicU8;
 use std::sync::{
     atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 
 use bytes::Bytes;
@@ -43,40 +41,52 @@ use self::agent_detection::{
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(unix)]
-pub(crate) use self::osc::RemoteExecReadyFilter;
-use self::osc::ReportedCwd;
-#[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
-    TerminalTextPoint, TerminalTextSearchChunk, TerminalTextSearchChunkStatus,
-    TerminalTextSearchSnapshot, TerminalWordMotion, ViewportHyperlink, ViewportLogicalLine,
-    TERMINAL_TEXT_SEARCH_MAX_CELLS, TERMINAL_TEXT_SEARCH_MAX_MATCHES,
-    TERMINAL_TEXT_SEARCH_MAX_QUERY_CHARS,
+    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
+    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
     terminal::{ScrollMetrics, TerminalCursorState},
 };
 
+pub(crate) struct TerminalDirtyPatchSnapshot {
+    pub patch: TerminalDirtyPatchOutcome,
+    pub content_revision: u64,
+    pub scroll_metrics: Option<ScrollMetrics>,
+    pub mouse_reporting: bool,
+    pub sgr_pixel_mouse: bool,
+    pub alternate_screen_active: bool,
+    pub graphics_may_have_placements: bool,
+}
+
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
+const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = "xterm-256color";
-pub(crate) const PANE_COLORTERM: &str = "truecolor";
+const PANE_COLORTERM: &str = "truecolor";
 
-#[cfg(test)]
-thread_local! {
-    static AGGREGATE_INPUT_STATE_READS: Cell<usize> = const { Cell::new(0) };
+fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
+    static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    PERMITS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
 }
 
-#[cfg(test)]
-pub(crate) fn reset_aggregate_input_state_reads() {
-    AGGREGATE_INPUT_STATE_READS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn aggregate_input_state_reads() -> usize {
-    AGGREGATE_INPUT_STATE_READS.get()
+fn spawn_blocking_with_compression_permit<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    operation: F,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
 }
 
 fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
@@ -86,56 +96,31 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // when the remote side lacks matching terminfo entries.
     cmd.env("TERM", PANE_TERM);
     cmd.env("COLORTERM", PANE_COLORTERM);
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct OmpBridgeEnv {
-    address: String,
-    secret: [u8; 32],
-}
-
-impl std::fmt::Debug for OmpBridgeEnv {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OmpBridgeEnv")
-            .field("address", &self.address)
-            .field("secret", &"[redacted]")
-            .finish()
-    }
-}
-
-impl OmpBridgeEnv {
-    pub(crate) fn generate(address: String) -> std::io::Result<Self> {
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(Self { address, secret })
-    }
-
-    pub(crate) fn address(&self) -> &str {
-        &self.address
-    }
-
-    pub(crate) fn token(&self, pane_id: &str) -> String {
-        use base64::Engine as _;
-        use sha2::Digest as _;
-
-        let mut digest = sha2::Sha256::new();
-        digest.update(self.secret);
-        digest.update(pane_id.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize())
-    }
-
-    pub(crate) fn validates(&self, pane_id: &str, token: &str) -> bool {
-        self.token(pane_id) == token
+    cmd.env("TERM_PROGRAM", "herdr");
+    cmd.env("TERM_PROGRAM_VERSION", crate::build_info::version());
+    // Host handles refer to the outer terminal, never to this pane.
+    for key in [
+        "ITERM_SESSION_ID",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "WEZTERM_PANE",
+        "KITTY_WINDOW_ID",
+        "WT_SESSION",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "ZELLIJ",
+        "ZELLIJ_SESSION_NAME",
+        "ZELLIJ_PANE_ID",
+    ] {
+        cmd.env_remove(key);
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
-    remove: Vec<String>,
     identity: PaneLaunchIdentity,
-    omp_bridge: Option<OmpBridgeEnv>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,60 +132,15 @@ enum PaneLaunchIdentity {
         tab_id: String,
         pane_id: String,
     },
-    WorkspaceManaged {
-        workspace_id: String,
-        pane_id: String,
-    },
-    NoIdentity,
-}
-impl PaneLaunchIdentity {
-    fn apply_env(&self, mut apply: impl FnMut(&str, &str)) -> Option<&str> {
-        match self {
-            Self::Managed {
-                workspace_id,
-                tab_id,
-                pane_id,
-            } => {
-                apply(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
-                apply(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
-                apply(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
-                Some(pane_id)
-            }
-            Self::WorkspaceManaged {
-                workspace_id,
-                pane_id,
-            } => {
-                apply(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
-                apply(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
-                Some(pane_id)
-            }
-            Self::Inherit | Self::NoIdentity => None,
-        }
-    }
+    OmitPane,
 }
 
 impl PaneLaunchEnv {
     pub(crate) fn from_extra(extra: Vec<(String, String)>) -> Self {
         Self {
             extra,
-            remove: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
-            omp_bridge: None,
         }
-    }
-    pub(crate) fn with_extra(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.extra.push((key.into(), value.into()));
-        self
-    }
-
-    pub(crate) fn without_env(mut self, key: impl Into<String>) -> Self {
-        self.remove.push(key.into());
-        self
-    }
-
-    pub(crate) fn with_omp_bridge(mut self, omp_bridge: Option<OmpBridgeEnv>) -> Self {
-        self.omp_bridge = omp_bridge;
-        self
     }
 
     pub(crate) fn with_identity(
@@ -217,160 +157,46 @@ impl PaneLaunchEnv {
         self
     }
 
-    pub(crate) fn with_workspace_identity(mut self, workspace_id: String, pane_id: String) -> Self {
-        self.identity = PaneLaunchIdentity::WorkspaceManaged {
-            workspace_id,
-            pane_id,
-        };
-        self
-    }
-
     pub(crate) fn without_pane_identity(mut self) -> Self {
-        self.identity = PaneLaunchIdentity::NoIdentity;
+        self.identity = PaneLaunchIdentity::OmitPane;
         self
-    }
-    pub(crate) fn remote_env_with_removals(&self) -> (Vec<(String, String)>, Vec<String>) {
-        let mut remove = crate::integration::HERDR_OMP_BRIDGE_ENV_VARS
-            .iter()
-            .map(|key| (*key).to_string())
-            .collect::<Vec<_>>();
-        remove.extend(self.remove.clone());
-        (self.remote_env(), remove)
-    }
-    pub(crate) fn remote_env(&self) -> Vec<(String, String)> {
-        let mut env = self.extra.clone();
-        env.retain(|(key, _)| key != "HERDR_BUILD_BIN_PATH");
-        match &self.identity {
-            PaneLaunchIdentity::Managed { .. }
-            | PaneLaunchIdentity::WorkspaceManaged { .. }
-            | PaneLaunchIdentity::NoIdentity => {
-                env.retain(|(key, _)| {
-                    key != crate::integration::HERDR_WORKSPACE_ID_ENV_VAR
-                        && key != crate::integration::HERDR_TAB_ID_ENV_VAR
-                        && key != crate::integration::HERDR_PANE_ID_ENV_VAR
-                });
-            }
-            PaneLaunchIdentity::Inherit => {}
-        }
-        if !matches!(&self.identity, PaneLaunchIdentity::NoIdentity) {
-            env.retain(|(key, _)| key != "HERDR_VIEW_ID");
-        }
-        env.push((crate::HERDR_ENV_VAR.into(), crate::HERDR_ENV_VALUE.into()));
-        let _ = self
-            .identity
-            .apply_env(|key, value| env.push((key.into(), value.into())));
-        env
     }
 }
 
 fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
-    cmd.env_remove("CODEX_THREAD_ID");
-    // Outer mux markers no longer describe the process launched inside Herdr.
-    for key in ["TMUX", "STY", "ZELLIJ"] {
-        cmd.env_remove(key);
-    }
-    cmd.env_remove("HERDR_VIEW_ID");
-    // Bridge capabilities belong to the Herdr server launching this pane, not to
-    // any parent pane or remote client. Trusted launch extras and this server's
-    // pane-scoped host credentials are applied below.
-    for key in crate::integration::HERDR_OMP_BRIDGE_ENV_VARS {
-        cmd.env_remove(key);
-    }
-    for key in &launch_env.remove {
+    #[cfg(unix)]
+    crate::platform::ssh_agent::apply_pane_env(cmd);
+    // A new pane is not a child agent of the process that started the server.
+    // Explicit launch env below can opt back into an intentional child session.
+    for key in [
+        "CODEX_THREAD_ID",
+        "OMPCODE",
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+    ] {
         cmd.env_remove(key);
     }
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
-    cmd.env_remove("HERDR_BUILD_BIN_PATH");
-    if !matches!(&launch_env.identity, PaneLaunchIdentity::NoIdentity) {
-        cmd.env_remove("HERDR_VIEW_ID");
-    }
-    if matches!(&launch_env.identity, PaneLaunchIdentity::NoIdentity) {
-        cmd.env_remove(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR);
-        cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-        cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
-    }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
-    if matches!(
-        &launch_env.identity,
-        PaneLaunchIdentity::WorkspaceManaged { .. }
-    ) {
-        cmd.env_remove(crate::integration::HERDR_TAB_ID_ENV_VAR);
-    }
-    let pane_id = launch_env.identity.apply_env(|key, value| {
-        cmd.env(key, value);
-    });
-    if let (Some(bridge), Some(pane_id)) = (&launch_env.omp_bridge, pane_id) {
-        cmd.env("HERDR_OMP_BRIDGE", bridge.address());
-        cmd.env("HERDR_OMP_BRIDGE_TOKEN", bridge.token(pane_id));
-    }
-}
-
-fn pane_argv_command_builder(argv: &[String]) -> std::io::Result<CommandBuilder> {
-    let Some((program, args)) = argv.split_first() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "argv must not be empty",
-        ));
-    };
-    let mut cmd = CommandBuilder::new(program);
-    cmd.args(args);
-    Ok(cmd)
-}
-
-type PreparedPanePty = (
-    CommandBuilder,
-    Option<crate::execution::RemoteRequestChannel>,
-    Option<crate::execution::RemoteExecReadyNonce>,
-);
-
-fn prepare_pane_pty_command<Local>(
-    cwd: &Path,
-    execution_target: &crate::execution::ExecutionTarget,
-    launch_env: &PaneLaunchEnv,
-    local: Local,
-    ssh_command: crate::execution::RemoteCommand,
-    provider_command: crate::execution::RemoteCommand,
-) -> std::io::Result<PreparedPanePty>
-where
-    Local: FnOnce() -> std::io::Result<CommandBuilder>,
-{
-    match execution_target {
-        crate::execution::ExecutionTarget::Local => {
-            let mut cmd = local()?;
-            cmd.cwd(cwd);
-            apply_pane_terminal_env(&mut cmd);
-            apply_pane_launch_env(&mut cmd, launch_env);
-            Ok((cmd, None, None))
+    match &launch_env.identity {
+        PaneLaunchIdentity::Inherit => {}
+        PaneLaunchIdentity::Managed {
+            workspace_id,
+            tab_id,
+            pane_id,
+        } => {
+            cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
+            cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
+            cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
         }
-        crate::execution::ExecutionTarget::Ssh { .. } => {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::ssh_pty_command_with_removals(
-                execution_target,
-                cwd,
-                ssh_command,
-                env,
-                remove_env,
-            )?;
-            Ok((
-                prepared.command,
-                Some(prepared.request_channel),
-                Some(prepared.ready_nonce),
-            ))
-        }
-        crate::execution::ExecutionTarget::Extension { .. } => {
-            let (env, remove_env) = launch_env.remote_env_with_removals();
-            let prepared = crate::execution::execution_provider_pty_command_with_removals(
-                execution_target,
-                cwd,
-                provider_command,
-                env,
-                remove_env,
-            )?;
-            Ok((prepared.command, None, Some(prepared.ready_nonce)))
+        PaneLaunchIdentity::OmitPane => {
+            cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
         }
     }
 }
@@ -908,131 +734,6 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
-struct ManagedAgentHintState<'a> {
-    agent_presence: &'a mut AgentDetectionPresence,
-    state: &'a mut AgentState,
-    last_visible_idle: &'a mut bool,
-    last_foreground_pgid: &'a mut Option<u32>,
-    has_process_probe: &'a mut bool,
-    acquisition_started_at: &'a mut Option<std::time::Instant>,
-    last_content_change_at: &'a mut Option<std::time::Instant>,
-    pending_foreground_shell_clear: &'a mut bool,
-    pending_restore_probe: &'a mut bool,
-    foreground_shell_exit_reported: &'a mut bool,
-    last_visible_blocker: &'a mut bool,
-    last_visible_working: &'a mut bool,
-    last_visible_signal_refresh: &'a mut Option<std::time::Instant>,
-    last_detection_text: &'a mut String,
-    last_screen_scan_detection_content_seq: &'a mut Option<u64>,
-    agent_startup_grace_until: &'a mut Option<std::time::Instant>,
-    pending_idle: &'a mut PendingIdleConfirmation,
-    last_managed_agent_hint: &'a mut Option<Agent>,
-}
-
-impl ManagedAgentHintState<'_> {
-    fn reset_for_agent_switch(&mut self, agent: Agent, now: std::time::Instant) {
-        *self.agent_presence = AgentDetectionPresence::from_agent(Some(agent));
-        *self.state = AgentState::Unknown;
-        *self.last_visible_idle = false;
-        *self.last_foreground_pgid = None;
-        *self.has_process_probe = false;
-        *self.acquisition_started_at = None;
-        *self.last_content_change_at = None;
-        *self.pending_foreground_shell_clear = false;
-        *self.pending_restore_probe = false;
-        *self.foreground_shell_exit_reported = false;
-        *self.last_visible_blocker = false;
-        *self.last_visible_working = false;
-        *self.last_visible_signal_refresh = None;
-        self.last_detection_text.clear();
-        *self.last_screen_scan_detection_content_seq = None;
-        *self.agent_startup_grace_until = Some(now + AGENT_STARTUP_GRACE_WINDOW);
-        self.pending_idle.clear();
-    }
-}
-
-enum ManagedAgentHintOutcome {
-    Continue {
-        suppressed_agent: Option<Agent>,
-        hinted_agent: Option<Agent>,
-        agent_changed: bool,
-    },
-    ResetRequested,
-}
-
-struct ManagedAgentHintContext<'a> {
-    pane_id: PaneId,
-    terminal: &'a PaneTerminal,
-    state_events: &'a mpsc::Sender<AppEvent>,
-    pending_release: &'a Mutex<Option<PendingAgentRelease>>,
-    managed_agent_hint: &'a Mutex<Option<Agent>>,
-    detect_reset: &'a Notify,
-}
-
-impl ManagedAgentHintContext<'_> {
-    async fn apply(
-        &self,
-        now: std::time::Instant,
-        mut detection: ManagedAgentHintState<'_>,
-    ) -> ManagedAgentHintOutcome {
-        let mut suppressed_agent = active_pending_release(self.pending_release, now);
-        let hinted_agent = self.managed_agent_hint.lock().ok().and_then(|hint| *hint);
-        if let (Some(suppressed), Some(hinted)) = (suppressed_agent, hinted_agent) {
-            if hinted != suppressed {
-                if let Ok(mut pending_release) = self.pending_release.lock() {
-                    *pending_release = None;
-                }
-                suppressed_agent = None;
-            }
-        }
-
-        let mut agent_changed = false;
-        if let Some(hinted_agent) = hinted_agent {
-            if Some(hinted_agent) != suppressed_agent
-                && detection.agent_presence.current_agent() != Some(hinted_agent)
-            {
-                detection.reset_for_agent_switch(hinted_agent, now);
-                self.terminal.clear_agent_osc_state();
-                publish_agent_process_detected_event(
-                    self.state_events.clone(),
-                    self.pane_id,
-                    hinted_agent,
-                    now,
-                )
-                .await;
-                agent_changed = true;
-            }
-        }
-
-        if detection.last_managed_agent_hint.is_some()
-            && hinted_agent.is_none()
-            && suppressed_agent.is_none()
-        {
-            publish_state_changed_event(
-                self.state_events.clone(),
-                self.pane_id,
-                None,
-                AgentState::Unknown,
-                false,
-                false,
-                false,
-                now,
-            )
-            .await;
-            *detection.last_managed_agent_hint = hinted_agent;
-            self.detect_reset.notify_one();
-            return ManagedAgentHintOutcome::ResetRequested;
-        }
-
-        *detection.last_managed_agent_hint = hinted_agent;
-        ManagedAgentHintOutcome::Continue {
-            suppressed_agent,
-            hinted_agent,
-            agent_changed,
-        }
-    }
-}
-
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -1040,10 +741,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
-    managed_agent_hint: Arc<Mutex<Option<Agent>>>,
     state_events: mpsc::Sender<AppEvent>,
-    initial_agent: Option<Agent>,
-    initial_state: AgentState,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
@@ -1053,14 +751,13 @@ fn spawn_basic_detection_task(
     let detect_reset = detect_reset_notify.clone();
     let pending_release = Arc::new(Mutex::new(None));
     let pending_release_for_task = pending_release.clone();
-    let managed_agent_hint_for_task = managed_agent_hint;
 
     let handle = tokio::spawn(async move {
-        let mut agent_presence = AgentDetectionPresence::from_agent(initial_agent);
-        let mut state = initial_state;
-        let mut last_visible_idle = initial_agent.is_some() && state == AgentState::Idle;
-        let mut last_visible_blocker = initial_agent.is_some() && state == AgentState::Blocked;
-        let mut last_visible_working = initial_agent.is_some() && state == AgentState::Working;
+        let mut agent_presence = AgentDetectionPresence::from_agent(None);
+        let mut state = AgentState::Unknown;
+        let mut last_visible_idle = false;
+        let mut last_visible_blocker = false;
+        let mut last_visible_working = false;
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
@@ -1068,14 +765,12 @@ fn spawn_basic_detection_task(
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
         let mut pending_foreground_shell_clear = false;
-        let mut pending_restore_probe = initial_agent.is_some();
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
-        let mut last_managed_agent_hint = None;
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -1098,7 +793,6 @@ fn spawn_basic_detection_task(
                     acquisition_started_at = None;
                     last_content_change_at = None;
                     pending_foreground_shell_clear = false;
-                    pending_restore_probe = false;
                     foreground_shell_exit_reported = false;
                     release_was_active = false;
                     last_detection_text.clear();
@@ -1109,48 +803,7 @@ fn spawn_basic_detection_task(
             }
 
             let now = std::time::Instant::now();
-            let (suppressed_agent, hinted_agent, mut agent_changed) =
-                match (ManagedAgentHintContext {
-                    pane_id,
-                    terminal: &terminal,
-                    state_events: &state_events,
-                    pending_release: &pending_release_for_task,
-                    managed_agent_hint: &managed_agent_hint_for_task,
-                    detect_reset: &detect_reset,
-                })
-                .apply(
-                    now,
-                    ManagedAgentHintState {
-                        agent_presence: &mut agent_presence,
-                        state: &mut state,
-                        last_visible_idle: &mut last_visible_idle,
-                        last_foreground_pgid: &mut last_foreground_pgid,
-                        has_process_probe: &mut has_process_probe,
-                        acquisition_started_at: &mut acquisition_started_at,
-                        last_content_change_at: &mut last_content_change_at,
-                        pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
-                        pending_restore_probe: &mut pending_restore_probe,
-                        foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
-                        last_visible_blocker: &mut last_visible_blocker,
-                        last_visible_working: &mut last_visible_working,
-                        last_visible_signal_refresh: &mut last_visible_signal_refresh,
-                        last_detection_text: &mut last_detection_text,
-                        last_screen_scan_detection_content_seq:
-                            &mut last_screen_scan_detection_content_seq,
-                        agent_startup_grace_until: &mut agent_startup_grace_until,
-                        pending_idle: &mut pending_idle,
-                        last_managed_agent_hint: &mut last_managed_agent_hint,
-                    },
-                )
-                .await
-                {
-                    ManagedAgentHintOutcome::Continue {
-                        suppressed_agent,
-                        hinted_agent,
-                        agent_changed,
-                    } => (suppressed_agent, hinted_agent, agent_changed),
-                    ManagedAgentHintOutcome::ResetRequested => continue,
-                };
+            let suppressed_agent = active_pending_release(&pending_release_for_task, now);
             if suppressed_agent.is_none() && release_was_active {
                 has_process_probe = false;
                 acquisition_started_at = None;
@@ -1158,6 +811,7 @@ fn spawn_basic_detection_task(
             }
             release_was_active = suppressed_agent.is_some();
             let pid = child_pid.load(Ordering::Acquire);
+            let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
@@ -1166,7 +820,7 @@ fn spawn_basic_detection_task(
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
-            let should_check_process = hinted_agent.is_none() && pid > 0 && {
+            let should_check_process = pid > 0 && {
                 let process_probe_input = ProcessProbeInput {
                     current_agent: agent,
                     suppressed_agent,
@@ -1176,7 +830,7 @@ fn spawn_basic_detection_task(
                     acquisition_age: acquisition_started_at
                         .map(|started| now.duration_since(started)),
                     pending_foreground_shell_clear,
-                    pending_restore_probe,
+                    pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
                 };
                 !should_skip_process_probe_for_lifecycle_authority(
@@ -1218,7 +872,6 @@ fn spawn_basic_detection_task(
                     &mut foreground_shell_exit_reported,
                 );
                 last_foreground_pgid = tracked_process_group_id;
-                pending_restore_probe = false;
                 if new_agent.is_some() {
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -1437,79 +1090,212 @@ impl AgentDetectionPresence {
 // PaneRuntime — PTY, parser, channels, background tasks
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
-#[derive(Default)]
-struct SpawnExitLatch(AtomicU8);
+#[derive(Clone)]
+struct TerminalCompressionWake {
+    notify: Arc<Notify>,
+    generation: Arc<AtomicU64>,
+}
 
-#[cfg(unix)]
-impl SpawnExitLatch {
-    const READER_DRAINED: u8 = 1 << 0;
-    const CHILD_REAPED: u8 = 1 << 1;
-    const PUBLISHED: u8 = 1 << 2;
-    const COMPLETE: u8 = Self::READER_DRAINED | Self::CHILD_REAPED;
-
-    fn signal(&self, signal: u8) -> bool {
-        let state = self.0.fetch_or(signal, Ordering::AcqRel) | signal;
-        if state & Self::COMPLETE != Self::COMPLETE {
-            return false;
-        }
-        self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state & Self::PUBLISHED == 0).then_some(state | Self::PUBLISHED)
-            })
-            .is_ok()
-    }
-    #[cfg(test)]
-    fn has_signal(&self, signal: u8) -> bool {
-        self.0.load(Ordering::Acquire) & signal != 0
+impl TerminalCompressionWake {
+    fn wake(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.notify.notify_one();
     }
 }
 
-#[cfg(unix)]
-fn publish_spawned_pane_died_if_complete(
-    exit_latch: &SpawnExitLatch,
-    signal: u8,
-    emit_pane_died: &AtomicBool,
-    events: &mpsc::Sender<AppEvent>,
-    rt: &tokio::runtime::Handle,
-    pane_id: PaneId,
-    child_pid: Option<u32>,
-) {
-    if !exit_latch.signal(signal) || !emit_pane_died.load(Ordering::Acquire) {
-        return;
+/// Drives libghostty-vt's caller-owned compression after terminal activity settles.
+struct TerminalCompressionTask {
+    wake: TerminalCompressionWake,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    completed_passes: Arc<AtomicU64>,
+    handle: tokio::task::AbortHandle,
+}
+
+impl Drop for TerminalCompressionTask {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
-    if let Err(err) = rt.block_on(events.send(AppEvent::PaneDied { pane_id, child_pid })) {
-        error!(pane = pane_id.raw(), err = %err, "failed to send PaneDied event");
+}
+
+impl TerminalCompressionTask {
+    fn spawn(pane_id: PaneId, terminal: Arc<PaneTerminal>) -> Self {
+        let wake = TerminalCompressionWake {
+            notify: Arc::new(Notify::new()),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let task_notify = wake.notify.clone();
+        let task_generation = wake.generation.clone();
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let completed_passes = Arc::new(AtomicU64::new(0));
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let task_completed_passes = completed_passes.clone();
+        let handle = tokio::spawn(async move {
+            run_terminal_compression_task(
+                pane_id,
+                terminal,
+                task_notify,
+                task_generation,
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                task_completed_passes,
+            )
+            .await;
+        })
+        .abort_handle();
+        Self {
+            wake,
+            #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+            completed_passes,
+            handle,
+        }
+    }
+
+    fn wake(&self) {
+        self.wake.wake();
+    }
+
+    fn notifier(&self) -> TerminalCompressionWake {
+        self.wake.clone()
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    fn completed_passes(&self) -> u64 {
+        self.completed_passes.load(Ordering::Acquire)
+    }
+}
+
+async fn run_terminal_compression_task(
+    pane_id: PaneId,
+    terminal: Arc<PaneTerminal>,
+    notify: Arc<Notify>,
+    generation: Arc<AtomicU64>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))] completed_passes: Arc<
+        AtomicU64,
+    >,
+) {
+    let mut observed_generation = generation.load(Ordering::Acquire);
+    let mut activity = loop {
+        match terminal.try_compression_activity() {
+            Ok(Some(activity)) => break activity,
+            Ok(None) => tokio::time::sleep(TERMINAL_COMPRESSION_IDLE).await,
+            Err(err) => {
+                warn!(pane = pane_id.raw(), err = %err, "failed to read terminal compression activity");
+                return;
+            }
+        }
+    };
+
+    'schedule: loop {
+        loop {
+            tokio::time::sleep(TERMINAL_COMPRESSION_IDLE).await;
+            let current = match terminal.try_compression_activity() {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(pane = pane_id.raw(), err = %err, "failed to read terminal compression activity");
+                    return;
+                }
+            };
+            let current_generation = generation.load(Ordering::Acquire);
+            if activity == current && observed_generation == current_generation {
+                break;
+            }
+            activity = current;
+            observed_generation = current_generation;
+        }
+
+        loop {
+            let current_generation = generation.load(Ordering::Acquire);
+            if observed_generation != current_generation {
+                observed_generation = current_generation;
+                continue 'schedule;
+            }
+
+            let permit = match terminal_compression_permits().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
+            let current_generation = generation.load(Ordering::Acquire);
+            if observed_generation != current_generation {
+                observed_generation = current_generation;
+                continue 'schedule;
+            }
+
+            let terminal_for_step = terminal.clone();
+            let step = spawn_blocking_with_compression_permit(permit, move || {
+                terminal_for_step.try_compress_incremental_if_activity(activity)
+            })
+            .await;
+            let step = match step {
+                Ok(Ok(step)) => step,
+                Ok(Err(err)) => {
+                    warn!(pane = pane_id.raw(), err = %err, "failed to compress terminal scrollback");
+                    return;
+                }
+                Err(err) => {
+                    warn!(pane = pane_id.raw(), err = %err, "terminal compression worker failed");
+                    return;
+                }
+            };
+
+            match step {
+                TerminalCompressionStep::Busy => continue 'schedule,
+                TerminalCompressionStep::ActivityChanged(current) => {
+                    activity = current;
+                    observed_generation = generation.load(Ordering::Acquire);
+                    continue 'schedule;
+                }
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Unsupported,
+                ) => return,
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Pending,
+                ) => tokio::time::sleep(TERMINAL_COMPRESSION_STEP).await,
+                TerminalCompressionStep::Compressed(
+                    crate::ghostty::TerminalCompressionResult::Complete,
+                ) => {
+                    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+                    completed_passes.fetch_add(1, Ordering::Release);
+                    loop {
+                        notify.notified().await;
+                        let current_generation = generation.load(Ordering::Acquire);
+                        if observed_generation != current_generation {
+                            observed_generation = current_generation;
+                            continue 'schedule;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
-/// Dropping this shuts down all background tasks and closes the PTY.
+/// Dropping this aborts async tasks and closes the PTY. An already-running bounded
+/// compression step may finish before releasing its terminal reference.
 pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
-    input_written: Arc<AtomicBool>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
-    #[cfg(unix)]
-    remote_execution_ready: Arc<AtomicBool>,
-    #[cfg(unix)]
-    remote_hostname: Arc<Mutex<Option<String>>>,
+    persistence_cwd: Mutex<Option<std::path::PathBuf>>,
+    cwd_process_exited: Arc<AtomicBool>,
     child_wait_completed: Option<Arc<AtomicBool>>,
-    #[cfg(all(test, unix))]
-    spawn_exit_latch_for_test: Option<Arc<SpawnExitLatch>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
-    emit_pane_died_on_reader_exit: Arc<AtomicBool>,
+    content_write_lock: Arc<Mutex<()>>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
-    managed_agent_hint: Arc<Mutex<Option<Agent>>>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
+    compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
 }
 
@@ -1626,14 +1412,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        match self {
-            PaneRuntimeIo::Actor(actor) => actor.write_user_input(bytes).await,
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.send(bytes).await,
-        }
-    }
-
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
@@ -1654,24 +1432,39 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+    fn queue_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
-                let actor = actor.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(err) = actor.write_user_input(bytes).await {
-                        warn!(error = %err, "failed to send delayed PTY input");
-                    }
-                });
+                #[cfg(windows)]
+                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                #[cfg(unix)]
+                {
+                    let _ = deadline;
+                    actor.queue_user_input_submission(text, enter, delay)
+                }
             }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
+                let _ = deadline;
                 let sender = sender.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sender.send(bytes).await;
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = sender
+                        .try_send(text)
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| {
+                            std::thread::sleep(delay);
+                            sender.try_send(enter).map_err(std::io::Error::other)
+                        });
+                    let _ = reply_tx.send(result);
                 });
+                Ok(reply_rx)
             }
         }
     }
@@ -1691,8 +1484,7 @@ impl Drop for PaneRuntime {
         if let Some(handle) = &self.detect_handle {
             handle.abort();
         }
-        self.emit_pane_died_on_reader_exit
-            .store(false, Ordering::Release);
+        self.compression.abort();
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1834,7 +1626,134 @@ fn pane_shell_from(configured_shell: &str, env_shell: Option<String>) -> String 
 
 #[cfg(windows)]
 fn default_pane_shell() -> String {
-    "powershell.exe".into()
+    default_windows_pane_shell(std::env::var_os("PATH"))
+}
+
+/// Windows has no `$SHELL`, so an unset `[terminal] default_shell` has to name
+/// a concrete executable. `powershell.exe` (5.1) is the only one guaranteed to
+/// exist, but `pwsh` (7+) is what every other Windows terminal prefers when it
+/// is installed. Return the first launchable `pwsh.exe` on `PATH` as a full
+/// path so the pane launches exactly the binary that was validated; keep the
+/// inbox shell when none is found. An explicit `default_shell` still wins.
+#[cfg(any(windows, test))]
+fn default_windows_pane_shell(path: Option<std::ffi::OsString>) -> String {
+    path.as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|candidate| is_windows_executable_file(candidate))
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "powershell.exe".into())
+}
+
+/// Validate that `path` looks like a Windows executable image the current
+/// machine can launch: a DOS `MZ` header whose `e_lfanew` points at a `PE\0\0`
+/// signature with a non-empty, executable-image COFF header for a compatible
+/// machine and a PE32/PE32+ optional header that fits in the file.
+///
+/// `portable-pty` resolves the configured shell with `Path::exists` and hands
+/// it straight to `CreateProcessW`, which does not fall back to later `PATH`
+/// entries, so a malformed, DLL, or foreign-architecture `pwsh.exe` must be
+/// skipped here instead of selected. Actually launching the candidate is the
+/// only way to prove it loads, and this deliberately does not do that.
+#[cfg(any(windows, test))]
+fn is_windows_executable_file(path: &std::path::Path) -> bool {
+    is_windows_executable_file_for_host(path, windows_host_native_machine())
+}
+
+/// Native processor architecture of the host. Non-Windows builds only reach
+/// this from the cross-platform unit tests, which model an x64 host.
+#[cfg(any(windows, test))]
+fn windows_host_native_machine() -> u16 {
+    #[cfg(windows)]
+    {
+        crate::platform::native_machine_type()
+    }
+    #[cfg(not(windows))]
+    {
+        0x8664
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_executable_file_for_host(path: &std::path::Path, native_machine: u16) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const PE_OFFSET_FIELD: usize = 0x3c;
+    const DOS_HEADER_LEN: u64 = 0x40;
+    const PE_SIGNATURE: &[u8; 4] = b"PE\0\0";
+    const COFF_HEADER_LEN: usize = 20;
+    const SECTION_HEADER_LEN: u64 = 40;
+    const OPTIONAL_HEADER_MAGIC_LEN: u64 = 2;
+    const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
+    const IMAGE_FILE_DLL: u16 = 0x2000;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+
+    let mut dos_header = [0u8; DOS_HEADER_LEN as usize];
+    if file.read_exact(&mut dos_header).is_err() || &dos_header[..2] != b"MZ" {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes([
+        dos_header[PE_OFFSET_FIELD],
+        dos_header[PE_OFFSET_FIELD + 1],
+        dos_header[PE_OFFSET_FIELD + 2],
+        dos_header[PE_OFFSET_FIELD + 3],
+    ]) as u64;
+    let pe_header_len = PE_SIGNATURE.len() as u64 + COFF_HEADER_LEN as u64;
+    if pe_offset < DOS_HEADER_LEN || pe_offset.saturating_add(pe_header_len) > len {
+        return false;
+    }
+    if file.seek(SeekFrom::Start(pe_offset)).is_err() {
+        return false;
+    }
+
+    let mut header = [0u8; 4 + COFF_HEADER_LEN];
+    if file.read_exact(&mut header).is_err() || &header[..4] != PE_SIGNATURE {
+        return false;
+    }
+    let machine = u16::from_le_bytes([header[4], header[5]]);
+    let number_of_sections = u16::from_le_bytes([header[4 + 2], header[4 + 3]]);
+    let optional_header_len = u16::from_le_bytes([header[4 + 16], header[4 + 17]]) as u64;
+    let characteristics = u16::from_le_bytes([header[4 + 18], header[4 + 19]]);
+
+    if !windows_executable_machine_is_compatible(machine, native_machine)
+        || number_of_sections == 0
+        || characteristics & IMAGE_FILE_EXECUTABLE_IMAGE == 0
+        || characteristics & IMAGE_FILE_DLL != 0
+        || optional_header_len < OPTIONAL_HEADER_MAGIC_LEN
+        || pe_offset.saturating_add(
+            pe_header_len + optional_header_len + number_of_sections as u64 * SECTION_HEADER_LEN,
+        ) > len
+    {
+        return false;
+    }
+
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic).is_ok() && matches!(u16::from_le_bytes(magic), 0x010b | 0x020b)
+}
+
+/// Whether a Windows host can launch a given `IMAGE_FILE_MACHINE_*` image.
+/// A native host runs its own architecture; ARM64 Windows also runs x64 and
+/// x86 through emulation, and x64 Windows runs x86 through WOW64. An unknown
+/// host (detection failed) is treated as the x64 build Herdr ships.
+#[cfg(any(windows, test))]
+fn windows_executable_machine_is_compatible(machine: u16, native_machine: u16) -> bool {
+    const MACHINE_I386: u16 = 0x014c;
+    const MACHINE_AMD64: u16 = 0x8664;
+    const MACHINE_ARM64: u16 = 0xaa64;
+
+    match native_machine {
+        MACHINE_ARM64 => matches!(machine, MACHINE_I386 | MACHINE_AMD64 | MACHINE_ARM64),
+        MACHINE_I386 => machine == MACHINE_I386,
+        _ => matches!(machine, MACHINE_I386 | MACHINE_AMD64),
+    }
 }
 
 #[cfg(not(windows))]
@@ -1955,26 +1874,59 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
 /// prompt would show success after a failed command (verified on 5.1).
 pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $loc.ProviderPath } catch {}; $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
 
+/// Login flags appended when launching POSIX-style shells on Windows.
+///
+/// `portable-pty`'s default-program path resolves to `%ComSpec%` (cmd.exe) on
+/// Windows and ignores the `SHELL` env override, and the Unix argv0-prefix
+/// login convention does not exist there. A login shell therefore has to be
+/// launched directly with the shell's own login flag. Only POSIX-style shells
+/// that define one (the sh family, fish, and csh/tcsh) get it; Windows-native
+/// shells such as cmd.exe and PowerShell have no login concept and launch
+/// plain.
+fn windows_login_shell_args(shell: &str) -> &'static [&'static str] {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "sh" | "bash" | "zsh" | "ksh" | "dash" | "ash" | "mksh" | "fish" | "csh" | "tcsh" => {
+            &["-l"]
+        }
+        _ => &[],
+    }
+}
+
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
-    if shell_mode_uses_login_shell(shell_config.mode, target) {
+    // Unix login shells go through portable-pty's default-program builder so
+    // they receive the login argv0 convention. Windows has no such convention
+    // and the default-program builder would launch cmd.exe, so Windows login
+    // shells are built directly below like every other direct-shell target.
+    if shell_mode_uses_login_shell(shell_config.mode, target)
+        && target != ShellLaunchTarget::Windows
+    {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
-        Ok(cmd)
-    } else {
-        let mut cmd = CommandBuilder::new(&shell);
-        if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
-            cmd.args([
-                "-NoExit",
-                "-Command",
-                WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
-            ]);
-        }
-        Ok(cmd)
+        return Ok(cmd);
     }
+
+    let mut cmd = CommandBuilder::new(&shell);
+    if shell_mode_uses_login_shell(shell_config.mode, target) {
+        cmd.args(windows_login_shell_args(&shell));
+    }
+    if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
+        cmd.args([
+            "-NoExit",
+            "-Command",
+            WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
+        ]);
+    }
+    Ok(cmd)
 }
 
 fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<CommandBuilder> {
@@ -1992,8 +1944,10 @@ fn uses_windows_powershell_pane_shell_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> bool {
+    // Login mode no longer routes Windows through the default-program builder,
+    // so login PowerShell panes are launched directly and can carry the same
+    // prompt-based cwd reporting as non-login panes.
     target == ShellLaunchTarget::Windows
-        && !shell_mode_uses_login_shell(shell_config.mode, target)
         && is_powershell_shell(&pane_shell(shell_config.default_shell))
 }
 
@@ -2012,23 +1966,8 @@ fn is_powershell_shell(shell: &str) -> bool {
     )
 }
 
-pub(crate) fn usable_reported_cwd(
-    cwd: std::path::PathBuf,
-    execution_target: &crate::execution::ExecutionTarget,
-) -> Option<std::path::PathBuf> {
-    (cwd.is_absolute() && (!execution_target.is_local() || cwd.is_dir())).then_some(cwd)
-}
-
-fn usable_terminal_reported_cwd(
-    (cwd, authority): ReportedCwd,
-    execution_target: &crate::execution::ExecutionTarget,
-    osc7_authority: &crate::execution::Osc7Authority,
-    remote_hostname: Option<&str>,
-) -> Option<std::path::PathBuf> {
-    if !osc7_authority.accepts(authority.as_deref(), remote_hostname) {
-        return None;
-    }
-    usable_reported_cwd(cwd, execution_target)
+fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    (cwd.is_absolute() && cwd.is_dir()).then_some(cwd)
 }
 
 fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<AppEvent>) {
@@ -2044,42 +1983,14 @@ fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<App
         );
     }
 }
-fn publish_remote_exec_ready(
-    pane_id: PaneId,
-    child_pid: u32,
-    hostname: Option<String>,
-    cwd: Option<std::path::PathBuf>,
-    events: &mpsc::Sender<AppEvent>,
-) {
-    if child_pid == 0 {
-        return;
-    }
-    if let Err(err) = events.blocking_send(AppEvent::RemoteExecutionReady {
-        pane_id,
-        child_pid,
-        hostname,
-        cwd,
-    }) {
-        warn!(
-            pane = pane_id.raw(),
-            err = %err,
-            "failed to send remote execution ready event"
-        );
-    }
-}
 
 fn publish_reported_cwd(
     pane_id: PaneId,
-    reported: ReportedCwd,
-    execution_target: &crate::execution::ExecutionTarget,
-    osc7_authority: &crate::execution::Osc7Authority,
-    remote_hostname: Option<&str>,
-    reported_cwd: &Mutex<Option<std::path::PathBuf>>,
+    cwd: std::path::PathBuf,
+    reported_cwd: &Arc<Mutex<Option<std::path::PathBuf>>>,
     events: &mpsc::Sender<AppEvent>,
 ) {
-    let Some(cwd) =
-        usable_terminal_reported_cwd(reported, execution_target, osc7_authority, remote_hostname)
-    else {
+    let Some(cwd) = usable_reported_cwd(cwd) else {
         return;
     };
     if let Ok(mut current) = reported_cwd.lock() {
@@ -2096,111 +2007,13 @@ fn publish_reported_cwd(
         );
     }
 }
-struct PtyRemoteMetadataState {
-    execution_target: crate::execution::ExecutionTarget,
-    osc7_authority: crate::execution::Osc7Authority,
-    remote_ready_seen: bool,
-    remote_hostname: Option<String>,
-    pending_remote_cwd: Option<ReportedCwd>,
-    remote_execution_ready: Arc<AtomicBool>,
-    remote_hostname_state: Arc<Mutex<Option<String>>>,
-    reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
-    events: mpsc::Sender<AppEvent>,
-}
-
-impl PtyRemoteMetadataState {
-    fn new(
-        execution_target: crate::execution::ExecutionTarget,
-        osc7_authority: crate::execution::Osc7Authority,
-        remote_execution_ready: Arc<AtomicBool>,
-        remote_hostname_state: Arc<Mutex<Option<String>>>,
-        reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
-        events: mpsc::Sender<AppEvent>,
-    ) -> Self {
-        let remote_ready_seen = remote_execution_ready.load(Ordering::Acquire);
-        let remote_hostname = remote_hostname_state
-            .lock()
-            .ok()
-            .and_then(|hostname| hostname.clone());
-        Self {
-            execution_target,
-            osc7_authority,
-            remote_ready_seen,
-            remote_hostname,
-            pending_remote_cwd: None,
-            remote_execution_ready,
-            remote_hostname_state,
-            reported_cwd,
-            events,
-        }
-    }
-
-    fn publish(
-        &mut self,
-        pane_id: PaneId,
-        shell_pid: u32,
-        result: &mut self::terminal::ProcessBytesResult,
-    ) {
-        let mut buffered_reported_cwd = false;
-        if !self.execution_target.is_local() && !self.remote_ready_seen {
-            if let Some(cwd) = result.reported_cwd.clone() {
-                self.pending_remote_cwd = Some(cwd);
-                buffered_reported_cwd = true;
-            }
-        }
-        if !self.remote_ready_seen {
-            if let Some(ready) = result.remote_exec_ready.as_ref() {
-                self.remote_ready_seen = true;
-                self.remote_hostname = ready.hostname.clone();
-                if let Ok(mut captured_hostname) = self.remote_hostname_state.lock() {
-                    *captured_hostname = self.remote_hostname.clone();
-                }
-                self.remote_execution_ready.store(true, Ordering::Release);
-                if !self.execution_target.is_local() {
-                    publish_remote_exec_ready(
-                        pane_id,
-                        shell_pid,
-                        ready.hostname.clone(),
-                        ready.cwd.clone(),
-                        &self.events,
-                    );
-                }
-                if let Some(cwd) = self.pending_remote_cwd.take() {
-                    publish_reported_cwd(
-                        pane_id,
-                        cwd,
-                        &self.execution_target,
-                        &self.osc7_authority,
-                        self.remote_hostname.as_deref(),
-                        &self.reported_cwd,
-                        &self.events,
-                    );
-                }
-            }
-        }
-        if !buffered_reported_cwd && (self.execution_target.is_local() || self.remote_ready_seen) {
-            if let Some(cwd) = result.reported_cwd.take() {
-                publish_reported_cwd(
-                    pane_id,
-                    cwd,
-                    &self.execution_target,
-                    &self.osc7_authority,
-                    self.remote_hostname.as_deref(),
-                    &self.reported_cwd,
-                    &self.events,
-                );
-            }
-        }
-    }
-}
 
 impl PaneRuntime {
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
-        self.emit_pane_died_on_reader_exit
-            .store(false, Ordering::Release);
+        self.compression.abort();
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -2217,8 +2030,6 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
-        self.emit_pane_died_on_reader_exit
-            .store(false, Ordering::Release);
         if let Err(err) = self.io.release_after_commit() {
             warn!(
                 pane = self.pane_id.raw(),
@@ -2229,6 +2040,7 @@ impl PaneRuntime {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
         }
+        self.compression.abort();
         self.preserve_processes_on_drop = true;
     }
 
@@ -2255,19 +2067,6 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn remote_execution_ready(&self) -> bool {
-        self.remote_execution_ready.load(Ordering::Acquire)
-    }
-
-    pub fn input_written(&self) -> bool {
-        self.input_written.load(Ordering::Acquire)
-    }
-    #[cfg(all(test, unix))]
-    pub(crate) fn set_remote_execution_ready_for_test(&self, ready: bool) {
-        self.remote_execution_ready.store(ready, Ordering::Release);
-    }
-
-    #[cfg(unix)]
     pub fn handoff_runtime_state(
         &self,
         pane_id: u32,
@@ -2281,22 +2080,10 @@ impl PaneRuntime {
             cols,
             cell_width_px,
             cell_height_px,
-            remote_execution_ready: self.remote_execution_ready.load(Ordering::Acquire),
-            input_written: self.input_written.load(Ordering::Acquire),
-            remote_hostname: self
-                .remote_hostname
-                .lock()
-                .ok()
-                .and_then(|hostname| hostname.clone()),
             keyboard_protocol_flags: match self.keyboard_protocol() {
                 crate::input::KeyboardProtocol::Legacy => 0,
                 crate::input::KeyboardProtocol::Kitty { flags } => flags,
             },
-            remote_exec_ready_filter: self.terminal.remote_exec_ready_filter_state(),
-            pending_agent_resume_plan: None,
-            pending_agent_resume_attempt_pid: None,
-            pending_agent_resume_retired_pids: Vec::new(),
-            respawn_shell_on_exit: None,
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
             terminal_title: self.terminal_title(),
@@ -2327,7 +2114,6 @@ impl PaneRuntime {
             .write_terminal_response(|| self.terminal.apply_host_terminal_appearance(appearance));
     }
 
-    #[cfg(test)]
     // Runtime construction threads PTY geometry, host context, launch policy, and render hooks.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -2344,45 +2130,11 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        Self::spawn_on(
+        Self::spawn_with_initial_history(
             pane_id,
             rows,
             cols,
             cwd,
-            &crate::execution::ExecutionTarget::Local,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            launch_env,
-            events,
-            render_notify,
-            render_dirty,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_on(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        shell_config: PaneShellConfig<'_>,
-        launch_env: &PaneLaunchEnv,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<Self> {
-        Self::spawn_with_initial_history_on(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -2395,13 +2147,13 @@ impl PaneRuntime {
         )
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, and render hooks together.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_with_initial_history_on(
+    pub(crate) fn spawn_with_initial_history(
         pane_id: PaneId,
         rows: u16,
         cols: u16,
         cwd: std::path::PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -2413,15 +2165,11 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         let windows_powershell_prompt_cwd_reporting =
-            execution_target.is_local() && uses_windows_powershell_pane_shell(shell_config);
-        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
-            &cwd,
-            execution_target,
-            launch_env,
-            || pane_shell_command_builder(shell_config),
-            crate::execution::RemoteCommand::Shell,
-            crate::execution::RemoteCommand::Shell,
-        )?;
+            uses_windows_powershell_pane_shell(shell_config);
+        let mut cmd = pane_shell_command_builder(shell_config)?;
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2432,10 +2180,7 @@ impl PaneRuntime {
             events,
             render_notify,
             render_dirty,
-            execution_target,
             cmd,
-            remote_request_channel,
-            remote_ready_nonce,
             "failed to spawn shell",
             SpawnInitialState {
                 detected_agent: None,
@@ -2446,13 +2191,13 @@ impl PaneRuntime {
         )
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, and render hooks together.
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn_shell_command_on(
+    pub fn spawn_shell_command(
         pane_id: PaneId,
         rows: u16,
         cols: u16,
         cwd: std::path::PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
         command: &str,
         launch_env: &PaneLaunchEnv,
         agent_detection: AgentDetection,
@@ -2463,18 +2208,10 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
-            &cwd,
-            execution_target,
-            launch_env,
-            || Ok(crate::platform::pane_custom_command_pty_builder(command)),
-            crate::execution::RemoteCommand::ShellCommand {
-                command: command.to_string(),
-            },
-            crate::execution::RemoteCommand::ShellCommand {
-                command: command.to_string(),
-            },
-        )?;
+        let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2485,16 +2222,14 @@ impl PaneRuntime {
             events,
             render_notify,
             render_dirty,
-            execution_target,
             cmd,
-            remote_request_channel,
-            remote_ready_nonce,
             "failed to spawn command pane",
             SpawnInitialState::default(),
             agent_detection,
         )
     }
 
+    // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_argv_command(
         pane_id: PaneId,
@@ -2511,53 +2246,19 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        Self::spawn_argv_command_on(
-            pane_id,
-            rows,
-            cols,
-            cwd,
-            &crate::execution::ExecutionTarget::Local,
-            argv,
-            launch_env,
-            agent_detection,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            events,
-            render_notify,
-            render_dirty,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_argv_command_on(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
-        argv: &[String],
-        launch_env: &PaneLaunchEnv,
-        agent_detection: AgentDetection,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
-            &cwd,
-            execution_target,
-            launch_env,
-            || pane_argv_command_builder(argv),
-            crate::execution::RemoteCommand::Argv {
-                argv: argv.to_vec(),
-            },
-            crate::execution::RemoteCommand::Argv {
-                argv: argv.to_vec(),
-            },
-        )?;
+        let Some((program, args)) = argv.split_first() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "argv must not be empty",
+            ));
+        };
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.cwd(crate::platform::normalize_cwd_for_launch(&cwd));
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, launch_env);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -2568,64 +2269,8 @@ impl PaneRuntime {
             events,
             render_notify,
             render_dirty,
-            execution_target,
             cmd,
-            remote_request_channel,
-            remote_ready_nonce,
             "failed to spawn argv command pane",
-            SpawnInitialState::default(),
-            agent_detection,
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_plugin_command_on(
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-        cwd: std::path::PathBuf,
-        execution_target: &crate::execution::ExecutionTarget,
-        plugin_id: &str,
-        entrypoint: &str,
-        local_argv: &[String],
-        launch_env: &PaneLaunchEnv,
-        agent_detection: AgentDetection,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        events: mpsc::Sender<AppEvent>,
-        render_notify: Arc<Notify>,
-        render_dirty: Arc<RenderSignal>,
-    ) -> std::io::Result<Self> {
-        let (cmd, remote_request_channel, remote_ready_nonce) = prepare_pane_pty_command(
-            &cwd,
-            execution_target,
-            launch_env,
-            || pane_argv_command_builder(local_argv),
-            crate::execution::RemoteCommand::Plugin {
-                plugin_id: plugin_id.to_string(),
-                target: crate::plugin_command::PluginCommandTarget::Pane {
-                    entrypoint: entrypoint.to_string(),
-                },
-            },
-            crate::execution::RemoteCommand::Argv {
-                argv: local_argv.to_vec(),
-            },
-        )?;
-        Self::spawn_command_builder(
-            pane_id,
-            rows,
-            cols,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            events,
-            render_notify,
-            render_dirty,
-            execution_target,
-            cmd,
-            remote_request_channel,
-            remote_ready_nonce,
-            "failed to spawn plugin command pane",
             SpawnInitialState::default(),
             agent_detection,
         )
@@ -2634,7 +2279,6 @@ impl PaneRuntime {
     #[cfg(unix)]
     pub fn from_handoff_fd(
         import: crate::handoff_runtime::ImportedHandoffRuntime,
-        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -2650,22 +2294,13 @@ impl PaneRuntime {
             cols,
             cell_width_px,
             cell_height_px,
-            remote_execution_ready: handoff_remote_execution_ready,
-            input_written: handoff_input_written,
-            remote_hostname: handoff_remote_hostname,
-            remote_exec_ready_filter,
             keyboard_protocol_flags,
             keyboard_protocol_ansi,
             input_state,
             terminal_title,
             initial_history_ansi,
-            agent_state,
-            ..
+            agent_state: _,
         } = state;
-        let (initial_agent, initial_agent_state, initial_lifecycle_authority_active) = agent_state
-            .as_ref()
-            .map(crate::handoff_runtime::HandoffAgentState::detection_seed)
-            .unwrap_or((None, AgentState::Unknown, false));
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
 
@@ -2698,19 +2333,14 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
-        terminal.seed_remote_exec_ready_filter(remote_exec_ready_filter);
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
-        let input_written = Arc::new(AtomicBool::new(handoff_input_written));
+        let cwd_process_exited = Arc::new(AtomicBool::new(false));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let content_seq = Arc::new(AtomicU64::new(0));
+        let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
-        let remote_execution_ready = Arc::new(AtomicBool::new(
-            execution_target.is_local() || handoff_remote_execution_ready,
-        ));
-        let remote_hostname = Arc::new(Mutex::new(handoff_remote_hostname));
-        let emit_pane_died_on_reader_exit = Arc::new(AtomicBool::new(true));
-        let osc7_authority = execution_target.osc7_authority();
 
         let io = {
             let terminal = terminal.clone();
@@ -2718,27 +2348,26 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let content_seq = content_seq.clone();
+            let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
-            let mut remote_metadata = PtyRemoteMetadataState::new(
-                execution_target.clone(),
-                osc7_authority.clone(),
-                remote_execution_ready.clone(),
-                remote_hostname.clone(),
-                reported_cwd.clone(),
-                read_events.clone(),
-            );
-            let exit_child_pid = child_pid.clone();
-            let emit_pane_died_on_reader_exit = emit_pane_died_on_reader_exit.clone();
+            let reported_cwd = reported_cwd.clone();
+            let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let _content_write_guard = match content_write_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let mut result =
+                let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
+                drop(_content_write_guard);
+                compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 let title_requested =
@@ -2757,11 +2386,11 @@ impl PaneRuntime {
                         }
                     });
                 }
-                remote_metadata.publish(pane_id, shell_pid, &mut result);
+                if let Some(cwd) = result.reported_cwd.clone() {
+                    publish_reported_cwd(pane_id, cwd, &reported_cwd, &read_events);
+                }
                 for content in result.clipboard_writes {
-                    if let Err(err) =
-                        read_events.try_send(AppEvent::PaneClipboardWrite { pane_id, content })
-                    {
+                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -2774,14 +2403,15 @@ impl PaneRuntime {
                 }
             });
             let exit_events = events.clone();
+            let cwd_process_exited = cwd_process_exited.clone();
             let on_reader_exit = Box::new(move || {
-                if emit_pane_died_on_reader_exit.load(Ordering::Acquire) {
-                    let child_pid = exit_child_pid.load(Ordering::Acquire);
-                    let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
-                        pane_id,
-                        child_pid: (child_pid > 0).then_some(child_pid),
-                    }));
-                }
+                cwd_process_exited.store(true, Ordering::Release);
+                // Imported handoff panes have no child wait handle, so their exit cause is
+                // unknowable. Checkpoint conservatively; normal autosave settles clean exits.
+                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied {
+                    pane_id,
+                    exit_reason: crate::platform::ChildExitReason::Handoff,
+                }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
@@ -2793,47 +2423,35 @@ impl PaneRuntime {
             })?)
         };
 
-        let full_lifecycle_authority_active =
-            Arc::new(AtomicBool::new(initial_lifecycle_authority_active));
-        let managed_agent_hint = Arc::new(Mutex::new(
-            (!execution_target.is_local())
-                .then_some(initial_agent)
-                .flatten(),
-        ));
+        let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
-            managed_agent_hint.clone(),
             events,
-            initial_agent,
-            initial_agent_state,
         );
 
         Ok(Self {
             pane_id,
             terminal,
             io,
-            input_written,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
-            remote_execution_ready,
-            remote_hostname,
+            persistence_cwd: Mutex::new(None),
+            cwd_process_exited,
             child_wait_completed: None,
-            #[cfg(all(test, unix))]
-            spawn_exit_latch_for_test: None,
             kitty_keyboard_flags,
             content_seq,
-            emit_pane_died_on_reader_exit,
+            content_write_lock,
             detection_content_seq,
             full_lifecycle_authority_active,
-            managed_agent_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            compression,
             detect_handle: Some(detect_handle),
         })
     }
@@ -2850,10 +2468,7 @@ impl PaneRuntime {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
-        execution_target: &crate::execution::ExecutionTarget,
         cmd: CommandBuilder,
-        remote_request_channel: Option<crate::execution::RemoteRequestChannel>,
-        remote_ready_nonce: Option<crate::execution::RemoteExecReadyNonce>,
         spawn_error_message: &'static str,
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
@@ -2878,31 +2493,52 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
-        #[cfg(not(unix))]
-        let _ = remote_ready_nonce;
-        #[cfg(unix)]
-        terminal.set_remote_exec_ready_nonce(remote_ready_nonce);
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
+        let content_write_lock = Arc::new(Mutex::new(()));
 
-        let osc7_authority = execution_target.osc7_authority();
-        let mut spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
+        // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
-        let remote_execution_ready = Arc::new(AtomicBool::new(execution_target.is_local()));
-        let input_written = Arc::new(AtomicBool::new(false));
-        let remote_hostname = Arc::new(Mutex::new(None));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
-        let emit_pane_died_on_reader_exit = Arc::new(AtomicBool::new(true));
-        #[cfg(unix)]
-        let exit_latch = Arc::new(SpawnExitLatch::default());
-        if let Some(pid) = spawned.child.process_id() {
-            child_pid.store(pid, Ordering::Release);
-            crate::logging::pane_spawned(pane_id.raw(), pid);
+        {
+            let child_pid = child_pid.clone();
+            let child_wait_completed = child_wait_completed.clone();
+            let events = events.clone();
+            let rt = tokio::runtime::Handle::current();
+            let mut child = spawned.child;
+            if let Some(pid) = child.process_id() {
+                child_pid.store(pid, Ordering::Release);
+                crate::logging::pane_spawned(pane_id.raw(), pid);
+            }
+            tokio::task::spawn_blocking(move || {
+                let exit_reason = match child.wait() {
+                    Ok(status) => {
+                        let exit_reason = crate::platform::classify_child_exit(&status);
+                        let status_text = format!("{status:?}");
+                        crate::logging::pane_exited(pane_id.raw(), &status_text);
+                        exit_reason
+                    }
+                    Err(e) => {
+                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                        crate::platform::ChildExitReason::WaitFailed
+                    }
+                };
+                child_wait_completed.store(true, Ordering::Release);
+                // Use blocking send — PaneDied is critical, must not be dropped
+                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
+                    pane_id,
+                    exit_reason,
+                })) {
+                    error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                }
+            });
         }
 
         let io = {
@@ -2911,34 +2547,25 @@ impl PaneRuntime {
             let render_notify = render_notify.clone();
             let render_dirty = render_dirty.clone();
             let content_seq = content_seq.clone();
+            let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
-            let mut remote_metadata = PtyRemoteMetadataState::new(
-                execution_target.clone(),
-                osc7_authority.clone(),
-                remote_execution_ready.clone(),
-                remote_hostname.clone(),
-                reported_cwd.clone(),
-                events.clone(),
-            );
-            #[cfg(unix)]
-            let exit_events = events.clone();
-            #[cfg(unix)]
-            let reader_exit_child_pid = child_pid.clone();
-            #[cfg(unix)]
-            let emit_pane_died = emit_pane_died_on_reader_exit.clone();
-            #[cfg(unix)]
-            let reader_exit_latch = exit_latch.clone();
-            let delay_rt = tokio::runtime::Handle::current();
-            #[cfg(unix)]
-            let exit_rt = delay_rt.clone();
+            let reported_cwd = reported_cwd.clone();
+            let compression_wake = compression.notifier();
+            let rt = tokio::runtime::Handle::current();
             let on_read = Box::new(move |bytes: &[u8]| {
+                let _content_write_guard = match content_write_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
-                let mut result =
+                let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
+                drop(_content_write_guard);
+                compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
@@ -2952,18 +2579,18 @@ impl PaneRuntime {
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
-                    delay_rt.spawn(async move {
+                    rt.spawn(async move {
                         tokio::time::sleep(delay).await;
                         if render_dirty.request_pty(pane_id) {
                             render_notify.notify_one();
                         }
                     });
                 }
-                remote_metadata.publish(pane_id, shell_pid, &mut result);
+                if let Some(cwd) = result.reported_cwd.clone() {
+                    publish_reported_cwd(pane_id, cwd, &reported_cwd, &events);
+                }
                 for content in result.clipboard_writes {
-                    if let Err(err) =
-                        events.try_send(AppEvent::PaneClipboardWrite { pane_id, content })
-                    {
+                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -2975,20 +2602,7 @@ impl PaneRuntime {
                     terminal_responses: result.terminal_responses,
                 }
             });
-            let on_reader_exit = Box::new(move || {
-                #[cfg(unix)]
-                publish_spawned_pane_died_if_complete(
-                    &reader_exit_latch,
-                    SpawnExitLatch::READER_DRAINED,
-                    &emit_pane_died,
-                    &exit_events,
-                    &exit_rt,
-                    pane_id,
-                    (reader_exit_child_pid.load(Ordering::Acquire) > 0)
-                        .then(|| reader_exit_child_pid.load(Ordering::Acquire)),
-                );
-            });
-            let actor = match PtyIoActor::spawn(PtyIoActorConfig {
+            PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
                 #[cfg(unix)]
                 master_fd: spawned.master_fd,
@@ -2996,106 +2610,10 @@ impl PaneRuntime {
                 master: spawned.master,
                 initially_quiesced: false,
                 on_read,
-                on_reader_exit: Some(on_reader_exit),
-            }) {
-                Ok(actor) => actor,
-                Err(err) => {
-                    let _ = spawned.child.kill();
-                    let _ = spawned.child.wait();
-                    return Err(err);
-                }
-            };
-            PaneRuntimeIo::Actor(actor)
+                on_reader_exit: None,
+            })?)
         };
-        #[cfg(unix)]
-        let child_exit_actor = match &io {
-            PaneRuntimeIo::Actor(actor) => Some(actor.clone()),
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => None,
-        };
-        {
-            let child_wait_completed = child_wait_completed.clone();
-            let emit_pane_died = emit_pane_died_on_reader_exit.clone();
-            let child_wait_events = events.clone();
-            let child_wait_rt = tokio::runtime::Handle::current();
-            let child_wait_child_pid = child_pid.clone();
-            #[cfg(unix)]
-            let child_wait_exit_latch = exit_latch.clone();
-            let mut child = spawned.child;
-            tokio::task::spawn_blocking(move || {
-                let status = {
-                    #[cfg(unix)]
-                    {
-                        if let Some(channel) = remote_request_channel {
-                            loop {
-                                match channel.delivery_status() {
-                                    crate::execution::RemoteRequestDelivery::Delivered => {
-                                        break child.wait()
-                                    }
-                                    crate::execution::RemoteRequestDelivery::Failed(err) => {
-                                        error!(pane = pane_id.raw(), %err, "remote execution request delivery failed");
-                                        let _ = child.kill();
-                                        break child.wait();
-                                    }
-                                    crate::execution::RemoteRequestDelivery::Pending => {}
-                                }
-                                match child.try_wait() {
-                                    Ok(Some(status)) => break Ok(status),
-                                    Ok(None) => {
-                                        std::thread::sleep(std::time::Duration::from_millis(25))
-                                    }
-                                    Err(err) => break Err(err),
-                                }
-                            }
-                        } else {
-                            child.wait()
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = remote_request_channel;
-                        child.wait()
-                    }
-                };
-                match status {
-                    Ok(status) => {
-                        let status_text = format!("{status:?}");
-                        crate::logging::pane_exited(pane_id.raw(), &status_text);
-                    }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
-                }
-                #[cfg(unix)]
-                if let Some(actor) = child_exit_actor {
-                    actor.finish_after_child_exit();
-                }
-                child_wait_completed.store(true, Ordering::Release);
-                #[cfg(unix)]
-                publish_spawned_pane_died_if_complete(
-                    &child_wait_exit_latch,
-                    SpawnExitLatch::CHILD_REAPED,
-                    &emit_pane_died,
-                    &child_wait_events,
-                    &child_wait_rt,
-                    pane_id,
-                    (child_wait_child_pid.load(Ordering::Acquire) > 0)
-                        .then(|| child_wait_child_pid.load(Ordering::Acquire)),
-                );
-                #[cfg(not(unix))]
-                if emit_pane_died.load(Ordering::Acquire) {
-                    let child_pid = child_wait_child_pid.load(Ordering::Acquire);
-                    if let Err(err) =
-                        child_wait_rt.block_on(child_wait_events.send(AppEvent::PaneDied {
-                            pane_id,
-                            child_pid: (child_pid > 0).then_some(child_pid),
-                        }))
-                    {
-                        error!(pane = pane_id.raw(), err = %err, "failed to send PaneDied event");
-                    }
-                }
-            });
-        }
 
-        let managed_agent_hint = Arc::new(Mutex::new(None));
         // --- Detection task ---
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
@@ -3118,7 +2636,6 @@ impl PaneRuntime {
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
             let pending_release_for_task = pending_release.clone();
-            let managed_agent_hint_for_task = managed_agent_hint.clone();
 
             let handle = tokio::spawn(async move {
                 let mut agent_presence =
@@ -3143,7 +2660,6 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
-                let mut last_managed_agent_hint = None;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3186,48 +2702,7 @@ impl PaneRuntime {
                     }
 
                     let now = Instant::now();
-                    let (suppressed_agent, hinted_agent, mut agent_changed) =
-                        match (ManagedAgentHintContext {
-                            pane_id,
-                            terminal: &terminal,
-                            state_events: &state_events,
-                            pending_release: &pending_release_for_task,
-                            managed_agent_hint: &managed_agent_hint_for_task,
-                            detect_reset: &detect_reset,
-                        })
-                        .apply(
-                            now,
-                            ManagedAgentHintState {
-                                agent_presence: &mut agent_presence,
-                                state: &mut state,
-                                last_visible_idle: &mut last_visible_idle,
-                                last_foreground_pgid: &mut last_foreground_pgid,
-                                has_process_probe: &mut has_process_probe,
-                                acquisition_started_at: &mut acquisition_started_at,
-                                last_content_change_at: &mut last_content_change_at,
-                                pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
-                                pending_restore_probe: &mut pending_restore_probe,
-                                foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
-                                last_visible_blocker: &mut last_visible_blocker,
-                                last_visible_working: &mut last_visible_working,
-                                last_visible_signal_refresh: &mut last_visible_signal_refresh,
-                                last_detection_text: &mut last_detection_text,
-                                last_screen_scan_detection_content_seq:
-                                    &mut last_screen_scan_detection_content_seq,
-                                agent_startup_grace_until: &mut agent_startup_grace_until,
-                                pending_idle: &mut pending_idle,
-                                last_managed_agent_hint: &mut last_managed_agent_hint,
-                            },
-                        )
-                        .await
-                        {
-                            ManagedAgentHintOutcome::Continue {
-                                suppressed_agent,
-                                hinted_agent,
-                                agent_changed,
-                            } => (suppressed_agent, hinted_agent, agent_changed),
-                            ManagedAgentHintOutcome::ResetRequested => continue,
-                        };
+                    let suppressed_agent = active_pending_release(&pending_release_for_task, now);
                     if suppressed_agent.is_none() && release_was_active {
                         has_process_probe = false;
                         acquisition_started_at = None;
@@ -3278,7 +2753,7 @@ impl PaneRuntime {
                     }
                     let process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
-                    let should_check_process = hinted_agent.is_none() && pid > 0 && {
+                    let should_check_process = pid > 0 && {
                         let process_probe_input = ProcessProbeInput {
                             foreground_pgid,
                             ..process_probe_input
@@ -3289,6 +2764,7 @@ impl PaneRuntime {
                         ) && should_probe_foreground_job(process_probe_input)
                     };
 
+                    let mut agent_changed = false;
                     if should_check_process {
                         last_process_check = now;
                         let had_process_probe = has_process_probe;
@@ -3539,26 +3015,21 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
-            input_written,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
-            #[cfg(unix)]
-            remote_execution_ready,
-            #[cfg(unix)]
-            remote_hostname,
+            persistence_cwd: Mutex::new(None),
+            cwd_process_exited: child_wait_completed.clone(),
             child_wait_completed: Some(child_wait_completed),
-            #[cfg(all(test, unix))]
-            spawn_exit_latch_for_test: Some(exit_latch),
             kitty_keyboard_flags,
             content_seq,
-            emit_pane_died_on_reader_exit,
+            content_write_lock,
             detection_content_seq,
             full_lifecycle_authority_active,
-            managed_agent_hint,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            compression,
             detect_handle,
         })
     }
@@ -3570,9 +3041,6 @@ impl PaneRuntime {
                 until: std::time::Instant::now() + RELEASE_REACQUIRE_SUPPRESSION,
             });
         }
-        if let Ok(mut hint) = self.managed_agent_hint.lock() {
-            *hint = None;
-        }
         self.detect_reset_notify.notify_one();
     }
 
@@ -3580,32 +3048,9 @@ impl PaneRuntime {
         self.detect_reset_notify.notify_one();
     }
 
-    pub fn set_managed_agent_hint(&self, agent: Option<Agent>) {
-        let changed = self.managed_agent_hint.lock().is_ok_and(|mut hint| {
-            if *hint == agent {
-                return false;
-            }
-            *hint = agent;
-            true
-        });
-        if changed {
-            self.detect_reset_notify.notify_one();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn managed_agent_hint_for_test(&self) -> Option<Agent> {
-        self.managed_agent_hint.lock().ok().and_then(|hint| *hint)
-    }
-
     #[cfg(test)]
     pub(crate) fn agent_detection_reset_notify_for_test(&self) -> Arc<Notify> {
         self.detect_reset_notify.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn agent_detection_enabled_for_test(&self) -> bool {
-        self.detect_handle.is_some()
     }
 
     pub fn set_full_lifecycle_authority_active(&self, active: bool) {
@@ -3635,9 +3080,17 @@ impl PaneRuntime {
             return;
         }
         self.current_size.set(size);
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.content_seq.fetch_add(1, Ordering::AcqRel);
         let terminal_responses = self
             .terminal
             .resize(rows, cols, cell_width_px, cell_height_px);
+        self.content_seq.fetch_add(1, Ordering::Release);
+        drop(_content_write_guard);
+        self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
         self.io.resize(
             rows,
@@ -3658,63 +3111,67 @@ impl PaneRuntime {
     /// Scroll up by N lines (into scrollback history).
     pub fn scroll_up(&self, lines: usize) {
         self.terminal.scroll_up(lines);
+        self.compression.wake();
     }
 
     /// Scroll down by N lines (toward live output).
     pub fn scroll_down(&self, lines: usize) {
         self.terminal.scroll_down(lines);
+        self.compression.wake();
+    }
+
+    pub fn clear_screen(&self) -> Result<(), String> {
+        let guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.content_seq.fetch_add(1, Ordering::AcqRel);
+        let result = self.terminal.clear_screen();
+        self.content_seq.fetch_add(1, Ordering::Release);
+        drop(guard);
+        self.compression.wake();
+        mark_detection_content_changed(&self.detection_content_seq);
+        result
     }
 
     /// Reset scroll to live view (offset = 0).
     pub fn scroll_reset(&self) {
         self.terminal.scroll_reset();
+        self.compression.wake();
     }
 
     /// Set scrollback offset measured from the live bottom of the terminal.
     pub fn set_scroll_offset_from_bottom(&self, lines: usize) {
         self.terminal.set_scroll_offset_from_bottom(lines);
+        self.compression.wake();
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
         self.terminal.scroll_metrics()
     }
 
-    pub(crate) fn search_text_matches(
+    pub(crate) fn search_text_window(
         &self,
         query: &str,
         case_sensitive: bool,
-    ) -> Vec<crate::pane::TerminalTextMatch> {
-        self.terminal.search_text_matches(query, case_sensitive)
-    }
-
-    pub(crate) fn search_text_matches_reverse_chunk(
-        &self,
-        query: &str,
-        case_sensitive: bool,
-        end_row_exclusive: u32,
-        max_cells: usize,
-        max_matches: usize,
-        expected_snapshot: Option<crate::pane::TerminalTextSearchSnapshot>,
-    ) -> crate::pane::TerminalTextSearchChunk {
-        self.terminal.search_text_matches_reverse_chunk(
+        direction: crate::pane::TerminalSearchDirection,
+        cursor: crate::pane::TerminalTextPoint,
+        previous: Option<(
+            crate::pane::TerminalTextPoint,
+            crate::pane::TerminalTextPoint,
+        )>,
+        limit: usize,
+    ) -> crate::pane::TerminalSearchWindow {
+        let result = self.terminal.search_text_window(
             query,
             case_sensitive,
-            end_row_exclusive,
-            max_cells,
-            max_matches,
-            expected_snapshot,
-        )
-    }
-
-    pub(crate) fn text_match_is_current(&self, text_match: crate::pane::TerminalTextMatch) -> bool {
-        self.terminal.text_match_is_current(text_match)
-    }
-
-    pub(crate) fn text_matches_are_current(
-        &self,
-        text_matches: &[crate::pane::TerminalTextMatch],
-    ) -> Vec<bool> {
-        self.terminal.text_matches_are_current(text_matches)
+            direction,
+            cursor,
+            previous,
+            limit,
+        );
+        self.compression.wake();
+        result
     }
 
     pub(crate) fn word_motion_target(
@@ -3723,18 +3180,28 @@ impl PaneRuntime {
         col: u16,
         motion: crate::pane::TerminalWordMotion,
     ) -> Option<crate::pane::TerminalTextPoint> {
-        self.terminal.word_motion_target(row, col, motion)
+        let result = self.terminal.word_motion_target(row, col, motion);
+        self.compression.wake();
+        result
     }
 
-    #[cfg(any(unix, test))]
+    pub(crate) fn terminal_dimensions(&self) -> Option<(u16, u16)> {
+        self.terminal.dimensions()
+    }
+
+    pub(crate) fn paragraph_motion_target(
+        &self,
+        row: u32,
+        direction: i8,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        let result = self.terminal.paragraph_motion_target(row, direction);
+        self.compression.wake();
+        result
+    }
+
+    #[cfg(unix)]
     pub fn input_state(&self) -> Option<InputState> {
-        #[cfg(test)]
-        AGGREGATE_INPUT_STATE_READS.set(AGGREGATE_INPUT_STATE_READS.get() + 1);
         self.terminal.input_state()
-    }
-
-    pub fn keyboard_report_all_requested(&self) -> bool {
-        self.terminal.keyboard_report_all_requested()
     }
 
     pub fn bracketed_paste_enabled(&self) -> bool {
@@ -3781,6 +3248,10 @@ impl PaneRuntime {
         self.terminal.synchronized_output_active()
     }
 
+    pub(crate) fn synchronized_output_state(&self) -> (bool, u64) {
+        self.terminal.synchronized_output_state()
+    }
+
     pub fn visible_text(&self) -> String {
         self.terminal.visible_text()
     }
@@ -3806,23 +3277,33 @@ impl PaneRuntime {
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
-        self.terminal.recent_text_snapshot(lines)
+        let result = self.terminal.recent_text_snapshot(lines);
+        self.compression.wake();
+        result
     }
 
     pub(crate) fn recent_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
-        self.terminal.recent_ansi_snapshot(lines)
+        let result = self.terminal.recent_ansi_snapshot(lines);
+        self.compression.wake();
+        result
     }
 
     pub(crate) fn recent_unwrapped_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
-        self.terminal.recent_unwrapped_text_snapshot(lines)
+        let result = self.terminal.recent_unwrapped_text_snapshot(lines);
+        self.compression.wake();
+        result
     }
 
     pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
-        self.terminal.recent_unwrapped_ansi(lines)
+        let result = self.terminal.recent_unwrapped_ansi(lines);
+        self.compression.wake();
+        result
     }
 
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
-        self.terminal.recent_unwrapped_ansi_snapshot(lines)
+        let result = self.terminal.recent_unwrapped_ansi_snapshot(lines);
+        self.compression.wake();
+        result
     }
 
     pub fn snapshot_history(&self) -> Option<String> {
@@ -3831,44 +3312,66 @@ impl PaneRuntime {
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
-        self.terminal.extract_selection(selection)
+        let result = self.terminal.extract_selection(selection);
+        self.compression.wake();
+        result
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.terminal.render(frame, area, show_cursor);
     }
 
-    pub(crate) fn collect_dirty_patch(
+    pub(crate) fn collect_dirty_patch_snapshot(
         &self,
         area_width: u16,
         area_height: u16,
-    ) -> TerminalDirtyPatchOutcome {
-        self.terminal.collect_dirty_patch(area_width, area_height)
+    ) -> Option<TerminalDirtyPatchSnapshot> {
+        // PTY/resize writers announce changes before locking the terminal core.
+        // Exclude them until rows and metadata have been paired with their revision.
+        let _content_guard = self
+            .content_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = self.content_seq();
+        if !revision.is_multiple_of(2) {
+            return None;
+        }
+        let patch = self.terminal.collect_dirty_patch(area_width, area_height);
+        if matches!(patch, TerminalDirtyPatchOutcome::Fallback) {
+            return None;
+        }
+        let snapshot = TerminalDirtyPatchSnapshot {
+            patch,
+            content_revision: revision,
+            scroll_metrics: self.scroll_metrics(),
+            mouse_reporting: self.mouse_reporting_enabled(),
+            sgr_pixel_mouse: self.sgr_pixel_mouse_enabled(),
+            alternate_screen_active: self.alternate_screen_active(),
+            graphics_may_have_placements: crate::kitty_graphics::is_enabled()
+                && self.kitty_graphics_may_have_placements(),
+        };
+        (self.content_seq() == revision).then_some(snapshot)
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.terminal.visible_hyperlinks(area)
     }
 
-    pub(crate) fn hyperlink_at_viewport_cell(
+    pub(crate) fn link_regions_at(
         &self,
         col: u16,
         row: u16,
-        width: u16,
-        height: u16,
-    ) -> Option<terminal::ViewportHyperlink> {
-        self.terminal
-            .hyperlink_at_viewport_cell(col, row, width, height)
+        resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.terminal.link_regions_at(col, row, resolve)
     }
 
-    pub(crate) fn logical_line_at_viewport_row(
-        &self,
-        row: u16,
-        width: u16,
-        height: u16,
-    ) -> Option<terminal::ViewportLogicalLine> {
-        self.terminal
-            .logical_line_at_viewport_row(row, width, height)
+    pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
+        self.terminal.link_target_at(col, row)
+    }
+
+    pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
+        self.terminal.kitty_graphics_may_have_placements()
     }
 
     pub fn kitty_image_placements_with_data_filter<F>(
@@ -3889,34 +3392,28 @@ impl PaneRuntime {
         self.terminal.keyboard_protocol(fallback)
     }
 
+    pub fn modify_other_keys_level(&self) -> u8 {
+        self.terminal.modify_other_keys_level()
+    }
+
     pub fn encode_terminal_key(&self, key: crate::input::TerminalKey) -> Vec<u8> {
         self.terminal
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        let result = self.io.send_bytes(bytes).await;
-        if result.is_ok() {
-            self.input_written.store(true, Ordering::Release);
-        }
-        result
-    }
-
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        let result = self.io.try_send_bytes(bytes);
-        if result.is_ok() {
-            self.input_written.store(true, Ordering::Release);
-        }
-        result
+        self.io.try_send_bytes(bytes)
     }
 
-    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.input_written.store(true, Ordering::Release);
-        self.io.send_bytes_after(bytes, delay);
-    }
-
-    pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.send_bytes(self.paste_payload(text)).await
+    pub fn queue_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.io
+            .queue_user_input_submission(text, enter, delay, deadline)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3924,6 +3421,7 @@ impl PaneRuntime {
     }
 
     fn paste_payload(&self, text: String) -> Bytes {
+        let text = crate::platform::prepare_paste_text_for_pty(text);
         let bracketed = self.bracketed_paste_enabled();
         let payload = if bracketed {
             format!("\x1b[200~{text}\x1b[201~")
@@ -3958,7 +3456,9 @@ impl PaneRuntime {
         u16,
         Vec<crate::ghostty::ScreenTextRow>,
     )> {
-        self.terminal.screen_text_snapshot()
+        let result = self.terminal.screen_text_snapshot();
+        self.compression.wake();
+        result
     }
 
     pub fn encode_mouse_button(
@@ -4034,6 +3534,27 @@ impl PaneRuntime {
         crate::platform::process_cwd(pid)
     }
 
+    pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        let exited = self.cwd_process_exited.load(Ordering::Acquire);
+        if let Some(cwd) = (!exited)
+            .then(|| crate::platform::process_cwd(pid))
+            .flatten()
+            .filter(|cwd| cwd.is_absolute())
+        {
+            // Persistence observations must not change OSC authority or follow-cwd behavior.
+            if let Ok(mut known) = self.persistence_cwd.lock() {
+                *known = Some(cwd.clone());
+            }
+            return Some(cwd);
+        }
+        self.persistence_cwd
+            .lock()
+            .ok()
+            .and_then(|cwd| cwd.clone())
+            .or_else(|| self.reported_cwd.lock().ok().and_then(|cwd| cwd.clone()))
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         let pid = self.child_pid.load(Ordering::Acquire);
         (pid > 0).then_some(pid)
@@ -4067,12 +3588,12 @@ impl PaneRuntime {
                 .or_else(|| crate::platform::foreground_process_group_id(pid));
             let leader_cwd = foreground_pgid.and_then(absolute_process_cwd);
 
-            if leader_cwd.as_ref() == shell_cwd.as_ref() {
-                foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()).or(leader_cwd)
-            } else {
-                leader_cwd
-                    .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
-            }
+            // The group leader's cwd is authoritative (issue #3270): a helper
+            // process that chdirs elsewhere inside the same foreground group
+            // must not override it. Scan other members only when the leader's
+            // cwd cannot be read at all.
+            leader_cwd
+                .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
         }
 
         #[cfg(not(unix))]
@@ -4084,10 +3605,6 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
-    pub(crate) fn test_set_child_pid(&self, pid: u32) {
-        self.child_pid.store(pid, Ordering::Release);
-    }
-
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], 4)
     }
@@ -4104,11 +3621,70 @@ impl PaneRuntime {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
     }
 
+    pub(crate) fn test_contend_during_dirty_collection(
+        &self,
+        bytes: Vec<u8>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        let terminal = self.terminal.clone();
+        let sequence = self.content_seq.clone();
+        let write_lock = self.content_write_lock.clone();
+        let pane_id = self.pane_id;
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.terminal
+            .ghostty
+            .core
+            .lock()
+            .unwrap()
+            .dirty_collection_hook = Some(Box::new(move || {
+            start_tx.send(()).unwrap();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }));
+        let writer = std::thread::spawn(move || {
+            start_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let guard = match write_lock.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(error) => panic!("poisoned content lock: {error}"),
+            };
+            let announced = guard.is_some();
+            if announced {
+                sequence.fetch_add(1, Ordering::AcqRel);
+                assert!(matches!(
+                    terminal.ghostty.core.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+            }
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            let _guard = guard.unwrap_or_else(|| {
+                let guard = write_lock.lock().unwrap();
+                sequence.fetch_add(1, Ordering::AcqRel);
+                guard
+            });
+            let (tx, _rx) = mpsc::channel(1);
+            let _ = terminal.process_pty_bytes(pane_id, 0, &bytes, &tx);
+            sequence.fetch_add(1, Ordering::Release);
+            announced
+        });
+        (release_tx, writer)
+    }
+
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         self.content_seq.fetch_add(1, Ordering::AcqRel);
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
+        self.compression.wake();
     }
 
     pub(crate) fn test_with_scrollback_bytes(
@@ -4132,37 +3708,35 @@ impl PaneRuntime {
         let mut terminal =
             crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes).unwrap();
         terminal.write(bytes);
+        let pane_id = PaneId::from_raw(0);
+        let terminal = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
+        ));
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
 
         (
             Self {
-                pane_id: PaneId::from_raw(0),
-                terminal: Arc::new(PaneTerminal::new(
-                    GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
-                )),
+                pane_id,
+                terminal,
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
                 },
-                input_written: Arc::new(AtomicBool::new(false)),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
-                #[cfg(unix)]
-                remote_execution_ready: Arc::new(AtomicBool::new(true)),
-                #[cfg(unix)]
-                remote_hostname: Arc::new(Mutex::new(None)),
+                persistence_cwd: Mutex::new(None),
+                cwd_process_exited: Arc::new(AtomicBool::new(false)),
                 child_wait_completed: None,
-                #[cfg(all(test, unix))]
-                spawn_exit_latch_for_test: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
-                emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
+                content_write_lock: Arc::new(Mutex::new(())),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
-                managed_agent_hint: Arc::new(Mutex::new(None)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -4173,431 +3747,194 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
-    #[cfg(unix)]
-    fn handoff_test_state(
-        child_pid: u32,
-        remote_execution_ready: bool,
-        remote_hostname: Option<&str>,
-    ) -> crate::handoff_runtime::HandoffRuntimeState {
-        crate::handoff_runtime::HandoffRuntimeState {
-            pane_id: 7,
-            child_pid,
-            rows: 24,
-            cols: 80,
-            cell_width_px: 0,
-            cell_height_px: 0,
-            remote_execution_ready,
-            input_written: false,
-            remote_hostname: remote_hostname.map(str::to_owned),
-            remote_exec_ready_filter: RemoteExecReadyFilter::default(),
-            pending_agent_resume_plan: None,
-            pending_agent_resume_attempt_pid: None,
-            pending_agent_resume_retired_pids: Vec::new(),
-            respawn_shell_on_exit: None,
-            keyboard_protocol_flags: 0,
-            keyboard_protocol_ansi: None,
-            input_state: None,
-            terminal_title: None,
-            initial_history_ansi: None,
-            agent_state: None,
-        }
-    }
-
-    #[cfg(unix)]
-    fn import_handoff_with_output(
-        output: &str,
-        remote_execution_ready: bool,
-        remote_hostname: Option<&str>,
-    ) -> (
-        PaneRuntime,
-        mpsc::Receiver<AppEvent>,
-        Box<dyn portable_pty::Child + Send + Sync>,
-    ) {
-        import_handoff_state_with_output(
-            output,
-            handoff_test_state(0, remote_execution_ready, remote_hostname),
-        )
-    }
-
-    #[cfg(unix)]
-    fn import_handoff_state_with_output(
-        output: &str,
-        mut state: crate::handoff_runtime::HandoffRuntimeState,
-    ) -> (
-        PaneRuntime,
-        mpsc::Receiver<AppEvent>,
-        Box<dyn portable_pty::Child + Send + Sync>,
-    ) {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let master_fd =
-            crate::pty::fd::duplicate_cloexec_fd(pair.master.as_raw_fd().expect("PTY master fd"))
-                .unwrap();
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.args(["-c", "printf %s \"$1\"", "herdr-test", output]);
-        let child = pair.slave.spawn_command(cmd).unwrap();
-        state.child_pid = child.process_id().expect("child pid");
-        drop(pair);
-
-        let (events, event_rx) = mpsc::channel(8);
-        let runtime = PaneRuntime::from_handoff_fd(
-            crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state },
-            &crate::execution::ExecutionTarget::ssh("build-alias").unwrap(),
-            4096,
-            crate::terminal_theme::TerminalTheme::default(),
-            None,
-            events,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-        )
-        .unwrap();
-        runtime.set_handoff_reader_paused(false);
-        (runtime, event_rx, child)
-    }
-
-    #[test]
-    fn managed_agent_switch_resets_process_probe_state() {
-        let now = std::time::Instant::now();
-        let mut agent_presence = AgentDetectionPresence::from_agent(Some(Agent::Omp));
-        let mut state = AgentState::Working;
-        let mut last_visible_idle = true;
-        let mut last_foreground_pgid = Some(42);
-        let mut has_process_probe = true;
-        let mut acquisition_started_at = Some(now);
-        let mut last_content_change_at = Some(now);
-        let mut pending_foreground_shell_clear = true;
-        let mut pending_restore_probe = true;
-        let mut foreground_shell_exit_reported = true;
-        let mut last_visible_blocker = true;
-        let mut last_visible_working = true;
-        let mut last_visible_signal_refresh = Some(now);
-        let mut last_detection_text = "stale".to_string();
-        let mut last_screen_scan_detection_content_seq = Some(7);
-        let mut agent_startup_grace_until = None;
-        let mut pending_idle = PendingIdleConfirmation::default();
-        let mut last_managed_agent_hint = Some(Agent::Omp);
-
-        ManagedAgentHintState {
-            agent_presence: &mut agent_presence,
-            state: &mut state,
-            last_visible_idle: &mut last_visible_idle,
-            last_foreground_pgid: &mut last_foreground_pgid,
-            has_process_probe: &mut has_process_probe,
-            acquisition_started_at: &mut acquisition_started_at,
-            last_content_change_at: &mut last_content_change_at,
-            pending_foreground_shell_clear: &mut pending_foreground_shell_clear,
-            pending_restore_probe: &mut pending_restore_probe,
-            foreground_shell_exit_reported: &mut foreground_shell_exit_reported,
-            last_visible_blocker: &mut last_visible_blocker,
-            last_visible_working: &mut last_visible_working,
-            last_visible_signal_refresh: &mut last_visible_signal_refresh,
-            last_detection_text: &mut last_detection_text,
-            last_screen_scan_detection_content_seq: &mut last_screen_scan_detection_content_seq,
-            agent_startup_grace_until: &mut agent_startup_grace_until,
-            pending_idle: &mut pending_idle,
-            last_managed_agent_hint: &mut last_managed_agent_hint,
-        }
-        .reset_for_agent_switch(Agent::Codex, now);
-
-        assert_eq!(agent_presence.current_agent(), Some(Agent::Codex));
-        assert_eq!(last_foreground_pgid, None);
-        assert!(!has_process_probe);
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_detection_adopts_managed_agent_switch() {
-        let mut handoff = handoff_test_state(0, true, Some("build-alias"));
-        handoff.agent_state = Some(
-            serde_json::from_value(serde_json::json!({
-                "agent": "omp",
-                "state": "idle",
-                "seen": true
-            }))
-            .unwrap(),
+    async fn clear_pane_preserves_wrapped_input_and_unfinished_vt_sequence() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_and_scrollback_bytes(
+            10,
+            5,
+            100_000,
+            b"old\r\nold\r\nold\r\nold\r\nold\r\n\x1b[32m$ abcdefghijklmnop\x1b[1A\x1b[4G\x1b[",
+            4,
         );
-        let (runtime, mut events, mut child) = import_handoff_state_with_output("", handoff);
+        let before = runtime.content_seq();
+        runtime.scroll_up(1);
+        runtime.clear_screen().unwrap();
+        let snapshot = runtime.collect_dirty_patch_snapshot(10, 5).unwrap();
+        assert!(snapshot.content_revision > before);
+        assert!(!matches!(snapshot.patch, TerminalDirtyPatchOutcome::Clean));
+        let metrics = runtime.scroll_metrics().unwrap();
+        assert_eq!(metrics.max_offset_from_bottom, 0);
+        assert_eq!(metrics.offset_from_bottom, 0);
+        let text = runtime.recent_unwrapped_text_snapshot(100).text;
+        assert!(text.contains("$ abcdefghijklmnop"), "{text:?}");
+        assert!(!text.contains("old"), "{text:?}");
+        runtime.test_process_pty_bytes(b"5 q");
+        assert!(!runtime.visible_text().contains("5 q"));
+        assert!(rx.try_recv().is_err(), "clear must not send child input");
+    }
 
-        runtime.set_managed_agent_hint(Some(Agent::Codex));
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match events.recv().await {
-                    Some(AppEvent::AgentProcessDetected {
-                        agent: Agent::Codex,
-                        ..
-                    }) => break,
-                    Some(_) => {}
-                    None => panic!("handoff event channel closed before managed-agent switch"),
-                }
-            }
-        })
-        .await
-        .expect("handoff detection should use the shared managed-agent transition");
+    #[tokio::test]
+    async fn clear_pane_preserves_alternate_screen_and_primary_history() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            20,
+            4,
+            100_000,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[?1049halt app",
+        );
+        let before = runtime.visible_text();
+        runtime.clear_screen().unwrap();
+        assert_eq!(runtime.visible_text(), before);
+        runtime.test_process_pty_bytes(b"\x1b[?1049l");
+        assert!(runtime
+            .recent_unwrapped_text_snapshot(100)
+            .text
+            .contains("one"));
+        runtime.clear_screen().unwrap();
+        assert!(!runtime
+            .recent_unwrapped_text_snapshot(100)
+            .text
+            .contains("one"));
+        assert!(runtime.visible_text().contains("five"));
+    }
 
-        assert_eq!(runtime.managed_agent_hint_for_test(), Some(Agent::Codex));
-        child.wait().unwrap();
+    #[tokio::test]
+    async fn dirty_patch_snapshot_keeps_clean_metadata_and_terminal_fallback() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(20, 4);
+        runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("initial snapshot");
+        runtime.test_process_pty_bytes(b"\x1b[?1003h\x1b[?1016h");
+        let snapshot = runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("mode snapshot");
+        assert!(matches!(snapshot.patch, TerminalDirtyPatchOutcome::Clean));
+        assert_eq!(snapshot.content_revision, runtime.content_seq());
+        assert!(snapshot.content_revision.is_multiple_of(2));
+        assert!(snapshot.mouse_reporting);
+        assert!(snapshot.sgr_pixel_mouse);
+        assert!(!snapshot.alternate_screen_active);
+
+        runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        assert!(runtime.collect_dirty_patch_snapshot(20, 4).is_none());
+        assert!(runtime.content_write_lock.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dirty_patch_snapshot_tracks_serialized_scroll_and_resize() {
+        let runtime = PaneRuntime::test_with_scrollback_bytes(
+            20,
+            4,
+            100_000,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix",
+        );
+        runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("live snapshot");
+        runtime.scroll_up(1);
+        let scrolled = runtime
+            .collect_dirty_patch_snapshot(20, 4)
+            .expect("scrolled snapshot");
+        assert_eq!(
+            scrolled.scroll_metrics.expect("metrics").offset_from_bottom,
+            1
+        );
+        runtime.scroll_reset();
+        runtime.resize(5, 24, 0, 0);
+        let resized = runtime
+            .collect_dirty_patch_snapshot(24, 5)
+            .expect("resized snapshot");
+        let metrics = resized.scroll_metrics.expect("resized metrics");
+        assert_eq!(metrics.offset_from_bottom, 0);
+        assert_eq!(metrics.viewport_rows, 5);
+        assert!(resized.content_revision.is_multiple_of(2));
+        let TerminalDirtyPatchOutcome::Patch(patch) = resized.patch else {
+            panic!("resize must dirty the viewport");
+        };
+        assert_eq!(patch.rows.len(), 5);
+        assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 24));
     }
 
     #[test]
-    fn pane_launch_env_removes_outer_codex_thread_id() {
-        let mut cmd = CommandBuilder::new("shell");
-        cmd.env("CODEX_THREAD_ID", "outer-session");
-
-        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
-
-        assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
-    }
-
-    #[test]
-    fn managed_pane_launch_scrubs_explicit_and_inherited_view() {
-        let mut cmd = CommandBuilder::new("shell");
-        cmd.env("HERDR_VIEW_ID", "inherited-view");
-        let launch =
-            PaneLaunchEnv::from_extra(vec![("HERDR_VIEW_ID".into(), "spoofed-view".into())])
-                .with_identity("w1".into(), "w1:t1".into(), "w1:p1".into());
-
-        apply_pane_launch_env(&mut cmd, &launch);
-
-        assert!(cmd.get_env("HERDR_VIEW_ID").is_none());
-        assert!(!launch
-            .remote_env()
-            .iter()
-            .any(|(key, _)| key == "HERDR_VIEW_ID"));
-    }
-
-    #[test]
-    fn pane_launch_env_scrubs_build_only_manager_path() {
-        let launch = PaneLaunchEnv::from_extra(vec![(
-            "HERDR_BUILD_BIN_PATH".into(),
-            "spoofed-manager".into(),
-        )]);
-        let mut cmd = CommandBuilder::new("shell");
-        cmd.env("HERDR_BUILD_BIN_PATH", "inherited-manager");
-
-        apply_pane_launch_env(&mut cmd, &launch);
-
-        assert!(cmd.get_env("HERDR_BUILD_BIN_PATH").is_none());
-        assert!(!launch
-            .remote_env()
-            .iter()
-            .any(|(key, _)| key == "HERDR_BUILD_BIN_PATH"));
-    }
-
-    #[test]
-    fn no_identity_launch_scrubs_identity_but_preserves_explicit_view() {
-        let identity_keys = [
-            crate::integration::HERDR_WORKSPACE_ID_ENV_VAR,
-            crate::integration::HERDR_TAB_ID_ENV_VAR,
-            crate::integration::HERDR_PANE_ID_ENV_VAR,
+    fn pane_launch_env_removes_outer_agent_identity() {
+        let keys = [
+            "CODEX_THREAD_ID",
+            "OMPCODE",
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
         ];
         let mut cmd = CommandBuilder::new("shell");
-        for key in identity_keys {
-            cmd.env(key, "inherited");
+        for key in keys {
+            cmd.env(key, "outer-session");
         }
-        cmd.env("HERDR_VIEW_ID", "inherited-view");
-        let launch = PaneLaunchEnv::from_extra(vec![
-            (
-                crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.into(),
-                "spoofed-workspace".into(),
-            ),
-            (
-                crate::integration::HERDR_TAB_ID_ENV_VAR.into(),
-                "spoofed-tab".into(),
-            ),
-            (
-                crate::integration::HERDR_PANE_ID_ENV_VAR.into(),
-                "spoofed-pane".into(),
-            ),
-            ("HERDR_VIEW_ID".into(), "view-private".into()),
-        ])
-        .without_pane_identity();
-
-        apply_pane_launch_env(&mut cmd, &launch);
-
-        for key in identity_keys {
-            assert!(cmd.get_env(key).is_none(), "{key} should be scrubbed");
-        }
-        assert_eq!(
-            cmd.get_env("HERDR_VIEW_ID")
-                .and_then(std::ffi::OsStr::to_str),
-            Some("view-private")
-        );
-
-        let remote: std::collections::HashMap<_, _> = launch.remote_env().into_iter().collect();
-        for key in identity_keys {
-            assert!(!remote.contains_key(key), "{key} should be scrubbed");
-        }
-        assert_eq!(
-            remote.get("HERDR_VIEW_ID"),
-            Some(&"view-private".to_string())
-        );
-    }
-
-    #[test]
-    fn pane_launch_env_removes_requested_variables() {
-        let mut cmd = CommandBuilder::new("shell");
-        cmd.env("BUN_OPTIONS", "--preload=attacker.ts");
-
-        apply_pane_launch_env(
-            &mut cmd,
-            &PaneLaunchEnv::default().without_env("BUN_OPTIONS"),
-        );
-
-        assert!(cmd.get_env("BUN_OPTIONS").is_none());
-    }
-
-    #[test]
-    fn pane_launch_env_remote_removals_preserve_without_env() {
-        let (_, remove_env) = PaneLaunchEnv::default()
-            .without_env("BUN_OPTIONS")
-            .remote_env_with_removals();
-
-        assert_eq!(
-            remove_env,
-            [
-                "HERDR_OMP_BRIDGE",
-                "HERDR_OMP_BRIDGE_TOKEN",
-                "HERDR_OMP_GUEST_BRIDGE_TOKEN",
-                "BUN_OPTIONS",
-            ]
-            .map(String::from)
-        );
-    }
-
-    #[test]
-    fn pane_launch_env_clears_only_inherited_mux_markers() {
-        let mut cmd = CommandBuilder::new("shell");
-        for key in ["TMUX", "STY", "ZELLIJ"] {
-            cmd.env(key, "outer");
-        }
+        cmd.env("ANTHROPIC_API_KEY", "fake-api-key");
+        cmd.env("DISPLAY", ":42");
 
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
-        for key in ["TMUX", "STY", "ZELLIJ"] {
-            assert!(
-                cmd.get_env(key).is_none(),
-                "inherited {key} marker survived"
-            );
+        for key in keys {
+            assert!(cmd.get_env(key).is_none(), "{key} must not leak into panes");
         }
-
-        let mut nested = CommandBuilder::new("shell");
-        apply_pane_launch_env(
-            &mut nested,
-            &PaneLaunchEnv::from_extra(vec![("TMUX".into(), "fresh".into())]),
-        );
         assert_eq!(
-            nested.get_env("TMUX").and_then(std::ffi::OsStr::to_str),
-            Some("fresh")
+            cmd.get_env("ANTHROPIC_API_KEY"),
+            Some(OsStr::new("fake-api-key"))
         );
+        assert_eq!(cmd.get_env("DISPLAY"), Some(OsStr::new(":42")));
     }
 
     #[test]
-    fn remote_workspace_identity_preserves_workspace_and_pane_only() {
-        let env: std::collections::HashMap<_, _> = PaneLaunchEnv::from_extra(vec![
-            (
-                crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.into(),
-                "wrong-workspace".into(),
-            ),
-            (
-                crate::integration::HERDR_TAB_ID_ENV_VAR.into(),
-                "wrong-tab".into(),
-            ),
-            (
-                crate::integration::HERDR_PANE_ID_ENV_VAR.into(),
-                "wrong-pane".into(),
-            ),
-            ("HERDR_VIEW_ID".into(), "spoofed-view".into()),
-        ])
-        .with_workspace_identity("w1".into(), "w1:plugin".into())
-        .remote_env()
-        .into_iter()
-        .collect();
-
-        assert_eq!(
-            env.get(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR),
-            Some(&"w1".to_string()),
-        );
-        assert_eq!(
-            env.get(crate::integration::HERDR_PANE_ID_ENV_VAR),
-            Some(&"w1:plugin".to_string()),
-        );
-        assert!(!env.contains_key(crate::integration::HERDR_TAB_ID_ENV_VAR));
-        assert!(!env.contains_key("HERDR_VIEW_ID"));
-    }
-
-    #[test]
-    fn omp_bridge_token_is_scoped_to_managed_pane_identity() {
-        let bridge = OmpBridgeEnv::generate("127.0.0.1:12345".into()).unwrap();
-        let launch = PaneLaunchEnv::default()
-            .with_omp_bridge(Some(bridge.clone()))
-            .with_identity("w1".into(), "w1:t1".into(), "w1:p1".into());
+    fn pane_terminal_identity_removes_outer_terminal_identity() {
+        let keys = [
+            "ITERM_SESSION_ID",
+            "LC_TERMINAL",
+            "LC_TERMINAL_VERSION",
+            "WEZTERM_PANE",
+            "KITTY_WINDOW_ID",
+            "WT_SESSION",
+            "TMUX",
+            "TMUX_PANE",
+            "STY",
+            "ZELLIJ",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+        ];
         let mut cmd = CommandBuilder::new("shell");
-        cmd.env("HERDR_OMP_BRIDGE", "stale-address");
-        cmd.env("HERDR_OMP_BRIDGE_TOKEN", "stale-host-token");
-        cmd.env("HERDR_OMP_GUEST_BRIDGE_TOKEN", "stale-guest-token");
+        for key in keys {
+            cmd.env(key, "outer-session");
+        }
+        cmd.env("TERM_PROGRAM", "iTerm.app");
+        cmd.env("TERM_PROGRAM_VERSION", "outer-version");
 
-        apply_pane_launch_env(&mut cmd, &launch);
-        assert_eq!(
-            cmd.get_env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR)
-                .and_then(std::ffi::OsStr::to_str),
-            Some("w1")
-        );
-        assert_eq!(
-            cmd.get_env(crate::integration::HERDR_TAB_ID_ENV_VAR)
-                .and_then(std::ffi::OsStr::to_str),
-            Some("w1:t1")
-        );
-        assert_eq!(
-            cmd.get_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
-                .and_then(std::ffi::OsStr::to_str),
-            Some("w1:p1")
-        );
+        apply_pane_terminal_env(&mut cmd);
 
+        for key in keys {
+            assert!(cmd.get_env(key).is_none(), "{key} must not leak into panes");
+        }
+        assert_eq!(cmd.get_env("TERM_PROGRAM"), Some(OsStr::new("herdr")));
         assert_eq!(
-            cmd.get_env("HERDR_OMP_BRIDGE")
-                .and_then(std::ffi::OsStr::to_str),
-            Some("127.0.0.1:12345")
+            cmd.get_env("TERM_PROGRAM_VERSION"),
+            Some(OsStr::new(&crate::build_info::version()))
         );
-        let token = cmd
-            .get_env("HERDR_OMP_BRIDGE_TOKEN")
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap();
-        assert!(bridge.validates("w1:p1", token));
-        assert!(!bridge.validates("w1:p2", token));
-        assert_eq!(cmd.get_env("HERDR_OMP_GUEST_BRIDGE_TOKEN"), None);
     }
 
     #[test]
-    fn remote_ready_event_is_attributed_to_pane_and_child() {
-        let (events, mut event_rx) = mpsc::channel(1);
-        let pane_id = PaneId::from_raw(7);
+    fn pane_launch_env_allows_explicit_session_identity() {
+        let extra = vec![
+            ("CLAUDE_CODE_CHILD_SESSION".into(), "1".into()),
+            ("CLAUDE_CODE_SESSION_ID".into(), "intentional-child".into()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN".into(), "fake-token".into()),
+            ("ITERM_SESSION_ID".into(), "intentional-host".into()),
+        ];
+        let mut cmd = CommandBuilder::new("shell");
+        apply_pane_terminal_env(&mut cmd);
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::from_extra(extra.clone()));
 
-        publish_remote_exec_ready(
-            pane_id,
-            42,
-            Some("build-node".into()),
-            Some("/remote/plugin-root".into()),
-            &events,
-        );
-
-        assert!(matches!(
-            event_rx.blocking_recv(),
-            Some(AppEvent::RemoteExecutionReady {
-                pane_id: reported_pane,
-                child_pid: 42,
-                hostname: Some(hostname),
-                cwd: Some(cwd),
-            }) if reported_pane == pane_id
-                && hostname == "build-node"
-                && cwd == Path::new("/remote/plugin-root")
-        ));
+        for (key, value) in extra {
+            assert_eq!(cmd.get_env(key), Some(OsStr::new(&value)));
+        }
     }
 
     #[tokio::test]
@@ -4614,17 +3951,7 @@ mod tests {
 
         let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
         let (events, _event_rx) = mpsc::channel(1);
-        let authority = crate::execution::ExecutionTarget::Local
-            .osc7_authority_with(Some("local-node".into()), None);
-        publish_reported_cwd(
-            runtime.pane_id,
-            (cwd.clone(), None),
-            &crate::execution::ExecutionTarget::Local,
-            &authority,
-            None,
-            &runtime.reported_cwd,
-            &events,
-        );
+        publish_reported_cwd(runtime.pane_id, cwd.clone(), &runtime.reported_cwd, &events);
         assert_eq!(
             runtime.reported_cwd.lock().unwrap().as_ref(),
             Some(&cwd),
@@ -4634,109 +3961,6 @@ mod tests {
         std::fs::remove_dir(&cwd).expect("remove reported cwd after admission");
 
         assert_eq!(runtime.cwd(), Some(cwd));
-    }
-
-    #[test]
-    fn reported_cwd_validation_requires_local_directory_but_not_remote_directory() {
-        let cwd = std::env::temp_dir().join(format!(
-            "herdr-missing-reported-cwd-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be after unix epoch")
-                .as_nanos()
-        ));
-        assert!(!cwd.exists());
-
-        assert_eq!(
-            usable_reported_cwd(cwd.clone(), &crate::execution::ExecutionTarget::Local),
-            None
-        );
-        assert_eq!(
-            usable_reported_cwd(
-                cwd.clone(),
-                &crate::execution::ExecutionTarget::ssh("buildhost").unwrap()
-            ),
-            Some(cwd)
-        );
-    }
-
-    #[test]
-    fn reported_cwd_accepts_ready_hostname_for_ssh_alias() {
-        let cwd = std::path::PathBuf::from("/remote/repo");
-        let target = crate::execution::ExecutionTarget::ssh("build-alias").unwrap();
-        let authority = target.osc7_authority_with(None, None);
-
-        assert_eq!(
-            usable_terminal_reported_cwd(
-                (cwd.clone(), Some("actual-node".into())),
-                &target,
-                &authority,
-                Some("ACTUAL-NODE"),
-            ),
-            Some(cwd)
-        );
-    }
-
-    #[test]
-    fn reported_cwd_accepts_provider_authority_without_ready_hostname() {
-        let cwd = std::path::PathBuf::from("/remote/repo");
-        let target = crate::execution::ExecutionTarget::extension("runtime", "dev2").unwrap();
-        let authority = target.osc7_authority_with(None, None);
-
-        assert_eq!(
-            usable_terminal_reported_cwd(
-                (cwd.clone(), Some("actual-node".into())),
-                &target,
-                &authority,
-                None,
-            ),
-            Some(cwd)
-        );
-    }
-
-    #[test]
-    fn reported_cwd_validation_accepts_local_and_direct_remote_authorities() {
-        let local_cwd = std::env::current_dir().unwrap();
-        let local = crate::execution::ExecutionTarget::Local;
-        let local_authority = local.osc7_authority_with(Some("local-node".into()), None);
-        assert_eq!(
-            usable_terminal_reported_cwd((local_cwd.clone(), None), &local, &local_authority, None,),
-            Some(local_cwd.clone())
-        );
-        assert_eq!(
-            usable_terminal_reported_cwd(
-                (local_cwd.clone(), Some("LOCALHOST".into())),
-                &local,
-                &local_authority,
-                None,
-            ),
-            Some(local_cwd.clone())
-        );
-        assert_eq!(
-            usable_terminal_reported_cwd(
-                (local_cwd, Some("build-host".into())),
-                &local,
-                &local_authority,
-                None,
-            ),
-            None
-        );
-
-        let remote_cwd = std::env::temp_dir().join("herdr-missing-remote-reported-cwd");
-        let ssh = crate::execution::ExecutionTarget::ssh("deploy@Build-Host").unwrap();
-        let ssh_authority = ssh.osc7_authority_with(None, None);
-        for authority in [None, Some("localhost"), Some("build-host")] {
-            assert_eq!(
-                usable_terminal_reported_cwd(
-                    (remote_cwd.clone(), authority.map(str::to_owned)),
-                    &ssh,
-                    &ssh_authority,
-                    None,
-                ),
-                Some(remote_cwd.clone())
-            );
-        }
     }
 
     #[cfg(unix)]
@@ -4887,6 +4111,201 @@ mod tests {
         assert_eq!(pane_shell_from("", None), default_pane_shell());
     }
 
+    const TEST_EXECUTABLE_IMAGE: u16 = 0x0002;
+    const TEST_DLL: u16 = 0x2000;
+    const TEST_MACHINE_AMD64: u16 = 0x8664;
+
+    /// Structurally valid PE32+ image, with fields chosen so tests can make it
+    /// malformed one way at a time.
+    fn windows_test_pe(machine: u16, characteristics: u16, number_of_sections: u16) -> Vec<u8> {
+        const PE_OFFSET: u32 = 0x80;
+        const COFF_HEADER_LEN: usize = 20;
+        const OPTIONAL_HEADER_LEN: u16 = 0x70;
+        const SECTION_HEADER_LEN: usize = 40;
+
+        let pe = PE_OFFSET as usize;
+        let mut bytes = vec![
+            0u8;
+            pe + 4
+                + COFF_HEADER_LEN
+                + OPTIONAL_HEADER_LEN as usize
+                + number_of_sections as usize * SECTION_HEADER_LEN
+        ];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&PE_OFFSET.to_le_bytes());
+        bytes[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        bytes[pe + 4..pe + 6].copy_from_slice(&machine.to_le_bytes());
+        bytes[pe + 4 + 2..pe + 4 + 4].copy_from_slice(&number_of_sections.to_le_bytes());
+        bytes[pe + 4 + 16..pe + 4 + 18].copy_from_slice(&OPTIONAL_HEADER_LEN.to_le_bytes());
+        bytes[pe + 4 + 18..pe + 4 + 20].copy_from_slice(&characteristics.to_le_bytes());
+        bytes[pe + 24..pe + 26].copy_from_slice(&0x020bu16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn windows_default_pane_shell_prefers_pwsh_on_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-windows-default-shell-pwsh-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pwsh = dir.join("pwsh.exe");
+        let image = windows_test_pe(TEST_MACHINE_AMD64, TEST_EXECUTABLE_IMAGE, 1);
+        std::fs::write(&pwsh, image).unwrap();
+        let path = std::env::join_paths([&dir]).unwrap();
+
+        let resolved = default_windows_pane_shell(Some(path));
+        let expected = pwsh.into_os_string().into_string().unwrap();
+
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn windows_default_pane_shell_falls_back_to_inbox_powershell() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-windows-default-shell-fallback-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file that is not a launchable executable must not be selected.
+        std::fs::write(dir.join("pwsh.exe"), b"not a PE image").unwrap();
+        let path = std::env::join_paths([&dir]).unwrap();
+
+        let invalid = default_windows_pane_shell(Some(path));
+
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(invalid, "powershell.exe");
+        assert_eq!(default_windows_pane_shell(None), "powershell.exe");
+    }
+
+    #[test]
+    fn windows_default_pane_shell_rejects_non_executable_pe_images() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-windows-default-shell-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pwsh = dir.join("pwsh.exe");
+        let path = || std::env::join_paths([&dir]).unwrap();
+
+        let truncated_header = {
+            let mut bytes = b"MZ".to_vec();
+            bytes.resize(0x40, 0);
+            bytes[0x3c..0x40].copy_from_slice(&0x50u32.to_le_bytes());
+            bytes
+        };
+        // One declared section, but the file ends before its 40-byte header.
+        let truncated_section_table = {
+            let mut bytes = windows_test_pe(TEST_MACHINE_AMD64, TEST_EXECUTABLE_IMAGE, 1);
+            bytes.truncate(bytes.len() - 1);
+            bytes
+        };
+        let cases: [(&str, Vec<u8>); 7] = [
+            ("empty", Vec::new()),
+            ("dos signature only", b"MZ".to_vec()),
+            ("truncated pe header", truncated_header),
+            ("truncated section table", truncated_section_table),
+            (
+                "dll",
+                windows_test_pe(TEST_MACHINE_AMD64, TEST_EXECUTABLE_IMAGE | TEST_DLL, 1),
+            ),
+            (
+                "no executable bit",
+                windows_test_pe(TEST_MACHINE_AMD64, 0, 1),
+            ),
+            (
+                "foreign machine",
+                windows_test_pe(0x0200, TEST_EXECUTABLE_IMAGE, 1),
+            ),
+        ];
+
+        for (label, bytes) in cases {
+            std::fs::write(&pwsh, &bytes).unwrap();
+            assert_eq!(
+                default_windows_pane_shell(Some(path())),
+                "powershell.exe",
+                "case {label:?}"
+            );
+        }
+
+        std::fs::write(
+            &pwsh,
+            windows_test_pe(TEST_MACHINE_AMD64, TEST_EXECUTABLE_IMAGE, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            default_windows_pane_shell(Some(path())),
+            "powershell.exe",
+            "case zero sections"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_executable_machine_compatibility_tracks_native_host() {
+        const I386: u16 = 0x014c;
+        const AMD64: u16 = 0x8664;
+        const ARM64: u16 = 0xaa64;
+
+        assert!(windows_executable_machine_is_compatible(I386, AMD64));
+        assert!(windows_executable_machine_is_compatible(AMD64, AMD64));
+        assert!(!windows_executable_machine_is_compatible(ARM64, AMD64));
+        assert!(windows_executable_machine_is_compatible(I386, ARM64));
+        assert!(windows_executable_machine_is_compatible(AMD64, ARM64));
+        assert!(windows_executable_machine_is_compatible(ARM64, ARM64));
+        assert!(windows_executable_machine_is_compatible(I386, I386));
+        assert!(!windows_executable_machine_is_compatible(AMD64, I386));
+        assert!(!windows_executable_machine_is_compatible(0x0200, AMD64));
+    }
+
+    #[test]
+    fn windows_executable_file_rejects_arm64_image_on_amd64_host() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-windows-default-shell-arm64-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pwsh = dir.join("pwsh.exe");
+        std::fs::write(&pwsh, windows_test_pe(0xaa64, TEST_EXECUTABLE_IMAGE, 1)).unwrap();
+
+        let on_amd64 = is_windows_executable_file_for_host(&pwsh, 0x8664);
+        let on_arm64 = is_windows_executable_file_for_host(&pwsh, 0xaa64);
+        let on_x86 = is_windows_executable_file_for_host(&pwsh, 0x014c);
+
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!on_amd64, "x64 Windows cannot launch a pure ARM64 image");
+        assert!(on_arm64);
+        assert!(!on_x86);
+    }
+
+    #[test]
+    fn windows_default_pane_shell_skips_invalid_pwsh_candidates() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-windows-default-shell-skip-{}",
+            std::process::id()
+        ));
+        let invalid_dir = base.join("invalid");
+        let valid_dir = base.join("valid");
+        std::fs::create_dir_all(&invalid_dir).unwrap();
+        std::fs::create_dir_all(&valid_dir).unwrap();
+        std::fs::write(invalid_dir.join("pwsh.exe"), b"MZ").unwrap();
+        let pwsh = valid_dir.join("pwsh.exe");
+        std::fs::write(
+            &pwsh,
+            windows_test_pe(TEST_MACHINE_AMD64, TEST_EXECUTABLE_IMAGE, 1),
+        )
+        .unwrap();
+        let path = std::env::join_paths([&invalid_dir, &valid_dir]).unwrap();
+
+        let resolved = default_windows_pane_shell(Some(path));
+        let expected = pwsh.into_os_string().into_string().unwrap();
+
+        let _ = std::fs::remove_dir_all(base);
+        assert_eq!(resolved, expected);
+    }
+
     #[test]
     fn shell_mode_auto_uses_login_shell_only_on_macos() {
         assert!(shell_mode_uses_login_shell(
@@ -4939,6 +4358,122 @@ mod tests {
             cmd.get_env("SHELL").and_then(std::ffi::OsStr::to_str),
             Some("/bin/sh")
         );
+    }
+
+    #[test]
+    fn windows_login_shell_builder_launches_configured_shell_with_login_flag() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("bash.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(
+            !cmd.is_default_prog(),
+            "Windows login mode must not fall back to the default program (cmd.exe)"
+        );
+        assert_eq!(
+            cmd.get_argv(),
+            &[
+                std::ffi::OsString::from("bash.exe"),
+                std::ffi::OsString::from("-l"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_login_shell_builder_launches_native_shells_without_flag() {
+        for shell in ["cmd.exe", "C:\\Windows\\System32\\cmd.exe"] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert!(!cmd.is_default_prog(), "shell {shell:?}");
+            assert_eq!(
+                cmd.get_argv(),
+                &[std::ffi::OsString::from(shell)],
+                "shell {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_powershell_builder_injects_prompt_cwd_shell_integration() {
+        for shell in [
+            "powershell.exe",
+            "pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cmd.get_argv(),
+                &[
+                    std::ffi::OsString::from(shell),
+                    std::ffi::OsString::from("-NoExit"),
+                    std::ffi::OsString::from("-Command"),
+                    std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+                ],
+                "shell {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_shell_args_maps_posix_shells_to_login_flag() {
+        for shell in [
+            "sh",
+            "sh.exe",
+            "bash",
+            "bash.exe",
+            "BASH.EXE",
+            "zsh",
+            "zsh.exe",
+            "ksh",
+            "dash",
+            "ash",
+            "mksh",
+            "fish",
+            "fish.exe",
+            "csh",
+            "csh.exe",
+            "tcsh",
+            "tcsh.exe",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_args(shell),
+                &["-l"],
+                "shell {shell:?} should get the login flag"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_shell_args_omits_flag_for_shells_without_login_concept() {
+        for shell in [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "nu",
+            "nu.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_args(shell),
+                &[] as &[&str],
+                "shell {shell:?} must not get a login flag"
+            );
+        }
     }
 
     #[test]
@@ -5033,26 +4568,31 @@ mod tests {
     }
 
     #[test]
-    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
-        let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
-        assert!(uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::Windows
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::OtherUnix
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            pwsh,
-            ShellLaunchTarget::Macos
-        ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
-            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
-            ShellLaunchTarget::Windows
-        ));
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_powershell() {
+        for mode in [
+            crate::config::ShellModeConfig::NonLogin,
+            crate::config::ShellModeConfig::Login,
+        ] {
+            let pwsh = PaneShellConfig::new("pwsh.exe", mode);
+            assert!(
+                uses_windows_powershell_pane_shell_for_target(pwsh, ShellLaunchTarget::Windows),
+                "mode {mode:?}"
+            );
+            assert!(!uses_windows_powershell_pane_shell_for_target(
+                pwsh,
+                ShellLaunchTarget::OtherUnix
+            ));
+            assert!(!uses_windows_powershell_pane_shell_for_target(
+                pwsh,
+                ShellLaunchTarget::Macos
+            ));
+        }
         assert!(!uses_windows_powershell_pane_shell_for_target(
             PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::Login),
             ShellLaunchTarget::Windows
         ));
     }
@@ -5172,6 +4712,23 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ended_handoff_keeps_persistence_cwd_when_pid_is_reused() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        assert!(runtime.child_wait_completed.is_none());
+        let saved = std::env::temp_dir().join("saved-handoff-cwd");
+        *runtime.persistence_cwd.lock().unwrap() = Some(saved.clone());
+        // A different live process now owns the imported shell's numeric PID.
+        runtime
+            .child_pid
+            .store(std::process::id(), Ordering::Release);
+        runtime.cwd_process_exited.store(true, Ordering::Release);
+        assert_eq!(runtime.cwd_for_persistence(), Some(saved));
+        *runtime.persistence_cwd.lock().unwrap() = None;
+        assert_eq!(runtime.cwd_for_persistence(), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn handoff_runtime_state_captures_terminal_input_and_title_state() {
         let runtime = PaneRuntime::test_with_screen_bytes(
             80,
@@ -5203,302 +4760,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn handoff_runtime_state_preserves_written_input() {
-        let (runtime, _input) = PaneRuntime::test_with_channel(80, 24);
-        assert!(!runtime.input_written());
-
-        runtime.try_send_bytes(Bytes::from_static(b"x")).unwrap();
-
-        assert!(runtime.input_written());
-        assert!(runtime.handoff_runtime_state(12).input_written);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn handoff_runtime_state_captures_remote_execution_confirmation() {
-        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"");
-        runtime
-            .remote_execution_ready
-            .store(true, Ordering::Release);
-        let Ok(mut remote_hostname) = runtime.remote_hostname.lock() else {
-            panic!("remote hostname lock poisoned");
-        };
-        *remote_hostname = Some("actual-node".into());
-        drop(remote_hostname);
-
-        let pane = runtime.handoff_runtime_state(12);
-
-        assert!(pane.remote_execution_ready);
-        assert_eq!(pane.remote_hostname.as_deref(), Some("actual-node"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawned_remote_ready_and_final_output_precede_reaped_pane_died() {
-        let pane_id = PaneId::from_raw(29);
-        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
-        let output = format!(
-            "before-\x1b]7;file://build-alias/untrusted-local-path\x1b\\\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"actual-node\",\"cwd\":\"/remote/plugin-root\"}}\x1b\\tail-output",
-            nonce.as_str()
-        );
-        let mut command = CommandBuilder::new("python3");
-        command.args([
-            "-c",
-            "import os,signal,sys,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); os.write(1, sys.argv[1].encode()); os.closerange(0, 256); time.sleep(30)",
-            &output,
-        ]);
-        let (events, mut event_rx) = mpsc::channel(8);
-        let runtime = PaneRuntime::spawn_command_builder(
-            pane_id,
-            24,
-            80,
-            4096,
-            crate::terminal_theme::TerminalTheme::default(),
-            None,
-            events,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-            &crate::execution::ExecutionTarget::ssh("build-alias").unwrap(),
-            command,
-            None,
-            Some(nonce),
-            "test command failed",
-            SpawnInitialState::default(),
-            AgentDetection::Disabled,
-        )
-        .unwrap();
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("ready event should arrive")
-            .expect("event channel should remain open");
-        assert!(matches!(
-            first,
-            AppEvent::RemoteExecutionReady {
-                pane_id: ready_pane,
-                cwd: Some(ref cwd),
-                ..
-            } if ready_pane == pane_id && cwd == &std::path::PathBuf::from("/remote/plugin-root")
-        ));
-        let second = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("buffered cwd should follow ready event")
-            .expect("event channel should remain open");
-        assert!(matches!(
-            second,
-            AppEvent::TerminalCwdReported {
-                pane_id: cwd_pane,
-                ref cwd,
-            } if cwd_pane == pane_id
-                && cwd == &std::path::PathBuf::from("/untrusted-local-path")
-        ));
-        let exit_latch = runtime
-            .spawn_exit_latch_for_test
-            .as_ref()
-            .expect("spawned runtime should expose its exit latch to tests");
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !exit_latch.has_signal(SpawnExitLatch::READER_DRAINED) {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("PTY reader should observe EOF while the child remains alive");
-        assert!(
-            !runtime
-                .child_wait_completed
-                .as_ref()
-                .is_some_and(|completed| completed.load(Ordering::Acquire)),
-            "PTY EOF must not reap the child"
-        );
-        assert!(
-            matches!(event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-            "PTY EOF alone must not publish PaneDied before the child is reaped"
-        );
-
-        let child_pid = runtime.child_pid.load(Ordering::Acquire);
-        assert_ne!(child_pid, 0, "spawned child pid should be available");
-        crate::platform::signal_processes(&[child_pid], crate::platform::Signal::Terminate);
-        let second = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("pane death should arrive after child exit")
-            .expect("event channel should remain open");
-        assert!(matches!(
-            second,
-            AppEvent::PaneDied {
-                pane_id: died,
-                child_pid: Some(died_pid),
-            } if died == pane_id && died_pid == child_pid
-        ));
-        assert!(
-            runtime
-                .child_wait_completed
-                .as_ref()
-                .is_some_and(|completed| completed.load(Ordering::Acquire)),
-            "PaneDied must observe the direct child as reaped"
-        );
-        let visible = runtime.visible_text();
-        assert!(
-            visible.contains("before-tail-output"),
-            "visible={visible:?}"
-        );
-        assert!(!visible.contains("6973"));
-        assert!(!visible.contains("actual-node"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn child_exit_finishes_after_bounded_drain_when_descendant_holds_slave() {
-        let pane_id = PaneId::from_raw(30);
-        let mut command = CommandBuilder::new("python3");
-        command.args([
-            "-c",
-            "import os,time\nif os.fork() == 0:\n    time.sleep(2)\n    os._exit(0)\nos.write(1, b'final-before-exit')\nos._exit(0)\n",
-        ]);
-        let (events, mut event_rx) = mpsc::channel(8);
-        let _runtime = PaneRuntime::spawn_command_builder(
-            pane_id,
-            24,
-            80,
-            4096,
-            crate::terminal_theme::TerminalTheme::default(),
-            None,
-            events,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-            &crate::execution::ExecutionTarget::Local,
-            command,
-            None,
-            None,
-            "test command failed",
-            SpawnInitialState::default(),
-            AgentDetection::Disabled,
-        )
-        .unwrap();
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("PaneDied should not wait for a descendant-held slave")
-            .expect("event channel should remain open");
-        assert!(matches!(event, AppEvent::PaneDied { pane_id: died, .. } if died == pane_id));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn handoff_preserves_partial_remote_ready_marker_without_residue() {
-        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
-        let source = PaneRuntime::test_with_scrollback_bytes(80, 24, 4096, b"before-");
-        source
-            .terminal
-            .set_remote_exec_ready_nonce(Some(nonce.clone()));
-        let partial = format!(
-            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"actual",
-            nonce.as_str()
-        );
-        source.test_process_pty_bytes(partial.as_bytes());
-        let mut state = source.handoff_runtime_state(7);
-        state.remote_execution_ready = false;
-        state.remote_hostname = None;
-        state.initial_history_ansi = source.handoff_history_ansi();
-        let state: crate::handoff_runtime::HandoffRuntimeState =
-            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        let (runtime, mut events, mut child) = import_handoff_state_with_output(
-            "-node\",\"cwd\":\"/remote/plugin-root\"}\x1b\\after-tail",
-            state,
-        );
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("completed marker should be observed")
-            .expect("event channel should remain open");
-        assert!(matches!(
-            first,
-            AppEvent::RemoteExecutionReady {
-                hostname: Some(ref hostname),
-                cwd: Some(ref cwd),
-                ..
-            } if hostname == "actual-node"
-                && cwd == &std::path::PathBuf::from("/remote/plugin-root")
-        ));
-        let second = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("pane death should follow drained output")
-            .expect("event channel should remain open");
-        assert!(matches!(second, AppEvent::PaneDied { .. }));
-        let visible = runtime.visible_text();
-        assert!(visible.contains("before-after-tail"));
-        assert!(!visible.contains("6973"));
-        assert!(!visible.contains("remote-exec-ready"));
-        assert!(!visible.contains("actual-node"));
-        child.wait().unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn imported_pre_ready_remote_runtime_can_confirm_after_handoff() {
-        let nonce = crate::execution::RemoteExecReadyNonce::generate().unwrap();
-        let output = format!(
-            "\x1b]6973;herdr-remote-exec-ready={{\"nonce\":\"{}\",\"hostname\":\"actual-node\"}}\x1b\\",
-            nonce.as_str()
-        );
-        let mut state = handoff_test_state(0, false, None);
-        state
-            .remote_exec_ready_filter
-            .set_expected_nonce(Some(nonce));
-        let (runtime, mut events, mut child) = import_handoff_state_with_output(&output, state);
-
-        let hostname = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match events.recv().await {
-                    Some(AppEvent::RemoteExecutionReady { hostname, .. }) => break hostname,
-                    Some(_) => {}
-                    None => panic!("imported runtime event channel closed"),
-                }
-            }
-        })
-        .await
-        .expect("imported runtime should still observe the ready marker");
-
-        assert_eq!(hostname.as_deref(), Some("actual-node"));
-        let pane = runtime.handoff_runtime_state(7);
-        assert!(pane.remote_execution_ready);
-        assert_eq!(pane.remote_hostname.as_deref(), Some("actual-node"));
-        child.wait().unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn imported_ready_remote_runtime_retains_hostname_for_osc7() {
-        let (runtime, mut events, mut child) = import_handoff_with_output(
-            "\x1b]7;file://actual-node/remote/repo\x1b\\",
-            true,
-            Some("actual-node"),
-        );
-
-        let cwd = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match events.recv().await {
-                    Some(AppEvent::TerminalCwdReported { cwd, .. }) => break cwd,
-                    Some(_) => {}
-                    None => panic!("imported runtime event channel closed"),
-                }
-            }
-        })
-        .await
-        .expect("restored hostname should authorize OSC 7 endpoint authority");
-
-        assert_eq!(cwd, std::path::PathBuf::from("/remote/repo"));
-        let pane = runtime.handoff_runtime_state(7);
-        assert!(pane.remote_execution_ready);
-        assert_eq!(pane.remote_hostname.as_deref(), Some("actual-node"));
-        child.wait().unwrap();
-    }
-
-    #[cfg(unix)]
     #[test]
     fn truncate_handoff_history_keeps_recent_utf8_boundary() {
         let history = format!("old\n{}\nrecent\n", "é".repeat(8));
@@ -5520,6 +4781,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compression_permit_survives_an_aborted_async_waiter() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = spawn_blocking_with_compression_permit(permit, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        });
+        started_rx.await.unwrap();
+
+        handle.abort();
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        release_tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn compression_task_rechecks_history_after_a_read() {
+        let suffix = "x".repeat(66);
+        let history = (1..=2_000)
+            .map(|line| format!("{line:05} {suffix}\r\n"))
+            .collect::<String>();
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(80, 24, 20_000_000, history.as_bytes());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let completed_before_read = runtime.compression.completed_passes();
+
+        let snapshot = runtime.recent_unwrapped_text_snapshot(usize::MAX);
+        assert!(snapshot.text.contains("00001 "));
+        assert!(snapshot.text.contains("02000 "));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == completed_before_read {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn compressed_scrollback_survives_shrink_and_grow_resize() {
+        let suffix = "x".repeat(66);
+        let history = (1..=2_000)
+            .map(|line| format!("{line:05} {suffix}\r\n"))
+            .collect::<String>();
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(80, 45, 20_000_000, history.as_bytes());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        runtime.resize(21, 80, 0, 0);
+        let completed_after_shrink = runtime.compression.completed_passes();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.compression.completed_passes() == completed_after_shrink {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        runtime.resize(45, 80, 0, 0);
+
+        assert_eq!(runtime.current_size(), (45, 80));
+        assert_eq!(runtime.terminal_dimensions(), Some((80, 45)));
+        assert_eq!(runtime.scroll_metrics().unwrap().viewport_rows, 45);
+        let snapshot = runtime.recent_unwrapped_text_snapshot(usize::MAX);
+        assert!(snapshot.text.contains("00001 "));
+        assert!(snapshot.text.contains("02000 "));
+    }
+
+    #[tokio::test]
     async fn focus_events_are_forwarded_when_enabled() {
         let (tx, mut rx) = mpsc::channel(4);
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
@@ -5527,35 +4878,33 @@ mod tests {
         terminal
             .mode_set(crate::ghostty::MODE_FOCUS_EVENT, true)
             .unwrap();
+        let pane_id = PaneId::from_raw(0);
+        let terminal = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
+        ));
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
-            pane_id: PaneId::from_raw(0),
-            terminal: Arc::new(PaneTerminal::new(
-                GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
-            )),
+            cwd_process_exited: Arc::new(AtomicBool::new(false)),
+            persistence_cwd: Mutex::new(None),
+            pane_id,
+            terminal,
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
             },
-            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
-            #[cfg(unix)]
-            remote_execution_ready: Arc::new(AtomicBool::new(true)),
-            #[cfg(unix)]
-            remote_hostname: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
-            #[cfg(all(test, unix))]
-            spawn_exit_latch_for_test: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
-            emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
+            content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
-            managed_agent_hint: Arc::new(Mutex::new(None)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -5568,35 +4917,33 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane_id = PaneId::from_raw(0);
+        let terminal = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
+        ));
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
-            pane_id: PaneId::from_raw(0),
-            terminal: Arc::new(PaneTerminal::new(
-                GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
-            )),
+            cwd_process_exited: Arc::new(AtomicBool::new(false)),
+            persistence_cwd: Mutex::new(None),
+            pane_id,
+            terminal,
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
             },
-            input_written: Arc::new(AtomicBool::new(false)),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
-            #[cfg(unix)]
-            remote_execution_ready: Arc::new(AtomicBool::new(true)),
-            #[cfg(unix)]
-            remote_hostname: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
-            #[cfg(all(test, unix))]
-            spawn_exit_latch_for_test: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
-            emit_pane_died_on_reader_exit: Arc::new(AtomicBool::new(false)),
+            content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
-            managed_agent_hint: Arc::new(Mutex::new(None)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -6358,122 +5705,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn managed_agent_hint_drives_screen_detection_without_local_process_identity() {
-        let (events, mut event_rx) = mpsc::channel(8);
-        let pane_id = PaneId::from_raw(41);
-        let runtime = PaneRuntime::spawn_shell_command_on(
-            pane_id,
-            24,
-            80,
-            std::env::temp_dir(),
-            &crate::execution::ExecutionTarget::Local,
-            "printf '\\033]0;omp\\007'; sleep 6",
-            &PaneLaunchEnv::default(),
-            AgentDetection::Enabled,
-            0,
-            crate::terminal_theme::TerminalTheme::default(),
-            None,
-            events,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-        )
-        .unwrap();
-        runtime.set_managed_agent_hint(Some(Agent::Omp));
-
-        let mut process_detected = false;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(AppEvent::AgentProcessDetected {
-                        pane_id: delivered_pane,
-                        agent: Agent::Omp,
-                        ..
-                    }) if delivered_pane == pane_id => process_detected = true,
-                    Some(AppEvent::StateChanged {
-                        pane_id: delivered_pane,
-                        agent: Some(Agent::Omp),
-                        state: AgentState::Idle,
-                        ..
-                    }) if delivered_pane == pane_id && process_detected => break,
-                    Some(_) => {}
-                    None => panic!("event channel closed before idle detection"),
-                }
-            }
-        })
-        .await
-        .expect("managed agent hint should drive screen detection");
-        runtime.set_managed_agent_hint(None);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(AppEvent::StateChanged {
-                        pane_id: delivered_pane,
-                        agent: None,
-                        state: AgentState::Unknown,
-                        visible_blocker: false,
-                        visible_working: false,
-                        process_exited: false,
-                        ..
-                    }) if delivered_pane == pane_id => break,
-                    Some(_) => {}
-                    None => panic!("event channel closed before managed-agent clear"),
-                }
-            }
-        })
-        .await
-        .expect("clearing a managed agent hint should clear detected agent state");
-        runtime.set_managed_agent_hint(Some(Agent::Omp));
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(AppEvent::AgentProcessDetected {
-                        pane_id: delivered_pane,
-                        agent: Agent::Omp,
-                        ..
-                    }) if delivered_pane == pane_id => break,
-                    Some(_) => {}
-                    None => panic!("event channel closed before managed-agent reacquisition"),
-                }
-            }
-        })
-        .await
-        .expect("managed agent hint should reacquire the remote agent");
-
-        runtime.begin_graceful_release(Agent::Omp);
-        runtime.set_managed_agent_hint(Some(Agent::Omp));
-        let redetected = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-            loop {
-                match event_rx.recv().await {
-                    Some(AppEvent::AgentProcessDetected {
-                        pane_id: delivered_pane,
-                        agent: Agent::Omp,
-                        ..
-                    }) if delivered_pane == pane_id => break,
-                    Some(_) => {}
-                    None => panic!("event channel closed during graceful release"),
-                }
-            }
-        })
-        .await;
-        assert!(
-            redetected.is_err(),
-            "graceful release must suppress a stale managed-agent hint"
-        );
-
-        runtime.shutdown();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn spawned_pty_reader_aggregates_terminal_bells() {
         let (events, mut event_rx) = mpsc::channel(8);
         let pane_id = PaneId::from_raw(42);
-        let runtime = PaneRuntime::spawn_shell_command_on(
+        let runtime = PaneRuntime::spawn_shell_command(
             pane_id,
             24,
             80,
             std::env::temp_dir(),
-            &crate::execution::ExecutionTarget::Local,
             "printf '\\a\\a'; sleep 0.05",
             &PaneLaunchEnv::default(),
             AgentDetection::Disabled,

@@ -49,10 +49,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-22.04
+            os: ubuntu-latest
             name: herdr-linux-x86_64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
+            os: ubuntu-latest
             name: herdr-linux-aarch64
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
@@ -68,16 +68,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: ${{ matrix.target }}
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          key: manual-${{ matrix.target }}
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Prefer official Ubuntu mirrors over Azure
         run: |
@@ -138,10 +133,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-latest
             name: herdr-macos-x86_64
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             name: herdr-macos-aarch64
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
@@ -157,16 +152,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: ${{ matrix.target }}
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          key: manual-${{ matrix.target }}
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Install macOS build tools
         run: brew install cmake ninja
@@ -215,16 +205,11 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: x86_64-pc-windows-msvc
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-bin: false
-          key: manual-x86_64-pc-windows-msvc
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Remove Zig caches
         shell: pwsh

@@ -1,12 +1,7 @@
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
-}
-
-pub(crate) fn display_width_u16(text: &str) -> u16 {
-    display_width(text).min(u16::MAX as usize) as u16
 }
 
 pub(crate) fn truncate_end(text: &str, max_width: usize) -> String {
@@ -24,22 +19,6 @@ pub(crate) fn truncate_end(text: &str, max_width: usize) -> String {
     format!("{prefix}…")
 }
 
-pub(crate) fn middle_elide(text: &str, max_width: usize) -> String {
-    if display_width(text) <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-
-    let content_width = max_width.saturating_sub(1);
-    let left_width = content_width / 2;
-    let right_width = content_width.saturating_sub(left_width);
-    let prefix = take_prefix_width(text, left_width);
-    let suffix = take_suffix_width(text, right_width);
-    format!("{prefix}…{suffix}")
-}
-
 fn take_prefix_width(text: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut width = 0usize;
@@ -54,24 +33,6 @@ fn take_prefix_width(text: &str, max_width: usize) -> String {
     output
 }
 
-fn take_suffix_width(text: &str, max_width: usize) -> String {
-    tail_within_width(text, max_width).to_string()
-}
-
-pub(crate) fn tail_within_width(text: &str, max_width: usize) -> &str {
-    let mut start = text.len();
-    let mut width = 0usize;
-    for (index, grapheme) in text.grapheme_indices(true).rev() {
-        let grapheme_width = grapheme.width();
-        if width + grapheme_width > max_width {
-            break;
-        }
-        start = index;
-        width += grapheme_width;
-    }
-    &text[start..]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,19 +43,5 @@ mod tests {
 
         assert_eq!(text, "提交 herdr 的反…");
         assert!(display_width(&text) <= 16);
-    }
-
-    #[test]
-    fn middle_elide_uses_display_width() {
-        let text = middle_elide("重构用户认证模块并迁移到统一登录服务", 12);
-
-        assert!(text.contains('…'));
-        assert!(display_width(&text) <= 12);
-    }
-
-    #[test]
-    fn tail_within_width_keeps_graphemes_intact() {
-        assert_eq!(tail_within_width("xe\u{301}", 1), "e\u{301}");
-        assert_eq!(tail_within_width("x👩‍💻", 2), "👩‍💻");
     }
 }

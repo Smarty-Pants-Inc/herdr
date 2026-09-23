@@ -1,4 +1,6 @@
-mod support;
+#![cfg(unix)]
+
+pub mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,18 +12,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_herdr_pid,
-    send_input, unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_socket,
+    cleanup_test_base, client_shell_handshake, register_runtime_dir, register_spawned_herdr_pid,
+    send_client_shell_shift_enter, unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap,
+    wait_for_message_variant, wait_for_socket, SERVER_MESSAGE_ENDPOINT_CONTROL,
+    SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
-fn fresh_omp_maintenance_owner() -> String {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("generate maintenance test capability");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
 
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
@@ -52,37 +49,6 @@ fn unique_test_dir() -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
-}
-fn write_versioned_handoff_importer(path: &Path, accepted_version: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    fs::write(
-        path,
-        format!(
-            r#"#!/usr/bin/env python3
-import json
-import socket
-import sys
-
-socket_path, token = sys.argv[-2:]
-stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-stream.connect(socket_path)
-stream.sendall(token.encode() + b"\n")
-line = b""
-while not line.endswith(b"\n"):
-    chunk = stream.recv(4096)
-    if not chunk:
-        sys.exit(20)
-    line += chunk
-manifest = json.loads(line)
-if manifest.get("version") != {accepted_version}:
-    sys.exit(21)
-stream.sendall(b"validated\n")
-"#
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
@@ -115,11 +81,6 @@ fn spawn_server_with_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env(
-        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
-        runtime_dir.join("maintenance-state"),
-    );
     cmd.env("HERDR_SOCKET_PATH", api_socket);
     cmd.env(
         "HERDR_CLIENT_SOCKET_PATH",
@@ -136,110 +97,6 @@ fn spawn_server_with_env(
         _master: pair.master,
         child,
     }
-}
-fn spawn_remote_client(
-    base: &Path,
-    config_home: &Path,
-    runtime_dir: &Path,
-    api_socket: &Path,
-    client_socket: &Path,
-) -> SpawnedHerdr {
-    let remote_home = base.join("remote-home");
-    let remote_bin = remote_home.join(".local/bin/herdr");
-    fs::create_dir_all(remote_bin.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_herdr"), &remote_bin).unwrap();
-    let mut permissions = fs::metadata(&remote_bin).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    fs::set_permissions(&remote_bin, permissions).unwrap();
-
-    let fake_bin = base.join("fake-bin");
-    fs::create_dir_all(&fake_bin).unwrap();
-    let fake_ssh = fake_bin.join("ssh");
-    fs::write(
-        &fake_ssh,
-        "#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=$arg; done\nexec /bin/sh -c \"$last\"\n",
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&fake_ssh).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    fs::set_permissions(&fake_ssh, permissions).unwrap();
-
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
-    cmd.arg("--remote");
-    cmd.arg("fake-host");
-    cmd.env("HERDR_DISABLE_SOUND", "1");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket);
-    cmd.env("HERDR_CLIENT_SOCKET_PATH", client_socket);
-    cmd.env("HOME", &remote_home);
-    cmd.env(
-        "PATH",
-        format!(
-            "{}:{}:{}",
-            fake_bin.display(),
-            remote_bin.parent().unwrap().display(),
-            std::env::var("PATH").unwrap_or_default()
-        ),
-    );
-    cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
-
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    drop(pair.slave);
-    SpawnedHerdr {
-        _master: pair.master,
-        child,
-    }
-}
-
-fn read_pty_until(
-    client: &SpawnedHerdr,
-    timeout: Duration,
-    mut complete: impl FnMut(&str) -> bool,
-) -> String {
-    let fd = client
-        ._master
-        .as_raw_fd()
-        .expect("remote client PTY file descriptor");
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert_ne!(flags, -1, "read remote client PTY flags");
-    assert_ne!(
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        -1,
-        "make remote client PTY nonblocking"
-    );
-
-    let mut reader = client
-        ._master
-        .try_clone_reader()
-        .expect("clone remote client PTY reader");
-    let mut output = String::new();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let mut buf = [0u8; 4096];
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(read) => output.push_str(&String::from_utf8_lossy(&buf[..read])),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(err) => panic!("read remote client PTY: {err}"),
-        }
-        if complete(&output) {
-            return output;
-        }
-    }
-    panic!("remote client output did not reach expected state: {output:?}");
 }
 
 fn spawn_named_session_server(
@@ -267,11 +124,6 @@ fn spawn_named_session_server(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env(
-        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
-        runtime_dir.join("maintenance-state"),
-    );
     cmd.env("HERDR_SESSION", session_name);
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -307,10 +159,6 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env(
-        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
-        runtime_dir.join("maintenance-state"),
-    );
     cmd.env_remove("HERDR_SESSION");
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -355,11 +203,6 @@ fn spawn_server_with_args_and_socket_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
-    cmd.env(
-        "HERDR_TEST_OMP_MAINTENANCE_STATE_ROOT",
-        runtime_dir.join("maintenance-state"),
-    );
     cmd.env_remove("HERDR_SESSION");
     if let Some(api_socket_env) = api_socket_env {
         cmd.env("HERDR_SOCKET_PATH", api_socket_env);
@@ -567,6 +410,50 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> Strin
     );
 }
 
+fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
+    // Shell redirection creates the file before echo writes the PID. Wait for
+    // the newline too, so a partially written PID cannot be accepted.
+    let text = wait_for_file_contains(path, "\n", timeout);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|pid| pid.parse().ok())
+        .filter(|pid| *pid > 0)
+        .unwrap_or_else(|| panic!("invalid PID marker at {}: {text:?}", path.display()))
+}
+
+#[test]
+fn pid_marker_waits_for_complete_line() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let marker = base.join("child.pid");
+    // Keep each incomplete marker unchanged throughout the wait. In particular,
+    // READY 12 must time out rather than return a truncated but parseable PID.
+    for partial in ["", "READY ", "READY 12"] {
+        fs::write(&marker, partial).unwrap();
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let panic = std::panic::catch_unwind(|| wait_for_pid_marker(&marker, timeout))
+            .expect_err("incomplete marker should time out");
+        assert!(
+            started.elapsed() >= timeout,
+            "marker {partial:?} failed early"
+        );
+        let message = panic.downcast_ref::<String>().expect("timeout diagnostic");
+        assert_eq!(
+            message,
+            &format!(
+                "{} did not contain {:?}; last text was {partial:?}",
+                marker.display(),
+                "\n"
+            )
+        );
+    }
+    fs::write(&marker, "READY 1234\n").unwrap();
+    assert_eq!(wait_for_pid_marker(&marker, Duration::from_secs(1)), 1234);
+    fs::remove_dir_all(base).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 fn server_ptmx_fd_count(pid: u32) -> usize {
     let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
@@ -769,9 +656,9 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
     cleanup_test_base(&base);
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[test]
-fn live_handoff_preserves_layout_apply_idempotency_epoch() {
+fn live_handoff_unknown_pane_exit_preserves_session_on_shutdown() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -781,576 +668,7 @@ fn live_handoff_preserves_layout_apply_idempotency_epoch() {
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    assert_ok(created.clone());
-    let workspace_id = created["result"]["workspace"]["workspace_id"]
-        .as_str()
-        .expect("workspace create should return an id")
-        .to_owned();
-    let layout_request = serde_json::json!({
-        "id": "test:layout:apply",
-        "method": "layout.apply_idempotent",
-        "params": {
-            "idempotency_key": "handoff-layout-epoch",
-            "workspace_id": workspace_id,
-            "tab_label": "handoff-idempotency",
-            "focus": false,
-            "root": {
-                "type": "pane",
-                "command": ["/bin/sh", "-c", "sleep 30"]
-            }
-        }
-    });
-    let applied = request(&api_socket, layout_request.clone());
-    assert_ok(applied.clone());
-    let tab_id = applied["result"]["layout"]["tab_id"]
-        .as_str()
-        .expect("layout apply should return a tab id")
-        .to_owned();
 
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    wait_for_api(&api_socket, Duration::from_secs(10));
-
-    let mut replay_request = layout_request;
-    replay_request["id"] = serde_json::json!("test:layout:replay");
-    let replayed = request(&api_socket, replay_request);
-    assert_ok(replayed.clone());
-    assert_eq!(replayed["result"]["layout"]["tab_id"], tab_id);
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_preserves_omp_maintenance_owner_and_permit() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let owner = fresh_omp_maintenance_owner();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let acquired = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:acquire",
-            "method": "server.omp_maintenance.acquire",
-            "params": {"operation_id": owner}
-        }),
-    );
-    assert_ok(acquired.clone());
-    assert_eq!(acquired["result"]["type"], "omp_maintenance");
-    assert_eq!(acquired["result"]["maintenance"]["held"], true);
-
-    let permitted = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:permit",
-            "method": "server.omp_maintenance.permit",
-            "params": {
-                "operation_id": owner,
-                "session": "default",
-                "pane_id": "w1:p1"
-            }
-        }),
-    );
-    assert_ok(permitted.clone());
-    assert_eq!(
-        permitted["result"]["maintenance"]["permit"],
-        serde_json::json!({"session": "default", "pane_id": "w1:p1"})
-    );
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    wait_for_api(&api_socket, Duration::from_secs(10));
-
-    let status = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:status",
-            "method": "server.omp_maintenance.status",
-            "params": {}
-        }),
-    );
-    assert_ok(status.clone());
-    let maintenance = &status["result"]["maintenance"];
-    assert!(maintenance.get("operation_id").is_none());
-    assert!(!status.to_string().contains(&owner));
-    assert_eq!(
-        status["result"]["maintenance"]["permit"],
-        serde_json::json!({"session": "default", "pane_id": "w1:p1"})
-    );
-    assert_eq!(status["result"]["maintenance"]["route_count"], 0);
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:release",
-            "method": "server.omp_maintenance.release",
-            "params": {"operation_id": owner}
-        }),
-    ));
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_rejects_pre_maintenance_importer_without_dropping_lease() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let owner = fresh_omp_maintenance_owner();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let legacy_import = base.join("legacy-herdr");
-    fs::create_dir_all(&base).unwrap();
-    write_versioned_handoff_importer(&legacy_import, 1);
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:acquire",
-            "method": "server.omp_maintenance.acquire",
-            "params": {"operation_id": owner}
-        }),
-    ));
-
-    let response = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:handoff:downgrade",
-            "method": "server.live_handoff",
-            "params": {"import_exe": legacy_import.to_string_lossy()}
-        }),
-    );
-    assert_eq!(response["error"]["code"], "handoff_failed");
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
-    ));
-    let status = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:status",
-            "method": "server.omp_maintenance.status",
-            "params": {}
-        }),
-    );
-    assert_ok(status.clone());
-    assert_eq!(status["result"]["maintenance"]["held"], true);
-    assert!(status["result"]["maintenance"]
-        .get("operation_id")
-        .is_none());
-    assert!(!status.to_string().contains(&owner));
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:maintenance:release",
-            "method": "server.omp_maintenance.release",
-            "params": {"operation_id": owner}
-        }),
-    ));
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_rejects_pre_epoch_importer_without_replacing_server() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let previous_import = base.join("previous-herdr");
-    fs::create_dir_all(&base).unwrap();
-    write_versioned_handoff_importer(&previous_import, 2);
-
-    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let response = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:handoff:pre-epoch",
-            "method": "server.live_handoff",
-            "params": {"import_exe": previous_import.to_string_lossy()}
-        }),
-    );
-    assert_eq!(response["error"]["code"], "handoff_failed");
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    assert!(
-        spawned.child.try_wait().unwrap().is_none(),
-        "the current server must remain alive after importer rejection"
-    );
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
-    ));
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn failed_external_handoff_preserves_v5_session_for_restart() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let session_dir = config_home.join(if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    });
-    let session_path = session_dir.join("session.json");
-    let ledger_path = session_dir.join("api-idempotency.json");
-    fs::create_dir_all(&base).unwrap();
-    let fake_omp = base.join("omp");
-    let started_marker = base.join("omp-started");
-    fs::write(
-        &fake_omp,
-        format!(
-            "#!/bin/sh\nexport HERDR_AGENT=omp\necho started > {}\nsleep 30\n",
-            started_marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut spawned = spawn_server_with_env(
-        &config_home,
-        &runtime_dir,
-        &api_socket,
-        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored")],
-    );
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    assert_ok(created.clone());
-    let workspace_id = created["result"]["workspace"]["workspace_id"]
-        .as_str()
-        .unwrap();
-    let applied = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:layout:apply",
-            "method": "layout.apply_idempotent",
-            "params": {
-                "idempotency_key": "handoff-precommit-ledger",
-                "workspace_id": workspace_id,
-                "tab_label": "handoff-precommit",
-                "focus": false,
-                "root": {"type": "pane", "command": ["/bin/sh", "-c", "sleep 30"]}
-            }
-        }),
-    );
-    assert_ok(applied.clone());
-    let tab_id = applied["result"]["layout"]["tab_id"].as_str().unwrap();
-    let mut ledger: serde_json::Value =
-        serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
-    ledger["layout_apply"]["handoff-precommit-ledger"]["outcome"] =
-        serde_json::json!({"state": "pending", "expected_tab_id": tab_id});
-    let pending_ledger_bytes = serde_json::to_vec_pretty(&ledger).unwrap();
-    fs::write(&ledger_path, &pending_ledger_bytes).unwrap();
-    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:start-omp",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": fake_omp, "keys": ["Enter"]}
-        }),
-    ));
-    support::wait_for_file(&started_marker, Duration::from_secs(5));
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:external-session",
-            "method": "pane.report_agent_session",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:omp",
-                "agent": "omp",
-                "seq": 1,
-                "agent_session_id": "external-handoff-session",
-                "session_start_source": "startup",
-                "resume_policy": "external"
-            }
-        }),
-    ));
-    let pane = request(
-        &api_socket,
-        serde_json::json!({"id":"test:pane:get-external","method":"pane.get","params":{"pane_id":pane_id}}),
-    );
-    assert_eq!(
-        pane["result"]["pane"]["agent_session"]["resume_policy"], "external",
-        "external report did not reach pane state: {pane}"
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(12);
-    let mut observed_version = serde_json::Value::Null;
-    let mut persisted = loop {
-        if let Ok(bytes) = fs::read(&session_path) {
-            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            observed_version = value["version"].clone();
-            if value["version"] == 6 {
-                break value;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "external v6 session was not persisted; observed version {observed_version} at {}",
-            session_path.display()
-        );
-        thread::sleep(Duration::from_millis(25));
-    };
-    persisted["version"] = serde_json::json!(5);
-    let v5_bytes = serde_json::to_vec_pretty(&persisted).unwrap();
-    fs::write(&session_path, &v5_bytes).unwrap();
-
-    let response = request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff:fail-after-restore","method":"server.live_handoff","params":{}}),
-    );
-    assert_eq!(response["error"]["code"], "handoff_failed");
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    assert_eq!(fs::read(&session_path).unwrap(), v5_bytes);
-    assert_eq!(fs::read(&ledger_path).unwrap(), pending_ledger_bytes);
-    assert!(spawned.child.try_wait().unwrap().is_none());
-
-    drop(spawned);
-    let _ = fs::remove_file(&api_socket);
-    let _ = fs::remove_file(runtime_dir.join("herdr-client.sock"));
-    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:restart:ping","method":"ping","params":{}}),
-    ));
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(restarted);
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn remote_client_reconnects_after_live_handoff() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
-    let mut remote_client = spawn_remote_client(
-        &base,
-        &config_home,
-        &runtime_dir,
-        &api_socket,
-        &client_socket,
-    );
-    let attached = read_pty_until(&remote_client, Duration::from_secs(10), |output| {
-        output.contains("\u{1b}[?1049h")
-    });
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    let reconnected = read_pty_until(&remote_client, Duration::from_secs(15), |output| {
-        output.contains("\u{1b}[?1049h")
-    });
-
-    assert!(
-        remote_client.child.try_wait().unwrap().is_none(),
-        "remote launcher exited instead of reconnecting; initial={attached:?}; reconnect={reconnected:?}"
-    );
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
-    ));
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    drop(remote_client);
-    drop(spawned);
-    cleanup_test_base(&base);
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn live_handoff_preserved_shell_discovers_replacement_omp_bridge() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let fake_bin = base.join("fake-bin");
-    let marker = base.join("omp-bridge.json");
-    let fake_omp = fake_bin.join("omp");
-    fs::create_dir_all(&fake_bin).unwrap();
-    let test_config = base.join("config.toml");
-    fs::write(
-        &test_config,
-        "onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\nshell_mode = \"non_login\"\n",
-    )
-    .unwrap();
-
-    let marker_literal = serde_json::to_string(marker.to_string_lossy().as_ref()).unwrap();
-    let omp_build_id_literal =
-        serde_json::to_string(option_env!("HERDR_BUILD_OMP_BUILD_ID").unwrap_or("")).unwrap();
-    let script = r#"#!/usr/bin/env python3
-import json
-import os
-import socket
-
-marker = __MARKER__
-omp_build_id = __OMP_BUILD_ID__
-
-def start():
-    inherited_pane_id = os.environ["HERDR_PANE_ID"]
-    stale_pane_id = inherited_pane_id + "-retired"
-    inherited_address = os.environ.get("HERDR_OMP_BRIDGE", "")
-    request_id = "handoff-omp-bridge"
-    api = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    api.settimeout(5)
-    api.connect(os.environ["HERDR_SOCKET_PATH"])
-    request = {
-        "id": request_id,
-        "method": "pane.omp_bridge",
-        "params": {"pane_id": stale_pane_id},
-    }
-    api.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
-    response_line = api.makefile("r", encoding="utf-8").readline()
-    if not response_line:
-        raise RuntimeError("bridge discovery returned no response")
-    response = json.loads(response_line)
-    if response.get("id") != request_id:
-        raise RuntimeError("bridge discovery response id mismatch")
-    result = response.get("result")
-    if not isinstance(result, dict) or result.get("type") != "pane_omp_bridge":
-        raise RuntimeError("bridge discovery response type mismatch")
-    pane_id = result.get("pane_id")
-    if not isinstance(pane_id, str) or not pane_id:
-        raise RuntimeError("bridge discovery pane missing")
-    address = result.get("address")
-    token = result.get("token")
-    if not isinstance(address, str) or not address:
-        raise RuntimeError("bridge discovery address missing")
-    if not isinstance(token, str) or not token:
-        raise RuntimeError("bridge discovery credential missing")
-
-    host, port = address.rsplit(":", 1)
-    bridge = socket.create_connection((host, int(port)), timeout=5)
-    announcement = {
-        "t": "host",
-        "paneId": pane_id,
-        "ompSessionId": "handoff-discovery",
-        "routeGeneration": 1,
-        "token": token,
-        "ompBuildId": omp_build_id,
-    }
-    bridge.sendall((json.dumps(announcement, separators=(",", ":")) + "\n").encode())
-    ready_line = bridge.makefile("r", encoding="utf-8").readline()
-    if not ready_line or json.loads(ready_line).get("t") != "ready":
-        raise RuntimeError("replacement OMP bridge did not accept host")
-    return {
-        "inherited_pane_id": inherited_pane_id,
-        "stale_pane_id": stale_pane_id,
-        "pane_id": pane_id,
-        "inherited_address": inherited_address,
-        "address": address,
-    }
-
-try:
-    payload = start()
-except Exception as error:
-    payload = {"error": type(error).__name__ + ": " + str(error)}
-
-with open(marker, "w", encoding="utf-8") as output:
-    json.dump(payload, output)
-if "error" in payload:
-    raise SystemExit(payload["error"])
-"#
-    .replace("__MARKER__", &marker_literal)
-    .replace("__OMP_BUILD_ID__", &omp_build_id_literal);
-    fs::write(&fake_omp, script).unwrap();
-    fs::set_permissions(&fake_omp, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let test_config = test_config.to_string_lossy().into_owned();
-
-    let spawned = spawn_server_with_env(
-        &config_home,
-        &runtime_dir,
-        &api_socket,
-        &[
-            ("PATH", path.as_str()),
-            ("HERDR_CONFIG_PATH", test_config.as_str()),
-        ],
-    );
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
     let created = request(
         &api_socket,
         serde_json::json!({
@@ -1361,45 +679,143 @@ if "error" in payload:
     );
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
-        .unwrap()
+        .expect("root pane id")
         .to_string();
+    let old_pid = spawned.child.process_id().expect("old server pid");
 
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, old_pid, Duration::from_secs(10));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-    assert_ok(request(
+
+    let process_info = request(
         &api_socket,
         serde_json::json!({
-            "id": "test:pane:start-omp",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": "omp", "keys": ["Enter"]}
+            "id": "test:process-info",
+            "method": "pane.process_info",
+            "params": {"pane_id": pane_id}
         }),
-    ));
-
-    let marker_text = wait_for_file_contains(&marker, "}", Duration::from_secs(10));
-    let payload: serde_json::Value = serde_json::from_str(&marker_text).unwrap();
-    assert!(payload.get("error").is_none(), "fake OMP failed: {payload}");
-    assert_eq!(payload["inherited_pane_id"], pane_id);
-    assert_ne!(
-        payload["pane_id"], payload["stale_pane_id"],
-        "bridge discovery trusted the stale public pane ID"
     );
-    let inherited_address = payload["inherited_address"].as_str().unwrap();
-    let replacement_address = payload["address"].as_str().unwrap();
-    assert!(!inherited_address.is_empty());
-    assert!(!replacement_address.is_empty());
-    assert_ne!(
-        inherited_address, replacement_address,
-        "preserved shell reused the retired OMP bridge"
+    let shell_pid = process_info["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .expect("shell pid") as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(shell_pid, libc::SIGHUP) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let panes = request(
+            &api_socket,
+            serde_json::json!({"id":"test:panes","method":"pane.list","params":{}}),
+        );
+        if panes["result"]["panes"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "handoff pane was not removed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{replacement_pid}")).exists() {
+        assert!(Instant::now() < deadline, "replacement server did not stop");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let session: serde_json::Value = serde_json::from_slice(
+        &fs::read(config_home.join("herdr-dev/session.json")).expect("saved session"),
+    )
+    .expect("valid session json");
+    assert_eq!(session["workspaces"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        session["workspaces"][0]["tabs"][0]["panes"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(1)
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_carries_more_panes_than_one_scm_rights_message() {
+    const PANES: usize = 70;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // One pane per tab keeps the layout shallow, so this exercises the fd
+    // transfer rather than the depth of a single split tree.
+    for index in 1..PANES {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:tab:create-{index}"),
+                "method": "tab.create",
+                "params": {"workspace_id": workspace_id, "focus": false}
+            }),
+        ));
+    }
+    wait_for_server_ptmx_fd_count(server_pid, PANES, Duration::from_secs(60));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, server_pid, Duration::from_secs(30));
+    wait_for_api(&api_socket, Duration::from_secs(30));
+    wait_for_server_ptmx_fd_count(replacement_pid, PANES, Duration::from_secs(30));
+
+    let panes = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:list","method":"pane.list","params":{}}),
+    );
+    assert_eq!(
+        panes["result"]["panes"].as_array().map(Vec::len),
+        Some(PANES),
+        "replacement server should report every pane after handoff"
     );
 
     let _ = request(
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
+    drop(spawned);
     cleanup_test_base(&base);
 }
 
@@ -1566,194 +982,6 @@ fn live_handoff_preserves_installed_plugins() {
 }
 
 #[test]
-fn live_handoff_preserves_active_agent_status() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let session_path = base.join("agent-session.jsonl");
-    let agent_pid_marker = base.join("agent.pid");
-    let fake_pi = base.join("pi");
-    fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &fake_pi,
-        format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\nprintf '%s' $$ > {}\nexec /bin/sleep 30\n",
-            agent_pid_marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:start-agent",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
-        }),
-    ));
-    support::wait_for_file(&agent_pid_marker, Duration::from_secs(5));
-    let agent_pid: libc::pid_t = fs::read_to_string(&agent_pid_marker)
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:working",
-            "method": "pane.report_agent",
-            "params": {
-                "pane_id": pane_id,
-                "source": "custom:handoff-test",
-                "agent": "pi",
-                "state": "working",
-                "agent_session_path": session_path
-            }
-        }),
-    ));
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    drop(spawned);
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    thread::sleep(Duration::from_millis(700));
-
-    let after = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:get-after",
-            "method": "agent.get",
-            "params": {"target": pane_id}
-        }),
-    );
-    assert_eq!(
-        after["result"]["agent"]["agent_status"], "working",
-        "live handoff reset an active agent: {after}"
-    );
-
-    assert_eq!(unsafe { libc::kill(agent_pid, libc::SIGTERM) }, 0);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let response = request(
-            &api_socket,
-            serde_json::json!({
-                "id": "test:agent:get-after-exit",
-                "method": "agent.get",
-                "params": {"target": pane_id}
-            }),
-        );
-        if response["result"]["agent"]["agent_status"].as_str() != Some("working") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "restored agent status did not follow process exit: {response}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_reconciles_stale_agent_status() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:working",
-            "method": "pane.report_agent",
-            "params": {
-                "pane_id": pane_id,
-                "source": "custom:handoff-test",
-                "agent": "pi",
-                "state": "working"
-            }
-        }),
-    ));
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    drop(spawned);
-    wait_for_api(&api_socket, Duration::from_secs(10));
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let response = request(
-            &api_socket,
-            serde_json::json!({
-                "id": "test:agent:get-stale",
-                "method": "agent.get",
-                "params": {"target": pane_id}
-            }),
-        );
-        if response["result"]["agent"]["agent_status"].as_str() != Some("working") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stale restored agent status was not reconciled: {response}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-
-    let _ = request(
-        &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
-    );
-    cleanup_test_base(&base);
-}
-
-#[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -1830,30 +1058,26 @@ fn live_handoff_preserves_pane_process_io() {
             "params": {"pane_id": second_pane_id, "text": second_command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    support::wait_for_file(&second_marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
-    let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
-    let second_pid_text = fs::read_to_string(&second_marker).unwrap();
-    let second_child_pid: u32 = second_pid_text
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let child_pid = wait_for_pid_marker(&marker, Duration::from_secs(5));
+    let second_child_pid = wait_for_pid_marker(&second_marker, Duration::from_secs(5));
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
     assert_eq!(unsafe { libc::kill(second_child_pid as libc::pid_t, 0) }, 0);
 
-    let protocol = request(
-        &api_socket,
-        serde_json::json!({"id":"test:protocol","method":"ping","params":{}}),
-    )["result"]["protocol"]
-        .as_u64()
-        .unwrap() as u32;
+    let endpoint_generation = support::CURRENT_ENDPOINT_PROTOCOL_GENERATION;
     let mut client_stream = UnixStream::connect(&client_socket).unwrap();
-    let (server_protocol, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
-    assert_eq!(server_protocol, protocol);
-    assert!(error.is_none(), "client handshake failed: {error:?}");
+    let (server_generation, error) =
+        client_shell_handshake(&mut client_stream, endpoint_generation, 54, 23).unwrap();
+    assert_eq!(server_generation, endpoint_generation);
+    assert!(error.is_none(), "client shell handshake failed: {error:?}");
+    assert!(
+        wait_for_message_variant(
+            &mut client_stream,
+            Duration::from_secs(5),
+            SERVER_MESSAGE_ENDPOINT_CONTROL,
+        )
+        .unwrap(),
+        "client shell should receive a complete snapshot before handoff"
+    );
 
     assert_ok(request(
         &api_socket,
@@ -1869,11 +1093,16 @@ fn live_handoff_preserves_pane_process_io() {
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
-    drop(spawned);
     assert!(
-        wait_for_disconnect(&mut client_stream, Duration::from_secs(5)).unwrap(),
-        "connected clients should disconnect during live handoff"
+        wait_for_message_variant(
+            &mut client_stream,
+            Duration::from_secs(5),
+            SERVER_MESSAGE_SERVER_SHUTDOWN,
+        )
+        .unwrap(),
+        "connected client shell should receive live-handoff shutdown"
     );
+    drop(spawned);
     thread::sleep(Duration::from_millis(300));
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
@@ -1917,6 +1146,22 @@ fn live_handoff_preserves_pane_process_io() {
         Duration::from_secs(5),
     );
     wait_for_output(&api_socket, &second_pane_id, "second:after-handoff-sec");
+
+    let mut reattached_shell = UnixStream::connect(&client_socket).unwrap();
+    let (server_generation, error) = client_shell_handshake(
+        &mut reattached_shell,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION,
+        54,
+        23,
+    )
+    .unwrap();
+    assert_eq!(
+        server_generation,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION
+    );
+    assert!(error.is_none(), "reattached client shell failed: {error:?}");
+    wait_for_client_shell_bootstrap(&mut reattached_shell, Duration::from_secs(5))
+        .expect("fresh client shell should receive restored snapshot before pane content");
 
     let _ = request(
         &api_socket,
@@ -1988,12 +1233,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     ));
     support::wait_for_file(&ready_marker, Duration::from_secs(5));
 
-    let protocol = request(
-        &api_socket,
-        serde_json::json!({"id":"test:protocol","method":"ping","params":{}}),
-    )["result"]["protocol"]
-        .as_u64()
-        .unwrap() as u32;
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
@@ -2003,10 +1242,21 @@ pathlib.Path({received:?}).write_text(data.hex())
     wait_for_socket(&client_socket, Duration::from_secs(5));
 
     let mut client_stream = UnixStream::connect(&client_socket).unwrap();
-    let (server_protocol, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
-    assert_eq!(server_protocol, protocol);
-    assert!(error.is_none(), "client handshake failed: {error:?}");
-    send_input(&mut client_stream, b"\x1b[13;2u").unwrap();
+    let (server_generation, error) = client_shell_handshake(
+        &mut client_stream,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION,
+        54,
+        23,
+    )
+    .unwrap();
+    assert_eq!(
+        server_generation,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION
+    );
+    assert!(error.is_none(), "client shell handshake failed: {error:?}");
+    wait_for_client_shell_bootstrap(&mut client_stream, Duration::from_secs(5))
+        .expect("client shell should receive restored state before sending input");
+    send_client_shell_shift_enter(&mut client_stream, &pane_id).unwrap();
 
     wait_for_file_contains(&received_marker, "1b5b31333b3275", Duration::from_secs(5));
 
@@ -2079,12 +1329,6 @@ pathlib.Path({received:?}).write_text(data.hex())
     ));
     support::wait_for_file(&ready_marker, Duration::from_secs(5));
 
-    let protocol = request(
-        &api_socket,
-        serde_json::json!({"id":"test:protocol","method":"ping","params":{}}),
-    )["result"]["protocol"]
-        .as_u64()
-        .unwrap() as u32;
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
@@ -2094,10 +1338,21 @@ pathlib.Path({received:?}).write_text(data.hex())
     wait_for_socket(&client_socket, Duration::from_secs(5));
 
     let mut client_stream = UnixStream::connect(&client_socket).unwrap();
-    let (server_protocol, error) = client_handshake(&mut client_stream, protocol, 80, 24).unwrap();
-    assert_eq!(server_protocol, protocol);
-    assert!(error.is_none(), "client handshake failed: {error:?}");
-    send_input(&mut client_stream, b"\x1b[13;2u").unwrap();
+    let (server_generation, error) = client_shell_handshake(
+        &mut client_stream,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION,
+        54,
+        23,
+    )
+    .unwrap();
+    assert_eq!(
+        server_generation,
+        support::CURRENT_ENDPOINT_PROTOCOL_GENERATION
+    );
+    assert!(error.is_none(), "client shell handshake failed: {error:?}");
+    wait_for_client_shell_bootstrap(&mut client_stream, Duration::from_secs(5))
+        .expect("client shell should receive restored state before sending input");
+    send_client_shell_shift_enter(&mut client_stream, &pane_id).unwrap();
 
     wait_for_file_contains(
         &received_marker,
@@ -2212,7 +1467,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
             started_marker.display()
         ),
     )
@@ -2361,9 +1616,13 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     let api_socket = runtime_dir.join("herdr.sock");
     let started_marker = base.join("agent-started");
     let exited_marker = base.join("agent-exited");
+    let ready_marker = base.join("shell-ready");
     let shell_marker = base.join("shell-after-agent");
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
+    let delayed_shell = bin.join("delayed-shell");
+    fs::write(&delayed_shell, "#!/bin/sh\n/bin/sleep 0.4\nexec /bin/sh\n").unwrap();
+    fs::set_permissions(&delayed_shell, fs::Permissions::from_mode(0o755)).unwrap();
     let fake_pi = bin.join("pi");
     fs::write(
         &fake_pi,
@@ -2381,7 +1640,10 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         &config_home,
         &runtime_dir,
         &api_socket,
-        &[("PATH", path.as_str())],
+        &[
+            ("PATH", path.as_str()),
+            ("SHELL", delayed_shell.to_str().unwrap()),
+        ],
     );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
@@ -2399,31 +1661,35 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         .unwrap()
         .to_string();
 
-    let start_deadline = Instant::now() + Duration::from_secs(5);
-    let started = loop {
-        let response = request(
-            &api_socket,
-            serde_json::json!({
-                "id": "test:agent-start",
-                "method": "agent.start",
-                "params": {
-                    "name": "handoff-agent",
-                    "kind": "pi",
-                    "pane_id": pane_id,
-                    "timeout_ms": 5000
-                }
-            }),
-        );
-        if response.get("result").is_some() {
-            break response;
-        }
-        assert_eq!(response["error"]["code"], "agent_pane_busy", "{response}");
-        assert!(
-            Instant::now() < start_deadline,
-            "new pane shell did not become available: {response}"
-        );
-        thread::sleep(Duration::from_millis(25));
-    };
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:shell-ready",
+            "method": "pane.send_input",
+            "params": {
+                "pane_id": pane_id,
+                "text": format!("printf ready > {}", ready_marker.display()),
+                "keys": ["Enter"]
+            }
+        }),
+    ));
+    // Creation acknowledges the PTY, not an idle interactive shell. A real
+    // shell command must execute before this raw agent.start request.
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+
+    let started = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent-start",
+            "method": "agent.start",
+            "params": {
+                "name": "handoff-agent",
+                "kind": "pi",
+                "pane_id": pane_id,
+                "timeout_ms": 5000
+            }
+        }),
+    );
     assert_ok(started);
     support::wait_for_file(&started_marker, Duration::from_secs(5));
 
@@ -2724,9 +1990,7 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
             "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
-    let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
+    let child_pid = wait_for_pid_marker(&marker, Duration::from_secs(5));
 
     let failed = request(
         &api_socket,
@@ -2810,9 +2074,7 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
             "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    let pid_text = fs::read_to_string(&marker).unwrap();
-    let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
+    let child_pid = wait_for_pid_marker(&marker, Duration::from_secs(5));
 
     let failed = request(
         &api_socket,

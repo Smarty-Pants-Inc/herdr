@@ -4,34 +4,23 @@ use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::layout::{Position, Rect, Size};
 
 use crate::app::state::AppState;
-use crate::app::Mode;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
-use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
+use crate::protocol::{
+    CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePatch, RenderEncoding, ServerMessage,
+    TerminalFrame,
+};
 use crate::terminal::TerminalRuntimeRegistry;
-
-pub(crate) fn identity_ui_state(
-    identity: Option<&crate::server::clients::AppIdentity>,
-) -> crate::ui::IdentityUiState {
-    let Some(identity) = identity else {
-        return crate::ui::IdentityUiState::default();
-    };
-    crate::ui::IdentityUiState {
-        committed_name: identity
-            .committed
-            .as_ref()
-            .map(|committed| committed.name.clone()),
-        editor_open: identity.editor.open,
-        draft: identity.editor.draft.clone(),
-        cursor: identity.editor.cursor,
-        saving: identity.pending.is_some(),
-        error: identity.editor.error.clone(),
-    }
-}
 
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
-    Semantic { last_frame: Option<FrameData> },
+    Semantic {
+        last_surface: Option<Box<PaneSurfaceFrame>>,
+        surface_revision: u64,
+        surface_reuse: bool,
+        surface_delta: bool,
+        recompute_pending: bool,
+    },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi {
         blit_encoder: BlitEncoder,
@@ -43,7 +32,13 @@ pub(crate) enum ClientRenderState {
 impl ClientRenderState {
     pub(crate) fn new(render_encoding: RenderEncoding) -> Self {
         match render_encoding {
-            RenderEncoding::SemanticFrame => Self::Semantic { last_frame: None },
+            RenderEncoding::SemanticFrame => Self::Semantic {
+                last_surface: None,
+                surface_revision: 0,
+                surface_reuse: false,
+                surface_delta: false,
+                recompute_pending: false,
+            },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
                 seq: 0,
@@ -52,9 +47,44 @@ impl ClientRenderState {
         }
     }
 
+    pub(crate) fn enable_surface_reuse(&mut self, enabled: bool) {
+        if let Self::Semantic { surface_reuse, .. } = self {
+            *surface_reuse = enabled;
+        }
+    }
+
+    pub(crate) fn enable_surface_delta(&mut self, enabled: bool) {
+        if let Self::Semantic { surface_delta, .. } = self {
+            *surface_delta = enabled;
+        }
+    }
+
+    pub(crate) fn request_recompute(&mut self) {
+        if let Self::Semantic {
+            surface_delta: true,
+            recompute_pending,
+            ..
+        } = self
+        {
+            *recompute_pending = true;
+        } else {
+            self.request_repaint();
+        }
+    }
+
+    pub(crate) fn requires_recompute(&self) -> bool {
+        matches!(
+            self,
+            Self::Semantic {
+                recompute_pending: true,
+                ..
+            }
+        )
+    }
+
     pub(crate) fn reset_baseline(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic { last_surface, .. } => *last_surface = None,
             Self::TerminalAnsi {
                 blit_encoder,
                 repaint_pending,
@@ -68,31 +98,16 @@ impl ClientRenderState {
 
     pub(crate) fn request_repaint(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic { last_surface, .. } => *last_surface = None,
             Self::TerminalAnsi {
                 repaint_pending, ..
             } => *repaint_pending = true,
         }
     }
 
-    pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
-            *last_frame = None;
-        }
-    }
-
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
-            Self::Semantic { last_frame } => {
-                if last_frame.as_ref() == Some(&frame) {
-                    crate::render_prof::event("prepare_frame.semantic.skip_current");
-                    return None;
-                }
-                crate::render_prof::event("prepare_frame.semantic.changed");
-                Some(PreparedRender::Semantic {
-                    message: ServerMessage::Frame(frame),
-                })
-            }
+            Self::Semantic { .. } => None,
             Self::TerminalAnsi {
                 blit_encoder,
                 seq,
@@ -130,21 +145,143 @@ impl ClientRenderState {
         }
     }
 
-    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
+    pub(crate) fn last_pane_surface(&self) -> Option<&PaneSurfaceFrame> {
         match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
-            Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
+            Self::Semantic { last_surface, .. } => last_surface.as_deref(),
+            Self::TerminalAnsi { .. } => None,
         }
+    }
+
+    pub(crate) fn prepare_pane_surface(
+        &mut self,
+        mut surface: PaneSurfaceFrame,
+    ) -> Option<PreparedRender> {
+        let Self::Semantic {
+            last_surface,
+            surface_revision,
+            surface_reuse,
+            surface_delta,
+            recompute_pending,
+        } = self
+        else {
+            return None;
+        };
+        if !*recompute_pending
+            && surface.graphics.assets.is_empty()
+            && last_surface.as_deref().is_some_and(|last| {
+                last.projection_revision == surface.projection_revision
+                    && last.frame == surface.frame
+                    && last.panes == surface.panes
+                    && last.splits == surface.splits
+                    && last.popup == surface.popup
+                    && last.graphics.placements == surface.graphics.placements
+                    && last.graphics.retained_assets == surface.graphics.retained_assets
+            })
+        {
+            return None;
+        }
+        surface.surface_revision = surface_revision.saturating_add(1);
+        let assets = std::mem::take(&mut surface.graphics.assets);
+        let committed_surface = surface.clone();
+        surface.graphics.assets = assets;
+        let mut message = ServerMessage::PaneSurface(surface);
+        let delta = (*surface_delta)
+            .then_some(last_surface.as_deref())
+            .flatten()
+            .and_then(|last| {
+                crate::protocol::surface_delta::message(last, &mut message)
+                    .map_err(|error| tracing::warn!(%error, "failed to encode surface delta"))
+                    .ok()
+                    .flatten()
+            });
+        let reused = if let ServerMessage::PaneSurface(surface) = &mut message {
+            (delta.is_none() && *surface_reuse)
+                .then_some(last_surface.as_deref())
+                .flatten()
+                .filter(|last| {
+                    last.boot_id == surface.boot_id
+                        && last.frame == surface.frame
+                        // Popup cells are not part of the reusable grid; keep their compact codec.
+                        && surface.popup.is_none()
+                        && surface.graphics.assets.is_empty()
+                })
+                .and_then(|last| {
+                    crate::protocol::surface_reuse::message(last.surface_revision, surface)
+                        .map_err(|error| tracing::warn!(%error, "failed to encode surface reuse"))
+                        .ok()
+                        .flatten()
+                })
+        } else {
+            None
+        };
+        Some(PreparedRender::Semantic {
+            message: delta.or(reused).unwrap_or(message),
+            committed_surface: Box::new(committed_surface),
+        })
+    }
+
+    pub(crate) fn prepare_pane_surface_patch(
+        &self,
+        mut patch: PaneSurfacePatch,
+    ) -> Option<PreparedRender> {
+        let Self::Semantic {
+            last_surface,
+            surface_revision,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if self.requires_recompute() {
+            return None;
+        }
+        let last = last_surface.as_deref()?;
+        if last.boot_id != patch.boot_id
+            || last.projection_revision != patch.projection_revision
+            || last.surface_revision != patch.base_surface_revision
+        {
+            return None;
+        }
+        let next_revision = surface_revision.saturating_add(1);
+        patch.surface_revision = next_revision;
+        Some(PreparedRender::SemanticPatch {
+            message: ServerMessage::PaneSurfacePatch(patch),
+        })
     }
 
     pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
         match (self, prepared) {
             (
-                Self::Semantic { last_frame },
-                PreparedRender::Semantic {
-                    message: ServerMessage::Frame(frame),
+                Self::Semantic {
+                    last_surface,
+                    surface_revision,
+                    recompute_pending,
+                    ..
                 },
-            ) => *last_frame = Some(frame),
+                PreparedRender::Semantic {
+                    committed_surface, ..
+                },
+            ) => {
+                *surface_revision = committed_surface.surface_revision;
+                *last_surface = Some(committed_surface);
+                *recompute_pending = false;
+            }
+            (
+                Self::Semantic {
+                    last_surface,
+                    surface_revision,
+                    ..
+                },
+                PreparedRender::SemanticPatch {
+                    message: ServerMessage::PaneSurfacePatch(patch),
+                },
+            ) => {
+                let surface = last_surface
+                    .as_deref_mut()
+                    .expect("prepared patch baseline");
+                apply_pane_surface_patch(surface, &patch);
+                *surface_revision = patch.surface_revision;
+            }
             (
                 Self::TerminalAnsi {
                     blit_encoder,
@@ -164,14 +301,28 @@ impl ClientRenderState {
             _ => {}
         }
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn terminal_seq(&self) -> Option<u64> {
-        match self {
-            Self::Semantic { .. } => None,
-            Self::TerminalAnsi { seq, .. } => Some(*seq),
-        }
+// Planning validates all rows and pane IDs before any send. The server does not yield
+// between planning and commit, so applying the accepted patch cannot fail partway through.
+pub(super) fn apply_pane_surface_patch(surface: &mut PaneSurfaceFrame, patch: &PaneSurfacePatch) {
+    debug_assert_eq!(surface.boot_id, patch.boot_id);
+    debug_assert_eq!(surface.projection_revision, patch.projection_revision);
+    debug_assert_eq!(surface.surface_revision, patch.base_surface_revision);
+    for row in &patch.rows {
+        let start = usize::from(row.y) * usize::from(surface.frame.width) + usize::from(row.x);
+        surface.frame.cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
     }
+    for updated in &patch.panes {
+        let pane = surface
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_id == updated.pane_id)
+            .expect("planned patch pane");
+        pane.clone_from(updated);
+    }
+    surface.frame.cursor.clone_from(&patch.cursor);
+    surface.surface_revision = patch.surface_revision;
 }
 
 fn insert_graphics_before_sync_end(encoded: &mut Vec<u8>, graphics: &[u8]) {
@@ -190,6 +341,10 @@ fn insert_graphics_before_sync_end(encoded: &mut Vec<u8>, graphics: &[u8]) {
 pub(crate) enum PreparedRender {
     Semantic {
         message: ServerMessage,
+        committed_surface: Box<PaneSurfaceFrame>,
+    },
+    SemanticPatch {
+        message: ServerMessage,
     },
     TerminalAnsi {
         message: ServerMessage,
@@ -201,18 +356,25 @@ pub(crate) enum PreparedRender {
 impl PreparedRender {
     pub(crate) fn message(&self) -> &ServerMessage {
         match self {
-            Self::Semantic { message } | Self::TerminalAnsi { message, .. } => message,
+            Self::Semantic { message, .. }
+            | Self::SemanticPatch { message }
+            | Self::TerminalAnsi { message, .. } => message,
         }
     }
 
-    pub(crate) fn into_frame(self) -> Option<FrameData> {
-        match self {
-            Self::Semantic {
-                message: ServerMessage::Frame(frame),
-            } => Some(frame),
-            Self::TerminalAnsi { frame, .. } => Some(frame),
-            _ => None,
+    pub(crate) fn strip_pane_surface_assets(&mut self) -> bool {
+        let Self::Semantic {
+            message: ServerMessage::PaneSurface(surface),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if surface.graphics.assets.is_empty() {
+            return false;
         }
+        surface.graphics.assets.clear();
+        true
     }
 }
 
@@ -299,180 +461,42 @@ impl Backend for CursorTrackingBackend {
     }
 }
 
-/// Renders the AppState to an in-memory ratatui Buffer.
-///
-/// This produces the same output as the monolithic binary's terminal draw,
-/// but writes to a `Buffer` instead of stdout. Cursor visibility is captured
-/// from explicit frame cursor intent rather than incidental backend state.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn render_virtual(
-    app_state: &mut AppState,
-    area: Rect,
-    resize_panes: bool,
-) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let terminal_runtimes = TerminalRuntimeRegistry::new();
-    render_virtual_with_runtime_registry(
-        app_state,
-        &terminal_runtimes,
-        area,
-        resize_panes,
-        crate::kitty_graphics::HostCellSize::default(),
-    )
-}
+pub(crate) type RenderedTabSurface = (
+    ratatui::buffer::Buffer,
+    Option<CursorState>,
+    Vec<((u16, u16), String, String)>,
+    crate::ui::TabSurfaceLayout,
+);
 
-pub(crate) fn render_virtual_with_runtime_registry(
-    app_state: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-    resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
-) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    render_virtual_with_runtime_registry_and_identity_and_private_surface(
-        app_state,
-        terminal_runtimes,
-        area,
-        resize_panes,
-        cell_size,
-        &crate::ui::IdentityUiState::default(),
-        None,
-    )
-}
-
-pub(crate) fn render_virtual_with_runtime_registry_and_identity_and_private_surface(
-    app_state: &mut AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-    resize_panes: bool,
-    cell_size: crate::kitty_graphics::HostCellSize,
-    identity: &crate::ui::IdentityUiState,
-    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
-) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
-    let pre_compute_suppresses_focused_terminal_cursor =
-        !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
-    if resize_panes {
-        crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
-    } else {
-        crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
-    }
-    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
-        || (!popup_visible
-            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
-    render_precomputed_virtual_inner(
-        app_state,
-        terminal_runtimes,
-        area,
-        suppress_focused_terminal_cursor,
-        identity,
-        private_surface,
-    )
-}
-
-pub(crate) fn render_precomputed_virtual_with_runtime_registry_and_private_surface(
+/// Renders only the active tab's pane surface at an origin-relative client viewport.
+pub(crate) fn render_tab_surface_virtual(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    layout: crate::ui::TabSurfaceLayout,
     area: Rect,
-    pre_compute_suppresses_focused_terminal_cursor: bool,
-    identity: &crate::ui::IdentityUiState,
-    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
-) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let popup_visible = app_state.popup_pane.is_some() || private_surface.is_some();
-    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
-        || (!popup_visible
-            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
-    render_precomputed_virtual_inner(
-        app_state,
-        terminal_runtimes,
-        area,
-        suppress_focused_terminal_cursor,
-        identity,
-        private_surface,
-    )
-}
+) -> RenderedTabSurface {
+    let surface = crate::ui::TabSurfaceView {
+        target: layout.target,
+        pane_infos: &layout.pane_infos,
+        split_borders: &layout.split_borders,
+    };
+    let cursor = crate::ui::tab_surface_cursor(app_state, terminal_runtimes, surface);
+    let hyperlinks = crate::ui::tab_surface_hyperlinks(app_state, terminal_runtimes, surface);
 
-fn render_precomputed_virtual_inner(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-    area: Rect,
-    suppress_focused_terminal_cursor: bool,
-    identity: &crate::ui::IdentityUiState,
-    private_surface: Option<&crate::server::private_surface::PrivateSurface>,
-) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
-
     terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry_and_identity(
-                app_state,
-                terminal_runtimes,
-                frame,
-                identity,
-            );
+            crate::ui::render_tab_surface(app_state, terminal_runtimes, surface, frame);
         })
         .expect("render to TestBackend should never fail");
 
-    let buffer = terminal.backend().buffer().clone();
-    let cursor = if let Some(surface) = private_surface {
-        surface.cursor(app_state.view.terminal_area)
-    } else if identity.editor_open {
-        terminal.backend().rendered_cursor()
-    } else if app_state.popup_pane.is_some() {
-        popup_terminal_cursor(app_state, terminal_runtimes)
-    } else if suppress_focused_terminal_cursor {
-        None
-    } else {
-        focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
-            (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
-                .then(|| terminal.backend().rendered_cursor())
-                .flatten()
-        })
-    };
-
-    (buffer, cursor)
-}
-
-pub(crate) fn overlay_private_surface(
-    buffer: &mut ratatui::buffer::Buffer,
-    surface: &crate::server::private_surface::PrivateSurface,
-    palette: &crate::app::state::Palette,
-    area: Rect,
-) {
-    let Some(outer) = surface.outer_rect(area) else {
-        return;
-    };
-    let backend = CursorTrackingBackend::new(buffer.area.right(), buffer.area.bottom());
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
-    terminal
-        .draw(|frame| surface.render(frame, palette, area))
-        .expect("render to TestBackend should never fail");
-    let overlay = terminal.backend().buffer();
-    let x_end = outer.right().min(buffer.area.right());
-    let y_end = outer.bottom().min(buffer.area.bottom());
-    for y in outer.y.max(buffer.area.y)..y_end {
-        for x in outer.x.max(buffer.area.x)..x_end {
-            buffer[(x, y)] = overlay[(x, y)].clone();
-        }
-    }
-}
-
-fn popup_terminal_cursor(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Option<CursorState> {
-    let popup = app_state.popup_pane.as_ref()?;
-    let runtime = terminal_runtimes.get(&popup.terminal_id)?;
-    if runtime.synchronized_output_active() {
-        return None;
-    }
-    let (_, inner) = crate::ui::popup_pane_rects(app_state, app_state.view.terminal_area)?;
-    let cursor = runtime.cursor_state(inner, true)?;
-    Some(CursorState {
-        x: cursor.x,
-        y: cursor.y,
-        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
-        shape: cursor.shape,
-    })
+    (
+        terminal.backend().buffer().clone(),
+        cursor,
+        hyperlinks,
+        layout,
+    )
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
@@ -509,270 +533,233 @@ pub(crate) fn render_terminal_virtual(
     (buffer, cursor)
 }
 
-pub(crate) fn visible_hyperlinks(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Vec<((u16, u16), String, String)> {
-    crate::ui::tab_surface_hyperlinks(app_state, terminal_runtimes, app_state.view.tab_surface())
-}
-
-pub(crate) fn focused_terminal_cursor(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Option<CursorState> {
-    workspace_plugin_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
-        crate::ui::tab_surface_cursor(app_state, terminal_runtimes, app_state.view.tab_surface())
-    })
-}
-
-fn workspace_plugin_terminal_cursor(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Option<CursorState> {
-    let (_, pane) = app_state.focused_workspace_plugin_pane()?;
-    let runtime = terminal_runtimes.get(&pane.terminal_id)?;
-    if runtime.synchronized_output_active() {
-        return None;
-    }
-    let cursor = runtime.cursor_state(app_state.view.workspace_plugin_pane_inner, true)?;
-    Some(CursorState {
-        x: cursor.x,
-        y: cursor.y,
-        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
-        shape: cursor.shape,
-    })
-}
-
-fn focused_terminal_owns_host_cursor(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> bool {
-    if app_state.mode != Mode::Terminal {
-        return false;
-    }
-    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
-        return terminal_runtimes.get(&pane.terminal_id).is_some();
-    }
-
-    let Some(ws_idx) = app_state.active else {
-        return false;
-    };
-    let Some(info) = app_state
-        .view
-        .pane_infos
-        .iter()
-        .find(|info| info.is_focused)
-    else {
-        return false;
-    };
-    if !app_state.pane_exposes_host_cursor(ws_idx, info.id) {
-        return false;
-    }
-
-    app_state
-        .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
-        .is_some()
-}
-
-pub(crate) fn focused_terminal_suppresses_host_cursor(
-    app_state: &AppState,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> bool {
-    if app_state.mode != Mode::Terminal {
-        return false;
-    }
-    if let Some((_, pane)) = app_state.focused_workspace_plugin_pane() {
-        return terminal_runtimes
-            .get(&pane.terminal_id)
-            .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active);
-    }
-
-    let Some(ws_idx) = app_state.active else {
-        return false;
-    };
-    let Some(info) = app_state
-        .view
-        .pane_infos
-        .iter()
-        .find(|info| info.is_focused)
-    else {
-        return false;
-    };
-    if !app_state.pane_exposes_host_cursor(ws_idx, info.id) {
-        return false;
-    }
-
-    app_state
-        .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
-        .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
-}
-
 #[cfg(test)]
-mod render_scale_benchmark {
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    use ratatui::layout::Direction;
-
+mod tests {
     use super::*;
-    use crate::app::Mode;
-    use crate::terminal::TerminalRuntime;
-    use crate::workspace::Workspace;
+    use crate::protocol::ClientShellPopupSurface;
 
-    const AREA: Rect = Rect::new(0, 0, 120, 40);
-    const SAMPLE_COUNT: usize = 40;
-    const WARMUP_COUNT: usize = 5;
-
-    #[derive(Clone, Copy)]
-    struct RenderStats {
-        median_us: u128,
-        p95_us: u128,
-        max_us: u128,
-    }
-
-    fn history() -> String {
-        (0..2_000).map(|line| format!("line-{line}\r\n")).collect()
-    }
-
-    fn runtime(history: &str) -> TerminalRuntime {
-        TerminalRuntime::test_with_scrollback_bytes(
-            AREA.width,
-            AREA.height,
-            1024 * 1024,
-            history.as_bytes(),
-        )
-    }
-
-    fn app_with_workspaces(workspace_count: usize) -> AppState {
-        let history = history();
-        let workspaces = (0..workspace_count)
-            .map(|index| {
-                let mut workspace = Workspace::test_new(&format!("bench-{}", index + 1));
-                let root_pane = workspace.tabs[0].root_pane;
-                workspace.tabs[0]
-                    .runtimes
-                    .insert(root_pane, runtime(&history));
-                workspace
-            })
-            .collect();
-        app_with(workspaces)
-    }
-
-    fn app_with_active_panes(pane_count: usize) -> AppState {
-        let history = history();
-        let mut workspace = Workspace::test_new("bench");
-        let root_pane = workspace.tabs[0].root_pane;
-        workspace.tabs[0]
-            .runtimes
-            .insert(root_pane, runtime(&history));
-        let mut pane_ids = vec![root_pane];
-
-        for index in 1..pane_count {
-            let target = pane_ids[(index - 1) / 2];
-            workspace.tabs[0].layout.focus_pane(target);
-            let direction = if index % 2 == 0 {
-                Direction::Vertical
-            } else {
-                Direction::Horizontal
-            };
-            let pane_id = workspace.test_split(direction);
-            workspace.tabs[0]
-                .runtimes
-                .insert(pane_id, runtime(&history));
-            pane_ids.push(pane_id);
-        }
-
-        app_with(vec![workspace])
-    }
-
-    fn app_with(workspaces: Vec<Workspace>) -> AppState {
-        let mut app = AppState::test_new();
-        app.mode = Mode::Terminal;
-        app.pane_scrollbars = true;
-        app.workspaces = workspaces;
-        app.active = Some(0);
-        app.selected = 0;
-        app
-    }
-
-    fn profile(mut app: AppState) -> RenderStats {
-        for _ in 0..WARMUP_COUNT {
-            black_box(render_virtual(&mut app, AREA, true));
-        }
-
-        let mut samples = Vec::with_capacity(SAMPLE_COUNT);
-        for _ in 0..SAMPLE_COUNT {
-            let started = Instant::now();
-            black_box(render_virtual(&mut app, AREA, true));
-            samples.push(started.elapsed().as_micros());
-        }
-        samples.sort_unstable();
-
-        RenderStats {
-            median_us: samples[SAMPLE_COUNT / 2],
-            p95_us: samples[(SAMPLE_COUNT - 1) * 95 / 100],
-            max_us: samples[SAMPLE_COUNT - 1],
+    fn popup_surface(content: &str) -> PaneSurfaceFrame {
+        let pane = ratatui::buffer::Buffer::with_lines(["pane"]);
+        let popup = ratatui::buffer::Buffer::with_lines([content]);
+        PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            surface_revision: 1,
+            frame: FrameData::from_ratatui_buffer_with_hyperlinks(&pane, None, &[]),
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: Some(Box::new(ClientShellPopupSurface {
+                terminal_id: "popup-terminal".into(),
+                title: "popup".into(),
+                width: None,
+                height: None,
+                frame: FrameData::from_ratatui_buffer_with_hyperlinks(&popup, None, &[]),
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                pixel_width: 0,
+                pixel_height: 0,
+            })),
+            graphics: crate::protocol::SurfaceGraphicsScene::default(),
         }
     }
 
-    fn profile_cardinalities(build: fn(usize) -> AppState) -> [(usize, RenderStats); 3] {
-        [1, 15, 50].map(|count| (count, profile(build(count))))
-    }
-
-    fn print_profiles(label: &str, profiles: [(usize, RenderStats); 3]) {
-        let baseline_median_us = profiles[0].1.median_us as f64;
-        let baseline_p95_us = profiles[0].1.p95_us as f64;
-        println!("{label}");
-        println!("     count  median_us  p95_us  max_us  median_vs_1x  p95_vs_1x");
-        for (count, stats) in profiles {
-            println!(
-                "{count:>10}  {:>9}  {:>6}  {:>6}  {:>12.2}  {:>9.2}",
-                stats.median_us,
-                stats.p95_us,
-                stats.max_us,
-                stats.median_us as f64 / baseline_median_us,
-                stats.p95_us as f64 / baseline_p95_us,
+    #[test]
+    fn surface_delta_recompute_preserves_wire_baseline_but_epoch_reset_drops_it() {
+        for enabled in [false, true] {
+            let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+            state.enable_surface_delta(enabled);
+            let mut surface = popup_surface("popup");
+            surface.popup = None;
+            surface.frame = FrameData::from_ratatui_buffer(
+                &ratatui::buffer::Buffer::empty(Rect::new(0, 0, 120, 40)),
+                None,
+            );
+            let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+            state.commit_sent_frame(initial);
+            state.request_recompute();
+            assert_eq!(state.last_pane_surface().is_some(), enabled);
+            assert_eq!(state.requires_recompute(), enabled);
+            // A freshness request still emits a new revision when every cell is equal.
+            let fresh = state.prepare_pane_surface(surface.clone()).unwrap();
+            assert_eq!(
+                matches!(fresh.message(), ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::surface_delta::MESSAGE_KIND),
+                enabled
+            );
+            assert_eq!(
+                state.requires_recompute(),
+                enabled,
+                "prepare must not commit"
+            );
+            state.commit_sent_frame(fresh);
+            assert!(!state.requires_recompute());
+            assert_eq!(state.last_pane_surface().unwrap().surface_revision, 2);
+            state.request_repaint();
+            assert!(state.last_pane_surface().is_none());
+            let recovery = state.prepare_pane_surface(surface).unwrap();
+            assert!(
+                matches!(recovery.message(), ServerMessage::PaneSurface(frame) if frame.surface_revision == 3)
             );
         }
     }
 
-    fn assert_full_render_avoids_aggregate_input_state(mut app: AppState, scenario: &str) {
-        crate::pane::reset_aggregate_input_state_reads();
-        black_box(render_virtual(&mut app, AREA, true));
-        assert_eq!(
-            crate::pane::aggregate_input_state_reads(),
-            0,
-            "full render collected aggregate input state for {scenario}",
-        );
+    #[test]
+    fn surface_reuse_preserves_projection_and_patch_baselines_without_resending_cells() {
+        for enabled in [false, true] {
+            let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+            state.enable_surface_reuse(enabled);
+            let mut decoder = crate::protocol::surface_reuse::Decoder::default();
+            let mut surface = popup_surface("popup");
+            surface.popup = None;
+            let buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 240, 100));
+            surface.frame = FrameData::from_ratatui_buffer(&buffer, None);
+            let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+            decoder.decode(initial.message().clone()).unwrap();
+            state.commit_sent_frame(initial);
+
+            surface.projection_revision += 1;
+            let update = state.prepare_pane_surface(surface.clone()).unwrap();
+            let mut bytes = Vec::new();
+            crate::protocol::write_message(&mut bytes, update.message()).unwrap();
+            if enabled {
+                assert!(
+                    matches!(update.message(), ServerMessage::EndpointControl { kind, .. }
+                    if kind == crate::protocol::surface_reuse::MESSAGE_KIND)
+                );
+                assert!(
+                    bytes.len() < 2000,
+                    "metadata update was {} bytes",
+                    bytes.len()
+                );
+            } else {
+                assert!(matches!(update.message(), ServerMessage::PaneSurface(_)));
+                assert!(bytes.len() > 100_000);
+            }
+            let ServerMessage::PaneSurface(decoded) =
+                decoder.decode(update.message().clone()).unwrap()
+            else {
+                panic!("decoded full surface");
+            };
+            assert_eq!(decoded.frame, surface.frame);
+            assert_eq!(decoded.projection_revision, surface.projection_revision);
+            assert_eq!(decoded.surface_revision, 2);
+            state.commit_sent_frame(update);
+
+            let mut changed_cell = surface.frame.cells[0].clone();
+            changed_cell.symbol = "x".into();
+            let patch = state
+                .prepare_pane_surface_patch(PaneSurfacePatch {
+                    boot_id: surface.boot_id.clone(),
+                    projection_revision: surface.projection_revision,
+                    base_surface_revision: 2,
+                    surface_revision: 0,
+                    rows: vec![crate::protocol::PaneSurfacePatchRow {
+                        x: 0,
+                        y: 0,
+                        cells: vec![changed_cell.clone()],
+                    }],
+                    panes: Vec::new(),
+                    cursor: None,
+                })
+                .unwrap();
+            decoder.decode(patch.message().clone()).unwrap();
+            state.commit_sent_frame(patch);
+            surface.frame.cells[0] = changed_cell;
+            surface.projection_revision += 1;
+            let update = state.prepare_pane_surface(surface.clone()).unwrap();
+            let ServerMessage::PaneSurface(decoded) =
+                decoder.decode(update.message().clone()).unwrap()
+            else {
+                panic!("decoded surface after patch");
+            };
+            assert_eq!(decoded.frame, surface.frame);
+            assert_eq!(decoded.surface_revision, 4);
+            state.commit_sent_frame(update);
+
+            // A changed border or terminal cell must still reach the client.
+            surface.frame.cells[0].symbol = "y".into();
+            let changed = state.prepare_pane_surface(surface.clone()).unwrap();
+            assert!(matches!(changed.message(), ServerMessage::PaneSurface(_)));
+            let ServerMessage::PaneSurface(decoded) =
+                decoder.decode(changed.message().clone()).unwrap()
+            else {
+                panic!("changed full surface");
+            };
+            assert_eq!(decoded.frame, surface.frame);
+            state.commit_sent_frame(changed);
+
+            state.request_repaint();
+            assert!(matches!(
+                state.prepare_pane_surface(surface).unwrap().message(),
+                ServerMessage::PaneSurface(_)
+            ));
+        }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn aggregate_input_state_counter_records_reads() {
-        let runtime = TerminalRuntime::test_with_screen_bytes(80, 24, b"");
-        crate::pane::reset_aggregate_input_state_reads();
-        black_box(runtime.input_state());
-        assert_eq!(crate::pane::aggregate_input_state_reads(), 1);
+    #[test]
+    fn surface_reuse_keeps_popup_cells_on_the_binary_codec() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        state.enable_surface_reuse(true);
+        let mut surface = popup_surface("popup");
+        let buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 400, 100));
+        surface.popup.as_mut().unwrap().frame = FrameData::from_ratatui_buffer(&buffer, None);
+        let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+        state.commit_sent_frame(initial);
+        surface.projection_revision += 1;
+        let update = state.prepare_pane_surface(surface).unwrap();
+        assert!(matches!(update.message(), ServerMessage::PaneSurface(_)));
+        let mut bytes = Vec::new();
+        crate::protocol::write_message(&mut bytes, update.message()).unwrap();
+        assert!(bytes.len() < crate::protocol::MAX_FRAME_SIZE);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_render_avoids_aggregate_input_state_reads() {
-        assert_full_render_avoids_aggregate_input_state(
-            app_with_workspaces(15),
-            "background workspaces",
-        );
-        assert_full_render_avoids_aggregate_input_state(app_with_active_panes(15), "active panes");
+    #[test]
+    fn surface_reuse_falls_back_when_json_metadata_exceeds_the_frame_limit() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        state.enable_surface_reuse(true);
+        let mut surface = popup_surface("popup");
+        surface.popup = None;
+        surface.frame.hyperlinks = vec!["\"".repeat(crate::protocol::MAX_FRAME_SIZE / 2)];
+        let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+        state.commit_sent_frame(initial);
+        surface.projection_revision += 1;
+        let update = state.prepare_pane_surface(surface).unwrap();
+        assert!(matches!(update.message(), ServerMessage::PaneSurface(_)));
+        let mut bytes = Vec::new();
+        crate::protocol::write_message(&mut bytes, update.message()).unwrap();
+        assert!(bytes.len() < crate::protocol::MAX_FRAME_SIZE);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore = "manual full-render scaling profile"]
-    async fn render_scale_profile() {
-        print_profiles(
-            "background-workspace resize/layout (one pane each)",
-            profile_cardinalities(app_with_workspaces),
-        );
-        print_profiles(
-            "active panes (one workspace)",
-            profile_cardinalities(app_with_active_panes),
-        );
+    #[test]
+    fn popup_only_surface_changes_are_not_deduplicated() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let prepared = state
+            .prepare_pane_surface(popup_surface("first"))
+            .expect("initial surface");
+        state.commit_sent_frame(prepared);
+
+        assert!(state
+            .prepare_pane_surface(popup_surface("second"))
+            .is_some());
+    }
+
+    #[test]
+    fn forced_full_surface_keeps_the_connection_revision_monotonic() {
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        let prepared = state
+            .prepare_pane_surface(popup_surface("first"))
+            .expect("initial surface");
+        state.commit_sent_frame(prepared);
+        state.request_repaint();
+
+        let prepared = state
+            .prepare_pane_surface(popup_surface("replacement"))
+            .expect("forced replacement surface");
+        assert!(matches!(
+            prepared.message(),
+            ServerMessage::PaneSurface(surface) if surface.surface_revision == 2
+        ));
+        state.commit_sent_frame(prepared);
+        assert_eq!(state.last_pane_surface().unwrap().surface_revision, 2);
     }
 }

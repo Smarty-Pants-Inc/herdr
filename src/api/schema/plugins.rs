@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,8 +51,6 @@ pub struct InstalledPluginInfo {
     pub build: Vec<PluginManifestBuild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub startup: Vec<PluginManifestStartup>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub execution_providers: Vec<PluginManifestExecutionProvider>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<PluginManifestAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -246,16 +241,6 @@ pub struct PluginManifestStartup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PluginManifestExecutionProvider {
-    pub scheme: String,
-    pub protocol: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub platforms: Option<Vec<PluginPlatform>>,
-    pub pty_command: Vec<String>,
-    pub process_command: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginManifestAction {
     pub id: String,
     pub title: String,
@@ -286,8 +271,6 @@ pub struct PluginManifestPane {
     pub platforms: Option<Vec<PluginPlatform>>,
     #[serde(default)]
     pub placement: PluginPanePlacement,
-    #[serde(default, skip_serializing_if = "PluginPaneScope::is_shared")]
-    pub scope: PluginPaneScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<PopupSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,34 +359,6 @@ pub enum PluginActionContext {
     Pane,
     Selection,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct ViewId(String);
-
-static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
-
-impl ViewId {
-    pub(crate) fn alloc() -> Self {
-        let micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_micros())
-            .unwrap_or(0);
-        let counter = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
-        Self(format!("view_{micros:x}{counter:x}"))
-    }
-
-    pub(crate) fn from_opaque(value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        (!value.is_empty()).then_some(Self(value))
-    }
-}
-
-impl fmt::Display for ViewId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginInvocationContext {
@@ -437,8 +392,6 @@ pub struct PluginInvocationContext {
     pub clicked_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_handler_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view_id: Option<ViewId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -461,32 +414,12 @@ impl PluginActionInfo {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginPaneScope {
-    #[default]
-    Shared,
-    ClientPrivate,
-}
-
-impl PluginPaneScope {
-    fn is_shared(value: &Self) -> bool {
-        matches!(value, Self::Shared)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginPaneOpenParams {
     pub plugin_id: String,
     pub entrypoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PluginPanePlacement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<PluginPaneScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view_id: Option<ViewId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<PopupSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -513,7 +446,6 @@ pub enum PluginPanePlacement {
     #[default]
     Overlay,
     Popup,
-    WorkspaceRight,
     Split,
     Tab,
     Zoomed,
@@ -534,14 +466,4 @@ pub struct PluginPaneInfo {
     pub plugin_id: String,
     pub entrypoint: String,
     pub pane: PaneInfo,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PluginWorkspacePaneInfo {
-    pub plugin_id: String,
-    pub entrypoint: String,
-    pub pane_id: String,
-    pub terminal_id: String,
-    pub workspace_id: String,
-    pub focused: bool,
 }

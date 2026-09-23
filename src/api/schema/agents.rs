@@ -20,9 +20,6 @@ pub struct AgentReadParams {
 pub struct AgentSendKeysParams {
     pub target: String,
     pub keys: Vec<String>,
-    /// Deliberately allow an agent-originated request to target another pane.
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -40,6 +37,9 @@ pub struct AgentPromptWaitOptions {
     pub until: Vec<AgentStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) submission_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -173,9 +173,6 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    /// Deliberately allow an agent-originated request to target another pane.
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -184,9 +181,6 @@ pub struct AgentPromptParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
-    /// Deliberately allow an agent-originated request to target another pane.
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub allow_cross_pane: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -224,6 +218,9 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// The current idle transition completed work, independently of who has viewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +234,4 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_policy: Option<crate::agent_resume::AgentResumePolicy>,
 }

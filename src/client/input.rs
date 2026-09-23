@@ -14,16 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[cfg(unix)]
-use std::io;
+use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::ClientLoopEvent;
-#[cfg(unix)]
-use super::{HostInputSnapshot, HostInputState};
 
 #[cfg(any(windows, test))]
 mod windows_vti;
@@ -42,14 +40,22 @@ pub fn stdin_reader_loop(
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
     host_cell_size_query_sent: bool,
-    #[cfg(unix)] host_input_state: Arc<HostInputState>,
-    #[cfg(unix)] input_wake: OwnedFd,
+    host_mouse_capture_active: Arc<AtomicBool>,
+    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_escape_disambiguation_active: bool,
+    initial_host_input: Vec<u8>,
     #[cfg(unix)] direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
     #[cfg(unix)] direct_response_active: Arc<AtomicBool>,
 ) {
     #[cfg(windows)]
     {
-        let _ = (host_color_query_sent, host_cell_size_query_sent);
+        let _ = (
+            host_color_query_sent,
+            host_cell_size_query_sent,
+            host_mouse_capture_active,
+            host_sgr_pixels_active,
+        );
+        let _ = (host_escape_disambiguation_active, initial_host_input);
         windows_stdin_reader_loop(event_tx, should_quit);
     }
 
@@ -59,8 +65,10 @@ pub fn stdin_reader_loop(
         should_quit,
         host_color_query_sent,
         host_cell_size_query_sent,
-        host_input_state,
-        input_wake,
+        host_mouse_capture_active,
+        host_sgr_pixels_active,
+        host_escape_disambiguation_active,
+        initial_host_input,
         direct_response,
         direct_response_active,
     );
@@ -72,14 +80,18 @@ fn unix_stdin_reader_loop(
     should_quit: &Arc<AtomicBool>,
     host_color_query_sent: bool,
     host_cell_size_query_sent: bool,
-    host_input_state: Arc<HostInputState>,
-    input_wake: OwnedFd,
+    host_mouse_capture_active: Arc<AtomicBool>,
+    host_sgr_pixels_active: Arc<AtomicBool>,
+    host_escape_disambiguation_active: bool,
+    initial_host_input: Vec<u8>,
     direct_response: Arc<std::sync::Mutex<super::direct_graphics::ResponseMatcher>>,
     direct_response_active: Arc<AtomicBool>,
 ) {
-    let stdin_fd = io::stdin().as_raw_fd();
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
     let mut scratch = [0u8; 4096];
     let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
+    framer.set_host_escape_disambiguation_active(host_escape_disambiguation_active);
     if host_color_query_sent {
         framer.host_color_query_sent();
         framer.enable_host_color_scheme_change_tracking();
@@ -89,14 +101,64 @@ fn unix_stdin_reader_loop(
         framer.host_cell_size_query_sent();
     }
     let mut pending_palette = Vec::new();
-    let mut pending_input_state = None;
-    let mut direct_pending_state = None;
+    let mut pending_mode = None;
     let mut last_geometry = None;
     let mut direct_filter = super::direct_graphics::InputFilter::default();
 
+    if !initial_host_input.is_empty() {
+        let sgr_pixels = host_sgr_pixels_active.load(Ordering::Acquire);
+        if sgr_pixels {
+            last_geometry = crate::input::mouse::HostGeometry::current();
+        }
+        let chunks = framer.push(&initial_host_input);
+        if !send_unix_input_chunks(
+            chunks,
+            &event_tx,
+            &mut pending_palette,
+            sgr_pixels,
+            last_geometry,
+        ) {
+            return;
+        }
+        if (framer.has_pending_input() || !pending_palette.is_empty())
+            && stdin_read_ready(
+                &reader,
+                idle_flush_timeout_ms(&framer, host_mouse_capture_active.load(Ordering::Acquire)),
+            ) == Some(false)
+        {
+            let had_pending = framer.has_pending_input();
+            let chunks = framer.flush_timeout();
+            let held_escape = had_pending && chunks.is_empty();
+            if !send_unix_input_chunks(
+                chunks,
+                &event_tx,
+                &mut pending_palette,
+                sgr_pixels,
+                last_geometry,
+            ) || !flush_unix_palette_input(&event_tx, &mut pending_palette)
+            {
+                return;
+            }
+            if held_escape
+                && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+                    == Some(false)
+                && !send_unix_input_chunks(
+                    framer.flush_timeout(),
+                    &event_tx,
+                    &mut pending_palette,
+                    sgr_pixels,
+                    last_geometry,
+                )
+            {
+                return;
+            }
+        }
+        pending_mode = framer.has_pending_input().then_some(sgr_pixels);
+    }
+
     while !should_quit.load(Ordering::Acquire) {
         if direct_filter.has_pending()
-            && poll_read_ready(stdin_fd, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+            && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
                 == Some(false)
         {
             let released = direct_response
@@ -104,150 +166,112 @@ fn unix_stdin_reader_loop(
                 .ok()
                 .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher));
             if let Some(data) = released {
-                let (input_state, geometry) = direct_pending_state
-                    .take()
-                    .unwrap_or_else(|| host_input_state.load_context());
-                let mut events = Vec::new();
-                frame_input(
-                    &data,
-                    input_state,
-                    geometry,
-                    &mut framer,
-                    &mut pending_input_state,
-                    &mut last_geometry,
-                    &mut pending_palette,
-                    &mut events,
-                );
-                if !events.is_empty()
-                    && host_input_state
-                        .send_event(&event_tx, ClientLoopEvent::OrderedInput(events))
-                        .is_err()
+                if event_tx
+                    .blocking_send(ClientLoopEvent::StdinInput(data))
+                    .is_err()
                 {
                     return;
-                }
-                let (current_input_state, current_geometry) = host_input_state.load_context();
-                if let Some(events) = flush_framer_after_idle(
-                    &mut framer,
-                    &mut pending_input_state,
-                    &mut last_geometry,
-                    &mut pending_palette,
-                    current_input_state,
-                    current_geometry,
-                    |timeout_ms| poll_read_ready(stdin_fd, timeout_ms),
-                ) {
-                    if !events.is_empty()
-                        && host_input_state
-                            .send_event(&event_tx, ClientLoopEvent::OrderedInput(events))
-                            .is_err()
-                    {
-                        return;
-                    }
                 }
             }
             continue;
         }
-
-        let readiness = match poll_stdin_and_wake(stdin_fd, input_wake.as_raw_fd(), -1) {
-            Ok(readiness) => readiness,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        };
-        if readiness.wake_ready && crate::pty::fd::drain_wake_fd(input_wake.as_raw_fd()).is_err() {
-            break;
-        }
-        if !readiness.pty_read_ready {
-            continue;
-        }
-        let read = host_input_state.read_input_and_send(
-            &event_tx,
-            &mut scratch,
-            |bytes, input_state, observed_geometry| {
-                let mut events = Vec::new();
+        match reader.read(&mut scratch) {
+            Ok(0) => break,
+            Ok(n) => {
+                let sgr_pixels = *pending_mode
+                    .get_or_insert_with(|| host_sgr_pixels_active.load(Ordering::Acquire));
+                if sgr_pixels {
+                    last_geometry = retain_geometry(
+                        last_geometry,
+                        crate::input::mouse::HostGeometry::current(),
+                    );
+                }
                 let filtered = filter_direct_input(
-                    bytes,
+                    &scratch[..n],
                     &mut direct_filter,
                     &direct_response,
                     &direct_response_active,
                 );
-                if let Some((raw_chunks, responses, pending_uses_old)) = filtered {
-                    events.extend(
-                        responses
-                            .into_iter()
-                            .map(ClientLoopEvent::DirectGraphicsResponse),
-                    );
-                    let current_context = (input_state, observed_geometry);
-                    let filter_pending_context = direct_pending_state.unwrap_or(current_context);
-                    direct_pending_state =
-                        direct_filter.has_pending().then_some(if pending_uses_old {
-                            filter_pending_context
-                        } else {
-                            current_context
-                        });
-                    for chunk in raw_chunks {
-                        if chunk.pending_bytes > 0 {
-                            frame_input(
-                                &chunk.data[..chunk.pending_bytes],
-                                filter_pending_context.0,
-                                filter_pending_context.1,
-                                &mut framer,
-                                &mut pending_input_state,
-                                &mut last_geometry,
-                                &mut pending_palette,
-                                &mut events,
-                            );
-                        }
-                        if chunk.pending_bytes < chunk.data.len() {
-                            frame_input(
-                                &chunk.data[chunk.pending_bytes..],
-                                input_state,
-                                observed_geometry,
-                                &mut framer,
-                                &mut pending_input_state,
-                                &mut last_geometry,
-                                &mut pending_palette,
-                                &mut events,
-                            );
+                let chunks = if let Some((raw_chunks, responses)) = filtered {
+                    for response in responses {
+                        if event_tx
+                            .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
+                            .is_err()
+                        {
+                            return;
                         }
                     }
+                    raw_chunks
+                        .into_iter()
+                        .flat_map(|chunk| framer.push(&chunk))
+                        .collect()
                 } else {
-                    frame_input(
-                        bytes,
-                        input_state,
-                        observed_geometry,
-                        &mut framer,
-                        &mut pending_input_state,
-                        &mut last_geometry,
-                        &mut pending_palette,
-                        &mut events,
-                    );
+                    framer.push(&scratch[..n])
+                };
+                if !framer.has_pending_input() {
+                    pending_mode = None;
                 }
-                (!events.is_empty()).then_some(ClientLoopEvent::OrderedInput(events))
-            },
-        );
-        match read {
-            Ok(0) => break,
-            Ok(_) => {
-                let (current_input_state, current_geometry) = host_input_state.load_context();
-                if let Some(events) = flush_framer_after_idle(
-                    &mut framer,
-                    &mut pending_input_state,
-                    &mut last_geometry,
+                if !send_unix_input_chunks(
+                    chunks,
+                    &event_tx,
                     &mut pending_palette,
-                    current_input_state,
-                    current_geometry,
-                    |timeout_ms| poll_read_ready(stdin_fd, timeout_ms),
+                    sgr_pixels,
+                    last_geometry,
                 ) {
-                    if !events.is_empty()
-                        && host_input_state
-                            .send_event(&event_tx, ClientLoopEvent::OrderedInput(events))
-                            .is_err()
+                    return;
+                }
+
+                let timeout_ms = idle_flush_timeout_ms(
+                    &framer,
+                    host_mouse_capture_active.load(Ordering::Acquire),
+                );
+                if stdin_read_ready(&reader, timeout_ms) == Some(false) {
+                    let had_pending = framer.has_pending_input();
+                    let chunks = framer.flush_timeout();
+                    let held_escape = had_pending && chunks.is_empty();
+                    let sgr_pixels = pending_mode
+                        .unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
+                    if !framer.has_pending_input() {
+                        pending_mode = None;
+                    }
+                    if !send_unix_input_chunks(
+                        chunks,
+                        &event_tx,
+                        &mut pending_palette,
+                        sgr_pixels,
+                        last_geometry,
+                    ) || !flush_unix_palette_input(&event_tx, &mut pending_palette)
                     {
                         return;
                     }
+                    if held_escape
+                        && stdin_read_ready(
+                            &reader,
+                            crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS,
+                        ) == Some(false)
+                    {
+                        let chunks = framer.flush_timeout();
+                        if !framer.has_pending_input() {
+                            pending_mode = None;
+                        }
+                        if !send_unix_input_chunks(
+                            chunks,
+                            &event_tx,
+                            &mut pending_palette,
+                            sgr_pixels,
+                            last_geometry,
+                        ) {
+                            return;
+                        }
+                    }
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
         }
     }
 }
@@ -258,11 +282,7 @@ fn filter_direct_input(
     filter: &mut super::direct_graphics::InputFilter,
     response: &std::sync::Mutex<super::direct_graphics::ResponseMatcher>,
     active: &AtomicBool,
-) -> Option<(
-    Vec<super::direct_graphics::FilteredInput>,
-    Vec<super::direct_graphics::Response>,
-    bool,
-)> {
+) -> Option<(Vec<Vec<u8>>, Vec<super::direct_graphics::Response>)> {
     if !active.load(Ordering::Acquire) && !filter.has_pending() {
         return None;
     }
@@ -270,82 +290,18 @@ fn filter_direct_input(
         response
             .lock()
             .map(|mut matcher| filter.push(bytes, &mut matcher))
-            .unwrap_or_else(|_| {
-                (
-                    vec![super::direct_graphics::FilteredInput {
-                        data: bytes.to_vec(),
-                        pending_bytes: 0,
-                    }],
-                    Vec::new(),
-                    false,
-                )
-            }),
+            .unwrap_or_else(|_| (vec![bytes.to_vec()], Vec::new())),
     )
 }
 
 #[cfg(unix)]
-type HostInputContext = (HostInputSnapshot, Option<crate::input::mouse::HostGeometry>);
-
-#[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-fn frame_input(
-    bytes: &[u8],
-    input_state: HostInputSnapshot,
-    observed_geometry: Option<crate::input::mouse::HostGeometry>,
-    framer: &mut crate::raw_input::RawInputByteFramer,
-    pending_input_state: &mut Option<HostInputContext>,
-    last_geometry: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
-    pending_palette: &mut Vec<Vec<u8>>,
-    events: &mut Vec<ClientLoopEvent>,
-) {
-    let geometry = input_geometry(last_geometry, input_state, observed_geometry);
-    let mut offset = 0;
-    if let Some((pending_state, pending_geometry)) = *pending_input_state {
-        let continued_state = pending_state.continued_with(input_state);
-        let continued_geometry = (pending_geometry == geometry).then_some(geometry).flatten();
-        if continued_state != input_state || continued_geometry != geometry {
-            while offset < bytes.len() && framer.has_pending_input() {
-                let chunks = framer.push(&bytes[offset..offset + 1]);
-                offset += 1;
-                let emitted = !chunks.is_empty();
-                append_unix_input_chunks(
-                    chunks,
-                    pending_palette,
-                    continued_state,
-                    continued_geometry,
-                    events,
-                );
-                if emitted {
-                    break;
-                }
-            }
-            if framer.has_pending_input() && offset == bytes.len() {
-                *pending_input_state = Some((continued_state, continued_geometry));
-                return;
-            }
-            *pending_input_state = framer
-                .has_pending_input()
-                .then_some((input_state, geometry));
-            if offset == bytes.len() {
-                return;
-            }
-        }
-    }
-    let chunks = framer.push(&bytes[offset..]);
-    *pending_input_state = framer
-        .has_pending_input()
-        .then_some((input_state, geometry));
-    append_unix_input_chunks(chunks, pending_palette, input_state, geometry, events);
-}
-
-#[cfg(unix)]
-fn append_unix_input_chunks(
+fn send_unix_input_chunks(
     chunks: Vec<Vec<u8>>,
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
-    input_state: HostInputSnapshot,
+    sgr_pixels: bool,
     geometry: Option<crate::input::mouse::HostGeometry>,
-    events: &mut Vec<ClientLoopEvent>,
-) {
+) -> bool {
     for data in chunks {
         let palette_response = std::str::from_utf8(&data)
             .ok()
@@ -353,8 +309,9 @@ fn append_unix_input_chunks(
             .is_some();
         if palette_response {
             pending_palette.push(data);
-            if pending_palette.len() == 256 {
-                flush_unix_palette_input(pending_palette, input_state, events);
+            if pending_palette.len() == 256 && !flush_unix_palette_input(event_tx, pending_palette)
+            {
+                return false;
             }
             continue;
         }
@@ -362,56 +319,51 @@ fn append_unix_input_chunks(
             .ok()
             .and_then(crate::terminal_theme::parse_default_color_response)
             .is_some();
-        if !default_color_response {
-            flush_unix_palette_input(pending_palette, input_state, events);
+        if !default_color_response && !flush_unix_palette_input(event_tx, pending_palette) {
+            return false;
         }
-        if let Some(event) = classify_unix_input(data, input_state, geometry) {
-            events.push(event);
+        let Some(event) = classify_unix_input(data, sgr_pixels, geometry) else {
+            continue;
+        };
+        if event_tx.blocking_send(event).is_err() {
+            return false;
         }
     }
+    true
 }
 
 #[cfg(unix)]
-fn input_geometry(
-    last: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
-    input_state: HostInputSnapshot,
+fn retain_geometry(
+    last: Option<crate::input::mouse::HostGeometry>,
     observed: Option<crate::input::mouse::HostGeometry>,
 ) -> Option<crate::input::mouse::HostGeometry> {
-    if !input_state.sgr_pixels_active() {
-        return None;
-    }
-    if let Some(geometry) = observed {
-        *last = Some((input_state.generation(), geometry));
-        return Some(geometry);
-    }
-    last.as_ref()
-        .filter(|(generation, _)| *generation == input_state.generation())
-        .map(|(_, geometry)| *geometry)
+    observed.or(last)
 }
 
 #[cfg(unix)]
 fn classify_unix_input(
     data: Vec<u8>,
-    input_state: HostInputSnapshot,
+    sgr_pixels: bool,
     geometry: Option<crate::input::mouse::HostGeometry>,
 ) -> Option<ClientLoopEvent> {
-    if input_state.sgr_pixels_active() && crate::input::mouse::parse_report(&data).is_some() {
-        return geometry.map(|geometry| ClientLoopEvent::PixelMouse(data, geometry, input_state));
+    if sgr_pixels && crate::input::mouse::parse_report(&data).is_some() {
+        return geometry.map(|geometry| ClientLoopEvent::PixelMouse(data, geometry));
     }
-    Some(ClientLoopEvent::StdinInput(data, input_state))
+    Some(ClientLoopEvent::StdinInput(data))
 }
 
 #[cfg(unix)]
 fn flush_unix_palette_input(
+    event_tx: &mpsc::Sender<ClientLoopEvent>,
     pending_palette: &mut Vec<Vec<u8>>,
-    input_state: HostInputSnapshot,
-    events: &mut Vec<ClientLoopEvent>,
-) {
+) -> bool {
     if pending_palette.is_empty() {
-        return;
+        return true;
     }
     let data = std::mem::take(pending_palette).concat();
-    events.push(ClientLoopEvent::StdinInput(data, input_state));
+    event_tx
+        .blocking_send(ClientLoopEvent::StdinInput(data))
+        .is_ok()
 }
 
 #[cfg(unix)]
@@ -428,66 +380,24 @@ fn idle_flush_timeout_ms(
     }
 }
 
-#[cfg(unix)]
-fn flush_framer_after_idle(
-    framer: &mut crate::raw_input::RawInputByteFramer,
-    pending_input_state: &mut Option<HostInputContext>,
-    last_geometry: &mut Option<(u64, crate::input::mouse::HostGeometry)>,
-    pending_palette: &mut Vec<Vec<u8>>,
-    current_input_state: HostInputSnapshot,
-    current_geometry: Option<crate::input::mouse::HostGeometry>,
-    mut wait_for_input: impl FnMut(i32) -> Option<bool>,
-) -> Option<Vec<ClientLoopEvent>> {
-    if !framer.has_pending_input() && pending_palette.is_empty() {
-        return None;
-    }
-
-    let current_geometry = input_geometry(last_geometry, current_input_state, current_geometry);
-    let (input_state, geometry) =
-        (*pending_input_state).unwrap_or((current_input_state, current_geometry));
-    let timeout_ms = idle_flush_timeout_ms(framer, input_state.capture_active());
-    if wait_for_input(timeout_ms) != Some(false) {
-        return None;
-    }
-
-    let had_pending = framer.has_pending_input();
-    let chunks = framer.flush_timeout();
-    let held_escape = had_pending && chunks.is_empty();
-    *pending_input_state = framer
-        .has_pending_input()
-        .then_some((input_state, geometry));
-    let mut events = Vec::new();
-    append_unix_input_chunks(chunks, pending_palette, input_state, geometry, &mut events);
-    flush_unix_palette_input(pending_palette, input_state, &mut events);
-
-    if held_escape
-        && wait_for_input(crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS) == Some(false)
-    {
-        let (input_state, geometry) =
-            (*pending_input_state).unwrap_or((current_input_state, current_geometry));
-        let chunks = framer.flush_timeout();
-        *pending_input_state = framer
-            .has_pending_input()
-            .then_some((input_state, geometry));
-        append_unix_input_chunks(chunks, pending_palette, input_state, geometry, &mut events);
-    }
-
-    Some(events)
-}
-
 #[cfg(windows)]
 fn windows_stdin_reader_loop(
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
 ) {
     if !super::windows_vti_input_backend_enabled() {
+        windows_vti::trace_input_transport("reader=crossterm");
         windows_crossterm_reader_loop(event_tx, should_quit);
     } else {
         match windows_vti::console_input_handle() {
-            Ok(handle) if windows_vti::virtual_terminal_input_enabled(handle) => {
+            Ok(handle) => {
+                windows_vti::trace_input_transport("reader=windows-console");
                 windows_vti::raw_console_reader_loop(handle, event_tx, should_quit);
             }
-            _ => windows_crossterm_reader_loop(event_tx, should_quit),
+            _ => {
+                windows_vti::trace_input_transport("reader=crossterm-fallback");
+                windows_crossterm_reader_loop(event_tx, should_quit);
+            }
         }
     }
 }
@@ -519,31 +429,11 @@ fn windows_crossterm_reader_loop(
             Err(_) => break,
         };
 
-        let raw_sequence_pending = framer.has_pending_input();
-        if let Some(bytes) = windows_key_raw_bytes(&event, raw_sequence_pending) {
-            tracing::debug!(
-                bytes = ?bytes,
-                pending_before = raw_sequence_pending,
-                "windows input routed through raw framer"
-            );
-            if !send_windows_raw_events(framer.push(&bytes), &event_tx) {
-                return;
-            }
-            continue;
+        let (raw_events, event) = frame_windows_crossterm_event(&mut framer, event);
+        if !send_windows_raw_events(raw_events, &event_tx) {
+            return;
         }
-
-        if raw_sequence_pending {
-            tracing::debug!("windows input raw sequence interrupted by semantic event; flushing");
-            if !send_windows_raw_events(framer.flush_timeout(), &event_tx) {
-                return;
-            }
-        }
-
-        if windows_event_is_control_key(&event) {
-            tracing::debug!(event = ?event, "windows control key forwarded as semantic input");
-        }
-
-        let Some(event) = windows_crossterm_input_event(event) else {
+        let Some(event) = event else {
             continue;
         };
         if event_tx
@@ -555,8 +445,48 @@ fn windows_crossterm_reader_loop(
     }
 
     if framer.has_pending_input() {
-        let _ = send_windows_raw_events(framer.flush_timeout(), &event_tx);
+        let _ = send_windows_raw_events(framer.flush_interrupted(), &event_tx);
     }
+}
+
+#[cfg(any(windows, test))]
+fn frame_windows_crossterm_event(
+    framer: &mut crate::raw_input::RawInputFramer,
+    event: crossterm::event::Event,
+) -> (
+    Vec<crate::raw_input::RawInputEvent>,
+    Option<crate::protocol::ClientInputEvent>,
+) {
+    let raw_sequence_pending = framer.has_pending_input();
+    if let Some(bytes) = windows_key_raw_bytes(&event, raw_sequence_pending) {
+        tracing::debug!(
+            bytes = ?bytes,
+            pending_before = raw_sequence_pending,
+            "windows input routed through raw framer"
+        );
+        return (framer.push(&bytes), None);
+    }
+
+    if windows_event_is_control_key(&event) {
+        tracing::debug!(event = ?event, "windows control key forwarded as semantic input");
+    }
+    let Some(event) = windows_crossterm_input_event(event) else {
+        // Preserve the existing flush for unrelated pending input, but do not
+        // cancel mouse recovery for an event that will not be forwarded.
+        return (
+            if raw_sequence_pending {
+                framer.flush_timeout()
+            } else {
+                Vec::new()
+            },
+            None,
+        );
+    };
+    if raw_sequence_pending {
+        tracing::debug!("windows input raw sequence interrupted by semantic event; flushing");
+    }
+    // Even a dormant mouse prefix must stop claiming bytes after semantic input.
+    (framer.flush_interrupted(), Some(event))
 }
 
 #[cfg(any(windows, test))]
@@ -583,7 +513,7 @@ fn windows_crossterm_input_event(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn windows_event_is_control_key(event: &crossterm::event::Event) -> bool {
     use crossterm::event::{Event, KeyModifiers};
 
@@ -716,50 +646,13 @@ fn windows_client_input_event_from_raw(
 }
 
 #[cfg(unix)]
-pub(super) fn pending_input_bytes(fd: RawFd) -> io::Result<usize> {
-    let mut pending: libc::c_int = 0;
-    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(pending.max(0) as usize)
-}
-
-#[cfg(unix)]
-fn poll_stdin_and_wake(
-    stdin_fd: RawFd,
-    wake_fd: RawFd,
-    timeout_ms: i32,
-) -> io::Result<crate::pty::fd::PtyWakeReadiness> {
-    crate::pty::fd::poll_pty_and_wake(stdin_fd, wake_fd, true, false, timeout_ms)
+fn stdin_read_ready<R: AsRawFd>(reader: &R, timeout_ms: i32) -> Option<bool> {
+    poll_read_ready(reader.as_raw_fd(), timeout_ms)
 }
 
 #[cfg(unix)]
 fn poll_read_ready(fd: i32, timeout_ms: i32) -> Option<bool> {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
-    }
-
-    const POLLIN: i16 = 0x0001;
-
-    let mut pfd = PollFd {
-        fd,
-        events: POLLIN,
-        revents: 0,
-    };
-
-    let result = unsafe { poll(&mut pfd as *mut PollFd, 1, timeout_ms) };
-    if result < 0 {
-        None
-    } else {
-        Some(result > 0)
-    }
+    crate::platform::poll_fd_readable(fd, timeout_ms).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -773,33 +666,15 @@ mod tests {
     // Here we test the event type construction.
 
     use super::*;
-    fn read_exact_input(state: &HostInputState, len: usize) -> (Vec<u8>, HostInputSnapshot) {
-        let mut data = Vec::with_capacity(len);
-        let mut captured = None;
-        while data.len() < len {
-            let mut scratch = vec![0; len - data.len()];
-            let (read, snapshot, _) = state.read_input(&mut scratch).unwrap();
-            assert!(read > 0);
-            if let Some(captured) = captured {
-                assert_eq!(snapshot, captured);
-            } else {
-                captured = Some(snapshot);
-            }
-            data.extend_from_slice(&scratch[..read]);
-        }
-        (data, captured.unwrap())
-    }
 
+    #[cfg(unix)]
     #[test]
-    fn stdin_input_event_carries_raw_bytes_and_snapshot() {
-        let data = vec![0x1b, b'[', b'A'];
-        let snapshot = HostInputSnapshot::from_parts(7, true, false);
-        match ClientLoopEvent::StdinInput(data.clone(), snapshot) {
-            ClientLoopEvent::StdinInput(actual, captured) => {
-                assert_eq!(actual, data);
-                assert_eq!(captured, snapshot);
-            }
-            _ => panic!("expected stdin input"),
+    fn stdin_input_event_carries_raw_bytes() {
+        let data = vec![0x1b, b'[', b'A']; // Up arrow escape sequence
+        let event = ClientLoopEvent::StdinInput(data.clone());
+        match event {
+            ClientLoopEvent::StdinInput(d) => assert_eq!(d, data),
+            _ => panic!("expected StdinInput event"),
         }
     }
 
@@ -816,17 +691,15 @@ mod tests {
     #[test]
     fn pixel_mouse_classification_is_narrow_and_uses_read_geometry() {
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        let snapshot = HostInputSnapshot::from_parts(7, true, true);
         let report = b"\x1b[<35;321;241M".to_vec();
-        let Some(ClientLoopEvent::PixelMouse(data, captured, captured_snapshot)) =
-            classify_unix_input(report.clone(), snapshot, Some(geometry))
+        let Some(ClientLoopEvent::PixelMouse(data, captured)) =
+            classify_unix_input(report.clone(), true, Some(geometry))
         else {
-            panic!("expected pixel mouse event");
+            panic!("expected dedicated pixel mouse event");
         };
         assert_eq!(data, report);
         assert_eq!(captured, geometry);
-        assert_eq!(captured_snapshot, snapshot);
-        assert!(classify_unix_input(report, snapshot, None).is_none());
+        assert!(classify_unix_input(report, true, None).is_none());
 
         for raw in [
             b"key".as_slice(),
@@ -834,298 +707,40 @@ mod tests {
             b"\x1b_Gi=7;unrelated\x1b\\".as_slice(),
             b"\x1b[<35;2;3Mtail".as_slice(),
         ] {
-            let Some(ClientLoopEvent::StdinInput(data, captured_snapshot)) =
-                classify_unix_input(raw.to_vec(), snapshot, Some(geometry))
+            let Some(ClientLoopEvent::StdinInput(data)) =
+                classify_unix_input(raw.to_vec(), true, Some(geometry))
             else {
                 panic!("unrelated input must remain raw");
             };
             assert_eq!(data, raw);
-            assert_eq!(captured_snapshot, snapshot);
         }
     }
 
     #[test]
-    fn geometry_cache_does_not_cross_input_generations() {
+    fn transient_geometry_failure_keeps_last_real_value() {
         let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        let old = HostInputSnapshot::from_parts(7, true, true);
-        let current = HostInputSnapshot::from_parts(8, true, true);
-        let mut cached = None;
-        assert_eq!(
-            input_geometry(&mut cached, old, Some(geometry)),
-            Some(geometry)
-        );
-        assert_eq!(input_geometry(&mut cached, old, None), Some(geometry));
-        assert_eq!(input_geometry(&mut cached, current, None), None);
-    }
-
-    #[test]
-    fn resize_boundary_drains_only_pre_transition_mouse_bytes() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixStream;
-
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let (input_state, wake) =
-            HostInputState::with_input_fd(true, false, reader.as_raw_fd()).unwrap();
-        let old = input_state.load();
-        let stale = b"\x1b[<0;2;2M";
-        let fresh = b"\x1b[<0;3;3M";
-        writer.write_all(stale).unwrap();
-
-        let (tx, mut rx) = mpsc::channel(2);
-        input_state.send_resize(&tx, (80, 24, 8, 16), None).unwrap();
-        let current = input_state.load();
-        writer.write_all(fresh).unwrap();
-
-        let readiness = poll_stdin_and_wake(reader.as_raw_fd(), wake.as_raw_fd(), 0).unwrap();
-        assert!(readiness.pty_read_ready);
-        assert!(readiness.wake_ready);
-        crate::pty::fd::drain_wake_fd(wake.as_raw_fd()).unwrap();
-
-        let (stale_data, stale_snapshot) = read_exact_input(&input_state, stale.len());
-        let (fresh_data, fresh_snapshot) = read_exact_input(&input_state, fresh.len());
-        assert_eq!(stale_data, stale);
-        assert_eq!(stale_snapshot, old);
-        assert_eq!(fresh_data, fresh);
-        assert_eq!(fresh_snapshot, current);
-
-        let ClientLoopEvent::Resize(_, _, _, _, applied_generation, _) = rx.try_recv().unwrap()
-        else {
-            panic!("expected resize event");
-        };
-        assert!(!super::super::mouse_input_is_current(
-            stale_snapshot,
-            current,
-            applied_generation,
-            true,
-        ));
-        assert!(super::super::mouse_input_is_current(
-            fresh_snapshot,
-            current,
-            applied_generation,
-            true,
-        ));
-    }
-
-    #[test]
-    fn mouse_mode_transition_wakes_before_first_post_transition_input() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixStream;
-
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let (input_state, wake) =
-            HostInputState::with_input_fd(false, false, reader.as_raw_fd()).unwrap();
-        let input_state = Arc::new(input_state);
-        let reader_state = input_state.clone();
-        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
-        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
-        let report = b"\x1b[<0;4;4M";
-
-        let reader_thread = std::thread::spawn(move || {
-            let readiness = poll_stdin_and_wake(reader.as_raw_fd(), wake.as_raw_fd(), -1).unwrap();
-            if readiness.wake_ready {
-                crate::pty::fd::drain_wake_fd(wake.as_raw_fd()).unwrap();
-            }
-            woke_tx.send(readiness).unwrap();
-            continue_rx.recv().unwrap();
-
-            let readiness = poll_stdin_and_wake(reader.as_raw_fd(), wake.as_raw_fd(), -1).unwrap();
-            assert!(readiness.pty_read_ready);
-            read_exact_input(&reader_state, report.len())
-        });
-
-        let current = input_state
-            .transition_mouse_mode(true, false, || Ok(()))
-            .unwrap();
-        let readiness = woke_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
-        assert!(readiness.wake_ready);
-        assert!(!readiness.pty_read_ready);
-
-        writer.write_all(report).unwrap();
-        continue_tx.send(()).unwrap();
-        let (data, snapshot) = reader_thread.join().unwrap();
-        assert_eq!(data, report);
-        assert_eq!(snapshot, current);
-        assert!(super::super::mouse_input_is_current(
-            snapshot,
-            input_state.load(),
-            current.generation(),
-            true,
-        ));
-    }
-
-    #[test]
-    fn mouse_mode_transition_separates_boundary_bytes_from_new_generation() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixStream;
-
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let (input_state, _wake) =
-            HostInputState::with_input_fd(false, false, reader.as_raw_fd()).unwrap();
-        let old = input_state.load();
-        let boundary_report = b"\x1b[<0;4;4M";
-        let stable_report = b"\x1b[<0;5;5M";
-
-        let current = input_state
-            .transition_mouse_mode(true, false, || writer.write_all(boundary_report))
-            .unwrap();
-        writer.write_all(stable_report).unwrap();
-
-        let (boundary_data, boundary_snapshot) =
-            read_exact_input(&input_state, boundary_report.len());
-        let (stable_data, stable_snapshot) = read_exact_input(&input_state, stable_report.len());
-
-        assert_eq!(boundary_data, boundary_report);
-        assert_ne!(current.generation(), old.generation());
-        assert!(!boundary_snapshot.stable);
-        assert!(!super::super::mouse_input_is_current(
-            boundary_snapshot,
-            input_state.load(),
-            current.generation(),
-            true,
-        ));
-        assert_eq!(stable_data, stable_report);
-        assert_eq!(stable_snapshot, current);
-        assert!(super::super::mouse_input_is_current(
-            stable_snapshot,
-            input_state.load(),
-            current.generation(),
-            true,
-        ));
-    }
-
-    #[test]
-    fn stdin_read_is_published_before_a_resize_boundary() {
-        use std::io::Write as _;
-        use std::os::unix::net::UnixStream;
-
-        let down = b"\x1b[<0;4;4M";
-        let up = b"\x1b[<0;4;4m";
-        let old_geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
-        let new_geometry = crate::input::mouse::HostGeometry::new(80, 24, 809, 480).unwrap();
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        writer
-            .write_all(&[down.as_slice(), up.as_slice()].concat())
-            .unwrap();
-        let (input_state, _wake) =
-            HostInputState::with_input_fd(true, true, reader.as_raw_fd()).unwrap();
-        {
-            let mut boundary = input_state
-                .event_order
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            boundary.geometry = Some(old_geometry);
-            input_state.capture_input_boundary(&mut boundary).unwrap();
-        }
-        let input_state = Arc::new(input_state);
-        let applied_before_resize = input_state.load();
-        let (event_tx, mut event_rx) = mpsc::channel(2);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-
-        let reader_state = input_state.clone();
-        let reader_tx = event_tx.clone();
-        let reader_thread = std::thread::spawn(move || {
-            let mut scratch = [0; 64];
-            reader_state.read_input_and_send(
-                &reader_tx,
-                &mut scratch,
-                |bytes, snapshot, geometry| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    let geometry = geometry.expect("captured host geometry");
-                    Some(ClientLoopEvent::OrderedInput(vec![
-                        ClientLoopEvent::PixelMouse(
-                            bytes[..down.len()].to_vec(),
-                            geometry,
-                            snapshot,
-                        ),
-                        ClientLoopEvent::PixelMouse(
-                            bytes[down.len()..].to_vec(),
-                            geometry,
-                            snapshot,
-                        ),
-                    ]))
-                },
-            )
-        });
-        entered_rx.recv().unwrap();
-
-        let resize_state = input_state.clone();
-        let resize_tx = event_tx.clone();
-        let resize_thread = std::thread::spawn(move || {
-            resize_state.send_resize(&resize_tx, (80, 24, 10, 20), Some(new_geometry))
-        });
-        release_tx.send(()).unwrap();
-        assert_eq!(
-            reader_thread.join().unwrap().unwrap(),
-            down.len() + up.len()
-        );
-        resize_thread.join().unwrap().unwrap();
-
-        let ClientLoopEvent::OrderedInput(events) = event_rx.try_recv().unwrap() else {
-            panic!("stdin batch must be published first");
-        };
-        assert!(matches!(
-            events.as_slice(),
-            [ClientLoopEvent::PixelMouse(first, first_geometry, first_snapshot), ClientLoopEvent::PixelMouse(second, second_geometry, second_snapshot)]
-                if first == down
-                    && second == up
-                    && *first_geometry == old_geometry
-                    && *second_geometry == old_geometry
-                    && *first_snapshot == applied_before_resize
-                    && *second_snapshot == applied_before_resize
-        ));
-        assert!(super::super::pixel_input_is_current(
-            applied_before_resize,
-            input_state.load(),
-            applied_before_resize.generation(),
-            old_geometry,
-            Some(old_geometry),
-        ));
-
-        let ClientLoopEvent::Resize(_, _, _, _, applied_generation, applied_geometry) =
-            event_rx.try_recv().unwrap()
-        else {
-            panic!("resize must follow the stdin batch");
-        };
-        assert!(!super::super::pixel_input_is_current(
-            applied_before_resize,
-            input_state.load(),
-            applied_generation,
-            old_geometry,
-            applied_geometry,
-        ));
-        let current = input_state.load();
-        assert!(super::super::pixel_input_is_current(
-            current,
-            current,
-            applied_generation,
-            new_geometry,
-            applied_geometry,
-        ));
+        assert_eq!(retain_geometry(Some(geometry), None), Some(geometry));
     }
 
     #[test]
     fn palette_replies_are_forwarded_as_one_input_batch() {
-        let snapshot = HostInputSnapshot::from_parts(7, false, false);
+        let (tx, mut rx) = mpsc::channel(4);
         let mut pending = Vec::new();
-        let mut events = Vec::new();
-        append_unix_input_chunks(
+        assert!(send_unix_input_chunks(
             vec![
                 b"\x1b]4;0;rgb:1111/2222/3333\x1b\\".to_vec(),
                 b"\x1b]4;1;rgb:4444/5555/6666\x1b\\".to_vec(),
             ],
+            &tx,
             &mut pending,
-            snapshot,
+            false,
             None,
-            &mut events,
-        );
-        assert!(events.is_empty());
-        flush_unix_palette_input(&mut pending, snapshot, &mut events);
-        let ClientLoopEvent::StdinInput(data, captured) = events.remove(0) else {
-            panic!("expected palette input");
+        ));
+        assert!(rx.try_recv().is_err());
+
+        assert!(flush_unix_palette_input(&tx, &mut pending));
+        let ClientLoopEvent::StdinInput(data) = rx.try_recv().unwrap() else {
+            panic!("expected palette input batch");
         };
         assert_eq!(
             data.windows(4)
@@ -1133,89 +748,7 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(captured, snapshot);
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn direct_filter_idle_release_flushes_lone_escape_with_captured_state() {
-        let response =
-            std::sync::Mutex::new(super::super::direct_graphics::ResponseMatcher::default());
-        let active = response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_handle();
-        assert!(response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .arm(1, 1));
-        let mut direct_filter = super::super::direct_graphics::InputFilter::default();
-        let snapshot = HostInputSnapshot::from_parts(7, true, false);
-
-        let Some((chunks, responses, _)) =
-            filter_direct_input(b"\x1b", &mut direct_filter, &response, &active)
-        else {
-            panic!("active direct filter must retain a partial response prefix");
-        };
-        assert!(chunks.is_empty());
-        assert!(responses.is_empty());
-        response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancel(1);
-        let released = response
-            .lock()
-            .ok()
-            .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher))
-            .expect("inactive direct filter must release its pending prefix");
-
-        let mut framer = crate::raw_input::RawInputByteFramer::for_host_input();
-        let mut pending_input_state = None;
-        framer.host_cell_size_query_sent();
-        let mut last_geometry = None;
-        let mut pending_palette = Vec::new();
-        let mut initial_events = Vec::new();
-        frame_input(
-            &released,
-            snapshot,
-            None,
-            &mut framer,
-            &mut pending_input_state,
-            &mut last_geometry,
-            &mut pending_palette,
-            &mut initial_events,
-        );
-        assert!(initial_events.is_empty());
-        assert_eq!(pending_input_state, Some((snapshot, None)));
-
-        let mut timeouts = Vec::new();
-        let events = flush_framer_after_idle(
-            &mut framer,
-            &mut pending_input_state,
-            &mut last_geometry,
-            &mut pending_palette,
-            snapshot,
-            None,
-            |timeout_ms| {
-                timeouts.push(timeout_ms);
-                Some(false)
-            },
-        )
-        .expect("idle raw framer must be flushed after direct-filter release");
-
-        assert_eq!(
-            timeouts,
-            vec![
-                crate::raw_input::MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS,
-                crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS,
-            ]
-        );
-        assert!(matches!(
-            events.as_slice(),
-            [ClientLoopEvent::StdinInput(data, captured)] if data == b"\x1b" && *captured == snapshot
-        ));
-        assert!(!framer.has_pending_input());
-        assert_eq!(pending_input_state, None);
     }
 
     #[test]
@@ -1298,6 +831,60 @@ mod windows_tests {
             windows_key_raw_bytes(&pending_arrow_tail, true).as_deref(),
             Some(b"[".as_slice())
         );
+    }
+
+    #[test]
+    fn windows_crossterm_semantic_input_cancels_dormant_and_buffered_mouse_recovery() {
+        for buffered in [false, true] {
+            let mut framer = crate::raw_input::RawInputFramer::for_host_input();
+            assert!(framer.push(b"\x1b[<3").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            if buffered {
+                assert!(framer.push(b"5").is_empty());
+            }
+            // Printable input bypasses the raw route when no bytes are pending;
+            // an arrow bypasses it even when a continuation is buffered.
+            let key = if buffered {
+                KeyCode::Up
+            } else {
+                KeyCode::Char('x')
+            };
+            let event = Event::Key(KeyEvent::new(key, KeyModifiers::empty()));
+            let (raw, semantic) = frame_windows_crossterm_event(&mut framer, event.clone());
+            let raw_bytes: Vec<_> = raw
+                .into_iter()
+                .filter_map(|event| {
+                    let crate::raw_input::RawInputEvent::Key(key) = event else {
+                        return None;
+                    };
+                    key.vt_bytes().map(ToOwned::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                raw_bytes.concat(),
+                if buffered { b"5".as_slice() } else { b"" }
+            );
+            assert_eq!(semantic, windows_crossterm_input_event(event));
+            assert_eq!(framer.push(b"5;28;31M").len(), 8);
+        }
+    }
+
+    #[test]
+    fn windows_crossterm_ignored_event_preserves_mouse_recovery() {
+        let mut framer = crate::raw_input::RawInputFramer::for_host_input();
+        assert!(framer.push(b"\x1b[<3").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.push(b"5").is_empty());
+        let (raw, semantic) = frame_windows_crossterm_event(&mut framer, Event::Resize(80, 24));
+        assert!(raw.is_empty());
+        assert!(semantic.is_none());
+        let events = framer.push(b";28;31Mx");
+        assert!(
+            matches!(events.as_slice(), [crate::raw_input::RawInputEvent::Key(key)]
+            if key.code == KeyCode::Char('x'))
+        );
+        assert!(!framer.has_pending_input());
     }
 
     #[test]

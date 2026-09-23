@@ -50,6 +50,7 @@ fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),
         method: Method::WorkspaceCreate(WorkspaceCreateParams {
+            source_workspace_id: None,
             cwd: Some("/tmp".into()),
             focus: true,
             label: Some("api".into()),
@@ -90,34 +91,6 @@ fn workspace_close_group_intent_defaults_false_and_round_trips() {
 }
 
 #[test]
-fn plugin_workspace_right_request_round_trips() {
-    let request = Request {
-        id: "plugin-right".into(),
-        method: Method::PluginPaneOpen(PluginPaneOpenParams {
-            plugin_id: "example.explorer".into(),
-            entrypoint: "explorer".into(),
-            placement: Some(PluginPanePlacement::WorkspaceRight),
-            scope: None,
-            view_id: None,
-            width: Some(crate::popup_size::PopupSize::Cells(24)),
-            height: None,
-            workspace_id: Some("w1".into()),
-            target_pane_id: None,
-            direction: None,
-            cwd: None,
-            focus: true,
-            env: HashMap::new(),
-        }),
-    };
-
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "plugin.pane.open");
-    assert_eq!(json["params"]["placement"], "workspace_right");
-    assert_eq!(json["params"]["width"], 24);
-    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
-}
-
-#[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {
         id: "start".into(),
@@ -127,12 +100,10 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
-            allow_cross_pane: false,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
     assert_eq!(start_json["method"], "agent.start");
-    assert!(start_json["params"].get("allow_cross_pane").is_none());
     assert_eq!(start_json["params"]["pane_id"], "w1:p2");
     assert_eq!(
         serde_json::from_value::<Request>(start_json).unwrap(),
@@ -145,7 +116,6 @@ fn agent_start_and_prompt_requests_round_trip() {
             target: "reviewer".into(),
             text: "review this".into(),
             wait: None,
-            allow_cross_pane: false,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
@@ -163,8 +133,8 @@ fn agent_start_and_prompt_requests_round_trip() {
             wait: Some(AgentPromptWaitOptions {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
+                submission_deadline: None,
             }),
-            allow_cross_pane: false,
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
@@ -231,8 +201,7 @@ fn generated_protocol_schema_artifact_is_current() {
         )
     });
     assert_eq!(
-        expected,
-        actual,
+        expected, actual,
         "generated API schema artifact is stale; run `HERDR_UPDATE_API_SCHEMA=1 just test-one generated_protocol_schema_artifact_is_current`"
     );
 }
@@ -290,59 +259,6 @@ fn request_round_trips_for_server_agent_manifests() {
 }
 
 #[test]
-fn omp_maintenance_requests_round_trip_and_reject_unknown_fields() {
-    let operation_id = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
-    let requests = [
-        Request {
-            id: "acquire".into(),
-            method: Method::ServerOmpMaintenanceAcquire(ServerOmpMaintenanceAcquireParams {
-                operation_id: operation_id.into(),
-            }),
-        },
-        Request {
-            id: "status".into(),
-            method: Method::ServerOmpMaintenanceStatus(EmptyParams::default()),
-        },
-        Request {
-            id: "inspect".into(),
-            method: Method::ServerOmpMaintenanceInspect(EmptyParams::default()),
-        },
-        Request {
-            id: "permit".into(),
-            method: Method::ServerOmpMaintenancePermit(ServerOmpMaintenancePermitParams {
-                operation_id: operation_id.into(),
-                session: "proof".into(),
-                pane_id: "w1:p1".into(),
-            }),
-        },
-        Request {
-            id: "release".into(),
-            method: Method::ServerOmpMaintenanceRelease(ServerOmpMaintenanceReleaseParams {
-                operation_id: operation_id.into(),
-            }),
-        },
-    ];
-
-    let methods = [
-        "server.omp_maintenance.acquire",
-        "server.omp_maintenance.status",
-        "server.omp_maintenance.inspect",
-        "server.omp_maintenance.permit",
-        "server.omp_maintenance.release",
-    ];
-    for (request, method) in requests.into_iter().zip(methods) {
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["method"], method);
-        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
-    }
-
-    assert!(serde_json::from_str::<Request>(
-        r#"{"id":"bad","method":"server.omp_maintenance.acquire","params":{"operation_id":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","unexpected":true}}"#,
-    )
-    .is_err());
-}
-
-#[test]
 fn request_round_trips_for_agent_explain() {
     let request = Request {
         id: "req_agent_explain".into(),
@@ -355,6 +271,54 @@ fn request_round_trips_for_agent_explain() {
     assert_eq!(json["method"], "agent.explain");
     let restored: Request = serde_json::from_value(json).unwrap();
     assert_eq!(restored, request);
+}
+
+#[test]
+fn integration_list_request_and_response_round_trip() {
+    let request = Request {
+        id: "req_integrations".into(),
+        method: Method::IntegrationList(EmptyParams::default()),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "integration.list");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+
+    let response = SuccessResponse {
+        id: "req_integrations".into(),
+        result: ResponseResult::IntegrationList {
+            integrations: vec![IntegrationInfo {
+                target: IntegrationTarget::Codex,
+                label: "codex".into(),
+                command: "codex".into(),
+                available: true,
+                state: IntegrationState::Outdated,
+            }],
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "integration_list");
+    assert_eq!(json["result"]["integrations"][0]["state"], "outdated");
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn command_invoke_request_round_trips_without_command_text() {
+    let request = Request {
+        id: "req_command".into(),
+        method: Method::CommandInvoke(CommandInvokeParams {
+            command_id: "cmd_0123456789abcdef0123456789abcdef".into(),
+            workspace_id: Some("w1".into()),
+            tab_id: Some("w1:t1".into()),
+            pane_id: Some("w1:p1".into()),
+            selection: None,
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "command.invoke");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
 }
 
 #[test]
@@ -567,36 +531,6 @@ fn pane_process_info_request_round_trips() {
 }
 
 #[test]
-fn pane_omp_bridge_request_and_response_round_trip() {
-    let request = Request {
-        id: "req_omp_bridge".into(),
-        method: Method::PaneOmpBridge(PaneOmpBridgeParams {
-            pane_id: "w1:p1".into(),
-        }),
-    };
-
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "pane.omp_bridge");
-    assert_eq!(json["params"]["pane_id"], "w1:p1");
-    let restored: Request = serde_json::from_value(json).unwrap();
-    assert_eq!(restored, request);
-
-    let response = SuccessResponse {
-        id: "req_omp_bridge".into(),
-        result: ResponseResult::PaneOmpBridge {
-            pane_id: "w1:p1".into(),
-            address: "127.0.0.1:1234".into(),
-            token: "opaque".into(),
-        },
-    };
-    let json = serde_json::to_value(&response).unwrap();
-    assert_eq!(json["result"]["type"], "pane_omp_bridge");
-    assert_eq!(json["result"]["pane_id"], "w1:p1");
-    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
-    assert_eq!(restored, response);
-}
-
-#[test]
 fn event_envelope_round_trips() {
     let events = [
         EventEnvelope {
@@ -774,7 +708,13 @@ fn scroll_changed_subscription_event_round_trips() {
 }
 
 #[test]
-fn pong_with_build_identity_round_trips() {
+fn agent_status_request_values_remain_strict() {
+    assert!(serde_json::from_str::<AgentStatus>(r#""working""#).is_ok());
+    assert!(serde_json::from_str::<AgentStatus>(r#""future_status""#).is_err());
+}
+
+#[test]
+fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
         result: ResponseResult::Pong {
@@ -783,33 +723,17 @@ fn pong_with_build_identity_round_trips() {
             capabilities: Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
-                omp_maintenance: true,
-            }),
-            build: Some(ServerBuildIdentity {
-                channel: "stable".into(),
-                build_id: "20260811.1".into(),
-                update_manifest_url: "https://example.com/manifest.json".into(),
+                endpoint_protocol_generation: Some(1),
+                surface_interest: true,
+                health_check: true,
+                ssh_agent_registration: false,
             }),
         },
     };
 
-    let json = serde_json::to_value(&response).unwrap();
-    assert_eq!(json["result"]["build"]["channel"], "stable");
-    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    let json = serde_json::to_string(&response).unwrap();
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
-}
-
-#[test]
-fn legacy_pong_without_build_deserializes() {
-    let response: SuccessResponse = serde_json::from_str(
-        r#"{"id":"req_1","result":{"type":"pong","version":"0.1.2","protocol":6,"capabilities":{"live_handoff":true,"detached_server_daemon":true}}}"#,
-    )
-    .unwrap();
-
-    assert!(matches!(
-        response.result,
-        ResponseResult::Pong { build: None, .. }
-    ));
 }
 
 #[test]
@@ -901,8 +825,8 @@ fn worktree_request_and_response_round_trip() {
                 tab_id: "w_1:1".into(),
                 focused: true,
                 cwd: Some("/worktrees/herdr/worktree-api".into()),
-                execution_target: crate::execution::ExecutionTarget::Local,
                 foreground_cwd: None,
+                restore_error: None,
                 label: None,
                 agent: None,
                 title: None,
@@ -1077,7 +1001,6 @@ fn plugin_link_list_unlink_round_trip() {
             command: vec!["bun".into(), "install".into()],
         }],
         startup: vec![],
-        execution_providers: vec![],
         actions: vec![PluginManifestAction {
             id: "bootstrap".into(),
             title: "Bootstrap worktree".into(),
@@ -1097,7 +1020,6 @@ fn plugin_link_list_unlink_round_trip() {
             description: None,
             platforms: None,
             placement: PluginPanePlacement::Overlay,
-            scope: PluginPaneScope::Shared,
             width: None,
             height: None,
             command: vec!["bun".into(), "run".into(), "board.ts".into()],
@@ -1174,42 +1096,20 @@ fn layout_export_apply_round_trip() {
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, export);
 
-    let layout = LayoutApplyParams {
-        workspace_id: Some("w1".into()),
-        tab_id: None,
-        tab_label: Some("dev".into()),
-        focus: true,
-        root: root.clone(),
-    };
     let apply = Request {
         id: "layout_apply".into(),
-        method: Method::LayoutApply(layout.clone()),
+        method: Method::LayoutApply(LayoutApplyParams {
+            workspace_id: Some("w1".into()),
+            tab_id: None,
+            tab_label: Some("dev".into()),
+            focus: true,
+            root: root.clone(),
+        }),
     };
     let json = serde_json::to_string(&apply).unwrap();
     assert!(json.contains("\"method\":\"layout.apply\""));
-    assert!(!json.contains("idempotency_key"));
     let restored: Request = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, apply);
-
-    for method in [
-        Method::LayoutApplyIdempotent(LayoutIdempotentParams {
-            idempotency_key: "layout-operation-1".into(),
-            layout: layout.clone(),
-        }),
-        Method::LayoutReconcileIdempotent(LayoutIdempotentParams {
-            idempotency_key: "layout-operation-1".into(),
-            layout: layout.clone(),
-        }),
-    ] {
-        let request = Request {
-            id: "layout_idempotent".into(),
-            method,
-        };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"idempotency_key\":\"layout-operation-1\""));
-        let restored: Request = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored, request);
-    }
 
     let response = SuccessResponse {
         id: "layout_export".into(),
@@ -1354,8 +1254,8 @@ fn create_response_round_trips_with_root_pane() {
                 tab_id: "w_1:2".into(),
                 focused: false,
                 cwd: Some("/tmp/review".into()),
-                execution_target: crate::execution::ExecutionTarget::Local,
                 foreground_cwd: None,
+                restore_error: None,
                 label: None,
                 agent: None,
                 title: None,
@@ -1425,6 +1325,32 @@ fn event_wait_parses_typed_match() {
 }
 
 #[test]
+fn pane_link_activate_round_trips() {
+    let request = Request {
+        id: "req_pane_link".into(),
+        method: Method::PaneLinkActivate(PaneLinkActivateParams {
+            pane_id: "w1:p1".into(),
+            viewport_row: 3,
+            col: 7,
+            content_revision: Some(42),
+            offset_from_bottom: Some(5),
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.link.activate");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+
+    let response = ResponseResult::PaneLinkActivated {
+        url: Some("https://example.test".into()),
+        handled: false,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let restored: ResponseResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn plugin_action_list_and_invoke_round_trips() {
     let list = Request {
         id: "req_plugin_action_list".into(),
@@ -1476,8 +1402,6 @@ fn plugin_pane_open_request_round_trips() {
             plugin_id: "example.board".into(),
             entrypoint: "board".into(),
             placement: Some(PluginPanePlacement::Popup),
-            scope: None,
-            view_id: None,
             width: Some(crate::popup_size::PopupSize::Cells(90)),
             height: Some(crate::popup_size::PopupSize::Percent(80)),
             workspace_id: None,
@@ -1510,4 +1434,28 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+#[test]
+fn pane_link_resolve_round_trips() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "hover", "method": "pane.link.resolve",
+        "params": {"pane_id": "pane-1", "viewport_row": 2, "col": 3}
+    }))
+    .unwrap();
+    assert!(matches!(request.method, Method::PaneLinkResolve(_)));
+    let result = ResponseResult::PaneLinkResolved {
+        regions: vec![PaneLinkRegion {
+            row: 2,
+            start_col: 3,
+            end_col: 9,
+        }],
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["type"], "pane_link_resolved");
+    assert_eq!(json["regions"][0]["end_col"], 9);
+    assert_eq!(
+        serde_json::from_value::<ResponseResult>(json).unwrap(),
+        result
+    );
 }

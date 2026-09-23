@@ -18,18 +18,6 @@ pub(crate) struct MovedPane {
     pub pane_state: PaneState,
 }
 
-pub(crate) struct PaneMoveTabSnapshot {
-    pub(crate) custom_name: Option<String>,
-    pub(crate) number: usize,
-    pub(crate) root_pane: PaneId,
-    pub(crate) layout: TileLayout,
-    pub(crate) zoomed: bool,
-    pub(crate) pane_count: usize,
-    pub(crate) events: mpsc::Sender<AppEvent>,
-    pub(crate) render_notify: Arc<Notify>,
-    pub(crate) render_dirty: Arc<RenderSignal>,
-}
-
 pub struct NewPane {
     pub pane_id: PaneId,
     pub terminal: TerminalState,
@@ -45,18 +33,11 @@ enum SplitCommand<'a> {
         argv: &'a [String],
         launch_env: &'a PaneLaunchEnv,
     },
-    Plugin {
-        plugin_id: &'a str,
-        entrypoint: &'a str,
-        local_argv: &'a [String],
-        launch_env: &'a PaneLaunchEnv,
-    },
 }
 
 pub struct Tab {
     pub custom_name: Option<String>,
     pub number: usize,
-    pub(crate) layout_effect_nonce: Option<String>,
     /// Identity source for this tab's pane tree.
     pub root_pane: PaneId,
     pub layout: TileLayout,
@@ -71,8 +52,9 @@ pub struct Tab {
 }
 
 impl Tab {
+    // Tab construction threads pane runtime geometry, host context, and render hooks.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new_with_runtime(
+    pub fn new(
         number: usize,
         initial_cwd: PathBuf,
         rows: u16,
@@ -85,37 +67,80 @@ impl Tab {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
-        execution_target: &crate::execution::ExecutionTarget,
+    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
+        Self::new_with_runtime(
+            number,
+            initial_cwd,
+            rows,
+            cols,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            shell_config,
+            launch_env,
+            events,
+            render_notify,
+            render_dirty,
+            None,
+        )
+    }
+
+    // Command tab construction mirrors the shell tab runtime arguments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_argv_command(
+        number: usize,
+        initial_cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+        argv: &[String],
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        launch_env: &PaneLaunchEnv,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
+        Self::new_with_runtime(
+            number,
+            initial_cwd,
+            rows,
+            cols,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
+            launch_env,
+            events,
+            render_notify,
+            render_dirty,
+            Some(argv),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_runtime(
+        number: usize,
+        initial_cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        shell_config: crate::pane::PaneShellConfig<'_>,
+        launch_env: &PaneLaunchEnv,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
-        plugin: Option<(&str, &str)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let (layout, root_id) = TileLayout::new();
-        let runtime = if let Some((plugin_id, entrypoint)) = plugin {
-            TerminalRuntime::spawn_plugin_command_on(
+        let runtime = if let Some(argv) = argv {
+            TerminalRuntime::spawn_argv_command(
                 root_id,
                 rows,
                 cols,
                 initial_cwd.clone(),
-                execution_target,
-                plugin_id,
-                entrypoint,
-                argv.expect("plugin tab requires local argv"),
-                launch_env,
-                crate::pane::AgentDetection::Enabled,
-                scrollback_limit_bytes,
-                host_terminal_theme,
-                host_terminal_appearance,
-                events.clone(),
-                render_notify.clone(),
-                render_dirty.clone(),
-            )?
-        } else if let Some(argv) = argv {
-            TerminalRuntime::spawn_argv_command_on(
-                root_id,
-                rows,
-                cols,
-                initial_cwd.clone(),
-                execution_target,
                 argv,
                 launch_env,
                 crate::pane::AgentDetection::Enabled,
@@ -127,12 +152,11 @@ impl Tab {
                 render_dirty.clone(),
             )?
         } else {
-            TerminalRuntime::spawn_on(
+            TerminalRuntime::spawn(
                 root_id,
                 rows,
                 cols,
                 initial_cwd.clone(),
-                execution_target,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
@@ -146,11 +170,10 @@ impl Tab {
 
         let terminal_id = TerminalId::alloc();
         let terminal = match argv {
-            Some(argv) => TerminalState::new(terminal_id.clone(), initial_cwd)
-                .with_execution_target(execution_target.clone())
-                .with_launch_argv(argv.to_vec()),
-            None => TerminalState::new(terminal_id.clone(), initial_cwd)
-                .with_execution_target(execution_target.clone()),
+            Some(argv) => {
+                TerminalState::new(terminal_id.clone(), initial_cwd).with_launch_argv(argv.to_vec())
+            }
+            None => TerminalState::new(terminal_id.clone(), initial_cwd),
         };
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(terminal_id));
@@ -159,7 +182,6 @@ impl Tab {
             Self {
                 custom_name: None,
                 number,
-                layout_effect_nonce: None,
                 root_pane: root_id,
                 layout,
                 panes,
@@ -183,44 +205,12 @@ impl Tab {
         self.custom_name = Some(name);
     }
 
-    #[cfg(test)]
-    pub fn split_focused(
-        &mut self,
-        direction: Direction,
-        rows: u16,
-        cols: u16,
-        cwd: Option<PathBuf>,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-        shell_config: crate::pane::PaneShellConfig<'_>,
-        launch_env: &PaneLaunchEnv,
-    ) -> std::io::Result<NewPane> {
-        self.split_pane_with_runtime(
-            self.layout.focused(),
-            true,
-            direction,
-            None,
-            rows,
-            cols,
-            cwd,
-            &crate::execution::ExecutionTarget::Local,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            shell_config,
-            launch_env,
-            None,
-        )
-    }
-
     pub fn split_focused_command(
         &mut self,
         direction: Direction,
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
-        execution_target: &crate::execution::ExecutionTarget,
         command: &str,
         launch_env: &PaneLaunchEnv,
         scrollback_limit_bytes: usize,
@@ -235,7 +225,6 @@ impl Tab {
             rows,
             cols,
             cwd,
-            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -248,8 +237,11 @@ impl Tab {
         )
     }
 
+    /// Split `target` with a shell pane. Focus moves to the new pane only when
+    /// `focus_new_pane` is set; a spawn failure rolls the layout back without
+    /// touching focus or its history.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn split_pane_shell_on(
+    pub(crate) fn split_pane_shell(
         &mut self,
         target: PaneId,
         focus_new_pane: bool,
@@ -258,7 +250,6 @@ impl Tab {
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
-        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -273,7 +264,6 @@ impl Tab {
             rows,
             cols,
             cwd,
-            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
@@ -283,8 +273,10 @@ impl Tab {
         )
     }
 
+    /// Split `target` with an argv-command pane. Same focus contract as
+    /// `split_pane_shell`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn split_pane_argv_on(
+    pub(crate) fn split_pane_argv(
         &mut self,
         target: PaneId,
         focus_new_pane: bool,
@@ -293,7 +285,6 @@ impl Tab {
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
-        execution_target: &crate::execution::ExecutionTarget,
         argv: &[String],
         launch_env: &PaneLaunchEnv,
         scrollback_limit_bytes: usize,
@@ -308,54 +299,12 @@ impl Tab {
             rows,
             cols,
             cwd,
-            execution_target,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             launch_env,
             Some(SplitCommand::Argv { argv, launch_env }),
-        )
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn split_pane_plugin_on(
-        &mut self,
-        target: PaneId,
-        focus_new_pane: bool,
-        direction: Direction,
-        ratio: Option<f32>,
-        rows: u16,
-        cols: u16,
-        cwd: Option<PathBuf>,
-        execution_target: &crate::execution::ExecutionTarget,
-        plugin_id: &str,
-        entrypoint: &str,
-        local_argv: &[String],
-        launch_env: &PaneLaunchEnv,
-        scrollback_limit_bytes: usize,
-        host_terminal_theme: crate::terminal_theme::TerminalTheme,
-        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
-    ) -> std::io::Result<NewPane> {
-        self.split_pane_with_runtime(
-            target,
-            focus_new_pane,
-            direction,
-            ratio,
-            rows,
-            cols,
-            cwd,
-            execution_target,
-            scrollback_limit_bytes,
-            host_terminal_theme,
-            host_terminal_appearance,
-            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
-            launch_env,
-            Some(SplitCommand::Plugin {
-                plugin_id,
-                entrypoint,
-                local_argv,
-                launch_env,
-            }),
         )
     }
 
@@ -370,7 +319,6 @@ impl Tab {
         rows: u16,
         cols: u16,
         cwd: Option<PathBuf>,
-        execution_target: &crate::execution::ExecutionTarget,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -389,21 +337,20 @@ impl Tab {
         };
         let actual_cwd =
             cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
-        let launch_argv = match &command {
-            Some(SplitCommand::Argv { argv, .. }) => Some((*argv).to_vec()),
-            Some(SplitCommand::Plugin { local_argv, .. }) => Some((*local_argv).to_vec()),
-            _ => None,
+        let launch_argv = if let Some(SplitCommand::Argv { argv, .. }) = &command {
+            Some((*argv).to_vec())
+        } else {
+            None
         };
         let runtime = match command {
             Some(SplitCommand::Shell {
                 command,
                 launch_env,
-            }) => TerminalRuntime::spawn_shell_command_on(
+            }) => TerminalRuntime::spawn_shell_command(
                 new_id,
                 rows,
                 cols,
                 actual_cwd.clone(),
-                execution_target,
                 command,
                 launch_env,
                 crate::pane::AgentDetection::Enabled,
@@ -414,38 +361,12 @@ impl Tab {
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
             ),
-            Some(SplitCommand::Argv { argv, launch_env }) => {
-                TerminalRuntime::spawn_argv_command_on(
-                    new_id,
-                    rows,
-                    cols,
-                    actual_cwd.clone(),
-                    execution_target,
-                    argv,
-                    launch_env,
-                    crate::pane::AgentDetection::Enabled,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    host_terminal_appearance,
-                    self.events.clone(),
-                    self.render_notify.clone(),
-                    self.render_dirty.clone(),
-                )
-            }
-            Some(SplitCommand::Plugin {
-                plugin_id,
-                entrypoint,
-                local_argv,
-                launch_env,
-            }) => TerminalRuntime::spawn_plugin_command_on(
+            Some(SplitCommand::Argv { argv, launch_env }) => TerminalRuntime::spawn_argv_command(
                 new_id,
                 rows,
                 cols,
                 actual_cwd.clone(),
-                execution_target,
-                plugin_id,
-                entrypoint,
-                local_argv,
+                argv,
                 launch_env,
                 crate::pane::AgentDetection::Enabled,
                 scrollback_limit_bytes,
@@ -455,12 +376,11 @@ impl Tab {
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
             ),
-            None => TerminalRuntime::spawn_on(
+            None => TerminalRuntime::spawn(
                 new_id,
                 rows,
                 cols,
                 actual_cwd.clone(),
-                execution_target,
                 scrollback_limit_bytes,
                 host_terminal_theme,
                 host_terminal_appearance,
@@ -480,11 +400,10 @@ impl Tab {
         };
         let terminal_id = TerminalId::alloc();
         let terminal = match launch_argv {
-            Some(argv) => TerminalState::new(terminal_id.clone(), actual_cwd)
-                .with_execution_target(execution_target.clone())
-                .with_launch_argv(argv),
-            None => TerminalState::new(terminal_id.clone(), actual_cwd)
-                .with_execution_target(execution_target.clone()),
+            Some(argv) => {
+                TerminalState::new(terminal_id.clone(), actual_cwd).with_launch_argv(argv)
+            }
+            None => TerminalState::new(terminal_id.clone(), actual_cwd),
         };
         if focus_new_pane {
             self.layout.focus_pane(new_id);
@@ -525,7 +444,6 @@ impl Tab {
         panes.insert(pane_id, moved.pane_state);
         Self {
             custom_name,
-            layout_effect_nonce: None,
             number,
             root_pane: pane_id,
             layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),
@@ -537,51 +455,6 @@ impl Tab {
             render_notify,
             render_dirty,
         }
-    }
-    pub(crate) fn pane_move_snapshot(&self) -> PaneMoveTabSnapshot {
-        PaneMoveTabSnapshot {
-            custom_name: self.custom_name.clone(),
-            number: self.number,
-            root_pane: self.root_pane,
-            layout: self.layout.clone(),
-            zoomed: self.zoomed,
-            pane_count: self.layout.pane_count(),
-            events: self.events.clone(),
-            render_notify: self.render_notify.clone(),
-            render_dirty: self.render_dirty.clone(),
-        }
-    }
-
-    pub(crate) fn from_existing_pane_for_recovery(
-        snapshot: &PaneMoveTabSnapshot,
-        moved: MovedPane,
-    ) -> Self {
-        let mut tab = Self::from_existing_pane(
-            snapshot.number,
-            snapshot.custom_name.clone(),
-            moved,
-            snapshot.events.clone(),
-            snapshot.render_notify.clone(),
-            snapshot.render_dirty.clone(),
-        );
-        tab.root_pane = snapshot.root_pane;
-        tab.layout = snapshot.layout.clone();
-        tab.zoomed = snapshot.zoomed;
-        tab
-    }
-    pub(crate) fn restore_moved_pane(
-        &mut self,
-        snapshot: &PaneMoveTabSnapshot,
-        moved: MovedPane,
-    ) -> Result<(), MovedPane> {
-        if self.panes.contains_key(&moved.pane_id) {
-            return Err(moved);
-        }
-        self.panes.insert(moved.pane_id, moved.pane_state);
-        self.root_pane = snapshot.root_pane;
-        self.layout = snapshot.layout.clone();
-        self.zoomed = snapshot.zoomed;
-        Ok(())
     }
 
     pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<MovedPane> {
@@ -663,14 +536,14 @@ impl Tab {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
         let terminal_id = self.terminal_id(pane_id)?;
-        let terminal = terminals.get(terminal_id)?;
-        if !terminal.execution_target.is_local() {
-            return Some(terminal.cwd.clone());
-        }
         terminal_runtimes
             .get(terminal_id)
-            .and_then(|runtime| runtime.cwd())
-            .or_else(|| Some(terminal.cwd.clone()))
+            .and_then(|rt| rt.cwd())
+            .or_else(|| {
+                terminals
+                    .get(terminal_id)
+                    .map(|terminal| terminal.cwd.clone())
+            })
     }
 
     pub fn foreground_cwd_for_pane(

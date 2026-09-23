@@ -31,6 +31,7 @@ pub(crate) struct Layer {
 #[derive(Debug)]
 pub(crate) struct DirectGate {
     pub(crate) transfer_id: u64,
+    pub(crate) image_id: u32,
     pub(crate) client_id: u64,
     pub(crate) deadline: std::time::Instant,
     pub(crate) written: bool,
@@ -63,6 +64,13 @@ impl Slot {
         self.stream_active
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    pub(crate) fn direct_client(&self) -> Option<u64> {
+        self.direct_gate
+            .as_ref()
+            .map(|gate| gate.client_id)
+            .or_else(|| self.layer.as_ref().and_then(Layer::resident_client))
     }
 }
 
@@ -100,6 +108,7 @@ impl Runtime {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.mark_changed();
@@ -148,12 +157,6 @@ impl Runtime {
             .filter_map(Layer::inline_data)
             .map(<[u8]>::len)
             .sum()
-    }
-
-    pub(crate) fn active_for_pane(&self, pane_id: PaneId) -> bool {
-        self.slots
-            .iter()
-            .any(|((id, _), slot)| *id == pane_id && slot.layer.is_some())
     }
 
     pub(crate) fn attach_stream_active(
