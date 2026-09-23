@@ -124,6 +124,7 @@ impl HeadlessServer {
             | self.handle_client_shell_api_request(
                 client_id,
                 api::ApiRequestMessage {
+                    context: crate::api::ApiRequestContext::default(),
                     request: *request,
                     respond_to,
                     response_write_complete: None,

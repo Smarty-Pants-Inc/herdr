@@ -560,6 +560,7 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         assert!(response_rx.try_recv().is_err());
@@ -589,6 +590,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -604,6 +606,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -631,6 +634,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
 
@@ -671,6 +675,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -704,6 +709,7 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -715,6 +721,7 @@ mod tests {
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
+                allow_cross_pane: false,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
@@ -750,6 +757,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
+                allow_cross_pane: false,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

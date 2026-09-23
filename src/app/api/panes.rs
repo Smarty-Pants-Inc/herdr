@@ -2334,6 +2334,7 @@ mod tests {
                     "ctrl+k".into(),
                     "ctrl+l".into(),
                 ],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2356,6 +2357,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+tab".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2719,6 +2721,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2747,6 +2750,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["cmd+c".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2769,6 +2773,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["+".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2798,6 +2803,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+?".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2822,6 +2828,7 @@ mod tests {
                 pane_id,
                 text: "A != B".into(),
                 keys: vec!["Enter".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2844,6 +2851,7 @@ mod tests {
                 pane_id,
                 text: String::new(),
                 keys: vec!["ctrl+j".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2863,6 +2871,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
+                allow_cross_pane: false,
             }),
         });
 
@@ -2883,6 +2892,7 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
+                allow_cross_pane: false,
             }),
         });
 

@@ -133,7 +133,7 @@ impl App {
         }
     }
 
-    fn terminal_targets(&self) -> Vec<TerminalTarget> {
+    pub(crate) fn terminal_targets(&self) -> Vec<TerminalTarget> {
         self.state
             .workspaces
             .iter()
@@ -156,7 +156,7 @@ impl App {
             .collect()
     }
 
-    fn terminal_target_for_pane(
+    pub(crate) fn terminal_target_for_pane(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -170,6 +170,39 @@ impl App {
             pane_id,
             terminal_id,
         })
+    }
+
+    /// Maps a locally attributed process to the managed agent terminal that owns
+    /// its session. Missing runtime state or process inspection intentionally
+    /// yields no match so callers retain normal compatibility behavior.
+    pub(crate) fn agent_terminal_target_for_peer_pid(
+        &self,
+        peer_pid: u32,
+    ) -> Option<TerminalTarget> {
+        let mut matches = self.terminal_targets().into_iter().filter(|target| {
+            if !self.target_is_agent(target) {
+                return false;
+            }
+
+            let Some(child_pid) = self
+                .state
+                .runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    target.ws_idx,
+                    target.pane_id,
+                )
+                .and_then(crate::terminal::TerminalRuntime::child_pid)
+            else {
+                return false;
+            };
+
+            child_pid == peer_pid
+                || crate::platform::session_processes(child_pid)
+                    .into_iter()
+                    .any(|session_pid| session_pid == peer_pid)
+        });
+        let target = matches.next()?;
+        matches.next().is_none().then_some(target)
     }
 
     fn terminal_target_candidate(
