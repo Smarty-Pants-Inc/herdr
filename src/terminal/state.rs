@@ -147,6 +147,7 @@ pub struct TerminalState {
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
+    displaced_persisted_session: Option<crate::agent_resume::PersistedAgentSession>,
     metadata_report_sequences: HashMap<String, u64>,
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
@@ -185,6 +186,7 @@ impl TerminalState {
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
+            displaced_persisted_session: None,
             metadata_report_sequences: HashMap::new(),
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
@@ -453,6 +455,7 @@ impl TerminalState {
             self.recent_agent_process_exit = None;
         }
         if process_exited {
+            self.displaced_persisted_session = None;
             let mut reset_sources = Vec::new();
             let mut stale_sessions = Vec::new();
             for (source, suppressed) in &mut self.suppressed_full_lifecycle_hook_reports {
@@ -705,6 +708,12 @@ impl TerminalState {
         {
             return None;
         }
+        // Snapshot before routing: routing may let a displaced session reclaim the pane.
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        let previous_session = self.current_session_identity_for_persistence();
         let reanchor_sequence = match self.route_full_lifecycle_hook_report(
             &source,
             &agent_label,
@@ -756,11 +765,6 @@ impl TerminalState {
             return None;
         }
 
-        let previous_agent_label = self.effective_agent_label().map(str::to_string);
-        let previous_known_agent = self.effective_known_agent();
-        let previous_state = self.state;
-        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
-        let previous_session = self.current_session_identity_for_persistence();
         self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
@@ -933,6 +937,7 @@ impl TerminalState {
         if self.full_lifecycle_hook_report_matches_stale_session(source, agent_label, session_ref) {
             return FullLifecycleHookReportRoute::Ignore;
         }
+        self.reconcile_live_session_report(source, agent_label, session_ref.as_ref(), seq);
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
         let process_present = known_agent.is_some()
@@ -1045,6 +1050,90 @@ impl TerminalState {
             });
         }
         FullLifecycleHookReportRoute::Ignore
+    }
+
+    /// A nested agent that inherited `HERDR_PANE_ID` reports into its parent's pane
+    /// (smarty-dev#509). A strictly newer report from the parent's session, with the agent
+    /// process still present, proves the parent is live. If the nested session adopted a
+    /// persisted-only anchor, the parent reclaims it. An unvalidated pending replacement left
+    /// by the nested session no longer gates it. Older reports still lose on sequence.
+    fn reconcile_live_session_report(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+    ) {
+        let (Some(session_ref), Some(seq)) = (session_ref, seq) else {
+            return;
+        };
+        let known_agent = crate::detect::parse_agent_label(agent_label);
+        let process_present = known_agent.is_some()
+            && self.detected_agent == known_agent
+            && self.recent_agent_process_exit.is_none();
+        let anchored_session_ref = self
+            .hook_authority
+            .as_ref()
+            .filter(|authority| authority.source == source && authority.agent_label == agent_label)
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .filter(|session| session.source == source && session.agent == agent_label)
+                    .map(|session| &session.session_ref)
+            })
+            .cloned();
+        let newer_than_accepted = self
+            .hook_report_sequences
+            .get(source)
+            .is_none_or(|previous| seq > *previous);
+        if !process_present || !newer_than_accepted {
+            return;
+        }
+        let reclaims_displaced_session =
+            self.displaced_persisted_session
+                .as_ref()
+                .is_some_and(|displaced| {
+                    displaced.source == source
+                        && displaced.agent == agent_label
+                        && displaced.session_ref == *session_ref
+                });
+        if reclaims_displaced_session {
+            if let Some(adopted) = anchored_session_ref.filter(|adopted| adopted != session_ref) {
+                self.remember_stale_full_lifecycle_hook_session(
+                    source.to_string(),
+                    agent_label.to_string(),
+                    adopted,
+                );
+            }
+            if self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == source && authority.agent_label == agent_label
+            }) {
+                self.hook_authority = None;
+            }
+            self.persisted_agent_session = self.displaced_persisted_session.take();
+            self.suppressed_full_lifecycle_hook_reports.remove(source);
+            return;
+        }
+        let discard = anchored_session_ref.as_ref() == Some(session_ref)
+            && self
+                .suppressed_full_lifecycle_hook_reports
+                .get(source)
+                .is_some_and(|suppressed| {
+                    suppressed.agent_label == agent_label
+                        && suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit
+                        && suppressed.replacement_session_ref.is_none()
+                        && suppressed
+                            .pending_replacement_report
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                seq > pending.seq
+                                    && pending.authority.session_ref.as_ref() != Some(session_ref)
+                            })
+                });
+        if discard {
+            self.suppressed_full_lifecycle_hook_reports.remove(source);
+        }
     }
 
     fn full_lifecycle_hook_report_matches_stale_session(
@@ -1460,6 +1549,16 @@ impl TerminalState {
             && self.recent_agent_process_exit.is_none();
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
+        // Snapshot before reconciling: a displaced session may reclaim the pane.
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        let previous_session = self.current_session_identity_for_persistence();
+        if full_lifecycle_source {
+            self.reconcile_live_session_report(&source, &agent_label, Some(&session_ref), seq);
+        }
         let generation_gated = self
             .suppressed_full_lifecycle_hook_reports
             .get(&source)
@@ -1526,13 +1625,13 @@ impl TerminalState {
                 return None;
             }
 
-            let previous_agent_label = self.effective_agent_label().map(str::to_string);
-            let previous_known_agent = self.effective_known_agent();
-            let previous_state = self.state;
-            let now = Instant::now();
-            let previous_presentation =
-                self.effective_presentation_for_state_at(previous_state, now);
-            let previous_session = self.current_session_identity_for_persistence();
+            if Self::session_report_allows_session_replacement(
+                &source,
+                &agent_label,
+                session_start_source.as_deref(),
+            ) {
+                self.displaced_persisted_session = None;
+            }
             let suppressed = self
                 .suppressed_full_lifecycle_hook_reports
                 .entry(source.clone())
@@ -1632,13 +1731,26 @@ impl TerminalState {
             return None;
         }
 
-        let now = Instant::now();
-        let previous_agent_label = self.effective_agent_label().map(str::to_string);
-        let previous_known_agent = self.effective_known_agent();
-        let previous_state = self.state;
-        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
-        let previous_session = self.current_session_identity_for_persistence();
+        // A report without a replacement reason may adopt a persisted-only anchor, for example a
+        // fresh Pi after a restore. Keep the adopted session so it can reclaim the pane if it
+        // proves live again (smarty-dev#509).
+        let displaced_persisted_session = self.persisted_agent_session.clone().filter(|previous| {
+            full_lifecycle_source
+                && !session_replacement_allowed
+                && !foreground_takeover_allowed
+                && replaced_hook_session.is_none()
+                && !self.hook_authority.as_ref().is_some_and(|authority| {
+                    authority.source == source && authority.agent_label == agent_label
+                })
+                && previous.source == source
+                && previous.agent == agent_label
+                && previous.session_ref != session_ref
+        });
+        if displaced_persisted_session.is_some() {
+            self.displaced_persisted_session = displaced_persisted_session;
+        }
         if session_replacement_allowed || foreground_takeover_allowed {
+            self.displaced_persisted_session = None;
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
         if let Some(replaced_hook_session) = replaced_hook_session {
@@ -1787,6 +1899,7 @@ impl TerminalState {
         );
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.displaced_persisted_session = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1835,6 +1948,7 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        self.displaced_persisted_session = None;
         self.suppress_full_lifecycle_hook_report(
             source,
             agent_label,
@@ -2928,6 +3042,188 @@ mod tests {
                 "{reason:?} must not replace the current Pi session"
             );
         }
+    }
+
+    #[test]
+    fn pi_parent_session_recovers_after_nested_pi_reports() {
+        // smarty-dev#509: a nested Pi inherits HERDR_PANE_ID and reports into its parent's pane.
+        let parent =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-parent.jsonl"));
+        let nested =
+            crate::agent_resume::AgentSessionRef::id("01a0d15d-47db-7268-81da-0fb2036f40fc");
+        let second_nested =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-nested-2.jsonl"));
+        let parent_identity = || {
+            let parent = parent.clone().unwrap();
+            Some((
+                "herdr:pi".to_string(),
+                "pi".to_string(),
+                parent.kind,
+                parent.value,
+            ))
+        };
+        let report_session =
+            |terminal: &mut TerminalState, session_ref, seq, reason: Option<&str>| {
+                terminal.set_agent_session_ref_for_session_start(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    session_ref,
+                    Some(seq),
+                    reason.map(str::to_string),
+                )
+            };
+        let report_state = |terminal: &mut TerminalState, session_ref, state, seq| {
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                state,
+                None,
+                session_ref,
+                Some(seq),
+            )
+        };
+        // The parent is anchored by live hook authority, or only by its persisted session (for
+        // example after a server restart), which a startup report may adopt.
+        for live_authority in [true, false] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            if live_authority {
+                assert!(
+                    report_session(&mut terminal, parent.clone(), 10, Some("startup")).is_some()
+                );
+                assert!(
+                    report_state(&mut terminal, parent.clone(), AgentState::Idle, 11).is_some()
+                );
+            } else {
+                anchor_full_lifecycle_session(
+                    &mut terminal,
+                    Agent::Pi,
+                    "herdr:pi",
+                    "pi",
+                    parent.clone().unwrap(),
+                );
+            }
+
+            // The nested Pi reports its startup, state and a turn with larger sequences; then a
+            // second nested Pi starts.
+            report_session(&mut terminal, nested.clone(), 20, Some("startup"));
+            report_state(&mut terminal, nested.clone(), AgentState::Idle, 21);
+            report_session(&mut terminal, nested.clone(), 22, None);
+            report_state(&mut terminal, nested.clone(), AgentState::Working, 23);
+            report_session(&mut terminal, second_nested.clone(), 24, Some("startup"));
+            report_state(&mut terminal, second_nested.clone(), AgentState::Idle, 25);
+            if live_authority {
+                // It must not replace live authority.
+                assert_eq!(
+                    terminal.current_session_identity_for_persistence(),
+                    parent_identity()
+                );
+                assert_eq!(terminal.state, AgentState::Idle);
+            }
+            let nested_state = terminal.state;
+
+            // A genuinely old parent report still loses.
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 15).is_none());
+            assert_eq!(terminal.state, nested_state);
+
+            // The parent's next turn: session report without a reason, then working and idle.
+            let recovered = report_session(&mut terminal, parent.clone(), 30, None);
+            assert_eq!(
+                recovered.map(|mutation| mutation.session_ref_changed),
+                Some(!live_authority),
+                "live_authority={live_authority}"
+            );
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 31).is_some());
+            assert_eq!(terminal.state, AgentState::Working);
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 32).is_some());
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                parent_identity()
+            );
+
+            // Late nested reports stay rejected.
+            assert!(report_state(&mut terminal, nested.clone(), AgentState::Working, 33).is_none());
+            assert!(report_state(
+                &mut terminal,
+                second_nested.clone(),
+                AgentState::Working,
+                34
+            )
+            .is_none());
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                parent_identity(),
+                "live_authority={live_authority}"
+            );
+        }
+    }
+
+    #[test]
+    fn displaced_pi_session_cannot_reclaim_after_explicit_replacement() {
+        let mut terminal = test_terminal();
+        let old = crate::agent_resume::AgentSessionRef::path(test_session_path("pi-old.jsonl"));
+        let adopted =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-adopted.jsonl"));
+        let chosen =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-chosen.jsonl"));
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            old.clone().unwrap(),
+        );
+        for (session_ref, seq, reason) in [
+            (adopted.clone(), 20, Some("startup")),
+            (chosen.clone(), 22, Some("new")),
+        ] {
+            assert!(terminal
+                .set_agent_session_ref_for_session_start(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    session_ref.clone(),
+                    Some(seq),
+                    reason.map(str::to_string),
+                )
+                .is_some());
+            assert!(terminal
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    session_ref,
+                    Some(seq + 1),
+                )
+                .is_some());
+        }
+
+        let late_session = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            old.clone(),
+            Some(30),
+            None,
+        );
+        let late_working = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            old,
+            Some(31),
+        );
+
+        assert!(late_session.is_none());
+        assert!(late_working.is_none());
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal.hook_authority.as_ref().unwrap().session_ref,
+            chosen
+        );
     }
 
     #[test]
