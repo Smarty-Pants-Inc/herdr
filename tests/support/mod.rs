@@ -51,10 +51,12 @@ pub fn register_runtime_dir(path: &Path) {
     ensure_cleanup_hooks();
 
     let _ = fs::create_dir_all(path);
-    let _ = fs::write(
-        path.join(RUNTIME_OWNER_MARKER),
-        std::process::id().to_string(),
-    );
+    // Every spawn registers its runtime dir again. Replace the marker atomically: the watchdog
+    // reads it concurrently, and a truncated marker makes it SIGTERM this test's live server.
+    let pid = std::process::id().to_string();
+    let staged = path.join(format!("{RUNTIME_OWNER_MARKER}.{pid}.tmp"));
+    let _ = fs::write(&staged, &pid)
+        .and_then(|()| fs::rename(&staged, path.join(RUNTIME_OWNER_MARKER)));
 
     let mut runtime_dirs = runtime_dir_registry_lock();
     runtime_dirs.insert(path.to_path_buf());
