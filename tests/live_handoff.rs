@@ -38,6 +38,9 @@ impl Drop for SpawnedHerdr {
     }
 }
 
+// Import servers exit when this PID dies (debug builds only).
+const TEST_HANDOFF_OWNER_PID_ENV: &str = "HERDR_TEST_HANDOFF_OWNER_PID";
+
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -61,6 +64,22 @@ fn spawn_server_with_env(
     api_socket: &Path,
     extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
+    spawn_server_with_env_and_owner(
+        config_home,
+        runtime_dir,
+        api_socket,
+        std::process::id(),
+        extra_env,
+    )
+}
+
+fn spawn_server_with_env_and_owner(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    owner_pid: u32,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     fs::write(
@@ -81,6 +100,7 @@ fn spawn_server_with_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, owner_pid.to_string());
     cmd.env("HERDR_SOCKET_PATH", api_socket);
     cmd.env(
         "HERDR_CLIENT_SOCKET_PATH",
@@ -124,6 +144,7 @@ fn spawn_named_session_server(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env("HERDR_SESSION", session_name);
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -159,6 +180,7 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env_remove("HERDR_SESSION");
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -203,6 +225,7 @@ fn spawn_server_with_args_and_socket_env(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
     cmd.env_remove("HERDR_SESSION");
     if let Some(api_socket_env) = api_socket_env {
         cmd.env("HERDR_SOCKET_PATH", api_socket_env);
@@ -572,6 +595,53 @@ fn wait_for_http_contains(port: u16, needle: &str, timeout: Duration) -> String 
     panic!(
         "http server on port {port} did not return {needle:?}; last response was {last_response:?}"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn live_handoff_import_exits_when_its_test_owner_dies() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let mut owner = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn separate test owner");
+
+    let spawned =
+        spawn_server_with_env_and_owner(&config_home, &runtime_dir, &api_socket, owner.id(), &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let source_pid = spawned.child.process_id().expect("source server pid");
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, source_pid, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let replacement_alive = || unsafe { libc::kill(replacement_pid as libc::pid_t, 0) } == 0;
+    // The source server's exit must not end the detached replacement.
+    drop(spawned);
+    thread::sleep(Duration::from_millis(300));
+    assert!(replacement_alive(), "replacement exited before its owner");
+
+    owner.kill().expect("kill test owner");
+    owner.wait().expect("reap test owner");
+    let exited = support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+        !replacement_alive()
+    });
+    if !exited {
+        unsafe { libc::kill(replacement_pid as libc::pid_t, libc::SIGKILL) };
+    }
+    assert!(
+        exited,
+        "replacement server {replacement_pid} survived its test owner"
+    );
+    cleanup_test_base(&base);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
