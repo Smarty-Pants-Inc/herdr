@@ -55,7 +55,8 @@ jobs:
             nextest_filter: all()
           - os: macos-latest
             kind: unix
-            nextest_filter: not binary(live_handoff)
+            # Keep the macOS owner-watchdog regression; the rest of live_handoff stays Linux-only.
+            nextest_filter: not binary(live_handoff) or test(=live_handoff_import_exits_when_its_test_owner_dies)
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
