@@ -1052,10 +1052,9 @@ impl TerminalState {
 
     /// A nested agent that inherited `HERDR_PANE_ID` reports into its parent's pane
     /// (smarty-dev#509). A strictly newer report from the parent's session, with the agent
-    /// process still present, proves the parent is live:
-    /// - if the nested session adopted a persisted-only anchor, the parent reclaims it;
-    /// - an unvalidated pending replacement left by the nested session no longer gates it.
-    /// Older reports still lose on sequence.
+    /// process still present, proves the parent is live. If the nested session adopted a
+    /// persisted-only anchor, the parent reclaims it. An unvalidated pending replacement left
+    /// by the nested session no longer gates it. Older reports still lose on sequence.
     fn reconcile_live_session_report(
         &mut self,
         source: &str,
@@ -1095,7 +1094,7 @@ impl TerminalState {
                 .is_some_and(|displaced| {
                     displaced.source == source
                         && displaced.agent == agent_label
-                        && &displaced.session_ref == session_ref
+                        && displaced.session_ref == *session_ref
                 });
         if reclaims_displaced_session {
             if let Some(adopted) = anchored_session_ref.filter(|adopted| adopted != session_ref) {
@@ -1732,14 +1731,12 @@ impl TerminalState {
         // A report without a replacement reason may adopt a persisted-only anchor, for example a
         // fresh Pi after a restore. Keep the adopted session so it can reclaim the pane if it
         // proves live again (smarty-dev#509).
-        let displaced_persisted_session = (full_lifecycle_source
-            && !session_replacement_allowed
-            && !foreground_takeover_allowed
-            && replaced_hook_session.is_none())
-        .then(|| self.persisted_agent_session.clone())
-        .flatten()
-        .filter(|previous| {
-            previous.source == source
+        let displaced_persisted_session = self.persisted_agent_session.clone().filter(|previous| {
+            full_lifecycle_source
+                && !session_replacement_allowed
+                && !foreground_takeover_allowed
+                && replaced_hook_session.is_none()
+                && previous.source == source
                 && previous.agent == agent_label
                 && previous.session_ref != session_ref
         });
