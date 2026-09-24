@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -85,7 +85,10 @@ let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
 
 function nextReportSeq(): number {
-  reportSeq += 1;
+  // Wall-clock based, not load-time based: a Pi started later in this pane (a nested probe that
+  // inherited HERDR_PANE_ID) must not leave a higher sequence that makes Herdr drop this
+  // long-running session's later reports as stale (smarty-dev#509).
+  reportSeq = Math.max(reportSeq + 1, Date.now() * 1000);
   return reportSeq;
 }
 
