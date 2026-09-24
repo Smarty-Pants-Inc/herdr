@@ -597,7 +597,8 @@ fn wait_for_http_contains(port: u16, needle: &str, timeout: Duration) -> String 
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// The owner watchdog exists only in debug builds.
+#[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn live_handoff_import_exits_when_its_test_owner_dies() {
     let _lock = test_lock();
