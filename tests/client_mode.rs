@@ -653,6 +653,14 @@ fn server_crash_after_attach_causes_lost_connection_error() {
 /// restore path (`TerminalGuard::Drop` → `restore_terminal_state`) ran.
 const MOUSE_TEARDOWN_MARKERS: [&str; 2] = ["\u{1b}[?1003l", "\u{1b}[?1000l"];
 
+/// Frames one retried shell command line. The client drops pane input while its endpoint is
+/// offline or a surface handoff is pending, so a retried line can reach the shell in part. A
+/// partial quoted line leaves the shell at its continuation prompt, where every later retry
+/// also fails. Ctrl-C first cancels any partial or continued line; the shell stays alive.
+fn retry_shell_line(command: &str) -> Vec<u8> {
+    format!("\x03{command}\r").into_bytes()
+}
+
 fn output_has_mouse_teardown(output: &str) -> bool {
     MOUSE_TEARDOWN_MARKERS
         .iter()
@@ -891,12 +899,12 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // the first rendered frame (the unavailable remote must not extend the wait). Retry
             // the write instead of assuming a single write lands, matching the recovered-Local
             // path below.
-            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(20), || {
+            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
                 if read_output(&output).contains("LOCAL_DIRECT_READY") {
                     return true;
                 }
                 input
-                    .write_all(b"printf 'LOCAL_%s\\n' DIRECT_READY\r")
+                    .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' DIRECT_READY"))
                     .unwrap();
                 false
             }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
@@ -1032,14 +1040,15 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 if screen_text().contains(&format!("REMOTE_ALIVE_INPUT_{cycle}")) {
                     return true;
                 }
-                write!(
-                    input,
-                    "printf 'REMOTE_%s_INPUT_{cycle}\\n' \"$reconnect_survivor\"\r"
-                )
-                .unwrap();
+                input
+                    .write_all(&retry_shell_line(&format!(
+                        "printf 'REMOTE_%s_INPUT_{cycle}\\n' \"$reconnect_survivor\""
+                    )))
+                    .unwrap();
                 false
             }),
-            "remote reconnect {cycle} must restore visible input and preserve the shell"
+            "remote reconnect {cycle} must restore visible input and preserve the shell: {}",
+            screen_text()
         );
     }
 
@@ -1069,7 +1078,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 return true;
             }
             input
-                .write_all(b"printf 'REMOTE_%s\\n' SURVIVED\r")
+                .write_all(&retry_shell_line("printf 'REMOTE_%s\\n' SURVIVED"))
                 .unwrap();
             false
         }),
@@ -1141,11 +1150,14 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                     return true;
                 }
                 input
-                    .write_all(b"printf 'LOCAL_%s\\n' INPUT_WHILE_REMOTE_STALLED\r")
+                    .write_all(&retry_shell_line(
+                        "printf 'LOCAL_%s\\n' INPUT_WHILE_REMOTE_STALLED",
+                    ))
                     .unwrap();
                 false
             }),
-            "Local input must become usable while the remote bridge remains stopped"
+            "Local input must become usable while the remote bridge remains stopped: {}",
+            screen_text()
         );
     }
     input
@@ -1195,7 +1207,7 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
                 return true;
             }
             input
-                .write_all(b"printf 'LOCAL_%s\\n' INPUT_RECOVERED\r")
+                .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' INPUT_RECOVERED"))
                 .unwrap();
             false
         }),
@@ -1295,7 +1307,8 @@ fn client_shell_detaches_restores_and_freshly_reattaches_to_current_state() {
             let output = read_output(&output_b);
             output.contains("shell-lifecycle") && output.contains("SHELL_LIFECYCLE_DETACHED")
         }),
-        "fresh client shell should receive current state and detached-period output; output: {:?}",
+        "fresh client shell should receive current state and detached-period output; server exit: {:?}; output: {:?}",
+        server.child.try_wait(),
         read_output(&output_b)
     );
 
