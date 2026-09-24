@@ -933,6 +933,12 @@ impl TerminalState {
         if self.full_lifecycle_hook_report_matches_stale_session(source, agent_label, session_ref) {
             return FullLifecycleHookReportRoute::Ignore;
         }
+        self.discard_unvalidated_replacement_for_live_session(
+            source,
+            agent_label,
+            session_ref.as_ref(),
+            seq,
+        );
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
         let process_present = known_agent.is_some()
@@ -1045,6 +1051,63 @@ impl TerminalState {
             });
         }
         FullLifecycleHookReportRoute::Ignore
+    }
+
+    /// A report from another session while the anchored agent process is still present leaves
+    /// an unvalidated pending replacement. A nested agent that inherited `HERDR_PANE_ID` does
+    /// this. A strictly newer report from the anchored session proves that session is still
+    /// live, so discard the pending replacement instead of letting it gate the live session.
+    /// Older reports still lose on sequence (smarty-dev#509).
+    fn discard_unvalidated_replacement_for_live_session(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+    ) {
+        let (Some(session_ref), Some(seq)) = (session_ref, seq) else {
+            return;
+        };
+        let known_agent = crate::detect::parse_agent_label(agent_label);
+        let process_present = known_agent.is_some()
+            && self.detected_agent == known_agent
+            && self.recent_agent_process_exit.is_none();
+        let anchored_session_ref = self
+            .hook_authority
+            .as_ref()
+            .filter(|authority| authority.source == source && authority.agent_label == agent_label)
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .filter(|session| session.source == source && session.agent == agent_label)
+                    .map(|session| &session.session_ref)
+            });
+        let newer_than_accepted = self
+            .hook_report_sequences
+            .get(source)
+            .is_none_or(|previous| seq > *previous);
+        let discard = process_present
+            && anchored_session_ref == Some(session_ref)
+            && newer_than_accepted
+            && self
+                .suppressed_full_lifecycle_hook_reports
+                .get(source)
+                .is_some_and(|suppressed| {
+                    suppressed.agent_label == agent_label
+                        && suppressed.reason == FullLifecycleHookSuppressionReason::ProcessExit
+                        && suppressed.replacement_session_ref.is_none()
+                        && suppressed
+                            .pending_replacement_report
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                seq > pending.seq
+                                    && pending.authority.session_ref.as_ref() != Some(session_ref)
+                            })
+                });
+        if discard {
+            self.suppressed_full_lifecycle_hook_reports.remove(source);
+        }
     }
 
     fn full_lifecycle_hook_report_matches_stale_session(
@@ -1460,6 +1523,14 @@ impl TerminalState {
             && self.recent_agent_process_exit.is_none();
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
+        if full_lifecycle_source {
+            self.discard_unvalidated_replacement_for_live_session(
+                &source,
+                &agent_label,
+                Some(&session_ref),
+                seq,
+            );
+        }
         let generation_gated = self
             .suppressed_full_lifecycle_hook_reports
             .get(&source)
@@ -2928,6 +2999,82 @@ mod tests {
                 "{reason:?} must not replace the current Pi session"
             );
         }
+    }
+
+    #[test]
+    fn pi_parent_session_recovers_after_nested_pi_reports() {
+        // smarty-dev#509: a nested Pi inherits HERDR_PANE_ID and reports into its parent's pane.
+        let mut terminal = test_terminal();
+        let parent =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("pi-parent.jsonl"));
+        let nested =
+            crate::agent_resume::AgentSessionRef::id("01a0d15d-47db-7268-81da-0fb2036f40fc");
+        let parent_identity = || {
+            let parent = parent.clone().unwrap();
+            Some((
+                "herdr:pi".to_string(),
+                "pi".to_string(),
+                parent.kind,
+                parent.value,
+            ))
+        };
+        let report_session =
+            |terminal: &mut TerminalState, session_ref, seq, reason: Option<&str>| {
+                terminal.set_agent_session_ref_for_session_start(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    session_ref,
+                    Some(seq),
+                    reason.map(str::to_string),
+                )
+            };
+        let report_state = |terminal: &mut TerminalState, session_ref, state, seq| {
+            terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                state,
+                None,
+                session_ref,
+                Some(seq),
+            )
+        };
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(report_session(&mut terminal, parent.clone(), 10, Some("startup")).is_some());
+        assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 11).is_some());
+
+        // The nested Pi's startup and state reports carry larger sequences but must not win.
+        report_session(&mut terminal, nested.clone(), 20, Some("startup"));
+        report_state(&mut terminal, nested.clone(), AgentState::Idle, 21);
+        report_session(&mut terminal, nested.clone(), 22, None);
+        report_state(&mut terminal, nested.clone(), AgentState::Working, 23);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            parent_identity()
+        );
+        assert_eq!(terminal.state, AgentState::Idle);
+
+        // A genuinely old parent report still loses.
+        assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 15).is_none());
+        assert_eq!(terminal.state, AgentState::Idle);
+
+        // The parent's next turn: session report without a reason, then working and idle.
+        report_session(&mut terminal, parent.clone(), 30, None);
+        assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 31).is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 32).is_some());
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            parent_identity()
+        );
+
+        // Late nested reports stay rejected.
+        assert!(report_state(&mut terminal, nested, AgentState::Working, 33).is_none());
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            parent_identity()
+        );
     }
 
     #[test]
