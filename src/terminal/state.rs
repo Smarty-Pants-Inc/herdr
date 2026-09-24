@@ -1702,6 +1702,26 @@ impl TerminalState {
         if replaced_hook_session.is_some() && !session_replacement_allowed {
             return None;
         }
+        // A persisted anchor without live hook authority (for example after a server restart)
+        // gets the same protection, so a nested agent cannot displace it without a replacement
+        // reason (smarty-dev#509). An id anchor may still gain its path: one session can report
+        // either form.
+        let replaces_persisted_session = full_lifecycle_source
+            && process_present
+            && self
+                .persisted_agent_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.source == source
+                        && session.agent == agent_label
+                        && session.session_ref != session_ref
+                        && !(session.session_ref.kind
+                            == crate::agent_resume::AgentSessionRefKind::Id
+                            && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
+                });
+        if replaces_persisted_session && !session_replacement_allowed {
+            return None;
+        }
 
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -3004,7 +3024,6 @@ mod tests {
     #[test]
     fn pi_parent_session_recovers_after_nested_pi_reports() {
         // smarty-dev#509: a nested Pi inherits HERDR_PANE_ID and reports into its parent's pane.
-        let mut terminal = test_terminal();
         let parent =
             crate::agent_resume::AgentSessionRef::path(test_session_path("pi-parent.jsonl"));
         let nested =
@@ -3038,43 +3057,63 @@ mod tests {
                 Some(seq),
             )
         };
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
-        assert!(report_session(&mut terminal, parent.clone(), 10, Some("startup")).is_some());
-        assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 11).is_some());
+        // The parent is anchored by live hook authority, or only by its persisted session (for
+        // example after a server restart).
+        for live_authority in [true, false] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+            if live_authority {
+                assert!(
+                    report_session(&mut terminal, parent.clone(), 10, Some("startup")).is_some()
+                );
+                assert!(
+                    report_state(&mut terminal, parent.clone(), AgentState::Idle, 11).is_some()
+                );
+            } else {
+                anchor_full_lifecycle_session(
+                    &mut terminal,
+                    Agent::Pi,
+                    "herdr:pi",
+                    "pi",
+                    parent.clone().unwrap(),
+                );
+            }
 
-        // The nested Pi's startup and state reports carry larger sequences but must not win.
-        report_session(&mut terminal, nested.clone(), 20, Some("startup"));
-        report_state(&mut terminal, nested.clone(), AgentState::Idle, 21);
-        report_session(&mut terminal, nested.clone(), 22, None);
-        report_state(&mut terminal, nested.clone(), AgentState::Working, 23);
-        assert_eq!(
-            terminal.current_session_identity_for_persistence(),
-            parent_identity()
-        );
-        assert_eq!(terminal.state, AgentState::Idle);
+            // The nested Pi's startup and state reports carry larger sequences but must not win.
+            report_session(&mut terminal, nested.clone(), 20, Some("startup"));
+            report_state(&mut terminal, nested.clone(), AgentState::Idle, 21);
+            report_session(&mut terminal, nested.clone(), 22, None);
+            report_state(&mut terminal, nested.clone(), AgentState::Working, 23);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                parent_identity()
+            );
+            assert_eq!(terminal.state, AgentState::Idle);
 
-        // A genuinely old parent report still loses.
-        assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 15).is_none());
-        assert_eq!(terminal.state, AgentState::Idle);
+            // A genuinely old parent report still loses.
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 15).is_none());
+            assert_eq!(terminal.state, AgentState::Idle);
 
-        // The parent's next turn: session report without a reason, then working and idle.
-        report_session(&mut terminal, parent.clone(), 30, None);
-        assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 31).is_some());
-        assert_eq!(terminal.state, AgentState::Working);
-        assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 32).is_some());
-        assert_eq!(terminal.state, AgentState::Idle);
-        assert_eq!(
-            terminal.current_session_identity_for_persistence(),
-            parent_identity()
-        );
+            // The parent's next turn: session report without a reason, then working and idle.
+            report_session(&mut terminal, parent.clone(), 30, None);
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 31).is_some());
+            assert_eq!(terminal.state, AgentState::Working);
+            assert!(report_state(&mut terminal, parent.clone(), AgentState::Idle, 32).is_some());
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                parent_identity()
+            );
 
-        // Late nested reports stay rejected.
-        assert!(report_state(&mut terminal, nested, AgentState::Working, 33).is_none());
-        assert_eq!(terminal.state, AgentState::Idle);
-        assert_eq!(
-            terminal.current_session_identity_for_persistence(),
-            parent_identity()
-        );
+            // Late nested reports stay rejected.
+            assert!(report_state(&mut terminal, nested.clone(), AgentState::Working, 33).is_none());
+            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(
+                terminal.current_session_identity_for_persistence(),
+                parent_identity(),
+                "live_authority={live_authority}"
+            );
+        }
     }
 
     #[test]
