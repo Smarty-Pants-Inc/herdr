@@ -147,6 +147,7 @@ pub struct TerminalState {
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
+    displaced_persisted_session: Option<crate::agent_resume::PersistedAgentSession>,
     metadata_report_sequences: HashMap<String, u64>,
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
@@ -185,6 +186,7 @@ impl TerminalState {
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
+            displaced_persisted_session: None,
             metadata_report_sequences: HashMap::new(),
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
@@ -933,12 +935,7 @@ impl TerminalState {
         if self.full_lifecycle_hook_report_matches_stale_session(source, agent_label, session_ref) {
             return FullLifecycleHookReportRoute::Ignore;
         }
-        self.discard_unvalidated_replacement_for_live_session(
-            source,
-            agent_label,
-            session_ref.as_ref(),
-            seq,
-        );
+        self.reconcile_live_session_report(source, agent_label, session_ref.as_ref(), seq);
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
         let process_present = known_agent.is_some()
@@ -1053,12 +1050,13 @@ impl TerminalState {
         FullLifecycleHookReportRoute::Ignore
     }
 
-    /// A report from another session while the anchored agent process is still present leaves
-    /// an unvalidated pending replacement. A nested agent that inherited `HERDR_PANE_ID` does
-    /// this. A strictly newer report from the anchored session proves that session is still
-    /// live, so discard the pending replacement instead of letting it gate the live session.
-    /// Older reports still lose on sequence (smarty-dev#509).
-    fn discard_unvalidated_replacement_for_live_session(
+    /// A nested agent that inherited `HERDR_PANE_ID` reports into its parent's pane
+    /// (smarty-dev#509). A strictly newer report from the parent's session, with the agent
+    /// process still present, proves the parent is live:
+    /// - if the nested session adopted a persisted-only anchor, the parent reclaims it;
+    /// - an unvalidated pending replacement left by the nested session no longer gates it.
+    /// Older reports still lose on sequence.
+    fn reconcile_live_session_report(
         &mut self,
         source: &str,
         agent_label: &str,
@@ -1082,14 +1080,41 @@ impl TerminalState {
                     .as_ref()
                     .filter(|session| session.source == source && session.agent == agent_label)
                     .map(|session| &session.session_ref)
-            });
+            })
+            .cloned();
         let newer_than_accepted = self
             .hook_report_sequences
             .get(source)
             .is_none_or(|previous| seq > *previous);
-        let discard = process_present
-            && anchored_session_ref == Some(session_ref)
-            && newer_than_accepted
+        if !process_present || !newer_than_accepted {
+            return;
+        }
+        let reclaims_displaced_session =
+            self.displaced_persisted_session
+                .as_ref()
+                .is_some_and(|displaced| {
+                    displaced.source == source
+                        && displaced.agent == agent_label
+                        && &displaced.session_ref == session_ref
+                });
+        if reclaims_displaced_session {
+            if let Some(adopted) = anchored_session_ref.filter(|adopted| adopted != session_ref) {
+                self.remember_stale_full_lifecycle_hook_session(
+                    source.to_string(),
+                    agent_label.to_string(),
+                    adopted,
+                );
+            }
+            if self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == source && authority.agent_label == agent_label
+            }) {
+                self.hook_authority = None;
+            }
+            self.persisted_agent_session = self.displaced_persisted_session.take();
+            self.suppressed_full_lifecycle_hook_reports.remove(source);
+            return;
+        }
+        let discard = anchored_session_ref.as_ref() == Some(session_ref)
             && self
                 .suppressed_full_lifecycle_hook_reports
                 .get(source)
@@ -1524,12 +1549,7 @@ impl TerminalState {
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
         if full_lifecycle_source {
-            self.discard_unvalidated_replacement_for_live_session(
-                &source,
-                &agent_label,
-                Some(&session_ref),
-                seq,
-            );
+            self.reconcile_live_session_report(&source, &agent_label, Some(&session_ref), seq);
         }
         let generation_gated = self
             .suppressed_full_lifecycle_hook_reports
@@ -1702,26 +1722,6 @@ impl TerminalState {
         if replaced_hook_session.is_some() && !session_replacement_allowed {
             return None;
         }
-        // A persisted anchor without live hook authority (for example after a server restart)
-        // gets the same protection, so a nested agent cannot displace it without a replacement
-        // reason (smarty-dev#509). An id anchor may still gain its path: one session can report
-        // either form.
-        let replaces_persisted_session = full_lifecycle_source
-            && process_present
-            && self
-                .persisted_agent_session
-                .as_ref()
-                .is_some_and(|session| {
-                    session.source == source
-                        && session.agent == agent_label
-                        && session.session_ref != session_ref
-                        && !(session.session_ref.kind
-                            == crate::agent_resume::AgentSessionRefKind::Id
-                            && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
-                });
-        if replaces_persisted_session && !session_replacement_allowed {
-            return None;
-        }
 
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -1729,6 +1729,23 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        // A report without a replacement reason may adopt a persisted-only anchor, for example a
+        // fresh Pi after a restore. Keep the adopted session so it can reclaim the pane if it
+        // proves live again (smarty-dev#509).
+        let displaced_persisted_session = (full_lifecycle_source
+            && !session_replacement_allowed
+            && !foreground_takeover_allowed
+            && replaced_hook_session.is_none())
+        .then(|| self.persisted_agent_session.clone())
+        .flatten()
+        .filter(|previous| {
+            previous.source == source
+                && previous.agent == agent_label
+                && previous.session_ref != session_ref
+        });
+        if displaced_persisted_session.is_some() {
+            self.displaced_persisted_session = displaced_persisted_session;
+        }
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -3058,7 +3075,7 @@ mod tests {
             )
         };
         // The parent is anchored by live hook authority, or only by its persisted session (for
-        // example after a server restart).
+        // example after a server restart), which a startup report may adopt.
         for live_authority in [true, false] {
             let mut terminal = test_terminal();
             terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
@@ -3079,20 +3096,24 @@ mod tests {
                 );
             }
 
-            // The nested Pi's startup and state reports carry larger sequences but must not win.
+            // The nested Pi reports its startup, state and a turn with larger sequences.
             report_session(&mut terminal, nested.clone(), 20, Some("startup"));
             report_state(&mut terminal, nested.clone(), AgentState::Idle, 21);
             report_session(&mut terminal, nested.clone(), 22, None);
             report_state(&mut terminal, nested.clone(), AgentState::Working, 23);
-            assert_eq!(
-                terminal.current_session_identity_for_persistence(),
-                parent_identity()
-            );
-            assert_eq!(terminal.state, AgentState::Idle);
+            if live_authority {
+                // It must not replace live authority.
+                assert_eq!(
+                    terminal.current_session_identity_for_persistence(),
+                    parent_identity()
+                );
+                assert_eq!(terminal.state, AgentState::Idle);
+            }
+            let nested_state = terminal.state;
 
             // A genuinely old parent report still loses.
             assert!(report_state(&mut terminal, parent.clone(), AgentState::Working, 15).is_none());
-            assert_eq!(terminal.state, AgentState::Idle);
+            assert_eq!(terminal.state, nested_state);
 
             // The parent's next turn: session report without a reason, then working and idle.
             report_session(&mut terminal, parent.clone(), 30, None);
