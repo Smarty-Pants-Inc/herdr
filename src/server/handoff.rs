@@ -113,6 +113,33 @@ pub(crate) fn spawn_handoff_import(
     })
 }
 
+/// Ends a debug import server when the test process that owns it exits.
+///
+/// The import server is a detached daemon, so it outlives a killed or aborted
+/// test process and no test-side cleanup remains to reap it. Tests pass their
+/// PID in `HERDR_TEST_HANDOFF_OWNER_PID`; release builds ignore it.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn start_test_owner_watchdog() {
+    let Some(owner_pid) = std::env::var("HERDR_TEST_HANDOFF_OWNER_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid != 0 && *pid != std::process::id())
+    else {
+        return;
+    };
+    let watchdog = std::thread::Builder::new()
+        .name("herdr-test-owner-watchdog".to_string())
+        .spawn(move || loop {
+            if !crate::platform::process_exists(owner_pid) {
+                std::process::exit(0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        });
+    if let Err(err) = watchdog {
+        warn!(%err, "failed to start test owner watchdog");
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
