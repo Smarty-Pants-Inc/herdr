@@ -47,6 +47,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.13.1"
 schemars = { version = "1.2.1", features = ["derive"] }
+# native-media: client WebRTC peer. opus builds a bundled libopus when no system one exists.
+webrtc = { version = "0.17.2", optional = true }
+opus = { version = "0.4.0", optional = true }
+
+[features]
+default = []
+# Client-side WebRTC media peer (microphone and speaker for pane voice agents).
+native-media = ["dep:webrtc", "dep:opus", "dep:cpal"]
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
@@ -55,6 +63,10 @@ portable-pty = { path = "vendor/portable-pty" }
 # logind's delay inhibitor lets the server save before host shutdown kills panes.
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# native-media audio devices (CoreAudio). Linux would need ALSA headers.
+cpal = { version = "0.18.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # UTF-16 SDDL input for interprocess security descriptors.
