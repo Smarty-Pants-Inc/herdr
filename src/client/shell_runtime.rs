@@ -71,6 +71,63 @@ pub(super) fn dispatch_client_shell_actions(
     Ok((replay_mouse, repaint))
 }
 
+/// Apply media controller effects. Returns true when client chrome changed.
+pub(super) fn apply_media_effects(
+    state: &mut ClientState,
+    endpoints: &mut endpoint::EndpointRegistry,
+) -> bool {
+    let mut repaint = false;
+    for effect in state.media.take_effects() {
+        match effect {
+            media::MediaEffect::Send(endpoint_id, control) => match control.client_message() {
+                Ok(message) => {
+                    endpoints.send_to(&endpoint_id, &message);
+                }
+                Err(error) => warn!(%error, "failed to encode media control"),
+            },
+            media::MediaEffect::Notice(message) => {
+                if let Some(shell) = state.shell.as_mut() {
+                    repaint |= shell.receive_media_notice(message);
+                }
+            }
+            media::MediaEffect::AskConsent {
+                session_id,
+                pane_label,
+            } => {
+                if let Some(shell) = state.shell.as_mut() {
+                    shell.open_media_consent(session_id, &pane_label);
+                    repaint = true;
+                }
+            }
+            media::MediaEffect::CancelConsent { session_id } => {
+                if let Some(shell) = state.shell.as_mut() {
+                    repaint |= shell.close_media_consent(&session_id);
+                }
+            }
+        }
+    }
+    repaint
+}
+
+/// Apply media controller effects and repaint client chrome when it changed.
+pub(super) fn present_media_effects(
+    state: &mut ClientState,
+    endpoints: &mut endpoint::EndpointRegistry,
+    prefix_input_source: &mut impl crate::platform::PrefixInputSource,
+) {
+    if !apply_media_effects(state, endpoints) {
+        return;
+    }
+    apply_client_shell_input_source_changes(state, prefix_input_source);
+    if let Some(frame) = state
+        .shell
+        .as_mut()
+        .and_then(|shell| shell.compose(state.reported_size.0, state.reported_size.1))
+    {
+        state.present_frame(frame);
+    }
+}
+
 pub(super) fn client_shell_resize_message(
     shell: &shell::ClientShellState,
     cols: u16,
@@ -510,6 +567,8 @@ pub(super) fn handle_endpoint_disconnect(
     notice: &str,
 ) -> bool {
     supervisors.disconnected(endpoint_id, generation, now);
+    state.media.endpoint_gone(endpoint_id);
+    apply_media_effects(state, endpoints);
     #[cfg(unix)]
     state.retire_endpoint_graphics(endpoint_id);
     if pending_activation
@@ -565,6 +624,8 @@ pub(super) fn handle_endpoint_attention(
     message: String,
 ) -> bool {
     endpoints.disconnect(endpoint_id);
+    state.media.endpoint_gone(endpoint_id);
+    apply_media_effects(state, endpoints);
     supervisors.record_status(
         endpoint_id,
         generation,
@@ -693,6 +754,13 @@ pub(super) fn finish_client_shell_input(
         let _ = write_to_server(endpoints, &ClientMessage::Detach);
         return Ok(true);
     }
+    let mut media_repaint = false;
+    if !outcome.media_consent.is_empty() {
+        for (session_id, allowed) in outcome.media_consent {
+            state.media.consent(&session_id, allowed);
+        }
+        media_repaint = apply_media_effects(state, endpoints);
+    }
     if outcome.resize {
         let shell = state.shell.as_ref().expect("shell mode remains active");
         let resize = client_shell_resize_message(
@@ -727,7 +795,7 @@ pub(super) fn finish_client_shell_input(
         &mut state.detached_process_children,
         scheduled_activation,
     )?;
-    let frame = if dispatch_repaint {
+    let frame = if dispatch_repaint || media_repaint {
         state
             .shell
             .as_mut()
@@ -787,6 +855,11 @@ pub(super) fn finish_client_shell_input(
         if pending_activation.is_some() {
             // Pane input and non-focus host effects do not cross the frozen handoff boundary.
             continue;
+        }
+        if let ClientMessage::ClientShellPaneInput { pane_id, .. } = &request {
+            state
+                .media
+                .note_pane_input(endpoints.active_id(), pane_id, std::time::Instant::now());
         }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }

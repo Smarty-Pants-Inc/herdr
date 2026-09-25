@@ -15,4 +15,5 @@ pub(super) struct ClientLoopConfig {
     pub(super) remote_image_paste_key:
         Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(super) shell_config: Option<shell::ClientShellConfig>,
+    pub(super) media_mode: crate::config::MediaMode,
 }

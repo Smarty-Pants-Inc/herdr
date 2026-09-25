@@ -188,6 +188,7 @@ pub(super) fn do_handshake(
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
+            capabilities: super::media::peer::advertised_capabilities(),
         };
         ClientMessage::EndpointControl {
             kind: ENDPOINT_HELLO_KIND.into(),

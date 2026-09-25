@@ -45,6 +45,7 @@ pub(super) fn apply_profiles(
     let active_removed = retired.contains(endpoints.active_id());
     for endpoint_id in retired {
         endpoints.disconnect(&endpoint_id);
+        state.media.endpoint_gone(&endpoint_id);
         let cancelled = commands.disconnect(&endpoint_id);
         #[cfg(unix)]
         state.retire_endpoint_graphics(&endpoint_id);
@@ -55,6 +56,7 @@ pub(super) fn apply_profiles(
             shell.retire_endpoint(&endpoint_id);
         }
     }
+    apply_media_effects(state, endpoints);
     catalog.ssh = profiles;
     if active_removed {
         endpoints.select_unavailable_local();

@@ -305,6 +305,19 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     Ok {},
+    MediaOffer {
+        session_id: String,
+        sdp: String,
+    },
+    MediaSession {
+        session_id: String,
+        state: super::media::MediaSessionState,
+        muted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

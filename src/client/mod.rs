@@ -27,6 +27,7 @@ mod frame_output;
 mod handshake;
 mod input;
 mod loop_config;
+mod media;
 mod notifications;
 mod shell;
 mod shell_runtime;
@@ -194,6 +195,7 @@ fn run_client_with_mode(
         endpoint_keybindings,
         remote_image_paste_key,
         shell_config,
+        media_mode: loaded_config.config.media,
     };
 
     crate::logging::startup("client");
@@ -390,6 +392,15 @@ async fn run_client_loop(
     let is_remote_client = is_remote_client_process();
     let local_unavailable = initial.is_none();
 
+    // Channel for events from the resize, server reader and media peer threads.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
+    let media_tx = event_tx.clone();
+    let media_sink: media::peer::PeerEventSink = Arc::new(move |event: media::peer::PeerEvent| {
+        if media_tx.try_send(ClientLoopEvent::Media(event)).is_err() {
+            warn!("dropping media peer event: client loop queue is full or closed");
+        }
+    });
+
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
@@ -424,6 +435,11 @@ async fn run_client_loop(
         draw_host_cursor,
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
+        media: media::ClientMedia::new(
+            config.media_mode,
+            media::peer::native_peer_factory(),
+            media_sink,
+        ),
     };
     let mut federated = endpoint_catalog.has_enabled_ssh();
     if let Some(shell) = state.shell.as_mut() {
@@ -459,8 +475,6 @@ async fn run_client_loop(
     let reported_cell_size = Arc::new(AtomicU64::new(0));
     let host_sgr_pixels_active = Arc::new(AtomicBool::new(false));
 
-    // Channel for events from the resize and server reader threads.
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     let (supervisor_tx, mut supervisor_rx) =
         tokio::sync::mpsc::channel::<endpoint::EndpointSupervisorEvent>(64);
     // Keep Windows console draining independent of server-frame backpressure.
@@ -719,6 +733,9 @@ async fn run_client_loop(
             .map_or(Duration::from_millis(100), |shell| {
                 shell.timer_delay(std::time::Instant::now())
             });
+        let timer_delay = state.media.deadline().map_or(timer_delay, |deadline| {
+            timer_delay.min(deadline.saturating_duration_since(std::time::Instant::now()))
+        });
         let timer_deadline = client_timer.deadline(std::time::Instant::now(), timer_delay);
         let immediate_event = scheduled_activation.take();
         #[cfg(windows)]
@@ -1219,6 +1236,9 @@ async fn run_client_loop(
                     let agent_view_projection_supported = negotiation.supports_capability(
                         crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY,
                     );
+                    // A new generation replaces the old connection and any media it carried.
+                    state.media.endpoint_gone(&endpoint_id);
+                    apply_media_effects(&mut state, &mut write_stream);
                     let frame = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
                         shell.set_endpoint_agent_view_projection_supported(
@@ -1879,6 +1899,36 @@ async fn run_client_loop(
                         }
                     }
                     ServerMessage::EndpointControl { kind, data } => {
+                        if protocol::media::MediaControl::is_media_kind(&kind) {
+                            match protocol::media::MediaControl::decode(&kind, &data) {
+                                Some(Ok(control)) => {
+                                    let endpoint_shown = endpoint_active
+                                        && state.shell.as_ref().is_some_and(|shell| {
+                                            shell.endpoint_is_active(&endpoint_id)
+                                        });
+                                    let shell = state.shell.as_ref();
+                                    state.media.handle_server_control(
+                                        &endpoint_id,
+                                        control,
+                                        endpoint_shown,
+                                        |pane_id| {
+                                            shell.and_then(|shell| shell.media_pane_label(pane_id))
+                                        },
+                                        now,
+                                    );
+                                    present_media_effects(
+                                        &mut state,
+                                        &mut write_stream,
+                                        &mut prefix_input_source,
+                                    );
+                                }
+                                Some(Err(error)) => {
+                                    warn!(endpoint = %endpoint_id.storage_key(), %error, "ignoring invalid media control");
+                                }
+                                None => debug!(%kind, "ignoring unknown media control"),
+                            }
+                            continue;
+                        }
                         if kind == crate::protocol::endpoint::PRESENTATION_EFFECTS_READY_KIND {
                             let progress = pending_activation.as_mut().map(|activation| {
                                 activation.receive_presentation_effects_ready(
@@ -2040,9 +2090,17 @@ async fn run_client_loop(
                     &endpoint_id,
                     io::Error::new(io::ErrorKind::UnexpectedEof, "connection was lost"),
                 );
+                state.media.endpoint_gone(&endpoint_id);
+                present_media_effects(&mut state, &mut write_stream, &mut prefix_input_source);
+            }
+            ClientLoopEvent::Media(event) => {
+                state.media.handle_peer_event(event);
+                present_media_effects(&mut state, &mut write_stream, &mut prefix_input_source);
             }
             ClientLoopEvent::Timer => {
                 client_timer.fired();
+                state.media.tick(now);
+                present_media_effects(&mut state, &mut write_stream, &mut prefix_input_source);
                 #[cfg(unix)]
                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
                     matcher.expire();

@@ -1694,6 +1694,9 @@ impl ClientShellState {
                     Some(ClientShellOverlay::ConfirmClose(_)) => {
                         self.accept_close_confirmation(outcome);
                     }
+                    Some(ClientShellOverlay::MediaConsent(_)) => {
+                        self.answer_media_consent(true, outcome);
+                    }
                     _ => {}
                 }
             } else if super::contains(self.hits.overlay_clear, point) {
@@ -1701,6 +1704,9 @@ impl ClientShellState {
                     rename.input.clear();
                     outcome.repaint = true;
                 }
+            } else if matches!(self.overlay, Some(ClientShellOverlay::MediaConsent(_))) {
+                // Cancel and clicks outside the dialog deny.
+                self.answer_media_consent(false, outcome);
             } else {
                 self.overlay = None;
                 outcome.repaint = true;
