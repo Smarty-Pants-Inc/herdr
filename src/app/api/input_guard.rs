@@ -427,21 +427,23 @@ mod tests {
 
     #[tokio::test]
     async fn known_pane_id_report_is_not_rebound_to_the_reporting_process_pane() {
-        let mut fixture = attributed_agent_fixture();
-        let target = fixture.target_pane_id.clone();
-        let response = fixture.app.handle_api_request_with_context(
-            Request {
-                id: "known".into(),
-                method: report_working(&target),
-            },
-            attributed_context(),
-        );
+        let fixture = attributed_agent_fixture();
+        let mut request = Request {
+            id: "known".into(),
+            method: report_working(&fixture.target_pane_id),
+        };
+        fixture
+            .app
+            .rebind_stale_report_pane(&mut request, attributed_context());
+        assert_eq!(request.method, report_working(&fixture.target_pane_id));
 
-        assert_ok(&response);
-        assert_eq!(terminal_state(&fixture.app, &target), AgentState::Working);
-        assert_eq!(
-            terminal_state(&fixture.app, &fixture.source_pane_id),
-            AgentState::Idle
-        );
+        let mut stale = Request {
+            id: "stale".into(),
+            method: report_working("w42:p1F"),
+        };
+        fixture
+            .app
+            .rebind_stale_report_pane(&mut stale, attributed_context());
+        assert_eq!(stale.method, report_working(&fixture.source_pane_id));
     }
 }
