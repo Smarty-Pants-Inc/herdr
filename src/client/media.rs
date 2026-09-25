@@ -5,6 +5,8 @@
 //! media controls for the owning endpoint. It does no I/O: the client loop passes in the view
 //! facts and the clock, then applies the returned [`MediaEffect`]s.
 
+#[cfg(feature = "native-media")]
+mod native;
 pub(crate) mod peer;
 
 use std::collections::HashMap;

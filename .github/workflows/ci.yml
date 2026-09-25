@@ -60,7 +60,8 @@ jobs:
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The native-media feature adds a second herdr build with WebRTC and libopus.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -152,6 +153,15 @@ jobs:
       - name: Run macOS checks
         if: runner.os == 'macOS'
         run: just ci '${{ matrix.nextest_filter }}'
+
+      # The native media peer is feature-gated; its unit tests use a fake audio device.
+      - name: Test native media peer
+        if: matrix.kind == 'unix'
+        run: cargo test --locked --features native-media --bin herdr -- client::media
+
+      - name: Lint native media peer
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked --features native-media --bin herdr -- -D warnings
 
       - name: Check scalar libghostty with runtime safety
         if: runner.os == 'Linux'

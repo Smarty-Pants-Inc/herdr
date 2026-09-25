@@ -10,8 +10,8 @@ use std::sync::Arc;
 use crate::protocol::media::MediaPeerState;
 
 /// Asynchronous results from a peer. The peer calls the sink from its own threads.
-// Only a media peer constructs these; this build has none outside tests.
-#[allow(dead_code)]
+// Only the native peer constructs these; builds without it have none outside tests.
+#[cfg_attr(not(feature = "native-media"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PeerEvent {
     /// The complete local SDP offer (ICE gathering finished or timed out).
@@ -49,9 +49,11 @@ pub(crate) trait MediaPeer: Send {
 pub(crate) type PeerFactory =
     Box<dyn Fn(String, PeerEventSink) -> Result<Box<dyn MediaPeer>, String> + Send>;
 
-/// Whether this build contains a real media peer. The WebRTC peer lands behind the
-/// `native-media` cargo feature in a follow-up change.
-pub(crate) const NATIVE_PEER_AVAILABLE: bool = false;
+/// Whether this build contains a real media peer.
+/// Only macOS has a native audio backend; other feature builds compile the peer for tests
+/// but must not advertise a capability their factory always refuses.
+pub(crate) const NATIVE_PEER_AVAILABLE: bool =
+    cfg!(all(feature = "native-media", target_os = "macos"));
 
 /// Endpoint hello capabilities this client build advertises.
 pub(crate) fn advertised_capabilities() -> Vec<String> {
@@ -64,5 +66,26 @@ pub(crate) fn advertised_capabilities() -> Vec<String> {
 
 /// The peer factory for this build.
 pub(crate) fn native_peer_factory() -> PeerFactory {
-    Box::new(|_, _| Err("this Herdr client was built without native media".to_owned()))
+    #[cfg(feature = "native-media")]
+    {
+        Box::new(|session_id, sink| {
+            super::native::start(session_id, sink).map(|peer| Box::new(peer) as Box<dyn MediaPeer>)
+        })
+    }
+    #[cfg(not(feature = "native-media"))]
+    {
+        Box::new(|_, _| Err("this Herdr client was built without native media".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_is_advertised_only_where_the_native_peer_works() {
+        let expected = cfg!(all(feature = "native-media", target_os = "macos"));
+        assert_eq!(NATIVE_PEER_AVAILABLE, expected);
+        assert_eq!(!advertised_capabilities().is_empty(), expected);
+    }
 }
