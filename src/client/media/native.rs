@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
@@ -93,7 +93,13 @@ type Playback = Arc<Mutex<VecDeque<f32>>>;
 /// A running native media peer. Dropping it closes the session.
 pub(crate) struct NativePeer {
     commands: mpsc::UnboundedSender<Command>,
+    /// Cancels setup and negotiation at their next await, so close never waits for them.
+    cancel: watch::Sender<bool>,
     closed: Arc<AtomicBool>,
+    /// Set by the peer thread once it has released the devices and stopped.
+    // Only tests read it; the reaper thread waits on `done` instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    stopped: Arc<AtomicBool>,
     done: Option<std_mpsc::Receiver<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -126,8 +132,11 @@ pub(crate) fn start_with_audio(
         .build()
         .map_err(|error| format!("could not start the media runtime: {error}"))?;
     let (commands, command_rx) = mpsc::unbounded_channel();
+    let (cancel, cancel_rx) = watch::channel(false);
     let (done_tx, done) = std_mpsc::channel();
     let closed = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let thread_stopped = Arc::clone(&stopped);
     let emitter = Emitter {
         session_id,
         sink,
@@ -136,7 +145,7 @@ pub(crate) fn start_with_audio(
     let thread = std::thread::Builder::new()
         .name("herdr-media-peer".to_owned())
         .spawn(move || {
-            let result = runtime.block_on(session(&emitter, audio, command_rx));
+            let result = runtime.block_on(session(&emitter, audio, command_rx, cancel_rx));
             runtime.shutdown_timeout(Duration::from_millis(500));
             if let Err(message) = result {
                 tracing::warn!(session_id = %emitter.session_id, %message, "media peer failed");
@@ -146,12 +155,15 @@ pub(crate) fn start_with_audio(
                     message,
                 });
             }
+            thread_stopped.store(true, Ordering::SeqCst);
             let _ = done_tx.send(());
         })
         .map_err(|error| format!("could not start the media thread: {error}"))?;
     Ok(NativePeer {
         commands,
+        cancel,
         closed,
+        stopped,
         done: Some(done),
         thread: Some(thread),
     })
@@ -171,17 +183,25 @@ impl MediaPeer for NativePeer {
             return;
         };
         self.closed.store(true, Ordering::SeqCst);
+        let _ = self.cancel.send(true);
         let _ = self.commands.send(Command::Close);
-        match done.recv_timeout(THREAD_JOIN_TIMEOUT) {
-            Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                if let Some(thread) = self.thread.take() {
-                    let _ = thread.join();
+        // Cancellation makes the peer thread drop the devices at its next await. Closing the
+        // WebRTC connection can still take up to a second, so join off the client loop.
+        let thread = self.thread.take();
+        let reaper = std::thread::Builder::new()
+            .name("herdr-media-reaper".to_owned())
+            .spawn(move || match done.recv_timeout(THREAD_JOIN_TIMEOUT) {
+                Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(thread) = thread {
+                        let _ = thread.join();
+                    }
                 }
-            }
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!("media peer did not stop within 2 s; detaching its thread");
-                self.thread.take();
-            }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("media peer did not stop within 2 s after close");
+                }
+            });
+        if let Err(error) = reaper {
+            tracing::warn!(%error, "could not start the media reaper thread");
         }
     }
 }
@@ -222,30 +242,45 @@ async fn session(
     emitter: &Emitter,
     audio: Box<dyn AudioBackend>,
     commands: mpsc::UnboundedReceiver<Command>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    if *cancel.borrow() {
+        return Ok(());
+    }
     let (internal_tx, internal) = mpsc::unbounded_channel();
     let playback: Playback = Arc::new(Mutex::new(VecDeque::with_capacity(PLAYBACK_CAPACITY)));
     let (frames_tx, frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
     let muted = Arc::new(AtomicBool::new(false));
 
     let audio_guard = audio.open(audio_io(frames_tx, Arc::clone(&playback), &internal_tx))?;
-    let peer = match new_peer_connection().await {
-        Ok(peer) => Arc::new(peer),
-        Err(error) => return Err(format!("could not create the WebRTC peer: {error}")),
-    };
-    let result = drive(
-        emitter,
-        &peer,
-        Channels {
-            commands,
-            internal,
-            internal_tx,
-            frames,
-            playback,
-            muted,
+    // A close that arrived while the device opened releases it here, before any WebRTC work.
+    if *cancel.borrow() {
+        return Ok(());
+    }
+    let peer = tokio::select! {
+        biased;
+        () = cancelled(&mut cancel) => return Ok(()),
+        peer = new_peer_connection() => match peer {
+            Ok(peer) => Arc::new(peer),
+            Err(error) => return Err(format!("could not create the WebRTC peer: {error}")),
         },
-    )
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        () = cancelled(&mut cancel) => Ok(()),
+        result = drive(
+            emitter,
+            &peer,
+            Channels {
+                commands,
+                internal,
+                internal_tx,
+                frames,
+                playback,
+                muted,
+            },
+        ) => result,
+    };
     drop(audio_guard);
     match tokio::time::timeout(PEER_CLOSE_TIMEOUT, peer.close()).await {
         Ok(Ok(())) => {}
@@ -253,6 +288,15 @@ async fn session(
         Err(_) => tracing::debug!("media peer close timed out"),
     }
     result
+}
+
+/// Resolves once the controller closes the peer (or drops it).
+async fn cancelled(cancel: &mut watch::Receiver<bool>) {
+    while !*cancel.borrow_and_update() {
+        if cancel.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 struct Channels {
@@ -743,6 +787,17 @@ mod tests {
         (peer, devices, events)
     }
 
+    fn wait_until(flag: &AtomicBool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        flag.load(Ordering::SeqCst)
+    }
+
     fn wait_offer(events: &std_mpsc::Receiver<PeerEvent>) -> String {
         match events.recv_timeout(Duration::from_secs(10)) {
             Ok(PeerEvent::Offer { session_id, sdp }) => {
@@ -776,10 +831,64 @@ mod tests {
         wait_offer(&events);
         assert!(!devices.released.load(Ordering::SeqCst));
         peer.close();
-        assert!(devices.released.load(Ordering::SeqCst));
+        assert!(wait_until(&devices.released, Duration::from_secs(2)));
+        assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
         peer.close();
         drop(peer);
         // A closed peer reports nothing more, not even Closed.
+        assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn close_during_a_slow_device_open_returns_at_once_and_starts_no_media() {
+        struct SlowAudio(Arc<FakeDevices>);
+        impl AudioBackend for SlowAudio {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+                std::thread::sleep(Duration::from_millis(300));
+                self.0.opened.store(true, Ordering::SeqCst);
+                Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
+            }
+        }
+        let devices = Arc::new(FakeDevices::default());
+        let (events_tx, events) = std_mpsc::channel();
+        let events_tx = Mutex::new(events_tx);
+        let sink: PeerEventSink = Arc::new(move |event| {
+            if let Ok(events_tx) = events_tx.lock() {
+                let _ = events_tx.send(event);
+            }
+        });
+        let mut peer = start_with_audio(
+            "media_test".to_owned(),
+            sink,
+            Box::new(SlowAudio(Arc::clone(&devices))),
+        )
+        .expect("peer starts");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        peer.close();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "close must not block the client loop"
+        );
+        // The device finished opening after close; the peer releases it and stops without
+        // negotiating.
+        assert!(wait_until(&devices.opened, Duration::from_secs(2)));
+        assert!(wait_until(&devices.released, Duration::from_secs(2)));
+        assert!(wait_until(&peer.stopped, Duration::from_secs(1)));
+        assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn close_before_the_offer_releases_the_devices() {
+        let (mut peer, devices, events) = start_fake();
+        peer.close();
+        assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+        assert_eq!(
+            devices.opened.load(Ordering::SeqCst),
+            devices.released.load(Ordering::SeqCst),
+            "an opened device is always released"
+        );
         assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
