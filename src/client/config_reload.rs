@@ -14,13 +14,16 @@ pub(super) fn apply_reload(
 ) -> Result<(), ClientError> {
     let previous_mouse_capture = state.shell_mouse_capture_preference;
     let mut mouse_capture = previous_mouse_capture;
-    reload_local_client_config(
+    if let Some(media_mode) = reload_local_client_config(
         &mut state.sound_config,
         &mut state.redraw_on_focus_gained,
         &mut state.draw_host_cursor,
         &mut state.remote_image_paste_key,
         &mut mouse_capture,
-    );
+    ) {
+        state.media.set_mode(media_mode);
+        apply_media_effects(state, endpoints);
+    }
     state.shell_mouse_capture_preference = mouse_capture;
     state.direct_mouse_capture_preference = state.attach_escape.is_some() && mouse_capture;
     if state.shell.is_some() && previous_mouse_capture != mouse_capture {
@@ -98,7 +101,7 @@ pub(super) fn reload_local_client_config(
         crossterm::event::KeyModifiers,
     )>,
     mouse_capture: &mut bool,
-) {
+) -> Option<crate::config::MediaMode> {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             let invalid_section = |section: &str| {
@@ -121,9 +124,15 @@ pub(super) fn reload_local_client_config(
                 *remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
             }
             debug!("reloaded local client config");
+            let media_valid = !loaded
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.starts_with("invalid media setting"));
+            media_valid.then_some(loaded.config.media)
         }
         Err(diagnostics) => {
             warn!(diagnostics = ?diagnostics, "failed to reload local client config; keeping current client config");
+            None
         }
     }
 }

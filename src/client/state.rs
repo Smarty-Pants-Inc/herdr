@@ -43,6 +43,8 @@ pub(super) struct ClientState {
     pub(super) draw_host_cursor: bool,
     pub(super) detached_process_children: Vec<std::process::Child>,
     pub(super) shell: Option<shell::ClientShellState>,
+    /// Client media sessions (microphone and speaker for a pane).
+    pub(super) media: media::ClientMedia,
 }
 
 impl Drop for ClientState {
@@ -97,6 +99,11 @@ impl ClientState {
             shell: Some(shell::ClientShellState::new(
                 shell::ClientShellConfig::from_config(&crate::config::Config::default()),
             )),
+            media: media::ClientMedia::new(
+                crate::config::MediaMode::default(),
+                media::peer::native_peer_factory(),
+                Arc::new(|_: media::peer::PeerEvent| {}),
+            ),
         }
     }
 

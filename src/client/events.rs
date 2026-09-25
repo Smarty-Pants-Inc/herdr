@@ -30,5 +30,7 @@ pub(super) enum ClientLoopEvent {
         /// latest target have the same identity after restoration.
         force: bool,
     },
+    /// An event from the live media peer, posted from its threads.
+    Media(super::media::peer::PeerEvent),
     Timer,
 }

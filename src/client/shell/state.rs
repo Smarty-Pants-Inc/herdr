@@ -265,6 +265,8 @@ pub(crate) struct ClientShellInput {
     pub query_host_theme: bool,
     pub requests: Vec<ClientMessage>,
     pub actions: Vec<ClientShellAction>,
+    /// Media consent answers as `(session_id, allowed)`.
+    pub media_consent: Vec<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +293,7 @@ pub(super) enum ClientShellOverlayKind {
     ContextMenu,
     GlobalMenu,
     Settings,
+    MediaConsent,
 }
 
 #[derive(Debug)]
@@ -577,6 +580,12 @@ pub(super) struct ClientConfirmCloseOverlay {
 }
 
 #[derive(Debug)]
+pub(super) struct ClientMediaConsentOverlay {
+    pub(super) session_id: String,
+    pub(super) detail: String,
+}
+
+#[derive(Debug)]
 pub(super) enum ClientShellOverlay {
     Onboarding,
     ProductAnnouncement(crate::app::state::ProductAnnouncementState),
@@ -591,6 +600,7 @@ pub(super) enum ClientShellOverlay {
     ContextMenu(ClientContextMenuOverlay),
     GlobalMenu(ClientGlobalMenuOverlay),
     Settings(ClientSettingsOverlay),
+    MediaConsent(ClientMediaConsentOverlay),
 }
 
 impl ClientShellOverlay {
@@ -609,6 +619,7 @@ impl ClientShellOverlay {
             Self::ContextMenu(_) => ClientShellOverlayKind::ContextMenu,
             Self::GlobalMenu(_) => ClientShellOverlayKind::GlobalMenu,
             Self::Settings(_) => ClientShellOverlayKind::Settings,
+            Self::MediaConsent(_) => ClientShellOverlayKind::MediaConsent,
         }
     }
 }
@@ -1868,5 +1879,70 @@ impl ClientShellState {
         self.pending_pane_surface = None;
         self.hits = ShellHitMap::default();
         self.host_mouse_pixels = None;
+    }
+
+    /// Label of `pane_id` when it is in the layout this client shows: a pane of the focused
+    /// tab, or only the focused pane when that tab is zoomed.
+    pub(crate) fn media_pane_label(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.snapshot.as_deref()?;
+        let tab_id = snapshot.focused_tab_id.as_deref()?;
+        let tab = snapshot.tabs.iter().find(|tab| tab.tab_id == tab_id)?;
+        if tab.zoomed && snapshot.focused_pane_id.as_deref() != Some(pane_id) {
+            return None;
+        }
+        let pane = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == pane_id && pane.tab_id == tab_id)?;
+        Some(
+            pane.label
+                .clone()
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| pane_id.to_owned()),
+        )
+    }
+
+    /// Ask the user whether a pane may use the microphone. Replaces any other overlay: the
+    /// request follows the user's own recent input to that pane.
+    pub(crate) fn open_media_consent(&mut self, session_id: String, pane_label: &str) {
+        self.overlay = Some(ClientShellOverlay::MediaConsent(
+            ClientMediaConsentOverlay {
+                session_id,
+                detail: format!("{pane_label} wants to start a voice call"),
+            },
+        ));
+        self.reconcile_input_source();
+    }
+
+    /// Remove the consent prompt for `session_id` without an answer.
+    pub(crate) fn close_media_consent(&mut self, session_id: &str) -> bool {
+        if !matches!(
+            &self.overlay,
+            Some(ClientShellOverlay::MediaConsent(consent)) if consent.session_id == session_id
+        ) {
+            return false;
+        }
+        self.overlay = None;
+        self.reconcile_input_source();
+        true
+    }
+
+    /// Answer the visible consent prompt.
+    pub(super) fn answer_media_consent(&mut self, allowed: bool, outcome: &mut ClientShellInput) {
+        let Some(ClientShellOverlay::MediaConsent(consent)) = self.overlay.take() else {
+            return;
+        };
+        outcome.media_consent.push((consent.session_id, allowed));
+        outcome.repaint = true;
+    }
+
+    /// Show one short client-local media notice.
+    pub(crate) fn receive_media_notice(&mut self, message: String) -> bool {
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Rejected,
+            "media",
+            "Voice",
+            message,
+        )
     }
 }

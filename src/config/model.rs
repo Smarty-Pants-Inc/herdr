@@ -308,10 +308,25 @@ pub fn validated_sidebar_bounds(min: u16, max: u16) -> Option<(u16, u16)> {
     }
 }
 
+/// Whether a server may start a client media session (local microphone and speaker) for a
+/// pane this client just typed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaMode {
+    /// Refuse every media session.
+    Off,
+    /// Ask once per client process before the first session.
+    #[default]
+    Ask,
+    /// Start sessions without asking.
+    Auto,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub onboarding: Option<bool>,
+    pub media: MediaMode,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
@@ -1937,6 +1952,15 @@ delay_seconds = {}
     fn missing_onboarding_shows_setup() {
         let config = Config::default();
         assert!(config.should_show_onboarding());
+    }
+
+    #[test]
+    fn media_mode_defaults_to_ask_and_parses_lowercase() {
+        assert_eq!(Config::default().media, MediaMode::Ask);
+        let config: Config = toml::from_str("media = \"auto\"").unwrap();
+        assert_eq!(config.media, MediaMode::Auto);
+        let config: Config = toml::from_str("media = \"off\"").unwrap();
+        assert_eq!(config.media, MediaMode::Off);
     }
 
     #[test]
