@@ -350,4 +350,102 @@ mod tests {
             Bytes::from_static(b"non-agent")
         );
     }
+
+    fn report_working(pane_id: &str) -> Method {
+        Method::PaneReportAgent(crate::api::schema::PaneReportAgentParams {
+            pane_id: pane_id.into(),
+            // A plain hook source: the rebind is source-agnostic, and the Pi
+            // lifecycle source adds session-anchoring rules this test does not need.
+            source: "custom:pi".into(),
+            agent: "pi".into(),
+            state: crate::api::schema::PaneAgentState::Working,
+            message: None,
+            seq: Some(1),
+            agent_session_id: None,
+            agent_session_path: None,
+        })
+    }
+
+    fn terminal_state(app: &App, public_pane_id: &str) -> AgentState {
+        let (ws_idx, pane_id) = app.parse_pane_id(public_pane_id).expect("pane");
+        let terminal_id = app.state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .expect("terminal");
+        app.state.terminals[terminal_id].state
+    }
+
+    // smarty-dev#509: a Pi keeps reporting under the HERDR_PANE_ID it inherited
+    // after its pane was renumbered by a recovery.
+    #[tokio::test]
+    async fn stale_pane_id_report_rebinds_to_the_reporting_process_pane() {
+        let mut fixture = attributed_agent_fixture();
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "stale".into(),
+                method: report_working("w42:p1F"),
+            },
+            attributed_context(),
+        );
+
+        assert_ok(&response);
+        assert_eq!(
+            terminal_state(&fixture.app, &fixture.source_pane_id),
+            AgentState::Working
+        );
+        assert_eq!(
+            terminal_state(&fixture.app, &fixture.target_pane_id),
+            AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pane_id_report_from_unknown_process_is_pane_not_found() {
+        let mut fixture = attributed_agent_fixture();
+        for (id, context) in [
+            ("unattributed", ApiRequestContext::default()),
+            (
+                "outside-every-pane",
+                ApiRequestContext {
+                    local_peer_pid: Some(u32::MAX),
+                },
+            ),
+        ] {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: id.into(),
+                    method: report_working("w42:p1F"),
+                },
+                context,
+            );
+            let response: ErrorResponse = serde_json::from_str(&response).expect("error");
+            assert_eq!(response.error.code, "pane_not_found", "{id}");
+            assert_eq!(response.error.message, "pane w42:p1F not found", "{id}");
+        }
+        assert_eq!(
+            terminal_state(&fixture.app, &fixture.source_pane_id),
+            AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn known_pane_id_report_is_not_rebound_to_the_reporting_process_pane() {
+        let fixture = attributed_agent_fixture();
+        let mut request = Request {
+            id: "known".into(),
+            method: report_working(&fixture.target_pane_id),
+        };
+        fixture
+            .app
+            .rebind_stale_report_pane(&mut request, attributed_context());
+        assert_eq!(request.method, report_working(&fixture.target_pane_id));
+
+        let mut stale = Request {
+            id: "stale".into(),
+            method: report_working("w42:p1F"),
+        };
+        fixture
+            .app
+            .rebind_stale_report_pane(&mut stale, attributed_context());
+        assert_eq!(stale.method, report_working(&fixture.source_pane_id));
+    }
 }

@@ -205,6 +205,26 @@ impl App {
         matches.next().is_none().then_some(target)
     }
 
+    /// Maps a locally attributed process to the one pane whose session it runs in,
+    /// agent or not. Used when a process reports under a pane ID it inherited
+    /// before its pane was renumbered or moved (smarty-dev#509).
+    pub(crate) fn pane_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
+        let mut matches = self.terminal_targets().into_iter().filter(|target| {
+            self.state
+                .runtime_for_pane_in_workspace(
+                    &self.terminal_runtimes,
+                    target.ws_idx,
+                    target.pane_id,
+                )
+                .and_then(crate::terminal::TerminalRuntime::child_pid)
+                .is_some_and(|child_pid| {
+                    crate::platform::process_in_pane_session(child_pid, peer_pid)
+                })
+        });
+        let target = matches.next()?;
+        matches.next().is_none().then_some(target)
+    }
+
     fn terminal_target_candidate(
         &self,
         ws_idx: usize,
