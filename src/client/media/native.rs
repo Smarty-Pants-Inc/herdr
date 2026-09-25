@@ -53,12 +53,17 @@ const THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The OpenAI Realtime peer expects a data channel with this label.
 const EVENTS_CHANNEL_LABEL: &str = "oai-events";
 
+/// Takes captured microphone samples.
+pub(crate) type CaptureFn = Box<dyn FnMut(&[f32]) + Send>;
+/// Fills a speaker buffer.
+pub(crate) type PlaybackFn = Box<dyn FnMut(&mut [f32]) + Send>;
+
 /// Callbacks the peer hands to an audio backend. All samples are mono 48 kHz `f32`.
 pub(crate) struct AudioIo {
     /// Takes captured microphone samples. Any chunk size.
-    pub(crate) capture: Box<dyn FnMut(&[f32]) + Send>,
+    pub(crate) capture: CaptureFn,
     /// Fills the whole buffer with speaker samples (silence when nothing is buffered).
-    pub(crate) playback: Box<dyn FnMut(&mut [f32]) + Send>,
+    pub(crate) playback: PlaybackFn,
     /// Reports a device failure; the peer then closes with `device_error`.
     pub(crate) error: Arc<dyn Fn(String) + Send + Sync>,
 }
@@ -571,7 +576,9 @@ mod cpal_audio {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
-    use super::{AudioBackend, AudioIo, Resampler, FRAME_SAMPLES, SAMPLE_RATE};
+    use super::{
+        AudioBackend, AudioIo, CaptureFn, PlaybackFn, Resampler, FRAME_SAMPLES, SAMPLE_RATE,
+    };
 
     /// The default CoreAudio microphone and speaker.
     pub(super) struct CpalAudio;
@@ -623,7 +630,7 @@ mod cpal_audio {
     fn input_stream<T>(
         device: &cpal::Device,
         config: StreamConfig,
-        mut capture: Box<dyn FnMut(&[f32]) + Send>,
+        mut capture: CaptureFn,
         error: &Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<cpal::Stream, String>
     where
@@ -657,7 +664,7 @@ mod cpal_audio {
     fn output_stream<T>(
         device: &cpal::Device,
         config: StreamConfig,
-        mut playback: Box<dyn FnMut(&mut [f32]) + Send>,
+        mut playback: PlaybackFn,
         error: &Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<cpal::Stream, String>
     where
