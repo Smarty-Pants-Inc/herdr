@@ -1989,6 +1989,43 @@ fn pane_not_found(id: String, pane_id: &str) -> String {
 }
 
 impl App {
+    /// An agent reports under the `HERDR_PANE_ID` it inherited at launch. When its
+    /// pane was since renumbered or moved (for example by a session recovery),
+    /// that ID names no pane. Rebind such a self-report to the one pane whose
+    /// session holds the reporting process; otherwise keep `pane_not_found`.
+    // ponytail: only an unknown ID is rebound. A stale ID that now names another
+    // pane still reports there; overriding a known ID would break deliberate
+    // cross-pane reporters.
+    pub(in crate::app) fn rebind_stale_report_pane(
+        &self,
+        request: &mut crate::api::schema::Request,
+        context: crate::api::ApiRequestContext,
+    ) {
+        use crate::api::schema::Method;
+        let pane_id = match &mut request.method {
+            Method::PaneReportAgent(params) => &mut params.pane_id,
+            Method::PaneReportAgentSession(params) => &mut params.pane_id,
+            Method::PaneReportMetadata(params) => &mut params.pane_id,
+            Method::PaneClearAgentAuthority(params) => &mut params.pane_id,
+            Method::PaneReleaseAgent(params) => &mut params.pane_id,
+            _ => return,
+        };
+        if self.parse_pane_id(pane_id).is_some() {
+            return;
+        }
+        let Some(peer_pid) = context.local_peer_pid else {
+            return;
+        };
+        let Some(current) = self
+            .pane_target_for_peer_pid(peer_pid)
+            .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id))
+        else {
+            return;
+        };
+        tracing::info!(stale = %pane_id, %current, peer_pid, "rebinding agent report to its pane");
+        *pane_id = current;
+    }
+
     fn resolve_optional_pane(&self, pane_id: Option<&str>) -> Option<(usize, PaneId)> {
         match pane_id {
             Some(pane_id) => self.parse_pane_id(pane_id),

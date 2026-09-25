@@ -82,8 +82,15 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+    classify_child_exit, poll_fd_readable, process_in_pane_session, read_fd,
+    shared_ssh_control_path,
 };
+
+/// Whether `pid` belongs to the process tree of the pane child `child_pid`.
+#[cfg(not(unix))]
+pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
+    child_pid == pid || session_processes(child_pid).contains(&pid)
+}
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn classify_child_exit(_status: &portable_pty::ExitStatus) -> ChildExitReason {
