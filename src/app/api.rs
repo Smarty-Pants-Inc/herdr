@@ -924,6 +924,8 @@ impl App {
         if let Some(response) = self.cross_pane_input_denial(&request, context) {
             return response;
         }
+        let mut request = request;
+        self.rebind_stale_report_pane(&mut request, context);
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
