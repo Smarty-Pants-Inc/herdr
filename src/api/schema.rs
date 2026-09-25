@@ -5,6 +5,7 @@ pub mod commands;
 pub mod common;
 pub mod events;
 pub mod integrations;
+pub mod media;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -19,6 +20,7 @@ pub use commands::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
+pub use media::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -270,6 +272,16 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "pane.media_open")]
+    PaneMediaOpen(PaneTarget),
+    #[serde(rename = "media.answer")]
+    MediaAnswer(MediaAnswerParams),
+    #[serde(rename = "media.mute")]
+    MediaMute(MediaMuteParams),
+    #[serde(rename = "media.state")]
+    MediaState(MediaSessionTarget),
+    #[serde(rename = "media.close")]
+    MediaClose(MediaSessionTarget),
 }
 
 #[cfg(test)]

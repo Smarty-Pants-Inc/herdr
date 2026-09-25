@@ -2366,6 +2366,47 @@
           ],
           "type": "object"
         },
+        "MediaAnswerParams": {
+          "properties": {
+            "sdp": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "sdp"
+          ],
+          "type": "object"
+        },
+        "MediaMuteParams": {
+          "properties": {
+            "muted": {
+              "type": "boolean"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "muted"
+          ],
+          "type": "object"
+        },
+        "MediaSessionTarget": {
+          "properties": {
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id"
+          ],
+          "type": "object"
+        },
         "NotificationShowParams": {
           "properties": {
             "body": {
@@ -6468,6 +6509,86 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.media_open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "media.answer",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MediaAnswerParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "media.mute",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MediaMuteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "media.state",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MediaSessionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "media.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MediaSessionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7929,6 +8050,17 @@
               "type": "object"
             }
           ]
+        },
+        "MediaSessionState": {
+          "enum": [
+            "opening",
+            "offered",
+            "connecting",
+            "connected",
+            "failed",
+            "closed"
+          ],
+          "type": "string"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10671,6 +10803,62 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "sdp": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "media_offer",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "session_id",
+                "sdp"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "muted": {
+                  "type": "boolean"
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/MediaSessionState"
+                },
+                "type": {
+                  "const": "media_session",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "session_id",
+                "state",
+                "muted"
               ],
               "type": "object"
             }

@@ -9,6 +9,17 @@
           "type": "boolean",
           "default": "unset",
           "description": "Show first-run setup on startup. Missing or true shows onboarding; continuing from onboarding writes onboarding = false."
+        },
+        {
+          "key": "media",
+          "type": "enum",
+          "default": "\"ask\"",
+          "description": "Whether a server may use this client's microphone and speaker for a pane you just typed into, for example a voice agent. off refuses every request; ask shows a prompt the first time in each client process; auto starts without asking. Needs a client built with native media.",
+          "values": [
+            "off",
+            "ask",
+            "auto"
+          ]
         }
       ]
     },

@@ -76,6 +76,7 @@ mod bootstrap;
 mod client_views;
 mod endpoint_requests;
 mod lifecycle;
+mod media;
 mod notifications;
 mod pane_graphics;
 mod render;
@@ -235,6 +236,8 @@ pub struct HeadlessServer {
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
+    /// Client-local media sessions bound to the client that last typed into a pane.
+    media: crate::server::media::MediaBroker,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Configured virtual terminal size used when no clients are connected.
@@ -371,6 +374,7 @@ impl HeadlessServer {
             terminal_attach_owners: HashMap::new(),
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
+            media: crate::server::media::MediaBroker::new(),
             next_activity_stamp: 1,
             headless_size,
             effective_size: headless_size,
@@ -528,6 +532,7 @@ impl HeadlessServer {
             }
 
             self.poll_pending_alt_screen_reads(now);
+            self.expire_media_sessions(now);
             if self.process_deferred_alt_screen_reads() {
                 needs_render = true;
                 needs_full_render = true;
@@ -1030,6 +1035,8 @@ impl HeadlessServer {
             })
         });
         let was_foreground = self.foreground_client_id == Some(client_id);
+        let media_actions = self.media.client_removed(client_id, Instant::now());
+        self.perform_media_actions(media_actions);
         let removed = self.clients.remove(&client_id);
         self.tab_geometry_controllers
             .retain(|_, controller_id| *controller_id != client_id);
@@ -1989,6 +1996,7 @@ impl HeadlessServer {
                 surface_active,
                 surface_reuse,
                 surface_delta,
+                media_capable,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -2037,6 +2045,7 @@ impl HeadlessServer {
                 connection.render_state.enable_surface_reuse(surface_reuse);
                 connection.render_state.enable_surface_delta(surface_delta);
                 connection.shell_projection_revision = 1;
+                self.media.client_connected(client_id, media_capable);
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()
                 } else {
@@ -2498,6 +2507,14 @@ impl HeadlessServer {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
+                if interaction {
+                    self.media.note_pane_input(
+                        client_id,
+                        runtime_pane_id,
+                        &pane_id,
+                        Instant::now(),
+                    );
+                }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
                 let geometry_changed =
@@ -2685,6 +2702,13 @@ impl HeadlessServer {
                     },
                 );
                 navigation_changed | geometry_changed
+            }
+            ServerEvent::ClientMediaControl { client_id, control } => {
+                let actions = self
+                    .media
+                    .client_control(client_id, control, Instant::now());
+                self.perform_media_actions(actions);
+                false
             }
             ServerEvent::ClientDetach { client_id } => {
                 info!(client_id, "client detached");
@@ -3028,6 +3052,11 @@ impl HeadlessServer {
                 self.finish_live_handoff_shutdown();
             }
             return true;
+        }
+
+        if crate::server::headless::media::is_media_method(&msg.request.method) {
+            self.handle_media_api_request(msg);
+            return false;
         }
 
         if let api::schema::Method::NotificationShow(params) = &msg.request.method {

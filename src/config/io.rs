@@ -8,6 +8,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "keys",
+    "media",
     "onboarding",
     "remote",
     "server",
@@ -283,6 +284,15 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
             Ok(onboarding) => config.onboarding = onboarding,
             Err(err) => diagnostics.push(format!(
                 "invalid onboarding setting: {err}; keeping current onboarding state"
+            )),
+        }
+    }
+
+    if let Some(value) = table.get("media") {
+        match value.clone().try_into::<super::model::MediaMode>() {
+            Ok(media) => config.media = media,
+            Err(err) => diagnostics.push(format!(
+                "invalid media setting: {err}; expected \"off\", \"ask\" or \"auto\"; keeping current media mode"
             )),
         }
     }
@@ -883,6 +893,20 @@ mod tests {
 
         std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn load_live_config_parses_media_mode_and_reports_invalid_values() {
+        let loaded = load_live_config_from_str("media = \"off\"\n").unwrap();
+        assert_eq!(loaded.config.media, crate::config::MediaMode::Off);
+        assert!(loaded.diagnostics.is_empty());
+
+        let loaded = load_live_config_from_str("media = \"sometimes\"\n").unwrap();
+        assert_eq!(loaded.config.media, crate::config::MediaMode::Ask);
+        assert!(loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.starts_with("invalid media setting")));
     }
 
     #[test]

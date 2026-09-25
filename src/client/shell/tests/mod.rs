@@ -256,6 +256,7 @@ mod graphics;
 mod input_domain;
 mod keybindings_settings;
 mod link_hover;
+mod media_consent;
 mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;

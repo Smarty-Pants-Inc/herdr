@@ -62,7 +62,22 @@ pub(crate) fn render_client_overlay(
             render_release_notes_overlay(b, v, &s.update_install_command, p)
         }
         ClientShellOverlay::Rename(v) => render_rename_overlay(b, v, p),
-        ClientShellOverlay::ConfirmClose(v) => render_confirm_close_overlay(b, v, p),
+        ClientShellOverlay::ConfirmClose(v) => render_confirm_dialog(
+            b,
+            &v.title,
+            &v.detail,
+            [" ↵ confirm ", " esc cancel "],
+            p.red,
+            p,
+        ),
+        ClientShellOverlay::MediaConsent(v) => render_confirm_dialog(
+            b,
+            "Allow microphone?",
+            &v.detail,
+            [" ↵ allow ", " esc deny "],
+            p.accent,
+            p,
+        ),
         ClientShellOverlay::Help(v) => render_help_overlay(b, v, k, p),
         ClientShellOverlay::Navigator(v) => {
             render_navigator_overlay(b, v, endpoints, active_endpoint_id, p)
@@ -1239,21 +1254,24 @@ fn render_help_overlay(
         ..OverlayRender::default()
     })
 }
-fn render_confirm_close_overlay(
+fn render_confirm_dialog(
     b: &mut Buffer,
-    c: &ClientConfirmCloseOverlay,
+    title: &str,
+    detail: &str,
+    [confirm_label, cancel_label]: [&str; 2],
+    color: ratatui::style::Color,
     p: &Palette,
 ) -> Option<OverlayRender> {
     let q = popup(b.area, 64, 6)?;
-    let i = panel(b, q, p.red, p.panel_bg)?;
+    let i = panel(b, q, color, p.panel_bg)?;
     put_text(
         b,
         i.x,
         i.y,
         i.width,
-        &format!(" {}", c.title),
+        &format!(" {title}"),
         Style::default()
-            .fg(p.red)
+            .fg(color)
             .bg(p.panel_bg)
             .add_modifier(Modifier::BOLD),
     );
@@ -1262,7 +1280,7 @@ fn render_confirm_close_overlay(
         i.x,
         i.y + 1,
         i.width,
-        &format!(" {}", c.detail),
+        &format!(" {detail}"),
         Style::default().fg(p.text).bg(p.panel_bg),
     );
     let rs = row(i, &[13, 12], 2, 3);
@@ -1272,16 +1290,16 @@ fn render_confirm_close_overlay(
     button(
         b,
         *ok,
-        " ↵ confirm ",
+        confirm_label,
         Style::default()
             .fg(contrast(p))
-            .bg(p.red)
+            .bg(color)
             .add_modifier(Modifier::BOLD),
     );
     button(
         b,
         *cancel,
-        " esc cancel ",
+        cancel_label,
         Style::default()
             .fg(p.text)
             .bg(p.surface0)

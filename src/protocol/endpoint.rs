@@ -69,6 +69,10 @@ pub struct EndpointClientHello {
     pub input_codecs: Vec<String>,
     #[serde(default)]
     pub blob_codecs: Vec<String>,
+    /// Optional client-local capabilities, for example `media.webrtc.v1`. Servers ignore
+    /// names they do not know; older clients omit the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +218,20 @@ mod tests {
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
+            capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hello_client_capabilities_are_optional_and_round_trip() {
+        let legacy = serde_json::to_value(hello()).unwrap();
+        assert!(legacy.get("capabilities").is_none());
+
+        let mut with_media = hello();
+        with_media.capabilities = vec![crate::protocol::media::MEDIA_WEBRTC_CAPABILITY.into()];
+        let encoded = serde_json::to_string(&with_media).unwrap();
+        let decoded: EndpointClientHello = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, with_media);
     }
 
     fn snapshot() -> ClientShellSnapshot {

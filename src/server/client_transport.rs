@@ -400,6 +400,8 @@ pub(crate) enum ServerEvent {
         surface_active: bool,
         surface_reuse: bool,
         surface_delta: bool,
+        /// Whether the client advertised `media.webrtc.v1`.
+        media_capable: bool,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -491,6 +493,11 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         terminal_id: String,
         events: Vec<ClientPaneInputEvent>,
+    },
+    /// A client-owned shell sent one client-local media control.
+    ClientMediaControl {
+        client_id: u64,
+        control: crate::protocol::media::MediaControl,
     },
     /// A client-owned shell published one host terminal theme observation.
     ClientShellHostTheme {
@@ -767,6 +774,9 @@ pub(crate) fn handle_client_handshake(
                     hello.surface_active,
                     hello.surface_reuse,
                     hello.surface_delta,
+                    hello.capabilities.iter().any(|capability| {
+                        capability == crate::protocol::media::MEDIA_WEBRTC_CAPABILITY
+                    }),
                 )),
             )
         }
@@ -863,6 +873,7 @@ pub(crate) fn handle_client_handshake(
         surface_active,
         surface_reuse,
         surface_delta,
+        media_capable,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -878,6 +889,7 @@ pub(crate) fn handle_client_handshake(
             surface_active,
             surface_reuse,
             surface_delta,
+            media_capable,
             writer,
         }
     } else {
@@ -1324,6 +1336,21 @@ fn client_read_loop_with_endpoint_controls(
                     token: data,
                 }
             }
+            ClientMessage::EndpointControl { kind, data }
+                if crate::protocol::media::MediaControl::is_media_kind(&kind) =>
+            {
+                match crate::protocol::media::MediaControl::decode(&kind, &data) {
+                    Some(Ok(control)) => ServerEvent::ClientMediaControl { client_id, control },
+                    Some(Err(error)) => {
+                        warn!(client_id, %kind, %error, "ignoring invalid media control");
+                        continue;
+                    }
+                    None => {
+                        debug!(client_id, %kind, "ignoring unknown media control");
+                        continue;
+                    }
+                }
+            }
             ClientMessage::EndpointControl { kind, data } => {
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)
                 else {
@@ -1458,6 +1485,7 @@ mod tests {
             surface_codecs: vec![crate::protocol::endpoint::SURFACE_CODEC_V1.into()],
             input_codecs: vec![crate::protocol::endpoint::INPUT_CODEC_V1.into()],
             blob_codecs: vec![crate::protocol::endpoint::BLOB_CODEC_V1.into()],
+            capabilities: Vec::new(),
         };
         ClientMessage::EndpointControl {
             kind: ENDPOINT_HELLO_KIND.into(),
@@ -1971,8 +1999,10 @@ mod tests {
                 surface_active,
                 surface_reuse,
                 surface_delta,
+                media_capable,
                 writer,
             } => {
+                assert!(!media_capable);
                 assert!(!surface_reuse);
                 assert!(!surface_delta);
                 assert_eq!(client_id, 43);
