@@ -475,8 +475,10 @@ fn push_playback(playback: &Playback, samples: &[f32]) {
     let Ok(mut buffer) = playback.lock() else {
         return;
     };
+    let samples = &samples[samples.len().saturating_sub(PLAYBACK_CAPACITY)..];
     let overflow = (buffer.len() + samples.len()).saturating_sub(PLAYBACK_CAPACITY);
-    buffer.drain(..overflow.min(buffer.len()));
+    let dropped = overflow.min(buffer.len());
+    buffer.drain(..dropped);
     buffer.extend(samples.iter().copied());
 }
 
