@@ -29,16 +29,19 @@ fn connect_media_shell(
     control
 }
 
-fn media_open_sent(control: &std::sync::mpsc::Receiver<Vec<u8>>) -> Option<MediaOpen> {
-    let mut found = None;
-    while let Ok(bytes) = control.try_recv() {
+/// Controls reach the test channel through the writer's drain thread, so wait for them.
+fn media_open_sent(
+    control: &std::sync::mpsc::Receiver<Vec<u8>>,
+    wait: Duration,
+) -> Option<MediaOpen> {
+    while let Ok(bytes) = control.recv_timeout(wait) {
         if let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) {
             if let Some(Ok(MediaControl::Open(open))) = MediaControl::decode(&kind, &data) {
-                found = Some(open);
+                return Some(open);
             }
         }
     }
-    found
+    None
 }
 
 fn media_api(
@@ -103,9 +106,10 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
     type_into(&mut server, 31, &pane_id);
     let rx = media_api(&mut server, pane_open(&pane_id));
     assert!(rx.try_recv().is_err(), "the caller waits for the offer");
-    let open = media_open_sent(&capable).expect("media.open sent to the typing client");
+    let open = media_open_sent(&capable, Duration::from_secs(5))
+        .expect("media.open sent to the typing client");
     assert_eq!(open.pane_id, pane_id);
-    assert!(media_open_sent(&legacy).is_none());
+    assert!(media_open_sent(&legacy, Duration::from_millis(200)).is_none());
 
     server.handle_server_event(ServerEvent::ClientMediaControl {
         client_id: 31,
@@ -122,7 +126,7 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
     type_into(&mut server, 32, &pane_id);
     let rx = media_api(&mut server, pane_open(&pane_id));
     assert_eq!(json(&rx)["error"]["code"], "media_unsupported_client");
-    assert!(media_open_sent(&capable).is_none());
+    assert!(media_open_sent(&capable, Duration::from_millis(200)).is_none());
 
     // Closing the capable client ends its session.
     server.remove_client_and_resize_if_needed(31);
