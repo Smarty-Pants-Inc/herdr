@@ -22,6 +22,7 @@ pub(super) fn apply_reload(
         &mut mouse_capture,
     ) {
         state.media.set_mode(media_mode);
+        apply_media_effects(state, endpoints);
     }
     state.shell_mouse_capture_preference = mouse_capture;
     state.direct_mouse_capture_preference = state.attach_escape.is_some() && mouse_capture;

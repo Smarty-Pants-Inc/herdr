@@ -47,18 +47,13 @@ pub(crate) enum MediaAction {
     },
 }
 
+/// The latest input that reached one pane, from any client.
 #[derive(Debug, Clone)]
-struct PaneInput {
-    pane: PaneId,
+struct PaneOwner {
+    client_id: u64,
     /// The pane id exactly as the client sent it, so the client can match its own record.
     pane_ref: String,
     at: Instant,
-}
-
-#[derive(Debug, Default)]
-struct MediaClient {
-    capable: bool,
-    last_input: Option<PaneInput>,
 }
 
 #[derive(Debug)]
@@ -106,7 +101,11 @@ struct ClosedSession {
 
 #[derive(Debug)]
 pub(crate) struct MediaBroker {
-    clients: HashMap<u64, MediaClient>,
+    /// Attached client-shell clients and whether each advertised media support.
+    clients: HashMap<u64, bool>,
+    /// Per pane, the client whose input reached it last. Input to another pane never moves
+    /// this owner, so it cannot reroute a pane's microphone to an older client.
+    pane_owners: HashMap<PaneId, PaneOwner>,
     sessions: HashMap<String, MediaSession>,
     closed: VecDeque<ClosedSession>,
     id_prefix: String,
@@ -144,6 +143,7 @@ impl MediaBroker {
             .unwrap_or_default();
         Self {
             clients: HashMap::new(),
+            pane_owners: HashMap::new(),
             sessions: HashMap::new(),
             closed: VecDeque::new(),
             id_prefix: format!("media_{boot:x}_"),
@@ -152,13 +152,7 @@ impl MediaBroker {
     }
 
     pub(crate) fn client_connected(&mut self, client_id: u64, capable: bool) {
-        self.clients.insert(
-            client_id,
-            MediaClient {
-                capable,
-                last_input: None,
-            },
-        );
+        self.clients.insert(client_id, capable);
     }
 
     /// Record input that reached a pane the client views.
@@ -169,17 +163,27 @@ impl MediaBroker {
         pane_ref: &str,
         now: Instant,
     ) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.last_input = Some(PaneInput {
-                pane,
+        if !self.clients.contains_key(&client_id) {
+            return;
+        }
+        self.pane_owners
+            .retain(|_, owner| now.saturating_duration_since(owner.at) <= MEDIA_INPUT_WINDOW);
+        self.pane_owners.insert(
+            pane,
+            PaneOwner {
+                client_id,
                 pane_ref: pane_ref.to_owned(),
                 at: now,
-            });
-        }
+            },
+        );
     }
 
     pub(crate) fn client_removed(&mut self, client_id: u64, now: Instant) -> Vec<MediaAction> {
         self.clients.remove(&client_id);
+        // Panes this client typed into last now have no owner; they never fall back to an
+        // older client.
+        self.pane_owners
+            .retain(|_, owner| owner.client_id != client_id);
         let ids = self
             .sessions
             .iter()
@@ -214,15 +218,13 @@ impl MediaBroker {
     ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
         let latest = self
-            .clients
-            .iter()
-            .filter_map(|(&client_id, client)| {
-                let input = client.last_input.as_ref()?;
-                (input.pane == pane
-                    && now.saturating_duration_since(input.at) <= MEDIA_INPUT_WINDOW)
-                    .then_some((client_id, client.capable, input.clone()))
-            })
-            .max_by_key(|(client_id, _, input)| (input.at, *client_id));
+            .pane_owners
+            .get(&pane)
+            .filter(|owner| now.saturating_duration_since(owner.at) <= MEDIA_INPUT_WINDOW)
+            .and_then(|owner| {
+                let capable = *self.clients.get(&owner.client_id)?;
+                Some((owner.client_id, capable, owner.clone()))
+            });
         let Some((client_id, capable, input)) = latest else {
             actions.push(MediaAction::Respond {
                 respond_to,
@@ -610,6 +612,49 @@ mod tests {
         assert_eq!(client_id, 2);
         assert_eq!(pane_ref, "p_7");
         assert!(rx.try_recv().is_err(), "the caller waits for the offer");
+    }
+
+    #[test]
+    fn input_to_another_pane_does_not_move_a_pane_to_an_older_client() {
+        for b_capable in [true, false] {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            broker.client_connected(2, b_capable);
+            broker.note_pane_input(1, pane(7), "w1:p7", now);
+            broker.note_pane_input(2, pane(7), "w1:p7", now + Duration::from_secs(1));
+            broker.note_pane_input(2, pane(8), "w1:p8", now + Duration::from_secs(2));
+
+            let (sent, rx) = open(&mut broker, pane(7), now + Duration::from_secs(3));
+            assert!(
+                sent.iter().all(|(client_id, _)| *client_id != 1),
+                "client A must never receive the open"
+            );
+            if b_capable {
+                assert_eq!(opened_session(&sent).0, 2);
+            } else {
+                assert!(sent.is_empty());
+                assert_eq!(
+                    response(&rx)["error"]["code"],
+                    error_code::UNSUPPORTED_CLIENT
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_departed_owner_leaves_the_pane_without_a_client() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        broker.note_pane_input(1, pane(7), "w1:p7", now);
+        broker.note_pane_input(2, pane(7), "w1:p7", now + Duration::from_secs(1));
+        run(broker.client_removed(2, now));
+
+        let (sent, rx) = open(&mut broker, pane(7), now + Duration::from_secs(2));
+        assert!(sent.is_empty(), "no fallback to the older client");
+        assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
     }
 
     #[test]

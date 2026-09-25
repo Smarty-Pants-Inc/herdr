@@ -78,8 +78,34 @@ impl ClientMedia {
         }
     }
 
+    /// Apply a reloaded `media` setting. Turning media off also refuses an unanswered prompt
+    /// and ends a live call, so nothing keeps the microphone against the new setting.
     pub(super) fn set_mode(&mut self, mode: MediaMode) {
         self.mode = mode;
+        if mode != MediaMode::Off {
+            return;
+        }
+        if let Some(pending) = self.pending.take() {
+            self.effects.push(MediaEffect::CancelConsent {
+                session_id: pending.session_id.clone(),
+            });
+            self.send_close(
+                pending.endpoint_id,
+                pending.session_id,
+                close_code::DISABLED,
+                "media is off in this client's config",
+            );
+        }
+        if let Some(mut session) = self.session.take() {
+            session.peer.close();
+            self.send_close(
+                session.endpoint_id,
+                session.session_id,
+                close_code::DISABLED,
+                "media is off in this client's config",
+            );
+            self.notice("Voice call ended: media is off in this client's config");
+        }
     }
 
     pub(super) fn take_effects(&mut self) -> Vec<MediaEffect> {
@@ -246,7 +272,15 @@ impl ClientMedia {
         else {
             return;
         };
-        if allowed {
+        if allowed && self.mode == MediaMode::Off {
+            // The policy may have changed while the prompt was open; it wins over the answer.
+            self.send_close(
+                pending.endpoint_id,
+                pending.session_id,
+                close_code::DISABLED,
+                "media is off in this client's config",
+            );
+        } else if allowed {
             self.allowed = true;
             self.start(pending.endpoint_id, pending.session_id);
         } else {
@@ -624,6 +658,78 @@ mod tests {
             Some(close_code::STALE_INPUT)
         );
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reloading_media_off_refuses_a_pending_prompt_and_a_late_accept_starts_nothing() {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        open(&mut media, "m1", "pane_1", now);
+        assert!(media
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, MediaEffect::AskConsent { .. })));
+
+        media.set_mode(MediaMode::Off);
+        let effects = media.take_effects();
+        assert_eq!(
+            closes(&effects),
+            vec![("m1".to_owned(), Some(close_code::DISABLED.to_owned()))]
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            MediaEffect::CancelConsent { session_id } if session_id == "m1"
+        )));
+
+        media.consent("m1", true);
+        assert!(media.take_effects().is_empty());
+        assert!(calls.lock().unwrap().is_empty(), "no peer after media off");
+    }
+
+    #[test]
+    fn accepting_after_media_turned_off_is_disabled_and_ask_still_works_otherwise() {
+        let (mut media, calls) = media(MediaMode::Ask, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        open(&mut media, "m1", "pane_1", now);
+        media.take_effects();
+        // A policy change that bypassed set_mode's cleanup must still win at the start boundary.
+        media.mode = MediaMode::Off;
+        media.consent("m1", true);
+        assert_eq!(
+            closes(&media.take_effects()),
+            vec![("m1".to_owned(), Some(close_code::DISABLED.to_owned()))]
+        );
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Counterexample: with ask still in force, accepting starts the peer.
+        media.mode = MediaMode::Ask;
+        open(&mut media, "m2", "pane_1", now);
+        media.take_effects();
+        media.consent("m2", true);
+        assert_eq!(*calls.lock().unwrap(), vec![PeerCall::Start("m2".into())]);
+    }
+
+    #[test]
+    fn reloading_media_off_ends_a_live_call_and_releases_the_peer() {
+        let (mut media, calls) = media(MediaMode::Auto, false);
+        let now = Instant::now();
+        media.note_pane_input(&local(), "pane_1", now);
+        open(&mut media, "m1", "pane_1", now);
+        media.take_effects();
+        media.set_mode(MediaMode::Ask);
+        assert!(media.take_effects().is_empty(), "ask keeps the live call");
+
+        media.set_mode(MediaMode::Off);
+        assert_eq!(
+            closes(&media.take_effects()),
+            vec![("m1".to_owned(), Some(close_code::DISABLED.to_owned()))]
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![PeerCall::Start("m1".into()), PeerCall::Close("m1".into())]
+        );
     }
 
     #[test]
