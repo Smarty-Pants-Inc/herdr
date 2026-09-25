@@ -354,7 +354,9 @@ mod tests {
     fn report_working(pane_id: &str) -> Method {
         Method::PaneReportAgent(crate::api::schema::PaneReportAgentParams {
             pane_id: pane_id.into(),
-            source: "herdr:pi".into(),
+            // A plain hook source: the rebind is source-agnostic, and the Pi
+            // lifecycle source adds session-anchoring rules this test does not need.
+            source: "custom:pi".into(),
             agent: "pi".into(),
             state: crate::api::schema::PaneAgentState::Working,
             message: None,
