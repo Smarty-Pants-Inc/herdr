@@ -543,12 +543,25 @@ mod tests {
             foreground_pis(&[TARGET_PI, helper]),
         );
         report_pi(&mut fixture, Some("v1"), Some(helper.pid));
+        assert_eq!(
+            fixture.app.state.terminals[&fixture.target_terminal_id].input_origin_claims(),
+            &[TARGET_PI],
+            "the helper gained reader authority"
+        );
         assert!(is_framed(&send_text(&mut fixture, "x")));
+        // The helper exits: the reader keeps its frames.
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &fixture.target_terminal_id,
             foreground_pis(&[TARGET_PI]),
         );
         assert!(is_framed(&send_text(&mut fixture, "x")));
+        // The reader exits while the helper stays and an unclaimed Pi reads in the same group:
+        // the helper's report gave it nothing to borrow.
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            foreground_pis(&[helper]),
+        );
+        assert!(!is_framed(&send_text(&mut fixture, "x")));
     }
 
     #[tokio::test]

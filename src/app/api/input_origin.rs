@@ -185,9 +185,11 @@ impl App {
     /// Records a Pi's claim to read origin frames, only when the socket peer that sent it is
     /// itself a Pi process in the pane's foreground job. A wrapper or sibling in that job,
     /// another pane's process, a process outside every pane, or an unattributed caller cannot
-    /// add one. Claims are kept per process, so a new claim never removes another live
-    /// process's claim; only claims of processes known to be gone are dropped. A report without
-    /// the claim changes nothing.
+    /// add one. While a claimant reads the pane or cannot be checked, no other process can add a
+    /// claim: the first Pi to claim is the one that reads the terminal (only the TUI sets the
+    /// claim, and any other Pi in its job was started later). Claims are kept per process, so a
+    /// suspended Pi keeps its claim for when it resumes; only claims of processes known to be
+    /// gone are dropped. A report without the claim changes nothing.
     pub(super) fn record_input_origin_claim(
         &mut self,
         ws_idx: usize,
@@ -210,7 +212,7 @@ impl App {
         else {
             return;
         };
-        let gone: Vec<_> = self
+        let current: Vec<_> = self
             .state
             .terminals
             .get(&terminal_id)
@@ -218,13 +220,24 @@ impl App {
                 terminal
                     .input_origin_claims()
                     .iter()
-                    .copied()
-                    .filter(|current| {
-                        claimant_status(&terminal_id, runtime, *current) == ClaimantStatus::Gone
-                    })
+                    .map(|current| (*current, claimant_status(&terminal_id, runtime, *current)))
                     .collect()
             })
             .unwrap_or_default();
+        // While a claimant reads the pane, or may, it is the reader: another process in its job
+        // cannot become one by claiming (a helper named like Pi, say). A new reader is admitted
+        // only once every other claimant is known to be in the background or gone.
+        if current.iter().any(|(existing, status)| {
+            *existing != claim
+                && matches!(status, ClaimantStatus::Reading | ClaimantStatus::Unknown)
+        }) {
+            return;
+        }
+        let gone: Vec<_> = current
+            .iter()
+            .filter(|(_, status)| *status == ClaimantStatus::Gone)
+            .map(|(existing, _)| *existing)
+            .collect();
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.retain_input_origin_claims(|current| !gone.contains(current));
             terminal.add_input_origin_claim(claim);
