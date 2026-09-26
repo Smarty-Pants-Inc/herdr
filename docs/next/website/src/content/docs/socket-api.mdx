@@ -889,9 +889,10 @@ ESC _ herdr-origin;end;id=<id> ESC \
 
 `sender` is the calling pane's agent name, else its pane id, else `pid:<n>`, else
 `unknown`. herdr takes it from the socket peer process, never from request text.
-Values are percent-encoded. Other programs receive the raw bytes. herdr removes
-the `ESC _ herdr-origin` prefix from all other input, including keyboard input,
-pastes, and the payload inside a frame, so only herdr can emit a frame.
+Values are percent-encoded. Other programs receive the raw bytes. In all other
+input, including keyboard input, pastes, and the payload inside a frame, herdr
+replaces the last byte of any `ESC _ herdr-origin` prefix with `?`, so only herdr
+can emit a frame.
 
 ## Reading panes
 

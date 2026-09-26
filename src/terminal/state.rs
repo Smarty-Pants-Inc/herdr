@@ -2035,6 +2035,20 @@ impl TerminalState {
         })
     }
 
+    /// Makes this terminal a Pi that reports through herdr's Pi integration.
+    #[cfg(test)]
+    pub fn test_activate_herdr_pi_integration(&mut self) {
+        self.set_detected_state(Some(Agent::Pi), self.fallback_state);
+        self.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("test-pi-session")
+                .expect("valid session id"),
+        });
+        self.set_hook_authority("herdr:pi".into(), "pi".into(), AgentState::Idle, None, None);
+        assert!(self.herdr_pi_integration_active());
+    }
+
     fn visible_blocker_overrides_hook(&self) -> bool {
         if self.live_full_lifecycle_hook_authority() {
             return false;

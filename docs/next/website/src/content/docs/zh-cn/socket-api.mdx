@@ -661,7 +661,7 @@ ESC _ herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;sessio
 ESC _ herdr-origin;end;id=<id> ESC \
 ```
 
-`sender` 是调用方窗格的智能体名称；没有时为窗格 ID，再没有时为 `pid:<n>`，否则为 `unknown`。herdr 从 socket 对端进程得出它，从不取自请求文本。值经过百分号编码。其他程序收到的是原始字节。herdr 会从所有其他输入（包括键盘输入、粘贴和帧内的负载）中移除 `ESC _ herdr-origin` 前缀，因此只有 herdr 能发出帧。
+`sender` 是调用方窗格的智能体名称；没有时为窗格 ID，再没有时为 `pid:<n>`，否则为 `unknown`。herdr 从 socket 对端进程得出它，从不取自请求文本。值经过百分号编码。其他程序收到的是原始字节。herdr 会从所有其他输入（包括键盘输入、粘贴和帧内的负载）中把 `ESC _ herdr-origin` 前缀的最后一个字节替换为 `?`，因此只有 herdr 能发出帧。
 
 ## 读取窗格
 

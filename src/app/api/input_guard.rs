@@ -127,13 +127,7 @@ mod tests {
         target_terminal.set_agent_name("target-agent".into());
         target_terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         // Pi reporting through herdr's Pi integration reads origin frames.
-        target_terminal.set_hook_authority(
-            "herdr:pi".into(),
-            "pi".into(),
-            AgentState::Idle,
-            None,
-            None,
-        );
+        target_terminal.test_activate_herdr_pi_integration();
 
         let (source_runtime, source_rx) =
             crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -441,7 +435,7 @@ mod tests {
         assert_ok(&response);
         assert_eq!(
             fixture.target_rx.try_recv().expect("raw bytes"),
-            Bytes::from_static(b"plain;end\x1b\\")
+            Bytes::from_static(b"plain\x1b_herdr-origi?;end\x1b\\")
         );
     }
 

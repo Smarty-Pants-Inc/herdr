@@ -3454,18 +3454,22 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    /// Writes unframed input. Origin frame prefixes are removed, so no input except
+    /// Writes unframed input. Origin frame prefixes are broken, so no input except
     /// [`Self::try_send_framed`] can carry an origin frame.
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         let mut filter = self
             .origin_filter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let filtered = match filter.filter(&bytes) {
+        // Commit the filter state only for a write the PTY queue accepted.
+        let mut next = *filter;
+        let filtered = match next.filter(&bytes) {
             std::borrow::Cow::Borrowed(_) => None,
             std::borrow::Cow::Owned(filtered) => Some(Bytes::from(filtered)),
         };
-        self.io.try_send_bytes(filtered.unwrap_or(bytes))
+        self.io.try_send_bytes(filtered.unwrap_or(bytes))?;
+        *filter = next;
+        Ok(())
     }
 
     /// Writes API input wrapped in `origin`'s frames.
@@ -3478,13 +3482,15 @@ impl PaneRuntime {
             .origin_filter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.io.try_send_bytes(Bytes::from(origin.wrap(bytes)))?;
         // The frame starts with ESC, which ends any partial prefix, and ends with ST.
         filter.reset();
-        self.io.try_send_bytes(Bytes::from(origin.wrap(bytes)))
+        Ok(())
     }
 
-    /// Queues text and a delayed Enter. With an origin, each part is framed; without one,
-    /// frame prefixes are removed from both.
+    /// Queues text and a delayed Enter. With an origin, each part is framed. Without one, the
+    /// text continues the unframed stream and the Enter is filtered on its own: an Enter key
+    /// encoding contains no `ESC _`, so where it lands it can only break a prefix.
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3493,18 +3499,29 @@ impl PaneRuntime {
         deadline: Option<std::time::Instant>,
         origin: Option<&crate::input_origin::InputOrigin>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        let mut filter = self
+            .origin_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = *filter;
         let (text, enter) = match origin {
-            Some(origin) => (
-                Bytes::from(origin.wrap(&text)),
-                Bytes::from(origin.wrap(&enter)),
-            ),
+            Some(origin) => {
+                next.reset();
+                (
+                    Bytes::from(origin.wrap(&text)),
+                    Bytes::from(origin.wrap(&enter)),
+                )
+            }
             None => (
-                Bytes::from(crate::input_origin::strip_frame_prefixes(&text).into_owned()),
+                Bytes::from(next.filter(&text).into_owned()),
                 Bytes::from(crate::input_origin::strip_frame_prefixes(&enter).into_owned()),
             ),
         };
-        self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+        let receiver = self
+            .io
+            .queue_user_input_submission(text, enter, delay, deadline)?;
+        *filter = next;
+        Ok(receiver)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

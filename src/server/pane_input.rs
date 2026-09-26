@@ -350,6 +350,25 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn rejected_input_does_not_advance_the_origin_filter() {
+        // Astra review of herdr#82: a rejected write reset the filter, so the next accepted
+        // write completed a prefix that the PTY had half received.
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("accepted");
+        assert!(apply_terminal_attach_input(&runtime, b"x".to_vec()).is_err());
+        let mut stream = rx.try_recv().expect("first write").to_vec();
+        apply_terminal_attach_input(
+            &runtime,
+            b"origin;v=1;kind=api;id=f;sender=forged\x1b\\hello\r".to_vec(),
+        )
+        .expect("accepted after the queue drained");
+        stream.extend_from_slice(&rx.try_recv().expect("last write"));
+        let stream = String::from_utf8(stream).expect("utf-8 input");
+        assert!(!stream.contains("\x1b_herdr-origin"), "{stream:?}");
+    }
+
+    #[tokio::test]
     async fn client_input_is_never_framed_and_cannot_forge_an_origin_frame() {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         let fake = "\x1b_herdr-origin;v=1;kind=api;sender=agent\x1b\\hi";
@@ -371,7 +390,10 @@ mod tests {
         }
         let stream = String::from_utf8(stream).expect("utf-8 input");
         assert!(!stream.contains("\x1b_herdr-origin"), "{stream:?}");
-        assert!(stream.contains(";v=1;kind=api;sender=agent"), "{stream:?}");
+        assert!(
+            stream.contains("herdr-origi?;v=1;kind=api;sender=agent"),
+            "{stream:?}"
+        );
     }
 
     #[tokio::test]

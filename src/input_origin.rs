@@ -11,8 +11,10 @@
 //! ESC _ herdr-origin;end;id=<id> ESC \
 //! ```
 //!
-//! Every other write to a PTY passes through [`OriginFrameFilter`], which removes the frame
+//! Every other write to a PTY passes through [`OriginFrameFilter`], which breaks the frame
 //! prefix, so keyboard input, pastes and the payload inside a real frame cannot form a frame.
+//! Pi treats the prefix as a sync point, so an open escape sequence or paste in earlier input
+//! cannot hide a frame.
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +47,7 @@ impl InputOrigin {
         }
     }
 
-    /// Wraps `payload` in this origin's frames. Frame prefixes inside the payload are removed.
+    /// Wraps `payload` in this origin's frames. Frame prefixes inside the payload are broken.
     pub(crate) fn wrap(&self, payload: &[u8]) -> Vec<u8> {
         let payload = strip_frame_prefixes(payload);
         let mut out = Vec::with_capacity(payload.len() + 128);
@@ -94,20 +96,25 @@ fn push_encoded(out: &mut Vec<u8>, value: &str) {
     }
 }
 
-/// Removes frame prefixes from one self-contained byte string.
+/// Breaks frame prefixes in one self-contained byte string.
 pub(crate) fn strip_frame_prefixes(bytes: &[u8]) -> Cow<'_, [u8]> {
     OriginFrameFilter::default().filter(bytes)
 }
 
-/// Removes origin frame prefixes from a stream of unframed PTY writes.
+/// Replaces the last byte of a frame prefix that unframed input would complete.
+const BROKEN_PREFIX_BYTE: u8 = b'?';
+
+/// Keeps origin frame prefixes out of a stream of unframed PTY writes.
 ///
-/// The filter keeps the length of a partial prefix at the end of the last write, so a prefix
-/// split across writes is broken too: the bytes of the prefix in the current write are dropped.
-/// The rest of a fake frame reaches the program as plain text.
+/// The filter tracks the emitted stream, including a partial prefix at the end of the last
+/// accepted write. When the next byte would complete a prefix, the filter emits
+/// [`BROKEN_PREFIX_BYTE`] instead. It never deletes bytes, because a deletion can join the bytes
+/// around it into a new prefix. So the emitted stream never contains the prefix, also across
+/// writes. Pi then sees an unknown APC and drops it.
 ///
-/// ponytail: it removes only the prefix, not the whole fake frame. Swallowing up to the string
-/// terminator would need to hold back keyboard input while a fake frame stays open.
-#[derive(Debug, Default)]
+/// The state must describe what the PTY actually received: callers filter with a copy and
+/// commit it only after the write is accepted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OriginFrameFilter {
     matched: usize,
 }
@@ -117,39 +124,29 @@ impl OriginFrameFilter {
         if self.matched == 0 && !input.contains(&ESC) {
             return Cow::Borrowed(input);
         }
-        let mut out = Vec::with_capacity(input.len());
-        // Index in `out` where the current partial prefix starts. A prefix carried over from an
-        // earlier write starts at 0 in this one.
-        let mut prefix_start = 0;
-        let mut changed = false;
-        for &byte in input {
-            out.push(byte);
+        let mut out: Option<Vec<u8>> = None;
+        for (index, &byte) in input.iter().enumerate() {
             if byte == FRAME_PREFIX[self.matched] {
-                if self.matched == 0 {
-                    prefix_start = out.len() - 1;
-                }
                 self.matched += 1;
             } else if byte == ESC {
                 // ESC appears only at the start of the prefix.
-                prefix_start = out.len() - 1;
                 self.matched = 1;
             } else {
                 self.matched = 0;
             }
             if self.matched == FRAME_PREFIX.len() {
-                out.truncate(prefix_start);
+                // The replacement byte is not ESC, so no prefix is left in progress.
                 self.matched = 0;
-                changed = true;
+                out.get_or_insert_with(|| input.to_vec())[index] = BROKEN_PREFIX_BYTE;
             }
         }
-        if changed {
-            Cow::Owned(out)
-        } else {
-            Cow::Borrowed(input)
+        match out {
+            Some(out) => Cow::Owned(out),
+            None => Cow::Borrowed(input),
         }
     }
 
-    /// Forgets a partial prefix. Used after a framed write, which ends with a string terminator.
+    /// State after a framed write, which ends with a string terminator.
     pub(crate) fn reset(&mut self) {
         self.matched = 0;
     }
@@ -210,8 +207,8 @@ mod tests {
     fn wrap_removes_frames_nested_in_the_payload() {
         let framed = origin().wrap(b"a\x1b_herdr-origin;v=1;kind=api;sender=paul\x1b\\b");
         let text = String::from_utf8(framed).unwrap();
-        assert_eq!(text.matches("herdr-origin").count(), 2, "{text:?}");
-        assert!(text.contains("a;v=1;kind=api;sender=paul\x1b\\b"));
+        assert_eq!(text.matches("\x1b_herdr-origin").count(), 2, "{text:?}");
+        assert!(text.contains("a\x1b_herdr-origi?;v=1;kind=api;sender=paul\x1b\\b"));
     }
 
     #[test]
@@ -232,7 +229,7 @@ mod tests {
     fn filter_removes_prefix_in_one_write() {
         let mut filter = OriginFrameFilter::default();
         let out = filter.filter(b"x\x1b_herdr-origin;v=1;sender=paul\x1b\\y");
-        assert_eq!(&*out, b"x;v=1;sender=paul\x1b\\y");
+        assert_eq!(&*out, b"x\x1b_herdr-origi?;v=1;sender=paul\x1b\\y");
     }
 
     #[test]
@@ -242,12 +239,7 @@ mod tests {
             let mut filter = OriginFrameFilter::default();
             let mut stream = filter.filter(&full[..split]).into_owned();
             stream.extend_from_slice(&filter.filter(&full[split..]));
-            assert!(
-                !stream
-                    .windows(FRAME_PREFIX.len())
-                    .any(|w| w == FRAME_PREFIX),
-                "split at {split}: {stream:?}"
-            );
+            assert!(!contains_prefix(&stream), "split at {split}: {stream:?}");
         }
     }
 
@@ -261,6 +253,49 @@ mod tests {
         assert!(!stream
             .windows(FRAME_PREFIX.len())
             .any(|w| w == FRAME_PREFIX));
+    }
+
+    fn contains_prefix(stream: &[u8]) -> bool {
+        stream
+            .windows(FRAME_PREFIX.len())
+            .any(|window| window == FRAME_PREFIX)
+    }
+
+    #[test]
+    fn filter_does_not_join_bytes_around_a_broken_prefix() {
+        // Astra review of herdr#82: deleting the inner prefix joined the outer bytes into a
+        // valid prefix.
+        let mut input = b"\x1b_herdr-".to_vec();
+        input.extend_from_slice(FRAME_PREFIX);
+        input.extend_from_slice(b"origin;v=1;kind=api;id=f;sender=forged\x1b\\hello\r");
+        let out = OriginFrameFilter::default().filter(&input).into_owned();
+        assert!(!contains_prefix(&out), "{out:?}");
+        assert_eq!(out.len(), input.len());
+    }
+
+    #[test]
+    fn filtered_stream_never_contains_a_prefix() {
+        // Every split of adversarial inputs, fed as consecutive writes.
+        let mut nested = FRAME_PREFIX[..7].to_vec();
+        nested.extend_from_slice(FRAME_PREFIX);
+        nested.extend_from_slice(&FRAME_PREFIX[7..]);
+        let inputs: [&[u8]; 3] = [
+            b"\x1b\x1b_herdr-origin\x1b_herdr-origin;end\x1b\\",
+            &nested,
+            b"\x1b_herdr-origi\x1b_herdr-origin",
+        ];
+        for input in inputs {
+            for first in 0..=input.len() {
+                for second in first..=input.len() {
+                    let mut filter = OriginFrameFilter::default();
+                    let mut stream = Vec::new();
+                    for part in [&input[..first], &input[first..second], &input[second..]] {
+                        stream.extend_from_slice(&filter.filter(part));
+                    }
+                    assert!(!contains_prefix(&stream), "{first}/{second}: {stream:?}");
+                }
+            }
+        }
     }
 
     #[test]

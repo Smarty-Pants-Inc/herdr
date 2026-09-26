@@ -557,18 +557,18 @@ mod tests {
             .attached_terminal_id
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.test_activate_herdr_pi_integration();
         terminal.set_agent_name("reviewer".into());
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
-        terminal.set_hook_authority("herdr:pi".into(), "pi".into(), AgentState::Idle, None, None);
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
 
         let response = run_deferred_agent_prompt(
             &mut app,
             "req",
             AgentPromptParams {
-                target: "reviewer".into(),
+                target,
                 text: "hello".into(),
                 wait: None,
                 allow_cross_pane: false,
