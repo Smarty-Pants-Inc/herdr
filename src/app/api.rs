@@ -4,6 +4,7 @@ mod agent_view;
 mod agents;
 mod env;
 mod input_guard;
+mod input_origin;
 mod integrations;
 mod layouts;
 mod pane_graphics;
@@ -1129,7 +1130,7 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSendKeys(params) => {
-                return self.handle_agent_send_keys(request.id, params);
+                return self.handle_agent_send_keys(request.id, params, context);
             }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
@@ -1220,9 +1221,11 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
+            Method::PaneSendText(params) => {
+                return self.handle_pane_send_text(request.id, params, context);
+            }
             Method::PaneSendInput(params) => {
-                return self.handle_pane_send_input(request.id, params);
+                return self.handle_pane_send_input(request.id, params, context);
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PopupClose(_) => {
@@ -1232,7 +1235,9 @@ impl App {
                     responses::encode_error(request.id, "popup_not_open", "no popup is open")
                 };
             }
-            Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
+            Method::PaneSendKeys(params) => {
+                return self.handle_pane_send_keys(request.id, params, context);
+            }
             Method::IntegrationList(_) => {
                 return self.handle_integration_list(request.id);
             }

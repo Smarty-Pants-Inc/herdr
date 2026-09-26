@@ -26,6 +26,7 @@ mod events;
 mod ghostty;
 mod handoff_runtime;
 mod input;
+mod input_origin;
 mod integration;
 mod ipc;
 mod kitty_graphics;

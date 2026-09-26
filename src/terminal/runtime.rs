@@ -470,15 +470,24 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub fn try_send_framed(
+        &self,
+        origin: &crate::input_origin::InputOrigin,
+        bytes: &[u8],
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_framed(origin, bytes)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        origin: Option<&crate::input_origin::InputOrigin>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(text, enter, delay, deadline, origin)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

@@ -350,6 +350,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn client_input_is_never_framed_and_cannot_forge_an_origin_frame() {
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let fake = "\x1b_herdr-origin;v=1;kind=api;sender=agent\x1b\\hi";
+        apply_client_pane_input_events(
+            &runtime,
+            &[
+                ClientPaneInputEvent::TextCommit(fake.into()),
+                ClientPaneInputEvent::Paste(fake.into()),
+            ],
+        )
+        .expect("client input");
+        // A raw terminal attach can split the frame prefix across writes.
+        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("first half");
+        apply_terminal_attach_input(&runtime, b"origin;end\x1b\\".to_vec()).expect("second half");
+
+        let mut stream = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            stream.extend_from_slice(&bytes);
+        }
+        let stream = String::from_utf8(stream).expect("utf-8 input");
+        assert!(!stream.contains("\x1b_herdr-origin"), "{stream:?}");
+        assert!(stream.contains(";v=1;kind=api;sender=agent"), "{stream:?}");
+    }
+
+    #[tokio::test]
     async fn terminal_attach_stale_geometry_falls_back_to_the_canonical_cell() {
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"");
         let position = crate::protocol::ClientMousePosition::Pixels {

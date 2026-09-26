@@ -1326,6 +1326,8 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
+    /// Removes origin frame prefixes from unframed input (smarty-dev#931).
+    origin_filter: Mutex<crate::input_origin::OriginFrameFilter>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
@@ -2483,6 +2485,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            origin_filter: Mutex::default(),
             detection_content_seq,
             full_lifecycle_authority_active,
             detect_reset_notify,
@@ -3073,6 +3076,7 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
+            origin_filter: Mutex::default(),
             detection_content_seq,
             full_lifecycle_authority_active,
             detect_reset_notify,
@@ -3450,17 +3454,55 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
+    /// Writes unframed input. Origin frame prefixes are removed, so no input except
+    /// [`Self::try_send_framed`] can carry an origin frame.
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        let mut filter = self
+            .origin_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let filtered = match filter.filter(&bytes) {
+            std::borrow::Cow::Borrowed(_) => None,
+            std::borrow::Cow::Owned(filtered) => Some(Bytes::from(filtered)),
+        };
+        self.io.try_send_bytes(filtered.unwrap_or(bytes))
     }
 
+    /// Writes API input wrapped in `origin`'s frames.
+    pub fn try_send_framed(
+        &self,
+        origin: &crate::input_origin::InputOrigin,
+        bytes: &[u8],
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let mut filter = self
+            .origin_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The frame starts with ESC, which ends any partial prefix, and ends with ST.
+        filter.reset();
+        self.io.try_send_bytes(Bytes::from(origin.wrap(bytes)))
+    }
+
+    /// Queues text and a delayed Enter. With an origin, each part is framed; without one,
+    /// frame prefixes are removed from both.
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        origin: Option<&crate::input_origin::InputOrigin>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        let (text, enter) = match origin {
+            Some(origin) => (
+                Bytes::from(origin.wrap(&text)),
+                Bytes::from(origin.wrap(&enter)),
+            ),
+            None => (
+                Bytes::from(crate::input_origin::strip_frame_prefixes(&text).into_owned()),
+                Bytes::from(crate::input_origin::strip_frame_prefixes(&enter).into_owned()),
+            ),
+        };
         self.io
             .queue_user_input_submission(text, enter, delay, deadline)
     }
@@ -3784,6 +3826,7 @@ impl PaneRuntime {
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
+                origin_filter: Mutex::default(),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
@@ -4952,6 +4995,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            origin_filter: Mutex::default(),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
@@ -4991,6 +5035,7 @@ mod tests {
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
+            origin_filter: Mutex::default(),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
