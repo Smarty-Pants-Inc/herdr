@@ -877,8 +877,9 @@ Use `events.subscribe` for lifecycle events. Dedicated wait helpers are document
 ## Input origin frames
 
 When `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`, or
-`agent.prompt` writes to a pane whose agent is Pi and Pi is the foreground process,
-herdr wraps the bytes in an origin frame, so Pi can tell sent input from typed input:
+`agent.prompt` writes to a pane where Pi reports through herdr's Pi integration and Pi
+is the foreground process, herdr wraps the bytes in an origin frame, so Pi can tell
+sent input from typed input:
 
 ```text
 ESC _ herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] ESC \

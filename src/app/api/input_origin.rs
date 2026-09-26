@@ -5,8 +5,9 @@ use crate::input_origin::InputOrigin;
 impl App {
     /// The origin frame for an API write to this pane, or `None` to write raw bytes.
     ///
-    /// Only Pi reads origin frames today, so a pane gets them only while its agent is Pi and Pi
-    /// is its foreground process. Every other program gets the raw bytes as before.
+    /// Only Pi reads origin frames today, so a pane gets them only while Pi reports through
+    /// herdr's Pi integration and Pi is its foreground process. Every other program, including
+    /// one that is only named `pi`, gets the raw bytes as before.
     pub(super) fn api_input_origin(
         &self,
         ws_idx: usize,
@@ -16,7 +17,7 @@ impl App {
     ) -> Option<InputOrigin> {
         let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
         let terminal = self.state.terminals.get(terminal_id)?;
-        if terminal.effective_known_agent() != Some(crate::detect::Agent::Pi)
+        if !terminal.herdr_pi_integration_active()
             || !super::super::agents::runtime_hosts_agent(runtime, crate::detect::Agent::Pi)
         {
             return None;

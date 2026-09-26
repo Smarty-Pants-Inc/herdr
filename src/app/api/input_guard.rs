@@ -126,6 +126,14 @@ mod tests {
             .expect("target state");
         target_terminal.set_agent_name("target-agent".into());
         target_terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        // Pi reporting through herdr's Pi integration reads origin frames.
+        target_terminal.set_hook_authority(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+        );
 
         let (source_runtime, source_rx) =
             crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -401,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_pi_panes_receive_raw_api_input() {
+    async fn panes_without_herdrs_pi_integration_receive_raw_api_input() {
         let mut fixture = attributed_agent_fixture();
         let (_, target_pane) = fixture
             .app
@@ -417,11 +425,11 @@ mod tests {
             .terminals
             .get_mut(&target_terminal_id)
             .expect("target state")
-            .set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            .clear_hook_authority(None, None);
 
         let response = fixture.app.handle_api_request_with_context(
             Request {
-                id: "claude".into(),
+                id: "no-integration".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
                     pane_id: fixture.target_pane_id.clone(),
                     text: "plain\x1b_herdr-origin;end\x1b\\".into(),

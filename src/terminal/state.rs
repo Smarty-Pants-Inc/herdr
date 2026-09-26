@@ -2025,6 +2025,16 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
+    /// Whether Pi reports through herdr's own Pi integration. Only that Pi reads origin
+    /// frames (smarty-dev#931); a program that is merely named `pi` does not.
+    pub fn herdr_pi_integration_active(&self) -> bool {
+        self.hook_authority.as_ref().is_some_and(|authority| {
+            authority.source == "herdr:pi"
+                && authority.agent_label == "pi"
+                && self.hook_authority_is_effective(authority)
+        })
+    }
+
     fn visible_blocker_overrides_hook(&self) -> bool {
         if self.live_full_lifecycle_hook_authority() {
             return false;
