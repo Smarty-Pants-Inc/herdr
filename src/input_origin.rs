@@ -138,11 +138,11 @@ impl OriginFrameFilter {
         let mut out: Option<Vec<u8>> = None;
         for (index, &byte) in input.iter().enumerate() {
             let mut next = 0u16;
-            for matched in 0..FRAME_PREFIX.len() {
+            for (matched, &expected) in FRAME_PREFIX.iter().enumerate() {
                 if self.possible & (1 << matched) == 0 {
                     continue;
                 }
-                next |= if byte == FRAME_PREFIX[matched] {
+                next |= if byte == expected {
                     1 << (matched + 1)
                 } else if byte == ESC {
                     // ESC appears only at the start of the prefix.
