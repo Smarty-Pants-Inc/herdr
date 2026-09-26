@@ -3509,13 +3509,16 @@ impl PaneRuntime {
     }
 
     /// Tells the pane's Pi that its API input is framed from now on.
-    pub fn try_send_origin_ready(&self, pid: u32) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub fn try_send_origin_ready(
+        &self,
+        nonce: &str,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         let mut filter = self
             .origin_filter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.io
-            .try_send_bytes(Bytes::from(crate::input_origin::ready_frame(pid)))?;
+            .try_send_bytes(Bytes::from(crate::input_origin::ready_frame(nonce)))?;
         filter.merge_frame();
         Ok(())
     }

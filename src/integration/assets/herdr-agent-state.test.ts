@@ -298,8 +298,8 @@ test("Pi reports a Windows session path", async () => {
 test("Pi reports that it reads origin frames only when its TUI says so", async () => {
   const inputOriginKey = Symbol.for("pi.herdrInputOrigin");
   const globals = globalThis as Record<symbol, unknown>;
-  for (const claim of [undefined, "v1"]) {
-    const requests = await startRecordingServer(`pi-input-origin-${claim ?? "none"}`);
+  for (const claim of [undefined, { version: "v1", nonce: "0123456789abcdef" }]) {
+    const requests = await startRecordingServer(`pi-input-origin-${claim ? "claim" : "none"}`);
     if (claim) globals[inputOriginKey] = claim;
     else delete globals[inputOriginKey];
     try {
@@ -311,7 +311,8 @@ test("Pi reports that it reads origin frames only when its TUI says so", async (
       const report = requests.find(
         (request) => isRecord(request) && request.method === "pane.report_agent",
       ) as { params: Record<string, unknown> };
-      expect(report.params.input_origin).toBe(claim);
+      expect(report.params.input_origin).toBe(claim?.version);
+      expect(report.params.input_origin_nonce).toBe(claim?.nonce);
     } finally {
       delete globals[inputOriginKey];
       await new Promise<void>((resolve) => server?.close(() => resolve()));

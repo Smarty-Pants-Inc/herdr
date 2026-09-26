@@ -88,6 +88,7 @@ mod tests {
     }
 
     /// In these tests the target pane's foreground job has a wrapper (not Pi) and a Pi process.
+    const TEST_NONCE: &str = "0123456789abcdef";
     const TARGET_WRAPPER_PROCESS: u32 = 7000;
     const TARGET_PI_PROCESS: u32 = 7001;
     const TARGET_PI: crate::input_origin::InputOriginClaim =
@@ -482,6 +483,7 @@ mod tests {
                     agent_session_id: None,
                     agent_session_path: None,
                     input_origin: input_origin.map(str::to_string),
+                    input_origin_nonce: input_origin.map(|_| TEST_NONCE.to_string()),
                 }),
             },
             ApiRequestContext {
@@ -526,11 +528,40 @@ mod tests {
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert_eq!(
             fixture.target_rx.try_recv().expect("ready frame"),
-            Bytes::from(crate::input_origin::ready_frame(TARGET_PI_PROCESS))
+            Bytes::from(crate::input_origin::ready_frame(TEST_NONCE))
         );
         // A repeated report sends it once.
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert!(fixture.target_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_claim_without_a_valid_nonce_is_ignored() {
+        let mut fixture = unclaimed_fixture();
+        for nonce in [None, Some("short"), Some("0123456789abcdef;x=1")] {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "report".into(),
+                    method: Method::PaneReportAgent(crate::api::schema::PaneReportAgentParams {
+                        pane_id: fixture.target_pane_id.clone(),
+                        source: "herdr:pi".into(),
+                        agent: "pi".into(),
+                        state: crate::api::schema::PaneAgentState::Idle,
+                        message: None,
+                        seq: None,
+                        agent_session_id: None,
+                        agent_session_path: None,
+                        input_origin: Some("v1".into()),
+                        input_origin_nonce: nonce.map(str::to_string),
+                    }),
+                },
+                ApiRequestContext {
+                    local_peer_pid: Some(TARGET_PI_PROCESS),
+                },
+            );
+            assert_ok(&response);
+            assert!(!is_framed(&send_text(&mut fixture, "x")), "{nonce:?}");
+        }
     }
 
     #[tokio::test]
@@ -551,7 +582,7 @@ mod tests {
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert_eq!(
             fixture.target_rx.try_recv().expect("ready frame"),
-            Bytes::from(crate::input_origin::ready_frame(TARGET_PI_PROCESS))
+            Bytes::from(crate::input_origin::ready_frame(TEST_NONCE))
         );
     }
 
@@ -827,6 +858,7 @@ mod tests {
             agent_session_id: None,
             agent_session_path: None,
             input_origin: None,
+            input_origin_nonce: None,
         })
     }
 

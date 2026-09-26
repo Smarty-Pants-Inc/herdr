@@ -470,6 +470,10 @@ pub struct PaneReportAgentParams {
     // Origin frame version the reporting agent reads, for example `v1` (smarty-dev#931).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_origin: Option<String>,
+    // Unpredictable value that the claiming Pi generated for this run; Herdr echoes it in the
+    // ready frame so only that run accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_origin_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

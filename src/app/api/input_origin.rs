@@ -232,6 +232,7 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         context: ApiRequestContext,
+        nonce: &str,
     ) {
         let Some(peer_pid) = context.local_peer_pid else {
             return;
@@ -288,7 +289,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return;
         };
-        match runtime.try_send_origin_ready(claim.pid) {
+        match runtime.try_send_origin_ready(nonce) {
             Ok(()) => {
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.mark_input_origin_ready_sent(claim);

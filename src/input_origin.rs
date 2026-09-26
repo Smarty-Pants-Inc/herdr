@@ -12,7 +12,7 @@
 //! ```
 //!
 //! When Herdr admits a Pi's claim to read frames, it sends that Pi
-//! `U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1`. Until then the Pi cannot know that unframed input
+//! `U+FDD0 herdr-origin;ready;v=1;nonce=<nonce> U+FDD1`, echoing the nonce from its claim. Until then the Pi cannot know that unframed input
 //! is typed, so it does not record it as keyboard input.
 //!
 //! The markers are Unicode noncharacters. A UTF-8 reader gets `U+FDD0` whole, so it knows a
@@ -91,17 +91,22 @@ impl InputOrigin {
     }
 }
 
-/// Tells the Pi process `pid` that Herdr frames its API input from now on, so it may record
-/// unframed input as typed. Sent when Herdr admits that process's claim; another process that
-/// reads the frame ignores it.
-pub(crate) fn ready_frame(pid: u32) -> Vec<u8> {
+/// Tells the Pi run that generated `nonce` that Herdr frames its API input from now on, so it
+/// may record unframed input as typed. Sent when Herdr admits that run's claim; any other
+/// reader, including a later process with the same pid, ignores it.
+pub(crate) fn ready_frame(nonce: &str) -> Vec<u8> {
     [
         FRAME_PREFIX,
         FRAME_TAG,
-        format!("ready;v=1;pid={pid}").as_bytes(),
+        format!("ready;v=1;nonce={nonce}").as_bytes(),
         FRAME_HEADER_END,
     ]
     .concat()
+}
+
+/// A ready nonce is 16 to 128 ASCII letters or digits, so it needs no encoding in a frame.
+pub(crate) fn valid_ready_nonce(nonce: &str) -> bool {
+    (16..=128).contains(&nonce.len()) && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn next_frame_id() -> String {

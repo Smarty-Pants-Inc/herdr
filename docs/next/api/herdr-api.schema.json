@@ -3063,6 +3063,12 @@
                 "null"
               ]
             },
+            "input_origin_nonce": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "type": [
                 "string",

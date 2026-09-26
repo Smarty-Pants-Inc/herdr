@@ -1556,7 +1556,13 @@ impl App {
             return invalid_agent(id);
         };
         if params.source == "herdr:pi" && params.input_origin.as_deref() == Some("v1") {
-            self.record_input_origin_claim(ws_idx, pane_id, context);
+            if let Some(nonce) = params
+                .input_origin_nonce
+                .as_deref()
+                .filter(|nonce| crate::input_origin::valid_ready_nonce(nonce))
+            {
+                self.record_input_origin_claim(ws_idx, pane_id, context, nonce);
+            }
         }
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,

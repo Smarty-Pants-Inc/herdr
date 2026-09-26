@@ -661,7 +661,7 @@ U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;sessi
 U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
-标记是 Unicode 非字符 `U+FDD0` 和 `U+FDD1`。herdr 接受某个 Pi 的声明后，会向该 Pi 发送 `U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1`，告知其此后的 API 输入都会带帧。只有当通过 herdr 的 Pi 集成（来源为 `herdr:pi` 的 `pane.report_agent`）上报了 `input_origin: "v1"` 的那个 Pi 进程仍是窗格前台作业中的 Pi 时，该窗格才会收到帧。herdr 只在 socket 对端就是该 Pi 进程本身时才接受这一上报，并且在该 Pi 仍在运行时，其他进程不能替换它的声明。如果 herdr 无法读取已声明窗格的前台作业，它会以 `input_origin_unavailable` 拒绝写入，而不是发送原始字节。其他程序以及不上报它的 Pi 收到的是原始字节。
+标记是 Unicode 非字符 `U+FDD0` 和 `U+FDD1`。Pi 的上报还带有本次运行的随机值 `input_origin_nonce`。herdr 接受声明后，会发送 `U+FDD0 herdr-origin;ready;v=1;nonce=<nonce> U+FDD1`，只告知该 Pi 此后的 API 输入都会带帧。只有当通过 herdr 的 Pi 集成（来源为 `herdr:pi` 的 `pane.report_agent`）上报了 `input_origin: "v1"` 的那个 Pi 进程仍是窗格前台作业中的 Pi 时，该窗格才会收到帧。herdr 只在 socket 对端就是该 Pi 进程本身时才接受这一上报，并且在该 Pi 仍在运行时，其他进程不能替换它的声明。如果 herdr 无法读取已声明窗格的前台作业，它会以 `input_origin_unavailable` 拒绝写入，而不是发送原始字节。其他程序以及不上报它的 Pi 收到的是原始字节。
 
 `sender` 是调用方窗格的智能体名称；没有时为窗格 ID，再没有时为 `pid:<n>`，否则为 `unknown`。herdr 从 socket 对端进程得出它，从不取自请求文本。值经过百分号编码。herdr 会把所有其他输入（包括键盘输入、粘贴和帧内的负载）中任何 `U+FDD0` 的最后一个字节替换为 `?`，因此只有 herdr 能开始一个帧。
 

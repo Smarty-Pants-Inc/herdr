@@ -1321,6 +1321,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
         agent_session_id,
         agent_session_path,
         input_origin: None,
+        input_origin_nonce: None,
     }))
 }
 

@@ -475,8 +475,11 @@ impl TerminalRuntime {
         self.0.test_origin_filter()
     }
 
-    pub fn try_send_origin_ready(&self, pid: u32) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_origin_ready(pid)
+    pub fn try_send_origin_ready(
+        &self,
+        nonce: &str,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_origin_ready(nonce)
     }
 
     pub fn try_send_framed(

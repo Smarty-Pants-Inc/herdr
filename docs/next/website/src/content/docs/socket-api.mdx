@@ -886,9 +886,10 @@ U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;sessi
 U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
-The markers are the Unicode noncharacters `U+FDD0` and `U+FDD1`. When herdr accepts a
-Pi's claim, it sends that Pi `U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1`, so the Pi knows
-that its API input is framed from then on. A pane gets frames
+The markers are the Unicode noncharacters `U+FDD0` and `U+FDD1`. The Pi's report also
+carries `input_origin_nonce`, a random value for that Pi run. When herdr accepts the claim, it
+sends `U+FDD0 herdr-origin;ready;v=1;nonce=<nonce> U+FDD1`, so that Pi, and no other reader,
+knows that its API input is framed from then on. A pane gets frames
 only while the Pi process that reported `input_origin: "v1"` through herdr's Pi
 integration (`pane.report_agent` from source `herdr:pi`) is a Pi in the pane's
 foreground job. herdr accepts that claim only when the socket peer is that Pi

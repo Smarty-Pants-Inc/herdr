@@ -138,9 +138,14 @@ function reportSession(sessionStartSource?: string): Promise<void> {
 // environment variable, so child processes do not inherit the claim.
 const inputOriginKey = Symbol.for("pi.herdrInputOrigin");
 
-function inputOrigin(): string | undefined {
-  const value = (globalThis as Record<symbol, unknown>)[inputOriginKey];
-  return value === "v1" ? value : undefined;
+// The claim is `{ version: "v1", nonce }`; Herdr echoes the nonce in its ready frame so that
+// only this Pi run accepts it.
+function inputOrigin(): { version: string; nonce: string } | undefined {
+  const value = (globalThis as Record<symbol, unknown>)[inputOriginKey] as
+    | { version?: unknown; nonce?: unknown }
+    | undefined;
+  if (value?.version !== "v1" || typeof value.nonce !== "string") return undefined;
+  return { version: value.version, nonce: value.nonce };
 }
 
 function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
@@ -155,7 +160,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
       state,
       message,
       seq,
-      ...(origin ? { input_origin: origin } : {}),
+      ...(origin ? { input_origin: origin.version, input_origin_nonce: origin.nonce } : {}),
     }),
   });
 }
