@@ -211,6 +211,10 @@ pub fn process_start(_pid: u32) -> super::ProcessStart {
     super::ProcessStart::Unknown
 }
 
+pub fn process_stdin_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Unsupported platform stub.
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None

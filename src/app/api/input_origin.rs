@@ -73,7 +73,8 @@ pub(crate) fn classify_claimant(
 }
 
 /// The Pi processes Herdr can identify in the pane's foreground job, each identified on its
-/// own, so a wrapper or sibling process in the same job is not taken for Pi. Tests can set the
+/// own, so a wrapper or sibling process in the same job is not taken for Pi, and each with the
+/// pane's terminal as its standard input. Tests can set the
 /// job through `test_support::set_foreground_pi`.
 fn foreground_pi(
     terminal_id: &crate::terminal::TerminalId,
@@ -85,14 +86,22 @@ fn foreground_pi(
     }
     #[cfg(not(test))]
     let _ = terminal_id;
-    let Some(job) = runtime.child_pid().and_then(crate::detect::foreground_job) else {
+    let Some(child_pid) = runtime.child_pid() else {
         return ForegroundPi {
             pi_processes: Vec::new(),
         };
     };
+    let Some(job) = crate::detect::foreground_job(child_pid) else {
+        return ForegroundPi {
+            pi_processes: Vec::new(),
+        };
+    };
+    // The pane's terminal, as the pane's first process has it on standard input.
+    let pane_terminal = crate::platform::process_stdin_path(child_pid);
     let pi_processes = job
         .processes
         .iter()
+        .filter(|process| reads_pane_terminal(process.pid, pane_terminal.as_deref()))
         .filter(|process| {
             let alone = crate::platform::ForegroundJob {
                 process_group_id: process.pid,
@@ -114,6 +123,23 @@ fn foreground_pi(
         )
         .collect();
     ForegroundPi { pi_processes }
+}
+
+/// Whether `pid` has the pane's terminal as its standard input. A helper that Pi starts with
+/// piped input is then not a candidate reader. Where the platform cannot tell (Windows), every
+/// candidate passes.
+///
+/// ponytail: this narrows who can claim; it does not prove that the process reads the
+/// terminal. A same-job process that inherits the terminal can still claim. A challenge sent
+/// through the terminal would prove it, at the cost of Pi changes (smarty-dev#931).
+fn reads_pane_terminal(pid: u32, pane_terminal: Option<&std::path::Path>) -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    match (pane_terminal, crate::platform::process_stdin_path(pid)) {
+        (Some(pane), Some(stdin)) => pane == stdin,
+        _ => false,
+    }
 }
 
 /// Whether `claim`'s process still reads the pane. Tests can set it through
@@ -377,6 +403,19 @@ mod tests {
             start_time,
             process_group,
         }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn only_a_process_on_the_pane_terminal_is_a_candidate_reader() {
+        let own = std::process::id();
+        let stdin = crate::platform::process_stdin_path(own).expect("own stdin");
+        assert!(super::reads_pane_terminal(own, Some(&stdin)));
+        assert!(!super::reads_pane_terminal(
+            own,
+            Some(std::path::Path::new("/dev/pts/does-not-exist"))
+        ));
+        assert!(!super::reads_pane_terminal(own, None));
     }
 
     #[test]

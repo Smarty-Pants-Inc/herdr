@@ -586,6 +586,52 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
+/// The file a process has open as its standard input.
+pub fn process_stdin_path(pid: u32) -> Option<PathBuf> {
+    // `struct proc_fileinfo` and `struct vnode_fdinfowithpath` from <sys/proc_info.h>; libc
+    // does not bind them.
+    #[repr(C)]
+    struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidfdinfo(
+            pid as libc::c_int,
+            0,
+            PROC_PIDFDVNODEPATHINFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret != size {
+        return None;
+    }
+    let path: Vec<u8> = info
+        .pvip
+        .vip_path
+        .iter()
+        .flatten()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    (!path.is_empty()).then(|| {
+        PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(path))
+    })
+}
+
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)

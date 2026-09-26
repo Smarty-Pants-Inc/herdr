@@ -708,6 +708,11 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
+/// The file a process has open as its standard input.
+pub fn process_stdin_path(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()
+}
+
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)

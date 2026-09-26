@@ -1446,6 +1446,11 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
+/// The file a process has open as its standard input. Not available here.
+pub fn process_stdin_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
     let process_parameters = read_process_parameters(process.0)?;
