@@ -101,8 +101,20 @@ impl AppPolicy {
     };
 }
 
+/// A separate API input log per test app, so tests do not share or pollute a real one.
+fn test_api_input_log_path() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "herdr-test-api-input-{}-{next}.jsonl",
+        std::process::id()
+    ))
+}
+
 pub struct App {
     pub state: AppState,
+    /// Herdr's API input log (smarty-dev#931); see `api::input_log`.
+    pub(crate) api_input_log: std::path::PathBuf,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -571,6 +583,11 @@ impl App {
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
         let mut app = Self {
+            api_input_log: if cfg!(test) {
+                test_api_input_log_path()
+            } else {
+                api::input_log::default_api_input_log_path()
+            },
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,

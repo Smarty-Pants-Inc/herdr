@@ -1818,10 +1818,24 @@ impl App {
         &mut self,
         id: String,
         params: PaneSendTextParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if self.lookup_runtime_sender(ws_idx, pane_id).is_none() {
+            return pane_not_found(id, &params.pane_id);
+        }
+        if let Err(response) = self.log_api_input(
+            &id,
+            "pane.send_text",
+            ws_idx,
+            pane_id,
+            context,
+            params.text.len(),
+        ) {
+            return response;
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1836,6 +1850,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneSendInputParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1851,6 +1866,16 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        if let Err(response) = self.log_api_input(
+            &id,
+            "pane.send_input",
+            ws_idx,
+            pane_id,
+            context,
+            bytes.len(),
+        ) {
+            return response;
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
@@ -1934,6 +1959,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneSendKeysParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1945,6 +1971,12 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        let total = encoded_keys.iter().map(Vec::len).sum();
+        if let Err(response) =
+            self.log_api_input(&id, "pane.send_keys", ws_idx, pane_id, context, total)
+        {
+            return response;
+        }
         for bytes in encoded_keys {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());

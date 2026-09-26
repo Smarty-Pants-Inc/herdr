@@ -651,6 +651,12 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
+## API 输入日志
+
+在 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys` 或 `agent.prompt` 写入窗格之前，herdr 会向其状态目录中的 `api-input.jsonl`（例如 `~/.local/state/herdr/api-input.jsonl`，仅所有者可读）追加一行 JSON。该行记录时间（`ts_ms`）、方法、目标窗格和终端、字节数，以及 herdr 通过 socket 对端进程得知的调用方：pid、窗格、智能体名称和智能体会话。它从不记录文本。如果 herdr 无法写入该行，就会以 `input_log_unavailable` 拒绝该输入。
+
+这样，读取智能体会话的一方无需在终端字节流中添加任何内容，就能区分 API 发送到窗格的轮次和在窗格中键入的轮次。
+
 ## 读取窗格
 
 除非你在编写协议客户端,否则通过 CLI 使用 `pane.read`。

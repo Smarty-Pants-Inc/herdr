@@ -216,6 +216,175 @@ pub(crate) fn create_config_temporary(
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
+/// Opens or creates `path` as a private log and returns the handle that was validated.
+///
+/// One handle carries the whole decision: it is opened without following a final reparse point
+/// and without delete sharing (so the entry cannot be renamed or replaced while it is open); a
+/// new file gets a protected owner/SYSTEM DACL; the handle's object must be a regular file
+/// owned by the current user (a file owned by this token's default owner, as Windows creates it
+/// for an elevated administrator, is given to the user), and its DACL is replaced with that
+/// protected one through the same handle. Writes then go to that same object. Fails closed on any step.
+pub(crate) fn open_private_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use interprocess::os::windows::security_descriptor::{
+        AsSecurityDescriptorExt as _, SecurityDescriptor,
+    };
+    use std::os::windows::fs::MetadataExt as _;
+    use widestring::U16CString;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE},
+        Security::{
+            EqualSid, GetKernelObjectSecurity, GetSecurityDescriptorOwner,
+            InitializeSecurityDescriptor, SetKernelObjectSecurity, SetSecurityDescriptorOwner,
+            TokenOwner, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_DESCRIPTOR, TOKEN_OWNER,
+            TOKEN_QUERY, TOKEN_USER,
+        },
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_ALWAYS, WRITE_DAC, WRITE_OWNER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let sddl =
+        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
+    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    descriptor.write_to_security_attributes(&mut attributes);
+    let wide = extended_length_path(path)?;
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // CreateFileW returned an owned handle; File closes it exactly once.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(std::io::Error::other("the log is not a regular file"));
+    }
+
+    // The owner of the opened object.
+    let raw = file.as_raw_handle();
+    let mut needed = 0u32;
+    unsafe { GetKernelObjectSecurity(raw, OWNER_SECURITY_INFORMATION, null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // u64 elements keep the self-relative descriptor aligned.
+    let mut owner_descriptor = vec![0u64; (needed as usize).div_ceil(8)];
+    if unsafe {
+        GetKernelObjectSecurity(
+            raw,
+            OWNER_SECURITY_INFORMATION,
+            owner_descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut owner: PSID = null_mut();
+    let mut defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorOwner(
+            owner_descriptor.as_mut_ptr().cast(),
+            &mut owner,
+            &mut defaulted,
+        )
+    } == 0
+        || owner.is_null()
+    {
+        return Err(std::io::Error::other("the log has no owner"));
+    }
+
+    // The current user, and the default owner that Windows gives this token's new objects (for
+    // an elevated administrator, the Administrators group).
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let user_buffer = token_information(token, TokenUser);
+    let owner_buffer = token_information(token, TokenOwner);
+    unsafe { CloseHandle(token) };
+    let (user_buffer, owner_buffer) = (user_buffer?, owner_buffer?);
+    // The buffers are 8-byte aligned and hold a TOKEN_USER and a TOKEN_OWNER.
+    let user = unsafe { (*(user_buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let default_owner = unsafe { (*(owner_buffer.as_ptr().cast::<TOKEN_OWNER>())).Owner };
+    if unsafe { EqualSid(owner, user) } == 0 {
+        // Only a log this token created (default owner) is taken over; any other owner is
+        // refused.
+        if unsafe { EqualSid(owner, default_owner) } == 0 {
+            return Err(std::io::Error::other("the log is not owned by this user"));
+        }
+        let mut owner_only = SECURITY_DESCRIPTOR::default();
+        let descriptor_ptr = (&mut owner_only as *mut SECURITY_DESCRIPTOR).cast();
+        if unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) } == 0
+            || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, user, 0) } == 0
+            || unsafe { SetKernelObjectSecurity(raw, OWNER_SECURITY_INFORMATION, descriptor_ptr) }
+                == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    if unsafe {
+        SetKernelObjectSecurity(
+            raw,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            attributes.lpSecurityDescriptor,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// `GetTokenInformation` into an 8-byte aligned buffer.
+fn token_information(
+    token: windows_sys::Win32::Foundation::HANDLE,
+    class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> std::io::Result<Vec<u64>> {
+    use windows_sys::Win32::Security::GetTokenInformation;
+    let mut length = 0u32;
+    unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut length) };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            buffer.as_mut_ptr().cast(),
+            length,
+            &mut length,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(buffer)
+}
+
 pub(crate) fn write_config_temporary(
     source: Option<&std::path::Path>,
     temporary: &std::path::Path,
