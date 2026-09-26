@@ -85,9 +85,6 @@ impl App {
     }
 }
 
-/// Log paths whose directory entries this process has made durable.
-static PUBLISHED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
-
 /// Appends `line` as one JSONL record and makes it durable before returning.
 ///
 /// An exclusive file lock serializes writers, including other Herdr processes that share the
@@ -95,10 +92,10 @@ static PUBLISHED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::
 /// the record starts on a new line, so every accepted record stays separately parseable; the
 /// fragment is a malformed line that readers skip.
 ///
-/// Until one call in this process has synced the directory entries of the log and of every
-/// directory above it, each call syncs them before returning. A path that exists is not proof
-/// that it was made durable (an earlier attempt, or another process, may have failed after
-/// creating it). ponytail: the chain is synced once per process, not per record.
+/// Every call then syncs the directory entries of the log and of every directory above it: a
+/// path that exists is not proof that it was made durable (an earlier attempt or another
+/// process may have failed after creating it, or the log may have been moved aside and
+/// recreated). ponytail: a few directory syncs per API write; API writes are infrequent.
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     if let Some(parent) = path.parent() {
@@ -123,19 +120,12 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
 }
 
 fn publish_directories(path: &std::path::Path) -> std::io::Result<()> {
-    let mut published = PUBLISHED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if published.iter().any(|done| done == path) {
-        return Ok(());
-    }
     for dir in path.ancestors().skip(1) {
         if dir.as_os_str().is_empty() {
             break;
         }
         sync_directory(dir)?;
     }
-    published.push(path.to_path_buf());
     Ok(())
 }
 
@@ -344,6 +334,24 @@ mod tests {
             "the retry did not sync the directory"
         );
         assert!(fixture.target_rx.try_recv().is_ok());
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_log_is_published_again() {
+        // Astra review of herdr#84: after a successful append, the log is moved aside; the
+        // replacement's directory entry must be synced before input is sent.
+        let mut fixture = fixture();
+        send_text(&mut fixture, "first");
+        assert!(fixture.target_rx.try_recv().is_ok());
+        let aside = fixture.app.api_input_log.with_extension("aside");
+        std::fs::rename(&fixture.app.api_input_log, &aside).unwrap();
+        super::FAIL_DIRECTORY_SYNCS.set(1);
+        let response: ErrorResponse =
+            serde_json::from_str(&send_text(&mut fixture, "second")).expect("error");
+        assert_eq!(response.error.code, "input_log_unavailable");
+        assert!(fixture.target_rx.try_recv().is_err());
+        let _ = std::fs::remove_file(&aside);
         let _ = std::fs::remove_file(&fixture.app.api_input_log);
     }
 

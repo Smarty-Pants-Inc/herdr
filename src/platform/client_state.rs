@@ -57,22 +57,42 @@ pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::
     Ok(file)
 }
 
-/// Opens `path` for reading and appending as a log. It refuses anything but a regular file
-/// (a symlink included); the file inherits the per-user ACL of the state directory.
-#[cfg(not(unix))]
+/// Opens `path` for reading and appending as a private log. It refuses anything but a regular
+/// file (a symlink included), creates a missing file with a protected owner/SYSTEM DACL, and
+/// requires an existing file to be owned by this user, replacing its DACL with that one.
+#[cfg(windows)]
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        if !metadata.file_type().is_file() {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(std::io::Error::other("the log is not a regular file"));
         }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match super::windows::create_config_temporary(path, true) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
     }
+    super::windows::restrict_private_log_file(path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .create(true)
         .append(true)
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::other("the log is not a regular file"));
     }
     Ok(file)
+}
+
+/// Opens `path` for reading and appending. No private-file support on this platform.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(true)
+        .open(path)
 }

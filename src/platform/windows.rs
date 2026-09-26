@@ -216,6 +216,116 @@ pub(crate) fn create_config_temporary(
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
+/// Makes an existing log file private: it must be owned by the current user, and its DACL is
+/// replaced with a protected one granting only SYSTEM and the owner. Fails closed.
+pub(crate) fn restrict_private_log_file(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::security_descriptor::{
+        AsSecurityDescriptorExt as _, SecurityDescriptor,
+    };
+    use widestring::U16CString;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{
+            EqualSid, GetFileSecurityW, GetSecurityDescriptorOwner, GetTokenInformation,
+            SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let wide = extended_length_path(path)?;
+
+    // The file's owner.
+    let mut needed = 0u32;
+    unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // u64 elements keep the self-relative descriptor aligned.
+    let mut owner_descriptor = vec![0u64; (needed as usize).div_ceil(8)];
+    if unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            owner_descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut owner: PSID = null_mut();
+    let mut defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorOwner(
+            owner_descriptor.as_mut_ptr().cast(),
+            &mut owner,
+            &mut defaulted,
+        )
+    } == 0
+        || owner.is_null()
+    {
+        return Err(std::io::Error::other("the log has no owner"));
+    }
+
+    // The current user.
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut user_length = 0u32;
+    unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut user_length) };
+    let mut user_buffer = vec![0u64; (user_length as usize).div_ceil(8).max(1)];
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            user_buffer.as_mut_ptr().cast(),
+            user_length,
+            &mut user_length,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The buffer is 8-byte aligned and at least as large as TOKEN_USER.
+    let user = unsafe { &*(user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+    if unsafe { EqualSid(owner, user.User.Sid) } == 0 {
+        return Err(std::io::Error::other("the log is not owned by this user"));
+    }
+
+    let sddl =
+        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
+    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    descriptor.write_to_security_attributes(&mut attributes);
+    if unsafe {
+        SetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            attributes.lpSecurityDescriptor,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(crate) fn write_config_temporary(
     source: Option<&std::path::Path>,
     temporary: &std::path::Path,
