@@ -9,12 +9,18 @@ pub(crate) struct ForegroundPi {
 }
 
 /// The Pi processes in the pane's foreground job, each identified on its own, so a wrapper or
-/// sibling process in the same job is not taken for Pi.
-#[cfg(not(test))]
+/// sibling process in the same job is not taken for Pi. Tests can set the job through
+/// `test_support::set_foreground_pi`.
 fn foreground_pi(
-    _terminal_id: &crate::terminal::TerminalId,
+    terminal_id: &crate::terminal::TerminalId,
     runtime: &crate::terminal::TerminalRuntime,
 ) -> Option<ForegroundPi> {
+    #[cfg(test)]
+    if let Some(job) = test_support::foreground_pi(terminal_id) {
+        return Some(job);
+    }
+    #[cfg(not(test))]
+    let _ = terminal_id;
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
     let pi_processes: Vec<_> = job
         .processes
@@ -35,15 +41,6 @@ fn foreground_pi(
         })
         .collect();
     (!pi_processes.is_empty()).then_some(ForegroundPi { pi_processes })
-}
-
-/// Tests set the foreground job through [`test_support::set_foreground_pi`].
-#[cfg(test)]
-fn foreground_pi(
-    terminal_id: &crate::terminal::TerminalId,
-    _runtime: &crate::terminal::TerminalRuntime,
-) -> Option<ForegroundPi> {
-    test_support::foreground_pi(terminal_id)
 }
 
 impl App {
