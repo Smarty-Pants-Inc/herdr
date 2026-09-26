@@ -467,6 +467,9 @@ pub struct PaneReportAgentParams {
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
+    // Origin frame version the reporting agent reads, for example `v1` (smarty-dev#931).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

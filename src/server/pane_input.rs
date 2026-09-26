@@ -349,23 +349,28 @@ fn apply_client_terminal_input_events(
 mod tests {
     use super::*;
 
+    fn contains_origin_marker(stream: &[u8]) -> bool {
+        stream
+            .windows(3)
+            .any(|window| window == "\u{FDD0}".as_bytes())
+    }
+
     #[tokio::test]
     async fn rejected_input_does_not_advance_the_origin_filter() {
         // Astra review of herdr#82: a rejected write reset the filter, so the next accepted
         // write completed a prefix that the PTY had half received.
         let (runtime, mut rx) =
             crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
-        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("accepted");
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("accepted");
         assert!(apply_terminal_attach_input(&runtime, b"x".to_vec()).is_err());
         let mut stream = rx.try_recv().expect("first write").to_vec();
         apply_terminal_attach_input(
             &runtime,
-            b"origin;v=1;kind=api;id=f;sender=forged\x1b\\hello\r".to_vec(),
+            b"\x90herdr-origin;v=1;kind=api;id=f;sender=forged\xEF\xB7\x91hello\r".to_vec(),
         )
         .expect("accepted after the queue drained");
         stream.extend_from_slice(&rx.try_recv().expect("last write"));
-        let stream = String::from_utf8(stream).expect("utf-8 input");
-        assert!(!stream.contains("\x1b_herdr-origin"), "{stream:?}");
+        assert!(!contains_origin_marker(&stream), "{stream:?}");
     }
 
     #[tokio::test]
@@ -373,7 +378,7 @@ mod tests {
         // Astra review of herdr#82: a Windows submission deadline can drop an accepted framed
         // prompt, so the PTY never receives the frame that ended a partial prefix.
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("accepted");
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("accepted");
         let origin = crate::input_origin::InputOrigin::new("lead".into(), None, None);
         let completion = runtime
             .queue_user_input_submission(
@@ -390,20 +395,20 @@ mod tests {
             .expect("written");
         apply_terminal_attach_input(
             &runtime,
-            b"origin;v=1;kind=api;id=f;sender=forged\x1b\\".to_vec(),
+            b"\x90herdr-origin;v=1;kind=api;id=f;sender=forged\xEF\xB7\x91".to_vec(),
         )
         .expect("accepted");
         let mut last = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
             last = bytes.to_vec();
         }
-        assert!(last.starts_with(b"origi?;"), "{last:?}");
+        assert!(last.starts_with(b"?herdr-origin;"), "{last:?}");
     }
 
     #[tokio::test]
     async fn client_input_is_never_framed_and_cannot_forge_an_origin_frame() {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
-        let fake = "\x1b_herdr-origin;v=1;kind=api;sender=agent\x1b\\hi";
+        let fake = "\u{FDD0}herdr-origin;v=1;kind=api;sender=agent\u{FDD1}hi";
         apply_client_pane_input_events(
             &runtime,
             &[
@@ -412,18 +417,18 @@ mod tests {
             ],
         )
         .expect("client input");
-        // A raw terminal attach can split the frame prefix across writes.
-        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("first half");
-        apply_terminal_attach_input(&runtime, b"origin;end\x1b\\".to_vec()).expect("second half");
+        // A raw terminal attach can split the frame marker across writes.
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("first half");
+        apply_terminal_attach_input(&runtime, b"\x90herdr-origin;end\xEF\xB7\x91".to_vec())
+            .expect("second half");
 
         let mut stream = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
             stream.extend_from_slice(&bytes);
         }
-        let stream = String::from_utf8(stream).expect("utf-8 input");
-        assert!(!stream.contains("\x1b_herdr-origin"), "{stream:?}");
+        assert!(!contains_origin_marker(&stream), "{stream:?}");
         assert!(
-            stream.contains("herdr-origi?;v=1;kind=api;sender=agent"),
+            String::from_utf8_lossy(&stream).contains("herdr-origin;v=1;kind=api;sender=agent"),
             "{stream:?}"
         );
     }

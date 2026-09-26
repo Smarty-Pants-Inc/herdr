@@ -656,15 +656,17 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 ## 入力元フレーム
 
-`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` が、Pi が herdr の Pi インテグレーション経由で状態を報告し、かつ Pi がフォアグラウンドプロセスであるペインに書き込むとき、herdr はバイト列を入力元フレームで囲みます。これにより Pi は送信された入力と打鍵された入力を区別できます。
+`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` が、入力元フレームを読める Pi のペインに書き込むとき、herdr はバイト列を入力元フレームで囲みます。これにより Pi は送信された入力と打鍵された入力を区別できます。
 
 ```text
-ESC _ herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] ESC \
+U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] U+FDD1
 <input bytes>
-ESC _ herdr-origin;end;id=<id> ESC \
+U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
-`sender` は呼び出し元ペインのエージェント名、なければペイン ID、なければ `pid:<n>`、なければ `unknown` です。herdr はこれをリクエスト本文ではなくソケットのピアプロセスから決めます。値はパーセントエンコードされます。ほかのプログラムには生のバイト列が届きます。herdr はキーボード入力、ペースト、フレーム内のペイロードを含むほかのすべての入力に含まれる `ESC _ herdr-origin` 接頭辞の最後のバイトを `?` に置き換えるため、フレームを出せるのは herdr だけです。
+マーカーは Unicode の非文字 `U+FDD0` と `U+FDD1` です。ペインにフレームが送られるのは、その Pi が herdr の Pi インテグレーション（ソース `herdr:pi` の `pane.report_agent`）で `input_origin: "v1"` を報告し、かつ Pi がフォアグラウンドプロセスである間だけです。ほかのプログラムや、これを報告しない Pi には生のバイト列が届きます。
+
+`sender` は呼び出し元ペインのエージェント名、なければペイン ID、なければ `pid:<n>`、なければ `unknown` です。herdr はこれをリクエスト本文ではなくソケットのピアプロセスから決めます。値はパーセントエンコードされます。herdr はキーボード入力、ペースト、フレーム内のペイロードを含むほかのすべての入力に含まれる `U+FDD0` の最後のバイトを `?` に置き換えるため、フレームを始められるのは herdr だけです。
 
 ## ペインの読み取り
 

@@ -161,6 +161,8 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
+    /// The last report from herdr's Pi integration said this Pi reads origin frames.
+    input_origin_frames: bool,
 }
 
 impl TerminalState {
@@ -200,6 +202,7 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
+            input_origin_frames: false,
         }
     }
 
@@ -2025,17 +2028,24 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
-    /// Whether Pi reports through herdr's own Pi integration. Only that Pi reads origin
-    /// frames (smarty-dev#931); a program that is merely named `pi` does not.
-    pub fn herdr_pi_integration_active(&self) -> bool {
-        self.hook_authority.as_ref().is_some_and(|authority| {
-            authority.source == "herdr:pi"
-                && authority.agent_label == "pi"
-                && self.hook_authority_is_effective(authority)
-        })
+    /// Whether this terminal's Pi reads origin frames (smarty-dev#931): it reports through
+    /// herdr's own Pi integration, and its last report said it reads them. Older Pi and a
+    /// program that is merely named `pi` do not.
+    pub fn reads_input_origin_frames(&self) -> bool {
+        self.input_origin_frames
+            && self.hook_authority.as_ref().is_some_and(|authority| {
+                authority.source == "herdr:pi"
+                    && authority.agent_label == "pi"
+                    && self.hook_authority_is_effective(authority)
+            })
     }
 
-    /// Makes this terminal a Pi that reports through herdr's Pi integration.
+    pub fn set_input_origin_frames(&mut self, enabled: bool) {
+        self.input_origin_frames = enabled;
+    }
+
+    /// Makes this terminal a Pi that reads origin frames and reports through herdr's Pi
+    /// integration.
     #[cfg(test)]
     pub fn test_activate_herdr_pi_integration(&mut self) {
         self.set_detected_state(Some(Agent::Pi), self.fallback_state);
@@ -2046,7 +2056,8 @@ impl TerminalState {
                 .expect("valid session id"),
         });
         self.set_hook_authority("herdr:pi".into(), "pi".into(), AgentState::Idle, None, None);
-        assert!(self.herdr_pi_integration_active());
+        self.set_input_origin_frames(true);
+        assert!(self.reads_input_origin_frames());
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {

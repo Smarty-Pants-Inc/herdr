@@ -3483,14 +3483,15 @@ impl PaneRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.io.try_send_bytes(Bytes::from(origin.wrap(bytes)))?;
-        // The frame ends with ST. Keep the earlier states too: extra states only break more.
+        // The frame ends with a complete marker. Keep the earlier states too: extra states only
+        // break more.
         filter.merge_frame();
         Ok(())
     }
 
     /// Queues text and a delayed Enter. With an origin, each part is framed. Without one, the
     /// text continues the unframed stream and the Enter is filtered on its own: an Enter key
-    /// encoding contains no `ESC _`, so where it lands it can only break a prefix. The actor
+    /// encoding contains no frame marker byte, so where it lands it can only break one. The actor
     /// can still drop an accepted submission at its deadline, so the filter keeps the states
     /// of both outcomes.
     pub fn queue_user_input_submission(

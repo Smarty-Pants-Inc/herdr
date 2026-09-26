@@ -134,7 +134,17 @@ function reportSession(sessionStartSource?: string): Promise<void> {
   });
 }
 
+// Pi's TUI sets this in its own process when it reads herdr origin frames. A global, not an
+// environment variable, so child processes do not inherit the claim.
+const inputOriginKey = Symbol.for("pi.herdrInputOrigin");
+
+function inputOrigin(): string | undefined {
+  const value = (globalThis as Record<symbol, unknown>)[inputOriginKey];
+  return value === "v1" ? value : undefined;
+}
+
 function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
+  const origin = inputOrigin();
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
@@ -145,6 +155,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
       state,
       message,
       seq,
+      ...(origin ? { input_origin: origin } : {}),
     }),
   });
 }

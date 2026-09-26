@@ -7346,6 +7346,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 seq: Some(seq as u64 + 1),
                 agent_session_id: None,
                 agent_session_path: None,
+                input_origin: None,
             }),
         );
     }
@@ -7421,6 +7422,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 seq: Some(12),
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
+                input_origin: None,
             };
             completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
             let terminal = &server.app.state.terminals[&terminal_id];
@@ -7612,6 +7614,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 seq: Some(19),
                 agent_session_id: None,
                 agent_session_path: None,
+                input_origin: None,
             }),
         },
         respond_to,
