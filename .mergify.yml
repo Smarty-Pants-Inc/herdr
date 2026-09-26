@@ -3,6 +3,9 @@ merge_queue:
   max_parallel_checks: 2
   reset_on_external_merge: always
 
+# smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
+# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
+# titles keep a PR out.
 queue_rules:
   - name: default
     batch_size: 1
@@ -11,12 +14,14 @@ queue_rules:
     queue_conditions:
       - base ~= ^(master|smarty-preview-source)$
       - -draft
-      - check-success = smarty-review
+      - -label = hold
+      - -title ~= (?i)do not land
       - check-success = review/astra
-      - check-success = smarty-land-ready
       - check-success = smarty-ci
+      - -check-failure = smarty-ci
     merge_conditions:
       - check-success = smarty-ci
+      - -check-failure = smarty-ci
 
 # The fleet's write App bot may queue (smarty-dev#735, #736): GitHub reports App bots as permission
 # none, so the default `sender-permission >= write` restriction refused its queue commands.
