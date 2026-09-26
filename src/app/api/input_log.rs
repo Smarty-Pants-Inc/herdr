@@ -85,14 +85,55 @@ impl App {
     }
 }
 
-/// Appends `line` and a newline in one write, then syncs the data.
+/// Appends `line` as one JSONL record and makes it durable before returning.
+///
+/// An exclusive file lock serializes writers, including other Herdr processes that share the
+/// state directory. If an earlier write left a partial record (a short write before an error),
+/// the record starts on a new line, so every accepted record stays separately parseable; the
+/// fragment is a malformed line that readers skip. When this call creates the log file or its
+/// directories, their directory entries are synced too.
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut created_dirs = Vec::new();
     if let Some(parent) = path.parent() {
+        let mut dir = Some(parent);
+        while let Some(current) = dir.filter(|current| !current.as_os_str().is_empty()) {
+            if current.exists() {
+                break;
+            }
+            created_dirs.push(current.to_path_buf());
+            dir = current.parent();
+        }
         std::fs::create_dir_all(parent)?;
     }
+    let created_file = !path.exists();
     let mut file = crate::platform::open_private_append_file(path)?;
-    file.write_all(format!("{line}\n").as_bytes())?;
-    file.sync_data()
+    file.lock()?;
+    let mut record = Vec::with_capacity(line.len() + 2);
+    if file.metadata()?.len() > 0 {
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            record.push(b'\n');
+        }
+    }
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    file.write_all(&record)?;
+    file.sync_data()?;
+    if created_file {
+        if let Some(parent) = path.parent() {
+            crate::platform::sync_parent_directory(parent)?;
+        }
+    }
+    // Deepest first: each created directory's entry lives in its parent.
+    for dir in &created_dirs {
+        if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            crate::platform::sync_parent_directory(parent)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +274,32 @@ mod tests {
         assert!(lines[0]["caller"]["pid"].is_null());
         assert!(lines[0]["caller"]["pane"].is_null());
         let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    #[tokio::test]
+    async fn a_partial_record_does_not_swallow_the_next_one() {
+        // Astra review of herdr#84: a short write left a record without its newline.
+        let mut fixture = fixture();
+        std::fs::write(&fixture.app.api_input_log, b"{\"ts_ms\":1,\"meth").unwrap();
+        send_text(&mut fixture, "x");
+        let raw = std::fs::read_to_string(&fixture.app.api_input_log).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "{raw:?}");
+        assert!(serde_json::from_str::<serde_json::Value>(lines[0]).is_err());
+        let record: serde_json::Value = serde_json::from_str(lines[1]).expect("record");
+        assert_eq!(record["method"], "pane.send_text");
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    #[tokio::test]
+    async fn the_first_record_creates_the_log_directory() {
+        let mut fixture = fixture();
+        let dir = fixture.app.api_input_log.with_extension("dir");
+        fixture.app.api_input_log = dir.join("nested").join("api-input.jsonl");
+        send_text(&mut fixture, "x");
+        assert_eq!(log_lines(&fixture.app).len(), 1);
+        assert!(fixture.target_rx.try_recv().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
