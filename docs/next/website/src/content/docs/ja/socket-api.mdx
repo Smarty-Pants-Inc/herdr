@@ -654,6 +654,12 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 ライフサイクルイベントには `events.subscribe` を使ってください。ワンショットの wait がサポートされる場合、専用の wait ヘルパーが別途ドキュメント化されます。
 
+## API 入力ログ
+
+`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` がペインに書き込む前に、herdr は状態ディレクトリの `api-input.jsonl`（例: `~/.local/state/herdr/api-input.jsonl`。所有者だけが読めるファイル）に JSON を 1 行追記します。行には時刻（`ts_ms`）、メソッド、対象のペインとターミナル、バイト数、そしてソケットのピアプロセスから herdr が知る呼び出し元（pid、ペイン、エージェント名、エージェントセッション）が入ります。テキストは記録しません。herdr がこの行を書けない場合、入力は `input_log_unavailable` で拒否されます。
+
+これにより、エージェントのセッションを読む側は、ターミナルのバイト列に何も加えずに、API がペインに送ったターンと打鍵されたターンを区別できます。
+
 ## ペインの読み取り
 
 プロトコルクライアントを書いているのでなければ、CLI 経由で `pane.read` を使ってください。
