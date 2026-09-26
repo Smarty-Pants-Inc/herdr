@@ -12,7 +12,7 @@
 //! ```
 //!
 //! When Herdr admits a Pi's claim to read frames, it sends that Pi
-//! `U+FDD0 herdr-origin;ready;v=1 U+FDD1`. Until then the Pi cannot know that unframed input
+//! `U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1`. Until then the Pi cannot know that unframed input
 //! is typed, so it does not record it as keyboard input.
 //!
 //! The markers are Unicode noncharacters. A UTF-8 reader gets `U+FDD0` whole, so it knows a
@@ -91,10 +91,17 @@ impl InputOrigin {
     }
 }
 
-/// Tells the receiving Pi that Herdr frames its API input from now on, so it may record
-/// unframed input as typed. Sent when Herdr admits the Pi's claim.
-pub(crate) fn ready_frame() -> Vec<u8> {
-    [FRAME_PREFIX, FRAME_TAG, b"ready;v=1", FRAME_HEADER_END].concat()
+/// Tells the Pi process `pid` that Herdr frames its API input from now on, so it may record
+/// unframed input as typed. Sent when Herdr admits that process's claim; another process that
+/// reads the frame ignores it.
+pub(crate) fn ready_frame(pid: u32) -> Vec<u8> {
+    [
+        FRAME_PREFIX,
+        FRAME_TAG,
+        format!("ready;v=1;pid={pid}").as_bytes(),
+        FRAME_HEADER_END,
+    ]
+    .concat()
 }
 
 fn next_frame_id() -> String {

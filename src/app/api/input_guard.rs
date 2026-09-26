@@ -458,7 +458,7 @@ mod tests {
         assert_ok(&response);
         loop {
             let bytes = fixture.target_rx.try_recv().expect("sent bytes");
-            if bytes.as_ref() != crate::input_origin::ready_frame().as_slice() {
+            if !bytes.starts_with("\u{FDD0}herdr-origin;ready;".as_bytes()) {
                 return bytes;
             }
         }
@@ -526,7 +526,7 @@ mod tests {
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert_eq!(
             fixture.target_rx.try_recv().expect("ready frame"),
-            Bytes::from(crate::input_origin::ready_frame())
+            Bytes::from(crate::input_origin::ready_frame(TARGET_PI_PROCESS))
         );
         // A repeated report sends it once.
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
@@ -551,7 +551,7 @@ mod tests {
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert_eq!(
             fixture.target_rx.try_recv().expect("ready frame"),
-            Bytes::from(crate::input_origin::ready_frame())
+            Bytes::from(crate::input_origin::ready_frame(TARGET_PI_PROCESS))
         );
     }
 

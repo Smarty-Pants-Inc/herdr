@@ -288,7 +288,7 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return;
         };
-        match runtime.try_send_origin_ready() {
+        match runtime.try_send_origin_ready(claim.pid) {
             Ok(()) => {
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.mark_input_origin_ready_sent(claim);
