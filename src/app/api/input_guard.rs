@@ -13,15 +13,18 @@ impl App {
     ) -> Option<String> {
         // Missing attribution retains the normal compatibility path.
         let peer_pid = context.local_peer_pid?;
+        // Decide from the method first: attribution walks every agent pane's session in
+        // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
+        // Only a content write that does not allow cross-pane input needs it.
+        if Self::allows_cross_pane(&request.method) {
+            return None;
+        }
+        let target = self.content_write_target(&request.method)?;
         let Some(source) = self.agent_terminal_target_for_peer_pid(peer_pid) else {
             // PID attribution, managed runtime state, and session membership are all
             // best-effort. Unknown, non-agent, and out-of-pane callers fail open.
             return None;
         };
-        if Self::allows_cross_pane(&request.method) {
-            return None;
-        }
-        let target = self.content_write_target(&request.method)?;
         if source.terminal_id == target.terminal_id {
             return None;
         }
