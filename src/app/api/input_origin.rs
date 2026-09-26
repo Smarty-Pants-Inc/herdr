@@ -32,35 +32,6 @@ fn foreground_pi(
     test_support::foreground_pi(terminal_id)
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::ForegroundPi;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    thread_local! {
-        static JOBS: RefCell<HashMap<String, ForegroundPi>> = RefCell::new(HashMap::new());
-    }
-
-    /// Makes `terminal_id`'s foreground job a Pi job in tests.
-    pub(crate) fn set_foreground_pi(
-        terminal_id: &crate::terminal::TerminalId,
-        job: Option<ForegroundPi>,
-    ) {
-        JOBS.with(|jobs| {
-            let mut jobs = jobs.borrow_mut();
-            match job {
-                Some(job) => jobs.insert(terminal_id.to_string(), job),
-                None => jobs.remove(&terminal_id.to_string()),
-            };
-        });
-    }
-
-    pub(super) fn foreground_pi(terminal_id: &crate::terminal::TerminalId) -> Option<ForegroundPi> {
-        JOBS.with(|jobs| jobs.borrow().get(&terminal_id.to_string()).cloned())
-    }
-}
-
 impl App {
     /// The origin frame for an API write to this pane, or `None` to write raw bytes.
     ///
@@ -149,5 +120,34 @@ pub(super) fn send_api_bytes(
     match origin {
         Some(origin) => runtime.try_send_framed(origin, &input),
         None => runtime.try_send_bytes(bytes::Bytes::from(input)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ForegroundPi;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static JOBS: RefCell<HashMap<String, ForegroundPi>> = RefCell::new(HashMap::new());
+    }
+
+    /// Makes `terminal_id`'s foreground job a Pi job in tests.
+    pub(crate) fn set_foreground_pi(
+        terminal_id: &crate::terminal::TerminalId,
+        job: Option<ForegroundPi>,
+    ) {
+        JOBS.with(|jobs| {
+            let mut jobs = jobs.borrow_mut();
+            match job {
+                Some(job) => jobs.insert(terminal_id.to_string(), job),
+                None => jobs.remove(&terminal_id.to_string()),
+            };
+        });
+    }
+
+    pub(super) fn foreground_pi(terminal_id: &crate::terminal::TerminalId) -> Option<ForegroundPi> {
+        JOBS.with(|jobs| jobs.borrow().get(&terminal_id.to_string()).cloned())
     }
 }
