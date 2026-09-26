@@ -17,6 +17,14 @@ queue_rules:
       - -label = hold
       - -title ~= (?i)do not land
       - check-success = review/astra
+      # A PR that needs a named security pass waits for review/security, which herdr-security-astra posts on
+      # the exact head (smarty-dev#806, #855); so does an upstream sync (smarty-dev#755).
+      - or:
+          - -label = needs-security-pass
+          - check-success = review/security
+      - or:
+          - -head ~= ^sync/upstream-
+          - check-success = review/security
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
@@ -27,6 +35,12 @@ queue_rules:
 # none, so the default `sender-permission >= write` restriction refused its queue commands.
 commands_restrictions:
   queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+  # The stuck-work check's R4 posts `@mergifyio refresh` as the write App (smarty-dev#868, #983).
+  refresh:
     conditions:
       - or:
           - sender-permission >= write
