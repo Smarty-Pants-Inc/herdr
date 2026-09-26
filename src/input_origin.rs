@@ -27,6 +27,14 @@ const FRAME_PREFIX: &[u8] = "\u{FDD0}".as_bytes();
 const FRAME_HEADER_END: &[u8] = "\u{FDD1}".as_bytes();
 const FRAME_TAG: &[u8] = b"herdr-origin;";
 
+/// A Pi process that claimed, as the socket peer of its own report, to read origin frames.
+/// The start time makes it one process generation, so a recycled pid is not the same claimant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InputOriginClaim {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
 /// The API caller that a framed write comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputOrigin {

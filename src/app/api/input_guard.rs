@@ -90,6 +90,19 @@ mod tests {
     /// In these tests the target pane's foreground job has a wrapper (not Pi) and a Pi process.
     const TARGET_WRAPPER_PROCESS: u32 = 7000;
     const TARGET_PI_PROCESS: u32 = 7001;
+    const TARGET_PI: crate::input_origin::InputOriginClaim =
+        crate::input_origin::InputOriginClaim {
+            pid: TARGET_PI_PROCESS,
+            start_time: 100,
+        };
+
+    fn foreground_pis(
+        pis: &[crate::input_origin::InputOriginClaim],
+    ) -> Option<crate::app::api::input_origin::ForegroundPi> {
+        Some(crate::app::api::input_origin::ForegroundPi {
+            pi_processes: pis.to_vec(),
+        })
+    }
 
     fn attributed_agent_fixture() -> Fixture {
         let mut fixture = unclaimed_fixture();
@@ -99,7 +112,7 @@ mod tests {
             .terminals
             .get_mut(&fixture.target_terminal_id)
             .expect("target state")
-            .set_input_origin_claim(TARGET_PI_PROCESS);
+            .set_input_origin_claim(TARGET_PI);
         fixture
     }
 
@@ -146,9 +159,7 @@ mod tests {
         target_terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &target_terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi {
-                pi_pids: vec![TARGET_PI_PROCESS],
-            }),
+            foreground_pis(&[TARGET_PI]),
         );
 
         let (source_runtime, source_rx) =
@@ -519,15 +530,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recycled_pid_does_not_inherit_the_claim() {
+        // Astra review of herdr#82: a later Pi that reuses the claimant's pid.
+        let mut fixture = attributed_agent_fixture();
+        let recycled = crate::input_origin::InputOriginClaim {
+            pid: TARGET_PI_PROCESS,
+            start_time: TARGET_PI.start_time + 1,
+        };
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            foreground_pis(&[recycled]),
+        );
+        assert!(!is_framed(&send_text(&mut fixture, "x")));
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+    }
+
+    #[tokio::test]
     async fn late_detection_of_a_restart_keeps_the_new_pis_claim() {
         // Astra review of herdr#82: Pi A exits, Pi B claims before the detector reports it,
         // then the detector reports A's exit and B's start.
         let mut fixture = attributed_agent_fixture();
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &fixture.target_terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi {
-                pi_pids: vec![8000],
-            }),
+            foreground_pis(&[crate::input_origin::InputOriginClaim {
+                pid: 8000,
+                start_time: 200,
+            }]),
         );
         report_pi(&mut fixture, Some("v1"), Some(8000));
         let terminal = fixture
@@ -555,12 +584,12 @@ mod tests {
     async fn a_new_pi_process_in_the_same_job_does_not_inherit_the_claim() {
         // Security pass on herdr#82: `sh -c 'pi-new; pi-old'` keeps one process group.
         let mut fixture = attributed_agent_fixture();
-        let replacement = crate::app::api::input_origin::ForegroundPi {
-            pi_pids: vec![8000],
-        };
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &fixture.target_terminal_id,
-            Some(replacement),
+            foreground_pis(&[crate::input_origin::InputOriginClaim {
+                pid: 8000,
+                start_time: 200,
+            }]),
         );
         assert!(!is_framed(&send_text(&mut fixture, "x")));
         report_pi(&mut fixture, Some("v1"), Some(8000));

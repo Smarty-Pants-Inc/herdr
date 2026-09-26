@@ -1848,7 +1848,11 @@ mod tests {
                 Arc::new(RenderSignal::new()),
             );
             let terminal = terminals.values_mut().next().unwrap();
-            terminal.set_input_origin_claim(4242);
+            let claim = crate::input_origin::InputOriginClaim {
+                pid: 4242,
+                start_time: 7,
+            };
+            terminal.set_input_origin_claim(claim);
             let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
             let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
             let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
@@ -1885,7 +1889,7 @@ mod tests {
             )
             .unwrap();
             let terminal = restored_terminals.values().next().unwrap();
-            assert_eq!(terminal.input_origin_claim(), Some(4242));
+            assert_eq!(terminal.input_origin_claim(), Some(claim));
             let mut filter = restored_runtimes
                 .values()
                 .next()

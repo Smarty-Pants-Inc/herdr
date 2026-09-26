@@ -558,12 +558,16 @@ mod tests {
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
-        terminal.set_input_origin_claim(7000);
+        let pi = crate::input_origin::InputOriginClaim {
+            pid: 7000,
+            start_time: 1,
+        };
+        terminal.set_input_origin_claim(pi);
         terminal.set_agent_name("reviewer".into());
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &terminal_id,
             Some(crate::app::api::input_origin::ForegroundPi {
-                pi_pids: vec![7000],
+                pi_processes: vec![pi],
             }),
         );
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);

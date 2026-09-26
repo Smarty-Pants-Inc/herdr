@@ -163,9 +163,9 @@ pub struct TerminalState {
     pub restore_error: Option<String>,
     /// The Pi process that claimed, as the socket peer of its own report, to read origin frames
     /// (smarty-dev#931). Frames go to the pane only while that process is a Pi in its foreground
-    /// job. The pid is the process identity: detection events do not clear it, because they can
-    /// arrive after a newer Pi has already claimed.
-    input_origin_claim: Option<u32>,
+    /// job. The pid and start time are the process identity: detection events do not clear it,
+    /// because they can arrive after a newer Pi has already claimed.
+    input_origin_claim: Option<crate::input_origin::InputOriginClaim>,
 }
 
 impl TerminalState {
@@ -2031,14 +2031,14 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
-    pub fn input_origin_claim(&self) -> Option<u32> {
+    pub(crate) fn input_origin_claim(&self) -> Option<crate::input_origin::InputOriginClaim> {
         self.input_origin_claim
     }
 
-    /// Records a claim that the caller verified: `pid` is a Pi process in the pane's
-    /// foreground job and sent the claim itself.
-    pub fn set_input_origin_claim(&mut self, pid: u32) {
-        self.input_origin_claim = Some(pid);
+    /// Records a claim that the caller verified: the process is a Pi in the pane's foreground
+    /// job and sent the claim itself.
+    pub(crate) fn set_input_origin_claim(&mut self, claim: crate::input_origin::InputOriginClaim) {
+        self.input_origin_claim = Some(claim);
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {

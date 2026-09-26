@@ -680,6 +680,15 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     (tpgid > 0).then_some(tpgid as u32)
 }
 
+/// When the process started, in clock ticks since boot. With the pid it names one process
+/// generation: a recycled pid has a later start time.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    // After (comm): state(0) ... starttime(19)
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)

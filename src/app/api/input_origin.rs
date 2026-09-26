@@ -2,10 +2,10 @@ use crate::api::ApiRequestContext;
 use crate::app::App;
 use crate::input_origin::InputOrigin;
 
-/// The Pi processes in a pane's foreground job.
+/// The Pi processes in a pane's foreground job, each with its start time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForegroundPi {
-    pub pi_pids: Vec<u32>,
+    pub pi_processes: Vec<crate::input_origin::InputOriginClaim>,
 }
 
 /// The Pi processes in the pane's foreground job, each identified on its own, so a wrapper or
@@ -16,7 +16,7 @@ fn foreground_pi(
     runtime: &crate::terminal::TerminalRuntime,
 ) -> Option<ForegroundPi> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
-    let pi_pids: Vec<u32> = job
+    let pi_processes: Vec<_> = job
         .processes
         .iter()
         .filter(|process| {
@@ -27,9 +27,14 @@ fn foreground_pi(
             crate::detect::identify_agent_in_job(&alone)
                 .is_some_and(|(agent, _)| agent == crate::detect::Agent::Pi)
         })
-        .map(|process| process.pid)
+        .filter_map(|process| {
+            Some(crate::input_origin::InputOriginClaim {
+                pid: process.pid,
+                start_time: crate::platform::process_start_time(process.pid)?,
+            })
+        })
         .collect();
-    (!pi_pids.is_empty()).then_some(ForegroundPi { pi_pids })
+    (!pi_processes.is_empty()).then_some(ForegroundPi { pi_processes })
 }
 
 /// Tests set the foreground job through [`test_support::set_foreground_pi`].
@@ -44,8 +49,8 @@ fn foreground_pi(
 impl App {
     /// The origin frame for an API write to this pane, or `None` to write raw bytes.
     ///
-    /// A pane gets frames only while the Pi process that claimed to read them is a Pi in its
-    /// foreground job. Every other program, including an older Pi, a later Pi process in the
+    /// A pane gets frames only while the Pi process that claimed to read them (same pid and
+    /// start time) is a Pi in its foreground job. Every other program, including an older Pi, a later Pi process in the
     /// same pane or job, and one that is only named `pi`, gets the raw bytes as before.
     pub(super) fn api_input_origin(
         &self,
@@ -61,7 +66,7 @@ impl App {
             .get(terminal_id)?
             .input_origin_claim()?;
         if !foreground_pi(terminal_id, runtime)?
-            .pi_pids
+            .pi_processes
             .contains(&claim)
         {
             return None;
@@ -92,11 +97,15 @@ impl App {
         let Some(pi) = foreground_pi(&terminal_id, runtime) else {
             return;
         };
-        if !pi.pi_pids.contains(&peer_pid) {
+        let Some(claim) = pi
+            .pi_processes
+            .into_iter()
+            .find(|process| process.pid == peer_pid)
+        else {
             return;
-        }
+        };
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.set_input_origin_claim(peer_pid);
+            terminal.set_input_origin_claim(claim);
         }
     }
 
