@@ -61,6 +61,8 @@ pub enum ProcessStart {
 }
 
 /// The terminal on a process's standard input (see `process_stdin_terminal`).
+// Windows cannot read another process's stdin, so it only returns `Unknown`.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinTerminal {
     /// A terminal, by device number.
