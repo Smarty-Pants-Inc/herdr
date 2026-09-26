@@ -95,7 +95,7 @@ impl App {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
-        match self.queue_agent_prompt(request.id, params) {
+        match self.queue_agent_prompt(request.id, params, context) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -120,6 +120,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
+        context: crate::api::ApiRequestContext,
     ) -> Result<
         (
             String,
@@ -180,6 +181,15 @@ impl App {
                 ),
             ));
         }
+        // Before any write to the pane, including the Copilot focus event.
+        self.log_api_input(
+            &id,
+            "agent.prompt",
+            resolved.ws_idx,
+            resolved.pane_id,
+            context,
+            params.text.len(),
+        )?;
         #[cfg(windows)]
         let submit_deadline = params
             .wait
@@ -339,6 +349,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentSendKeysParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
@@ -373,6 +384,16 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        if let Err(response) = self.log_api_input(
+            &id,
+            "agent.send_keys",
+            resolved.ws_idx,
+            resolved.pane_id,
+            context,
+            bytes.len(),
+        ) {
+            return response;
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
@@ -721,6 +742,7 @@ mod tests {
                 keys: vec!["enter".into(), "not-a-key".into()],
                 allow_cross_pane: false,
             },
+            Default::default(),
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "invalid_key");
@@ -733,6 +755,7 @@ mod tests {
                 keys: vec!["up".into(), "enter".into()],
                 allow_cross_pane: false,
             },
+            Default::default(),
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));

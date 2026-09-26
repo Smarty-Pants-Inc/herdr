@@ -30,3 +30,23 @@ pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     // replace_file uses MOVEFILE_WRITE_THROUGH on Windows.
     Ok(())
 }
+
+/// Opens `path` for appending, creating it readable and writable by the owner only.
+#[cfg(unix)]
+pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Opens `path` for appending. The file inherits the per-user ACL of the state directory.
+#[cfg(not(unix))]
+pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
