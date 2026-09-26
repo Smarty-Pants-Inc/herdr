@@ -11,6 +11,10 @@ queue_rules:
     batch_size: 1
     checks_timeout: 30 min
     merge_method: merge
+    # The push check (scripts/conventional_commits.py) reads every new subject on master, the merge commit's
+    # too; the PR title passed the same check on the PR, so it becomes the merge subject (smarty-dev#931).
+    commit_message_template: |
+      {{ title }} (#{{ number }})
     queue_conditions:
       - base ~= ^(master|smarty-preview-source)$
       - -draft
