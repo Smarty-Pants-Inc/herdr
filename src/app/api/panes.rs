@@ -1548,7 +1548,7 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
@@ -1557,12 +1557,8 @@ impl App {
         // Only herdr's Pi integration reports this; the frame gate also checks its authority.
         let input_origin_frames =
             params.source == "herdr:pi" && params.input_origin.as_deref() == Some("v1");
-        if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
-            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                terminal.set_input_origin_frames(input_origin_frames);
-            }
-        }
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
+            input_origin_frames,
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
                 &params.source,

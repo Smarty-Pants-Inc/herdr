@@ -2055,7 +2055,14 @@ impl TerminalState {
             session_ref: crate::agent_resume::AgentSessionRef::id("test-pi-session")
                 .expect("valid session id"),
         });
-        self.set_hook_authority("herdr:pi".into(), "pi".into(), AgentState::Idle, None, None);
+        self.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            crate::agent_resume::AgentSessionRef::id("test-pi-session"),
+            None,
+        );
         self.set_input_origin_frames(true);
         assert!(self.reads_input_origin_frames());
     }

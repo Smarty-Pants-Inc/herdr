@@ -5687,6 +5687,7 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
             message: None,
             seq: None,
             session_ref: None,
+            input_origin_frames: false,
         })
     );
     assert!(
