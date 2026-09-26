@@ -60,6 +60,17 @@ pub enum ProcessStart {
     Unknown,
 }
 
+/// The terminal on a process's standard input (see `process_stdin_terminal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinTerminal {
+    /// A terminal, by device number.
+    Terminal(u64),
+    /// Not a terminal (a pipe, a file, or closed).
+    NotTerminal,
+    /// It could not be read.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundJob {
     pub process_group_id: u32,

@@ -97,11 +97,16 @@ fn foreground_pi(
         };
     };
     // The pane's terminal, as the pane's first process has it on standard input.
-    let pane_terminal = crate::platform::process_stdin_path(child_pid);
+    let pane_terminal = crate::platform::process_stdin_terminal(child_pid);
     let pi_processes = job
         .processes
         .iter()
-        .filter(|process| reads_pane_terminal(process.pid, pane_terminal.as_deref()))
+        .filter(|process| {
+            reads_pane_terminal(
+                pane_terminal,
+                crate::platform::process_stdin_terminal(process.pid),
+            )
+        })
         .filter(|process| {
             let alone = crate::platform::ForegroundJob {
                 process_group_id: process.pid,
@@ -125,20 +130,26 @@ fn foreground_pi(
     ForegroundPi { pi_processes }
 }
 
-/// Whether `pid` has the pane's terminal as its standard input. A helper that Pi starts with
-/// piped input is then not a candidate reader. Where the platform cannot tell (Windows), every
-/// candidate passes.
+/// Whether a process with `stdin` on standard input may read the pane whose first process has
+/// `pane`. A process on a pipe or on another terminal cannot, so a helper that Pi starts with
+/// piped input is not a candidate. When either side cannot be read (and on Windows, which
+/// cannot tell), the candidate passes: refusing a genuine reader's claim would send it raw
+/// input, which it would record as typed.
 ///
 /// ponytail: this narrows who can claim; it does not prove that the process reads the
-/// terminal. A same-job process that inherits the terminal can still claim. A challenge sent
-/// through the terminal would prove it, at the cost of Pi changes (smarty-dev#931).
-fn reads_pane_terminal(pid: u32, pane_terminal: Option<&std::path::Path>) -> bool {
-    if cfg!(windows) {
-        return true;
-    }
-    match (pane_terminal, crate::platform::process_stdin_path(pid)) {
-        (Some(pane), Some(stdin)) => pane == stdin,
-        _ => false,
+/// terminal. A same-job process on the terminal that is named like Pi can still claim while no
+/// claimant reads; the effect is frame text in an unsupported reader's input, not a false
+/// attribution (P3 by scope, smarty-dev#931). A challenge sent through the terminal would prove
+/// the reader; revisit it if that frame text is seen in real use.
+pub(crate) fn reads_pane_terminal(
+    pane: crate::platform::StdinTerminal,
+    stdin: crate::platform::StdinTerminal,
+) -> bool {
+    use crate::platform::StdinTerminal;
+    match (pane, stdin) {
+        (_, StdinTerminal::NotTerminal) => false,
+        (StdinTerminal::Terminal(pane), StdinTerminal::Terminal(stdin)) => pane == stdin,
+        _ => true,
     }
 }
 
@@ -406,16 +417,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn only_a_process_on_the_pane_terminal_is_a_candidate_reader() {
-        let own = std::process::id();
-        let stdin = crate::platform::process_stdin_path(own).expect("own stdin");
-        assert!(super::reads_pane_terminal(own, Some(&stdin)));
-        assert!(!super::reads_pane_terminal(
-            own,
-            Some(std::path::Path::new("/dev/pts/does-not-exist"))
-        ));
-        assert!(!super::reads_pane_terminal(own, None));
+        use crate::platform::StdinTerminal::{NotTerminal, Terminal, Unknown};
+        assert!(super::reads_pane_terminal(Terminal(1), Terminal(1)));
+        assert!(!super::reads_pane_terminal(Terminal(1), Terminal(2)));
+        // A piped helper.
+        assert!(!super::reads_pane_terminal(Terminal(1), NotTerminal));
+        // Unreadable either side: a genuine reader must not lose its claim.
+        assert!(super::reads_pane_terminal(Unknown, Terminal(1)));
+        assert!(super::reads_pane_terminal(Terminal(1), Unknown));
     }
 
     #[test]

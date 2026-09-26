@@ -211,8 +211,9 @@ pub fn process_start(_pid: u32) -> super::ProcessStart {
     super::ProcessStart::Unknown
 }
 
-pub fn process_stdin_path(_pid: u32) -> Option<std::path::PathBuf> {
-    None
+/// Not available on this platform.
+pub fn process_stdin_terminal(_pid: u32) -> super::StdinTerminal {
+    super::StdinTerminal::Unknown
 }
 
 /// Unsupported platform stub.

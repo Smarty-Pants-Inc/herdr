@@ -708,9 +708,40 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
-/// The file a process has open as its standard input.
-pub fn process_stdin_path(pid: u32) -> Option<std::path::PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()
+/// The terminal a process has on standard input, with `/dev/tty` resolved to the process's
+/// controlling terminal.
+pub fn process_stdin_terminal(pid: u32) -> super::StdinTerminal {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = match std::fs::metadata(format!("/proc/{pid}/fd/0")) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return super::StdinTerminal::NotTerminal
+        }
+        Err(_) => return super::StdinTerminal::Unknown,
+    };
+    if !metadata.file_type().is_char_device() {
+        return super::StdinTerminal::NotTerminal;
+    }
+    let device = metadata.rdev();
+    if device != libc::makedev(5, 0) {
+        return super::StdinTerminal::Terminal(device);
+    }
+    // `/dev/tty`: the controlling terminal, `tty_nr` in /proc/<pid>/stat.
+    let Some(tty_nr) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let rest = stat.get(stat.rfind(')')? + 2..)?.to_string();
+            rest.split_whitespace().nth(4)?.parse::<u32>().ok()
+        })
+    else {
+        return super::StdinTerminal::Unknown;
+    };
+    if tty_nr == 0 {
+        return super::StdinTerminal::NotTerminal;
+    }
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00);
+    super::StdinTerminal::Terminal(libc::makedev(major, minor))
 }
 
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
@@ -1215,6 +1246,76 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_terminal_resolves_the_controlling_terminal_alias() {
+        // Astra review of herdr#82: a reader that reopened /dev/tty reads the same terminal as
+        // the pane's first process, and a piped process reads none.
+        use portable_pty::{CommandBuilder, PtySize};
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        let reader_pid_file = std::env::temp_dir().join(format!(
+            "herdr-stdin-terminal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = CommandBuilder::new("sh");
+        command.arg("-c");
+        command.arg(format!(
+            "sleep 30 </dev/tty & echo $! > '{}'; exec sleep 30",
+            reader_pid_file.display()
+        ));
+        let mut root = pair.slave.spawn_command(command).expect("spawn");
+        let root_pid = root.process_id().expect("root pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reader_pid = loop {
+            let pid = std::fs::read_to_string(&reader_pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            if let Some(pid) = pid.filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/fd/0"))
+                    .is_ok_and(|path| path == std::path::Path::new("/dev/tty"))
+            }) {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "reader did not start");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut piped = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("piped");
+
+        let pane = process_stdin_terminal(root_pid);
+        assert!(
+            matches!(pane, super::super::StdinTerminal::Terminal(_)),
+            "{pane:?}"
+        );
+        assert_eq!(process_stdin_terminal(reader_pid), pane);
+        assert_eq!(
+            process_stdin_terminal(piped.id()),
+            super::super::StdinTerminal::NotTerminal
+        );
+
+        let _ = piped.kill();
+        let _ = piped.wait();
+        unsafe {
+            libc::kill(reader_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = root.kill();
+        let _ = root.wait();
+        let _ = std::fs::remove_file(&reader_pid_file);
+    }
     use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
 

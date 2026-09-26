@@ -1446,9 +1446,9 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
-/// The file a process has open as its standard input. Not available here.
-pub fn process_stdin_path(_pid: u32) -> Option<std::path::PathBuf> {
-    None
+/// Not available on this platform.
+pub fn process_stdin_terminal(_pid: u32) -> super::StdinTerminal {
+    super::StdinTerminal::Unknown
 }
 
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {

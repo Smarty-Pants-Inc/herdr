@@ -586,8 +586,7 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
-/// The file a process has open as its standard input.
-pub fn process_stdin_path(pid: u32) -> Option<PathBuf> {
+fn process_stdin_path(pid: u32) -> Option<PathBuf> {
     // `struct proc_fileinfo` and `struct vnode_fdinfowithpath` from <sys/proc_info.h>; libc
     // does not bind them.
     #[repr(C)]
@@ -630,6 +629,43 @@ pub fn process_stdin_path(pid: u32) -> Option<PathBuf> {
     (!path.is_empty()).then(|| {
         PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(path))
     })
+}
+
+/// The terminal a process has on standard input, with `/dev/tty` resolved to the process's
+/// controlling terminal.
+pub fn process_stdin_terminal(pid: u32) -> super::StdinTerminal {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(path) = process_stdin_path(pid) else {
+        return super::StdinTerminal::Unknown;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return super::StdinTerminal::Unknown;
+    };
+    if !metadata.file_type().is_char_device() {
+        return super::StdinTerminal::NotTerminal;
+    }
+    if path != Path::new("/dev/tty") {
+        return super::StdinTerminal::Terminal(metadata.rdev() as u64);
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if ret != size {
+        return super::StdinTerminal::Unknown;
+    }
+    // NODEV (all bits set): no controlling terminal.
+    if info.e_tdev == u32::MAX {
+        return super::StdinTerminal::NotTerminal;
+    }
+    super::StdinTerminal::Terminal(u64::from(info.e_tdev))
 }
 
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
