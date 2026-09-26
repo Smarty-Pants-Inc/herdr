@@ -651,6 +651,20 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
+## 输入来源帧
+
+当 `pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys` 或 `agent.prompt` 写入一个其 Pi 能读取输入来源帧的窗格时，herdr 会用输入来源帧包裹这些字节，让 Pi 能区分发送的输入和键入的输入：
+
+```text
+U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] U+FDD1
+<input bytes>
+U+FDD0 herdr-origin;end;id=<id> U+FDD1
+```
+
+标记是 Unicode 非字符 `U+FDD0` 和 `U+FDD1`。只有当窗格中的 Pi 通过 herdr 的 Pi 集成（来源为 `herdr:pi` 的 `pane.report_agent`）上报 `input_origin: "v1"`，且 Pi 是前台进程时，该窗格才会收到帧。其他程序以及不上报它的 Pi 收到的是原始字节。
+
+`sender` 是调用方窗格的智能体名称；没有时为窗格 ID，再没有时为 `pid:<n>`，否则为 `unknown`。herdr 从 socket 对端进程得出它，从不取自请求文本。值经过百分号编码。herdr 会把所有其他输入（包括键盘输入、粘贴和帧内的负载）中任何 `U+FDD0` 的最后一个字节替换为 `?`，因此只有 herdr 能开始一个帧。
+
 ## 读取窗格
 
 除非你在编写协议客户端,否则通过 CLI 使用 `pane.read`。

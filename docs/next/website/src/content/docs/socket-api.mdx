@@ -874,6 +874,29 @@ Worktree event subscriptions include `worktree.created`, `worktree.opened`, and 
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
+## Input origin frames
+
+When `pane.send_text`, `pane.send_input`, `pane.send_keys`, `agent.send_keys`, or
+`agent.prompt` writes to a pane whose Pi reads origin frames, herdr wraps the bytes
+in an origin frame, so Pi can tell sent input from typed input:
+
+```text
+U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] U+FDD1
+<input bytes>
+U+FDD0 herdr-origin;end;id=<id> U+FDD1
+```
+
+The markers are the Unicode noncharacters `U+FDD0` and `U+FDD1`. A pane gets frames
+only while its Pi reports `input_origin: "v1"` through herdr's Pi integration
+(`pane.report_agent` from source `herdr:pi`) and Pi is the foreground process.
+Other programs, and Pi versions that do not report it, receive the raw bytes.
+
+`sender` is the calling pane's agent name, else its pane id, else `pid:<n>`, else
+`unknown`. herdr takes it from the socket peer process, never from request text.
+Values are percent-encoded. In all other input, including keyboard input, pastes,
+and the payload inside a frame, herdr replaces the last byte of any `U+FDD0` with
+`?`, so only herdr can start a frame.
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.

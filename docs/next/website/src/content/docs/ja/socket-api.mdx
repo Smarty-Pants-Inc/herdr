@@ -654,6 +654,20 @@ worktree のイベント購読には `worktree.created`、`worktree.opened`、`w
 
 ライフサイクルイベントには `events.subscribe` を使ってください。ワンショットの wait がサポートされる場合、専用の wait ヘルパーが別途ドキュメント化されます。
 
+## 入力元フレーム
+
+`pane.send_text`、`pane.send_input`、`pane.send_keys`、`agent.send_keys`、`agent.prompt` が、入力元フレームを読める Pi のペインに書き込むとき、herdr はバイト列を入力元フレームで囲みます。これにより Pi は送信された入力と打鍵された入力を区別できます。
+
+```text
+U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;session=<session id>] U+FDD1
+<input bytes>
+U+FDD0 herdr-origin;end;id=<id> U+FDD1
+```
+
+マーカーは Unicode の非文字 `U+FDD0` と `U+FDD1` です。ペインにフレームが送られるのは、その Pi が herdr の Pi インテグレーション（ソース `herdr:pi` の `pane.report_agent`）で `input_origin: "v1"` を報告し、かつ Pi がフォアグラウンドプロセスである間だけです。ほかのプログラムや、これを報告しない Pi には生のバイト列が届きます。
+
+`sender` は呼び出し元ペインのエージェント名、なければペイン ID、なければ `pid:<n>`、なければ `unknown` です。herdr はこれをリクエスト本文ではなくソケットのピアプロセスから決めます。値はパーセントエンコードされます。herdr はキーボード入力、ペースト、フレーム内のペイロードを含むほかのすべての入力に含まれる `U+FDD0` の最後のバイトを `?` に置き換えるため、フレームを始められるのは herdr だけです。
+
 ## ペインの読み取り
 
 プロトコルクライアントを書いているのでなければ、CLI 経由で `pane.read` を使ってください。

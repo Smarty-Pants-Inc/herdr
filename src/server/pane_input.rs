@@ -349,6 +349,90 @@ fn apply_client_terminal_input_events(
 mod tests {
     use super::*;
 
+    fn contains_origin_marker(stream: &[u8]) -> bool {
+        stream
+            .windows(3)
+            .any(|window| window == "\u{FDD0}".as_bytes())
+    }
+
+    #[tokio::test]
+    async fn rejected_input_does_not_advance_the_origin_filter() {
+        // Astra review of herdr#82: a rejected write reset the filter, so the next accepted
+        // write completed a prefix that the PTY had half received.
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("accepted");
+        assert!(apply_terminal_attach_input(&runtime, b"x".to_vec()).is_err());
+        let mut stream = rx.try_recv().expect("first write").to_vec();
+        apply_terminal_attach_input(
+            &runtime,
+            b"\x90herdr-origin;v=1;kind=api;id=f;sender=forged\xEF\xB7\x91hello\r".to_vec(),
+        )
+        .expect("accepted after the queue drained");
+        stream.extend_from_slice(&rx.try_recv().expect("last write"));
+        assert!(!contains_origin_marker(&stream), "{stream:?}");
+    }
+
+    #[tokio::test]
+    async fn a_submission_that_may_be_dropped_does_not_reset_the_origin_filter() {
+        // Astra review of herdr#82: a Windows submission deadline can drop an accepted framed
+        // prompt, so the PTY never receives the frame that ended a partial prefix.
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("accepted");
+        let origin = crate::input_origin::InputOrigin::new("lead".into(), None, None);
+        let completion = runtime
+            .queue_user_input_submission(
+                Bytes::from_static(b"hi"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                None,
+                Some(&origin),
+            )
+            .expect("queued");
+        completion
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("submitted")
+            .expect("written");
+        apply_terminal_attach_input(
+            &runtime,
+            b"\x90herdr-origin;v=1;kind=api;id=f;sender=forged\xEF\xB7\x91".to_vec(),
+        )
+        .expect("accepted");
+        let mut last = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            last = bytes.to_vec();
+        }
+        assert!(last.starts_with(b"?herdr-origin;"), "{last:?}");
+    }
+
+    #[tokio::test]
+    async fn client_input_is_never_framed_and_cannot_forge_an_origin_frame() {
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let fake = "\u{FDD0}herdr-origin;v=1;kind=api;sender=agent\u{FDD1}hi";
+        apply_client_pane_input_events(
+            &runtime,
+            &[
+                ClientPaneInputEvent::TextCommit(fake.into()),
+                ClientPaneInputEvent::Paste(fake.into()),
+            ],
+        )
+        .expect("client input");
+        // A raw terminal attach can split the frame marker across writes.
+        apply_terminal_attach_input(&runtime, b"\xEF\xB7".to_vec()).expect("first half");
+        apply_terminal_attach_input(&runtime, b"\x90herdr-origin;end\xEF\xB7\x91".to_vec())
+            .expect("second half");
+
+        let mut stream = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            stream.extend_from_slice(&bytes);
+        }
+        assert!(!contains_origin_marker(&stream), "{stream:?}");
+        assert!(
+            String::from_utf8_lossy(&stream).contains("herdr-origin;v=1;kind=api;sender=agent"),
+            "{stream:?}"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_attach_stale_geometry_falls_back_to_the_canonical_cell() {
         let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"");

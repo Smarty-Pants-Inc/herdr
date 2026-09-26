@@ -3057,6 +3057,12 @@
                 "null"
               ]
             },
+            "input_origin": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "message": {
               "type": [
                 "string",

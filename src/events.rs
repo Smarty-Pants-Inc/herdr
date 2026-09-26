@@ -110,6 +110,9 @@ pub enum AppEvent {
         message: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// The reporter reads origin frames (smarty-dev#931). Applied only if the report is
+        /// accepted.
+        input_origin_frames: bool,
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {

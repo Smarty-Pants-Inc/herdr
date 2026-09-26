@@ -95,7 +95,7 @@ impl App {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
-        match self.queue_agent_prompt(request.id, params) {
+        match self.queue_agent_prompt(request.id, params, context) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
@@ -120,6 +120,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
+        context: crate::api::ApiRequestContext,
     ) -> Result<
         (
             String,
@@ -212,12 +213,14 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        let origin = self.api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context);
         let completion = runtime
             .queue_user_input_submission(
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
+                origin.as_ref(),
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
@@ -339,6 +342,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentSendKeysParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
@@ -373,7 +377,8 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let origin = self.api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context);
+        if let Err(err) = super::input_origin::send_api_bytes(runtime, origin.as_ref(), bytes) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
 
@@ -542,6 +547,44 @@ mod tests {
             serde_json::from_str::<SuccessResponse>(&after).is_ok(),
             "a live agent must stay reachable by its assigned name: {after}"
         );
+    }
+
+    #[tokio::test]
+    async fn pi_agent_prompt_frames_text_and_enter_with_one_origin() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.test_activate_herdr_pi_integration();
+        terminal.set_agent_name("reviewer".into());
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target,
+                text: "hello".into(),
+                wait: None,
+                allow_cross_pane: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        let (text_fields, text) = crate::input_origin::unframe_for_test(&rx.try_recv().unwrap());
+        let (enter_fields, enter) = crate::input_origin::unframe_for_test(&rx.try_recv().unwrap());
+        assert_eq!(text, b"\x1b[200~hello\x1b[201~");
+        assert_eq!(enter, b"\r");
+        assert_eq!(text_fields, enter_fields);
+        assert!(text_fields.contains(&("kind".into(), "api".into())));
     }
 
     #[tokio::test]
@@ -721,6 +764,7 @@ mod tests {
                 keys: vec!["enter".into(), "not-a-key".into()],
                 allow_cross_pane: false,
             },
+            Default::default(),
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "invalid_key");
@@ -733,6 +777,7 @@ mod tests {
                 keys: vec!["up".into(), "enter".into()],
                 allow_cross_pane: false,
             },
+            Default::default(),
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));

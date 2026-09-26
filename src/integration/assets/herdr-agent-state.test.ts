@@ -295,6 +295,31 @@ test("Pi reports a Windows session path", async () => {
   expect(requests.map(requestSessionPath)).toEqual([sessionPath, sessionPath]);
 });
 
+test("Pi reports that it reads origin frames only when its TUI says so", async () => {
+  const inputOriginKey = Symbol.for("pi.herdrInputOrigin");
+  const globals = globalThis as Record<symbol, unknown>;
+  for (const claim of [undefined, "v1"]) {
+    const requests = await startRecordingServer(`pi-input-origin-${claim ?? "none"}`);
+    if (claim) globals[inputOriginKey] = claim;
+    else delete globals[inputOriginKey];
+    try {
+      const { handlers, pi } = createExtensionHarness();
+      const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+      install(pi);
+      await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+      await waitFor(() => requestStates(requests).length === 1);
+      const report = requests.find(
+        (request) => isRecord(request) && request.method === "pane.report_agent",
+      ) as { params: Record<string, unknown> };
+      expect(report.params.input_origin).toBe(claim);
+    } finally {
+      delete globals[inputOriginKey];
+      await new Promise<void>((resolve) => server?.close(() => resolve()));
+      server = undefined;
+    }
+  }
+});
+
 test("Pi reports idle only after the agent settles", async () => {
   const requests = await startRecordingServer("pi-settled");
   const { handlers, pi } = createExtensionHarness();
