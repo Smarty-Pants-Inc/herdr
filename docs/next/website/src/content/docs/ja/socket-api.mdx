@@ -664,7 +664,7 @@ U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;sessi
 U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
-マーカーは Unicode の非文字 `U+FDD0` と `U+FDD1` です。ペインにフレームが送られるのは、herdr の Pi インテグレーション（ソース `herdr:pi` の `pane.report_agent`）で `input_origin: "v1"` を報告した Pi プロセスが、そのペインのフォアグラウンドジョブ内の Pi である間だけです。herdr はこの報告を、ソケットのピアがその Pi プロセス自身である場合にのみ受け付け、その Pi が動いている間はほかのプロセスが置き換えることはできません。報告済みのペインのフォアグラウンドジョブを読めない場合、herdr は生のバイト列を送らず `input_origin_unavailable` で書き込みを拒否します。ほかのプログラムや、これを報告しない Pi には生のバイト列が届きます。
+マーカーは Unicode の非文字 `U+FDD0` と `U+FDD1` です。herdr は Pi の報告を受け付けると、その Pi に `U+FDD0 herdr-origin;ready;v=1 U+FDD1` を送り、以後の API 入力がフレーム付きになることを知らせます。ペインにフレームが送られるのは、herdr の Pi インテグレーション（ソース `herdr:pi` の `pane.report_agent`）で `input_origin: "v1"` を報告した Pi プロセスが、そのペインのフォアグラウンドジョブ内の Pi である間だけです。herdr はこの報告を、ソケットのピアがその Pi プロセス自身である場合にのみ受け付け、その Pi が動いている間はほかのプロセスが置き換えることはできません。報告済みのペインのフォアグラウンドジョブを読めない場合、herdr は生のバイト列を送らず `input_origin_unavailable` で書き込みを拒否します。ほかのプログラムや、これを報告しない Pi には生のバイト列が届きます。
 
 `sender` は呼び出し元ペインのエージェント名、なければペイン ID、なければ `pid:<n>`、なければ `unknown` です。herdr はこれをリクエスト本文ではなくソケットのピアプロセスから決めます。値はパーセントエンコードされます。herdr はキーボード入力、ペースト、フレーム内のペイロードを含むほかのすべての入力に含まれる `U+FDD0` の最後のバイトを `?` に置き換えるため、フレームを始められるのは herdr だけです。
 

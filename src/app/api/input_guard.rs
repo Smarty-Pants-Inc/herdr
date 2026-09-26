@@ -456,7 +456,12 @@ mod tests {
             attributed_context(),
         );
         assert_ok(&response);
-        fixture.target_rx.try_recv().expect("sent bytes")
+        loop {
+            let bytes = fixture.target_rx.try_recv().expect("sent bytes");
+            if bytes.as_ref() != crate::input_origin::ready_frame().as_slice() {
+                return bytes;
+            }
+        }
     }
 
     fn is_framed(bytes: &[u8]) -> bool {
@@ -513,6 +518,19 @@ mod tests {
         // The Pi job itself.
         report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
         assert!(is_framed(&send_text(&mut fixture, "x")));
+    }
+
+    #[tokio::test]
+    async fn an_admitted_claim_tells_the_reader_that_framing_is_on() {
+        let mut fixture = unclaimed_fixture();
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("ready frame"),
+            Bytes::from(crate::input_origin::ready_frame())
+        );
+        // A repeated report sends it once.
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        assert!(fixture.target_rx.try_recv().is_err());
     }
 
     #[tokio::test]

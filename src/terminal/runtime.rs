@@ -475,6 +475,10 @@ impl TerminalRuntime {
         self.0.test_origin_filter()
     }
 
+    pub fn try_send_origin_ready(&self) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_origin_ready()
+    }
+
     pub fn try_send_framed(
         &self,
         origin: &crate::input_origin::InputOrigin,

@@ -3508,6 +3508,18 @@ impl PaneRuntime {
         Ok(())
     }
 
+    /// Tells the pane's Pi that its API input is framed from now on.
+    pub fn try_send_origin_ready(&self) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let mut filter = self
+            .origin_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.io
+            .try_send_bytes(Bytes::from(crate::input_origin::ready_frame()))?;
+        filter.merge_frame();
+        Ok(())
+    }
+
     /// Queues text and a delayed Enter. With an origin, each part is framed. Without one, the
     /// text continues the unframed stream and the Enter is filtered on its own: an Enter key
     /// encoding contains no frame marker byte, so where it lands it can only break one. The actor
