@@ -565,6 +565,10 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let handoff_input_origin_claim = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.input_origin_claim);
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -700,6 +704,10 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
+                }
+                #[cfg(unix)]
+                if let Some(claim) = handoff_input_origin_claim {
+                    terminal.set_input_origin_claim(claim);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -1815,6 +1823,81 @@ mod tests {
                 terminal.finish_agent_process_acquisition(),
                 state_before_handoff == AgentState::Blocked
             );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_carries_the_input_origin_claim_and_filter_state() {
+        // Security pass on herdr#82: the same running Pi keeps its frame claim, and a partial
+        // U+FDD0 sent before the handoff cannot be completed after it.
+        for send_filter_state in [true, false] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, mut terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values_mut().next().unwrap();
+            terminal.set_input_origin_claim(4242);
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+            let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .try_send_bytes(bytes::Bytes::from_static(b"\xEF\xB7"))
+                .unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut state = runtime.handoff_runtime_state(pane_id.raw());
+            state.input_origin_claim = terminals.values().next().unwrap().input_origin_claim();
+            if !send_filter_state {
+                // An older server sends no filter state.
+                state.input_origin_filter = None;
+            }
+            let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state,
+                },
+            )]);
+            let (_, restored_terminals, restored_runtimes) = restore_handoff(
+                &snapshot,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .unwrap();
+            let terminal = restored_terminals.values().next().unwrap();
+            assert_eq!(terminal.input_origin_claim(), Some(4242));
+            let mut filter = restored_runtimes
+                .values()
+                .next()
+                .unwrap()
+                .test_origin_filter();
+            assert_eq!(
+                &*filter.filter(b"\x90herdr-origin;"),
+                b"?herdr-origin;",
+                "send_filter_state={send_filter_state}"
+            );
+            drop(restored_runtimes);
+            drop(runtimes);
         }
     }
 

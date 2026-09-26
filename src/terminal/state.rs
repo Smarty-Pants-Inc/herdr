@@ -161,8 +161,10 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
-    /// The last report from herdr's Pi integration said this Pi reads origin frames.
-    input_origin_frames: bool,
+    /// Process group of the foreground Pi job that claimed, from inside that job, to read
+    /// origin frames (smarty-dev#931). Frames go to the pane only while that job is still its
+    /// foreground Pi.
+    input_origin_claim: Option<u32>,
 }
 
 impl TerminalState {
@@ -202,7 +204,7 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
-            input_origin_frames: false,
+            input_origin_claim: None,
         }
     }
 
@@ -2028,43 +2030,13 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
-    /// Whether this terminal's Pi reads origin frames (smarty-dev#931): it reports through
-    /// herdr's own Pi integration, and its last report said it reads them. Older Pi and a
-    /// program that is merely named `pi` do not.
-    pub fn reads_input_origin_frames(&self) -> bool {
-        self.input_origin_frames
-            && self.hook_authority.as_ref().is_some_and(|authority| {
-                authority.source == "herdr:pi"
-                    && authority.agent_label == "pi"
-                    && self.hook_authority_is_effective(authority)
-            })
+    pub fn input_origin_claim(&self) -> Option<u32> {
+        self.input_origin_claim
     }
 
-    pub fn set_input_origin_frames(&mut self, enabled: bool) {
-        self.input_origin_frames = enabled;
-    }
-
-    /// Makes this terminal a Pi that reads origin frames and reports through herdr's Pi
-    /// integration.
-    #[cfg(test)]
-    pub fn test_activate_herdr_pi_integration(&mut self) {
-        self.set_detected_state(Some(Agent::Pi), self.fallback_state);
-        self.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:pi".into(),
-            agent: "pi".into(),
-            session_ref: crate::agent_resume::AgentSessionRef::id("test-pi-session")
-                .expect("valid session id"),
-        });
-        self.set_hook_authority_with_session_ref(
-            "herdr:pi".into(),
-            "pi".into(),
-            AgentState::Idle,
-            None,
-            crate::agent_resume::AgentSessionRef::id("test-pi-session"),
-            None,
-        );
-        self.set_input_origin_frames(true);
-        assert!(self.reads_input_origin_frames());
+    /// Records a claim that the caller verified against the pane's foreground Pi job.
+    pub fn set_input_origin_claim(&mut self, process_group: u32) {
+        self.input_origin_claim = Some(process_group);
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {

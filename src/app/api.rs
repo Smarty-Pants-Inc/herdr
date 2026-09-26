@@ -1207,7 +1207,7 @@ impl App {
                 return self.handle_pane_graphics_stream_close(request.id, params);
             }
             Method::PaneReportAgent(params) => {
-                return self.handle_pane_report_agent(request.id, params);
+                return self.handle_pane_report_agent(request.id, params, context);
             }
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);

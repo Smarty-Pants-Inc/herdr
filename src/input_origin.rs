@@ -175,6 +175,20 @@ impl OriginFrameFilter {
         self.possible |= other.possible;
     }
 
+    /// State to hand over with the PTY on a live server handoff.
+    pub(crate) fn to_handoff(self) -> u16 {
+        self.possible
+    }
+
+    /// State received with a PTY on a live server handoff. Without one (an older server), every
+    /// partial marker may be pending, so the first bytes after the handoff cannot complete one.
+    pub(crate) fn from_handoff(possible: Option<u16>) -> Self {
+        let every_partial = (1u16 << FRAME_PREFIX.len()) - 1;
+        Self {
+            possible: possible.map_or(every_partial, |possible| possible & every_partial) | 1,
+        }
+    }
+
     /// Adds the state after a framed write, which ends with a complete marker.
     pub(crate) fn merge_frame(&mut self) {
         self.possible |= 1;
@@ -369,6 +383,25 @@ mod tests {
         filter.filter(b"\xEF\xB7");
         filter.merge_frame();
         assert_eq!(&*filter.filter(b"\x90"), b"?");
+    }
+
+    #[test]
+    fn filter_state_survives_a_handoff() {
+        // Security pass on herdr#82 (P2): a marker split across a live handoff.
+        for split in 1..P.len() {
+            let mut before = OriginFrameFilter::default();
+            let mut stream = before.filter(&P[..split]).into_owned();
+            for imported in [Some(before.to_handoff()), None] {
+                let mut after = OriginFrameFilter::from_handoff(imported);
+                let mut joined = stream.clone();
+                joined.extend_from_slice(&after.filter(&P[split..]));
+                assert!(!contains_prefix(&joined), "split {split}, {imported:?}");
+            }
+            stream.clear();
+        }
+        // A fresh import still passes ordinary input unchanged.
+        let mut after = OriginFrameFilter::from_handoff(None);
+        assert_eq!(&*after.filter(b"hello"), b"hello");
     }
 
     #[test]

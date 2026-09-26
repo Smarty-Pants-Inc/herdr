@@ -82,11 +82,29 @@ mod tests {
         app: App,
         source_pane_id: String,
         target_pane_id: String,
+        target_terminal_id: crate::terminal::TerminalId,
         source_rx: Receiver<Bytes>,
         target_rx: Receiver<Bytes>,
     }
 
+    /// The target pane's foreground Pi job in these tests.
+    const TARGET_PI_GROUP: u32 = 7000;
+    const TARGET_PI_PROCESS: u32 = 7001;
+
     fn attributed_agent_fixture() -> Fixture {
+        let mut fixture = unclaimed_fixture();
+        fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&fixture.target_terminal_id)
+            .expect("target state")
+            .set_input_origin_claim(TARGET_PI_GROUP);
+        fixture
+    }
+
+    /// The target pane runs Pi in its foreground, which has not claimed to read frames.
+    fn unclaimed_fixture() -> Fixture {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
@@ -126,8 +144,13 @@ mod tests {
             .expect("target state");
         target_terminal.set_agent_name("target-agent".into());
         target_terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
-        // Pi reporting through herdr's Pi integration reads origin frames.
-        target_terminal.test_activate_herdr_pi_integration();
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &target_terminal_id,
+            Some(crate::app::api::input_origin::ForegroundPi {
+                process_group: TARGET_PI_GROUP,
+                pids: vec![TARGET_PI_GROUP, TARGET_PI_PROCESS],
+            }),
+        );
 
         let (source_runtime, source_rx) =
             crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -140,6 +163,7 @@ mod tests {
         Fixture {
             source_pane_id: app.public_pane_id(0, source_pane).expect("source pane id"),
             target_pane_id: app.public_pane_id(0, target_pane).expect("target pane id"),
+            target_terminal_id,
             app,
             source_rx,
             target_rx,
@@ -409,41 +433,106 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pi_that_does_not_claim_origin_frames_receives_raw_api_input() {
-        let mut fixture = attributed_agent_fixture();
-        let (_, target_pane) = fixture
-            .app
-            .parse_pane_id(&fixture.target_pane_id)
-            .expect("target pane");
-        let target_terminal_id = fixture.app.state.workspaces[0]
-            .terminal_id(target_pane)
-            .cloned()
-            .expect("target terminal");
-        fixture
-            .app
-            .state
-            .terminals
-            .get_mut(&target_terminal_id)
-            .expect("target state")
-            .set_input_origin_frames(false);
-
+    fn send_text(fixture: &mut Fixture, text: &str) -> Bytes {
         let response = fixture.app.handle_api_request_with_context(
             Request {
-                id: "no-integration".into(),
+                id: "send".into(),
                 method: Method::PaneSendText(PaneSendTextParams {
                     pane_id: fixture.target_pane_id.clone(),
-                    text: "plain\u{FDD0}herdr-origin;end\u{FDD1}".into(),
+                    text: text.into(),
                     allow_cross_pane: true,
                 }),
             },
             attributed_context(),
         );
         assert_ok(&response);
+        fixture.target_rx.try_recv().expect("sent bytes")
+    }
+
+    fn is_framed(bytes: &[u8]) -> bool {
+        bytes.starts_with("\u{FDD0}herdr-origin;".as_bytes())
+    }
+
+    fn report_pi(fixture: &mut Fixture, input_origin: Option<&str>, peer: Option<u32>) {
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "report".into(),
+                method: Method::PaneReportAgent(crate::api::schema::PaneReportAgentParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    source: "herdr:pi".into(),
+                    agent: "pi".into(),
+                    state: crate::api::schema::PaneAgentState::Idle,
+                    message: None,
+                    seq: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    input_origin: input_origin.map(str::to_string),
+                }),
+            },
+            ApiRequestContext {
+                local_peer_pid: peer,
+            },
+        );
+        assert_ok(&response);
+    }
+
+    #[tokio::test]
+    async fn pi_that_does_not_claim_origin_frames_receives_raw_api_input() {
+        let mut fixture = unclaimed_fixture();
         assert_eq!(
-            fixture.target_rx.try_recv().expect("raw bytes"),
+            send_text(&mut fixture, "plain\u{FDD0}herdr-origin;end\u{FDD1}"),
             Bytes::from_static(b"plain\xEF\xB7?herdr-origin;end\xEF\xB7\x91")
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_report_from_the_foreground_pi_job_claims_origin_frames() {
+        // Security pass on herdr#82 (P1): a report is not proof of who sent it.
+        let mut fixture = unclaimed_fixture();
+        // Another pane's agent, a process outside every pane, and an unattributed caller.
+        for peer in [Some(std::process::id()), Some(u32::MAX), None] {
+            report_pi(&mut fixture, Some("v1"), peer);
+            assert!(!is_framed(&send_text(&mut fixture, "x")), "peer {peer:?}");
+        }
+        // The Pi job itself.
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+    }
+
+    #[tokio::test]
+    async fn no_report_can_clear_the_live_pis_claim() {
+        let mut fixture = attributed_agent_fixture();
+        for peer in [
+            Some(std::process::id()),
+            Some(u32::MAX),
+            None,
+            Some(TARGET_PI_PROCESS),
+        ] {
+            report_pi(&mut fixture, None, peer);
+            assert!(is_framed(&send_text(&mut fixture, "x")), "peer {peer:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_pi_process_in_the_pane_does_not_inherit_the_claim() {
+        let mut fixture = attributed_agent_fixture();
+        let replacement = crate::app::api::input_origin::ForegroundPi {
+            process_group: 8000,
+            pids: vec![8000],
+        };
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            Some(replacement),
+        );
+        assert!(!is_framed(&send_text(&mut fixture, "x")));
+        report_pi(&mut fixture, Some("v1"), Some(8000));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+        // And once no Pi is in the foreground, nothing is framed.
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            None,
+        );
+        assert!(!is_framed(&send_text(&mut fixture, "x")));
     }
 
     fn report_working(pane_id: &str) -> Method {

@@ -2128,6 +2128,13 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            input_origin_claim: None,
+            input_origin_filter: Some(
+                self.origin_filter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .to_handoff(),
+            ),
         }
     }
 
@@ -2339,6 +2346,8 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            input_origin_claim: _,
+            input_origin_filter,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -2485,7 +2494,9 @@ impl PaneRuntime {
             kitty_keyboard_flags,
             content_seq,
             content_write_lock,
-            origin_filter: Mutex::default(),
+            origin_filter: Mutex::new(crate::input_origin::OriginFrameFilter::from_handoff(
+                input_origin_filter,
+            )),
             detection_content_seq,
             full_lifecycle_authority_active,
             detect_reset_notify,
@@ -3470,6 +3481,14 @@ impl PaneRuntime {
         self.io.try_send_bytes(filtered.unwrap_or(bytes))?;
         *filter = next;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_origin_filter(&self) -> crate::input_origin::OriginFrameFilter {
+        *self
+            .origin_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Writes API input wrapped in `origin`'s frames.

@@ -557,8 +557,16 @@ mod tests {
             .attached_terminal_id
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.test_activate_herdr_pi_integration();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_input_origin_claim(7000);
         terminal.set_agent_name("reviewer".into());
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &terminal_id,
+            Some(crate::app::api::input_origin::ForegroundPi {
+                process_group: 7000,
+                pids: vec![7000],
+            }),
+        );
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);

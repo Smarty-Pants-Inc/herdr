@@ -1478,7 +1478,6 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
-                input_origin_frames,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
                     self.update_terminal_state(pane_id, |terminal| {
@@ -1488,19 +1487,14 @@ impl AppState {
                     .collect()
                 } else {
                     self.update_terminal_state(pane_id, |terminal| {
-                        let accepted = terminal.set_hook_authority_with_session_ref(
+                        terminal.set_hook_authority_with_session_ref(
                             source,
                             agent_label,
                             state,
                             message,
                             session_ref,
                             seq,
-                        );
-                        // A stale or foreign report must not change the live agent's claim.
-                        if accepted.is_some() {
-                            terminal.set_input_origin_frames(input_origin_frames);
-                        }
-                        accepted
+                        )
                     })
                     .into_iter()
                     .collect()
@@ -3190,7 +3184,6 @@ mod tests {
                 message: None,
                 seq: Some(seq),
                 session_ref: None,
-                input_origin_frames: false,
             });
             if seq == 2 {
                 assert!(!app.workspaces[1].panes[&pane_id].seen);
@@ -3549,43 +3542,6 @@ mod tests {
     }
 
     #[test]
-    fn only_an_accepted_pi_report_changes_its_origin_frame_claim() {
-        // Astra review of herdr#82 (F4): a stale report must not turn frames off for the live
-        // Pi, and a stale claim must not turn them on.
-        let mut state = app_with_workspaces(&["pi"]);
-        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
-        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
-        state
-            .terminals
-            .get_mut(&terminal_id)
-            .unwrap()
-            .test_activate_herdr_pi_integration();
-        let report = |seq, input_origin_frames| AppEvent::HookStateReported {
-            pane_id,
-            source: "herdr:pi".into(),
-            agent_label: "pi".into(),
-            state: AgentState::Working,
-            message: None,
-            seq: Some(seq),
-            session_ref: crate::agent_resume::AgentSessionRef::id("test-pi-session"),
-            input_origin_frames,
-        };
-        let reads = |state: &AppState| state.terminals[&terminal_id].reads_input_origin_frames();
-
-        state.handle_app_event(report(20, true));
-        assert!(reads(&state));
-        state.handle_app_event(report(19, false));
-        assert!(reads(&state), "a stale report turned frames off");
-        state.handle_app_event(report(21, false));
-        assert!(
-            !reads(&state),
-            "an accepted report without the claim kept frames on"
-        );
-        state.handle_app_event(report(20, true));
-        assert!(!reads(&state), "a stale claim turned frames on");
-    }
-
-    #[test]
     fn hook_reported_unknown_agent_sets_toast_title_from_label() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
@@ -3600,7 +3556,6 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
-            input_origin_frames: false,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -3639,7 +3594,6 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
-            input_origin_frames: false,
         });
         state.handle_app_event(AppEvent::StateChanged {
             pane_id: bg_pane_id,
@@ -3688,7 +3642,6 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
-            input_origin_frames: false,
         });
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
@@ -3798,7 +3751,6 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("devin-session"),
-            input_origin_frames: false,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -3823,7 +3775,6 @@ mod tests {
             message: None,
             seq: Some(20),
             session_ref: crate::agent_resume::AgentSessionRef::path(first_session),
-            input_origin_frames: false,
         });
         assert_eq!(first_updates.len(), 1);
         state.session_dirty = false;
@@ -3836,7 +3787,6 @@ mod tests {
             message: None,
             seq: Some(21),
             session_ref: crate::agent_resume::AgentSessionRef::path(second_session),
-            input_origin_frames: false,
         });
 
         assert!(second_updates.is_empty());

@@ -1547,18 +1547,18 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentParams,
+        context: crate::api::ApiRequestContext,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
-        // Only herdr's Pi integration reports this; the frame gate also checks its authority.
-        let input_origin_frames =
-            params.source == "herdr:pi" && params.input_origin.as_deref() == Some("v1");
+        if params.source == "herdr:pi" && params.input_origin.as_deref() == Some("v1") {
+            self.record_input_origin_claim(ws_idx, pane_id, context);
+        }
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
-            input_origin_frames,
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
                 &params.source,
