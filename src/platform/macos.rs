@@ -586,6 +586,46 @@ pub fn process_start(pid: u32) -> super::ProcessStart {
     }
 }
 
+/// The `PROX_FDTYPE_*` of fd 0, `Some(u32::MAX)` when fd 0 is closed, or `None` when the
+/// descriptors cannot be listed.
+fn stdin_descriptor_type(pid: u32) -> Option<u32> {
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    let needed = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return None;
+    }
+    // Room for descriptors opened between the two calls.
+    let mut fds: Vec<libc::proc_fdinfo> =
+        vec![unsafe { std::mem::zeroed() }; needed as usize / entry + 16];
+    let size = (fds.len() * entry) as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut libc::c_void,
+            size,
+        )
+    };
+    if filled <= 0 {
+        return None;
+    }
+    fds.truncate(filled as usize / entry);
+    Some(
+        fds.iter()
+            .find(|fd| fd.proc_fd == 0)
+            .map_or(u32::MAX, |fd| fd.proc_fdtype),
+    )
+}
+
 fn process_stdin_path(pid: u32) -> Option<PathBuf> {
     // `struct proc_fileinfo` and `struct vnode_fdinfowithpath` from <sys/proc_info.h>; libc
     // does not bind them.
@@ -635,6 +675,12 @@ fn process_stdin_path(pid: u32) -> Option<PathBuf> {
 /// controlling terminal.
 pub fn process_stdin_terminal(pid: u32) -> super::StdinTerminal {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // A pipe or socket has no vnode path, so check the descriptor type first.
+    match stdin_descriptor_type(pid) {
+        Some(fd_type) if fd_type == libc::PROX_FDTYPE_VNODE as u32 => {}
+        Some(_) => return super::StdinTerminal::NotTerminal,
+        None => return super::StdinTerminal::Unknown,
+    }
     let Some(path) = process_stdin_path(pid) else {
         return super::StdinTerminal::Unknown;
     };
@@ -645,7 +691,7 @@ pub fn process_stdin_terminal(pid: u32) -> super::StdinTerminal {
         return super::StdinTerminal::NotTerminal;
     }
     if path != Path::new("/dev/tty") {
-        return super::StdinTerminal::Terminal(metadata.rdev() as u64);
+        return super::StdinTerminal::Terminal(metadata.rdev());
     }
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1280,6 +1326,22 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_terminal_reports_a_pipe_as_not_a_terminal() {
+        // Astra review of herdr#82: a piped helper must not pass as an unreadable descriptor.
+        let mut piped = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("piped");
+        assert_eq!(
+            process_stdin_terminal(piped.id()),
+            super::super::StdinTerminal::NotTerminal
+        );
+        let _ = piped.kill();
+        let _ = piped.wait();
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
