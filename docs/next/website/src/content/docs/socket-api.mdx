@@ -890,8 +890,11 @@ The markers are the Unicode noncharacters `U+FDD0` and `U+FDD1`. A pane gets fra
 only while the Pi process that reported `input_origin: "v1"` through herdr's Pi
 integration (`pane.report_agent` from source `herdr:pi`) is a Pi in the pane's
 foreground job. herdr accepts that claim only when the socket peer is that Pi
-process itself. Other programs, a later Pi process, and Pi versions that do not
-report it receive the raw bytes.
+process itself, and no other process can replace a claim while its Pi still runs
+there. Other programs, a later Pi process, and Pi versions that do not report it
+receive the raw bytes. If herdr cannot read the foreground job of a pane with a
+claim, it refuses the write with `input_origin_unavailable` instead of sending
+raw bytes.
 
 `sender` is the calling pane's agent name, else its pane id, else `pid:<n>`, else
 `unknown`. herdr takes it from the socket peer process, never from request text.

@@ -213,7 +213,9 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        let origin = self.api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context);
+        let origin = self
+            .api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context)
+            .map_err(|unavailable| unavailable.encode(id.clone()))?;
         let completion = runtime
             .queue_user_input_submission(
                 Bytes::from(text),
@@ -377,7 +379,11 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        let origin = self.api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context);
+        let origin =
+            match self.api_input_origin(resolved.ws_idx, resolved.pane_id, runtime, context) {
+                Ok(origin) => origin,
+                Err(unavailable) => return unavailable.encode(id),
+            };
         if let Err(err) = super::input_origin::send_api_bytes(runtime, origin.as_ref(), bytes) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
@@ -566,9 +572,7 @@ mod tests {
         terminal.set_agent_name("reviewer".into());
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi {
-                pi_processes: vec![pi],
-            }),
+            Some(crate::app::api::input_origin::ForegroundPi::Known(vec![pi])),
         );
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(b"\x1b[?2004h");

@@ -99,9 +99,9 @@ mod tests {
     fn foreground_pis(
         pis: &[crate::input_origin::InputOriginClaim],
     ) -> Option<crate::app::api::input_origin::ForegroundPi> {
-        Some(crate::app::api::input_origin::ForegroundPi {
-            pi_processes: pis.to_vec(),
-        })
+        Some(crate::app::api::input_origin::ForegroundPi::Known(
+            pis.to_vec(),
+        ))
     }
 
     fn attributed_agent_fixture() -> Fixture {
@@ -527,6 +527,75 @@ mod tests {
             report_pi(&mut fixture, None, peer);
             assert!(is_framed(&send_text(&mut fixture, "x")), "peer {peer:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_pi_in_the_job_cannot_take_over_the_readers_claim() {
+        // Security pass on herdr#82: a helper named like Pi in the reader's job reports a
+        // claim and exits. The reader keeps its frames throughout.
+        let mut fixture = attributed_agent_fixture();
+        let helper = crate::input_origin::InputOriginClaim {
+            pid: 7002,
+            start_time: 300,
+        };
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            foreground_pis(&[TARGET_PI, helper]),
+        );
+        report_pi(&mut fixture, Some("v1"), Some(helper.pid));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            foreground_pis(&[TARGET_PI]),
+        );
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+    }
+
+    #[tokio::test]
+    async fn a_claimed_pane_gets_no_api_input_while_its_reader_cannot_be_seen() {
+        // Security pass on herdr#82 (P2): a failed process lookup must not turn API input into
+        // typed input.
+        let mut fixture = attributed_agent_fixture();
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            Some(crate::app::api::input_origin::ForegroundPi::Unknown),
+        );
+        for method in [
+            Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "x".into(),
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id: fixture.target_pane_id.clone(),
+                keys: vec!["enter".into()],
+                allow_cross_pane: true,
+            }),
+            Method::PaneSendInput(PaneSendInputParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "x".into(),
+                keys: Vec::new(),
+                allow_cross_pane: true,
+            }),
+        ] {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "unverified".into(),
+                    method,
+                },
+                attributed_context(),
+            );
+            let response: ErrorResponse = serde_json::from_str(&response).expect("error");
+            assert_eq!(response.error.code, "input_origin_unavailable");
+            assert!(fixture.target_rx.try_recv().is_err());
+        }
+        // A pane without a claim is not affected.
+        let mut fixture = unclaimed_fixture();
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            Some(crate::app::api::input_origin::ForegroundPi::Unknown),
+        );
+        assert_eq!(send_text(&mut fixture, "x"), Bytes::from_static(b"x"));
     }
 
     #[tokio::test]

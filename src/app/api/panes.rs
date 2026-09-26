@@ -1829,7 +1829,10 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let origin = self.api_input_origin(ws_idx, pane_id, runtime, context);
+        let origin = match self.api_input_origin(ws_idx, pane_id, runtime, context) {
+            Ok(origin) => origin,
+            Err(unavailable) => return unavailable.encode(id),
+        };
         if let Err(err) = send_api_bytes(runtime, origin.as_ref(), params.text.into_bytes()) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
@@ -1857,7 +1860,10 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let origin = self.api_input_origin(ws_idx, pane_id, runtime, context);
+        let origin = match self.api_input_origin(ws_idx, pane_id, runtime, context) {
+            Ok(origin) => origin,
+            Err(unavailable) => return unavailable.encode(id),
+        };
         if let Err(err) = send_api_bytes(runtime, origin.as_ref(), bytes) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
@@ -1953,7 +1959,10 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let origin = self.api_input_origin(ws_idx, pane_id, runtime, context);
+        let origin = match self.api_input_origin(ws_idx, pane_id, runtime, context) {
+            Ok(origin) => origin,
+            Err(unavailable) => return unavailable.encode(id),
+        };
         for bytes in encoded_keys {
             if let Err(err) = send_api_bytes(runtime, origin.as_ref(), bytes) {
                 return encode_error(id, "pane_send_failed", err.to_string());
