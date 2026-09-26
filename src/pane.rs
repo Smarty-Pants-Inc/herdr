@@ -2128,7 +2128,7 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
-            input_origin_claim: None,
+            input_origin_claims: Vec::new(),
             input_origin_filter: Some(
                 self.origin_filter
                     .lock()
@@ -2346,7 +2346,7 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
-            input_origin_claim: _,
+            input_origin_claims: _,
             input_origin_filter,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);

@@ -112,7 +112,7 @@ mod tests {
             .terminals
             .get_mut(&fixture.target_terminal_id)
             .expect("target state")
-            .set_input_origin_claim(TARGET_PI);
+            .add_input_origin_claim(TARGET_PI);
         fixture
     }
 
@@ -621,9 +621,10 @@ mod tests {
                 status,
             );
             report_pi(&mut fixture, Some("v1"), Some(helper.pid));
-            assert_eq!(
-                fixture.app.state.terminals[&fixture.target_terminal_id].input_origin_claim(),
-                Some(TARGET_PI),
+            assert!(
+                fixture.app.state.terminals[&fixture.target_terminal_id]
+                    .input_origin_claims()
+                    .contains(&TARGET_PI),
                 "{status:?}"
             );
             let response = fixture.app.handle_api_request_with_context(
@@ -649,6 +650,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_suspended_pi_keeps_its_claim_while_another_pi_runs() {
+        // Security pass on herdr#82: A claims, is suspended, B claims, B exits, A resumes with
+        // no new report. The first API write must still be framed.
+        use crate::app::api::input_origin::{test_support, ClaimantStatus};
+        let mut fixture = attributed_agent_fixture();
+        let a = TARGET_PI;
+        let b = crate::input_origin::InputOriginClaim {
+            pid: 8000,
+            start_time: 200,
+        };
+        let terminal = fixture.target_terminal_id.clone();
+
+        // A suspended; B in the foreground claims.
+        test_support::set_foreground_pi(&terminal, foreground_pis(&[b]));
+        test_support::set_pid_status(&terminal, a.pid, ClaimantStatus::Background);
+        test_support::set_pid_status(&terminal, b.pid, ClaimantStatus::Reading);
+        report_pi(&mut fixture, Some("v1"), Some(b.pid));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+        assert_eq!(
+            fixture.app.state.terminals[&terminal].input_origin_claims(),
+            &[a, b]
+        );
+
+        // B exits; A resumes without reporting again.
+        test_support::set_foreground_pi(&terminal, foreground_pis(&[a]));
+        test_support::set_pid_status(&terminal, a.pid, ClaimantStatus::Reading);
+        test_support::set_pid_status(&terminal, b.pid, ClaimantStatus::Gone);
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+
+        // While A is suspended and nothing that claimed is in the foreground, a shell there
+        // gets raw bytes.
+        test_support::set_pid_status(&terminal, a.pid, ClaimantStatus::Background);
+        assert!(!is_framed(&send_text(&mut fixture, "x")));
     }
 
     #[tokio::test]

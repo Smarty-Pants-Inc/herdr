@@ -86,8 +86,9 @@ impl HeadlessServer {
             let terminal = self.app.state.terminals.get(terminal_id);
             handoff_runtime.agent_state =
                 terminal.and_then(|terminal| terminal.handoff_agent_state());
-            handoff_runtime.input_origin_claim =
-                terminal.and_then(|terminal| terminal.input_origin_claim());
+            handoff_runtime.input_origin_claims = terminal
+                .map(|terminal| terminal.input_origin_claims().to_vec())
+                .unwrap_or_default();
             let has_agent_session = self
                 .app
                 .state

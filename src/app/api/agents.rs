@@ -568,7 +568,7 @@ mod tests {
             pid: 7000,
             start_time: 1,
         };
-        terminal.set_input_origin_claim(pi);
+        terminal.add_input_origin_claim(pi);
         terminal.set_agent_name("reviewer".into());
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &terminal_id,

@@ -161,11 +161,11 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
-    /// The Pi process that claimed, as the socket peer of its own report, to read origin frames
-    /// (smarty-dev#931). Frames go to the pane only while that process is a Pi in its foreground
-    /// job. The pid and start time are the process identity: detection events do not clear it,
-    /// because they can arrive after a newer Pi has already claimed.
-    input_origin_claim: Option<crate::input_origin::InputOriginClaim>,
+    /// The Pi processes that claimed, each as the socket peer of its own report, to read origin
+    /// frames (smarty-dev#931). A pane gets frames while one of them reads it. Several can be
+    /// live at once (one suspended, another in the foreground). A claim is dropped only when its
+    /// process is known to be gone; detection events do not clear claims.
+    input_origin_claims: Vec<crate::input_origin::InputOriginClaim>,
 }
 
 impl TerminalState {
@@ -205,7 +205,7 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
-            input_origin_claim: None,
+            input_origin_claims: Vec::new(),
         }
     }
 
@@ -2031,14 +2031,24 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
-    pub(crate) fn input_origin_claim(&self) -> Option<crate::input_origin::InputOriginClaim> {
-        self.input_origin_claim
+    pub(crate) fn input_origin_claims(&self) -> &[crate::input_origin::InputOriginClaim] {
+        &self.input_origin_claims
     }
 
     /// Records a claim that the caller verified: the process is a Pi in the pane's foreground
     /// job and sent the claim itself.
-    pub(crate) fn set_input_origin_claim(&mut self, claim: crate::input_origin::InputOriginClaim) {
-        self.input_origin_claim = Some(claim);
+    pub(crate) fn add_input_origin_claim(&mut self, claim: crate::input_origin::InputOriginClaim) {
+        if !self.input_origin_claims.contains(&claim) {
+            self.input_origin_claims.push(claim);
+        }
+    }
+
+    /// Drops claims whose processes are known to be gone.
+    pub(crate) fn retain_input_origin_claims(
+        &mut self,
+        keep: impl FnMut(&crate::input_origin::InputOriginClaim) -> bool,
+    ) {
+        self.input_origin_claims.retain(keep);
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {

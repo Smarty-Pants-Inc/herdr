@@ -566,9 +566,10 @@ fn restore_tab(
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
         #[cfg(unix)]
-        let handoff_input_origin_claim = imported_runtime
+        let handoff_input_origin_claims = imported_runtime
             .as_ref()
-            .and_then(|imported| imported.state.input_origin_claim);
+            .map(|imported| imported.state.input_origin_claims.clone())
+            .unwrap_or_default();
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -706,8 +707,8 @@ fn restore_tab(
                     terminal.restore_handoff_agent_state(agent_state);
                 }
                 #[cfg(unix)]
-                if let Some(claim) = handoff_input_origin_claim {
-                    terminal.set_input_origin_claim(claim);
+                for claim in handoff_input_origin_claims {
+                    terminal.add_input_origin_claim(claim);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -1852,7 +1853,7 @@ mod tests {
                 pid: 4242,
                 start_time: 7,
             };
-            terminal.set_input_origin_claim(claim);
+            terminal.add_input_origin_claim(claim);
             let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
             let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
             let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
@@ -1864,7 +1865,12 @@ mod tests {
                 .pause_handoff_reader(std::time::Duration::from_secs(2))
                 .unwrap();
             let mut state = runtime.handoff_runtime_state(pane_id.raw());
-            state.input_origin_claim = terminals.values().next().unwrap().input_origin_claim();
+            state.input_origin_claims = terminals
+                .values()
+                .next()
+                .unwrap()
+                .input_origin_claims()
+                .to_vec();
             if !send_filter_state {
                 // An older server sends no filter state.
                 state.input_origin_filter = None;
@@ -1889,7 +1895,7 @@ mod tests {
             )
             .unwrap();
             let terminal = restored_terminals.values().next().unwrap();
-            assert_eq!(terminal.input_origin_claim(), Some(claim));
+            assert_eq!(terminal.input_origin_claims(), &[claim]);
             let mut filter = restored_runtimes
                 .values()
                 .next()

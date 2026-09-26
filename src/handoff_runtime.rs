@@ -29,9 +29,9 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
-    /// The Pi process that claimed to read origin frames (smarty-dev#931).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_origin_claim: Option<crate::input_origin::InputOriginClaim>,
+    /// The Pi processes that claimed to read origin frames (smarty-dev#931).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_origin_claims: Vec<crate::input_origin::InputOriginClaim>,
     /// Origin frame filter state of the PTY input stream. When absent, the importer assumes
     /// every partial marker is possible.
     #[serde(default, skip_serializing_if = "Option::is_none")]

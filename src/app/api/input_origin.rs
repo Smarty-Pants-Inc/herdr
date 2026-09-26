@@ -9,14 +9,17 @@ pub(crate) struct ForegroundPi {
     pub pi_processes: Vec<crate::input_origin::InputOriginClaim>,
 }
 
-/// Whether the process that claimed to read origin frames still reads the pane, checked on
-/// that process directly.
+/// Whether a process that claimed to read origin frames reads the pane now, checked on that
+/// process directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaimantStatus {
     /// The same process generation runs in the pane's foreground process group.
     Reading,
-    /// It exited, its pid now names a later process, or it left the foreground.
-    NotReading,
+    /// It runs, but another process group owns the terminal (for example, it is suspended). It
+    /// can read the pane again later, so its claim is kept.
+    Background,
+    /// It exited, or its pid now names a later process.
+    Gone,
     /// Herdr cannot tell.
     Unknown,
 }
@@ -45,20 +48,20 @@ pub(crate) fn classify_claimant(
     pane_foreground_group: Option<u32>,
 ) -> ClaimantStatus {
     match process {
-        crate::platform::ProcessStart::Gone => ClaimantStatus::NotReading,
+        crate::platform::ProcessStart::Gone => ClaimantStatus::Gone,
         crate::platform::ProcessStart::Unknown => ClaimantStatus::Unknown,
         crate::platform::ProcessStart::Running { start_time, .. }
             if start_time != claim.start_time =>
         {
             // The pid names a later process: the claimant exited.
-            ClaimantStatus::NotReading
+            ClaimantStatus::Gone
         }
         crate::platform::ProcessStart::Running {
             process_group: Some(group),
             ..
         } => match pane_foreground_group {
             Some(foreground) if foreground == group => ClaimantStatus::Reading,
-            Some(_) => ClaimantStatus::NotReading,
+            Some(_) => ClaimantStatus::Background,
             None => ClaimantStatus::Unknown,
         },
         // No process groups on this platform: a running claimant in the pane is its reader.
@@ -128,7 +131,7 @@ fn claimant_status(
     let _ = terminal_id;
     let Some(child_pid) = runtime.child_pid() else {
         // No process runs in the pane.
-        return ClaimantStatus::NotReading;
+        return ClaimantStatus::Gone;
     };
     classify_claimant(
         claim,
@@ -141,10 +144,11 @@ impl App {
     /// The origin frame for an API write to this pane: `Ok(None)` to write raw bytes, or an
     /// error when the write must not be sent.
     ///
-    /// A pane gets frames while the Pi process that claimed to read them (same pid and start
-    /// time) runs in its foreground process group. It gets raw bytes when it has no claim, or
-    /// when Herdr sees that the claimant exited or left the foreground. If Herdr cannot tell,
-    /// a claimed pane gets nothing: raw bytes would be recorded as typed input.
+    /// A pane gets frames while one of the Pi processes that claimed to read them (same pid and
+    /// start time) runs in its foreground process group. It gets raw bytes when it has no claim,
+    /// or when Herdr sees that every claimant has exited or is in the background. If Herdr
+    /// cannot tell for any claimant, a claimed pane gets nothing: raw bytes would be recorded as
+    /// typed input.
     pub(super) fn api_input_origin(
         &self,
         ws_idx: usize,
@@ -160,28 +164,30 @@ impl App {
         else {
             return Ok(None);
         };
-        let Some(claim) = self
-            .state
-            .terminals
-            .get(terminal_id)
-            .and_then(|terminal| terminal.input_origin_claim())
-        else {
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return Ok(None);
         };
-        match claimant_status(terminal_id, runtime, claim) {
-            ClaimantStatus::Reading => Ok(Some(self.api_caller_origin(context))),
-            ClaimantStatus::NotReading => Ok(None),
-            ClaimantStatus::Unknown => Err(InputOriginUnavailable),
+        let mut unknown = false;
+        for claim in terminal.input_origin_claims() {
+            match claimant_status(terminal_id, runtime, *claim) {
+                ClaimantStatus::Reading => return Ok(Some(self.api_caller_origin(context))),
+                ClaimantStatus::Unknown => unknown = true,
+                ClaimantStatus::Background | ClaimantStatus::Gone => {}
+            }
+        }
+        if unknown {
+            Err(InputOriginUnavailable)
+        } else {
+            Ok(None)
         }
     }
 
     /// Records a Pi's claim to read origin frames, only when the socket peer that sent it is
     /// itself a Pi process in the pane's foreground job. A wrapper or sibling in that job,
     /// another pane's process, a process outside every pane, or an unattributed caller cannot
-    /// change it. No other process can replace a claim unless its claimant is known not to read
-    /// the pane any more: the first Pi to claim is the one that reads the terminal (only the TUI
-    /// sets the claim, and any other Pi in its job was started later). A report without the
-    /// claim changes nothing.
+    /// add one. Claims are kept per process, so a new claim never removes another live
+    /// process's claim; only claims of processes known to be gone are dropped. A report without
+    /// the claim changes nothing.
     pub(super) fn record_input_origin_claim(
         &mut self,
         ws_idx: usize,
@@ -204,20 +210,24 @@ impl App {
         else {
             return;
         };
-        let current = self
+        let gone: Vec<_> = self
             .state
             .terminals
             .get(&terminal_id)
-            .and_then(|terminal| terminal.input_origin_claim());
-        if let Some(current) = current {
-            if current != claim
-                && claimant_status(&terminal_id, runtime, current) != ClaimantStatus::NotReading
-            {
-                return;
-            }
-        }
+            .map(|terminal| {
+                terminal
+                    .input_origin_claims()
+                    .iter()
+                    .copied()
+                    .filter(|current| {
+                        claimant_status(&terminal_id, runtime, *current) == ClaimantStatus::Gone
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.set_input_origin_claim(claim);
+            terminal.retain_input_origin_claims(|current| !gone.contains(current));
+            terminal.add_input_origin_claim(claim);
         }
     }
 
@@ -265,11 +275,13 @@ pub(crate) mod test_support {
 
     thread_local! {
         static JOBS: RefCell<HashMap<String, ForegroundPi>> = RefCell::new(HashMap::new());
-        static CLAIMANTS: RefCell<HashMap<String, ClaimantStatus>> = RefCell::new(HashMap::new());
+        static CLAIMANTS: RefCell<HashMap<(String, Option<u32>), ClaimantStatus>> =
+            RefCell::new(HashMap::new());
     }
 
-    /// Sets the Pi processes a test identifies in `terminal_id`'s foreground job. The claimant
-    /// then reads the pane while it is in that list; `None` uses the live lookups.
+    /// Sets the Pi processes a test identifies in `terminal_id`'s foreground job. A claimant
+    /// without an explicit status then reads the pane while it is in that list, and is gone
+    /// otherwise; `None` uses the live lookups.
     pub(crate) fn set_foreground_pi(
         terminal_id: &crate::terminal::TerminalId,
         job: Option<ForegroundPi>,
@@ -283,7 +295,7 @@ pub(crate) mod test_support {
         });
     }
 
-    /// Overrides the claimant check for `terminal_id`.
+    /// Overrides the claimant check for every claimant of `terminal_id`.
     pub(crate) fn set_claimant_status(
         terminal_id: &crate::terminal::TerminalId,
         status: ClaimantStatus,
@@ -291,7 +303,20 @@ pub(crate) mod test_support {
         CLAIMANTS.with(|claimants| {
             claimants
                 .borrow_mut()
-                .insert(terminal_id.to_string(), status)
+                .insert((terminal_id.to_string(), None), status)
+        });
+    }
+
+    /// Overrides the claimant check for the claimant `pid` of `terminal_id`.
+    pub(crate) fn set_pid_status(
+        terminal_id: &crate::terminal::TerminalId,
+        pid: u32,
+        status: ClaimantStatus,
+    ) {
+        CLAIMANTS.with(|claimants| {
+            claimants
+                .borrow_mut()
+                .insert((terminal_id.to_string(), Some(pid)), status)
         });
     }
 
@@ -303,15 +328,21 @@ pub(crate) mod test_support {
         terminal_id: &crate::terminal::TerminalId,
         claim: crate::input_origin::InputOriginClaim,
     ) -> Option<ClaimantStatus> {
+        let key = terminal_id.to_string();
         CLAIMANTS
-            .with(|claimants| claimants.borrow().get(&terminal_id.to_string()).copied())
+            .with(|claimants| {
+                let claimants = claimants.borrow();
+                claimants
+                    .get(&(key.clone(), Some(claim.pid)))
+                    .or_else(|| claimants.get(&(key.clone(), None)))
+                    .copied()
+            })
             .or_else(|| {
-                // Without an override, the claimant reads the pane while the test lists it.
                 let job = foreground_pi(terminal_id)?;
                 Some(if job.pi_processes.contains(&claim) {
                     ClaimantStatus::Reading
                 } else {
-                    ClaimantStatus::NotReading
+                    ClaimantStatus::Gone
                 })
             })
     }
@@ -366,17 +397,18 @@ mod tests {
     fn a_claimant_is_gone_only_on_positive_evidence() {
         assert_eq!(
             classify_claimant(CLAIM, ProcessStart::Gone, Some(7000)),
-            ClaimantStatus::NotReading
+            ClaimantStatus::Gone
         );
         // The pid now names a later process.
         assert_eq!(
             classify_claimant(CLAIM, running(101, Some(7000)), Some(7000)),
-            ClaimantStatus::NotReading
+            ClaimantStatus::Gone
         );
-        // It runs but another group owns the terminal (for example, it was suspended).
+        // It runs but another group owns the terminal (for example, it was suspended). It keeps
+        // its claim for when it returns.
         assert_eq!(
             classify_claimant(CLAIM, running(100, Some(7000)), Some(9000)),
-            ClaimantStatus::NotReading
+            ClaimantStatus::Background
         );
     }
 }
