@@ -3483,14 +3483,16 @@ impl PaneRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.io.try_send_bytes(Bytes::from(origin.wrap(bytes)))?;
-        // The frame starts with ESC, which ends any partial prefix, and ends with ST.
-        filter.reset();
+        // The frame ends with ST. Keep the earlier states too: extra states only break more.
+        filter.merge_frame();
         Ok(())
     }
 
     /// Queues text and a delayed Enter. With an origin, each part is framed. Without one, the
     /// text continues the unframed stream and the Enter is filtered on its own: an Enter key
-    /// encoding contains no `ESC _`, so where it lands it can only break a prefix.
+    /// encoding contains no `ESC _`, so where it lands it can only break a prefix. The actor
+    /// can still drop an accepted submission at its deadline, so the filter keeps the states
+    /// of both outcomes.
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3506,7 +3508,7 @@ impl PaneRuntime {
         let mut next = *filter;
         let (text, enter) = match origin {
             Some(origin) => {
-                next.reset();
+                next.merge_frame();
                 (
                     Bytes::from(origin.wrap(&text)),
                     Bytes::from(origin.wrap(&enter)),
@@ -3520,7 +3522,7 @@ impl PaneRuntime {
         let receiver = self
             .io
             .queue_user_input_submission(text, enter, delay, deadline)?;
-        *filter = next;
+        filter.merge(next);
         Ok(receiver)
     }
 

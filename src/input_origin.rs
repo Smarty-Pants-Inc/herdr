@@ -106,39 +106,57 @@ const BROKEN_PREFIX_BYTE: u8 = b'?';
 
 /// Keeps origin frame prefixes out of a stream of unframed PTY writes.
 ///
-/// The filter tracks the emitted stream, including a partial prefix at the end of the last
-/// accepted write. When the next byte would complete a prefix, the filter emits
-/// [`BROKEN_PREFIX_BYTE`] instead. It never deletes bytes, because a deletion can join the bytes
-/// around it into a new prefix. So the emitted stream never contains the prefix, also across
-/// writes. Pi then sees an unknown APC and drops it.
+/// The filter tracks how much of a prefix the emitted stream may end with. When a byte would
+/// complete a prefix, the filter emits [`BROKEN_PREFIX_BYTE`] instead. It never deletes bytes,
+/// because a deletion can join the bytes around it into a new prefix. So the emitted stream
+/// never contains the prefix, also across writes. Pi then sees an unknown APC and drops it.
 ///
-/// The state must describe what the PTY actually received: callers filter with a copy and
-/// commit it only after the write is accepted.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// A queued write can still be dropped before it reaches the PTY (a submission deadline on
+/// Windows). So the filter keeps the set of partial-prefix lengths the stream may end with, and
+/// breaks a prefix that any of them would complete. [`Self::merge`] adds the states of a write
+/// that may or may not land. Callers filter with a copy and commit it only after the write is
+/// accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OriginFrameFilter {
-    matched: usize,
+    /// Bit `n` set: the stream may end with the first `n` bytes of the prefix.
+    possible: u16,
+}
+
+const _: () = assert!(FRAME_PREFIX.len() < u16::BITS as usize);
+
+impl Default for OriginFrameFilter {
+    fn default() -> Self {
+        Self { possible: 1 }
+    }
 }
 
 impl OriginFrameFilter {
     pub(crate) fn filter<'a>(&mut self, input: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.matched == 0 && !input.contains(&ESC) {
+        if self.possible == 1 && !input.contains(&ESC) {
             return Cow::Borrowed(input);
         }
         let mut out: Option<Vec<u8>> = None;
         for (index, &byte) in input.iter().enumerate() {
-            if byte == FRAME_PREFIX[self.matched] {
-                self.matched += 1;
-            } else if byte == ESC {
-                // ESC appears only at the start of the prefix.
-                self.matched = 1;
-            } else {
-                self.matched = 0;
+            let mut next = 0u16;
+            for matched in 0..FRAME_PREFIX.len() {
+                if self.possible & (1 << matched) == 0 {
+                    continue;
+                }
+                next |= if byte == FRAME_PREFIX[matched] {
+                    1 << (matched + 1)
+                } else if byte == ESC {
+                    // ESC appears only at the start of the prefix.
+                    1 << 1
+                } else {
+                    1
+                };
             }
-            if self.matched == FRAME_PREFIX.len() {
+            if next & (1 << FRAME_PREFIX.len()) != 0 {
                 // The replacement byte is not ESC, so no prefix is left in progress.
-                self.matched = 0;
+                next = 1;
                 out.get_or_insert_with(|| input.to_vec())[index] = BROKEN_PREFIX_BYTE;
             }
+            self.possible = next;
         }
         match out {
             Some(out) => Cow::Owned(out),
@@ -146,9 +164,14 @@ impl OriginFrameFilter {
         }
     }
 
-    /// State after a framed write, which ends with a string terminator.
-    pub(crate) fn reset(&mut self) {
-        self.matched = 0;
+    /// Adds the states of another possible history, for a write that may not land.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.possible |= other.possible;
+    }
+
+    /// Adds the state after a framed write, which ends with a string terminator.
+    pub(crate) fn merge_frame(&mut self) {
+        self.possible |= 1;
     }
 }
 
@@ -296,6 +319,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filter_breaks_a_prefix_that_any_possible_history_would_complete() {
+        // A write that may not land: "x" may reach the PTY or be dropped.
+        let mut filter = OriginFrameFilter::default();
+        filter.filter(b"\x1b_herdr-");
+        let mut landed = filter;
+        landed.filter(b"x");
+        filter.merge(landed);
+        let out = filter.filter(b"origin;v=1\x1b\\").into_owned();
+        assert_eq!(out, b"origi?;v=1\x1b\\");
+        // And a dropped frame keeps the earlier partial prefix possible.
+        let mut filter = OriginFrameFilter::default();
+        filter.filter(b"\x1b_herdr-");
+        filter.merge_frame();
+        assert_eq!(&*filter.filter(b"origin"), b"origi?");
     }
 
     #[test]

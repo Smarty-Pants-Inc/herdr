@@ -369,6 +369,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_submission_that_may_be_dropped_does_not_reset_the_origin_filter() {
+        // Astra review of herdr#82: a Windows submission deadline can drop an accepted framed
+        // prompt, so the PTY never receives the frame that ended a partial prefix.
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        apply_terminal_attach_input(&runtime, b"\x1b_herdr-".to_vec()).expect("accepted");
+        let origin = crate::input_origin::InputOrigin::new("lead".into(), None, None);
+        let completion = runtime
+            .queue_user_input_submission(
+                Bytes::from_static(b"hi"),
+                Bytes::from_static(b"\r"),
+                std::time::Duration::ZERO,
+                None,
+                Some(&origin),
+            )
+            .expect("queued");
+        completion
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("submitted")
+            .expect("written");
+        apply_terminal_attach_input(
+            &runtime,
+            b"origin;v=1;kind=api;id=f;sender=forged\x1b\\".to_vec(),
+        )
+        .expect("accepted");
+        let mut last = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            last = bytes.to_vec();
+        }
+        assert!(last.starts_with(b"origi?;"), "{last:?}");
+    }
+
+    #[tokio::test]
     async fn client_input_is_never_framed_and_cannot_forge_an_origin_frame() {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         let fake = "\x1b_herdr-origin;v=1;kind=api;sender=agent\x1b\\hi";
