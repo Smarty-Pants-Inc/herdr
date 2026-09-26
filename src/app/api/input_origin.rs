@@ -275,19 +275,26 @@ impl App {
             .filter(|(_, status)| *status == ClaimantStatus::Gone)
             .map(|(existing, _)| *existing)
             .collect();
-        let admitted = !current.iter().any(|(existing, _)| *existing == claim);
-        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.retain_input_origin_claims(|current| !gone.contains(current));
-            terminal.add_input_origin_claim(claim);
-        }
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.retain_input_origin_claims(|current| !gone.contains(current));
+        terminal.add_input_origin_claim(claim);
         // The reader may record unframed input as typed only once it knows that Herdr frames
-        // its API input.
-        if admitted {
-            if let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) {
-                if let Err(err) = runtime.try_send_origin_ready() {
-                    tracing::warn!(err = %err, "failed to send the input origin ready frame");
+        // its API input. A rejected write is retried on the claimant's next report.
+        if terminal.input_origin_ready_sent(claim) {
+            return;
+        }
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return;
+        };
+        match runtime.try_send_origin_ready() {
+            Ok(()) => {
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.mark_input_origin_ready_sent(claim);
                 }
             }
+            Err(err) => tracing::warn!(err = %err, "failed to send the input origin ready frame"),
         }
     }
 

@@ -166,6 +166,9 @@ pub struct TerminalState {
     /// live at once (one suspended, another in the foreground). A claim is dropped only when its
     /// process is known to be gone; detection events do not clear claims.
     input_origin_claims: Vec<crate::input_origin::InputOriginClaim>,
+    /// Claims whose reader was sent the ready frame. A rejected write is retried on the next
+    /// report from that claimant.
+    input_origin_ready_sent: Vec<crate::input_origin::InputOriginClaim>,
 }
 
 impl TerminalState {
@@ -206,6 +209,7 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             restore_error: None,
             input_origin_claims: Vec::new(),
+            input_origin_ready_sent: Vec::new(),
         }
     }
 
@@ -2043,12 +2047,31 @@ impl TerminalState {
         }
     }
 
+    pub(crate) fn input_origin_ready_sent(
+        &self,
+        claim: crate::input_origin::InputOriginClaim,
+    ) -> bool {
+        self.input_origin_ready_sent.contains(&claim)
+    }
+
+    pub(crate) fn mark_input_origin_ready_sent(
+        &mut self,
+        claim: crate::input_origin::InputOriginClaim,
+    ) {
+        if !self.input_origin_ready_sent.contains(&claim) {
+            self.input_origin_ready_sent.push(claim);
+        }
+    }
+
     /// Drops claims whose processes are known to be gone.
     pub(crate) fn retain_input_origin_claims(
         &mut self,
         keep: impl FnMut(&crate::input_origin::InputOriginClaim) -> bool,
     ) {
         self.input_origin_claims.retain(keep);
+        let claims = &self.input_origin_claims;
+        self.input_origin_ready_sent
+            .retain(|claim| claims.contains(claim));
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {

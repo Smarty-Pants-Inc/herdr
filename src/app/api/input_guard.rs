@@ -534,6 +534,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rejected_ready_frame_is_sent_again_on_the_next_report() {
+        let mut fixture = unclaimed_fixture();
+        // Fill the target's input queue so the ready frame is rejected.
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target pane");
+        let runtime = fixture
+            .app
+            .lookup_runtime_sender(0, target_pane)
+            .expect("runtime");
+        while runtime.try_send_bytes(Bytes::from_static(b"x")).is_ok() {}
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        while fixture.target_rx.try_recv().is_ok() {}
+        report_pi(&mut fixture, Some("v1"), Some(TARGET_PI_PROCESS));
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("ready frame"),
+            Bytes::from(crate::input_origin::ready_frame())
+        );
+    }
+
+    #[tokio::test]
     async fn no_report_can_clear_the_live_pis_claim() {
         let mut fixture = attributed_agent_fixture();
         for peer in [
