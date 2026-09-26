@@ -176,12 +176,14 @@ impl OriginFrameFilter {
     }
 
     /// State to hand over with the PTY on a live server handoff.
+    #[cfg(unix)]
     pub(crate) fn to_handoff(self) -> u16 {
         self.possible
     }
 
     /// State received with a PTY on a live server handoff. Without one (an older server), every
     /// partial marker may be pending, so the first bytes after the handoff cannot complete one.
+    #[cfg(unix)]
     pub(crate) fn from_handoff(possible: Option<u16>) -> Self {
         let every_partial = (1u16 << FRAME_PREFIX.len()) - 1;
         Self {
@@ -386,6 +388,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn filter_state_survives_a_handoff() {
         // Security pass on herdr#82 (P2): a marker split across a live handoff.
         for split in 1..P.len() {

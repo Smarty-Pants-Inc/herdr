@@ -161,9 +161,9 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
-    /// Process group of the foreground Pi job that claimed, from inside that job, to read
-    /// origin frames (smarty-dev#931). Frames go to the pane only while that job is still its
-    /// foreground Pi.
+    /// The Pi process that claimed, as the socket peer of its own report, to read origin frames
+    /// (smarty-dev#931). Frames go to the pane only while that process is a Pi in its foreground
+    /// job. Cleared when the agent process exits or is replaced.
     input_origin_claim: Option<u32>,
 }
 
@@ -369,6 +369,10 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
+        if process_exited {
+            // A claim to read origin frames belongs to one Pi process.
+            self.input_origin_claim = None;
+        }
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
@@ -449,6 +453,10 @@ impl TerminalState {
         self.fallback_state = fallback_state;
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_observed_at = Some(now);
+        if replacement_process_detected {
+            // A later Pi process must claim again.
+            self.input_origin_claim = None;
+        }
         if process_exited {
             if let Some(agent) = agent {
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
@@ -2034,9 +2042,10 @@ impl TerminalState {
         self.input_origin_claim
     }
 
-    /// Records a claim that the caller verified against the pane's foreground Pi job.
-    pub fn set_input_origin_claim(&mut self, process_group: u32) {
-        self.input_origin_claim = Some(process_group);
+    /// Records a claim that the caller verified: `pid` is a Pi process in the pane's
+    /// foreground job and sent the claim itself.
+    pub fn set_input_origin_claim(&mut self, pid: u32) {
+        self.input_origin_claim = Some(pid);
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {
@@ -2580,6 +2589,23 @@ mod tests {
         };
 
         assert_eq!(stabilize_agent_detection(detection), AgentState::Idle);
+    }
+
+    #[test]
+    fn an_origin_frame_claim_ends_with_its_pi_process() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_input_origin_claim(4242);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert_eq!(terminal.input_origin_claim(), None);
     }
 
     #[test]

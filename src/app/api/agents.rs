@@ -563,8 +563,7 @@ mod tests {
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &terminal_id,
             Some(crate::app::api::input_origin::ForegroundPi {
-                process_group: 7000,
-                pids: vec![7000],
+                pi_pids: vec![7000],
             }),
         );
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);

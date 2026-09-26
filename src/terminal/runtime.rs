@@ -470,7 +470,7 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn test_origin_filter(&self) -> crate::input_origin::OriginFrameFilter {
         self.0.test_origin_filter()
     }

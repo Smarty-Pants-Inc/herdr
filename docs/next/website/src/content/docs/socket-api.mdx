@@ -887,11 +887,11 @@ U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
 The markers are the Unicode noncharacters `U+FDD0` and `U+FDD1`. A pane gets frames
-only while its foreground job is the Pi job that reported `input_origin: "v1"`
-through herdr's Pi integration (`pane.report_agent` from source `herdr:pi`). herdr
-accepts that claim only from a process inside that job, checked through the socket
-peer. Other programs, a later Pi process, and Pi versions that do not report it
-receive the raw bytes.
+only while the Pi process that reported `input_origin: "v1"` through herdr's Pi
+integration (`pane.report_agent` from source `herdr:pi`) is a Pi in the pane's
+foreground job. herdr accepts that claim only when the socket peer is that Pi
+process itself. Other programs, a later Pi process, and Pi versions that do not
+report it receive the raw bytes.
 
 `sender` is the calling pane's agent name, else its pane id, else `pid:<n>`, else
 `unknown`. herdr takes it from the socket peer process, never from request text.

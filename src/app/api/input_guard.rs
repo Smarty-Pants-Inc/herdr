@@ -87,8 +87,8 @@ mod tests {
         target_rx: Receiver<Bytes>,
     }
 
-    /// The target pane's foreground Pi job in these tests.
-    const TARGET_PI_GROUP: u32 = 7000;
+    /// In these tests the target pane's foreground job has a wrapper (not Pi) and a Pi process.
+    const TARGET_WRAPPER_PROCESS: u32 = 7000;
     const TARGET_PI_PROCESS: u32 = 7001;
 
     fn attributed_agent_fixture() -> Fixture {
@@ -99,7 +99,7 @@ mod tests {
             .terminals
             .get_mut(&fixture.target_terminal_id)
             .expect("target state")
-            .set_input_origin_claim(TARGET_PI_GROUP);
+            .set_input_origin_claim(TARGET_PI_PROCESS);
         fixture
     }
 
@@ -147,8 +147,7 @@ mod tests {
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &target_terminal_id,
             Some(crate::app::api::input_origin::ForegroundPi {
-                process_group: TARGET_PI_GROUP,
-                pids: vec![TARGET_PI_GROUP, TARGET_PI_PROCESS],
+                pi_pids: vec![TARGET_PI_PROCESS],
             }),
         );
 
@@ -489,8 +488,14 @@ mod tests {
     async fn only_a_report_from_the_foreground_pi_job_claims_origin_frames() {
         // Security pass on herdr#82 (P1): a report is not proof of who sent it.
         let mut fixture = unclaimed_fixture();
-        // Another pane's agent, a process outside every pane, and an unattributed caller.
-        for peer in [Some(std::process::id()), Some(u32::MAX), None] {
+        // A non-Pi process in the same job, another pane's agent, a process outside every
+        // pane, and an unattributed caller.
+        for peer in [
+            Some(TARGET_WRAPPER_PROCESS),
+            Some(std::process::id()),
+            Some(u32::MAX),
+            None,
+        ] {
             report_pi(&mut fixture, Some("v1"), peer);
             assert!(!is_framed(&send_text(&mut fixture, "x")), "peer {peer:?}");
         }
@@ -514,11 +519,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_pi_process_in_the_pane_does_not_inherit_the_claim() {
+    async fn a_new_pi_process_in_the_same_job_does_not_inherit_the_claim() {
+        // Security pass on herdr#82: `sh -c 'pi-new; pi-old'` keeps one process group.
         let mut fixture = attributed_agent_fixture();
         let replacement = crate::app::api::input_origin::ForegroundPi {
-            process_group: 8000,
-            pids: vec![8000],
+            pi_pids: vec![8000],
         };
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &fixture.target_terminal_id,

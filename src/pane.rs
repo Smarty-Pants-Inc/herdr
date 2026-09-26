@@ -3483,7 +3483,7 @@ impl PaneRuntime {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn test_origin_filter(&self) -> crate::input_origin::OriginFrameFilter {
         *self
             .origin_filter

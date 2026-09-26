@@ -661,7 +661,7 @@ U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<caller>[;pane=<pane id>][;sessi
 U+FDD0 herdr-origin;end;id=<id> U+FDD1
 ```
 
-标记是 Unicode 非字符 `U+FDD0` 和 `U+FDD1`。只有当窗格的前台作业是通过 herdr 的 Pi 集成（来源为 `herdr:pi` 的 `pane.report_agent`）上报了 `input_origin: "v1"` 的那个 Pi 作业时，该窗格才会收到帧。herdr 只接受由该作业内的进程发出的上报，并通过 socket 对端核实。其他程序以及不上报它的 Pi 收到的是原始字节。
+标记是 Unicode 非字符 `U+FDD0` 和 `U+FDD1`。只有当通过 herdr 的 Pi 集成（来源为 `herdr:pi` 的 `pane.report_agent`）上报了 `input_origin: "v1"` 的那个 Pi 进程仍是窗格前台作业中的 Pi 时，该窗格才会收到帧。herdr 只在 socket 对端就是该 Pi 进程本身时才接受这一上报。其他程序以及不上报它的 Pi 收到的是原始字节。
 
 `sender` 是调用方窗格的智能体名称；没有时为窗格 ID，再没有时为 `pid:<n>`，否则为 `unknown`。herdr 从 socket 对端进程得出它，从不取自请求文本。值经过百分号编码。herdr 会把所有其他输入（包括键盘输入、粘贴和帧内的负载）中任何 `U+FDD0` 的最后一个字节替换为 `?`，因此只有 herdr 能开始一个帧。
 
