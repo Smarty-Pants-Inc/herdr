@@ -114,6 +114,8 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     }
     record.extend_from_slice(line.as_bytes());
     record.push(b'\n');
+    // The lock is held, so the end cannot move before the write.
+    file.seek(SeekFrom::End(0))?;
     file.write_all(&record)?;
     file.sync_data()?;
     publish_directories(path)

@@ -57,34 +57,11 @@ pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::
     Ok(file)
 }
 
-/// Opens `path` for reading and appending as a private log. It refuses anything but a regular
-/// file (a symlink included), creates a missing file with a protected owner/SYSTEM DACL, and
-/// requires an existing file to be owned by this user, replacing its DACL with that one.
+/// Opens `path` as a private log; see `windows::open_private_log_file`. The handle is opened
+/// for writing, not appending, so callers must write at the end of the file.
 #[cfg(windows)]
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(std::io::Error::other("the log is not a regular file"));
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            match super::windows::create_config_temporary(path, true) {
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Err(err) => return Err(err),
-    }
-    super::windows::restrict_private_log_file(path)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::other("the log is not a regular file"));
-    }
-    Ok(file)
+    super::windows::open_private_log_file(path)
 }
 
 /// Opens `path` for reading and appending. No private-file support on this platform.

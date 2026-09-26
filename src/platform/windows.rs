@@ -216,44 +216,80 @@ pub(crate) fn create_config_temporary(
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
-/// Makes an existing log file private: it must be owned by the current user, and its DACL is
-/// replaced with a protected one granting only SYSTEM and the owner. Fails closed.
-pub(crate) fn restrict_private_log_file(path: &std::path::Path) -> std::io::Result<()> {
+/// Opens or creates `path` as a private log and returns the handle that was validated.
+///
+/// One handle carries the whole decision: it is opened without following a final reparse point
+/// and without delete sharing (so the entry cannot be renamed or replaced while it is open); a
+/// new file gets a protected owner/SYSTEM DACL; the handle's object must be a regular file
+/// owned by the current user, and its DACL is replaced with that protected one through the same
+/// handle. Writes then go to that same object. Fails closed on any step.
+pub(crate) fn open_private_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use interprocess::os::windows::security_descriptor::{
         AsSecurityDescriptorExt as _, SecurityDescriptor,
     };
+    use std::os::windows::fs::MetadataExt as _;
     use widestring::U16CString;
     use windows_sys::Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE},
         Security::{
-            EqualSid, GetFileSecurityW, GetSecurityDescriptorOwner, GetTokenInformation,
-            SetFileSecurityW, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER,
+            EqualSid, GetKernelObjectSecurity, GetSecurityDescriptorOwner, GetTokenInformation,
+            SetKernelObjectSecurity, TokenUser, DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_ALWAYS, WRITE_DAC,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
+    let sddl =
+        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
+    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    descriptor.write_to_security_attributes(&mut attributes);
     let wide = extended_length_path(path)?;
-
-    // The file's owner.
-    let mut needed = 0u32;
-    unsafe {
-        GetFileSecurityW(
+    let handle = unsafe {
+        CreateFileW(
             wide.as_ptr(),
-            OWNER_SECURITY_INFORMATION,
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             null_mut(),
-            0,
-            &mut needed,
         )
     };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // CreateFileW returned an owned handle; File closes it exactly once.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(std::io::Error::other("the log is not a regular file"));
+    }
+
+    // The owner of the opened object.
+    let raw = file.as_raw_handle();
+    let mut needed = 0u32;
+    unsafe { GetKernelObjectSecurity(raw, OWNER_SECURITY_INFORMATION, null_mut(), 0, &mut needed) };
     if needed == 0 {
         return Err(std::io::Error::last_os_error());
     }
     // u64 elements keep the self-relative descriptor aligned.
     let mut owner_descriptor = vec![0u64; (needed as usize).div_ceil(8)];
     if unsafe {
-        GetFileSecurityW(
-            wide.as_ptr(),
+        GetKernelObjectSecurity(
+            raw,
             OWNER_SECURITY_INFORMATION,
             owner_descriptor.as_mut_ptr().cast(),
             needed,
@@ -298,24 +334,15 @@ pub(crate) fn restrict_private_log_file(path: &std::path::Path) -> std::io::Resu
     if read == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // The buffer is 8-byte aligned and at least as large as TOKEN_USER.
+    // The buffer is 8-byte aligned and holds a TOKEN_USER.
     let user = unsafe { &*(user_buffer.as_ptr().cast::<TOKEN_USER>()) };
     if unsafe { EqualSid(owner, user.User.Sid) } == 0 {
         return Err(std::io::Error::other("the log is not owned by this user"));
     }
 
-    let sddl =
-        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
-    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
-    let mut attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 0,
-    };
-    descriptor.write_to_security_attributes(&mut attributes);
     if unsafe {
-        SetFileSecurityW(
-            wide.as_ptr(),
+        SetKernelObjectSecurity(
+            raw,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             attributes.lpSecurityDescriptor,
         )
@@ -323,7 +350,7 @@ pub(crate) fn restrict_private_log_file(path: &std::path::Path) -> std::io::Resu
     {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(())
+    Ok(file)
 }
 
 pub(crate) fn write_config_temporary(
