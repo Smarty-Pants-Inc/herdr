@@ -85,28 +85,25 @@ impl App {
     }
 }
 
+/// Log paths whose directory entries this process has made durable.
+static PUBLISHED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
 /// Appends `line` as one JSONL record and makes it durable before returning.
 ///
 /// An exclusive file lock serializes writers, including other Herdr processes that share the
 /// state directory. If an earlier write left a partial record (a short write before an error),
 /// the record starts on a new line, so every accepted record stays separately parseable; the
-/// fragment is a malformed line that readers skip. When this call creates the log file or its
-/// directories, their directory entries are synced too.
+/// fragment is a malformed line that readers skip.
+///
+/// Until one call in this process has synced the directory entries of the log and of every
+/// directory above it, each call syncs them before returning. A path that exists is not proof
+/// that it was made durable (an earlier attempt, or another process, may have failed after
+/// creating it). ponytail: the chain is synced once per process, not per record.
 fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut created_dirs = Vec::new();
     if let Some(parent) = path.parent() {
-        let mut dir = Some(parent);
-        while let Some(current) = dir.filter(|current| !current.as_os_str().is_empty()) {
-            if current.exists() {
-                break;
-            }
-            created_dirs.push(current.to_path_buf());
-            dir = current.parent();
-        }
         std::fs::create_dir_all(parent)?;
     }
-    let created_file = !path.exists();
     let mut file = crate::platform::open_private_append_file(path)?;
     file.lock()?;
     let mut record = Vec::with_capacity(line.len() + 2);
@@ -122,18 +119,46 @@ fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
     record.push(b'\n');
     file.write_all(&record)?;
     file.sync_data()?;
-    if created_file {
-        if let Some(parent) = path.parent() {
-            crate::platform::sync_parent_directory(parent)?;
-        }
+    publish_directories(path)
+}
+
+fn publish_directories(path: &std::path::Path) -> std::io::Result<()> {
+    let mut published = PUBLISHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if published.iter().any(|done| done == path) {
+        return Ok(());
     }
-    // Deepest first: each created directory's entry lives in its parent.
-    for dir in &created_dirs {
-        if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            crate::platform::sync_parent_directory(parent)?;
+    for dir in path.ancestors().skip(1) {
+        if dir.as_os_str().is_empty() {
+            break;
         }
+        sync_directory(dir)?;
     }
+    published.push(path.to_path_buf());
     Ok(())
+}
+
+#[cfg(not(test))]
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    crate::platform::sync_parent_directory(dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Directory syncs that fail before any succeeds, and the syncs done, for tests.
+    static FAIL_DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DIRECTORY_SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    if FAIL_DIRECTORY_SYNCS.get() > 0 {
+        FAIL_DIRECTORY_SYNCS.set(FAIL_DIRECTORY_SYNCS.get() - 1);
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    DIRECTORY_SYNCS.set(DIRECTORY_SYNCS.get() + 1);
+    crate::platform::sync_parent_directory(dir)
 }
 
 #[cfg(test)]
@@ -300,6 +325,63 @@ mod tests {
         assert_eq!(log_lines(&fixture.app).len(), 1);
         assert!(fixture.target_rx.try_recv().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_directory_sync_is_completed_before_the_next_write() {
+        // Astra review of herdr#84: the path exists after a failed first attempt, but its
+        // directory entry may not be durable.
+        let mut fixture = fixture();
+        super::FAIL_DIRECTORY_SYNCS.set(1);
+        let response: ErrorResponse =
+            serde_json::from_str(&send_text(&mut fixture, "first")).expect("error");
+        assert_eq!(response.error.code, "input_log_unavailable");
+        assert!(fixture.target_rx.try_recv().is_err());
+        super::DIRECTORY_SYNCS.set(0);
+        send_text(&mut fixture, "second");
+        assert!(
+            super::DIRECTORY_SYNCS.get() > 0,
+            "the retry did not sync the directory"
+        );
+        assert!(fixture.target_rx.try_recv().is_ok());
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_readable_log_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = fixture();
+        std::fs::write(&fixture.app.api_input_log, b"").unwrap();
+        std::fs::set_permissions(
+            &fixture.app.api_input_log,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        send_text(&mut fixture, "x");
+        let mode = std::fs::metadata(&fixture.app.api_input_log)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(log_lines(&fixture.app).len(), 1);
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_log_is_refused() {
+        let mut fixture = fixture();
+        let target = fixture.app.api_input_log.with_extension("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &fixture.app.api_input_log).unwrap();
+        let response: ErrorResponse =
+            serde_json::from_str(&send_text(&mut fixture, "x")).expect("error");
+        assert_eq!(response.error.code, "input_log_unavailable");
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+        let _ = std::fs::remove_file(&fixture.app.api_input_log);
+        let _ = std::fs::remove_file(&target);
     }
 
     #[tokio::test]

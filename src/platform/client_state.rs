@@ -31,25 +31,48 @@ pub(crate) fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Opens `path` for reading and appending, creating it readable and writable by the owner only.
+/// Opens `path` for reading and appending as an owner-only log. It creates the file with mode
+/// 0600, does not follow a final symlink, refuses anything but a regular file owned by this
+/// user, and restricts an existing file that others can read or write to 0600.
 #[cfg(unix)]
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::other("the log is not a regular file"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("the log is not owned by this user"));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
-/// Opens `path` for reading and appending. The file inherits the per-user ACL of the state
-/// directory.
+/// Opens `path` for reading and appending as a log. It refuses anything but a regular file
+/// (a symlink included); the file inherits the per-user ACL of the state directory.
 #[cfg(not(unix))]
 pub(crate) fn open_private_append_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::other("the log is not a regular file"));
+        }
+    }
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .create(true)
         .append(true)
-        .open(path)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("the log is not a regular file"));
+    }
+    Ok(file)
 }
