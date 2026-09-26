@@ -519,6 +519,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_detection_of_a_restart_keeps_the_new_pis_claim() {
+        // Astra review of herdr#82: Pi A exits, Pi B claims before the detector reports it,
+        // then the detector reports A's exit and B's start.
+        let mut fixture = attributed_agent_fixture();
+        crate::app::api::input_origin::test_support::set_foreground_pi(
+            &fixture.target_terminal_id,
+            Some(crate::app::api::input_origin::ForegroundPi {
+                pi_pids: vec![8000],
+            }),
+        );
+        report_pi(&mut fixture, Some("v1"), Some(8000));
+        let terminal = fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&fixture.target_terminal_id)
+            .expect("target state");
+        let now = std::time::Instant::now();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            now,
+        );
+        terminal
+            .set_detected_agent_process_at(Agent::Pi, now + std::time::Duration::from_millis(1));
+        assert!(is_framed(&send_text(&mut fixture, "x")));
+    }
+
+    #[tokio::test]
     async fn a_new_pi_process_in_the_same_job_does_not_inherit_the_claim() {
         // Security pass on herdr#82: `sh -c 'pi-new; pi-old'` keeps one process group.
         let mut fixture = attributed_agent_fixture();

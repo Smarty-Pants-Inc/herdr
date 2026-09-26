@@ -163,7 +163,8 @@ pub struct TerminalState {
     pub restore_error: Option<String>,
     /// The Pi process that claimed, as the socket peer of its own report, to read origin frames
     /// (smarty-dev#931). Frames go to the pane only while that process is a Pi in its foreground
-    /// job. Cleared when the agent process exits or is replaced.
+    /// job. The pid is the process identity: detection events do not clear it, because they can
+    /// arrive after a newer Pi has already claimed.
     input_origin_claim: Option<u32>,
 }
 
@@ -369,10 +370,6 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
-        if process_exited {
-            // A claim to read origin frames belongs to one Pi process.
-            self.input_origin_claim = None;
-        }
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
@@ -453,10 +450,6 @@ impl TerminalState {
         self.fallback_state = fallback_state;
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_observed_at = Some(now);
-        if replacement_process_detected {
-            // A later Pi process must claim again.
-            self.input_origin_claim = None;
-        }
         if process_exited {
             if let Some(agent) = agent {
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
@@ -2589,23 +2582,6 @@ mod tests {
         };
 
         assert_eq!(stabilize_agent_detection(detection), AgentState::Idle);
-    }
-
-    #[test]
-    fn an_origin_frame_claim_ends_with_its_pi_process() {
-        let mut terminal = test_terminal();
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
-        terminal.set_input_origin_claim(4242);
-        terminal.set_detected_state_with_screen_signals_at(
-            Some(Agent::Pi),
-            AgentState::Idle,
-            false,
-            false,
-            false,
-            true,
-            Instant::now(),
-        );
-        assert_eq!(terminal.input_origin_claim(), None);
     }
 
     #[test]
