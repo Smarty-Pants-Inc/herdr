@@ -1418,11 +1418,32 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
 }
 
-/// When the process was created, as a FILETIME value. With the pid it names one process
-/// generation: a recycled pid has a later creation time.
-pub fn process_start_time(pid: u32) -> Option<u64> {
-    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    process_creation_time(process.0)
+/// Whether `pid` runs, and when it was created (a FILETIME value). With the pid, the creation
+/// time names one process generation: a recycled pid is created later. Windows has no process
+/// groups here.
+pub fn process_start(pid: u32) -> super::ProcessStart {
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            super::ProcessStart::Gone
+        } else {
+            super::ProcessStart::Unknown
+        };
+    };
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+        return super::ProcessStart::Unknown;
+    }
+    if exit_code != STILL_ACTIVE {
+        return super::ProcessStart::Gone;
+    }
+    match process_creation_time(process.0) {
+        Some(start_time) => super::ProcessStart::Running {
+            start_time,
+            process_group: None,
+        },
+        None => super::ProcessStart::Unknown,
+    }
 }
 
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {

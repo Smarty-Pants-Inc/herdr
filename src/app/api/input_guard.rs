@@ -99,9 +99,9 @@ mod tests {
     fn foreground_pis(
         pis: &[crate::input_origin::InputOriginClaim],
     ) -> Option<crate::app::api::input_origin::ForegroundPi> {
-        Some(crate::app::api::input_origin::ForegroundPi::Known(
-            pis.to_vec(),
-        ))
+        Some(crate::app::api::input_origin::ForegroundPi {
+            pi_processes: pis.to_vec(),
+        })
     }
 
     fn attributed_agent_fixture() -> Fixture {
@@ -556,9 +556,9 @@ mod tests {
         // Security pass on herdr#82 (P2): a failed process lookup must not turn API input into
         // typed input.
         let mut fixture = attributed_agent_fixture();
-        crate::app::api::input_origin::test_support::set_foreground_pi(
+        crate::app::api::input_origin::test_support::set_claimant_status(
             &fixture.target_terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi::Unknown),
+            crate::app::api::input_origin::ClaimantStatus::Unknown,
         );
         for method in [
             Method::PaneSendText(PaneSendTextParams {
@@ -591,11 +591,64 @@ mod tests {
         }
         // A pane without a claim is not affected.
         let mut fixture = unclaimed_fixture();
-        crate::app::api::input_origin::test_support::set_foreground_pi(
+        crate::app::api::input_origin::test_support::set_claimant_status(
             &fixture.target_terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi::Unknown),
+            crate::app::api::input_origin::ClaimantStatus::Unknown,
         );
         assert_eq!(send_text(&mut fixture, "x"), Bytes::from_static(b"x"));
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_is_not_identified_as_pi_keeps_its_claim() {
+        // Astra review of herdr#82: identification is best effort (a Node Pi whose argv cannot
+        // be read, or an unreadable process next to a readable sibling). Missing from the
+        // identified list must not unframe the reader or let another Pi take its claim.
+        let helper = crate::input_origin::InputOriginClaim {
+            pid: 7002,
+            start_time: 300,
+        };
+        for status in [
+            crate::app::api::input_origin::ClaimantStatus::Reading,
+            crate::app::api::input_origin::ClaimantStatus::Unknown,
+        ] {
+            let mut fixture = attributed_agent_fixture();
+            crate::app::api::input_origin::test_support::set_foreground_pi(
+                &fixture.target_terminal_id,
+                foreground_pis(&[helper]),
+            );
+            crate::app::api::input_origin::test_support::set_claimant_status(
+                &fixture.target_terminal_id,
+                status,
+            );
+            report_pi(&mut fixture, Some("v1"), Some(helper.pid));
+            assert_eq!(
+                fixture.app.state.terminals[&fixture.target_terminal_id].input_origin_claim(),
+                Some(TARGET_PI),
+                "{status:?}"
+            );
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "send".into(),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: fixture.target_pane_id.clone(),
+                        text: "x".into(),
+                        allow_cross_pane: true,
+                    }),
+                },
+                attributed_context(),
+            );
+            match status {
+                crate::app::api::input_origin::ClaimantStatus::Reading => {
+                    assert_ok(&response);
+                    assert!(is_framed(&fixture.target_rx.try_recv().expect("bytes")));
+                }
+                _ => {
+                    let response: ErrorResponse = serde_json::from_str(&response).expect("error");
+                    assert_eq!(response.error.code, "input_origin_unavailable");
+                    assert!(fixture.target_rx.try_recv().is_err());
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -572,7 +572,9 @@ mod tests {
         terminal.set_agent_name("reviewer".into());
         crate::app::api::input_origin::test_support::set_foreground_pi(
             &terminal_id,
-            Some(crate::app::api::input_origin::ForegroundPi::Known(vec![pi])),
+            Some(crate::app::api::input_origin::ForegroundPi {
+                pi_processes: vec![pi],
+            }),
         );
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         runtime.test_process_pty_bytes(b"\x1b[?2004h");

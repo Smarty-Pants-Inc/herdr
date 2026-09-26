@@ -554,9 +554,10 @@ pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
     }
 }
 
-/// When the process started, in microseconds since the epoch. With the pid it names one
-/// process generation: a recycled pid has a later start time.
-pub fn process_start_time(pid: u32) -> Option<u64> {
+/// Whether `pid` runs, and when it started (microseconds since the epoch) and in which process
+/// group. With the pid, the start time names one process generation: a recycled pid starts
+/// later.
+pub fn process_start(pid: u32) -> super::ProcessStart {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let ret = unsafe {
@@ -569,9 +570,20 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
         )
     };
     if ret != size {
-        return None;
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            super::ProcessStart::Gone
+        } else {
+            super::ProcessStart::Unknown
+        };
     }
-    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    // SZOMB: exited, not yet reaped.
+    if info.pbi_status == 5 {
+        return super::ProcessStart::Gone;
+    }
+    super::ProcessStart::Running {
+        start_time: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        process_group: Some(info.pbi_pgid),
+    }
 }
 
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {

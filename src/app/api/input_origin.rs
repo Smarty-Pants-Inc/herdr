@@ -2,12 +2,22 @@ use crate::api::ApiRequestContext;
 use crate::app::App;
 use crate::input_origin::InputOrigin;
 
-/// What Herdr can see of the Pi processes in a pane's foreground job.
+/// The Pi processes Herdr can identify in a pane's foreground job. Used only to accept a claim:
+/// identification is best effort, so absence from this list proves nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ForegroundPi {
-    /// The job was read. These are its Pi processes with their start times (maybe none).
-    Known(Vec<crate::input_origin::InputOriginClaim>),
-    /// The job, or a Pi process's start time, could not be read.
+pub(crate) struct ForegroundPi {
+    pub pi_processes: Vec<crate::input_origin::InputOriginClaim>,
+}
+
+/// Whether the process that claimed to read origin frames still reads the pane, checked on
+/// that process directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimantStatus {
+    /// The same process generation runs in the pane's foreground process group.
+    Reading,
+    /// It exited, its pid now names a later process, or it left the foreground.
+    NotReading,
+    /// Herdr cannot tell.
     Unknown,
 }
 
@@ -27,9 +37,41 @@ impl InputOriginUnavailable {
     }
 }
 
-/// The Pi processes in the pane's foreground job, each identified on its own, so a wrapper or
-/// sibling process in the same job is not taken for Pi. Tests can set the job through
-/// `test_support::set_foreground_pi`.
+/// Classifies a claimant from what the platform says about its pid and about the pane's
+/// foreground process group. Nothing here depends on recognising the process as Pi.
+pub(crate) fn classify_claimant(
+    claim: crate::input_origin::InputOriginClaim,
+    process: crate::platform::ProcessStart,
+    pane_foreground_group: Option<u32>,
+) -> ClaimantStatus {
+    match process {
+        crate::platform::ProcessStart::Gone => ClaimantStatus::NotReading,
+        crate::platform::ProcessStart::Unknown => ClaimantStatus::Unknown,
+        crate::platform::ProcessStart::Running { start_time, .. }
+            if start_time != claim.start_time =>
+        {
+            // The pid names a later process: the claimant exited.
+            ClaimantStatus::NotReading
+        }
+        crate::platform::ProcessStart::Running {
+            process_group: Some(group),
+            ..
+        } => match pane_foreground_group {
+            Some(foreground) if foreground == group => ClaimantStatus::Reading,
+            Some(_) => ClaimantStatus::NotReading,
+            None => ClaimantStatus::Unknown,
+        },
+        // No process groups on this platform: a running claimant in the pane is its reader.
+        crate::platform::ProcessStart::Running {
+            process_group: None,
+            ..
+        } => ClaimantStatus::Reading,
+    }
+}
+
+/// The Pi processes Herdr can identify in the pane's foreground job, each identified on its
+/// own, so a wrapper or sibling process in the same job is not taken for Pi. Tests can set the
+/// job through `test_support::set_foreground_pi`.
 fn foreground_pi(
     terminal_id: &crate::terminal::TerminalId,
     runtime: &crate::terminal::TerminalRuntime,
@@ -40,33 +82,59 @@ fn foreground_pi(
     }
     #[cfg(not(test))]
     let _ = terminal_id;
+    let Some(job) = runtime.child_pid().and_then(crate::detect::foreground_job) else {
+        return ForegroundPi {
+            pi_processes: Vec::new(),
+        };
+    };
+    let pi_processes = job
+        .processes
+        .iter()
+        .filter(|process| {
+            let alone = crate::platform::ForegroundJob {
+                process_group_id: process.pid,
+                processes: vec![(*process).clone()],
+            };
+            crate::detect::identify_agent_in_job(&alone)
+                .is_some_and(|(agent, _)| agent == crate::detect::Agent::Pi)
+        })
+        .filter_map(
+            |process| match crate::platform::process_start(process.pid) {
+                crate::platform::ProcessStart::Running { start_time, .. } => {
+                    Some(crate::input_origin::InputOriginClaim {
+                        pid: process.pid,
+                        start_time,
+                    })
+                }
+                _ => None,
+            },
+        )
+        .collect();
+    ForegroundPi { pi_processes }
+}
+
+/// Whether `claim`'s process still reads the pane. Tests can set it through
+/// `test_support::set_claimant_status`.
+fn claimant_status(
+    terminal_id: &crate::terminal::TerminalId,
+    runtime: &crate::terminal::TerminalRuntime,
+    claim: crate::input_origin::InputOriginClaim,
+) -> ClaimantStatus {
+    #[cfg(test)]
+    if let Some(status) = test_support::claimant_status(terminal_id, claim) {
+        return status;
+    }
+    #[cfg(not(test))]
+    let _ = terminal_id;
     let Some(child_pid) = runtime.child_pid() else {
         // No process runs in the pane.
-        return ForegroundPi::Known(Vec::new());
+        return ClaimantStatus::NotReading;
     };
-    let Some(job) = crate::detect::foreground_job(child_pid) else {
-        return ForegroundPi::Unknown;
-    };
-    let mut pi_processes = Vec::new();
-    for process in &job.processes {
-        let alone = crate::platform::ForegroundJob {
-            process_group_id: process.pid,
-            processes: vec![process.clone()],
-        };
-        let is_pi = crate::detect::identify_agent_in_job(&alone)
-            .is_some_and(|(agent, _)| agent == crate::detect::Agent::Pi);
-        if !is_pi {
-            continue;
-        }
-        let Some(start_time) = crate::platform::process_start_time(process.pid) else {
-            return ForegroundPi::Unknown;
-        };
-        pi_processes.push(crate::input_origin::InputOriginClaim {
-            pid: process.pid,
-            start_time,
-        });
-    }
-    ForegroundPi::Known(pi_processes)
+    classify_claimant(
+        claim,
+        crate::platform::process_start(claim.pid),
+        crate::platform::foreground_process_group_id(child_pid),
+    )
 }
 
 impl App {
@@ -74,9 +142,9 @@ impl App {
     /// error when the write must not be sent.
     ///
     /// A pane gets frames while the Pi process that claimed to read them (same pid and start
-    /// time) is a Pi in its foreground job. It gets raw bytes when it has no claim, or when Herdr
-    /// can see that the claimant is gone. If Herdr cannot see the job, a claimed pane gets
-    /// nothing: raw bytes would be recorded as typed input.
+    /// time) runs in its foreground process group. It gets raw bytes when it has no claim, or
+    /// when Herdr sees that the claimant exited or left the foreground. If Herdr cannot tell,
+    /// a claimed pane gets nothing: raw bytes would be recorded as typed input.
     pub(super) fn api_input_origin(
         &self,
         ws_idx: usize,
@@ -100,22 +168,20 @@ impl App {
         else {
             return Ok(None);
         };
-        match foreground_pi(terminal_id, runtime) {
-            ForegroundPi::Unknown => Err(InputOriginUnavailable),
-            ForegroundPi::Known(pis) if pis.contains(&claim) => {
-                Ok(Some(self.api_caller_origin(context)))
-            }
-            ForegroundPi::Known(_) => Ok(None),
+        match claimant_status(terminal_id, runtime, claim) {
+            ClaimantStatus::Reading => Ok(Some(self.api_caller_origin(context))),
+            ClaimantStatus::NotReading => Ok(None),
+            ClaimantStatus::Unknown => Err(InputOriginUnavailable),
         }
     }
 
     /// Records a Pi's claim to read origin frames, only when the socket peer that sent it is
     /// itself a Pi process in the pane's foreground job. A wrapper or sibling in that job,
     /// another pane's process, a process outside every pane, or an unattributed caller cannot
-    /// change it. While the current claimant is still a Pi in the job, no other process can
-    /// replace its claim: the first Pi to claim is the one that reads the terminal (only the
-    /// TUI sets the claim, and any other Pi in its job was started later). A report without the
-    /// claim changes nothing: frames stop when the claimant leaves the foreground or exits.
+    /// change it. No other process can replace a claim unless its claimant is known not to read
+    /// the pane any more: the first Pi to claim is the one that reads the terminal (only the TUI
+    /// sets the claim, and any other Pi in its job was started later). A report without the
+    /// claim changes nothing.
     pub(super) fn record_input_origin_claim(
         &mut self,
         ws_idx: usize,
@@ -131,21 +197,28 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return;
         };
-        let ForegroundPi::Known(pis) = foreground_pi(&terminal_id, runtime) else {
+        let Some(claim) = foreground_pi(&terminal_id, runtime)
+            .pi_processes
+            .into_iter()
+            .find(|process| process.pid == peer_pid)
+        else {
             return;
         };
-        let Some(claim) = pis.iter().copied().find(|process| process.pid == peer_pid) else {
-            return;
-        };
-        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
-            return;
-        };
-        if let Some(current) = terminal.input_origin_claim() {
-            if current != claim && pis.contains(&current) {
+        let current = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.input_origin_claim());
+        if let Some(current) = current {
+            if current != claim
+                && claimant_status(&terminal_id, runtime, current) != ClaimantStatus::NotReading
+            {
                 return;
             }
         }
-        terminal.set_input_origin_claim(claim);
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.set_input_origin_claim(claim);
+        }
     }
 
     /// Names the API caller from socket attribution only, never from request text.
@@ -186,15 +259,17 @@ pub(super) fn send_api_bytes(
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::ForegroundPi;
+    use super::{ClaimantStatus, ForegroundPi};
     use std::cell::RefCell;
     use std::collections::HashMap;
 
     thread_local! {
         static JOBS: RefCell<HashMap<String, ForegroundPi>> = RefCell::new(HashMap::new());
+        static CLAIMANTS: RefCell<HashMap<String, ClaimantStatus>> = RefCell::new(HashMap::new());
     }
 
-    /// Sets what a test sees of `terminal_id`'s foreground job; `None` uses the live lookup.
+    /// Sets the Pi processes a test identifies in `terminal_id`'s foreground job. The claimant
+    /// then reads the pane while it is in that list; `None` uses the live lookups.
     pub(crate) fn set_foreground_pi(
         terminal_id: &crate::terminal::TerminalId,
         job: Option<ForegroundPi>,
@@ -208,7 +283,100 @@ pub(crate) mod test_support {
         });
     }
 
+    /// Overrides the claimant check for `terminal_id`.
+    pub(crate) fn set_claimant_status(
+        terminal_id: &crate::terminal::TerminalId,
+        status: ClaimantStatus,
+    ) {
+        CLAIMANTS.with(|claimants| {
+            claimants
+                .borrow_mut()
+                .insert(terminal_id.to_string(), status)
+        });
+    }
+
     pub(super) fn foreground_pi(terminal_id: &crate::terminal::TerminalId) -> Option<ForegroundPi> {
         JOBS.with(|jobs| jobs.borrow().get(&terminal_id.to_string()).cloned())
+    }
+
+    pub(super) fn claimant_status(
+        terminal_id: &crate::terminal::TerminalId,
+        claim: crate::input_origin::InputOriginClaim,
+    ) -> Option<ClaimantStatus> {
+        CLAIMANTS
+            .with(|claimants| claimants.borrow().get(&terminal_id.to_string()).copied())
+            .or_else(|| {
+                // Without an override, the claimant reads the pane while the test lists it.
+                let job = foreground_pi(terminal_id)?;
+                Some(if job.pi_processes.contains(&claim) {
+                    ClaimantStatus::Reading
+                } else {
+                    ClaimantStatus::NotReading
+                })
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_claimant, ClaimantStatus};
+    use crate::input_origin::InputOriginClaim;
+    use crate::platform::ProcessStart;
+
+    const CLAIM: InputOriginClaim = InputOriginClaim {
+        pid: 7001,
+        start_time: 100,
+    };
+
+    fn running(start_time: u64, process_group: Option<u32>) -> ProcessStart {
+        ProcessStart::Running {
+            start_time,
+            process_group,
+        }
+    }
+
+    #[test]
+    fn a_claimant_is_checked_on_its_own_pid_not_by_name() {
+        // A Node Pi whose argv cannot be read is still the same process in the foreground.
+        assert_eq!(
+            classify_claimant(CLAIM, running(100, Some(7000)), Some(7000)),
+            ClaimantStatus::Reading
+        );
+        // Platforms without process groups.
+        assert_eq!(
+            classify_claimant(CLAIM, running(100, None), None),
+            ClaimantStatus::Reading
+        );
+    }
+
+    #[test]
+    fn a_claimant_that_cannot_be_read_is_unknown_not_absent() {
+        // An unreadable claimant next to a readable sibling, or an unreadable foreground group.
+        assert_eq!(
+            classify_claimant(CLAIM, ProcessStart::Unknown, Some(7000)),
+            ClaimantStatus::Unknown
+        );
+        assert_eq!(
+            classify_claimant(CLAIM, running(100, Some(7000)), None),
+            ClaimantStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_claimant_is_gone_only_on_positive_evidence() {
+        assert_eq!(
+            classify_claimant(CLAIM, ProcessStart::Gone, Some(7000)),
+            ClaimantStatus::NotReading
+        );
+        // The pid now names a later process.
+        assert_eq!(
+            classify_claimant(CLAIM, running(101, Some(7000)), Some(7000)),
+            ClaimantStatus::NotReading
+        );
+        // It runs but another group owns the terminal (for example, it was suspended).
+        assert_eq!(
+            classify_claimant(CLAIM, running(100, Some(7000)), Some(9000)),
+            ClaimantStatus::NotReading
+        );
     }
 }

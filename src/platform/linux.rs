@@ -680,13 +680,32 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     (tpgid > 0).then_some(tpgid as u32)
 }
 
-/// When the process started, in clock ticks since boot. With the pid it names one process
-/// generation: a recycled pid has a later start time.
-pub fn process_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.get(stat.rfind(')')? + 2..)?;
-    // After (comm): state(0) ... starttime(19)
-    rest.split_whitespace().nth(19)?.parse().ok()
+/// Whether `pid` runs, and when it started (clock ticks since boot) and in which process group.
+/// With the pid, the start time names one process generation: a recycled pid starts later.
+pub fn process_start(pid: u32) -> super::ProcessStart {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return super::ProcessStart::Gone,
+        Err(_) => return super::ProcessStart::Unknown,
+    };
+    let Some(rest) = stat.rfind(')').and_then(|close| stat.get(close + 2..)) else {
+        return super::ProcessStart::Unknown;
+    };
+    // After (comm): state(0) ppid(1) pgrp(2) ... starttime(19)
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.first() == Some(&"Z") || fields.first() == Some(&"X") {
+        return super::ProcessStart::Gone;
+    }
+    match (
+        fields.get(19).and_then(|field| field.parse().ok()),
+        fields.get(2).and_then(|field| field.parse().ok()),
+    ) {
+        (Some(start_time), Some(process_group)) => super::ProcessStart::Running {
+            start_time,
+            process_group: Some(process_group),
+        },
+        _ => super::ProcessStart::Unknown,
+    }
 }
 
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {

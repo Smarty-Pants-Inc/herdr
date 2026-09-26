@@ -45,6 +45,21 @@ pub struct ForegroundProcess {
     pub cmdline: Option<String>,
 }
 
+/// What the platform can tell about one process (see `process_start`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessStart {
+    /// Running. The start time with the pid names one process generation. The process group is
+    /// `None` where the platform has none.
+    Running {
+        start_time: u64,
+        process_group: Option<u32>,
+    },
+    /// No such process, or it has exited.
+    Gone,
+    /// The process could not be read.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundJob {
     pub process_group_id: u32,

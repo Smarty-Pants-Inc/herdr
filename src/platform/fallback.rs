@@ -207,8 +207,8 @@ pub fn foreground_process_group_id(_child_pid: u32) -> Option<u32> {
     None
 }
 
-pub fn process_start_time(_pid: u32) -> Option<u64> {
-    None
+pub fn process_start(_pid: u32) -> super::ProcessStart {
+    super::ProcessStart::Unknown
 }
 
 /// Unsupported platform stub.
