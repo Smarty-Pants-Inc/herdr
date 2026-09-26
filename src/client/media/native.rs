@@ -28,7 +28,9 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
@@ -85,8 +87,13 @@ enum Command {
 enum Internal {
     PeerState(RTCPeerConnectionState),
     ChannelOpen,
+    /// The required events channel closed; the remote side ended the call.
+    ChannelClosed,
     Fatal(String),
 }
+
+/// How a session ended when it was not cancelled by the controller.
+type SessionEnd = Result<Option<String>, String>;
 
 type Playback = Arc<Mutex<VecDeque<f32>>>;
 
@@ -147,13 +154,21 @@ pub(crate) fn start_with_audio(
         .spawn(move || {
             let result = runtime.block_on(session(&emitter, audio, command_rx, cancel_rx));
             runtime.shutdown_timeout(Duration::from_millis(500));
-            if let Err(message) = result {
-                tracing::warn!(session_id = %emitter.session_id, %message, "media peer failed");
-                emitter.emit(PeerEvent::Closed {
+            match result {
+                Ok(None) => {}
+                Ok(Some(message)) => emitter.emit(PeerEvent::Closed {
                     session_id: emitter.session_id.clone(),
-                    code: close_code::DEVICE_ERROR,
+                    code: close_code::CLOSED,
                     message,
-                });
+                }),
+                Err(message) => {
+                    tracing::warn!(session_id = %emitter.session_id, %message, "media peer failed");
+                    emitter.emit(PeerEvent::Closed {
+                        session_id: emitter.session_id.clone(),
+                        code: close_code::DEVICE_ERROR,
+                        message,
+                    });
+                }
             }
             thread_stopped.store(true, Ordering::SeqCst);
             let _ = done_tx.send(());
@@ -236,16 +251,17 @@ impl Emitter {
     }
 }
 
-/// One media session. Returns `Err` when the peer must report `device_error`. Audio is
-/// released and the peer connection closed before it returns.
+/// One media session. Returns `Err` when the peer must report `device_error`, and
+/// `Ok(Some(message))` when the remote side ended the call. Audio is released and the peer
+/// connection closed before it returns.
 async fn session(
     emitter: &Emitter,
     audio: Box<dyn AudioBackend>,
     commands: mpsc::UnboundedReceiver<Command>,
     mut cancel: watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> SessionEnd {
     if *cancel.borrow() {
-        return Ok(());
+        return Ok(None);
     }
     let (internal_tx, internal) = mpsc::unbounded_channel();
     let playback: Playback = Arc::new(Mutex::new(VecDeque::with_capacity(PLAYBACK_CAPACITY)));
@@ -255,11 +271,11 @@ async fn session(
     let audio_guard = audio.open(audio_io(frames_tx, Arc::clone(&playback), &internal_tx))?;
     // A close that arrived while the device opened releases it here, before any WebRTC work.
     if *cancel.borrow() {
-        return Ok(());
+        return Ok(None);
     }
     let peer = tokio::select! {
         biased;
-        () = cancelled(&mut cancel) => return Ok(()),
+        () = cancelled(&mut cancel) => return Ok(None),
         peer = new_peer_connection() => match peer {
             Ok(peer) => Arc::new(peer),
             Err(error) => return Err(format!("could not create the WebRTC peer: {error}")),
@@ -267,7 +283,7 @@ async fn session(
     };
     let result = tokio::select! {
         biased;
-        () = cancelled(&mut cancel) => Ok(()),
+        () = cancelled(&mut cancel) => Ok(None),
         result = drive(
             emitter,
             &peer,
@@ -308,9 +324,26 @@ struct Channels {
     muted: Arc<AtomicBool>,
 }
 
+/// The Opus parameters webrtc-rs registers by default.
+fn opus_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        capability: RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: SAMPLE_RATE,
+            channels: 2,
+            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 111,
+        ..Default::default()
+    }
+}
+
 async fn new_peer_connection() -> webrtc::error::Result<RTCPeerConnection> {
     let mut media = MediaEngine::default();
-    media.register_default_codecs()?;
+    // Only Opus: capture encodes and playback decodes nothing else, so offering the other
+    // default codecs (G722, PCMU, PCMA) would let an answer pick audio this peer cannot play.
+    media.register_codec(opus_codec(), RTPCodecType::Audio)?;
     let registry = register_default_interceptors(Registry::new(), &mut media)?;
     let api = APIBuilder::new()
         .with_media_engine(media)
@@ -321,11 +354,7 @@ async fn new_peer_connection() -> webrtc::error::Result<RTCPeerConnection> {
 }
 
 /// Negotiate, then run the control loop until close or failure.
-async fn drive(
-    emitter: &Emitter,
-    peer: &Arc<RTCPeerConnection>,
-    channels: Channels,
-) -> Result<(), String> {
+async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Channels) -> SessionEnd {
     let Channels {
         mut commands,
         mut internal,
@@ -370,6 +399,20 @@ async fn drive(
     let open_tx = internal_tx.clone();
     channel.on_open(Box::new(move || {
         let _ = open_tx.send(Internal::ChannelOpen);
+        Box::pin(async {})
+    }));
+    // A connected session needs the events channel: losing it ends the call even while
+    // ICE and DTLS stay up, so the microphone never stays on without it.
+    let close_tx = internal_tx.clone();
+    channel.on_close(Box::new(move || {
+        let _ = close_tx.send(Internal::ChannelClosed);
+        Box::pin(async {})
+    }));
+    let error_tx = internal_tx.clone();
+    channel.on_error(Box::new(move |error| {
+        let _ = error_tx.send(Internal::Fatal(format!(
+            "the events channel failed: {error}"
+        )));
         Box::pin(async {})
     }));
 
@@ -432,7 +475,7 @@ async fn drive(
                     };
                     emitter.state(state, mute);
                 }
-                Some(Command::Close) | None => return Ok(()),
+                Some(Command::Close) | None => return Ok(None),
             },
             event = internal.recv() => match event {
                 Some(Internal::PeerState(RTCPeerConnectionState::Connected)) => connected = true,
@@ -442,8 +485,11 @@ async fn drive(
                 // Disconnected may recover; it turns into Failed when it does not.
                 Some(Internal::PeerState(_)) => {}
                 Some(Internal::ChannelOpen) => channel_open = true,
+                Some(Internal::ChannelClosed) => {
+                    return Ok(Some("the remote side closed the events channel".to_owned()));
+                }
                 Some(Internal::Fatal(message)) => return Err(message),
-                None => return Ok(()),
+                None => return Ok(None),
             },
         }
         if connected && channel_open && !reported_connected {
@@ -821,6 +867,18 @@ mod tests {
         ] {
             assert!(sdp.contains(needle), "offer lacks {needle:?}:\n{sdp}");
         }
+        // Only the codec this peer encodes and decodes is offered.
+        for codec in ["G722/", "PCMU/", "PCMA/"] {
+            assert!(!sdp.contains(codec), "offer advertises {codec:?}:\n{sdp}");
+        }
+        let audio_line = sdp
+            .lines()
+            .find(|line| line.starts_with("m=audio"))
+            .expect("an audio m-line");
+        assert!(
+            audio_line.trim_end().ends_with("UDP/TLS/RTP/SAVPF 111"),
+            "audio formats: {audio_line}"
+        );
         assert!(devices.opened.load(Ordering::SeqCst));
         peer.close();
     }
@@ -890,6 +948,95 @@ mod tests {
             "an opened device is always released"
         );
         assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// Answer the peer's offer with a real in-process WebRTC peer, as the Realtime server
+    /// would, and return that remote connection and its events channel once both sides
+    /// report connected.
+    async fn connect_remote(
+        peer: &mut NativePeer,
+        offer: String,
+        events: &std_mpsc::Receiver<PeerEvent>,
+    ) -> (
+        Arc<RTCPeerConnection>,
+        Arc<webrtc::data_channel::RTCDataChannel>,
+    ) {
+        let mut media = MediaEngine::default();
+        media.register_default_codecs().expect("codecs");
+        let registry =
+            register_default_interceptors(Registry::new(), &mut media).expect("interceptors");
+        let api = APIBuilder::new()
+            .with_media_engine(media)
+            .with_interceptor_registry(registry)
+            .build();
+        let remote = Arc::new(
+            api.new_peer_connection(RTCConfiguration::default())
+                .await
+                .expect("remote peer"),
+        );
+        let (channel_tx, mut channel_rx) = mpsc::unbounded_channel();
+        remote.on_data_channel(Box::new(move |channel| {
+            let _ = channel_tx.send(channel);
+            Box::pin(async {})
+        }));
+        remote
+            .set_remote_description(RTCSessionDescription::offer(offer).expect("offer sdp"))
+            .await
+            .expect("apply offer");
+        let answer = remote.create_answer(None).await.expect("answer");
+        let mut gathered = remote.gathering_complete_promise().await;
+        remote
+            .set_local_description(answer)
+            .await
+            .expect("apply answer");
+        let _ = tokio::time::timeout(ICE_GATHER_TIMEOUT, gathered.recv()).await;
+        let answer = remote.local_description().await.expect("local answer").sdp;
+        peer.apply_answer(answer);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(PeerEvent::State {
+                    state: MediaPeerState::Connected,
+                    ..
+                }) => break,
+                Ok(PeerEvent::State { .. }) => {}
+                other => panic!("expected the peer to connect, got {other:?}"),
+            }
+        }
+        let channel = tokio::time::timeout(Duration::from_secs(5), channel_rx.recv())
+            .await
+            .expect("remote events channel")
+            .expect("remote events channel");
+        assert_eq!(channel.label(), EVENTS_CHANNEL_LABEL);
+        (remote, channel)
+    }
+
+    #[test]
+    fn remote_closing_the_events_channel_ends_the_call_and_releases_the_devices() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (mut peer, devices, events) = start_fake();
+        let offer = wait_offer(&events);
+        runtime.block_on(async {
+            let (remote, channel) = connect_remote(&mut peer, offer, &events).await;
+            assert!(!devices.released.load(Ordering::SeqCst));
+
+            // Only the channel goes away; ICE and DTLS stay up on the remote side.
+            channel.close().await.expect("close the events channel");
+            match events.recv_timeout(Duration::from_secs(10)) {
+                Ok(PeerEvent::Closed { code, .. }) => assert_eq!(code, close_code::CLOSED),
+                other => panic!("expected Closed after the channel closed, got {other:?}"),
+            }
+            assert!(wait_until(&devices.released, Duration::from_secs(2)));
+            assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+            let _ = remote.close().await;
+        });
+        peer.close();
     }
 
     #[test]
