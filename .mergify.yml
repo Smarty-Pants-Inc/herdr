@@ -17,3 +17,12 @@ queue_rules:
       - check-success = smarty-ci
     merge_conditions:
       - check-success = smarty-ci
+
+# The fleet's write App bot may queue (smarty-dev#735, #736): GitHub reports App bots as permission
+# none, so the default `sender-permission >= write` restriction refused its queue commands.
+commands_restrictions:
+  queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
