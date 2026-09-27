@@ -536,6 +536,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
+        Method::WorkspaceCreateLinked(_) => "workspace.create_linked",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
         Method::WorkspaceFocus(_) => "workspace.focus",

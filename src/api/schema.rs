@@ -79,6 +79,11 @@ pub enum Method {
     SessionSnapshot(EmptyParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
+    // Creates a workspace linked to the Git checkout that contains `cwd`, even when
+    // another workspace already holds that checkout. A separate method, because
+    // `workspace.create` is a frozen endpoint shape and an older server would ignore a flag.
+    #[serde(rename = "workspace.create_linked")]
+    WorkspaceCreateLinked(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
     WorkspaceList(EmptyParams),
     #[serde(rename = "workspace.get")]

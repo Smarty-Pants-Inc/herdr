@@ -24,6 +24,13 @@ pub(super) fn workspace_create(params: WorkspaceCreateParams) -> std::io::Result
     print_method_response("cli:workspace:create", Method::WorkspaceCreate(params))
 }
 
+pub(super) fn workspace_create_linked(params: WorkspaceCreateParams) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workspace:create_linked",
+        Method::WorkspaceCreateLinked(params),
+    )
+}
+
 pub(super) fn workspace_get(workspace_id: String) -> std::io::Result<i32> {
     print_method_response(
         "cli:workspace:get",
