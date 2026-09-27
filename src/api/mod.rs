@@ -29,6 +29,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::ReleaseNotesDismiss(_)
             | Method::CommandInvoke(_)
             | Method::WorkspaceCreate(_)
+            | Method::WorkspaceCreateLinked(_)
             | Method::WorkspaceFocus(_)
             | Method::WorkspaceRename(_)
             | Method::WorkspaceMove(_)

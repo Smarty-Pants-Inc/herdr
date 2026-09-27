@@ -41,6 +41,66 @@ impl App {
         id: String,
         params: WorkspaceCreateParams,
     ) -> String {
+        self.create_workspace_from_params(id, params, None)
+    }
+
+    /// `workspace.create_linked`: like `workspace.create`, but the new workspace holds the
+    /// Git checkout that contains `cwd`. Unlike `worktree.open`, it does not return an
+    /// existing holder of that checkout, so one checkout can back several workspaces.
+    pub(super) fn handle_workspace_create_linked(
+        &mut self,
+        id: String,
+        params: WorkspaceCreateParams,
+    ) -> String {
+        let Some(cwd) = params.cwd.as_deref() else {
+            return encode_error(
+                id,
+                "invalid_request",
+                "workspace.create_linked requires cwd",
+            );
+        };
+        let path = crate::worktree::expand_tilde_path(cwd);
+        if !path.is_absolute() {
+            return encode_error(id, "invalid_request", "cwd must be an absolute path");
+        }
+        // Bare repositories have no working tree, so they are not checkouts.
+        let Some(space) = crate::workspace::git_checkout_space_metadata(&path) else {
+            return encode_error(
+                id,
+                "not_git_worktree",
+                format!("{} is not inside a Git checkout", path.display()),
+            );
+        };
+        if space.is_linked_worktree {
+            // ponytail: a linked worktree's parent repo root needs worktree discovery;
+            // `worktree open` already links those, so only main checkouts come here.
+            return encode_error(
+                id,
+                "linked_worktree_source",
+                "cwd is in a linked worktree; use `herdr worktree open` for it",
+            );
+        }
+        let membership = crate::workspace::WorktreeSpaceMembership {
+            key: space.key,
+            label: space.repo_name,
+            repo_root: space.repo_root.clone(),
+            checkout_path: space.repo_root,
+            is_linked_worktree: false,
+        };
+        // Launch in the path that was validated, not the unexpanded request string.
+        let params = WorkspaceCreateParams {
+            cwd: Some(path.display().to_string()),
+            ..params
+        };
+        self.create_workspace_from_params(id, params, Some(membership))
+    }
+
+    fn create_workspace_from_params(
+        &mut self,
+        id: String,
+        params: WorkspaceCreateParams,
+        worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
+    ) -> String {
         let source_workspace_index = if params.cwd.is_some() {
             None
         } else {
@@ -72,6 +132,9 @@ impl App {
                         workspace.set_custom_name(label);
                         crate::logging::workspace_renamed(&workspace.id);
                     }
+                }
+                if let Some(membership) = worktree_space {
+                    self.set_worktree_membership(index, membership, false);
                 }
                 self.emit_workspace_open_events(index);
                 encode_success(

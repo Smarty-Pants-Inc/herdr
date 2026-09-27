@@ -63,6 +63,12 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
     Some(git_space_metadata_from_info(&info))
 }
 
+/// Like [`git_space_metadata`], but only for a working tree: bare repositories are `None`.
+pub fn git_checkout_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
+    let info = git_worktree_info(cwd)?;
+    (!info.is_bare).then(|| git_space_metadata_from_info(&info))
+}
+
 pub(crate) fn automatic_workspace_label(cwd: &Path, repo_root: &Path) -> String {
     repo_root
         .file_name()

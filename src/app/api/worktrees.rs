@@ -2674,4 +2674,129 @@ mod tests {
             PathBuf::from("/repo/other")
         );
     }
+
+    // Skips the internal-event drain: the test shell exits at once, and a drain would
+    // close the workspaces that earlier requests created.
+    fn create_linked(app: &mut App, cwd: &Path) -> String {
+        app.handle_api_request_after_internal_events_drained(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorkspaceCreateLinked(
+                crate::api::schema::WorkspaceCreateParams {
+                    source_workspace_id: None,
+                    cwd: Some(cwd.display().to_string()),
+                    focus: false,
+                    label: None,
+                    env: Default::default(),
+                },
+            ),
+        })
+    }
+
+    fn error_code(response: &str) -> String {
+        let error: ErrorResponse = serde_json::from_str(response).unwrap();
+        error.error.code
+    }
+
+    #[tokio::test]
+    async fn workspace_create_linked_adds_second_workspace_on_held_checkout() {
+        let repo = create_committed_repo("api-create-linked-repo");
+        let subdir = repo.join("chief");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let mut app = test_app();
+
+        let first: SuccessResponse = serde_json::from_str(&create_linked(&mut app, &repo)).unwrap();
+        let second: SuccessResponse =
+            serde_json::from_str(&create_linked(&mut app, &subdir)).unwrap();
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_ne!(app.state.workspaces[0].id, app.state.workspaces[1].id);
+        let canonical_repo = crate::worktree::canonical_or_original(&repo);
+        for (index, (result, launch_dir)) in [(first.result, &repo), (second.result, &subdir)]
+            .into_iter()
+            .enumerate()
+        {
+            let ResponseResult::WorkspaceCreated { workspace, .. } = result else {
+                panic!("expected workspace_created response");
+            };
+            assert_eq!(workspace.workspace_id, app.state.workspaces[index].id);
+            // The pane starts in the requested directory, not only at the checkout root.
+            let tab = &app.state.workspaces[index].tabs[0];
+            let terminal_id = tab.terminal_id(tab.root_pane).unwrap();
+            assert_eq!(
+                crate::worktree::canonical_or_original(&app.state.terminals[terminal_id].cwd),
+                crate::worktree::canonical_or_original(launch_dir)
+            );
+            let worktree = workspace.worktree.expect("workspace should be linked");
+            assert!(!worktree.is_linked_worktree);
+            assert_eq!(
+                crate::worktree::canonical_or_original(Path::new(&worktree.checkout_path)),
+                canonical_repo
+            );
+        }
+        assert_eq!(
+            app.state.workspaces[0].worktree_space(),
+            app.state.workspaces[1].worktree_space()
+        );
+
+        // Windows keeps the exited shell's directory busy for a moment.
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn workspace_create_linked_rejects_paths_outside_a_main_checkout() {
+        let plain = unique_temp_path("api-create-linked-plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let repo = create_committed_repo("api-create-linked-source");
+        let checkout = unique_temp_path("api-create-linked-worktree");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/create-linked",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let bare = unique_temp_path("api-create-linked-bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&bare, &["init", "--quiet", "--bare", "."]);
+        let embedded_bare = unique_temp_path("api-create-linked-embedded-bare");
+        std::fs::create_dir_all(&embedded_bare).unwrap();
+        run_git(&embedded_bare, &["init", "--quiet", "--bare", ".git"]);
+        let mut app = test_app();
+
+        assert_eq!(
+            error_code(&create_linked(&mut app, &plain)),
+            "not_git_worktree"
+        );
+        for bare_path in [bare.clone(), bare.join("refs"), embedded_bare.clone()] {
+            assert_eq!(
+                error_code(&create_linked(&mut app, &bare_path)),
+                "not_git_worktree",
+                "{} is a bare repository",
+                bare_path.display()
+            );
+        }
+        assert_eq!(
+            error_code(&create_linked(&mut app, &checkout)),
+            "linked_worktree_source"
+        );
+        assert_eq!(
+            error_code(&create_linked(&mut app, Path::new("relative/path"))),
+            "invalid_request"
+        );
+        assert!(app.state.workspaces.is_empty());
+
+        run_git(
+            &repo,
+            &["worktree", "remove", "--force", checkout.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(plain).unwrap();
+        std::fs::remove_dir_all(bare).unwrap();
+        std::fs::remove_dir_all(embedded_bare).unwrap();
+    }
 }
