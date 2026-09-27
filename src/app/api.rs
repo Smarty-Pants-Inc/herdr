@@ -1056,6 +1056,9 @@ impl App {
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);
             }
+            Method::WorkspaceCreateLinked(params) => {
+                return self.handle_workspace_create_linked(request.id, params);
+            }
             Method::WorkspaceFocus(target) => {
                 return self.handle_workspace_focus(request.id, target);
             }

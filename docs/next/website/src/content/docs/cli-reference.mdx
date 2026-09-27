@@ -153,7 +153,7 @@ Use `default` as the session name when you need to stop the default session expl
 
 ```bash
 herdr workspace list
-herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus] [--link-checkout]
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
@@ -166,6 +166,8 @@ Create a workspace without stealing focus:
 ```bash
 herdr workspace create --cwd ~/project --label api --no-focus
 ```
+
+`--link-checkout` links the new workspace to the Git checkout that contains `--cwd`, like `herdr worktree open`, but always creates a new workspace, even when another workspace already holds that checkout. It fails when `--cwd` is not in a Git checkout or is in a linked worktree (use `herdr worktree open` for those).
 
 A workspace is a top-level project or work context. Creating one also creates its first tab and root pane. The JSON response exposes their IDs as `.result.workspace.workspace_id`, `.result.tab.tab_id`, and `.result.root_pane.pane_id`.
 
