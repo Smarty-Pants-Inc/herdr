@@ -2490,6 +2490,23 @@
           ],
           "type": "string"
         },
+        "PaneAttributeInputParams": {
+          "description": "`pane.attribute_input`: the pane's own agent asks who typed the prompt it just received.",
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "text": {
+              "description": "The submitted prompt text, returned with its label (if any) and look-alikes escaped.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text"
+          ],
+          "type": "object"
+        },
         "PaneClearAgentAuthorityParams": {
           "properties": {
             "pane_id": {
@@ -6534,6 +6551,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.attribute_input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneAttributeInputParams"
             }
           },
           "required": [
@@ -10819,6 +10852,29 @@
               },
               "required": [
                 "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`pane.attribute_input`: the text for the agent, and the verified person who alone typed\nit, if any.",
+              "properties": {
+                "principal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "text": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "attributed_input",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "text"
               ],
               "type": "object"
             },

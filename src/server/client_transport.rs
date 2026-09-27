@@ -386,6 +386,9 @@ pub(crate) enum ServerEvent {
         pixel_mouse: bool,
         writer: ClientWriter,
     },
+    /// A client was verified as a person (smarty-dev#1515). Sent before the client's connected
+    /// event; a client without one is unknown.
+    ClientIdentified { client_id: u64, principal: String },
     /// A client-owned shell completed its dedicated handshake.
     ClientShellConnected {
         client_id: u64,
@@ -675,6 +678,22 @@ pub(crate) fn handle_client_handshake(
         "client handshake read timeout unavailable",
         client_id,
     )?;
+
+    // Resolve who the client is before any of its input can arrive. Without the root-owned
+    // principals map this returns at once.
+    if let Some(principal) = crate::server::client_identity::principal_for_peer(
+        crate::ipc::local_stream_peer_pid(&stream),
+    ) {
+        if server_event_tx
+            .blocking_send(ServerEvent::ClientIdentified {
+                client_id,
+                principal,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
 
     // Read the handshake message.
     let hello: ClientMessage = match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {

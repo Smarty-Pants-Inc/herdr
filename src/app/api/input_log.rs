@@ -30,6 +30,13 @@ impl App {
         bytes: usize,
     ) -> Result<(), String> {
         let line = self.api_input_log_line(method, ws_idx, pane_id, context, bytes);
+        // API input is never a person's: it removes any label from what the pane submits next
+        // (smarty-dev#1515). Noted before the write, like the log line.
+        if let Some(target) = self.terminal_target_for_pane(ws_idx, pane_id) {
+            self.input_authors
+                .borrow_mut()
+                .note_agent(&target.terminal_id, std::time::Instant::now());
+        }
         append_line(&self.api_input_log, &line).map_err(|err| {
             tracing::warn!(err = %err, path = %self.api_input_log.display(), "api input log write failed");
             super::responses::encode_error(

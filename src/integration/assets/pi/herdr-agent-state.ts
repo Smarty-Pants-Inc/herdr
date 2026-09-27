@@ -54,6 +54,74 @@ async function sendRequest(request: unknown): Promise<void> {
   await sendRequestAttempt(request, 1500);
 }
 
+// Per-person identity (smarty-dev#1515): Herdr labels a prompt a verified person typed as
+// "**<Name> (in Herdr):** <text>" (Smarty Code's label with the surface changed) and escapes a
+// typed label look-alike. This local escape is the fallback when Herdr cannot answer; it never
+// adds a label.
+const LABEL_SHAPE = /^\*\*(.{1,80}) \(in (Code|Herdr)\):\*\* /;
+
+export function escapeLabelLookalike(text: string): string {
+  const match = LABEL_SHAPE.exec(text);
+  if (match) {
+    return `\\*\\*${match[1]} (in ${match[2]}):\\*\\* ${text.slice(match[0].length)}`;
+  }
+  if (text.startsWith("**") && text.slice(2).split("\n", 1)[0].includes("(in ")) {
+    return `\\*\\*${text.slice(2)}`;
+  }
+  return text;
+}
+
+function requestResult(request: unknown, timeoutMs: number): Promise<any> {
+  return new Promise((resolve) => {
+    let done = false;
+    let input = "";
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: any) => {
+      if (done) return;
+      done = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      socket.destroy();
+      resolve(value);
+    };
+
+    const socket = net.createConnection(socketEndpoint!);
+    socket.setEncoding?.("utf8");
+    socket.on("error", () => finish(undefined));
+    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline === -1) return;
+      try {
+        finish(JSON.parse(input.slice(0, newline))?.result);
+      } catch {
+        finish(undefined);
+      }
+    });
+    socket.on("end", () => finish(undefined));
+    timeout = setTimeout(() => finish(undefined), timeoutMs);
+    timeout.unref?.();
+  });
+}
+
+/** The prompt text for the agent: labelled by Herdr for a verified person, else escaped. */
+export async function attributeInput(text: string): Promise<string> {
+  const result = await requestResult(
+    {
+      id: `${source}:attribute:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.attribute_input",
+      params: { pane_id: paneId, text },
+    },
+    1000,
+  );
+  if (result?.type === "attributed_input" && typeof result.text === "string") {
+    return result.text;
+  }
+  return escapeLabelLookalike(text);
+}
+
 type AgentState = "working" | "blocked" | "idle";
 
 type QueuedState = {
@@ -241,6 +309,18 @@ export default function (pi) {
     // A reload can replace this extension mid-run without emitting another agent_start.
     agentActive = ctx?.isIdle?.() === false;
     publishState(true);
+  });
+
+  // A prompt typed in the pane's terminal reaches Pi as interactive input. Other sources (RPC,
+  // extensions such as Smarty Code's gateway) carry their own attribution and pass unchanged.
+  pi.on("input", async (event) => {
+    if (!rootSession || event?.source !== "interactive" || typeof event.text !== "string") {
+      return { action: "continue" };
+    }
+    const text = await attributeInput(event.text);
+    return text === event.text
+      ? { action: "continue" }
+      : { action: "transform", text, images: event.images };
   });
 
   pi.on("agent_start", (_event, ctx) => {

@@ -17,6 +17,7 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
+pub(crate) mod input_author;
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
@@ -115,6 +116,8 @@ pub struct App {
     pub state: AppState,
     /// Herdr's API input log (smarty-dev#931); see `api::input_log`.
     pub(crate) api_input_log: std::path::PathBuf,
+    /// Who typed each pane's submitted input (smarty-dev#1515).
+    pub(crate) input_authors: std::cell::RefCell<input_author::InputAuthors>,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
     pub(crate) direct_graphics_available: bool,
@@ -588,6 +591,7 @@ impl App {
             } else {
                 api::input_log::default_api_input_log_path()
             },
+            input_authors: std::cell::RefCell::default(),
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,

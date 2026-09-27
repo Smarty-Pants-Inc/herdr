@@ -4,6 +4,7 @@ pub mod autodetect;
 pub(crate) mod client_accept;
 pub(crate) mod client_commands;
 mod client_endpoint_control;
+pub(crate) mod client_identity;
 pub(crate) mod client_shell;
 pub(crate) mod client_shell_graphics;
 pub(crate) mod client_transport;

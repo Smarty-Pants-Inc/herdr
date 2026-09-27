@@ -238,6 +238,8 @@ pub struct HeadlessServer {
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
     /// Client-local media sessions bound to the client that last typed into a pane.
     media: crate::server::media::MediaBroker,
+    /// Verified people behind attached clients (smarty-dev#1515); absent means unknown.
+    client_principals: HashMap<u64, String>,
     /// Monotonic activity counter used to pick the most recently active client.
     next_activity_stamp: u64,
     /// Configured virtual terminal size used when no clients are connected.
@@ -375,6 +377,7 @@ impl HeadlessServer {
             pending_alt_screen_reads: Vec::new(),
             deferred_alt_screen_reads: Vec::new(),
             media: crate::server::media::MediaBroker::new(),
+            client_principals: HashMap::new(),
             next_activity_stamp: 1,
             headless_size,
             effective_size: headless_size,
@@ -1017,6 +1020,7 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.client_principals.remove(&client_id);
         self.retire_direct_graphics_for_client(client_id);
         let disconnected_focus = self
             .clients
@@ -1065,6 +1069,20 @@ impl HeadlessServer {
         } else {
             false
         }
+    }
+
+    /// Notes who typed into a terminal: the client's verified principal, or unknown.
+    fn note_input_author(&mut self, client_id: u64, terminal_id: &str, submitted: bool) {
+        let author = self
+            .client_principals
+            .get(&client_id)
+            .map_or(crate::app::input_author::InputAuthor::Unknown, |name| {
+                crate::app::input_author::InputAuthor::Person(name.clone())
+            });
+        self.app
+            .input_authors
+            .borrow_mut()
+            .note(terminal_id, author, submitted, Instant::now());
     }
 
     fn release_client_shell_inputs(
@@ -2161,6 +2179,13 @@ impl HeadlessServer {
             } => self.handle_terminal_attach_mouse(
                 client_id, kind, position, geometry, modifiers, lines,
             ),
+            ServerEvent::ClientIdentified {
+                client_id,
+                principal,
+            } => {
+                self.client_principals.insert(client_id, principal);
+                false
+            }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
                     debug!(
@@ -2177,7 +2202,9 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                let terminal_id = terminal_id.clone();
+                self.note_input_author(client_id, &terminal_id, data.contains(&b'\r'));
+                if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     if let Err(err) = apply_terminal_attach_input(runtime, data) {
                         warn!(client_id, terminal_id = %terminal_id, err = %err);
                     }
@@ -2514,6 +2541,19 @@ impl HeadlessServer {
                         &pane_id,
                         Instant::now(),
                     );
+                }
+                if client_pane_input_types(&events) {
+                    if let Some(terminal_id) = self
+                        .app
+                        .terminal_target_for_pane(workspace_index, runtime_pane_id)
+                        .map(|target| target.terminal_id)
+                    {
+                        self.note_input_author(
+                            client_id,
+                            &terminal_id,
+                            client_pane_input_submits(&events),
+                        );
+                    }
                 }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
@@ -3503,6 +3543,32 @@ fn client_pane_input_releases_press(event: &protocol::ClientPaneInputEvent) -> b
             ..
         }
     )
+}
+
+/// Whether the events type into the pane: keys, text or a paste, not mouse or releases.
+fn client_pane_input_types(events: &[protocol::ClientPaneInputEvent]) -> bool {
+    events.iter().any(|event| match event {
+        protocol::ClientPaneInputEvent::Key { kind, .. } => {
+            *kind != protocol::ClientKeyKind::Release
+        }
+        protocol::ClientPaneInputEvent::TextCommit(_)
+        | protocol::ClientPaneInputEvent::Paste(_) => true,
+        protocol::ClientPaneInputEvent::Mouse { .. } => false,
+    })
+}
+
+/// Whether the events press a plain Enter, which submits an agent prompt.
+fn client_pane_input_submits(events: &[protocol::ClientPaneInputEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            protocol::ClientPaneInputEvent::Key {
+                code: protocol::ClientKeyCode::Enter,
+                kind: protocol::ClientKeyKind::Press | protocol::ClientKeyKind::Repeat,
+                ..
+            }
+        )
+    })
 }
 
 fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) -> bool {

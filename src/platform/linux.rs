@@ -26,6 +26,7 @@ pub(crate) use super::unix_common::{
 #[cfg(test)]
 mod config_file_tests;
 
+pub(crate) mod client_identity;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 

@@ -305,6 +305,13 @@ pub enum ResponseResult {
         projection_revision: u64,
     },
     Ok {},
+    /// `pane.attribute_input`: the text for the agent, and the verified person who alone typed
+    /// it, if any.
+    AttributedInput {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal: Option<String>,
+    },
     MediaOffer {
         session_id: String,
         sdp: String,

@@ -190,6 +190,62 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+/// Kernel facts about one process, for attributing an attached client to a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityProcess {
+    pub ppid: u32,
+    /// Real, effective, saved and filesystem uids.
+    pub uids: Vec<u32>,
+    pub comm: String,
+    pub cmdline: Vec<String>,
+    pub exe_name: Option<String>,
+    pub start_unix_secs: u64,
+    /// Start time in clock ticks since boot; with the pid it names one process.
+    pub start_ticks: u64,
+}
+
+/// One journald record with its trusted fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityJournalRecord {
+    pub message: Option<String>,
+    pub pid: Option<u32>,
+    pub uid: Option<u32>,
+    pub comm: Option<String>,
+}
+
+pub(crate) fn identity_process(pid: u32) -> Option<IdentityProcess> {
+    #[cfg(target_os = "linux")]
+    return linux::client_identity::identity_process(pid);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+pub(crate) fn identity_journal_records(
+    pid: u32,
+    since_unix_secs: u64,
+) -> Option<Vec<IdentityJournalRecord>> {
+    #[cfg(target_os = "linux")]
+    return linux::client_identity::identity_journal_records(pid, since_unix_secs);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, since_unix_secs);
+        None
+    }
+}
+
+pub(crate) fn identity_tailscale_whois(ip: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return linux::client_identity::identity_tailscale_whois(ip);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ip;
+        None
+    }
+}
+
 /// Returns the PID connected to a Unix-domain socket when the platform exposes
 /// it. Unsupported or unavailable attribution deliberately returns `None`.
 #[cfg(unix)]

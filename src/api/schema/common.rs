@@ -35,6 +35,14 @@ pub struct PaneTarget {
     pub pane_id: String,
 }
 
+/// `pane.attribute_input`: the pane's own agent asks who typed the prompt it just received.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneAttributeInputParams {
+    pub pane_id: String,
+    /// The submitted prompt text, returned with its label (if any) and look-alikes escaped.
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProductAnnouncementDismissParams {
     pub version: String,

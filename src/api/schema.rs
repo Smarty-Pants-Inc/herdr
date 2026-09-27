@@ -279,6 +279,8 @@ pub enum Method {
     PluginPaneClose(PluginPaneCloseParams),
     #[serde(rename = "pane.media_open")]
     PaneMediaOpen(PaneTarget),
+    #[serde(rename = "pane.attribute_input")]
+    PaneAttributeInput(PaneAttributeInputParams),
     #[serde(rename = "media.answer")]
     MediaAnswer(MediaAnswerParams),
     #[serde(rename = "media.mute")]

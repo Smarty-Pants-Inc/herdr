@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "input_author.rs"]
+mod input_author_tests;
 #[path = "media.rs"]
 mod media_tests;
 #[path = "pane_graphics.rs"]
@@ -119,6 +121,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         pending_alt_screen_reads: Vec::new(),
         deferred_alt_screen_reads: Vec::new(),
         media: crate::server::media::MediaBroker::new(),
+        client_principals: HashMap::new(),
         next_activity_stamp: 1,
         headless_size,
         effective_size: headless_size,
