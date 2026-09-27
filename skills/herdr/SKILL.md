@@ -216,7 +216,7 @@ Use `--format ansi` when colors and terminal styling are evidence. Otherwise use
 
 `--lines` asks Herdr for more rows from the pane's available screen and host scrollback. Alternate-screen rows do not enter ordinary host scrollback. For supported idle agents, Herdr can collect application-owned history and restore the viewport afterward, but not every application or response can be recovered this way.
 
-If a larger recent read still does not reveal the completed response, use the normal coordination transport to ask the agent to write it as Markdown in a temporary directory and reply only with the file path, then read that file on the same machine. Do not fall back to terminal injection solely to recover output.
+If a larger recent read still does not reveal the completed response, use the normal coordination transport to ask the agent to write it as Markdown in a temporary directory and reply only with the file path, then read that file on the same machine. Use this only as a fallback; do not request file output in the initial prompt. Do not fall back to terminal injection solely to recover output.
 
 ## Safety and coordination rules
 
