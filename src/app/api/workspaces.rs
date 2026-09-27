@@ -63,7 +63,8 @@ impl App {
         if !path.is_absolute() {
             return encode_error(id, "invalid_request", "cwd must be an absolute path");
         }
-        let Some(space) = crate::workspace::git_space_metadata(&path) else {
+        // Bare repositories have no working tree, so they are not checkouts.
+        let Some(space) = crate::workspace::git_checkout_space_metadata(&path) else {
             return encode_error(
                 id,
                 "not_git_worktree",
@@ -85,6 +86,11 @@ impl App {
             repo_root: space.repo_root.clone(),
             checkout_path: space.repo_root,
             is_linked_worktree: false,
+        };
+        // Launch in the path that was validated, not the unexpanded request string.
+        let params = WorkspaceCreateParams {
+            cwd: Some(path.display().to_string()),
+            ..params
         };
         self.create_workspace_from_params(id, params, Some(membership))
     }
