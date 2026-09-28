@@ -223,6 +223,22 @@ fn serve_handoff_import(mut received: crate::server::handoff::ReceivedHandoff) -
             Some(api_server),
             should_quit,
         )?;
+        #[cfg(debug_assertions)]
+        if report_bound
+            && std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref()
+                == Ok("split_client_report_before_ready")
+        {
+            // A replacement whose last report reaches the source in two
+            // pieces, and which then never becomes ready.
+            crate::server::handoff::report_bound_split_for_test(
+                &mut received.stream,
+                crate::server::handoff::BoundSocketKind::Client,
+                &server.client_socket_identity,
+            )?;
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
         if report_bound {
             crate::server::handoff::report_bound(
                 &mut received.stream,

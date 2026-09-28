@@ -103,6 +103,9 @@ impl BoundSocketKind {
 pub(crate) struct BoundSockets {
     pub api: Option<crate::ipc::SocketFileIdentity>,
     pub client: Option<crate::ipc::SocketFileIdentity>,
+    /// The start of a report whose rest has not arrived yet. Stream reads do
+    /// not keep report boundaries, so it is kept across timeouts and drains.
+    pending: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -552,7 +555,7 @@ pub(crate) fn wait_ready(stream: &mut UnixStream, bound: &mut BoundSockets) -> i
             ));
         }
         stream.set_read_timeout(Some(remaining))?;
-        let line = match read_line_unbuffered(&mut *stream) {
+        let line = match read_line_into(&mut *stream, &mut bound.pending) {
             Ok(line) => line,
             Err(err)
                 if matches!(
@@ -590,7 +593,7 @@ pub(crate) fn drain_bound_reports(stream: &mut UnixStream, bound: &mut BoundSock
     {
         return;
     }
-    while let Ok(line) = read_line_unbuffered(&mut *stream) {
+    while let Ok(line) = read_line_into(&mut *stream, &mut bound.pending) {
         if line.is_empty() {
             return;
         }
@@ -600,35 +603,45 @@ pub(crate) fn drain_bound_reports(stream: &mut UnixStream, bound: &mut BoundSock
 
 /// Stops a replacement whose handoff failed, for certain, and records any
 /// `bound ...` reports it wrote: the spawned import child's process group, or
-/// in a pull handoff the importer at the other end of `stream`.
+/// in a pull handoff the importer at the other end of `stream`, through the
+/// `peer` handle taken when it connected.
 #[cfg(unix)]
 pub(crate) fn stop_failed_replacement(
     child: Option<&mut Child>,
+    peer: Option<&crate::platform::LocalSocketPeerProcess>,
     stream: &mut UnixStream,
     bound: &mut BoundSockets,
 ) {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("HERDR_TEST_HANDOFF_ROLLBACK_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        // Lets tests land a report while the rollback is about to begin.
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     if let Some(child) = child {
         cleanup_failed_import_child(child);
         drain_bound_reports(stream, bound);
         return;
     }
-    // ponytail: a pulling importer is not our child, so no unreaped pid pins
-    // it. It is signalled only while its end of the stream is still open; it
-    // passes that end to no other process, so the peer pid is still its own.
     if read_bound_reports_until_closed(stream, bound, None) {
         return;
     }
-    match crate::platform::local_socket_peer_pid(stream.as_raw_fd()) {
-        Some(pid) => {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            info!(pid, "pulling handoff importer killed during rollback");
+    // A pulling importer is not our child, so no unreaped pid pins it: it is
+    // signalled only through a handle that cannot reach a reused pid. Without
+    // one, it is never signalled; closing our end makes it fail and exit.
+    match peer.map(|peer| (peer.pid(), peer.kill())) {
+        Some((pid, Ok(true))) => info!(pid, "pulling handoff importer killed during rollback"),
+        Some((pid, Ok(false))) => info!(pid, "pulling handoff importer already exited"),
+        Some((pid, Err(err))) => {
+            warn!(pid, err = %err, "could not signal pulling handoff importer; waiting for it to exit")
         }
-        None => warn!("pulling handoff importer pid is unknown; waiting for it to exit"),
+        None => warn!("no safe handle on the pulling handoff importer; waiting for it to exit"),
     }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
     if !read_bound_reports_until_closed(stream, bound, Some(IMPORT_GROUP_EXIT_TIMEOUT)) {
-        tracing::error!(
-            "pulling handoff importer is still alive after SIGKILL; continuing rollback"
-        );
+        tracing::error!("pulling handoff importer is still alive; continuing rollback");
     }
 }
 
@@ -651,7 +664,7 @@ fn read_bound_reports_until_closed(
                 break false;
             }
         }
-        match read_line_unbuffered(&mut *stream) {
+        match read_line_into(&mut *stream, &mut bound.pending) {
             Ok(line) => {
                 bound.record(line.trim_end());
             }
@@ -681,6 +694,25 @@ pub(crate) fn report_bound(
         identity.dev(),
         identity.inode()
     )?;
+    stream.flush()
+}
+
+/// Debug builds let tests send a `bound ...` report in two writes, the second
+/// `HERDR_TEST_HANDOFF_REPORT_SPLIT_MS` after the first.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn report_bound_split_for_test(
+    stream: &mut UnixStream,
+    kind: BoundSocketKind,
+    identity: &crate::ipc::SocketFileIdentity,
+) -> io::Result<()> {
+    let split = std::env::var("HERDR_TEST_HANDOFF_REPORT_SPLIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    write!(stream, "bound {} {} ", kind.wire_name(), identity.dev())?;
+    stream.flush()?;
+    std::thread::sleep(Duration::from_millis(split));
+    writeln!(stream, "{}", identity.inode())?;
     stream.flush()
 }
 
@@ -941,7 +973,14 @@ fn accept_with_timeout(
 
 #[cfg(unix)]
 fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
-    let mut bytes = Vec::new();
+    read_line_into(stream, &mut Vec::new())
+}
+
+/// Reads one line, one byte at a time so nothing past it is consumed. The
+/// bytes of a line cut short by a timeout or `WouldBlock` stay in `pending`
+/// for the next call.
+#[cfg(unix)]
+fn read_line_into(stream: &mut UnixStream, pending: &mut Vec<u8>) -> io::Result<String> {
     let mut byte = [0u8; 1];
     loop {
         let read = stream.read(&mut byte)?;
@@ -951,12 +990,13 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
                 "handoff stream closed while reading line",
             ));
         }
-        bytes.push(byte[0]);
+        pending.push(byte[0]);
         if byte[0] == b'\n' {
-            return String::from_utf8(bytes)
+            return String::from_utf8(std::mem::take(pending))
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
         }
-        if bytes.len() > 16 * 1024 * 1024 {
+        if pending.len() > 16 * 1024 * 1024 {
+            pending.clear();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handoff line exceeded maximum size",
@@ -1326,6 +1366,66 @@ mod tests {
             bound.get(BoundSocketKind::Client),
             Some(&crate::ipc::SocketFileIdentity::from_parts(7, 43))
         );
+    }
+
+    #[test]
+    fn a_bound_report_split_across_rollback_drains_is_still_recorded() {
+        let (mut source, mut importer) = UnixStream::pair().unwrap();
+        let mut bound = BoundSockets::default();
+        importer
+            .write_all(b"bound api 7 42\nbound client 7 ")
+            .unwrap();
+        // The first drain sees only the start of the client report.
+        assert!(!read_bound_reports_until_closed(
+            &mut source,
+            &mut bound,
+            None
+        ));
+        importer.write_all(b"43\n").unwrap();
+        drop(importer);
+        stop_failed_replacement(None, None, &mut source, &mut bound);
+        assert_eq!(
+            bound.get(BoundSocketKind::Api),
+            Some(&crate::ipc::SocketFileIdentity::from_parts(7, 42))
+        );
+        assert_eq!(
+            bound.get(BoundSocketKind::Client),
+            Some(&crate::ipc::SocketFileIdentity::from_parts(7, 43))
+        );
+    }
+
+    #[test]
+    fn a_report_cut_short_by_the_ready_timeout_is_kept() {
+        let (mut source, mut importer) = UnixStream::pair().unwrap();
+        let mut bound = BoundSockets::default();
+        importer.write_all(b"bound client 7 ").unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(read_line_into(&mut source, &mut bound.pending).is_err());
+        importer.write_all(b"43\n").unwrap();
+        drop(importer);
+        drain_bound_reports(&mut source, &mut bound);
+        assert_eq!(
+            bound.get(BoundSocketKind::Client),
+            Some(&crate::ipc::SocketFileIdentity::from_parts(7, 43))
+        );
+    }
+
+    #[test]
+    fn a_pulling_importer_without_a_safe_handle_is_not_signalled_but_closed_out() {
+        // Both ends are this process: signalling the peer pid would kill the
+        // test. The importer gives up once the source closes its end.
+        let (mut source, mut importer) = UnixStream::pair().unwrap();
+        let importer = std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = importer.read_to_end(&mut rest);
+        });
+        let mut bound = BoundSockets::default();
+        let started = std::time::Instant::now();
+        stop_failed_replacement(None, None, &mut source, &mut bound);
+        assert!(started.elapsed() < IMPORT_GROUP_EXIT_TIMEOUT);
+        importer.join().unwrap();
     }
 
     #[test]

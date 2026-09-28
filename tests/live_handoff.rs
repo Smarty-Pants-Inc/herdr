@@ -2830,3 +2830,68 @@ fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
     drop(spawned);
     cleanup_test_base(&base);
 }
+
+#[test]
+fn failed_pull_import_keeps_a_socket_report_split_across_the_rollback() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    // The importer's last report is cut in two by the ready timeout, and its
+    // second half lands while the source is beginning its rollback.
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) = spawn_server_with_echo_pane(
+        &base,
+        &[
+            ("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "2000"),
+            ("HERDR_TEST_HANDOFF_ROLLBACK_DELAY_MS", "1500"),
+        ],
+    );
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+
+    let mut split = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[
+            (
+                "HERDR_TEST_HANDOFF_IMPORT_FAIL",
+                "split_client_report_before_ready",
+            ),
+            ("HERDR_TEST_HANDOFF_REPORT_SPLIT_MS", "2500"),
+        ],
+    );
+    let status = wait_for_exit(&mut split.0, Duration::from_secs(20));
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    // Both of the importer's sockets were known to be its own, so both
+    // original listeners are back and no recovery socket was needed.
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    assert!(!api_socket.with_file_name("herdr.sock.recover").exists());
+    assert!(!client_socket
+        .with_file_name("herdr-client.sock.recover")
+        .exists());
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-split-report",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}

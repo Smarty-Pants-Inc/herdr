@@ -215,6 +215,13 @@ impl HeadlessServer {
             }
         };
 
+        // Taken while the importer is still connected: a numeric peer pid
+        // could name another process by the time a rollback signals it.
+        let peer = if pull {
+            crate::platform::local_socket_peer_process(std::os::fd::AsRawFd::as_raw_fd(&stream))
+        } else {
+            None
+        };
         let mut bound = crate::server::handoff::BoundSockets::default();
         if guarded && !replacement.reports_bound_sockets {
             // Never downgrade a guarded handoff: without socket reports a failed
@@ -225,6 +232,7 @@ impl HeadlessServer {
             }
             crate::server::handoff::stop_failed_replacement(
                 import_child.as_mut(),
+                peer.as_ref(),
                 &mut stream,
                 &mut bound,
             );
@@ -242,6 +250,7 @@ impl HeadlessServer {
         if let Err(err) = send_result {
             crate::server::handoff::stop_failed_replacement(
                 import_child.as_mut(),
+                peer.as_ref(),
                 &mut stream,
                 &mut bound,
             );
@@ -257,6 +266,7 @@ impl HeadlessServer {
             // Stop the replacement for certain before touching the public paths.
             crate::server::handoff::stop_failed_replacement(
                 import_child.as_mut(),
+                peer.as_ref(),
                 &mut stream,
                 &mut bound,
             );
@@ -274,6 +284,7 @@ impl HeadlessServer {
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
             crate::server::handoff::stop_failed_replacement(
                 import_child.as_mut(),
+                peer.as_ref(),
                 &mut stream,
                 &mut bound,
             );

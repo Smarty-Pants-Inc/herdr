@@ -207,6 +207,42 @@ pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     }
 }
 
+/// A handle on the process at the other end of a connected Unix-domain
+/// socket that cannot be confused with a later process reusing its PID.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::LocalSocketPeerProcess;
+
+/// Platforms without a PID-reuse-safe process handle never get one: callers
+/// must not signal the peer by numeric PID instead.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) enum LocalSocketPeerProcess {}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl LocalSocketPeerProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        match *self {}
+    }
+
+    pub(crate) fn kill(&self) -> std::io::Result<bool> {
+        match *self {}
+    }
+}
+
+/// Opens a PID-reuse-safe handle on the process connected to `fd`, and only
+/// while that process still holds its end of the connection. `None` when the
+/// peer is gone or the platform has no such handle.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_process(fd: std::os::fd::RawFd) -> Option<LocalSocketPeerProcess> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_process_platform(fd);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 #[cfg(not(windows))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())
