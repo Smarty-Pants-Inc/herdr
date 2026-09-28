@@ -1,0 +1,53 @@
+# herdr smoke, binary ~/.local/bin/herdr sha256 e20e36f316b277d4e1f616dfc5112788ddd3c468a8d0e2c5eea4e2489f8a2fd6 (herdr 0.9.1), live server pid 3666571 (db438d89), 2026-09-28T14:55:27Z
+$ herdr status
+client:
+  version: 0.9.1
+  channel: stable
+  protocol: 22
+  endpoint_protocol_generation: 1
+
+server:
+  status: running
+exit=0
+$ herdr pane list | jq length
+61
+exit=0
+$ herdr pane current | jq .result.pane.pane_id
+{"pane_id":"wN3:p1","workspace_id":"wN3"}
+$ herdr agent list | jq length
+53
+exit=0
+$ herdr tab create --workspace wN3 --label smoke-99dee407 --no-focus
+{"tab_id":"wN3:t7","label":"smoke-99dee407"}
+pane=wN3:p7
+$ herdr pane send-text PANE "echo SMOKE_$((6*7))_OK" + Enter
+exit=1
+exit=1
+$ herdr pane wait-output PANE --match SMOKE_42_OK
+{"error":{"code":"pane_not_found","message":"pane wN3:p7 not found"},"id":"cli:pane:wait-output"}
+
+exit=0
+$ herdr pane read PANE | grep SMOKE
+$ herdr tab close TAB
+{"id":"cli:tab:close","result":{"type":"ok"}}
+
+exit=0
+$ tab gone?
+0
+server pid still: 3666571
+# end 2026-09-28T14:55:28Z
+
+# part 2 (first attempt guessed the pane id from the tab id, wrong: the real id is in .result.root_pane; tab wN3:t7 was closed OK) 2026-09-28T14:55:41Z
+$ herdr tab create --workspace wN3 --label smoke-99dee407 --no-focus  -> tab wN3:t8, root_pane wN3:pC
+$ herdr pane send-text wN3:pC "echo SMOKE_$((6*7))_OK"; herdr pane send-keys wN3:pC Enter
+ exit=0
+ exit=0
+$ herdr pane wait-output wN3:pC --match SMOKE_42_OK --timeout 10000
+{"type":"output_matched","matched_line":"SMOKE_42_OK"}
+ exit=0
+$ herdr pane read wN3:pC | grep SMOKE_42
+SMOKE_42_OK
+$ herdr tab close wN3:t8
+{"id":"cli:tab:close","result":{"type":"ok"}}
+
+tabs labelled smoke left: 0; server pid still: 3666571; # end 2026-09-28T14:55:44Z

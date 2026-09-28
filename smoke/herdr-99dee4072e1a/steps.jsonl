@@ -1,0 +1,12 @@
+{"event": "start", "surface": "herdr", "build": "99dee4072e1afac38f408715a0aa43d3bf74b2a0", "binary": "~/.local/bin/herdr", "sha256": "e20e36f316b277d4e1f616dfc5112788ddd3c468a8d0e2c5eea4e2489f8a2fd6", "server": "live smarty-dev server pid 3666571 (db438d89), not swapped", "at": "2026-09-28T14:55:27Z"}
+{"event": "step", "name": "status", "ok": true, "detail": "client 0.9.1 protocol 22; server running"}
+{"event": "step", "name": "pane list", "ok": true, "detail": "61 panes"}
+{"event": "step", "name": "pane current", "ok": true, "detail": "wN3:p1"}
+{"event": "step", "name": "agent list", "ok": true, "detail": "53 agents"}
+{"event": "step", "name": "tab create (scratch)", "ok": true, "detail": "wN3:t8, root pane wN3:pC"}
+{"event": "step", "name": "send-text + send-keys Enter", "ok": true, "detail": "echo SMOKE_$((6*7))_OK"}
+{"event": "step", "name": "wait-output", "ok": true, "detail": "output_matched SMOKE_42_OK (only the shell's output can match)"}
+{"event": "step", "name": "pane read", "ok": true, "detail": "SMOKE_42_OK"}
+{"event": "step", "name": "tab close", "ok": true, "detail": "ok; 0 smoke tabs left; server pid unchanged"}
+{"event": "note", "text": "first attempt used a wrong pane id (guessed from the tab id); its tab wN3:t7 closed OK; transcript.txt has both parts"}
+{"event": "done", "at": "2026-09-28T14:55:44Z"}
