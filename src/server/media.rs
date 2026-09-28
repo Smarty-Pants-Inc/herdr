@@ -72,6 +72,9 @@ struct MediaSession {
     /// A handover (smarty-voice#133): the sessions this one replaces once its client accepts it (its offer). Until
     /// then they stay live; if it is refused or times out they are untouched.
     replaces: Vec<String>,
+    /// The mute the caller last asked for (herdr#102 security pass): a renewal inherits it, even before the client
+    /// reported applying it, and a mute asked for during a handover also reaches the successor.
+    wants_muted: bool,
     state: MediaSessionState,
     muted: bool,
     pending: Option<PendingOpen>,
@@ -316,6 +319,12 @@ impl MediaBroker {
             Vec::new()
         };
 
+        // A renewal keeps the call's mute: muted if the caller asked for it or the client reported it (fail closed).
+        let inherited_mute = replaces.iter().any(|id| {
+            self.sessions
+                .get(id)
+                .is_some_and(|old| old.wants_muted || old.muted)
+        });
         let session_id = format!("{}{}", self.id_prefix, self.next_id);
         self.next_id += 1;
         self.sessions.insert(
@@ -325,8 +334,9 @@ impl MediaBroker {
                 pane,
                 pane_ref: input.pane_ref.clone(),
                 replaces,
+                wants_muted: inherited_mute,
                 state: MediaSessionState::Opening,
-                muted: false,
+                muted: inherited_mute,
                 pending: Some(PendingOpen {
                     request_id,
                     respond_to,
@@ -337,10 +347,20 @@ impl MediaBroker {
         actions.push(MediaAction::Send {
             client_id,
             control: MediaControl::Open(MediaOpen {
-                session_id,
+                session_id: session_id.clone(),
                 pane_id: input.pane_ref,
             }),
         });
+        if inherited_mute {
+            // Right after the Open it follows: the new peer is muted before it can send any microphone audio.
+            actions.push(MediaAction::Send {
+                client_id,
+                control: MediaControl::Mute(MediaMute {
+                    session_id,
+                    muted: true,
+                }),
+            });
+        }
         actions
     }
 
@@ -435,14 +455,36 @@ impl MediaBroker {
         session_id: &str,
         muted: bool,
     ) -> Result<Vec<MediaAction>, (&'static str, String)> {
-        let session = self.live_session(session_id)?;
-        Ok(vec![MediaAction::Send {
-            client_id: session.client_id,
-            control: MediaControl::Mute(MediaMute {
-                session_id: session_id.to_owned(),
-                muted,
-            }),
-        }])
+        let mut actions = Vec::new();
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.wants_muted = muted;
+            actions.push(MediaAction::Send {
+                client_id: session.client_id,
+                control: MediaControl::Mute(MediaMute {
+                    session_id: session_id.to_owned(),
+                    muted,
+                }),
+            });
+        } else if !self.has_successor(session_id) {
+            // Neither live nor being handed over: the error it always was.
+            self.live_session(session_id)?;
+        }
+        // A renewal of this call still being handed over gets the same mute (it replaces this session once accepted).
+        for (id, successor) in self
+            .sessions
+            .iter_mut()
+            .filter(|(_, other)| other.replaces.iter().any(|old| old == session_id))
+        {
+            successor.wants_muted = muted;
+            actions.push(MediaAction::Send {
+                client_id: successor.client_id,
+                control: MediaControl::Mute(MediaMute {
+                    session_id: id.clone(),
+                    muted,
+                }),
+            });
+        }
+        Ok(actions)
     }
 
     pub(crate) fn state(&self, session_id: &str) -> Option<MediaSessionView> {
@@ -464,6 +506,20 @@ impl MediaBroker {
     /// End a session at the API caller's request. Unknown ids are a no-op.
     pub(crate) fn close(&mut self, session_id: &str, now: Instant) -> Vec<MediaAction> {
         let mut actions = Vec::new();
+        // Its client may already have retired it for a renewal still being handed over: ending the call it knows
+        // cancels that renewal too (herdr#102 security pass).
+        if !self.sessions.contains_key(session_id) {
+            for id in self.successors(session_id) {
+                self.finish(
+                    &id,
+                    close_code::CLOSED,
+                    "the call it renewed was ended",
+                    true,
+                    now,
+                    &mut actions,
+                );
+            }
+        }
         if self.sessions.contains_key(session_id) {
             self.finish(
                 session_id,
@@ -537,6 +593,19 @@ impl MediaBroker {
         !self.sessions.is_empty()
     }
 
+    /// Sessions still being handed over as renewals of `session_id` (it is in their `replaces`).
+    fn successors(&self, session_id: &str) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, other)| other.replaces.iter().any(|old| old == session_id))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn has_successor(&self, session_id: &str) -> bool {
+        !self.successors(session_id).is_empty()
+    }
+
     fn live_session(
         &mut self,
         session_id: &str,
@@ -561,6 +630,20 @@ impl MediaBroker {
         let Some(session) = self.sessions.remove(session_id) else {
             return;
         };
+        // Ending a call (not its own replacement) also cancels a renewal of it still being handed over: the successor
+        // inherited its authorization from this session (herdr#102 security pass).
+        if code != close_code::REPLACED {
+            for id in self.successors(session_id) {
+                self.finish(
+                    &id,
+                    close_code::CLOSED,
+                    "the call it renewed was ended",
+                    true,
+                    now,
+                    actions,
+                );
+            }
+        }
         if notify_client {
             actions.push(MediaAction::Send {
                 client_id: session.client_id,

@@ -44,6 +44,8 @@ struct MediaSession {
     session_id: String,
     /// The pane this call is for, so a renewal of it can be recognised (smarty-voice#133).
     pane_id: String,
+    /// The mute last applied to this call's peer: a renewal's new peer starts with it (herdr#102 security pass).
+    muted: bool,
     peer: Box<dyn MediaPeer>,
 }
 
@@ -156,6 +158,7 @@ impl ClientMedia {
             }
             MediaControl::Mute(mute) => {
                 if let Some(session) = self.owned_session(endpoint_id, &mute.session_id) {
+                    session.muted = mute.muted;
                     session.peer.set_muted(mute.muted);
                 }
             }
@@ -377,6 +380,10 @@ impl ClientMedia {
     }
 
     fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String, pane_id: String) {
+        // A renewal of the same call keeps its mute from the first sample (closed before the new peer opens).
+        let keep_muted = self.session.as_ref().is_some_and(|previous| {
+            previous.muted && previous.endpoint_id == endpoint_id && previous.pane_id == pane_id
+        });
         if let Some(mut previous) = self.session.take() {
             previous.peer.close();
             self.send_close(
@@ -387,11 +394,15 @@ impl ClientMedia {
             );
         }
         match (self.factory)(session_id.clone(), self.sink.clone()) {
-            Ok(peer) => {
+            Ok(mut peer) => {
+                if keep_muted {
+                    peer.set_muted(true);
+                }
                 self.session = Some(MediaSession {
                     endpoint_id,
                     session_id,
                     pane_id,
+                    muted: keep_muted,
                     peer,
                 });
                 self.notice("Voice call started");
@@ -1049,6 +1060,130 @@ mod tests {
             broker.state(&old).map(|view| view.state),
             Some(MediaSessionState::Connected)
         );
+    }
+
+    /// Delivers broker actions to the client, in order.
+    fn deliver(
+        client: &mut ClientMedia,
+        actions: Vec<crate::server::media::MediaAction>,
+        now: Instant,
+    ) -> Vec<serde_json::Value> {
+        let (controls, responses) = to_client(actions);
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), now);
+        }
+        responses
+    }
+
+    // herdr#102 security pass, P1: a renewal of a muted call keeps it muted from the new peer's start.
+    #[test]
+    fn a_renewal_of_a_muted_call_starts_its_new_peer_muted() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        deliver(&mut client, broker.mute(&old, true).unwrap(), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        let calls = calls.lock().unwrap().clone();
+        let start = calls
+            .iter()
+            .position(|call| matches!(call, PeerCall::Start(id) if *id != old))
+            .expect("the new peer started");
+        let PeerCall::Start(new) = &calls[start] else {
+            unreachable!()
+        };
+        assert_eq!(
+            calls.get(start + 1),
+            Some(&PeerCall::Mute(new.clone(), true)),
+            "muted right after it starts: {calls:?}"
+        );
+        assert!(!calls[start..].contains(&PeerCall::Mute(new.clone(), false)));
+    }
+
+    #[test]
+    fn a_mute_asked_for_during_a_handover_reaches_the_new_peer() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later)); // The client's close of the old peer (replaced).
+        }
+        let new = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The caller mutes the call it knows (the old session) while the handover is under way.
+        let actions = broker
+            .mute(&old, true)
+            .map(|actions| actions)
+            .unwrap_or_default();
+        deliver(&mut client, actions, later);
+        assert!(calls.lock().unwrap().contains(&PeerCall::Mute(new, true)));
+    }
+
+    // herdr#102 security pass, P2: ending the call cancels its renewal still being handed over.
+    #[test]
+    fn ending_the_call_during_its_handover_cancels_the_renewal() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        let new = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The caller ends the call before the replacement's offer came back.
+        deliver(&mut client, broker.close(&old, later), later);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&PeerCall::Close(new.clone())),
+            "the new peer is closed"
+        );
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "media_refused");
+        assert!(broker.state(&new).map(|view| view.state) != Some(MediaSessionState::Offered));
+        // A late offer for the cancelled renewal changes nothing.
+        let late = to_client(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: new.clone(),
+                sdp: "v=0 late".into(),
+            }),
+            later,
+        ));
+        assert!(late.0.is_empty() && late.1.is_empty());
     }
 
     #[test]
