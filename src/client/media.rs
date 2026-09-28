@@ -42,12 +42,15 @@ pub(super) enum MediaEffect {
 struct MediaSession {
     endpoint_id: ClientEndpointId,
     session_id: String,
+    /// The pane this call is for, so a renewal of it can be recognised (smarty-voice#133).
+    pane_id: String,
     peer: Box<dyn MediaPeer>,
 }
 
 struct PendingConsent {
     endpoint_id: ClientEndpointId,
     session_id: String,
+    pane_id: String,
     deadline: Instant,
 }
 
@@ -232,7 +235,12 @@ impl ClientMedia {
             .is_some_and(|(last_pane, at)| {
                 *last_pane == pane_id && now.saturating_duration_since(*at) <= MEDIA_INPUT_WINDOW
             });
-        if !fresh_input {
+        // smarty-voice#133: a renewal of this client's own call on this pane (the server reopens for the client of the
+        // pane's live call) needs no fresh input: the user started that call here and it is still running.
+        let renewal = self.session.as_ref().is_some_and(|session| {
+            session.endpoint_id == *endpoint_id && session.pane_id == pane_id
+        });
+        if !fresh_input && !renewal {
             return self.refuse(
                 endpoint_id,
                 session_id,
@@ -241,7 +249,7 @@ impl ClientMedia {
             );
         }
         if self.mode == MediaMode::Auto || self.allowed {
-            return self.start(endpoint_id.clone(), session_id);
+            return self.start(endpoint_id.clone(), session_id, pane_id);
         }
         // A newer request supersedes an unanswered prompt.
         if let Some(previous) = self.pending.take() {
@@ -258,6 +266,7 @@ impl ClientMedia {
         self.pending = Some(PendingConsent {
             endpoint_id: endpoint_id.clone(),
             session_id: session_id.clone(),
+            pane_id,
             deadline: now + MEDIA_CONSENT_TIMEOUT,
         });
         self.effects.push(MediaEffect::AskConsent {
@@ -284,7 +293,7 @@ impl ClientMedia {
             );
         } else if allowed {
             self.allowed = true;
-            self.start(pending.endpoint_id, pending.session_id);
+            self.start(pending.endpoint_id, pending.session_id, pending.pane_id);
         } else {
             self.decline(pending, "Voice call declined");
         }
@@ -367,7 +376,7 @@ impl ClientMedia {
         }
     }
 
-    fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String) {
+    fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String, pane_id: String) {
         if let Some(mut previous) = self.session.take() {
             previous.peer.close();
             self.send_close(
@@ -382,6 +391,7 @@ impl ClientMedia {
                 self.session = Some(MediaSession {
                     endpoint_id,
                     session_id,
+                    pane_id,
                     peer,
                 });
                 self.notice("Voice call started");
@@ -859,6 +869,45 @@ mod tests {
         open(&mut media, "m1", "pane_1", now);
         media.take_effects();
         (media, calls)
+    }
+
+    // smarty-voice#133: the server reopens a pane's live call for its client when nobody typed in the last 10 s.
+    #[test]
+    fn a_renewal_of_this_clients_own_call_on_the_pane_starts_without_fresh_input() {
+        let (mut media, calls) = started(MediaMode::Auto);
+        let later = Instant::now() + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        open(&mut media, "m2", "pane_1", later);
+        let effects = media.take_effects();
+        assert_eq!(
+            closes(&effects),
+            vec![("m1".to_owned(), Some(close_code::REPLACED.to_owned()))],
+            "the old peer is replaced, and nothing is refused"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                PeerCall::Start("m1".into()),
+                PeerCall::Close("m1".into()),
+                PeerCall::Start("m2".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_input_is_still_refused_for_another_pane_or_with_no_call() {
+        let (mut media, _) = started(MediaMode::Auto);
+        let later = Instant::now() + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        open(&mut media, "m2", "pane_2", later); // The live call is on pane_1.
+        assert_eq!(
+            refusal(&mut media).as_deref(),
+            Some(close_code::STALE_INPUT)
+        );
+
+        let (mut idle, calls) = media(MediaMode::Auto, false);
+        idle.note_pane_input(&local(), "pane_1", Instant::now());
+        open(&mut idle, "m3", "pane_1", later); // No call on this client.
+        assert_eq!(refusal(&mut idle).as_deref(), Some(close_code::STALE_INPUT));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
