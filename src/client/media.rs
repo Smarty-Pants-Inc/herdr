@@ -1131,10 +1131,7 @@ mod tests {
             })
             .unwrap();
         // The caller mutes the call it knows (the old session) while the handover is under way.
-        let actions = broker
-            .mute(&old, true)
-            .map(|actions| actions)
-            .unwrap_or_default();
+        let actions = broker.mute(&old, true).unwrap_or_default();
         deliver(&mut client, actions, later);
         assert!(calls.lock().unwrap().contains(&PeerCall::Mute(new, true)));
     }
