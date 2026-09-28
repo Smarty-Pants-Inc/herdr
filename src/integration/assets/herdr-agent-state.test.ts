@@ -13,6 +13,7 @@ const originalEnvironment = {
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
   OMPCODE: process.env.OMPCODE,
+  PI_SESSION_ID: process.env.PI_SESSION_ID,
 };
 
 let server: Server | undefined;
@@ -90,6 +91,7 @@ function createExtensionHarness() {
 function configureIntegrationEnvironment(recordingSocketPath: string) {
   // Tests may run inside an OMP shell; nested-session cases opt in explicitly.
   delete process.env.OMPCODE;
+  delete process.env.PI_SESSION_ID;
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
@@ -234,6 +236,33 @@ for (const integration of integrations) {
     expect(reportedState()).toBe("working");
   });
 }
+
+test("Pi ignores nested sessions launched from another Pi's bash tool", async () => {
+  const requests = await startRecordingServer("pi-nested");
+  process.env.PI_SESSION_ID = "01a0e7d3-parent";
+  const { handlers, pi } = createExtensionHarness();
+
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  // Pi's bash tool sets PI_SESSION_ID for every command. A `pi` started there
+  // inherits it and must not claim the pane's session for its own conversation.
+  expect(handlers.size).toBe(0);
+  await handlers.get("session_start")?.(
+    { reason: "startup" },
+    {
+      hasUI: false,
+      isIdle: () => true,
+      sessionManager: {
+        getSessionFile: () => "/tmp/pi-nested.jsonl",
+        getSessionId: () => "pi-nested",
+      },
+    },
+  );
+  await Bun.sleep(25);
+
+  expect(requests).toEqual([]);
+});
 
 test("OMP ignores nested sessions launched inside another OMP shell", async () => {
   const requests = await startRecordingServer("omp-nested");

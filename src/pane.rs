@@ -171,6 +171,7 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     for key in [
         "CODEX_THREAD_ID",
         "OMPCODE",
+        "PI_SESSION_ID",
         "CLAUDECODE",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_SESSION_ID",
@@ -3914,6 +3915,8 @@ mod tests {
         let keys = [
             "CODEX_THREAD_ID",
             "OMPCODE",
+            "PI_SESSION_ID",
+        "PI_SESSION_ID",
             "CLAUDECODE",
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_CODE_SESSION_ID",

@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -14,9 +14,14 @@ const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:pi";
+// Pi's bash tool gives every command it runs PI_SESSION_ID (its own session). A
+// nested `pi` started from that shell (a probe, a sub-agent) inherits it with
+// HERDR_PANE_ID, so it is not the pane's root agent and must not report its
+// short-lived session over the parent's (like OMPCODE for OMP).
+const nestedPiSession = !!process.env.PI_SESSION_ID;
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedPiSession;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
