@@ -244,9 +244,10 @@ impl HeadlessServer {
                 )),
             });
         }
-        // Committed: the replacement owns the public paths now.
+        // Committed: the replacement owns the public paths now. Drop only our
+        // own parked files; anything else at those names is left alone.
         for socket in &parked {
-            let _ = std::fs::remove_file(&socket.parked);
+            let _ = remove_socket_file_if_owned(&socket.parked, &socket.identity);
         }
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
@@ -544,11 +545,26 @@ fn park_public_socket(
             return None;
         }
     }
-    let parked = sibling_socket_path(public, &format!(".handoff-{}", std::process::id()));
-    let _ = std::fs::remove_file(&parked);
-    if let Err(err) = std::fs::rename(public, &parked) {
-        warn!(path = %public.display(), err = %err, "failed to park public socket for handoff");
-        return None;
+    let parked = match move_socket_aside(public, "handoff") {
+        Ok(parked) => parked,
+        Err(err) => {
+            warn!(path = %public.display(), err = %err, "failed to park public socket for handoff");
+            return None;
+        }
+    };
+    if socket_file_identity(&parked).ok().as_ref() != Some(identity) {
+        // Another socket took the public path between the check and the move.
+        // Put it back; if that is impossible, keep it where it is.
+        return match put_back_foreign_socket(&parked, public) {
+            Ok(()) => {
+                warn!(path = %public.display(), "public socket is not ours; not parking it for handoff");
+                None
+            }
+            Err(err) => {
+                warn!(path = %public.display(), err = %err, "public socket changed while parking it for handoff");
+                None
+            }
+        };
     }
     Some(ParkedSocket {
         kind,
@@ -595,7 +611,7 @@ fn unpark_public_socket(
         Err(err) => return Err(err),
     }
     link_no_replace(&socket.parked, &socket.public)?;
-    let _ = std::fs::remove_file(&socket.parked);
+    let _ = remove_socket_file_if_owned(&socket.parked, &socket.identity);
     if socket_file_identity(&socket.public)? != socket.identity {
         return Err(io::Error::other("public socket changed while restoring"));
     }
@@ -603,13 +619,25 @@ fn unpark_public_socket(
 }
 
 /// Removes the failed replacement's socket file at `public`, and only that.
-/// The file is first renamed to a private name, so a socket bound at the
+/// The file is first moved to a fresh private name, so a socket bound at the
 /// public path in the meantime is never the one unlinked.
 #[cfg(unix)]
 fn remove_replacement_socket(public: &Path, replacement: &SocketFileIdentity) -> io::Result<()> {
-    let quarantine = sibling_socket_path(public, &format!(".failed-{}", std::process::id()));
-    let _ = std::fs::remove_file(&quarantine);
-    std::fs::rename(public, &quarantine)?;
+    remove_replacement_socket_with(public, replacement, || {}, || {})
+}
+
+/// [`remove_replacement_socket`] with hooks that run just before the move
+/// aside and just before a foreign socket is linked back, so tests can race
+/// other binds against both steps.
+#[cfg(unix)]
+fn remove_replacement_socket_with(
+    public: &Path,
+    replacement: &SocketFileIdentity,
+    before_quarantine: impl FnOnce(),
+    before_link_back: impl FnOnce(),
+) -> io::Result<()> {
+    before_quarantine();
+    let quarantine = move_socket_aside(public, "failed")?;
     match socket_file_identity(&quarantine) {
         Ok(moved) if moved == *replacement => {
             info!(
@@ -621,9 +649,8 @@ fn remove_replacement_socket(public: &Path, replacement: &SocketFileIdentity) ->
         }
         _ => {
             // Not the replacement's after all: put it back untouched.
-            let restored = link_no_replace(&quarantine, public);
-            let _ = std::fs::remove_file(&quarantine);
-            restored?;
+            before_link_back();
+            put_back_foreign_socket(&quarantine, public)?;
             Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -633,6 +660,110 @@ fn remove_replacement_socket(public: &Path, replacement: &SocketFileIdentity) ->
             ))
         }
     }
+}
+
+/// Links a socket file that is not ours from `aside` back to `public`, and
+/// drops the `aside` name only once that has worked. If `public` is taken or
+/// the link fails, the socket keeps its `aside` name, which is logged and
+/// returned in the error so its owner can still be reached.
+#[cfg(unix)]
+fn put_back_foreign_socket(aside: &Path, public: &Path) -> io::Result<()> {
+    let foreign = socket_file_identity(aside).ok();
+    if let Err(err) = link_no_replace(aside, public) {
+        tracing::error!(
+            path = %public.display(),
+            kept = %aside.display(),
+            err = %err,
+            "ANOTHER SERVER'S SOCKET COULD NOT BE PUT BACK at its public path; it is kept at the recovery path"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "another server's socket was moved off {} and could not be linked back ({err}); it is preserved at {}",
+                public.display(),
+                aside.display()
+            ),
+        ));
+    }
+    // `public` names the foreign socket again; the extra name can go.
+    if let Some(foreign) = foreign {
+        let _ = remove_socket_file_if_owned(aside, &foreign);
+    }
+    Ok(())
+}
+
+/// Moves the socket file at `public` to a new sibling name that nothing else
+/// uses, `<public>.<tag>-<pid>-<n>`, and returns that name. An existing file is
+/// never replaced: a taken name is skipped.
+#[cfg(unix)]
+fn move_socket_aside(public: &Path, tag: &str) -> io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let pid = std::process::id();
+    for _ in 0..64 {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let aside = sibling_socket_path(public, &format!(".{tag}-{pid}-{n}"));
+        match rename_no_replace(public, &aside) {
+            Ok(()) => return Ok(aside),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free name to move {} aside", public.display()),
+    ))
+}
+
+/// Renames `from` to `to`, failing with `AlreadyExists` instead of replacing
+/// anything at `to`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both paths are valid NUL-terminated strings for the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both paths are valid NUL-terminated strings for the call.
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no-replace rename is not available on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
 }
 
 /// Makes `to` name the same socket file as `from` without replacing anything
@@ -660,4 +791,144 @@ pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Res
         io::ErrorKind::TimedOut,
         "old server sockets did not close before handoff import bind",
     ))
+}
+
+#[cfg(all(test, unix))]
+mod socket_restore_tests {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn scratch_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hq-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names_with(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.to_string_lossy().contains(needle))
+            .collect()
+    }
+
+    fn identity(path: &Path) -> SocketFileIdentity {
+        socket_file_identity(path).unwrap()
+    }
+
+    #[test]
+    fn foreign_socket_survives_a_bind_that_takes_the_public_path_before_link_back() {
+        let dir = scratch_dir();
+        let public = dir.join("s.sock");
+        let replacement = UnixListener::bind(&public).unwrap();
+        let replacement_identity = identity(&public);
+
+        let mut foreign = None;
+        let mut occupier = None;
+        let result = remove_replacement_socket_with(
+            &public,
+            &replacement_identity,
+            || {
+                // An independent server clears the stale socket and binds
+                // after the replacement's socket was inspected.
+                std::fs::remove_file(&public).unwrap();
+                let listener = UnixListener::bind(&public).unwrap();
+                foreign = Some((listener, identity(&public)));
+            },
+            || {
+                // Another startup takes the public path while the foreign
+                // socket is aside.
+                let listener = UnixListener::bind(&public).unwrap();
+                occupier = Some((listener, identity(&public)));
+            },
+        );
+        drop(replacement);
+        let (_foreign_listener, foreign_identity) = foreign.unwrap();
+        let (_occupier_listener, occupier_identity) = occupier.unwrap();
+
+        let err = result.expect_err("a foreign socket that cannot go back is an error");
+        let kept = names_with(&dir, "s.sock.failed-");
+        assert_eq!(kept.len(), 1, "foreign socket must keep one aside name");
+        let kept = &kept[0];
+        assert!(
+            err.to_string().contains(&kept.display().to_string()),
+            "the error must name where the foreign socket is kept: {err}"
+        );
+        // Same inode, still reachable: nothing unlinked it.
+        assert_eq!(identity(kept), foreign_identity);
+        UnixStream::connect(kept).expect("foreign listener reachable at its kept path");
+        assert_eq!(identity(&public), occupier_identity);
+        UnixStream::connect(&public).expect("occupier still reachable at the public path");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_socket_goes_back_to_a_free_public_path() {
+        let dir = scratch_dir();
+        let public = dir.join("s.sock");
+        let replacement = UnixListener::bind(&public).unwrap();
+        let replacement_identity = identity(&public);
+
+        let mut foreign = None;
+        let result = remove_replacement_socket_with(
+            &public,
+            &replacement_identity,
+            || {
+                std::fs::remove_file(&public).unwrap();
+                let listener = UnixListener::bind(&public).unwrap();
+                foreign = Some((listener, identity(&public)));
+            },
+            || {},
+        );
+        drop(replacement);
+        let (_foreign_listener, foreign_identity) = foreign.unwrap();
+
+        let err = result.expect_err("a changed owner is reported");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(identity(&public), foreign_identity);
+        UnixStream::connect(&public).expect("foreign listener reachable at the public path");
+        assert!(names_with(&dir, ".failed-").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacement_socket_is_the_only_one_removed() {
+        let dir = scratch_dir();
+        let public = dir.join("s.sock");
+        let _replacement = UnixListener::bind(&public).unwrap();
+        let replacement_identity = identity(&public);
+
+        remove_replacement_socket(&public, &replacement_identity).unwrap();
+        assert!(!public.exists());
+        assert!(names_with(&dir, ".failed-").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moving_a_socket_aside_never_replaces_an_existing_file() {
+        let dir = scratch_dir();
+        let from = dir.join("a.sock");
+        let to = dir.join("b.sock");
+        let _a = UnixListener::bind(&from).unwrap();
+        let _b = UnixListener::bind(&to).unwrap();
+        let (a, b) = (identity(&from), identity(&to));
+
+        let err = rename_no_replace(&from, &to).expect_err("must not rename over b");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(identity(&from), a);
+        assert_eq!(identity(&to), b);
+
+        let first = move_socket_aside(&from, "failed").unwrap();
+        assert_eq!(identity(&first), a);
+        std::fs::hard_link(&first, &from).unwrap();
+        let second = move_socket_aside(&from, "failed").unwrap();
+        assert_ne!(first, second, "each move aside gets a fresh name");
+        assert_eq!(identity(&first), a);
+        assert_eq!(identity(&second), a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
