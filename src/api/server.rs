@@ -62,10 +62,12 @@ impl ServerHandle {
         remove_socket_file_if_owned(&self.path, &self.identity)
     }
 
+    #[cfg(unix)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
+    #[cfg(unix)]
     pub(crate) fn identity(&self) -> &SocketFileIdentity {
         &self.identity
     }
@@ -111,6 +113,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        guarded_live_handoff: crate::platform::capabilities().live_handoff,
     })
 }
 
@@ -555,6 +558,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
+        Method::ServerLiveHandoffGuarded(_) => "server.live_handoff_guarded",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
@@ -1455,6 +1459,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                guarded_live_handoff: true,
             }),
             None,
             None,

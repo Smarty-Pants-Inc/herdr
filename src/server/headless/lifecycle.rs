@@ -25,8 +25,20 @@ impl HeadlessServer {
     pub(super) fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
+        guarded_method: bool,
     ) -> io::Result<()> {
-        info!("starting live handoff");
+        info!(guarded = guarded_method, "starting live handoff");
+        let has_source_guard =
+            params.expected_source_pid.is_some() || params.expected_socket_inode.is_some();
+        if guarded_method && !has_source_guard {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server.live_handoff_guarded needs expected_source_pid or expected_socket_inode",
+            ));
+        }
+        // A request that names its source also requires a replacement that can
+        // prove which sockets it binds, whichever method carried it.
+        let guarded = guarded_method || has_source_guard;
         let own_socket_inode = self
             .api_server
             .as_ref()
@@ -159,13 +171,13 @@ impl HeadlessServer {
             return Err(err);
         }
 
-        let mut stream = match crate::server::handoff::accept_and_validate_on(
+        let (mut stream, replacement) = match crate::server::handoff::accept_and_validate_on(
             listener,
             &socket_path,
             &token,
             &manifest,
         ) {
-            Ok(stream) => stream,
+            Ok(accepted) => accepted,
             Err(err) => {
                 for fd in fds {
                     let _ = unsafe { libc::close(fd) };
@@ -175,6 +187,21 @@ impl HeadlessServer {
                 return Err(err);
             }
         };
+
+        if guarded && !replacement.reports_bound_sockets {
+            // Never downgrade a guarded handoff: without socket reports a failed
+            // replacement's socket files cannot be told apart from another
+            // server's. Nothing has been handed over or moved yet.
+            for fd in fds {
+                let _ = unsafe { libc::close(fd) };
+            }
+            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing guarded handoff: the replacement server does not support guarded handoff (it does not report the sockets it binds); no handoff was performed",
+            ));
+        }
 
         let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
         for fd in fds {
@@ -190,10 +217,12 @@ impl HeadlessServer {
         // unlinking the old listeners: each socket file is renamed aside and
         // renamed back if the handoff does not commit.
         let parked = self.park_public_sockets_for_handoff();
-        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
+        let mut bound = crate::server::handoff::BoundSockets::default();
+        if let Err(err) = crate::server::handoff::wait_ready(&mut stream, &mut bound) {
             // Stop the replacement for certain before touching the public paths.
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            let restored = self.restore_public_sockets_after_failed_handoff(parked);
+            crate::server::handoff::drain_bound_reports(&mut stream, &mut bound);
+            let restored = self.restore_public_sockets_after_failed_handoff(parked, &bound);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(match restored {
                 Ok(()) => io::Error::other(format!(
@@ -206,7 +235,7 @@ impl HeadlessServer {
         }
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            let restored = self.restore_public_sockets_after_failed_handoff(parked);
+            let restored = self.restore_public_sockets_after_failed_handoff(parked, &bound);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(match restored {
                 Ok(()) => err,
@@ -243,6 +272,7 @@ impl HeadlessServer {
     pub(super) fn perform_live_handoff(
         &mut self,
         _params: crate::api::schema::ServerLiveHandoffParams,
+        _guarded_method: bool,
     ) -> io::Result<()> {
         Err(io::Error::other("live handoff is only supported on Unix"))
     }
@@ -254,9 +284,11 @@ impl HeadlessServer {
         let mut parked = Vec::new();
         match &self.api_server {
             Some(api_server) => {
-                if let Some(socket) =
-                    park_public_socket(PublicSocket::Api, api_server.path(), api_server.identity())
-                {
+                if let Some(socket) = park_public_socket(
+                    BoundSocketKind::Api,
+                    api_server.path(),
+                    api_server.identity(),
+                ) {
                     parked.push(socket);
                 }
             }
@@ -265,7 +297,7 @@ impl HeadlessServer {
             }
         }
         if let Some(socket) = park_public_socket(
-            PublicSocket::Client,
+            BoundSocketKind::Client,
             &self.client_socket_path,
             &self.client_socket_identity,
         ) {
@@ -277,6 +309,8 @@ impl HeadlessServer {
     /// Returns the public paths to the old server's still-open listeners after
     /// a handoff that did not commit. The replacement must already be stopped.
     ///
+    /// Only a socket file the replacement reported binding is removed. Anything
+    /// else at a public path, such as another server's socket, is left alone.
     /// If a listener cannot be put back at its public path, the failure is
     /// logged as an error and a fresh listener is bound at `<socket>.recover`,
     /// so the old server, which still owns every pane, stays reachable.
@@ -284,10 +318,11 @@ impl HeadlessServer {
     fn restore_public_sockets_after_failed_handoff(
         &mut self,
         parked: Vec<ParkedSocket>,
+        bound: &crate::server::handoff::BoundSockets,
     ) -> io::Result<()> {
         let mut failures = Vec::new();
         for socket in parked {
-            let restored = unpark_public_socket(&socket);
+            let restored = unpark_public_socket(&socket, bound.get(socket.kind));
             let Err(err) = restored else {
                 info!(path = %socket.public.display(), "restored public socket after failed handoff");
                 continue;
@@ -300,9 +335,13 @@ impl HeadlessServer {
                 "OLD SERVER LOST ITS PUBLIC SOCKET after failed handoff; binding recovery socket"
             );
             let recovered = match socket.kind {
-                PublicSocket::Api => self.bind_api_recovery_socket(recover.clone()),
-                PublicSocket::Client => self.bind_client_recovery_socket(recover.clone()),
+                BoundSocketKind::Api => self.bind_api_recovery_socket(recover.clone()),
+                BoundSocketKind::Client => self.bind_client_recovery_socket(recover.clone()),
             };
+            if recovered.is_ok() {
+                // The parked file's listener was replaced by the recovery one.
+                let _ = remove_socket_file_if_owned(&socket.parked, &socket.identity);
+            }
             match recovered {
                 Ok(()) => failures.push(format!(
                     "{} not restored ({err}); server reachable at {}",
@@ -464,17 +503,13 @@ impl HeadlessServer {
 }
 
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
-enum PublicSocket {
-    Api,
-    Client,
-}
+use crate::server::handoff::BoundSocketKind;
 
 /// An old server's public socket file moved aside during a handoff. Its
 /// listener stays open, so renaming the file back restores the same socket.
 #[cfg(unix)]
 struct ParkedSocket {
-    kind: PublicSocket,
+    kind: BoundSocketKind,
     public: PathBuf,
     parked: PathBuf,
     identity: SocketFileIdentity,
@@ -494,7 +529,7 @@ fn recovery_socket_path(public: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn park_public_socket(
-    kind: PublicSocket,
+    kind: BoundSocketKind,
     public: &Path,
     identity: &SocketFileIdentity,
 ) -> Option<ParkedSocket> {
@@ -523,15 +558,33 @@ fn park_public_socket(
     })
 }
 
-/// Removes whatever the stopped replacement left at the public path, then
-/// renames the old server's own socket file back into place.
+/// Puts the old server's own socket file back at its public path.
+///
+/// Whatever is at the public path is removed only if it is the socket file the
+/// stopped replacement reported binding (`replacement`). Anything else, for
+/// example a server started independently while the path was free, is left in
+/// place and reported as a conflict. Neither step can clobber a competing bind:
+/// the replacement's file is moved aside and checked before it is unlinked, and
+/// the old file is linked back with no-replace semantics.
 #[cfg(unix)]
-fn unpark_public_socket(socket: &ParkedSocket) -> io::Result<()> {
+fn unpark_public_socket(
+    socket: &ParkedSocket,
+    replacement: Option<&SocketFileIdentity>,
+) -> io::Result<()> {
     match socket_file_identity(&socket.public) {
         Ok(current) if current == socket.identity => return Ok(()),
-        Ok(_) => {
-            info!(path = %socket.public.display(), "removing failed replacement's public socket");
-            std::fs::remove_file(&socket.public)?;
+        Ok(current) => {
+            if replacement != Some(&current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "{} is held by a socket that is not the failed replacement's (inode {}); left in place",
+                        socket.public.display(),
+                        current.inode()
+                    ),
+                ));
+            }
+            remove_replacement_socket(&socket.public, &current)?;
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
@@ -541,11 +594,52 @@ fn unpark_public_socket(socket: &ParkedSocket) -> io::Result<()> {
         Ok(_) => return Err(io::Error::other("parked socket was replaced")),
         Err(err) => return Err(err),
     }
-    std::fs::rename(&socket.parked, &socket.public)?;
+    link_no_replace(&socket.parked, &socket.public)?;
+    let _ = std::fs::remove_file(&socket.parked);
     if socket_file_identity(&socket.public)? != socket.identity {
         return Err(io::Error::other("public socket changed while restoring"));
     }
     Ok(())
+}
+
+/// Removes the failed replacement's socket file at `public`, and only that.
+/// The file is first renamed to a private name, so a socket bound at the
+/// public path in the meantime is never the one unlinked.
+#[cfg(unix)]
+fn remove_replacement_socket(public: &Path, replacement: &SocketFileIdentity) -> io::Result<()> {
+    let quarantine = sibling_socket_path(public, &format!(".failed-{}", std::process::id()));
+    let _ = std::fs::remove_file(&quarantine);
+    std::fs::rename(public, &quarantine)?;
+    match socket_file_identity(&quarantine) {
+        Ok(moved) if moved == *replacement => {
+            info!(
+                path = %public.display(),
+                inode = moved.inode(),
+                "removed failed replacement's public socket (the inode it reported binding)"
+            );
+            std::fs::remove_file(&quarantine)
+        }
+        _ => {
+            // Not the replacement's after all: put it back untouched.
+            let restored = link_no_replace(&quarantine, public);
+            let _ = std::fs::remove_file(&quarantine);
+            restored?;
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} changed owner while restoring; left in place",
+                    public.display()
+                ),
+            ))
+        }
+    }
+}
+
+/// Makes `to` name the same socket file as `from` without replacing anything
+/// already at `to`.
+#[cfg(unix)]
+fn link_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)
 }
 
 #[cfg(unix)]

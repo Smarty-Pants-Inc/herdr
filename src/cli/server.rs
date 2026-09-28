@@ -205,13 +205,28 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    // A handoff that names its source goes through the guarded method, which a
+    // server without source guards rejects as unknown. It is never sent as a
+    // plain `server.live_handoff`, which such a server would run unguarded.
+    let guarded = params.expected_source_pid.is_some() || params.expected_socket_inode.is_some();
+    let method = if guarded {
+        Method::ServerLiveHandoffGuarded(params)
+    } else {
+        Method::ServerLiveHandoff(params)
+    };
+
     // Live handoff is itself a protocol-mismatch recovery path, so it must
     // reach the running server without the normal CLI compatibility guard.
     let response = super::send_request_unchecked(&Request {
         id: "cli:server:live-handoff".into(),
-        method: Method::ServerLiveHandoff(params),
+        method,
     })?;
     if response.get("error").is_some() {
+        if guarded && response["error"]["code"] == "invalid_request" {
+            eprintln!(
+                "refusing guarded live handoff: the running server does not support source guards (server.live_handoff_guarded); no handoff was started"
+            );
+        }
         let rendered = serde_json::to_string(&response).unwrap_or_else(|err| {
             format!(
                 "{{\"error\":{{\"code\":\"render_failed\",\"message\":\"failed to render error response: {err}\"}}}}"

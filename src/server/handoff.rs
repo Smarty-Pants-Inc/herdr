@@ -51,13 +51,92 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// The source asks the replacement to report each public socket it binds
+    /// (`bound <api|client> <dev> <ino>`), so a failed handoff removes only the
+    /// replacement's own socket files. A replacement that supports this answers
+    /// `validated bound-sockets`; older replacements ignore the field.
+    #[serde(default)]
+    pub report_bound_sockets: bool,
 }
+
+#[cfg(unix)]
+const BOUND_SOCKETS_CAPABILITY: &str = "bound-sockets";
 
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
     pub fds: Vec<RawFd>,
     pub stream: UnixStream,
+    /// Whether this replacement agreed to report the sockets it binds.
+    pub report_bound_sockets: bool,
+}
+
+/// What the replacement said it supports when it validated the manifest.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReplacementCapabilities {
+    pub reports_bound_sockets: bool,
+}
+
+/// A public socket path the replacement binds.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoundSocketKind {
+    Api,
+    Client,
+}
+
+#[cfg(unix)]
+impl BoundSocketKind {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Client => "client",
+        }
+    }
+}
+
+/// The socket files the replacement reported binding, recorded as it binds
+/// them. Only these may be removed when the handoff fails.
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BoundSockets {
+    pub api: Option<crate::ipc::SocketFileIdentity>,
+    pub client: Option<crate::ipc::SocketFileIdentity>,
+}
+
+#[cfg(unix)]
+impl BoundSockets {
+    pub(crate) fn get(&self, kind: BoundSocketKind) -> Option<&crate::ipc::SocketFileIdentity> {
+        match kind {
+            BoundSocketKind::Api => self.api.as_ref(),
+            BoundSocketKind::Client => self.client.as_ref(),
+        }
+    }
+
+    /// Records a `bound <api|client> <dev> <ino>` line. Returns false for any
+    /// other line.
+    fn record(&mut self, line: &str) -> bool {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("bound") {
+            return false;
+        }
+        let (Some(kind), Some(dev), Some(ino), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let (Ok(dev), Ok(ino)) = (dev.parse::<u64>(), ino.parse::<u64>()) else {
+            return false;
+        };
+        let identity = crate::ipc::SocketFileIdentity::from_parts(dev, ino);
+        match kind {
+            "api" => self.api = Some(identity),
+            "client" => self.client = Some(identity),
+            _ => return false,
+        }
+        true
+    }
 }
 
 #[cfg(unix)]
@@ -147,45 +226,214 @@ const IMPORT_GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// group. The whole group is killed, not only the direct child: an import
 /// executable that is a wrapper, or anything the child started in its group,
 /// must not survive holding the public sockets. Pane processes run in sessions
-/// of their own and are not in this group. The group is signalled while the
-/// leader is still unreaped, so the id cannot have been reused.
+/// of their own and are not in this group.
+///
+/// The group id is only ever signalled while the leader is unreaped (running or
+/// a zombie): the kernel cannot reuse its pid, so it cannot name another group.
+/// The leader is reaped last, and nothing is signalled after that.
 #[cfg(unix)]
 pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
-    let pgid = pid as libc::pid_t;
-    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            warn!(pid, err = %err, "failed to kill handoff import process group during rollback");
-        }
-    }
-    // The leader may not be a group leader if it never reached setsid.
-    let _ = child.kill();
-    match child.wait() {
-        Ok(status) => {
-            info!(pid, status = %status, "handoff import server reaped during rollback");
-        }
-        Err(err) => {
-            warn!(pid, err = %err, "failed to reap handoff import server during rollback");
-        }
-    }
+    let mut ops = RealImportGroup { child };
+    stop_import_group(&mut ops, IMPORT_GROUP_EXIT_TIMEOUT);
+    info!(pid, "handoff import process group stopped during rollback");
+}
 
-    let deadline = std::time::Instant::now() + IMPORT_GROUP_EXIT_TIMEOUT;
+/// The operations `stop_import_group` needs, so tests can check their order.
+#[cfg(unix)]
+trait ImportGroupOps {
+    /// The leader has not been reaped yet, so its pid still pins the group id.
+    fn leader_unreaped(&mut self) -> bool;
+    /// SIGKILL the group (and the leader, in case it never became a leader).
+    fn kill_group(&mut self);
+    /// The leader has exited; it stays unreaped.
+    fn leader_exited(&mut self) -> bool;
+    /// A process other than the leader is still alive in the group.
+    fn group_has_live_members(&mut self) -> bool;
+    /// Reaps the leader. The group id must not be signalled after this.
+    fn reap(&mut self);
+}
+
+#[cfg(unix)]
+fn stop_import_group(ops: &mut impl ImportGroupOps, timeout: Duration) {
+    if !ops.leader_unreaped() {
+        // Someone already reaped it: its pid, and so its group id, may belong
+        // to another process now. Never signal it.
+        warn!("handoff import server was already reaped; not signalling its process group");
+        ops.reap();
+        return;
+    }
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        let alive = unsafe { libc::killpg(pgid, 0) } == 0;
-        if !alive {
-            return;
+        ops.kill_group();
+        if ops.leader_exited() && !ops.group_has_live_members() {
+            break;
         }
         if std::time::Instant::now() >= deadline {
             tracing::error!(
-                pid,
                 "handoff import process group is still alive after SIGKILL; continuing rollback"
             );
-            return;
+            break;
         }
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
         std::thread::sleep(Duration::from_millis(20));
     }
+    ops.reap();
+}
+
+#[cfg(unix)]
+struct RealImportGroup<'a> {
+    child: &'a mut Child,
+}
+
+#[cfg(unix)]
+impl RealImportGroup<'_> {
+    fn pid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+
+    /// `waitid(WNOWAIT)`: Some(exited) while the leader is ours and unreaped,
+    /// None once it has been reaped (ECHILD).
+    fn peek_leader(&self) -> Option<bool> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        Some(siginfo_pid(&info) != 0)
+    }
+}
+
+#[cfg(unix)]
+fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    unsafe { info.si_pid() }
+}
+
+#[cfg(unix)]
+impl ImportGroupOps for RealImportGroup<'_> {
+    fn leader_unreaped(&mut self) -> bool {
+        self.peek_leader().is_some()
+    }
+
+    fn kill_group(&mut self) {
+        let pid = self.pid();
+        if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                warn!(pid, err = %err, "failed to kill handoff import process group");
+            }
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    fn leader_exited(&mut self) -> bool {
+        // Reaped by someone else counts as exited; the loop then stops signalling.
+        self.peek_leader().unwrap_or(true)
+    }
+
+    fn group_has_live_members(&mut self) -> bool {
+        process_group_has_live_members(self.pid(), self.pid())
+    }
+
+    fn reap(&mut self) {
+        match self.child.wait() {
+            Ok(status) => {
+                info!(pid = self.child.id(), status = %status, "handoff import server reaped during rollback");
+            }
+            Err(err) => {
+                warn!(pid = self.child.id(), err = %err, "failed to reap handoff import server during rollback");
+            }
+        }
+    }
+}
+
+/// Whether any process other than `leader` is alive (not a zombie) in `pgid`.
+/// Only reads process tables; it never signals.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_group_has_live_members(pgid: libc::pid_t, leader: libc::pid_t) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid == leader {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // pid (comm) state ppid pgrp ...; comm may contain spaces or parens.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("Z");
+        let pgrp = fields
+            .nth(1)
+            .and_then(|field| field.parse::<libc::pid_t>().ok());
+        if pgrp == Some(pgid) && state != "Z" && state != "X" {
+            return true;
+        }
+    }
+    false
+}
+
+/// `PROC_PGRP_ONLY` from `<libproc.h>`; not exported by the libc crate.
+#[cfg(target_os = "macos")]
+const PROC_PGRP_ONLY: u32 = 2;
+
+#[cfg(target_os = "macos")]
+fn process_group_has_live_members(pgid: libc::pid_t, leader: libc::pid_t) -> bool {
+    let mut pids = vec![0 as libc::pid_t; 1024];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            pgid as u32,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return false;
+    }
+    let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
+    pids.iter().take(count).any(|&pid| {
+        if pid == 0 || pid == leader {
+            return false;
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        got == size && info.pbi_status != libc::SZOMB
+    })
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn process_group_has_live_members(_pgid: libc::pid_t, _leader: libc::pid_t) -> bool {
+    false
 }
 
 /// Refuses a handoff whose caller expected a different source server.
@@ -236,7 +484,7 @@ pub(crate) fn accept_and_validate_on(
     socket_path: &Path,
     token: &str,
     manifest: &HandoffManifest,
-) -> io::Result<UnixStream> {
+) -> io::Result<(UnixStream, ReplacementCapabilities)> {
     let (mut stream, _) = accept_with_timeout(&listener, READY_TIMEOUT)?;
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
@@ -255,11 +503,26 @@ pub(crate) fn accept_and_validate_on(
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
     let validated = read_line_unbuffered(&mut stream)?;
-    if validated.trim_end() != "validated" {
-        return Err(io::Error::other("handoff import did not validate manifest"));
-    }
+    let capabilities = parse_validated_line(&validated)
+        .ok_or_else(|| io::Error::other("handoff import did not validate manifest"))?;
     let _ = std::fs::remove_file(socket_path);
-    Ok(stream)
+    Ok((stream, capabilities))
+}
+
+/// Parses `validated` or `validated <capability>...` from the replacement.
+#[cfg(unix)]
+fn parse_validated_line(line: &str) -> Option<ReplacementCapabilities> {
+    let mut words = line.split_whitespace();
+    if words.next() != Some("validated") {
+        return None;
+    }
+    let mut capabilities = ReplacementCapabilities::default();
+    for word in words {
+        if word == BOUND_SOCKETS_CAPABILITY {
+            capabilities.reports_bound_sockets = true;
+        }
+    }
+    Some(capabilities)
 }
 
 #[cfg(unix)]
@@ -276,14 +539,80 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
     Ok(())
 }
 
+/// Waits for `ready`, recording each `bound ...` report on the way.
 #[cfg(unix)]
-pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(ready_timeout()))?;
-    let ready = read_line_unbuffered(&mut *stream)?;
-    if ready.trim_end() != "ready" {
-        return Err(io::Error::other("handoff import did not report ready"));
+pub(crate) fn wait_ready(stream: &mut UnixStream, bound: &mut BoundSockets) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + ready_timeout();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handoff import did not report ready in time",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let line = match read_line_unbuffered(&mut *stream) {
+            Ok(line) => line,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "handoff import did not report ready within {}ms",
+                        ready_timeout().as_millis()
+                    ),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+        let line = line.trim_end();
+        if line == "ready" {
+            return Ok(());
+        }
+        if !bound.record(line) {
+            return Err(io::Error::other("handoff import did not report ready"));
+        }
     }
-    Ok(())
+}
+
+/// Reads any `bound ...` reports a stopped replacement wrote before it died,
+/// up to end of stream. Call only after the replacement has been stopped.
+#[cfg(unix)]
+pub(crate) fn drain_bound_reports(stream: &mut UnixStream, bound: &mut BoundSockets) {
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .is_err()
+    {
+        return;
+    }
+    while let Ok(line) = read_line_unbuffered(&mut *stream) {
+        if line.is_empty() {
+            return;
+        }
+        bound.record(line.trim_end());
+    }
+}
+
+/// Tells the source which public socket file this replacement just bound.
+#[cfg(unix)]
+pub(crate) fn report_bound(
+    stream: &mut UnixStream,
+    kind: BoundSocketKind,
+    identity: &crate::ipc::SocketFileIdentity,
+) -> io::Result<()> {
+    writeln!(
+        stream,
+        "bound {} {} {}",
+        kind.wire_name(),
+        identity.dev(),
+        identity.inode()
+    )?;
+    stream.flush()
 }
 
 /// Debug builds let tests shorten the readiness wait for a replacement that
@@ -358,14 +687,28 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             crate::build_info::version()
         )));
     }
-    stream.write_all(b"validated\n")?;
+    let report_bound_sockets = manifest.report_bound_sockets && !test_legacy_replacement();
+    if report_bound_sockets {
+        writeln!(stream, "validated {BOUND_SOCKETS_CAPABILITY}")?;
+    } else {
+        stream.write_all(b"validated\n")?;
+    }
     stream.flush()?;
     let fds = recv_fds(&stream, manifest.panes.len())?;
     Ok(ReceivedHandoff {
         manifest,
         fds,
         stream,
+        report_bound_sockets,
     })
+}
+
+/// Debug builds let tests run a replacement that behaves like a build from
+/// before socket reports: it answers plain `validated` and reports nothing.
+#[cfg(unix)]
+fn test_legacy_replacement() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("HERDR_TEST_HANDOFF_IMPORT_LEGACY").as_deref() == Ok("1")
 }
 
 #[cfg(unix)]
@@ -423,6 +766,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        report_bound_sockets: true,
     }
 }
 
@@ -734,13 +1078,116 @@ mod tests {
 
         cleanup_failed_import_child(&mut child);
 
+        // The leader is reaped, and no live process is left in its group. The
+        // group id is only inspected, never signalled, after the reap.
         assert!(child.try_wait().unwrap().is_some());
-        assert_ne!(
-            unsafe { libc::killpg(pgid, 0) },
-            0,
+        assert!(
+            !process_group_has_live_members(pgid, pgid),
             "process group survived"
         );
-        assert_ne!(unsafe { libc::kill(helper, 0) }, 0, "helper survived");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::kill(helper, 0) } == 0 && std::time::Instant::now() < deadline {
+            // Reparented to init as a zombie until it is reaped there.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_group_has_live_members(pgid, pgid),
+            "helper survived"
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeGroup {
+        reaped_already: bool,
+        exits_after_kills: usize,
+        members_after_kills: usize,
+        kills: usize,
+        events: Vec<&'static str>,
+    }
+
+    impl ImportGroupOps for FakeGroup {
+        fn leader_unreaped(&mut self) -> bool {
+            !self.reaped_already && !self.events.contains(&"reap")
+        }
+        fn kill_group(&mut self) {
+            self.kills += 1;
+            self.events.push("kill");
+        }
+        fn leader_exited(&mut self) -> bool {
+            self.kills >= self.exits_after_kills
+        }
+        fn group_has_live_members(&mut self) -> bool {
+            self.kills < self.members_after_kills
+        }
+        fn reap(&mut self) {
+            self.events.push("reap");
+        }
+    }
+
+    #[test]
+    fn a_failed_import_group_is_never_signalled_after_its_leader_is_reaped() {
+        // A helper outlives the leader for a few rounds: every kill still comes
+        // before the single reap.
+        let mut group = FakeGroup {
+            exits_after_kills: 1,
+            members_after_kills: 4,
+            ..FakeGroup::default()
+        };
+        stop_import_group(&mut group, Duration::from_secs(5));
+        assert_eq!(group.events, ["kill", "kill", "kill", "kill", "reap"]);
+
+        // Even when the group outlives the deadline, it is reaped last.
+        let mut stubborn = FakeGroup {
+            exits_after_kills: usize::MAX,
+            members_after_kills: usize::MAX,
+            ..FakeGroup::default()
+        };
+        stop_import_group(&mut stubborn, Duration::from_millis(50));
+        assert_eq!(stubborn.events.last(), Some(&"reap"));
+        assert_eq!(stubborn.events.iter().filter(|e| **e == "reap").count(), 1);
+        assert!(stubborn.kills >= 1);
+
+        // A leader someone else already reaped no longer pins its group id:
+        // nothing is signalled at all.
+        let mut reaped = FakeGroup {
+            reaped_already: true,
+            ..FakeGroup::default()
+        };
+        stop_import_group(&mut reaped, Duration::from_secs(5));
+        assert_eq!(reaped.events, ["reap"]);
+    }
+
+    #[test]
+    fn a_replacement_advertises_socket_reports_when_it_validates() {
+        assert_eq!(
+            parse_validated_line("validated\n"),
+            Some(ReplacementCapabilities::default())
+        );
+        assert_eq!(
+            parse_validated_line("validated bound-sockets\n"),
+            Some(ReplacementCapabilities {
+                reports_bound_sockets: true
+            })
+        );
+        assert_eq!(parse_validated_line("ready\n"), None);
+    }
+
+    #[test]
+    fn bound_socket_reports_are_recorded_by_kind() {
+        let mut bound = BoundSockets::default();
+        assert!(bound.record("bound api 7 42"));
+        assert!(bound.record("bound client 7 43"));
+        assert!(!bound.record("bound other 7 44"));
+        assert!(!bound.record("bound api 7"));
+        assert!(!bound.record("ready"));
+        assert_eq!(
+            bound.get(BoundSocketKind::Api),
+            Some(&crate::ipc::SocketFileIdentity::from_parts(7, 42))
+        );
+        assert_eq!(
+            bound.get(BoundSocketKind::Client),
+            Some(&crate::ipc::SocketFileIdentity::from_parts(7, 43))
+        );
     }
 
     #[test]

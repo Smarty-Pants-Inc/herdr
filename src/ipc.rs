@@ -69,6 +69,14 @@ pub(crate) struct SocketFileIdentity {
 
 #[cfg(unix)]
 impl SocketFileIdentity {
+    pub(crate) fn from_parts(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    pub(crate) fn dev(&self) -> u64 {
+        self.dev
+    }
+
     pub(crate) fn inode(&self) -> u64 {
         self.ino
     }

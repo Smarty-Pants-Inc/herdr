@@ -4897,6 +4897,23 @@
           "type": "object"
         },
         {
+          "description": "A live handoff that must honour its source guards. Servers that predate\nthe guards reject this method, so a guarded request never runs unguarded.",
+          "properties": {
+            "method": {
+              "const": "server.live_handoff_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerLiveHandoffParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "server.reload_config",
@@ -10912,6 +10929,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "guarded_live_handoff": {
+              "default": false,
+              "description": "Supports `server.live_handoff_guarded`, which refuses an unexpected\nsource server and a replacement that cannot report its sockets.",
+              "type": "boolean"
             },
             "health_check": {
               "default": false,

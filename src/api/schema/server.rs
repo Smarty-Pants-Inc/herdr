@@ -43,4 +43,8 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `server.live_handoff_guarded`, which refuses an unexpected
+    /// source server and a replacement that cannot report its sockets.
+    #[serde(default)]
+    pub guarded_live_handoff: bool,
 }
