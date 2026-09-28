@@ -213,6 +213,11 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
 }
 
 /// Unsupported platform stub.
+pub fn parent_process_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn session_processes(_child_pid: u32) -> Vec<u32> {
     Vec::new()
 }
