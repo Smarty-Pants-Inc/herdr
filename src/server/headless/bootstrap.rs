@@ -170,12 +170,28 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             ));
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
+        if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("hang_before_bind") {
+            // A replacement that never binds the public paths or becomes ready.
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
 
+        let report_bound = received.report_bound_sockets;
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
         )?;
+        if report_bound {
+            // Reported as soon as it is bound, so a source whose handoff fails
+            // knows this socket file is ours to remove, and no other is.
+            crate::server::handoff::report_bound(
+                &mut received.stream,
+                crate::server::handoff::BoundSocketKind::Api,
+                api_server.identity(),
+            )?;
+        }
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
@@ -183,9 +199,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             Some(api_server),
             should_quit,
         )?;
+        if report_bound {
+            crate::server::handoff::report_bound(
+                &mut received.stream,
+                crate::server::handoff::BoundSocketKind::Client,
+                &server.client_socket_identity,
+            )?;
+        }
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
+        if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("hang_before_ready") {
+            // A replacement that holds the public sockets but never becomes ready.
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();

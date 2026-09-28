@@ -1607,6 +1607,7 @@ fn live_handoff_server_via_api_for_release_at(
         import_exe: Some(updated_exe.display().to_string()),
         expected_protocol: release.target_protocol,
         expected_version: Some(release.label().to_string()),
+        ..ServerLiveHandoffParams::default()
     };
 
     send_server_update_method_at(
@@ -2854,6 +2855,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                guarded_live_handoff: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2929,6 +2931,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    guarded_live_handoff: true,
                 }),
             },
         };
@@ -3188,6 +3191,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    guarded_live_handoff: true,
                 }),
             },
         };

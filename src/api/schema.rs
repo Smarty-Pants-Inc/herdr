@@ -53,6 +53,10 @@ pub enum Method {
     ServerStop(EmptyParams),
     #[serde(rename = "server.live_handoff")]
     ServerLiveHandoff(ServerLiveHandoffParams),
+    /// A live handoff that must honour its source guards. Servers that predate
+    /// the guards reject this method, so a guarded request never runs unguarded.
+    #[serde(rename = "server.live_handoff_guarded")]
+    ServerLiveHandoffGuarded(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.ssh_agent.register")]
