@@ -3916,7 +3916,6 @@ mod tests {
             "CODEX_THREAD_ID",
             "OMPCODE",
             "PI_SESSION_ID",
-        "PI_SESSION_ID",
             "CLAUDECODE",
             "CLAUDE_CODE_CHILD_SESSION",
             "CLAUDE_CODE_SESSION_ID",
