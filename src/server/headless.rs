@@ -2938,8 +2938,10 @@ impl HeadlessServer {
         changed
     }
 
-    /// What a client can see of the agents: per terminal, its state, agent label, agent name and
-    /// effective presentation, plus the toast. Compared around a `pane.report_agent*` request.
+    /// What a client can see of the agents: per terminal, its state, agent label, agent name,
+    /// effective presentation and completion (the Done mark); per pane, whether it has been seen
+    /// (workspace attention and the sidebar use it); and the toast. Compared around a
+    /// `pane.report_agent*` request.
     fn agent_report_view(&self) -> AgentReportView {
         let terminals: Vec<_> = self
             .app
@@ -2953,13 +2955,26 @@ impl HeadlessServer {
                     terminal.effective_agent_label().map(str::to_string),
                     terminal.agent_name.clone(),
                     terminal.effective_presentation(),
+                    terminal.last_agent_completion_seq,
                 )
+            })
+            .collect();
+        let panes: Vec<_> = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| {
+                tab.panes
+                    .iter()
+                    .map(|(&pane_id, pane)| (pane_id.raw(), pane.seen))
             })
             .collect();
         // ponytail: no sort: a HashMap's iteration order is the same between two reads while no
         // terminal is added or removed; if one is, the views differ and the request renders, which
         // is the safe side.
-        (self.app.state.toast.clone(), terminals)
+        (self.app.state.toast.clone(), terminals, panes)
     }
 
     /// Drains API requests with shutdown awareness.
@@ -3119,8 +3134,8 @@ impl HeadlessServer {
         // publishes every 2 s even when nothing changed). With ~100 agents, treating every report
         // as a UI change forced a full render per request (~50 ms each at that scale), which
         // stalled typing and scrolling for every client. A report now asks for a render only when
-        // it changes what a client can see: an agent's state, label, name or presentation, or the
-        // toast.
+        // it changes what a client can see: an agent's state, label, name, presentation or
+        // completion, a pane's seen mark, or the toast.
         let is_agent_report = matches!(
             &msg.request.method,
             api::schema::Method::PaneReportAgent(_)
@@ -3648,5 +3663,7 @@ type AgentReportView = (
         Option<String>,
         Option<String>,
         crate::terminal::EffectivePresentation,
+        Option<u64>,
     )>,
+    Vec<(u32, bool)>,
 );
