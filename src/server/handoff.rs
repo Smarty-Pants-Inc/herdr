@@ -598,6 +598,75 @@ pub(crate) fn drain_bound_reports(stream: &mut UnixStream, bound: &mut BoundSock
     }
 }
 
+/// Stops a replacement whose handoff failed, for certain, and records any
+/// `bound ...` reports it wrote: the spawned import child's process group, or
+/// in a pull handoff the importer at the other end of `stream`.
+#[cfg(unix)]
+pub(crate) fn stop_failed_replacement(
+    child: Option<&mut Child>,
+    stream: &mut UnixStream,
+    bound: &mut BoundSockets,
+) {
+    if let Some(child) = child {
+        cleanup_failed_import_child(child);
+        drain_bound_reports(stream, bound);
+        return;
+    }
+    // ponytail: a pulling importer is not our child, so no unreaped pid pins
+    // it. It is signalled only while its end of the stream is still open; it
+    // passes that end to no other process, so the peer pid is still its own.
+    if read_bound_reports_until_closed(stream, bound, None) {
+        return;
+    }
+    match crate::platform::local_socket_peer_pid(stream.as_raw_fd()) {
+        Some(pid) => {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            info!(pid, "pulling handoff importer killed during rollback");
+        }
+        None => warn!("pulling handoff importer pid is unknown; waiting for it to exit"),
+    }
+    if !read_bound_reports_until_closed(stream, bound, Some(IMPORT_GROUP_EXIT_TIMEOUT)) {
+        tracing::error!(
+            "pulling handoff importer is still alive after SIGKILL; continuing rollback"
+        );
+    }
+}
+
+/// Records `bound ...` reports until the peer closes the stream (true), or
+/// until `timeout` passes (false). `None` reads only what is already there.
+#[cfg(unix)]
+fn read_bound_reports_until_closed(
+    stream: &mut UnixStream,
+    bound: &mut BoundSockets,
+    timeout: Option<Duration>,
+) -> bool {
+    let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+    if stream.set_nonblocking(deadline.is_none()).is_err() {
+        return false;
+    }
+    let closed = loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+                break false;
+            }
+        }
+        match read_line_unbuffered(&mut *stream) {
+            Ok(line) => {
+                bound.record(line.trim_end());
+            }
+            Err(err) => {
+                break matches!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                )
+            }
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
+}
+
 /// Tells the source which public socket file this replacement just bound.
 #[cfg(unix)]
 pub(crate) fn report_bound(
@@ -657,7 +726,76 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
-    let mut stream = UnixStream::connect(socket_path)?;
+    receive_on(UnixStream::connect(socket_path)?, token)
+}
+
+/// Pulls a live handoff from the running server of this session into this
+/// process (`herdr server --import-from-running`), for example a systemd
+/// unit's main process. The source must be named: pull is always guarded.
+#[cfg(unix)]
+pub(crate) fn pull(
+    mut params: crate::api::schema::ServerLiveHandoffParams,
+) -> io::Result<ReceivedHandoff> {
+    let Some(source_pid) = params.expected_source_pid else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--import-from-running needs --expect-source-pid",
+        ));
+    };
+    let token = format!(
+        "pull-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    params.import_token = Some(token.clone());
+    let request = crate::api::schema::Request {
+        id: "server:import-from-running".into(),
+        method: crate::api::schema::Method::ServerLiveHandoffPull(params),
+    };
+    // The source answers only after the handoff ends, so the request waits
+    // on its own thread; an early answer is an error before we could connect.
+    let (answer_tx, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = answer_tx.send(crate::api::client::ApiClient::local().request_value(&request));
+    });
+    let socket_path = crate::session::data_dir().join(format!("herdr-handoff-{source_pid}.sock"));
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        match answer.try_recv() {
+            Ok(Ok(response)) => {
+                return Err(io::Error::other(format!(
+                    "the running server refused the pull handoff: {}",
+                    response.get("error").unwrap_or(&response)
+                )))
+            }
+            Ok(Err(err)) => {
+                return Err(io::Error::other(format!(
+                    "pull handoff request failed: {err}"
+                )))
+            }
+            Err(_) => {}
+        }
+        if let Ok(stream) = UnixStream::connect(&socket_path) {
+            // A leftover socket file from another handoff refuses the
+            // connection; a live source listener with a stranger's token
+            // fails validation, and the source rolls back.
+            return receive_on(stream, &token);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the running server did not open its handoff socket",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn receive_on(mut stream: UnixStream, token: &str) -> io::Result<ReceivedHandoff> {
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;

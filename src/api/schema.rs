@@ -57,6 +57,12 @@ pub enum Method {
     /// the guards reject this method, so a guarded request never runs unguarded.
     #[serde(rename = "server.live_handoff_guarded")]
     ServerLiveHandoffGuarded(ServerLiveHandoffParams),
+    /// A guarded live handoff to the importer that sent the request, which
+    /// connects to the handoff socket itself (for example a systemd unit's
+    /// main process). Servers without it reject the method, so it never runs
+    /// as a push handoff.
+    #[serde(rename = "server.live_handoff_pull")]
+    ServerLiveHandoffPull(ServerLiveHandoffParams),
     #[serde(rename = "server.reload_config")]
     ServerReloadConfig(EmptyParams),
     #[serde(rename = "server.ssh_agent.register")]

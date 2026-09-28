@@ -33,6 +33,7 @@ mod plugin;
 mod protocol_guard;
 mod runtime;
 mod server;
+pub(crate) use server::parse_live_handoff_params;
 mod server_not_running;
 mod spec;
 mod status;

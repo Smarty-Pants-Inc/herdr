@@ -25,6 +25,16 @@ pub fn run_server() -> io::Result<()> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
         return run_handoff_import_server(&socket_path, token);
     }
+    // `herdr [--session S] server --import-from-running --expect-source-pid P ...`
+    if let Some(at) = args.iter().position(|arg| arg == "--import-from-running") {
+        let Some(params) = crate::cli::parse_live_handoff_params(&args[at + 1..]) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: herdr server --import-from-running --expect-source-pid <pid> [--expect-socket-inode <inode>] [--expected-protocol <n>] [--expected-version <version>]",
+            ));
+        };
+        return run_pull_import_server(params);
+    }
 
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -129,8 +139,22 @@ fn take_startup_cwd() -> Option<PathBuf> {
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
     #[cfg(debug_assertions)]
     crate::server::handoff::start_test_owner_watchdog();
+    let received = crate::server::handoff::receive(socket_path, token)?;
+    serve_handoff_import(received)
+}
+
+/// Pulls the running server's panes into this process, which then serves them.
+#[cfg(unix)]
+fn run_pull_import_server(params: crate::api::schema::ServerLiveHandoffParams) -> io::Result<()> {
+    #[cfg(debug_assertions)]
+    crate::server::handoff::start_test_owner_watchdog();
+    let received = crate::server::handoff::pull(params)?;
+    serve_handoff_import(received)
+}
+
+#[cfg(unix)]
+fn serve_handoff_import(mut received: crate::server::handoff::ReceivedHandoff) -> io::Result<()> {
     let loaded_config = config::Config::load();
-    let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -232,6 +256,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
     result
+}
+
+#[cfg(not(unix))]
+fn run_pull_import_server(_params: crate::api::schema::ServerLiveHandoffParams) -> io::Result<()> {
+    Err(io::Error::other("live handoff is only supported on Unix"))
 }
 
 #[cfg(not(unix))]

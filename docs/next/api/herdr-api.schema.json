@@ -4044,6 +4044,13 @@
                 "string",
                 "null"
               ]
+            },
+            "import_token": {
+              "description": "`server.live_handoff_pull` only: the token the importer that sent the\nrequest presents on the handoff socket. The source spawns no replacement.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "type": "object"
@@ -4901,6 +4908,23 @@
           "properties": {
             "method": {
               "const": "server.live_handoff_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerLiveHandoffParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A guarded live handoff to the importer that sent the request, which\nconnects to the handoff socket itself (for example a systemd unit's\nmain process). Servers without it reject the method, so it never runs\nas a push handoff.",
+          "properties": {
+            "method": {
+              "const": "server.live_handoff_pull",
               "type": "string"
             },
             "params": {

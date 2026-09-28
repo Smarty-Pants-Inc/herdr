@@ -18,6 +18,10 @@ pub struct ServerLiveHandoffParams {
     /// with this inode and that socket is the one at the public path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_socket_inode: Option<u64>,
+    /// `server.live_handoff_pull` only: the token the importer that sent the
+    /// request presents on the handoff socket. The source spawns no replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

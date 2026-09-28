@@ -2648,3 +2648,185 @@ fn live_handoff_to_replacement_that_never_becomes_ready_keeps_old_server() {
     drop(spawned);
     cleanup_test_base(&base);
 }
+
+/// Runs `herdr server --import-from-running` against the server in `base`,
+/// the way a systemd unit's ExecStart would. Killed on drop.
+struct PullImporter(std::process::Child);
+
+impl Drop for PullImporter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_pull_importer(
+    base: &Path,
+    api_socket: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+) -> PullImporter {
+    let runtime_dir = api_socket.parent().unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command
+        .args(["server", "--import-from-running"])
+        .args(args)
+        .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string())
+        .env("HERDR_SOCKET_PATH", api_socket)
+        .env(
+            "HERDR_CLIENT_SOCKET_PATH",
+            runtime_dir.join("herdr-client.sock"),
+        )
+        .env("SHELL", "/bin/sh")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    PullImporter(command.spawn().unwrap())
+}
+
+fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "process did not exit in time");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn stderr_of(child: &mut std::process::Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    stderr
+}
+
+#[test]
+fn pull_import_takes_over_the_running_server_with_its_panes() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
+        spawn_server_with_echo_pane(&base, &[]);
+    let source_pid = spawned.child.process_id().unwrap();
+    let api_inode = socket_inode(&api_socket);
+
+    let mut importer = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[],
+    );
+
+    // The source hands over and exits; the importer keeps running as the server.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while spawned.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "source server did not hand over");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        importer.0.try_wait().unwrap().is_none(),
+        "importer exited: {}",
+        stderr_of(&mut importer.0)
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert_ne!(socket_inode(&api_socket), api_inode);
+    let importer_pid = importer.0.id();
+    assert_eq!(
+        server_ptmx_fd_count(importer_pid),
+        1,
+        "the importer holds the pane"
+    );
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-pull",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    assert!(wait_for_exit(&mut importer.0, Duration::from_secs(10)).success());
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
+        spawn_server_with_echo_pane(&base, &[("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "3000")]);
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+
+    // A source other than the one named: refused before anything moves.
+    let mut wrong = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &["--expect-source-pid".into(), (source_pid + 1).to_string()],
+        &[],
+    );
+    let status = wait_for_exit(&mut wrong.0, Duration::from_secs(10));
+    let stderr = stderr_of(&mut wrong.0);
+    assert!(!status.success());
+    assert!(stderr.contains("not the expected pid"), "stderr: {stderr}");
+
+    // A replacement that binds the public sockets but never becomes ready is
+    // killed by the source, which then restores its own sockets.
+    let mut hung = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "hang_before_ready")],
+    );
+    let status = wait_for_exit(&mut hung.0, Duration::from_secs(20));
+    assert!(!status.success(), "a failed importer must exit non-zero");
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the source stops a hung importer"
+    );
+
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert!(!api_socket.with_file_name("herdr.sock.recover").exists());
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-failed-pull",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}

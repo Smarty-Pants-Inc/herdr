@@ -8,7 +8,7 @@ pub(super) fn run_server_command(args: &[String]) -> std::io::Result<Option<i32>
     match subcommand {
         "stop" => server_stop(&args[1..]).map(Some),
         "live-handoff" => server_live_handoff(&args[1..]).map(Some),
-        "--handoff-import" => Ok(None),
+        "--handoff-import" | "--import-from-running" => Ok(None),
         "reload-config" => server_reload_config(&args[1..]).map(Some),
         "agent-manifests" => server_agent_manifests(&args[1..]).map(Some),
         "update-agent-manifests" => server_update_agent_manifests(&args[1..]).map(Some),
@@ -245,7 +245,7 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     Ok(0)
 }
 
-fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHandoffParams> {
+pub(crate) fn parse_live_handoff_params(args: &[String]) -> Option<ServerLiveHandoffParams> {
     let mut params = ServerLiveHandoffParams::default();
     let mut idx = 0;
     while idx < args.len() {
@@ -282,6 +282,8 @@ fn print_server_help() {
     eprintln!("  herdr server                run as headless server");
     eprintln!("  herdr server stop           stop the running server via the API socket");
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
+    eprintln!("  herdr server --import-from-running --expect-source-pid <pid> [--expect-socket-inode <inode>]");
+    eprintln!("                              become the server: pull the running server's live panes into this process");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");
     eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
     eprintln!("  herdr server update-agent-manifests [--json]  fetch and reload agent detection manifests");
