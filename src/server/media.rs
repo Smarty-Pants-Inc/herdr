@@ -67,6 +67,8 @@ struct PendingOpen {
 struct MediaSession {
     client_id: u64,
     pane: PaneId,
+    /// The pane id as its client knows it, so a renewal can reopen for that client (smarty-voice#133).
+    pane_ref: String,
     state: MediaSessionState,
     muted: bool,
     pending: Option<PendingOpen>,
@@ -224,6 +226,27 @@ impl MediaBroker {
             .and_then(|owner| {
                 let capable = *self.clients.get(&owner.client_id)?;
                 Some((owner.client_id, capable, owner.clone()))
+            })
+            // A renewal or resume minutes into a call (smarty-voice#133): nobody typed in the last 10 s, but the
+            // pane's call is live on a client. Only that client, only while its session on this pane is connected and
+            // the client is still attached (and, below, capable and viewing the pane). A pane without a live session
+            // stays media_no_client, and recent input by any client still wins.
+            .or_else(|| {
+                self.sessions.values().find_map(|session| {
+                    if session.pane != pane
+                        || session.state != MediaSessionState::Connected
+                        || !views(session.client_id)
+                    {
+                        return None;
+                    }
+                    let capable = *self.clients.get(&session.client_id)?;
+                    let owner = PaneOwner {
+                        client_id: session.client_id,
+                        pane_ref: session.pane_ref.clone(),
+                        at: now,
+                    };
+                    Some((session.client_id, capable, owner))
+                })
             });
         let Some((client_id, capable, input)) = latest else {
             actions.push(MediaAction::Respond {
@@ -288,6 +311,7 @@ impl MediaBroker {
             MediaSession {
                 client_id,
                 pane,
+                pane_ref: input.pane_ref.clone(),
                 state: MediaSessionState::Opening,
                 muted: false,
                 pending: Some(PendingOpen {
@@ -896,5 +920,144 @@ mod tests {
             true
         });
         assert!(broker.state(&third).is_none());
+    }
+
+    /// A session on `pane` for the client that typed into it, carried to Connected (a call in progress).
+    fn live_call(
+        broker: &mut MediaBroker,
+        client_id: u64,
+        pane_id: PaneId,
+        now: Instant,
+    ) -> String {
+        broker.note_pane_input(client_id, pane_id, "w1:p7", now);
+        let (sent, _rx) = open(broker, pane_id, now);
+        let (_, session_id, _) = opened_session(&sent);
+        run(broker.client_control(
+            client_id,
+            MediaControl::Offer(MediaSdp {
+                session_id: session_id.clone(),
+                sdp: "v=0 offer".into(),
+            }),
+            now,
+        ));
+        run(broker.answer(&session_id, "v=0 answer".into()).unwrap());
+        run(broker.client_control(
+            client_id,
+            MediaControl::State(MediaStateUpdate {
+                session_id: session_id.clone(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            }),
+            now,
+        ));
+        session_id
+    }
+
+    // smarty-voice#133: a provider renewal an hour into a native call reopens media with nobody typing.
+    #[test]
+    fn a_renewal_with_no_recent_input_binds_to_the_live_calls_client_and_replaces_it() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        let old = live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+
+        let (sent, rx) = open(&mut broker, pane(7), later);
+        let (client_id, new, pane_ref) = opened_session(&sent);
+        assert_eq!((client_id, pane_ref.as_str()), (1, "w1:p7"));
+        assert_ne!(new, old);
+        assert!(rx.try_recv().is_err(), "the caller waits for the new offer");
+        // One step: the new session is bound and the old one is closed as replaced, never two and never none.
+        assert!(broker.state(&new).is_some());
+        assert_ne!(
+            broker.state(&old).map(|view| view.state),
+            Some(MediaSessionState::Connected)
+        );
+        assert!(
+            sent.iter().all(|(client_id, _)| *client_id == 1),
+            "no other client is told anything"
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_live_call_still_has_no_client() {
+        for state in [
+            None,
+            Some(MediaPeerState::Connecting),
+            Some(MediaPeerState::Failed),
+        ] {
+            let now = Instant::now();
+            let mut broker = MediaBroker::new();
+            broker.client_connected(1, true);
+            broker.note_pane_input(1, pane(7), "w1:p7", now);
+            let (sent, _rx) = open(&mut broker, pane(7), now);
+            let (_, session_id, _) = opened_session(&sent);
+            if let Some(state) = state {
+                run(broker.client_control(
+                    1,
+                    MediaControl::Offer(MediaSdp {
+                        session_id: session_id.clone(),
+                        sdp: "v=0".into(),
+                    }),
+                    now,
+                ));
+                run(broker.client_control(
+                    1,
+                    MediaControl::State(MediaStateUpdate {
+                        session_id,
+                        state,
+                        muted: false,
+                        detail: None,
+                    }),
+                    now,
+                ));
+            }
+            let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+            let (sent, rx) = open(&mut broker, pane(7), later);
+            assert!(sent
+                .iter()
+                .all(|(_, control)| !matches!(control, MediaControl::Open(_))));
+            assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+        }
+    }
+
+    #[test]
+    fn the_live_calls_client_that_no_longer_views_the_pane_is_refused() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        let old = live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = mpsc::channel();
+        let sent = run(broker.open("req".into(), tx, pane(7), |_| false, later));
+        assert!(sent
+            .iter()
+            .all(|(_, control)| !matches!(control, MediaControl::Open(_))));
+        assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+        assert_eq!(
+            broker.state(&old).map(|view| view.state),
+            Some(MediaSessionState::Connected),
+            "the call is left alone"
+        );
+        // A departed client leaves the pane with no client at all.
+        run(broker.client_removed(1, later));
+        let (_, rx) = open(&mut broker, pane(7), later);
+        assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+    }
+
+    #[test]
+    fn recent_input_by_another_client_still_wins_over_the_live_call() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        live_call(&mut broker, 1, pane(7), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        broker.note_pane_input(2, pane(7), "p_7", later);
+        let (sent, _rx) = open(&mut broker, pane(7), later + Duration::from_secs(1));
+        let (client_id, _, pane_ref) = opened_session(&sent);
+        assert_eq!((client_id, pane_ref.as_str()), (2, "p_7"));
     }
 }
