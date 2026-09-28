@@ -1172,6 +1172,14 @@ fn detach_clipboard_owner(child: std::process::Child) -> bool {
     true
 }
 
+/// The parent of `pid`, from `/proc/<pid>/stat`. A process gone or unreadable has none.
+pub fn parent_process_id(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    // After (comm): state(0) ppid(1)
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn process_session_id(pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;

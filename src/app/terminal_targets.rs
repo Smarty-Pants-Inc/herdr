@@ -208,21 +208,33 @@ impl App {
     /// Maps a locally attributed process to the one pane whose session it runs in,
     /// agent or not. Used when a process reports under a pane ID it inherited
     /// before its pane was renumbered or moved (smarty-dev#509).
+    ///
+    /// A process that left its pane's session (a tool runner that calls `setsid`, as Pi's shell
+    /// tool does) still descends from the pane's shell, so the lookup walks the peer's
+    /// ancestors until one runs in a pane session (smarty-dev#931).
     pub(crate) fn pane_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
-        let mut matches = self.terminal_targets().into_iter().filter(|target| {
-            self.state
-                .runtime_for_pane_in_workspace(
-                    &self.terminal_runtimes,
-                    target.ws_idx,
-                    target.pane_id,
-                )
-                .and_then(crate::terminal::TerminalRuntime::child_pid)
-                .is_some_and(|child_pid| {
-                    crate::platform::process_in_pane_session(child_pid, peer_pid)
-                })
-        });
-        let target = matches.next()?;
-        matches.next().is_none().then_some(target)
+        let panes: Vec<(TerminalTarget, u32)> = self
+            .terminal_targets()
+            .into_iter()
+            .filter_map(|target| {
+                let child_pid = self
+                    .state
+                    .runtime_for_pane_in_workspace(
+                        &self.terminal_runtimes,
+                        target.ws_idx,
+                        target.pane_id,
+                    )
+                    .and_then(crate::terminal::TerminalRuntime::child_pid)?;
+                Some((target, child_pid))
+            })
+            .collect();
+        find_in_ancestors(peer_pid, crate::platform::parent_process_id, |pid| {
+            let mut matches = panes
+                .iter()
+                .filter(|(_, child_pid)| crate::platform::process_in_pane_session(*child_pid, pid));
+            let (target, _) = matches.next()?;
+            matches.next().is_none().then(|| target.clone())
+        })
     }
 
     fn terminal_target_candidate(
@@ -244,5 +256,82 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
         })
+    }
+}
+
+/// The deepest ancestor walk: a pane's shell sits a few levels above any tool it runs.
+const MAX_ANCESTOR_DEPTH: usize = 32;
+
+/// Returns the first hit of `found` for `pid` or one of its ancestors, nearest first. The walk
+/// stops at pid 1 (init adopts orphans, so it and above belong to no pane), at an unknown parent,
+/// and after `MAX_ANCESTOR_DEPTH` steps, which also ends a parent cycle.
+fn find_in_ancestors<T>(
+    pid: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    mut found: impl FnMut(u32) -> Option<T>,
+) -> Option<T> {
+    let mut current = pid;
+    for _ in 0..=MAX_ANCESTOR_DEPTH {
+        if current <= 1 {
+            return None;
+        }
+        if let Some(hit) = found(current) {
+            return Some(hit);
+        }
+        current = parent_of(current)?;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Fake process table: pid -> parent. Pane shells are pid 100 (pane "a") and 200 (pane "b").
+    fn walk(table: &HashMap<u32, u32>, pid: u32) -> Option<&'static str> {
+        find_in_ancestors(
+            pid,
+            |pid| table.get(&pid).copied(),
+            |pid| match pid {
+                100 => Some("a"),
+                200 => Some("b"),
+                _ => None,
+            },
+        )
+    }
+
+    #[test]
+    fn ancestor_walk_maps_grandchild_to_its_pane_shell() {
+        // 100 (pane a shell) -> 101 (pi) -> 102 (setsid tool shell) -> 103 (herdr cli)
+        let table = HashMap::from([(100, 50), (101, 100), (102, 101), (103, 102), (50, 1)]);
+        assert_eq!(walk(&table, 103), Some("a"));
+        assert_eq!(walk(&table, 100), Some("a"));
+    }
+
+    #[test]
+    fn ancestor_walk_ignores_unrelated_process() {
+        let table = HashMap::from([(300, 301), (301, 1), (400, 999)]);
+        assert_eq!(walk(&table, 300), None);
+        // The parent is unknown (exited), so the walk stops.
+        assert_eq!(walk(&table, 400), None);
+        assert_eq!(walk(&table, 1), None);
+        assert_eq!(walk(&table, 0), None);
+    }
+
+    #[test]
+    fn ancestor_walk_stops_on_cycle_and_depth_cap() {
+        let cycle = HashMap::from([(10, 11), (11, 12), (12, 10)]);
+        assert_eq!(walk(&cycle, 10), None);
+
+        // A chain whose pane shell sits one step past the cap is not reached; at the cap it is.
+        let chain = |len: u32| -> HashMap<u32, u32> {
+            let mut table: HashMap<u32, u32> = (0..len).map(|i| (1000 + i, 1000 + i + 1)).collect();
+            table.insert(1000 + len, 100);
+            table
+        };
+        let depth = MAX_ANCESTOR_DEPTH as u32;
+        assert_eq!(walk(&chain(depth - 1), 1000), Some("a"));
+        assert_eq!(walk(&chain(depth), 1000), None);
     }
 }

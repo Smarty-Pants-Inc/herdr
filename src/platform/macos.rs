@@ -927,6 +927,11 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
+/// The parent of `pid`, from `proc_pidinfo`. A process gone or unreadable has none.
+pub fn parent_process_id(pid: u32) -> Option<u32> {
+    process_bsdinfo(pid).map(|info| info.pbi_ppid)
+}
+
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
