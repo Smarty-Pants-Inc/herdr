@@ -483,6 +483,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::api::schema::MediaSessionState;
     use crate::protocol::media::MediaPeerState;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -895,11 +896,11 @@ mod tests {
 
     #[test]
     fn stale_input_is_still_refused_for_another_pane_or_with_no_call() {
-        let (mut media, _) = started(MediaMode::Auto);
+        let (mut calling, _) = started(MediaMode::Auto);
         let later = Instant::now() + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
-        open(&mut media, "m2", "pane_2", later); // The live call is on pane_1.
+        open(&mut calling, "m2", "pane_2", later); // The live call is on pane_1.
         assert_eq!(
-            refusal(&mut media).as_deref(),
+            refusal(&mut calling).as_deref(),
             Some(close_code::STALE_INPUT)
         );
 
@@ -908,6 +909,178 @@ mod tests {
         open(&mut idle, "m3", "pane_1", later); // No call on this client.
         assert_eq!(refusal(&mut idle).as_deref(), Some(close_code::STALE_INPUT));
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// The broker's controls for its client, and the responses its caller got.
+    fn to_client(
+        actions: Vec<crate::server::media::MediaAction>,
+    ) -> (Vec<MediaControl>, Vec<serde_json::Value>) {
+        let (mut controls, mut responses) = (Vec::new(), Vec::new());
+        for action in actions {
+            match action {
+                crate::server::media::MediaAction::Send { control, .. } => controls.push(control),
+                crate::server::media::MediaAction::Respond {
+                    respond_to,
+                    response,
+                } => {
+                    responses.push(serde_json::from_str(&response).unwrap());
+                    let _ = respond_to.send(response); // The caller waiting on pane.media_open.
+                }
+            }
+        }
+        (controls, responses)
+    }
+
+    /// The client's controls for the broker, in order.
+    fn to_broker(client: &mut ClientMedia) -> Vec<MediaControl> {
+        client
+            .take_effects()
+            .into_iter()
+            .filter_map(|effect| match effect {
+                MediaEffect::Send(_, control) => Some(control),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A live call through the real broker and client: opened on fresh input, offered, answered, connected.
+    fn live_call_through_broker(
+        now: Instant,
+    ) -> (
+        crate::server::media::MediaBroker,
+        ClientMedia,
+        Calls,
+        String,
+    ) {
+        use crate::layout::PaneId;
+        let mut broker = crate::server::media::MediaBroker::new();
+        broker.client_connected(1, true);
+        let (mut client, calls) = media(MediaMode::Auto, false);
+        broker.note_pane_input(1, PaneId::from_raw(7), "pane_1", now);
+        client.note_pane_input(&local(), "pane_1", now);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r1".into(), tx, PaneId::from_raw(7), |_| true, now));
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), now);
+        }
+        assert!(
+            to_broker(&mut client).is_empty(),
+            "the first open is accepted"
+        );
+        let old = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        client.handle_peer_event(PeerEvent::Offer {
+            session_id: old.clone(),
+            sdp: "v=0".into(),
+        });
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, now));
+        }
+        broker.answer(&old, "v=0 answer".into()).unwrap();
+        broker.client_control(
+            1,
+            MediaControl::State(MediaStateUpdate {
+                session_id: old.clone(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            }),
+            now,
+        );
+        (broker, client, calls, old)
+    }
+
+    // herdr#102 review: the broker's actual ordered controls, through the client, then back (smarty-voice#133).
+    #[test]
+    fn an_idle_renewal_hands_over_in_order_and_the_old_call_ends_only_after_the_client_accepts() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        // 1. Only the new Open: the live call is not closed yet.
+        let new = match controls.as_slice() {
+            [MediaControl::Open(open)] => open.session_id.clone(),
+            other => panic!("expected only the new Open, got {other:?}"),
+        };
+        assert_eq!(
+            broker.state(&old).unwrap().state,
+            MediaSessionState::Connected
+        );
+        // 2. The client accepts it: a renewal of its own call on the pane needs no fresh input.
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), later);
+        }
+        let accepted = to_broker(&mut client);
+        assert!(
+            accepted
+                .iter()
+                .all(|c| !matches!(c, MediaControl::Close(close) if close.session_id == new)),
+            "not refused: {accepted:?}"
+        );
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Start(new.clone())));
+        for control in accepted {
+            to_client(broker.client_control(1, control, later)); // Its close of the old peer, as replaced.
+        }
+        // 3. The client's offer (its acknowledgement) completes the handover; the caller gets the new offer.
+        client.handle_peer_event(PeerEvent::Offer {
+            session_id: new.clone(),
+            sdp: "v=0 new".into(),
+        });
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later));
+        }
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["result"]["session_id"], new.as_str());
+        assert_ne!(
+            broker.state(&old).map(|view| view.state),
+            Some(MediaSessionState::Connected)
+        );
+    }
+
+    #[test]
+    fn a_refused_idle_renewal_leaves_the_live_call_intact() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        // The client no longer shows the pane: it refuses the new session.
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| None, later);
+        }
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later));
+        }
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "media_refused");
+        assert_eq!(
+            broker.state(&old).unwrap().state,
+            MediaSessionState::Connected,
+            "the call goes on"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .contains(&PeerCall::Close(old.clone())),
+            "its peer was not closed"
+        );
     }
 
     #[test]

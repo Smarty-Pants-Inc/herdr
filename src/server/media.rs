@@ -69,6 +69,9 @@ struct MediaSession {
     pane: PaneId,
     /// The pane id as its client knows it, so a renewal can reopen for that client (smarty-voice#133).
     pane_ref: String,
+    /// A handover (smarty-voice#133): the sessions this one replaces once its client accepts it (its offer). Until
+    /// then they stay live; if it is refused or times out they are untouched.
+    replaces: Vec<String>,
     state: MediaSessionState,
     muted: bool,
     pending: Option<PendingOpen>,
@@ -219,14 +222,16 @@ impl MediaBroker {
         now: Instant,
     ) -> Vec<MediaAction> {
         let mut actions = Vec::new();
-        let latest = self
+        let fresh = self
             .pane_owners
             .get(&pane)
             .filter(|owner| now.saturating_duration_since(owner.at) <= MEDIA_INPUT_WINDOW)
             .and_then(|owner| {
                 let capable = *self.clients.get(&owner.client_id)?;
                 Some((owner.client_id, capable, owner.clone()))
-            })
+            });
+        let handover = fresh.is_none();
+        let latest = fresh
             // A renewal or resume minutes into a call (smarty-voice#133): nobody typed in the last 10 s, but the
             // pane's call is live on a client. Only that client, only while its session on this pane is connected and
             // the client is still attached (and, below, capable and viewing the pane). A pane without a live session
@@ -293,16 +298,23 @@ impl MediaBroker {
             .filter(|(_, session)| session.pane == pane || session.client_id == client_id)
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        for id in replaced {
-            self.finish(
-                &id,
-                close_code::REPLACED,
-                "a newer media session replaced this one",
-                true,
-                now,
-                &mut actions,
-            );
-        }
+        // A handover keeps the live call until the client accepts the new session (client_control, Offer): closing it
+        // first would leave the client with no call to renew, and a refusal would end it (herdr#102 review).
+        let replaces = if handover {
+            replaced
+        } else {
+            for id in replaced {
+                self.finish(
+                    &id,
+                    close_code::REPLACED,
+                    "a newer media session replaced this one",
+                    true,
+                    now,
+                    &mut actions,
+                );
+            }
+            Vec::new()
+        };
 
         let session_id = format!("{}{}", self.id_prefix, self.next_id);
         self.next_id += 1;
@@ -312,6 +324,7 @@ impl MediaBroker {
                 client_id,
                 pane,
                 pane_ref: input.pane_ref.clone(),
+                replaces,
                 state: MediaSessionState::Opening,
                 muted: false,
                 pending: Some(PendingOpen {
@@ -352,6 +365,17 @@ impl MediaBroker {
                     return actions;
                 };
                 session.state = MediaSessionState::Offered;
+                // The client accepted a handover: only now is the call it renews replaced.
+                for id in std::mem::take(&mut session.replaces) {
+                    self.finish(
+                        &id,
+                        close_code::REPLACED,
+                        "a newer media session replaced this one",
+                        true,
+                        now,
+                        &mut actions,
+                    );
+                }
                 actions.push(MediaAction::Respond {
                     respond_to: pending.respond_to,
                     response: success_response(
@@ -969,9 +993,13 @@ mod tests {
         assert_eq!((client_id, pane_ref.as_str()), (1, "w1:p7"));
         assert_ne!(new, old);
         assert!(rx.try_recv().is_err(), "the caller waits for the new offer");
-        // One step: the new session is bound and the old one is closed as replaced, never two and never none.
+        // A handover: the old call stays live until the client accepts the new session (its offer), so a refusal
+        // or a timeout leaves the call as it was (herdr#102 review).
         assert!(broker.state(&new).is_some());
-        assert_ne!(
+        assert!(sent
+            .iter()
+            .all(|(_, control)| !matches!(control, MediaControl::Close(_))));
+        assert_eq!(
             broker.state(&old).map(|view| view.state),
             Some(MediaSessionState::Connected)
         );
@@ -979,6 +1007,21 @@ mod tests {
             sent.iter().all(|(client_id, _)| *client_id == 1),
             "no other client is told anything"
         );
+        let sent = run(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: new.clone(),
+                sdp: "v=0 new".into(),
+            }),
+            later,
+        ));
+        assert!(matches!(&sent[..], [(1, MediaControl::Close(close))]
+            if close.session_id == old && close.code.as_deref() == Some(close_code::REPLACED)));
+        assert_ne!(
+            broker.state(&old).map(|view| view.state),
+            Some(MediaSessionState::Connected)
+        );
+        assert_eq!(response(&rx)["result"]["session_id"], new.as_str());
     }
 
     #[test]
