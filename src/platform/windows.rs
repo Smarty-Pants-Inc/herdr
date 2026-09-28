@@ -2378,6 +2378,12 @@ fn nul_terminated_utf16_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
+/// Not needed on Windows: pane attribution there already covers every descendant of the pane
+/// child (`session_processes`), so the ancestor walk finds nothing more.
+pub fn parent_process_id(_pid: u32) -> Option<u32> {
+    None
+}
+
 pub fn session_processes(child_pid: u32) -> Vec<u32> {
     if child_pid == 0 {
         return Vec::new();
