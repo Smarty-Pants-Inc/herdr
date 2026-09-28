@@ -61,6 +61,14 @@ impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, &self.identity)
     }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn identity(&self) -> &SocketFileIdentity {
+        &self.identity
+    }
 }
 
 pub(crate) fn start_server_with_stop_control(
@@ -68,7 +76,31 @@ pub(crate) fn start_server_with_stop_control(
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    start_server_inner(
+        socket_path(),
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+    )
+}
+
+/// Starts the API server on an explicit path, e.g. a recovery path when the
+/// public socket could not be restored after a failed live handoff.
+#[cfg(unix)]
+pub(crate) fn start_server_at_with_stop_control(
+    path: PathBuf,
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    server_stop: Arc<AtomicBool>,
+) -> std::io::Result<ServerHandle> {
+    start_server_inner(
+        path,
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+    )
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -83,12 +115,12 @@ fn default_capabilities() -> Option<ServerCapabilities> {
 }
 
 fn start_server_inner(
+    path: PathBuf,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<ServerHandle> {
-    let path = socket_path();
     prepare_socket_path(&path)?;
 
     let listener = bind_local_listener(&path)?;

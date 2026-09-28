@@ -2185,3 +2185,181 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
 }
+
+fn process_gone(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+fn socket_inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
+        .ino()
+}
+
+#[test]
+fn live_handoff_to_replacement_that_never_becomes_ready_keeps_old_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let marker = base.join("child.pid");
+    let received_marker = base.join("received");
+    let import_pid_marker = base.join("import.pid");
+    let helper_pid_marker = base.join("helper.pid");
+    let stub = base.join("import-stub.sh");
+
+    // The replacement is a wrapper that leaves a helper in its process group,
+    // then runs a real import server that binds the public sockets and hangs
+    // instead of reporting ready.
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nsleep 600 &\necho $! > {helper}\necho $$ > {import}\nexec {herdr} \"$@\"\n",
+            helper = helper_pid_marker.display(),
+            import = import_pid_marker.display(),
+            herdr = env!("CARGO_BIN_EXE_herdr"),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[
+            ("HERDR_TEST_HANDOFF_IMPORT_FAIL", "hang_before_ready"),
+            ("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "3000"),
+        ],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+    register_runtime_dir(&runtime_dir);
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let command = format!(
+        "sh -c 'echo READY $$ > {}; while read line; do echo got:$line; echo got:$line >> {}; done'",
+        marker.display(),
+        received_marker.display()
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:run",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
+        }),
+    ));
+    let pane_pid = wait_for_pid_marker(&marker, Duration::from_secs(5));
+
+    // A handoff that names a different source server is refused up front.
+    let wrong_source = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:wrong-source",
+            "method": "server.live_handoff",
+            "params": {"import_exe": stub, "expected_socket_inode": api_inode + 1}
+        }),
+    );
+    assert!(
+        wrong_source["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("expected api socket inode")),
+        "a handoff from an unexpected source should be refused: {wrong_source}"
+    );
+    assert!(
+        !import_pid_marker.exists(),
+        "a refused handoff spawned a replacement"
+    );
+
+    let failed = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff-never-ready",
+            "method": "server.live_handoff",
+            "params": {"import_exe": stub, "expected_socket_inode": api_inode}
+        }),
+    );
+    let message = failed["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("did not become ready") && !message.contains("could not restore"),
+        "handoff should fail readiness and restore cleanly: {failed}"
+    );
+
+    // The replacement and everything in its process group are gone.
+    let import_pid = wait_for_pid_marker(&import_pid_marker, Duration::from_secs(1));
+    let helper_pid = wait_for_pid_marker(&helper_pid_marker, Duration::from_secs(1));
+    assert!(
+        process_gone(import_pid, Duration::from_secs(5)),
+        "import server {import_pid} survived the failed handoff"
+    );
+    assert!(
+        process_gone(helper_pid, Duration::from_secs(5)),
+        "import helper {helper_pid} survived the failed handoff"
+    );
+
+    // The old server still owns the very same public sockets and answers.
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+    assert!(!runtime_dir.join("herdr.sock.recover").exists());
+
+    // And it keeps its panes and their processes.
+    assert_eq!(unsafe { libc::kill(pane_pid as libc::pid_t, 0) }, 0);
+    let panes = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:list","method":"pane.list","params":{}}),
+    );
+    assert!(
+        panes.to_string().contains(&pane_id),
+        "old server lost its pane: {panes}"
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:send-after-never-ready",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": "after-never-ready", "keys": ["Enter"]}
+        }),
+    ));
+    wait_for_file_contains(
+        &received_marker,
+        "got:after-never-ready",
+        Duration::from_secs(5),
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}

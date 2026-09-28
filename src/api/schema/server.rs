@@ -11,6 +11,13 @@ pub struct ServerLiveHandoffParams {
     pub expected_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Refuse the handoff unless the server handling it has this process id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_source_pid: Option<u32>,
+    /// Refuse the handoff unless the server handling it owns the API socket
+    /// with this inode and that socket is the one at the public path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_socket_inode: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

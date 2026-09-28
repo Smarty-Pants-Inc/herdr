@@ -4015,6 +4015,24 @@
                 "null"
               ]
             },
+            "expected_socket_inode": {
+              "description": "Refuse the handoff unless the server handling it owns the API socket\nwith this inode and that socket is the one at the public path.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "expected_source_pid": {
+              "description": "Refuse the handoff unless the server handling it has this process id.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "expected_version": {
               "type": [
                 "string",

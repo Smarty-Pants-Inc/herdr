@@ -35,8 +35,6 @@ const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 const FDS_PER_MESSAGE: usize = 64;
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
-#[cfg(unix)]
-pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
 #[cfg(unix)]
 #[derive(Serialize, Deserialize)]
@@ -141,22 +139,28 @@ pub(crate) fn start_test_owner_watchdog() {
 }
 
 #[cfg(unix)]
+const IMPORT_GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stops a replacement server whose handoff failed, for certain.
+///
+/// The import child runs in its own session, so its pid is also its process
+/// group. The whole group is killed, not only the direct child: an import
+/// executable that is a wrapper, or anything the child started in its group,
+/// must not survive holding the public sockets. Pane processes run in sessions
+/// of their own and are not in this group. The group is signalled while the
+/// leader is still unreaped, so the id cannot have been reused.
+#[cfg(unix)]
 pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
     let pid = child.id();
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            info!(pid, status = %status, "handoff import server exited during rollback");
-            return;
-        }
-        Ok(None) => {}
-        Err(err) => {
-            warn!(pid, err = %err, "failed to inspect handoff import server before rollback");
+    let pgid = pid as libc::pid_t;
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            warn!(pid, err = %err, "failed to kill handoff import process group during rollback");
         }
     }
-
-    if let Err(err) = child.kill() {
-        warn!(pid, err = %err, "failed to kill handoff import server during rollback");
-    }
+    // The leader may not be a group leader if it never reached setsid.
+    let _ = child.kill();
     match child.wait() {
         Ok(status) => {
             info!(pid, status = %status, "handoff import server reaped during rollback");
@@ -165,6 +169,56 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
             warn!(pid, err = %err, "failed to reap handoff import server during rollback");
         }
     }
+
+    let deadline = std::time::Instant::now() + IMPORT_GROUP_EXIT_TIMEOUT;
+    loop {
+        let alive = unsafe { libc::killpg(pgid, 0) } == 0;
+        if !alive {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::error!(
+                pid,
+                "handoff import process group is still alive after SIGKILL; continuing rollback"
+            );
+            return;
+        }
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Refuses a handoff whose caller expected a different source server.
+///
+/// A rollback must hand off from the original server, never from whatever
+/// server currently answers the socket (for example an orphaned import child).
+#[cfg(unix)]
+pub(crate) fn check_expected_source(
+    expected_pid: Option<u32>,
+    expected_socket_inode: Option<u64>,
+    own_pid: u32,
+    own_socket_inode: Option<u64>,
+    public_socket_inode: Option<u64>,
+) -> io::Result<()> {
+    if let Some(expected) = expected_pid {
+        if expected != own_pid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("handoff source is pid {own_pid}, not the expected pid {expected}"),
+            ));
+        }
+    }
+    if let Some(expected) = expected_socket_inode {
+        if own_socket_inode != Some(expected) || public_socket_inode != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "handoff source does not own the expected api socket inode {expected} (owns {own_socket_inode:?}, public path has {public_socket_inode:?})"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -224,12 +278,26 @@ pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd])
 
 #[cfg(unix)]
 pub(crate) fn wait_ready(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
+    stream.set_read_timeout(Some(ready_timeout()))?;
     let ready = read_line_unbuffered(&mut *stream)?;
     if ready.trim_end() != "ready" {
         return Err(io::Error::other("handoff import did not report ready"));
     }
     Ok(())
+}
+
+/// Debug builds let tests shorten the readiness wait for a replacement that
+/// never becomes ready.
+#[cfg(unix)]
+fn ready_timeout() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    READY_TIMEOUT
 }
 
 #[cfg(unix)]
@@ -624,6 +692,55 @@ mod tests {
             serde_json::from_value(value).expect("a fork manifest should load");
 
         assert!(validate_manifest_version(&fork).is_ok());
+    }
+
+    #[test]
+    fn a_handoff_from_an_unexpected_source_is_refused() {
+        assert!(check_expected_source(None, None, 10, None, None).is_ok());
+        assert!(check_expected_source(Some(10), Some(7), 10, Some(7), Some(7)).is_ok());
+        assert!(check_expected_source(Some(11), None, 10, Some(7), Some(7)).is_err());
+        // Another server's socket at the public path, or a socket we no longer own.
+        assert!(check_expected_source(None, Some(7), 10, Some(7), Some(8)).is_err());
+        assert!(check_expected_source(None, Some(7), 10, Some(8), Some(7)).is_err());
+        assert!(check_expected_source(None, Some(7), 10, None, Some(7)).is_err());
+    }
+
+    #[test]
+    fn a_failed_import_child_is_stopped_with_its_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 600 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn stub import child");
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let helper: libc::pid_t = line.trim().parse().expect("helper pid");
+        let pgid = child.id() as libc::pid_t;
+
+        cleanup_failed_import_child(&mut child);
+
+        assert!(child.try_wait().unwrap().is_some());
+        assert_ne!(
+            unsafe { libc::killpg(pgid, 0) },
+            0,
+            "process group survived"
+        );
+        assert_ne!(unsafe { libc::kill(helper, 0) }, 0, "helper survived");
     }
 
     #[test]
