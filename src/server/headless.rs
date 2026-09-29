@@ -3068,8 +3068,13 @@ impl HeadlessServer {
         };
         let stream_active = msg.stream_active.clone();
 
-        if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
-            let handoff_result = self.perform_live_handoff(params.clone());
+        let live_handoff = match &msg.request.method {
+            api::schema::Method::ServerLiveHandoff(params) => Some((params.clone(), false)),
+            api::schema::Method::ServerLiveHandoffGuarded(params) => Some((params.clone(), true)),
+            _ => None,
+        };
+        if let Some((params, guarded)) = live_handoff {
+            let handoff_result = self.perform_live_handoff(params, guarded);
             let handoff_succeeded = handoff_result.is_ok();
             let response = match handoff_result {
                 Ok(()) => serde_json::to_string(&api::schema::SuccessResponse {
@@ -3149,7 +3154,9 @@ impl HeadlessServer {
         let skip_default_workspace = skip_default_workspace_for_request
             || matches!(
                 &msg.request.method,
-                api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
+                api::schema::Method::ServerStop(_)
+                    | api::schema::Method::ServerLiveHandoff(_)
+                    | api::schema::Method::ServerLiveHandoffGuarded(_)
             );
         changed |= self.drain_all_internal_events_with_forwarding();
 

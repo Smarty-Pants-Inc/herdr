@@ -42,12 +42,17 @@ pub(super) enum MediaEffect {
 struct MediaSession {
     endpoint_id: ClientEndpointId,
     session_id: String,
+    /// The pane this call is for, so a renewal of it can be recognised (smarty-voice#133).
+    pane_id: String,
+    /// The mute last applied to this call's peer: a renewal's new peer starts with it (herdr#102 security pass).
+    muted: bool,
     peer: Box<dyn MediaPeer>,
 }
 
 struct PendingConsent {
     endpoint_id: ClientEndpointId,
     session_id: String,
+    pane_id: String,
     deadline: Instant,
 }
 
@@ -153,6 +158,7 @@ impl ClientMedia {
             }
             MediaControl::Mute(mute) => {
                 if let Some(session) = self.owned_session(endpoint_id, &mute.session_id) {
+                    session.muted = mute.muted;
                     session.peer.set_muted(mute.muted);
                 }
             }
@@ -232,7 +238,12 @@ impl ClientMedia {
             .is_some_and(|(last_pane, at)| {
                 *last_pane == pane_id && now.saturating_duration_since(*at) <= MEDIA_INPUT_WINDOW
             });
-        if !fresh_input {
+        // smarty-voice#133: a renewal of this client's own call on this pane (the server reopens for the client of the
+        // pane's live call) needs no fresh input: the user started that call here and it is still running.
+        let renewal = self.session.as_ref().is_some_and(|session| {
+            session.endpoint_id == *endpoint_id && session.pane_id == pane_id
+        });
+        if !fresh_input && !renewal {
             return self.refuse(
                 endpoint_id,
                 session_id,
@@ -241,7 +252,7 @@ impl ClientMedia {
             );
         }
         if self.mode == MediaMode::Auto || self.allowed {
-            return self.start(endpoint_id.clone(), session_id);
+            return self.start(endpoint_id.clone(), session_id, pane_id);
         }
         // A newer request supersedes an unanswered prompt.
         if let Some(previous) = self.pending.take() {
@@ -258,6 +269,7 @@ impl ClientMedia {
         self.pending = Some(PendingConsent {
             endpoint_id: endpoint_id.clone(),
             session_id: session_id.clone(),
+            pane_id,
             deadline: now + MEDIA_CONSENT_TIMEOUT,
         });
         self.effects.push(MediaEffect::AskConsent {
@@ -284,7 +296,7 @@ impl ClientMedia {
             );
         } else if allowed {
             self.allowed = true;
-            self.start(pending.endpoint_id, pending.session_id);
+            self.start(pending.endpoint_id, pending.session_id, pending.pane_id);
         } else {
             self.decline(pending, "Voice call declined");
         }
@@ -367,7 +379,11 @@ impl ClientMedia {
         }
     }
 
-    fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String) {
+    fn start(&mut self, endpoint_id: ClientEndpointId, session_id: String, pane_id: String) {
+        // A renewal of the same call keeps its mute from the first sample (closed before the new peer opens).
+        let keep_muted = self.session.as_ref().is_some_and(|previous| {
+            previous.muted && previous.endpoint_id == endpoint_id && previous.pane_id == pane_id
+        });
         if let Some(mut previous) = self.session.take() {
             previous.peer.close();
             self.send_close(
@@ -378,10 +394,15 @@ impl ClientMedia {
             );
         }
         match (self.factory)(session_id.clone(), self.sink.clone()) {
-            Ok(peer) => {
+            Ok(mut peer) => {
+                if keep_muted {
+                    peer.set_muted(true);
+                }
                 self.session = Some(MediaSession {
                     endpoint_id,
                     session_id,
+                    pane_id,
+                    muted: keep_muted,
                     peer,
                 });
                 self.notice("Voice call started");
@@ -473,6 +494,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::api::schema::MediaSessionState;
     use crate::protocol::media::MediaPeerState;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +881,338 @@ mod tests {
         open(&mut media, "m1", "pane_1", now);
         media.take_effects();
         (media, calls)
+    }
+
+    // smarty-voice#133: the server reopens a pane's live call for its client when nobody typed in the last 10 s.
+    #[test]
+    fn a_renewal_of_this_clients_own_call_on_the_pane_starts_without_fresh_input() {
+        let (mut media, calls) = started(MediaMode::Auto);
+        let later = Instant::now() + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        open(&mut media, "m2", "pane_1", later);
+        let effects = media.take_effects();
+        assert_eq!(
+            closes(&effects),
+            vec![("m1".to_owned(), Some(close_code::REPLACED.to_owned()))],
+            "the old peer is replaced, and nothing is refused"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                PeerCall::Start("m1".into()),
+                PeerCall::Close("m1".into()),
+                PeerCall::Start("m2".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_input_is_still_refused_for_another_pane_or_with_no_call() {
+        let (mut calling, _) = started(MediaMode::Auto);
+        let later = Instant::now() + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        open(&mut calling, "m2", "pane_2", later); // The live call is on pane_1.
+        assert_eq!(
+            refusal(&mut calling).as_deref(),
+            Some(close_code::STALE_INPUT)
+        );
+
+        let (mut idle, calls) = media(MediaMode::Auto, false);
+        idle.note_pane_input(&local(), "pane_1", Instant::now());
+        open(&mut idle, "m3", "pane_1", later); // No call on this client.
+        assert_eq!(refusal(&mut idle).as_deref(), Some(close_code::STALE_INPUT));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// The broker's controls for its client, and the responses its caller got.
+    fn to_client(
+        actions: Vec<crate::server::media::MediaAction>,
+    ) -> (Vec<MediaControl>, Vec<serde_json::Value>) {
+        let (mut controls, mut responses) = (Vec::new(), Vec::new());
+        for action in actions {
+            match action {
+                crate::server::media::MediaAction::Send { control, .. } => controls.push(control),
+                crate::server::media::MediaAction::Respond {
+                    respond_to,
+                    response,
+                } => {
+                    responses.push(serde_json::from_str(&response).unwrap());
+                    let _ = respond_to.send(response); // The caller waiting on pane.media_open.
+                }
+            }
+        }
+        (controls, responses)
+    }
+
+    /// The client's controls for the broker, in order.
+    fn to_broker(client: &mut ClientMedia) -> Vec<MediaControl> {
+        client
+            .take_effects()
+            .into_iter()
+            .filter_map(|effect| match effect {
+                MediaEffect::Send(_, control) => Some(control),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A live call through the real broker and client: opened on fresh input, offered, answered, connected.
+    fn live_call_through_broker(
+        now: Instant,
+    ) -> (
+        crate::server::media::MediaBroker,
+        ClientMedia,
+        Calls,
+        String,
+    ) {
+        use crate::layout::PaneId;
+        let mut broker = crate::server::media::MediaBroker::new();
+        broker.client_connected(1, true);
+        let (mut client, calls) = media(MediaMode::Auto, false);
+        broker.note_pane_input(1, PaneId::from_raw(7), "pane_1", now);
+        client.note_pane_input(&local(), "pane_1", now);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r1".into(), tx, PaneId::from_raw(7), |_| true, now));
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), now);
+        }
+        assert!(
+            to_broker(&mut client).is_empty(),
+            "the first open is accepted"
+        );
+        let old = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        client.handle_peer_event(PeerEvent::Offer {
+            session_id: old.clone(),
+            sdp: "v=0".into(),
+        });
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, now));
+        }
+        broker.answer(&old, "v=0 answer".into()).unwrap();
+        broker.client_control(
+            1,
+            MediaControl::State(MediaStateUpdate {
+                session_id: old.clone(),
+                state: MediaPeerState::Connected,
+                muted: false,
+                detail: None,
+            }),
+            now,
+        );
+        (broker, client, calls, old)
+    }
+
+    // herdr#102 review: the broker's actual ordered controls, through the client, then back (smarty-voice#133).
+    #[test]
+    fn an_idle_renewal_hands_over_in_order_and_the_old_call_ends_only_after_the_client_accepts() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        // 1. Only the new Open: the live call is not closed yet.
+        let new = match controls.as_slice() {
+            [MediaControl::Open(open)] => open.session_id.clone(),
+            other => panic!("expected only the new Open, got {other:?}"),
+        };
+        assert_eq!(
+            broker.state(&old).unwrap().state,
+            MediaSessionState::Connected
+        );
+        // 2. The client accepts it: a renewal of its own call on the pane needs no fresh input.
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), later);
+        }
+        let accepted = to_broker(&mut client);
+        assert!(
+            accepted
+                .iter()
+                .all(|c| !matches!(c, MediaControl::Close(close) if close.session_id == new)),
+            "not refused: {accepted:?}"
+        );
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&PeerCall::Start(new.clone())));
+        for control in accepted {
+            to_client(broker.client_control(1, control, later)); // Its close of the old peer, as replaced.
+        }
+        // 3. The client's offer (its acknowledgement) completes the handover; the caller gets the new offer.
+        client.handle_peer_event(PeerEvent::Offer {
+            session_id: new.clone(),
+            sdp: "v=0 new".into(),
+        });
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later));
+        }
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["result"]["session_id"], new.as_str());
+        assert_ne!(
+            broker.state(&old).map(|view| view.state),
+            Some(MediaSessionState::Connected)
+        );
+    }
+
+    /// Delivers broker actions to the client, in order.
+    fn deliver(
+        client: &mut ClientMedia,
+        actions: Vec<crate::server::media::MediaAction>,
+        now: Instant,
+    ) -> Vec<serde_json::Value> {
+        let (controls, responses) = to_client(actions);
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| Some("label".into()), now);
+        }
+        responses
+    }
+
+    // herdr#102 security pass, P1: a renewal of a muted call keeps it muted from the new peer's start.
+    #[test]
+    fn a_renewal_of_a_muted_call_starts_its_new_peer_muted() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        deliver(&mut client, broker.mute(&old, true).unwrap(), now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        let calls = calls.lock().unwrap().clone();
+        let start = calls
+            .iter()
+            .position(|call| matches!(call, PeerCall::Start(id) if *id != old))
+            .expect("the new peer started");
+        let PeerCall::Start(new) = &calls[start] else {
+            unreachable!()
+        };
+        assert_eq!(
+            calls.get(start + 1),
+            Some(&PeerCall::Mute(new.clone(), true)),
+            "muted right after it starts: {calls:?}"
+        );
+        assert!(!calls[start..].contains(&PeerCall::Mute(new.clone(), false)));
+    }
+
+    #[test]
+    fn a_mute_asked_for_during_a_handover_reaches_the_new_peer() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later)); // The client's close of the old peer (replaced).
+        }
+        let new = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The caller mutes the call it knows (the old session) while the handover is under way.
+        let actions = broker.mute(&old, true).unwrap_or_default();
+        deliver(&mut client, actions, later);
+        assert!(calls.lock().unwrap().contains(&PeerCall::Mute(new, true)));
+    }
+
+    // herdr#102 security pass, P2: ending the call cancels its renewal still being handed over.
+    #[test]
+    fn ending_the_call_during_its_handover_cancels_the_renewal() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        deliver(
+            &mut client,
+            broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later),
+            later,
+        );
+        let new = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                PeerCall::Start(id) => Some(id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The caller ends the call before the replacement's offer came back.
+        deliver(&mut client, broker.close(&old, later), later);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .contains(&PeerCall::Close(new.clone())),
+            "the new peer is closed"
+        );
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "media_refused");
+        assert!(broker.state(&new).map(|view| view.state) != Some(MediaSessionState::Offered));
+        // A late offer for the cancelled renewal changes nothing.
+        let late = to_client(broker.client_control(
+            1,
+            MediaControl::Offer(MediaSdp {
+                session_id: new.clone(),
+                sdp: "v=0 late".into(),
+            }),
+            later,
+        ));
+        assert!(late.0.is_empty() && late.1.is_empty());
+    }
+
+    #[test]
+    fn a_refused_idle_renewal_leaves_the_live_call_intact() {
+        use crate::layout::PaneId;
+        let now = Instant::now();
+        let (mut broker, mut client, calls, old) = live_call_through_broker(now);
+        let later = now + MEDIA_INPUT_WINDOW + Duration::from_secs(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (controls, _) =
+            to_client(broker.open("r2".into(), tx, PaneId::from_raw(7), |_| true, later));
+        // The client no longer shows the pane: it refuses the new session.
+        for control in controls {
+            client.handle_server_control(&local(), control, true, |_| None, later);
+        }
+        for control in to_broker(&mut client) {
+            to_client(broker.client_control(1, control, later));
+        }
+        let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "media_refused");
+        assert_eq!(
+            broker.state(&old).unwrap().state,
+            MediaSessionState::Connected,
+            "the call goes on"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .contains(&PeerCall::Close(old.clone())),
+            "its peer was not closed"
+        );
     }
 
     #[test]
