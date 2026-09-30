@@ -374,6 +374,7 @@ fn restore_workspace(
             resumed_agent_sessions,
             imported_panes,
             &public_pane_ids_by_old_raw,
+            &snap.default_launch_env,
         );
         failed_imports += tab_failed_imports;
         let Some((mut tab, restored_terminals, restored_runtimes, reverse_id_map)) = restored_tab
@@ -431,6 +432,8 @@ fn restore_workspace(
             public_pane_numbers,
             next_public_pane_number,
             next_public_tab_number,
+            // Bound to this saved record only, never looked up by its reusable id.
+            default_launch_env: snap.default_launch_env.clone(),
             active_tab: snap.active_tab.min(tabs.len().saturating_sub(1)),
             tabs,
             #[cfg(test)]
@@ -490,6 +493,7 @@ fn restore_tab(
     resumed_agent_sessions: &mut HashSet<String>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
+    default_launch_env: &[(String, String)],
 ) -> RestoreFailures<Option<RestoredTab>> {
     let (node, id_map) = restore_node_remapped(&snap.layout);
     let reverse_id_map: HashMap<PaneId, u32> = id_map
@@ -552,7 +556,7 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
+                PaneLaunchEnv::from_extra(default_launch_env.to_vec()).with_identity(
                     workspace_id.to_string(),
                     crate::workspace::public_tab_id_for_number(workspace_id, number),
                     pane_id.to_string(),
@@ -1316,6 +1320,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
@@ -1396,6 +1401,7 @@ mod tests {
                 next_public_pane_number: 4,
                 public_tab_numbers: vec![5],
                 next_public_tab_number: 6,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
@@ -1505,6 +1511,7 @@ mod tests {
                 next_public_pane_number: 5,
                 public_tab_numbers: vec![1, 3, 4, 5],
                 next_public_tab_number: 6,
+                default_launch_env: Vec::new(),
                 tabs: vec![
                     TabSnapshot {
                         custom_name: None,
@@ -1588,6 +1595,7 @@ mod tests {
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
             next_public_tab_number: 0,
+            default_launch_env: Vec::new(),
             tabs: vec![TabSnapshot {
                 custom_name: None,
                 layout: LayoutSnapshot::Split {
@@ -1627,6 +1635,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
@@ -1981,6 +1990,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),

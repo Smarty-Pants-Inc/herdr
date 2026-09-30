@@ -133,6 +133,9 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
     if !source.metadata()?.is_file() {
         return Err(io::Error::other("session path is not a regular file"));
     }
+    let mut contents = Vec::new();
+    io::Read::read_to_end(&mut source, &mut contents)?;
+    let contents = without_launch_env(contents);
     let directory = path.with_file_name(directory_name);
     std::fs::create_dir_all(&directory)?;
     let older = recovery_files(&directory)?;
@@ -154,7 +157,7 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
             "session-{timestamp:039}-{}-{sequence}.json",
             std::process::id()
         ));
-        match copy_recovery(&mut source, &backup) {
+        match copy_recovery(&mut contents.as_slice(), &backup) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -183,6 +186,20 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
         io::ErrorKind::AlreadyExists,
         "could not allocate session recovery copy",
     ))
+}
+
+/// Workspace launch env (possible secrets) ends when its workspace closes, so
+/// recovery copies never keep it. Other bytes are copied unchanged.
+fn without_launch_env(contents: Vec<u8>) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        return contents;
+    };
+    let before = value.clone();
+    super::snapshot::strip_launch_env(&mut value);
+    if value == before {
+        return contents;
+    }
+    serde_json::to_vec_pretty(&value).unwrap_or(contents)
 }
 
 fn copy_recovery(source: &mut impl io::Read, backup: &Path) -> io::Result<()> {
@@ -465,6 +482,110 @@ mod tests {
             assert!(backups(&writer).is_empty());
             std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn unloaded_json_recovery_preserves_bytes_and_allows_later_saves() {
+        let originals = [
+            " true \n",
+            " 42 \n",
+            " \"not a snapshot\" \n",
+            " null \n",
+            " [true, 42, null, {}] \n",
+            " { } \n",
+            " { \"version\": 999, \"unknown\": true } \n",
+            " { \"workspaces\": null } \n",
+            " { \"workspaces\": true } \n",
+            " { \"workspaces\": 42 } \n",
+            " { \"workspaces\": \"not an array\" } \n",
+            " { \"workspaces\": {} } \n",
+            " { \"workspaces\": [null, true, 42, \"unknown\", {}, []] } \n",
+        ];
+        for original in originals {
+            for background in [false, true] {
+                let writer = writer(true);
+                let path = writer.path.clone();
+                std::fs::write(&path, original.as_bytes()).unwrap();
+                let writer = std::sync::Mutex::new(writer);
+                // Match the save job's lock -> save ordering: an unwind here would
+                // poison the writer and prevent all later session saves.
+                let result = if background {
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| writer.lock().unwrap().save(&snapshot(), None))
+                            .join()
+                    })
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        writer.lock().unwrap().save(&snapshot(), None);
+                    }))
+                };
+                assert!(result.is_ok(), "recovery unwound for {original:?}");
+                assert!(!writer.is_poisoned(), "poisoned writer for {original:?}");
+                let saved: SessionSnapshot =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(saved.workspaces.len(), snapshot().workspaces.len());
+                {
+                    let writer = writer.lock().unwrap();
+                    assert!(!writer.protect_unloaded);
+                    assert_eq!(backups(&writer), vec![original.as_bytes().to_vec()]);
+                }
+
+                // Check actual disk contents, not just the absence of a panic:
+                // poisoned save jobs can silently refuse subsequent mutations.
+                for name in ["second save", "third save"] {
+                    let mut changed = snapshot();
+                    changed.workspaces[0].custom_name = Some(name.into());
+                    writer.lock().unwrap().save(&changed, None);
+                    let saved: SessionSnapshot =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    assert_eq!(saved.workspaces[0].custom_name.as_deref(), Some(name));
+                    assert_eq!(
+                        backups(&writer.lock().unwrap()),
+                        vec![original.as_bytes().to_vec()]
+                    );
+                }
+                std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unloaded_recovery_strips_launch_env_and_saves_current_session() {
+        let mut writer = writer(true);
+        // Even a rejected snapshot must lose workspace launch secrets in recovery.
+        let original = serde_json::json!({
+            "version": 999,
+            "workspaces": [
+                {"default_launch_env": [["TOKEN", "old-secret"]], "unknown": 42},
+                null,
+                {"default_launch_env": [["TOKEN", "other-secret"]]}
+            ]
+        });
+        std::fs::write(&writer.path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let mut current = snapshot();
+        current.workspaces[0].default_launch_env = vec![("TOKEN".into(), "current-secret".into())];
+        writer.save(&current, None);
+        assert!(!writer.protect_unloaded);
+        let copies = backups(&writer);
+        assert_eq!(copies.len(), 1);
+        let recovered: serde_json::Value = serde_json::from_slice(&copies[0]).unwrap();
+        assert_eq!(
+            recovered,
+            serde_json::json!({"version": 999, "workspaces": [{"unknown": 42}, null, {}]})
+        );
+        let saved: SessionSnapshot =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        assert_eq!(
+            saved.workspaces[0].default_launch_env,
+            current.workspaces[0].default_launch_env
+        );
+        for (_, path) in snapshots(&writer) {
+            let copy = std::fs::read_to_string(path).unwrap();
+            assert!(!copy.contains("current-secret"));
+            assert!(!copy.contains("default_launch_env"));
+        }
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
     }
 
     #[test]
