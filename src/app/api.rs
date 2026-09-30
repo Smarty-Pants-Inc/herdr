@@ -6,6 +6,8 @@ mod env;
 mod input_guard;
 pub(super) mod input_log;
 mod integrations;
+#[cfg(all(test, unix))]
+mod launch_env_defaults_tests;
 mod layouts;
 mod pane_graphics;
 mod panes;
