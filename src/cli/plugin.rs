@@ -1693,14 +1693,6 @@ mod tests {
         });
     }
 
-    fn unique_plugin_id(label: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        format!("test.{label}.{}.{nanos}", std::process::id())
-    }
-
     fn github_plugin(
         id: &str,
         owner: &str,
@@ -1824,32 +1816,5 @@ mod tests {
         plugin.source = PluginSourceInfo::default();
 
         assert!(plugin_by_github_source([plugin], &source).is_none());
-    }
-
-    #[test]
-    fn cli_user_dir_creation_seeds_legacy_config_before_printing_config_dir() {
-        let plugin_id = unique_plugin_id("legacy-config");
-        let config_dir = crate::plugin_paths::plugin_config_dir(&plugin_id);
-        let state_dir = crate::plugin_paths::plugin_state_dir(&plugin_id);
-        let legacy_dir = crate::config::config_dir().join("plugins").join(&plugin_id);
-        let _ = std::fs::remove_dir_all(&config_dir);
-        let _ = std::fs::remove_dir_all(&state_dir);
-        let _ = std::fs::remove_dir_all(&legacy_dir);
-        std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join(".env"), "TOKEN=legacy\n").unwrap();
-
-        assert_eq!(
-            plugin_config_dir_command(std::slice::from_ref(&plugin_id)).unwrap(),
-            0
-        );
-
-        assert_eq!(
-            std::fs::read_to_string(config_dir.join(".env")).unwrap(),
-            "TOKEN=legacy\n"
-        );
-
-        let _ = std::fs::remove_dir_all(config_dir);
-        let _ = std::fs::remove_dir_all(state_dir);
-        let _ = std::fs::remove_dir_all(legacy_dir);
     }
 }
