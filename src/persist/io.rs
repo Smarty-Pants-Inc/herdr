@@ -52,8 +52,14 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
     }
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
-    if let Err(err) = std::fs::rename(&tmp_path, &target) {
+    // Session state can hold workspace launch env (secrets): create it owner-only
+    // (0600 on unix) so the rename also replaces any older, wider file mode.
+    clear_path(&tmp_path)?;
+    let written = crate::platform::create_config_temporary(&tmp_path, true).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(err) = written.and_then(|()| std::fs::rename(&tmp_path, &target)) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
@@ -256,6 +262,24 @@ mod tests {
         clear_path(&path).unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_path_makes_session_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (session_path, history_path) = temp_session_paths("mode");
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        std::fs::write(&session_path, "{}").unwrap();
+        std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_to_path(&session_path, &empty_snapshot()).unwrap();
+        save_history_to_path(&history_path, Some(&history_snapshot("s"))).unwrap();
+
+        for path in [&session_path, &history_path] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
     }
 
     #[cfg(unix)]
