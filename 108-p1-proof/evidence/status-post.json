@@ -1,0 +1,13 @@
+{
+  "root": "/home/test-org/.herdr-p108-proof.b71l3md6",
+  "server_live": true,
+  "server": {
+    "pid": 4024838,
+    "start": "31535767",
+    "exe": "/var/lib/smarty-org-sandbox/test-org/p108-artifact2.fqes2er7/herdr-candidate",
+    "generation": "post",
+    "utc": "2026-09-30T15:25:21.970954+00:00"
+  },
+  "workspace": "w1",
+  "sha256": "c3b9adbc0d75f60a34d5bdf611f306fbb4176027735ca2700f06d2a5f1c7f1b1"
+}

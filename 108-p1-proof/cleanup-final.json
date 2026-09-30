@@ -1,0 +1,22 @@
+{
+  "candidate_processes": 0,
+  "proof_dir_removed_as_node": true,
+  "inbox_artifact_removed": true,
+  "installed_test_org_pids_unchanged": [
+    3242634,
+    3243748,
+    3243750,
+    3243754,
+    3243756,
+    3243758,
+    3243762,
+    3243772,
+    3243783,
+    3243840,
+    3244403,
+    3244802
+  ],
+  "evidence_root": "/tmp/herdr108-evidence2.p3115z",
+  "evidence_root_mode": "0o700",
+  "process_snapshot_recheck": "PASS; initial exact-baseline assertion transiently differed; immediate diagnostic and bounded recheck matched original twelve"
+}

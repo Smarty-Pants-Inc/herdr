@@ -1,0 +1,15 @@
+{
+  "version": "0.9.1",
+  "channel": "stable",
+  "protocol": 22,
+  "endpoint_protocol_generation": 1,
+  "endpoint_capabilities": [
+    "surface_interest",
+    "presentation_effects_fence",
+    "health_check"
+  ],
+  "remote_host_bridge": true,
+  "remote_bridge_idle_timeout": true,
+  "binary": "/var/lib/smarty-org-sandbox/test-org/p108-artifact2.fqes2er7/herdr-candidate",
+  "session": "herdr-p108-proof.b71l3md6"
+}

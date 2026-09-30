@@ -1,0 +1,62 @@
+{
+  "id": "cli:pane:list",
+  "result": {
+    "panes": [
+      {
+        "agent_status": "unknown",
+        "cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "focused": false,
+        "foreground_cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "pane_id": "w1:p1",
+        "revision": 1,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 24
+        },
+        "tab_id": "w1:t1",
+        "terminal_id": "term_65cb4e85052271",
+        "terminal_title": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "terminal_title_stripped": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "workspace_id": "w1"
+      },
+      {
+        "agent_status": "unknown",
+        "cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "focused": false,
+        "foreground_cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "pane_id": "w1:p2",
+        "revision": 1,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 24
+        },
+        "tab_id": "w1:t1",
+        "terminal_id": "term_65cb4e85058ad2",
+        "terminal_title": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "terminal_title_stripped": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "workspace_id": "w1"
+      },
+      {
+        "agent_status": "unknown",
+        "cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "focused": true,
+        "foreground_cwd": "/home/test-org/.herdr-p108-proof.b71l3md6/work",
+        "pane_id": "w1:p3",
+        "revision": 1,
+        "scroll": {
+          "max_offset_from_bottom": 0,
+          "offset_from_bottom": 0,
+          "viewport_rows": 24
+        },
+        "tab_id": "w1:t2",
+        "terminal_id": "term_65cb4e85060203",
+        "terminal_title": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "terminal_title_stripped": "test-org@dev1: ~/.herdr-p108-proof.b71l3md6/work",
+        "workspace_id": "w1"
+      }
+    ],
+    "type": "pane_list"
+  }
+}

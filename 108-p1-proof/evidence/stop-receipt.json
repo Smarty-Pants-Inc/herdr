@@ -1,0 +1,12 @@
+{
+  "uid": 999,
+  "root_mode": "0700",
+  "processes": 0,
+  "candidate_pids": [],
+  "server_pid": 4024838,
+  "server_pid_exists": false,
+  "session_mode": "0o600",
+  "saved_default_assertion": true,
+  "original_workspace": "w1",
+  "stopped": true
+}

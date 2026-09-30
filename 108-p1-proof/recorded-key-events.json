@@ -1,0 +1,118 @@
+{
+  "pre": [
+    {
+      "time_seconds": 0.264778,
+      "bytes_repr": "b'\\x1b[?7u\\x1b[?62;22c'"
+    },
+    {
+      "time_seconds": 14.608402,
+      "bytes_repr": "b'\\r'"
+    },
+    {
+      "time_seconds": 15.406772,
+      "bytes_repr": "b'\\x1b[27u'"
+    },
+    {
+      "time_seconds": 28.064905,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 28.63227,
+      "bytes_repr": "b'\\x1b[118;1:1;118u'"
+    },
+    {
+      "time_seconds": 49.202985,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 49.404451,
+      "bytes_repr": "b'\\x1b[99;1:1;99u'"
+    },
+    {
+      "time_seconds": 49.784691,
+      "bytes_repr": "b'\\r'"
+    },
+    {
+      "time_seconds": 95.917895,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 96.17532,
+      "bytes_repr": "b'\\x1b[118;1:1;118u'"
+    },
+    {
+      "time_seconds": 124.434788,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 124.527626,
+      "bytes_repr": "b'\\x1b[99;1:1;99u'"
+    },
+    {
+      "time_seconds": 125.014373,
+      "bytes_repr": "b'\\r'"
+    },
+    {
+      "time_seconds": 152.530204,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 152.725433,
+      "bytes_repr": "b'\\x1b[113;1:1;113u'"
+    }
+  ],
+  "post": [
+    {
+      "time_seconds": 0.294029,
+      "bytes_repr": "b'\\x1b[?7u\\x1b[?62;22c'"
+    },
+    {
+      "time_seconds": 61.901,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 62.044308,
+      "bytes_repr": "b'\\x1b[118;1:1;118u'"
+    },
+    {
+      "time_seconds": 80.2032,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 80.326453,
+      "bytes_repr": "b'\\x1b[99;1:1;99u'"
+    },
+    {
+      "time_seconds": 80.624929,
+      "bytes_repr": "b'\\r'"
+    },
+    {
+      "time_seconds": 115.530238,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 115.602226,
+      "bytes_repr": "b'\\x1b[118;1:1;118u'"
+    },
+    {
+      "time_seconds": 147.789751,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 147.877418,
+      "bytes_repr": "b'\\x1b[99;1:1;99u'"
+    },
+    {
+      "time_seconds": 148.139266,
+      "bytes_repr": "b'\\r'"
+    },
+    {
+      "time_seconds": 171.502288,
+      "bytes_repr": "b'\\x1b[97;5:1u'"
+    },
+    {
+      "time_seconds": 171.638062,
+      "bytes_repr": "b'\\x1b[113;1:1;113u'"
+    }
+  ]
+}

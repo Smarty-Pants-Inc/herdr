@@ -1,0 +1,183 @@
+FOUR CALL RECEIPTS PASS; this does NOT certify actual input/video/negative-isolation ledger.
+[
+  {
+    "phase": "pre-split",
+    "begin": "2026-09-30T15:24:09.060425+00:00",
+    "end": "2026-09-30T15:24:12.599135+00:00",
+    "exit": 0,
+    "pass": true,
+    "workspace": "w1",
+    "pane": "w1:p2",
+    "tab": "w1:t1",
+    "terminal_id": "term_65cb4e3f53c325",
+    "shell_pid": 4002130,
+    "usage_offset": 26178,
+    "usage_end": 26447,
+    "rows": [
+      {
+        "time": "2026-09-30T15:24:10.550Z",
+        "node": "test-org",
+        "member": "paul",
+        "model": "nemotron-3-super",
+        "path": "/v1/chat/completions",
+        "credential": null,
+        "trace": "20260930152409-4f1b40b159bd0cd8-00000005",
+        "status": 200,
+        "prompt_tokens": 469,
+        "completion_tokens": 28,
+        "end": "complete"
+      }
+    ],
+    "argv": [
+      "/var/lib/smarty-org-sandbox/test-org/hostd/current/bin/pi",
+      "--provider",
+      "node-gateway",
+      "--model",
+      "nemotron-3-super",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-session",
+      "--print",
+      "Reply exactly: P108-pre-split. Do not use tools."
+    ],
+    "candidate_sha256": "c3b9adbc0d75f60a34d5bdf611f306fbb4176027735ca2700f06d2a5f1c7f1b1"
+  },
+  {
+    "phase": "pre-tab",
+    "begin": "2026-09-30T15:24:37.801117+00:00",
+    "end": "2026-09-30T15:24:42.050099+00:00",
+    "exit": 0,
+    "pass": true,
+    "workspace": "w1",
+    "pane": "w1:p3",
+    "tab": "w1:t2",
+    "terminal_id": "term_65cb4e5ad48c86",
+    "shell_pid": 4010698,
+    "usage_offset": 26447,
+    "usage_end": 26716,
+    "rows": [
+      {
+        "time": "2026-09-30T15:24:40.022Z",
+        "node": "test-org",
+        "member": "paul",
+        "model": "nemotron-3-super",
+        "path": "/v1/chat/completions",
+        "credential": null,
+        "trace": "20260930152438-4f1b40b159bd0cd8-00000006",
+        "status": 200,
+        "prompt_tokens": 468,
+        "completion_tokens": 30,
+        "end": "complete"
+      }
+    ],
+    "argv": [
+      "/var/lib/smarty-org-sandbox/test-org/hostd/current/bin/pi",
+      "--provider",
+      "node-gateway",
+      "--model",
+      "nemotron-3-super",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-session",
+      "--print",
+      "Reply exactly: P108-pre-tab. Do not use tools."
+    ],
+    "candidate_sha256": "c3b9adbc0d75f60a34d5bdf611f306fbb4176027735ca2700f06d2a5f1c7f1b1"
+  },
+  {
+    "phase": "post-split",
+    "begin": "2026-09-30T15:27:18.094746+00:00",
+    "end": "2026-09-30T15:27:26.405221+00:00",
+    "exit": 0,
+    "pass": true,
+    "workspace": "w1",
+    "pane": "w1:p4",
+    "tab": "w1:t2",
+    "terminal_id": "term_65cb4ef3c6bcf9",
+    "shell_pid": 4062566,
+    "usage_offset": 26716,
+    "usage_end": 26986,
+    "rows": [
+      {
+        "time": "2026-09-30T15:27:24.380Z",
+        "node": "test-org",
+        "member": "paul",
+        "model": "nemotron-3-super",
+        "path": "/v1/chat/completions",
+        "credential": null,
+        "trace": "20260930152718-4f1b40b159bd0cd8-00000007",
+        "status": 200,
+        "prompt_tokens": 469,
+        "completion_tokens": 184,
+        "end": "complete"
+      }
+    ],
+    "argv": [
+      "/var/lib/smarty-org-sandbox/test-org/hostd/current/bin/pi",
+      "--provider",
+      "node-gateway",
+      "--model",
+      "nemotron-3-super",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-session",
+      "--print",
+      "Reply exactly: P108-post-split. Do not use tools."
+    ],
+    "candidate_sha256": "c3b9adbc0d75f60a34d5bdf611f306fbb4176027735ca2700f06d2a5f1c7f1b1"
+  },
+  {
+    "phase": "post-tab",
+    "begin": "2026-09-30T15:27:50.617315+00:00",
+    "end": "2026-09-30T15:27:54.274786+00:00",
+    "exit": 0,
+    "pass": true,
+    "workspace": "w1",
+    "pane": "w1:p5",
+    "tab": "w1:t3",
+    "terminal_id": "term_65cb4f12cdf40a",
+    "shell_pid": 4072522,
+    "usage_offset": 26986,
+    "usage_end": 27255,
+    "rows": [
+      {
+        "time": "2026-09-30T15:27:52.247Z",
+        "node": "test-org",
+        "member": "paul",
+        "model": "nemotron-3-super",
+        "path": "/v1/chat/completions",
+        "credential": null,
+        "trace": "20260930152751-4f1b40b159bd0cd8-00000008",
+        "status": 200,
+        "prompt_tokens": 468,
+        "completion_tokens": 60,
+        "end": "complete"
+      }
+    ],
+    "argv": [
+      "/var/lib/smarty-org-sandbox/test-org/hostd/current/bin/pi",
+      "--provider",
+      "node-gateway",
+      "--model",
+      "nemotron-3-super",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-session",
+      "--print",
+      "Reply exactly: P108-post-tab. Do not use tools."
+    ],
+    "candidate_sha256": "c3b9adbc0d75f60a34d5bdf611f306fbb4176027735ca2700f06d2a5f1c7f1b1"
+  }
+]
