@@ -201,6 +201,12 @@ pub struct Workspace {
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
     pub(crate) next_public_tab_number: usize,
+    /// Default launch environment from `workspace.create` env, applied to every
+    /// new pane and tab in this workspace unless the launch sets the key itself.
+    /// Bound to this record, never to its reusable public id. It can carry
+    /// secrets: it is saved only with this record in the 0600 session file
+    /// (and the handoff manifest), never logged or returned by the API.
+    pub(crate) default_launch_env: Vec<(String, String)>,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     #[cfg(test)]
@@ -266,6 +272,7 @@ impl Workspace {
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
+            default_launch_env: Vec::new(),
             tabs: vec![tab],
             active_tab: 0,
             #[cfg(test)]
@@ -361,6 +368,7 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
+        let default_launch_env = extra_env.clone();
         let launch_env = PaneLaunchEnv::from_extra(extra_env).with_identity(
             id.clone(),
             public_tab_id_for_number(&id, 1),
@@ -418,6 +426,7 @@ impl Workspace {
                 public_pane_numbers,
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
+                default_launch_env,
                 tabs: vec![tab],
                 active_tab: 0,
                 #[cfg(test)]
@@ -983,7 +992,15 @@ impl Workspace {
         pane_number: usize,
         extra_env: Vec<(String, String)>,
     ) -> PaneLaunchEnv {
-        PaneLaunchEnv::from_extra(extra_env).with_identity(
+        // Explicit per-launch keys win, an explicit empty value included.
+        let mut env: Vec<(String, String)> = self
+            .default_launch_env
+            .iter()
+            .filter(|(key, _)| !extra_env.iter().any(|(explicit, _)| explicit == key))
+            .cloned()
+            .collect();
+        env.extend(extra_env);
+        PaneLaunchEnv::from_extra(env).with_identity(
             self.id.clone(),
             public_tab_id_for_number(&self.id, tab_number),
             public_pane_id_for_number(&self.id, pane_number),
@@ -1207,6 +1224,7 @@ impl Workspace {
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
+            default_launch_env: Vec::new(),
             tabs: vec![tab],
             active_tab: 0,
             test_runtimes: HashMap::new(),
