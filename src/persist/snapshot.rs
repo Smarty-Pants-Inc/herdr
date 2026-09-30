@@ -65,6 +65,13 @@ pub struct WorkspaceSnapshot {
     pub public_tab_numbers: Vec<usize>,
     #[serde(default)]
     pub next_public_tab_number: usize,
+    /// The workspace's default launch env from `workspace.create`. It is bound
+    /// to this record: restore puts it back on the workspace built from this
+    /// entry only. It can carry secrets, so it lives only in the server's own
+    /// 0600 session file and handoff manifest, never in logs, fingerprints or
+    /// API responses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_launch_env: Vec<(String, String)>,
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
@@ -164,6 +171,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
             next_public_tab_number: 0,
+            default_launch_env: Vec::new(),
             tabs: vec![tab],
             active_tab: 0,
         }
@@ -306,6 +314,7 @@ fn capture_workspace(
         next_public_pane_number: ws.next_public_pane_number,
         public_tab_numbers: ws.tabs.iter().map(|tab| tab.number).collect(),
         next_public_tab_number: ws.next_public_tab_number,
+        default_launch_env: ws.default_launch_env.clone(),
         tabs,
         active_tab: ws.active_tab,
     }
@@ -384,10 +393,26 @@ fn capture_tab(
     }
 }
 
+/// Removes every workspace's launch env from a serialized session snapshot.
+pub(super) fn strip_launch_env(value: &mut serde_json::Value) {
+    if let Some(workspaces) = value
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for workspace in workspaces {
+            if let Some(workspace) = workspace.as_object_mut() {
+                workspace.remove("default_launch_env");
+            }
+        }
+    }
+}
+
 pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let mut value = serde_json::to_value(snapshot).ok()?;
+    // The fingerprint is a layout identity; keep launch env (possible secrets) out of it.
+    strip_launch_env(&mut value);
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
@@ -615,6 +640,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_launch_env_leaves_unrelated_json_unchanged() {
+        for contents in [
+            "{}",
+            "null",
+            "true",
+            "42",
+            "\"not a snapshot\"",
+            "[]",
+            r#"{"version":999}"#,
+            r#"{"workspaces":null}"#,
+            r#"{"workspaces":{}}"#,
+            r#"{"workspaces":[null,true,42,"unknown",{},[]]}"#,
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(contents).unwrap();
+            let original = value.clone();
+            strip_launch_env(&mut value);
+            assert_eq!(value, original, "sanitization changed {contents}");
+        }
+    }
+
+    #[test]
     fn layout_fingerprint_survives_json_round_trip() {
         let mut snapshot = parse_snapshot(include_str!(
             "../../tests/fixtures/session/current-herdr-session.json"
@@ -713,6 +759,7 @@ mod tests {
                 next_public_pane_number: 3,
                 public_tab_numbers: vec![1],
                 next_public_tab_number: 2,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
@@ -1378,6 +1425,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                default_launch_env: Vec::new(),
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
