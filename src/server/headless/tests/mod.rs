@@ -7288,6 +7288,157 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
     serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
 }
 
+fn report_agent_changed(
+    server: &mut HeadlessServer,
+    pane_id: &str,
+    state: api::schema::PaneAgentState,
+    seq: u64,
+) -> bool {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        context: crate::api::ApiRequestContext::default(),
+        request: api::schema::Request {
+            id: format!("render-probe-{seq}"),
+            method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
+                pane_id: pane_id.into(),
+                source: "custom:pi".into(),
+                agent: "pi".into(),
+                state,
+                message: None,
+                seq: Some(seq),
+                agent_session_id: None,
+                agent_session_path: None,
+            }),
+        },
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+    changed
+}
+
+/// Pi agents re-assert their state every 2 s (pi-herdr-state). An unchanged re-assert must not
+/// request a render (a full render per report stalled every client with ~100 agents); a real
+/// transition still must.
+#[test]
+fn agent_report_requests_a_render_only_for_a_visible_change() {
+    use api::schema::PaneAgentState::{Idle, Working};
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    server.handle_internal_event_with_forwarding(AppEvent::AgentProcessDetected {
+        pane_id,
+        agent: crate::detect::Agent::Pi,
+        observed_at: Instant::now(),
+    });
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    assert!(
+        report_agent_changed(&mut server, &public_pane_id, Working, 1),
+        "the first report is visible"
+    );
+    for seq in 2..6 {
+        assert!(
+            !report_agent_changed(&mut server, &public_pane_id, Working, seq),
+            "re-assert {seq} of an unchanged state must not request a render"
+        );
+    }
+    assert!(
+        report_agent_changed(&mut server, &public_pane_id, Idle, 6),
+        "working -> idle is visible"
+    );
+    assert!(
+        !report_agent_changed(&mut server, &public_pane_id, Idle, 7),
+        "an idle re-assert is not"
+    );
+    assert!(
+        report_agent_changed(&mut server, &public_pane_id, Working, 8),
+        "idle -> working is visible"
+    );
+}
+
+fn report_agent_session_changed(
+    server: &mut HeadlessServer,
+    pane_id: &str,
+    session: &str,
+    reason: &str,
+    seq: u64,
+) -> bool {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        context: crate::api::ApiRequestContext::default(),
+        request: api::schema::Request {
+            id: format!("session-probe-{seq}"),
+            method: api::schema::Method::PaneReportAgentSession(
+                api::schema::PaneReportAgentSessionParams {
+                    pane_id: pane_id.into(),
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    seq: Some(seq),
+                    agent_session_id: Some(session.into()),
+                    agent_session_path: None,
+                    session_start_source: Some(reason.into()),
+                },
+            ),
+        },
+        respond_to,
+        response_write_complete: None,
+        stream_active: None,
+    });
+    let response = response_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    serde_json::from_str::<api::schema::SuccessResponse>(&response).expect("successful report");
+    changed
+}
+
+/// Replacing an unseen idle session resets the pane's seen mark and its completion (the Done
+/// mark) without changing the agent's state or label. That is visible (workspace attention and
+/// the sidebar), so it must request a render; an identical repeat must not.
+#[test]
+fn agent_session_replacement_that_resets_seen_requests_a_render() {
+    let (writer, _control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    report_agent_session_changed(&mut server, &public_pane_id, "old-session", "startup", 1);
+    for state in [
+        crate::detect::AgentState::Working,
+        crate::detect::AgentState::Idle,
+    ] {
+        server.handle_internal_event_with_forwarding(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Claude),
+            state,
+            visible_blocker: false,
+            visible_working: state == crate::detect::AgentState::Working,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+    }
+    assert!(
+        !server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen
+    );
+    assert!(
+        report_agent_session_changed(&mut server, &public_pane_id, "new-session", "clear", 2),
+        "the replacement resets seen and completion: it must render"
+    );
+    assert!(
+        server.app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .seen
+    );
+    assert!(
+        !report_agent_session_changed(&mut server, &public_pane_id, "new-session", "clear", 3),
+        "an identical repeat changes nothing visible"
+    );
+}
+
 fn completion_guard_notifications(
     server: &mut HeadlessServer,
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -7619,7 +7770,8 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
         stream_active: None,
     });
 
-    assert!(changed);
+    // The stale report is ignored, so a client sees nothing new: no render is requested.
+    assert!(!changed, "a stale agent report must not request a render");
     assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
     assert_eq!(
         server.app.state.terminals.get(&terminal_id).unwrap().state,

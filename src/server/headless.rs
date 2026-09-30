@@ -2938,6 +2938,45 @@ impl HeadlessServer {
         changed
     }
 
+    /// What a client can see of the agents: per terminal, its state, agent label, agent name,
+    /// effective presentation and completion (the Done mark); per pane, whether it has been seen
+    /// (workspace attention and the sidebar use it); and the toast. Compared around a
+    /// `pane.report_agent*` request.
+    fn agent_report_view(&self) -> AgentReportView {
+        let terminals: Vec<_> = self
+            .app
+            .state
+            .terminals
+            .values()
+            .map(|terminal| {
+                (
+                    terminal.id.clone(),
+                    terminal.state,
+                    terminal.effective_agent_label().map(str::to_string),
+                    terminal.agent_name.clone(),
+                    terminal.effective_presentation(),
+                    terminal.last_agent_completion_seq,
+                )
+            })
+            .collect();
+        let panes: Vec<_> = self
+            .app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| {
+                tab.panes
+                    .iter()
+                    .map(|(&pane_id, pane)| (pane_id.raw(), pane.seen))
+            })
+            .collect();
+        // ponytail: no sort: a HashMap's iteration order is the same between two reads while no
+        // terminal is added or removed; if one is, the views differ and the request renders, which
+        // is the safe side.
+        (self.app.state.toast.clone(), terminals, panes)
+    }
+
     /// Drains API requests with shutdown awareness.
     ///
     /// During shutdown, remaining requests get a `server_unavailable` error.
@@ -3101,8 +3140,22 @@ impl HeadlessServer {
                 | api::schema::Method::PaneGraphicsStreamClose(_)
         )
         .then_some(self.app.pane_graphics.revision());
+        // Pi and other lifecycle-hook agents re-assert their state periodically (pi-herdr-state
+        // publishes every 2 s even when nothing changed). With ~100 agents, treating every report
+        // as a UI change forced a full render per request (~50 ms each at that scale), which
+        // stalled typing and scrolling for every client. A report now asks for a render only when
+        // it changes what a client can see: an agent's state, label, name, presentation or
+        // completion, a pane's seen mark, or the toast.
+        let is_agent_report = matches!(
+            &msg.request.method,
+            api::schema::Method::PaneReportAgent(_)
+                | api::schema::Method::PaneReportAgentSession(_)
+        );
+        let agent_report_view_before = is_agent_report.then(|| self.agent_report_view());
         let mut changed = metadata_expired
-            | (pane_graphics_revision_before.is_none() && api::request_changes_ui(&msg.request));
+            | (pane_graphics_revision_before.is_none()
+                && !is_agent_report
+                && api::request_changes_ui(&msg.request));
         let skip_default_workspace = skip_default_workspace_for_request
             || matches!(
                 &msg.request.method,
@@ -3261,6 +3314,15 @@ impl HeadlessServer {
             changed |= revision_before != self.app.pane_graphics.revision();
         }
 
+        if let Some(before) = &agent_report_view_before {
+            let visible_change = *before != self.agent_report_view();
+            crate::render_prof::event(if visible_change {
+                "api.agent_report.visible_change"
+            } else {
+                "api.agent_report.unchanged"
+            });
+            changed |= visible_change;
+        }
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
         // show a terminal or system notification.
@@ -3605,3 +3667,16 @@ fn server_config_diagnostic_summaries(diagnostics: &[String]) -> (Option<String>
 
 #[cfg(test)]
 mod tests;
+
+type AgentReportView = (
+    Option<crate::app::state::ToastNotification>,
+    Vec<(
+        crate::terminal::TerminalId,
+        crate::detect::AgentState,
+        Option<String>,
+        Option<String>,
+        crate::terminal::EffectivePresentation,
+        Option<u64>,
+    )>,
+    Vec<(u32, bool)>,
+);
