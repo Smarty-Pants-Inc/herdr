@@ -32,6 +32,9 @@ pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
+    #[cfg(test)]
+    return test_root().join("config").join(app_dir_name());
+    #[cfg(not(test))]
     platform_config_dir()
 }
 
@@ -39,10 +42,24 @@ pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
+    #[cfg(test)]
+    return test_root().join("state").join(app_dir_name());
+    #[cfg(not(test))]
     platform_state_dir()
 }
 
+/// Unit tests never fall back to the user's real config or state dirs
+/// (for example `~/.config/herdr/agent-detection`); tests that need a
+/// specific root still set `XDG_CONFIG_HOME` / `XDG_STATE_HOME`.
+#[cfg(test)]
+fn test_root() -> PathBuf {
+    std::env::temp_dir()
+        .join("herdr-unit-tests")
+        .join(std::process::id().to_string())
+}
+
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 fn platform_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("APPDATA") {
         return PathBuf::from(dir).join(app_dir_name());
@@ -60,6 +77,7 @@ fn platform_config_dir() -> PathBuf {
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(test, allow(dead_code))]
 fn platform_config_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
@@ -69,6 +87,7 @@ fn platform_config_dir() -> PathBuf {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
 fn platform_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LOCALAPPDATA") {
         return PathBuf::from(dir).join(app_dir_name());
@@ -86,6 +105,7 @@ fn platform_state_dir() -> PathBuf {
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(test, allow(dead_code))]
 fn platform_state_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
