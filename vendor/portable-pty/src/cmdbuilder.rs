@@ -427,6 +427,14 @@ impl CommandBuilder {
         )
     }
 
+    /// Iterate over the complete configured environment, including base entries,
+    /// preserving preferred key casing and non-Unicode keys and values.
+    pub fn iter_full_env(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.envs
+            .values()
+            .map(|entry| (entry.preferred_key.as_os_str(), entry.value.as_os_str()))
+    }
+
     pub fn iter_full_env_as_str(&self) -> impl Iterator<Item = (&str, &str)> {
         self.envs.values().filter_map(
             |EnvEntry {
@@ -830,6 +838,56 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iter_full_env_includes_base_and_extra_entries() {
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_clear();
+        cmd.envs.insert(
+            EnvEntry::map_key("Base_Key".into()),
+            EnvEntry {
+                is_from_base_env: true,
+                preferred_key: "Base_Key".into(),
+                value: "base value".into(),
+            },
+        );
+        cmd.env("Extra_Key", "extra value");
+
+        assert_eq!(
+            cmd.iter_full_env().collect::<Vec<_>>(),
+            vec![
+                (OsStr::new("Base_Key"), OsStr::new("base value")),
+                (OsStr::new("Extra_Key"), OsStr::new("extra value")),
+            ]
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn iter_full_env_preserves_non_unicode_keys_and_values() {
+        #[cfg(unix)]
+        let non_unicode = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let non_unicode = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        assert!(non_unicode.to_str().is_none());
+
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env_clear();
+        cmd.env(&non_unicode, "value");
+        cmd.env("key", &non_unicode);
+
+        let entries = cmd.iter_full_env().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&(non_unicode.as_os_str(), OsStr::new("value"))));
+        assert!(entries.contains(&(OsStr::new("key"), non_unicode.as_os_str())));
+        assert_eq!(cmd.iter_full_env_as_str().count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]
