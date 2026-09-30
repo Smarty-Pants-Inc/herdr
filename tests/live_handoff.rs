@@ -2745,7 +2745,11 @@ fn pull_without_a_safe_peer_handle_refuses_before_transferring_descriptors() {
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = std::mem::size_of_val(&control) as _;
     let received = unsafe { libc::recvmsg(peer.as_raw_fd(), &mut msg, 0) };
-    assert!(received >= 0, "recvmsg: {}", std::io::Error::last_os_error());
+    assert!(
+        received >= 0,
+        "recvmsg: {}",
+        std::io::Error::last_os_error()
+    );
     assert_eq!(
         msg.msg_flags & libc::MSG_CTRUNC,
         0,
@@ -2769,7 +2773,10 @@ fn pull_without_a_safe_peer_handle_refuses_before_transferring_descriptors() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains(".handoff-") || name.contains(".recover"))
         .collect();
-    assert!(leftovers.is_empty(), "refusal parked sockets: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "refusal parked sockets: {leftovers:?}"
+    );
     assert!(
         !handoff_socket.exists(),
         "refusal left the handoff socket behind"
