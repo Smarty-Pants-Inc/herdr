@@ -240,7 +240,7 @@ async fn defaults_survive_closing_the_root_pane() {
 // ASK items 5 and 6: a workspace without env stays unattributed; focus and
 // target selection never mix workspaces; a later workspace that reuses the
 // old public id does not pick up the closed workspace's defaults; snapshots
-// never carry the env.
+// never carry the env in the public session snapshot API.
 #[tokio::test]
 async fn defaults_are_scoped_to_the_workspace_record() {
     let mut h = Harness::new("scope");
@@ -274,14 +274,7 @@ async fn defaults_are_scoped_to_the_workspace_record() {
     let a_implicit = h.split(None, None, &[]);
     assert_eq!(h.seen(&a_implicit), "[probe-split]");
 
-    let snapshot = crate::persist::capture(
-        &h.app.state.workspaces,
-        &h.app.state.terminals,
-        &h.app.terminal_runtimes,
-        h.app.state.active,
-        h.app.state.selected,
-    );
-    let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+    let snapshot_json = serde_json::to_string(&h.app.session_snapshot()).unwrap();
     assert!(!snapshot_json.contains("probe-split"));
     assert!(!snapshot_json.contains(KEY));
 
@@ -309,4 +302,159 @@ async fn defaults_are_scoped_to_the_workspace_record() {
     assert!(reused_split.starts_with(&format!("{a}:")));
     assert_eq!(h.seen(&reused_split), UNSET);
     assert_eq!(h.seen(&reused_tab), UNSET);
+}
+
+fn forget_recorded_panes(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('w') && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+}
+
+// net-lead #209: a Node restarts the server on every install, relink or
+// restart. The defaults persist in the server's own 0600 session file, bound
+// to the saved workspace record, and come back onto that restored workspace
+// only. This is the server's restart path: save the session file, then a new
+// App loads and restores it.
+#[tokio::test]
+async fn defaults_survive_a_server_restart_on_the_restored_record_only() {
+    let _guard = crate::config::test_config_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Point the session file at a private config home before any App exists:
+    // the session writer resolves its path when the App is built.
+    let _env = ConfigHomeGuard::new("restart");
+    let mut h = Harness::new("restart");
+
+    let (a, a_root) = h.create_workspace(&[(KEY, "probe-split")]);
+    let (b, b_root) = h.create_workspace(&[]);
+    assert_eq!(h.seen(&a_root), "[probe-split]");
+    assert_eq!(h.seen(&b_root), UNSET);
+    h.app.policy.persist_session = true;
+    h.app.save_session_now();
+
+    let session = crate::session::data_dir().join("session.json");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&session).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "session file mode");
+    }
+    assert!(std::fs::read_to_string(&session)
+        .unwrap()
+        .contains("probe-split"));
+
+    // Restart: the old server's panes end, a new server restores the file.
+    let mut config = Config::default();
+    config.terminal.default_shell = h.app.state.default_shell.clone();
+    config.terminal.shell_mode = ShellModeConfig::NonLogin;
+    shutdown_test_runtimes(&mut h.app);
+    forget_recorded_panes(&h.dir);
+    let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let restored = App::new(
+        &config,
+        crate::app::AppPolicy {
+            restore_session: true,
+            persist_session: true,
+            ..crate::app::AppPolicy::TEST
+        },
+        None,
+        api_rx,
+        crate::api::EventHub::default(),
+    );
+    drop(std::mem::replace(&mut h.app, restored));
+    assert!(h.app.parse_workspace_id(&a).is_some(), "A was not restored");
+
+    // The restored panes and every new launch in A see the default; B does not.
+    assert_eq!(h.seen(&a_root), "[probe-split]");
+    assert_eq!(h.seen(&b_root), UNSET);
+    let a_split = h.split(Some(&a), None, &[]);
+    let a_tab = h.tab(Some(&a), &[]);
+    let b_split = h.split(Some(&b), None, &[]);
+    assert_eq!(h.seen(&a_split), "[probe-split]");
+    assert_eq!(h.seen(&a_tab), "[probe-split]");
+    assert_eq!(h.seen(&b_split), UNSET);
+    let override_split = h.split(Some(&a), None, &[(KEY, "override")]);
+    assert_eq!(h.seen(&override_split), "[override]");
+
+    // A new workspace after the restore, without env, stays unset.
+    let (c, c_root) = h.create_workspace(&[]);
+    let c_split = h.split(Some(&c), None, &[]);
+    assert_eq!(h.seen(&c_root), UNSET);
+    assert_eq!(h.seen(&c_split), UNSET);
+
+    // The public session snapshot API never returns the env.
+    let api_json = serde_json::to_string(&h.app.session_snapshot()).unwrap();
+    assert!(!api_json.contains("probe-split") && !api_json.contains(KEY));
+
+    // Closing A deletes its defaults from the session file, and a new
+    // workspace that takes A's reused id does not get them.
+    h.call(Method::WorkspaceClose(WorkspaceCloseParams {
+        workspace_id: a.clone(),
+        close_group: false,
+    }));
+    h.app.save_session_now();
+    let saved = std::fs::read_to_string(&session).unwrap();
+    assert!(!saved.contains("probe-split") && !saved.contains(KEY));
+    // Nor does any recovery copy the server keeps next to it.
+    let data_dir = crate::session::data_dir();
+    let mut copies = 0;
+    for sub in ["session-snapshots", "session-backups"] {
+        for entry in std::fs::read_dir(data_dir.join(sub))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            copies += 1;
+            let copy = std::fs::read_to_string(entry.path()).unwrap();
+            assert!(!copy.contains("probe-split"), "{}", entry.path().display());
+        }
+    }
+    assert!(copies > 0, "expected a recovery copy of the session with A");
+    let (d, _d_root) = h.create_workspace(&[]);
+    let d_idx = h.app.parse_workspace_id(&d).unwrap();
+    h.app.state.workspaces[d_idx].id = a.clone();
+    forget_recorded_panes(&h.dir);
+    let reused_split = h.split(Some(&a), None, &[]);
+    assert!(reused_split.starts_with(&format!("{a}:")));
+    assert_eq!(h.seen(&reused_split), UNSET);
+
+    h.app.policy.persist_session = false;
+}
+
+struct ConfigHomeGuard {
+    dir: PathBuf,
+    previous_home: Option<std::ffi::OsString>,
+    previous_session: Option<std::ffi::OsString>,
+}
+
+impl ConfigHomeGuard {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-env-inherit-config-{name}-{}",
+            std::process::id()
+        ));
+        let guard = Self {
+            dir,
+            previous_home: std::env::var_os("XDG_CONFIG_HOME"),
+            previous_session: std::env::var_os(crate::session::SESSION_ENV_VAR),
+        };
+        std::env::set_var("XDG_CONFIG_HOME", &guard.dir);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        guard
+    }
+}
+
+impl Drop for ConfigHomeGuard {
+    fn drop(&mut self) {
+        match &self.previous_home {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        if let Some(value) = &self.previous_session {
+            std::env::set_var(crate::session::SESSION_ENV_VAR, value);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }

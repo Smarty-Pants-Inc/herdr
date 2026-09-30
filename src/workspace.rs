@@ -203,8 +203,9 @@ pub struct Workspace {
     pub(crate) next_public_tab_number: usize,
     /// Default launch environment from `workspace.create` env, applied to every
     /// new pane and tab in this workspace unless the launch sets the key itself.
-    /// Bound to this record, never to its reusable public id; never persisted
-    /// or logged, because it can carry secrets.
+    /// Bound to this record, never to its reusable public id. It can carry
+    /// secrets: it is saved only with this record in the 0600 session file
+    /// (and the handoff manifest), never logged or returned by the API.
     pub(crate) default_launch_env: Vec<(String, String)>,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,

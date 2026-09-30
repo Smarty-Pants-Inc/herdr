@@ -133,6 +133,9 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
     if !source.metadata()?.is_file() {
         return Err(io::Error::other("session path is not a regular file"));
     }
+    let mut contents = Vec::new();
+    io::Read::read_to_end(&mut source, &mut contents)?;
+    let contents = without_launch_env(contents);
     let directory = path.with_file_name(directory_name);
     std::fs::create_dir_all(&directory)?;
     let older = recovery_files(&directory)?;
@@ -154,7 +157,7 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
             "session-{timestamp:039}-{}-{sequence}.json",
             std::process::id()
         ));
-        match copy_recovery(&mut source, &backup) {
+        match copy_recovery(&mut contents.as_slice(), &backup) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(err),
@@ -183,6 +186,20 @@ fn preserve_existing_in(path: &Path, directory_name: &str, keep: usize) -> io::R
         io::ErrorKind::AlreadyExists,
         "could not allocate session recovery copy",
     ))
+}
+
+/// Workspace launch env (possible secrets) ends when its workspace closes, so
+/// recovery copies never keep it. Other bytes are copied unchanged.
+fn without_launch_env(contents: Vec<u8>) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+        return contents;
+    };
+    let before = value.clone();
+    super::snapshot::strip_launch_env(&mut value);
+    if value == before {
+        return contents;
+    }
+    serde_json::to_vec_pretty(&value).unwrap_or(contents)
 }
 
 fn copy_recovery(source: &mut impl io::Read, backup: &Path) -> io::Result<()> {
