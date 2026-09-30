@@ -129,3 +129,42 @@ On Windows, also run:
 ```sh
 cargo test --manifest-path vendor/portable-pty/Cargo.toml windows_environment_rejects_malformed_entries
 ```
+
+## 0004 expose complete command environment
+
+status: active
+
+patch: `vendor/patches/portable-pty/0004-expose-complete-environment.patch`
+
+issue: https://github.com/Smarty-Pants-Inc/smarty-dev/issues/2491
+
+upstream discussion: none
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/cmdbuilder.rs`
+
+reason: Test helpers need to scrub the complete PTY environment snapshot,
+including Windows registry-derived base entries, rather than only parent
+process variables. `iter_full_env_as_str` omits non-Unicode keys and values;
+`iter_full_env` exposes every stored preferred key and value as borrowed
+`OsStr` pairs without filtering or conversion.
+
+remove when: upstream `portable-pty` exposes an equivalent public lossless
+iterator over all configured environment entries, including base entries and
+preferred key casing, and Herdr uses that upstream API.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+cargo test --manifest-path vendor/portable-pty/Cargo.toml iter_full_env_
+```
+
+The iterator regressions cover base and caller entries, preferred key casing,
+and non-Unicode keys and values on Unix and Windows. Run the vendor unit tests
+on both platforms.

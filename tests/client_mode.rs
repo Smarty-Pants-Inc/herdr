@@ -5,6 +5,8 @@
 pub mod support;
 #[path = "support/terminal_screen.rs"]
 mod terminal_screen;
+#[path = "support/command.rs"]
+pub mod test_command;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,7 +16,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use serde_json::Value;
 use support::{
     cleanup_test_base, client_shell_handshake, read_server_message, register_runtime_dir,
@@ -124,7 +126,7 @@ fn spawn_client_process_with_args_and_env(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.args(args);
     cmd.env("HERDR_DISABLE_SOUND", "1");
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
@@ -184,7 +186,7 @@ fn spawn_server_with_config(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -434,7 +436,7 @@ fn client_sees_headless_startup_config_diagnostic() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -495,7 +497,7 @@ fn server_unreachable_shows_clear_error() {
     )
     .unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let output = crate::test_command::herdr_command()
         .arg("client")
         .env("HERDR_DISABLE_SOUND", "1")
         .env("XDG_CONFIG_HOME", &config_home)
@@ -2013,7 +2015,7 @@ fn client_receives_notify_on_agent_state_change() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);

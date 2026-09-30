@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
 pub mod support;
+#[path = "support/command.rs"]
+pub mod test_command;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,7 +14,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use support::{
     cleanup_test_base, client_shell_handshake, register_runtime_dir, register_spawned_herdr_pid,
     send_client_shell_shift_enter, unregister_spawned_herdr_pid, wait_for_client_shell_bootstrap,
@@ -96,7 +98,7 @@ fn spawn_server_with_env_and_owner(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -140,7 +142,7 @@ fn spawn_named_session_server(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -175,13 +177,12 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("XDG_STATE_HOME", runtime_dir.join("state"));
     cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
-    cmd.env_remove("HERDR_SESSION");
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -217,7 +218,7 @@ fn spawn_server_with_args_and_socket_env(
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = crate::test_command::herdr_pty_command();
     if let Some(session_name) = session_name {
         cmd.arg("--session");
         cmd.arg(session_name);
@@ -226,7 +227,6 @@ fn spawn_server_with_args_and_socket_env(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string());
-    cmd.env_remove("HERDR_SESSION");
     if let Some(api_socket_env) = api_socket_env {
         cmd.env("HERDR_SOCKET_PATH", api_socket_env);
     } else {
@@ -2475,9 +2475,10 @@ fn guarded_cli_handoff_is_refused_by_a_server_without_guards() {
         method
     });
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let output = crate::test_command::herdr_command()
         .args(["server", "live-handoff", "--expect-socket-inode", "12345"])
         .env_clear()
+        .env("HERDR_SESSION", "default")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &base)
         .env("XDG_CONFIG_HOME", base.join("config"))
@@ -2825,7 +2826,7 @@ fn spawn_pull_importer(
     extra_env: &[(&str, &str)],
 ) -> PullImporter {
     let runtime_dir = api_socket.parent().unwrap();
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut command = crate::test_command::herdr_command();
     command
         .args(["server", "--import-from-running"])
         .args(args)
