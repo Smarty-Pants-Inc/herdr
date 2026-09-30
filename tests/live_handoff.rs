@@ -2658,8 +2658,14 @@ fn pull_without_a_safe_peer_handle_refuses_before_transferring_descriptors() {
 
     let _lock = test_lock();
     let base = unique_test_dir();
-    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
-        spawn_server_with_echo_pane(&base, &[("HERDR_TEST_HANDOFF_NO_PEER_PROCESS", "1")]);
+    // The private handoff socket must not follow the runner's named session.
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) = spawn_server_with_echo_pane(
+        &base,
+        &[
+            ("HERDR_SESSION", "default"),
+            ("HERDR_TEST_HANDOFF_NO_PEER_PROCESS", "1"),
+        ],
+    );
     let source_pid = spawned.child.process_id().unwrap();
     let client_socket = api_socket.with_file_name("herdr-client.sock");
     let api_inode = socket_inode(&api_socket);
