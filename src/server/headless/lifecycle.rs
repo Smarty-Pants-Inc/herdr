@@ -26,8 +26,9 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
         guarded_method: bool,
+        pull: bool,
     ) -> io::Result<()> {
-        info!(guarded = guarded_method, "starting live handoff");
+        info!(guarded = guarded_method, pull, "starting live handoff");
         let has_source_guard =
             params.expected_source_pid.is_some() || params.expected_socket_inode.is_some();
         if guarded_method && !has_source_guard {
@@ -55,14 +56,28 @@ impl HeadlessServer {
         )?;
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
-        let token = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+        // A pull handoff goes to the importer that sent the request: it
+        // connects with its own token, and no replacement is spawned here.
+        let token = if pull {
+            match params.import_token.as_deref().map(str::trim) {
+                Some(token) if !token.is_empty() => token.to_string(),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "server.live_handoff_pull needs import_token",
+                    ))
+                }
+            }
+        } else {
+            format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        };
         let listener = match crate::server::handoff::bind_listener(&socket_path) {
             Ok(listener) => listener,
             Err(err) => {
@@ -138,19 +153,25 @@ impl HeadlessServer {
             params.expected_version,
             self.api_window_title.clone(),
         );
-        let mut import_child = match crate::server::handoff::spawn_handoff_import(
-            import_exe.as_deref(),
-            &socket_path,
-            &token,
-        ) {
-            Ok(child) => child,
-            Err(err) => {
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(err);
+        let mut import_child = if pull {
+            info!(socket = %socket_path.display(), "waiting for pulling handoff importer");
+            None
+        } else {
+            match crate::server::handoff::spawn_handoff_import(
+                import_exe.as_deref(),
+                &socket_path,
+                &token,
+            ) {
+                Ok(child) => {
+                    info!(pid = child.id(), socket = %socket_path.display(), "spawned handoff import server");
+                    Some(child)
+                }
+                Err(err) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(err);
+                }
             }
         };
-        let child_pid = import_child.id();
-        info!(pid = child_pid, socket = %socket_path.display(), "spawned handoff import server");
 
         let mut fds = Vec::new();
         let duplicate_result = (|| {
@@ -166,7 +187,9 @@ impl HeadlessServer {
             for fd in fds {
                 let _ = unsafe { libc::close(fd) };
             }
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            if let Some(child) = import_child.as_mut() {
+                crate::server::handoff::cleanup_failed_import_child(child);
+            }
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(err);
         }
@@ -182,12 +205,36 @@ impl HeadlessServer {
                 for fd in fds {
                     let _ = unsafe { libc::close(fd) };
                 }
-                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                // A pulling importer that connected gets EOF and exits: it has
+                // bound nothing yet.
+                if let Some(child) = import_child.as_mut() {
+                    crate::server::handoff::cleanup_failed_import_child(child);
+                }
                 self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
                 return Err(err);
             }
         };
 
+        // Taken while the importer is still connected: a numeric peer pid
+        // could name another process by the time a rollback signals it.
+        let peer = if pull {
+            crate::platform::local_socket_peer_process(std::os::fd::AsRawFd::as_raw_fd(&stream))
+        } else {
+            None
+        };
+        if pull && peer.is_none() {
+            // No descriptors or public sockets have changed hands. The importer
+            // owns nothing, so rollback needs neither termination nor an EOF wait.
+            for fd in fds {
+                let _ = unsafe { libc::close(fd) };
+            }
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing pull handoff: cannot safely pin/terminate the importer; pull handoff is unsupported on this platform without a safe process handle; no handoff was performed",
+            ));
+        }
+        let mut bound = crate::server::handoff::BoundSockets::default();
         if guarded && !replacement.reports_bound_sockets {
             // Never downgrade a guarded handoff: without socket reports a failed
             // replacement's socket files cannot be told apart from another
@@ -195,7 +242,12 @@ impl HeadlessServer {
             for fd in fds {
                 let _ = unsafe { libc::close(fd) };
             }
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            crate::server::handoff::stop_failed_replacement(
+                import_child.as_mut(),
+                peer.as_ref(),
+                &mut stream,
+                &mut bound,
+            );
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -208,7 +260,12 @@ impl HeadlessServer {
             let _ = unsafe { libc::close(fd) };
         }
         if let Err(err) = send_result {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            crate::server::handoff::stop_failed_replacement(
+                import_child.as_mut(),
+                peer.as_ref(),
+                &mut stream,
+                &mut bound,
+            );
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(err);
         }
@@ -217,11 +274,14 @@ impl HeadlessServer {
         // unlinking the old listeners: each socket file is renamed aside and
         // renamed back if the handoff does not commit.
         let parked = self.park_public_sockets_for_handoff();
-        let mut bound = crate::server::handoff::BoundSockets::default();
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream, &mut bound) {
             // Stop the replacement for certain before touching the public paths.
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            crate::server::handoff::drain_bound_reports(&mut stream, &mut bound);
+            crate::server::handoff::stop_failed_replacement(
+                import_child.as_mut(),
+                peer.as_ref(),
+                &mut stream,
+                &mut bound,
+            );
             let restored = self.restore_public_sockets_after_failed_handoff(parked, &bound);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(match restored {
@@ -234,7 +294,12 @@ impl HeadlessServer {
             });
         }
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+            crate::server::handoff::stop_failed_replacement(
+                import_child.as_mut(),
+                peer.as_ref(),
+                &mut stream,
+                &mut bound,
+            );
             let restored = self.restore_public_sockets_after_failed_handoff(parked, &bound);
             self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
             return Err(match restored {
@@ -274,6 +339,7 @@ impl HeadlessServer {
         &mut self,
         _params: crate::api::schema::ServerLiveHandoffParams,
         _guarded_method: bool,
+        _pull: bool,
     ) -> io::Result<()> {
         Err(io::Error::other("live handoff is only supported on Unix"))
     }

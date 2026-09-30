@@ -50,6 +50,67 @@ pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
+/// A pidfd on the process connected to a Unix-domain socket. Signalling it
+/// can never reach a later process that reuses the numeric PID.
+pub(crate) struct LocalSocketPeerProcess {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl LocalSocketPeerProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Sends SIGKILL. `Ok(false)` when the process has already exited, even
+    /// if its PID now belongs to another process.
+    pub(crate) fn kill(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let status = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if status == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(err)
+    }
+}
+
+pub(super) fn local_socket_peer_process_platform(fd: RawFd) -> Option<LocalSocketPeerProcess> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let pid = local_socket_peer_pid_platform(fd)?;
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
+    // The PID is the peer's only while the peer still holds its end of the
+    // connection: a hung-up connection may mean the PID was already reused
+    // when the pidfd was opened.
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut poll, 1, 0) } < 0
+        || poll.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+    {
+        return None;
+    }
+    Some(LocalSocketPeerProcess { pid, pidfd })
+}
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -1196,6 +1257,62 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn a_socket_peer_handle_never_signals_a_reaped_peer_pid() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-peer-handle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+            *dst = *src as libc::c_char;
+        }
+
+        // The peer connects and then blocks until it is killed. Only
+        // async-signal-safe calls run after fork.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                if libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), len) != 0 {
+                    libc::_exit(1);
+                }
+                let mut byte = 0u8;
+                libc::read(fd, (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let (stream, _) = listener.accept().unwrap();
+        let peer = local_socket_peer_process_platform(stream.as_raw_fd())
+            .expect("a connected live peer has a handle");
+        assert_eq!(peer.pid(), child as u32);
+
+        assert!(peer.kill().unwrap(), "a live peer is signalled");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+
+        // Reaped: its pid may now name any process. The handle reports it
+        // gone instead of signalling that pid, and a hung-up connection
+        // yields no new handle.
+        assert!(!peer.kill().unwrap());
+        assert!(local_socket_peer_process_platform(stream.as_raw_fd()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

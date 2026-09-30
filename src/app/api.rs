@@ -945,7 +945,9 @@ impl App {
                     "SSH agent registration requires a persistent local JSON API connection",
                 );
             }
-            Method::ServerLiveHandoff(_) | Method::ServerLiveHandoffGuarded(_) => {
+            Method::ServerLiveHandoff(_)
+            | Method::ServerLiveHandoffGuarded(_)
+            | Method::ServerLiveHandoffPull(_) => {
                 let response = ErrorResponse {
                     id: request.id,
                     error: ErrorBody {
