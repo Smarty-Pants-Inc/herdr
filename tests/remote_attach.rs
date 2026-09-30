@@ -1,11 +1,14 @@
 #![cfg(unix)]
 
+#[path = "support/command.rs"]
+pub mod test_command;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -105,7 +108,7 @@ exit 255
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{inherited_path}", temp_dir.display());
-    let child = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let child = crate::test_command::herdr_command()
         .args(["--remote", "check-host"])
         .env("PATH", path)
         .env("FAKE_SSH_FRAMED", if framed_shell { "1" } else { "0" })
@@ -115,7 +118,6 @@ exit 255
         .env("FAKE_SSH_FIRST_DONE", &first_done_path)
         .env("HERDR_CONFIG_PATH", temp_dir.join("config.toml"))
         .env_remove("HERDR_ENV")
-        .env_remove("HERDR_SESSION")
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_REMOTE_BINARY")

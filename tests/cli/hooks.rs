@@ -86,6 +86,7 @@ fn run_shell_hook_with_env(
 
     let hook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(asset_path);
     let mut command = Command::new("bash");
+    crate::test_command::sanitize_command_env(&mut command);
     command
         .arg(hook_path)
         .args(args)

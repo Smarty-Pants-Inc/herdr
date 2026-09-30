@@ -1,5 +1,8 @@
 #![cfg(all(unix, not(target_os = "macos")))]
 
+#[path = "support/command.rs"]
+pub mod test_command;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -89,7 +92,7 @@ exec "$TEST_REMOTE_HERDR" "$@"
         remote.set_nonblocking(true).unwrap();
         let local = UnixListener::bind(root.join("local.sock")).unwrap();
         local.set_nonblocking(true).unwrap();
-        let status = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let status = crate::test_command::herdr_command()
             .args(["status", "client", "--json"])
             .output()
             .unwrap();
@@ -104,7 +107,7 @@ exec "$TEST_REMOTE_HERDR" "$@"
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        let mut command = crate::test_command::herdr_command();
         command
             .args(args)
             .env(

@@ -1,13 +1,15 @@
 #![cfg(unix)]
 
+#[path = "support/command.rs"]
+pub mod test_command;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, PtySize};
 
 // No real SSH connection or server is started. Stop at startup after recording setup actions.
 const SSH: &str = r#"#!/bin/sh
@@ -98,14 +100,14 @@ fn setup_with_strict_host_key_failure(
         "onboarding = false\n[remote]\nmanage_ssh_config = false\n",
     )
     .unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let status = crate::test_command::herdr_command()
         .args(["status", "client", "--json"])
         .output()
         .unwrap();
     assert!(status.status.success());
 
     let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut command = crate::test_command::herdr_pty_command();
     if handoff {
         command.args(["--remote", "fake-host", "--handoff"]);
     } else {
@@ -129,16 +131,6 @@ fn setup_with_strict_host_key_failure(
         "FAKE_CLIENT_STATUS",
         String::from_utf8(status.stdout).unwrap(),
     );
-    for name in [
-        "HERDR_ENV",
-        "HERDR_SESSION",
-        "HERDR_SOCKET_PATH",
-        "HERDR_CLIENT_SOCKET_PATH",
-        "HERDR_REMOTE_BINARY",
-        "HERDR_CONFIG_PATH",
-    ] {
-        command.env_remove(name);
-    }
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().unwrap();
@@ -227,7 +219,7 @@ fn machine_add_accepts_help_argument_order() {
         "onboarding = false\n[remote]\nmanage_ssh_config = false\n",
     )
     .unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut command = crate::test_command::herdr_command();
     command.args(["machine", "add", "--label", "coder", "workstation.coder"]);
     // Reach remote preparation, but never execute SSH or start a server.
     command.env("PATH", root.join("no-executables"));
@@ -235,16 +227,6 @@ fn machine_add_accepts_help_argument_order() {
     command.env("XDG_CONFIG_HOME", root.join("config"));
     command.env("XDG_STATE_HOME", root.join("state"));
     command.env("XDG_RUNTIME_DIR", &root);
-    for name in [
-        "HERDR_ENV",
-        "HERDR_SESSION",
-        "HERDR_SOCKET_PATH",
-        "HERDR_CLIENT_SOCKET_PATH",
-        "HERDR_REMOTE_BINARY",
-        "HERDR_CONFIG_PATH",
-    ] {
-        command.env_remove(name);
-    }
     let output = command.output().unwrap();
     let saved = root
         .join("state")
