@@ -395,7 +395,10 @@ fn capture_tab(
 
 /// Removes every workspace's launch env from a serialized session snapshot.
 pub(super) fn strip_launch_env(value: &mut serde_json::Value) {
-    if let Some(workspaces) = value["workspaces"].as_array_mut() {
+    if let Some(workspaces) = value
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for workspace in workspaces {
             if let Some(workspace) = workspace.as_object_mut() {
                 workspace.remove("default_launch_env");
@@ -634,6 +637,27 @@ mod tests {
         let active_pane = &active.workspaces[0].tabs[0].panes[&root.raw()];
         assert_eq!(active_pane.agent_name.as_deref(), Some("reviewer"));
         assert_eq!(active_pane.managed_agent_kind.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn strip_launch_env_leaves_unrelated_json_unchanged() {
+        for contents in [
+            "{}",
+            "null",
+            "true",
+            "42",
+            "\"not a snapshot\"",
+            "[]",
+            r#"{"version":999}"#,
+            r#"{"workspaces":null}"#,
+            r#"{"workspaces":{}}"#,
+            r#"{"workspaces":[null,true,42,"unknown",{},[]]}"#,
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(contents).unwrap();
+            let original = value.clone();
+            strip_launch_env(&mut value);
+            assert_eq!(value, original, "sanitization changed {contents}");
+        }
     }
 
     #[test]
