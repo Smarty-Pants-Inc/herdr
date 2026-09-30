@@ -222,6 +222,18 @@ impl HeadlessServer {
         } else {
             None
         };
+        if pull && peer.is_none() {
+            // No descriptors or public sockets have changed hands. The importer
+            // owns nothing, so rollback needs neither termination nor an EOF wait.
+            for fd in fds {
+                let _ = unsafe { libc::close(fd) };
+            }
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "refusing pull handoff: cannot safely pin/terminate the importer; pull handoff is unsupported on this platform without a safe process handle; no handoff was performed",
+            ));
+        }
         let mut bound = crate::server::handoff::BoundSockets::default();
         if guarded && !replacement.reports_bound_sockets {
             // Never downgrade a guarded handoff: without socket reports a failed

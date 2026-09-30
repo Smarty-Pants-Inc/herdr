@@ -284,6 +284,7 @@ fn print_server_help() {
     eprintln!("  herdr server live-handoff   hand off live panes to a new local server");
     eprintln!("  herdr server --import-from-running --expect-source-pid <pid> [--expect-socket-inode <inode>]");
     eprintln!("                              become the server: pull the running server's live panes into this process");
+    eprintln!("                              pull requires Linux with an available safe process handle for the importer");
     eprintln!("  herdr server reload-config  reload config.toml in the running server");
     eprintln!("  herdr server agent-manifests [--json]  show agent detection manifest status");
     eprintln!("  herdr server update-agent-manifests [--json]  fetch and reload agent detection manifests");

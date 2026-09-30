@@ -2649,10 +2649,154 @@ fn live_handoff_to_replacement_that_never_becomes_ready_keeps_old_server() {
     cleanup_test_base(&base);
 }
 
+// Linux forces pidfd acquisition to fail; other Unix platforms naturally have
+// no safe peer-process handle. The injection is debug-only.
+#[cfg(debug_assertions)]
+#[test]
+fn pull_without_a_safe_peer_handle_refuses_before_transferring_descriptors() {
+    use std::os::fd::AsRawFd;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
+        spawn_server_with_echo_pane(&base, &[("HERDR_TEST_HANDOFF_NO_PEER_PROCESS", "1")]);
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+    let handoff_socket = base
+        .join("config/herdr-dev")
+        .join(format!("herdr-handoff-{source_pid}.sock"));
+
+    // Keep the API response separate from the importer socket: the peer must
+    // not read anything after validation until the source has decided.
+    let mut api = UnixStream::connect(&api_socket).unwrap();
+    api.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    writeln!(
+        api,
+        "{}",
+        serde_json::json!({
+            "id": "test:pull-no-peer-handle",
+            "method": "server.live_handoff_pull",
+            "params": {
+                "import_token": "non-reading-peer",
+                "expected_source_pid": source_pid,
+                "expected_socket_inode": api_inode
+            }
+        })
+    )
+    .unwrap();
+    // Unlike a public listener, this listener accepts only one connection: a
+    // wait_for_socket probe would consume it before the real peer sends a token.
+    assert!(
+        support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            handoff_socket.exists()
+        }),
+        "handoff socket did not appear at {}",
+        handoff_socket.display()
+    );
+    let mut peer = UnixStream::connect(&handoff_socket).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    writeln!(peer, "non-reading-peer").unwrap();
+
+    // Consume exactly the manifest, without buffering any subsequent data.
+    // Otherwise recvmsg could mistake an unread manifest byte for fd transfer,
+    // or a buffered read could silently discard a descriptor control message.
+    let mut manifest = Vec::new();
+    loop {
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        if byte[0] == b'\n' {
+            break;
+        }
+        manifest.push(byte[0]);
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["report_bound_sockets"], true);
+    assert_eq!(manifest["panes"].as_array().map(Vec::len), Some(1));
+    // The wire capability is "bound-sockets", not the API method's name.
+    peer.write_all(b"validated bound-sockets\n").unwrap();
+
+    // Deliberately do NOT read peer here. A hang_before_ready importer cannot
+    // cooperate with EOF either; refusal must not depend on such cooperation.
+    let mut response = String::new();
+    BufReader::new(api).read_line(&mut response).unwrap();
+    let refused: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("refusing pull handoff")
+            && message.contains("without a safe process handle")
+            && message.contains("no handoff was performed"),
+        "pull must explicitly refuse an unavailable safe process handle: {refused}"
+    );
+
+    // Only after the API decision inspect the peer. EOF with no ancillary data
+    // proves the source never gave this non-reading importer any pane handles.
+    let mut byte = [0_u8];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    // usize storage gives the control buffer cmsghdr alignment on Linux/macOS.
+    let mut control = [0_usize; 512];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    let received = unsafe { libc::recvmsg(peer.as_raw_fd(), &mut msg, 0) };
+    assert!(received >= 0, "recvmsg: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        msg.msg_flags & libc::MSG_CTRUNC,
+        0,
+        "truncated ancillary data"
+    );
+    assert_eq!(
+        msg.msg_controllen, 0,
+        "refused peer received ancillary data (including possible SCM_RIGHTS)"
+    );
+    assert_eq!(
+        received, 0,
+        "refused peer must see EOF, not an fd carrier byte"
+    );
+
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    let leftovers: Vec<_> = fs::read_dir(api_socket.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".handoff-") || name.contains(".recover"))
+        .collect();
+    assert!(leftovers.is_empty(), "refusal parked sockets: {leftovers:?}");
+    assert!(
+        !handoff_socket.exists(),
+        "refusal left the handoff socket behind"
+    );
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-no-peer-refusal",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(peer);
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 /// Runs `herdr server --import-from-running` against the server in `base`,
 /// the way a systemd unit's ExecStart would. Killed on drop.
+#[cfg(target_os = "linux")]
 struct PullImporter(std::process::Child);
 
+#[cfg(target_os = "linux")]
 impl Drop for PullImporter {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -2660,6 +2804,7 @@ impl Drop for PullImporter {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_pull_importer(
     base: &Path,
     api_socket: &Path,
@@ -2689,6 +2834,7 @@ fn spawn_pull_importer(
     PullImporter(command.spawn().unwrap())
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + timeout;
     loop {
@@ -2700,6 +2846,7 @@ fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::pro
     }
 }
 
+#[cfg(target_os = "linux")]
 fn stderr_of(child: &mut std::process::Child) -> String {
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
@@ -2708,6 +2855,7 @@ fn stderr_of(child: &mut std::process::Child) -> String {
     stderr
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pull_import_takes_over_the_running_server_with_its_panes() {
     let _lock = test_lock();
@@ -2765,6 +2913,8 @@ fn pull_import_takes_over_the_running_server_with_its_panes() {
     cleanup_test_base(&base);
 }
 
+// Linux pidfds let the source stop even an importer that never reads EOF.
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
     let _lock = test_lock();
@@ -2815,6 +2965,10 @@ fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
     assert_eq!(socket_inode(&client_socket), client_inode);
     wait_for_api(&api_socket, Duration::from_secs(5));
     assert!(!api_socket.with_file_name("herdr.sock.recover").exists());
+    assert!(!client_socket
+        .with_file_name("herdr-client.sock.recover")
+        .exists());
+    assert_eq!(server_ptmx_fd_count(source_pid), 1);
     assert_pane_still_served(
         &api_socket,
         &pane_id,
@@ -2831,6 +2985,7 @@ fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
     cleanup_test_base(&base);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_pull_import_keeps_a_socket_report_split_across_the_rollback() {
     let _lock = test_lock();

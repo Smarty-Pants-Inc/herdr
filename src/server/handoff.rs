@@ -1404,8 +1404,11 @@ mod tests {
             .unwrap();
         assert!(read_line_into(&mut source, &mut bound.pending).is_err());
         importer.write_all(b"43\n").unwrap();
-        drop(importer);
+        // ponytail: Darwin can reject resetting a socket's timeout after peer
+        // closure. Keep it connected: this test checks partial-report retention,
+        // not the platform's timeout behavior on a disconnected socket.
         drain_bound_reports(&mut source, &mut bound);
+        drop(importer);
         assert_eq!(
             bound.get(BoundSocketKind::Client),
             Some(&crate::ipc::SocketFileIdentity::from_parts(7, 43))

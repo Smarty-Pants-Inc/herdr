@@ -233,6 +233,12 @@ impl LocalSocketPeerProcess {
 /// peer is gone or the platform has no such handle.
 #[cfg(unix)]
 pub(crate) fn local_socket_peer_process(fd: std::os::fd::RawFd) -> Option<LocalSocketPeerProcess> {
+    // Deterministic unavailable-handle injection; release builds ignore it.
+    #[cfg(debug_assertions)]
+    if std::env::var("HERDR_TEST_HANDOFF_NO_PEER_PROCESS").as_deref() == Ok("1") {
+        return None;
+    }
+
     #[cfg(target_os = "linux")]
     return linux::local_socket_peer_process_platform(fd);
 
