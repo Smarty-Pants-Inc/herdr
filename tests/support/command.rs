@@ -81,6 +81,47 @@ fn isolated_env(
 mod tests {
     use super::*;
 
+    // std::Command retains the first key spelling when Windows replaces an
+    // environment entry case-insensitively. Assert effective keys, not spelling.
+    fn env_keys_equal(actual: &OsStr, expected: &OsStr, windows: bool) -> bool {
+        if windows {
+            actual
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_encoded_bytes())
+        } else {
+            actual == expected
+        }
+    }
+
+    #[test]
+    fn command_env_key_comparison_matches_both_platform_policies() {
+        // Literal retained-spelling entries reproduce the default and explicit
+        // override assertion bug even when these tests run on Unix.
+        for (actual, expected, value) in [
+            ("herdr_session", "HERDR_SESSION", "default"),
+            ("herdr_session", "HERDR_SESSION", "named-session"),
+            (
+                "pi_coding_agent_dir",
+                "PI_CODING_AGENT_DIR",
+                "test-agent-profile",
+            ),
+            ("pi_config_dir", "PI_CONFIG_DIR", "test-omp-profile"),
+        ] {
+            let entry = (OsStr::new(actual), Some(OsStr::new(value)));
+            assert!(
+                env_keys_equal(entry.0, OsStr::new(expected), true)
+                    && entry.1 == Some(OsStr::new(value))
+            );
+            assert!(!env_keys_equal(entry.0, OsStr::new(expected), false));
+            assert!(env_keys_equal(entry.0, OsStr::new(actual), false));
+        }
+        assert!(!env_keys_equal(
+            OsStr::new("Pİ_CONFIG_DIR"),
+            OsStr::new("PI_CONFIG_DIR"),
+            true,
+        ));
+    }
+
     #[test]
     fn isolation_matches_platform_case_policy_and_exact_profile_keys() {
         for (key, unix, windows) in [
@@ -144,12 +185,16 @@ mod tests {
                 key == "HERDR_SESSION"
             };
             if is_isolated_env_key(&key, cfg!(windows)) && !is_session {
-                assert!(cli
-                    .get_envs()
-                    .any(|(name, value)| name == key.as_os_str() && value.is_none()));
+                assert!(cli.get_envs().any(|(name, value)| {
+                    env_keys_equal(name, key.as_os_str(), cfg!(windows)) && value.is_none()
+                }));
                 assert_eq!(pty.get_env(&key), None);
             } else if !is_isolated_env_key(&key, cfg!(windows)) {
-                assert!(!cli.get_envs().any(|(name, _)| name == key.as_os_str()));
+                assert!(!cli.get_envs().any(|(name, _)| env_keys_equal(
+                    name,
+                    key.as_os_str(),
+                    cfg!(windows)
+                )));
                 // Windows registry entries may legitimately override ordinary
                 // parent values in portable-pty's base snapshot.
                 if !cfg!(windows) {
@@ -158,7 +203,8 @@ mod tests {
             }
         }
         assert!(cli.get_envs().any(|(key, value)| {
-            key == "HERDR_SESSION" && value == Some(OsStr::new("default"))
+            env_keys_equal(key, OsStr::new("HERDR_SESSION"), cfg!(windows))
+                && value == Some(OsStr::new("default"))
         }));
         assert_eq!(pty.get_env("HERDR_SESSION"), Some(OsStr::new("default")));
 
@@ -170,9 +216,7 @@ mod tests {
         ] {
             if std::env::var_os(effective_key).is_some() {
                 assert!(cli.get_envs().any(|(key, value)| {
-                    key.as_encoded_bytes()
-                        .eq_ignore_ascii_case(effective_key.as_bytes())
-                        && value.is_none()
+                    env_keys_equal(key, OsStr::new(effective_key), cfg!(windows)) && value.is_none()
                 }));
                 assert_eq!(pty.get_env(effective_key), None);
             }
@@ -188,9 +232,10 @@ mod tests {
         ] {
             cli.env(key, value);
             pty.env(key, value);
-            assert!(cli
-                .get_envs()
-                .any(|(name, actual)| { name == key && actual == Some(OsStr::new(value)) }));
+            assert!(cli.get_envs().any(|(name, actual)| {
+                env_keys_equal(name, OsStr::new(key), cfg!(windows))
+                    && actual == Some(OsStr::new(value))
+            }));
             assert_eq!(pty.get_env(key), Some(OsStr::new(value)));
         }
     }
@@ -226,6 +271,51 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn constructors_are_checked_with_mixed_case_only_parent_context() {
+        for keys in [
+            ["herdr_session", "pi_coding_agent_dir", "pi_config_dir"],
+            ["hErDr_SeSsIoN", "pI_cOdInG_aGeNt_DiR", "pI_cOnFiG_dIr"],
+        ] {
+            let entries = [
+                (keys[0], "inherited-session"),
+                (keys[1], "inherited-agent-profile"),
+                (keys[2], "inherited-omp-profile"),
+            ];
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "test_command::tests::both_constructors_isolate_inherited_context_and_allow_explicit_overrides",
+                "--nocapture",
+            ]);
+            // env_remove uppercase names would seed Windows map spelling and
+            // mask the retained-key bug. Clear it, then restore ordinary keys.
+            child.env_clear();
+            child.envs(std::env::vars_os().filter(|(key, _)| !is_isolated_env_key(key, true)));
+            child.envs(entries);
+            let mut isolated: Vec<_> = child
+                .get_envs()
+                .filter(|(key, _)| is_isolated_env_key(key, true))
+                .collect();
+            isolated.sort();
+            let mut expected: Vec<_> = entries
+                .map(|(key, value)| (OsStr::new(key), Some(OsStr::new(value))))
+                .into();
+            expected.sort();
+            // Exact spelling is intentional: no uppercase insertion may mask
+            // the case variants in the environment passed to the child.
+            assert_eq!(isolated, expected);
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[test]
