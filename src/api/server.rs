@@ -559,6 +559,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
         Method::ServerLiveHandoffGuarded(_) => "server.live_handoff_guarded",
+        Method::ServerLiveHandoffPull(_) => "server.live_handoff_pull",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",

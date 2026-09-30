@@ -2648,3 +2648,418 @@ fn live_handoff_to_replacement_that_never_becomes_ready_keeps_old_server() {
     drop(spawned);
     cleanup_test_base(&base);
 }
+
+// Linux forces pidfd acquisition to fail; other Unix platforms naturally have
+// no safe peer-process handle. The injection is debug-only.
+#[cfg(debug_assertions)]
+#[test]
+fn pull_without_a_safe_peer_handle_refuses_before_transferring_descriptors() {
+    use std::os::fd::AsRawFd;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    // The private handoff socket must not follow the runner's named session.
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) = spawn_server_with_echo_pane(
+        &base,
+        &[
+            ("HERDR_SESSION", "default"),
+            ("HERDR_TEST_HANDOFF_NO_PEER_PROCESS", "1"),
+        ],
+    );
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+    let handoff_socket = base
+        .join("config/herdr-dev")
+        .join(format!("herdr-handoff-{source_pid}.sock"));
+
+    // Keep the API response separate from the importer socket: the peer must
+    // not read anything after validation until the source has decided.
+    let mut api = UnixStream::connect(&api_socket).unwrap();
+    api.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    writeln!(
+        api,
+        "{}",
+        serde_json::json!({
+            "id": "test:pull-no-peer-handle",
+            "method": "server.live_handoff_pull",
+            "params": {
+                "import_token": "non-reading-peer",
+                "expected_source_pid": source_pid,
+                "expected_socket_inode": api_inode
+            }
+        })
+    )
+    .unwrap();
+    // Unlike a public listener, this listener accepts only one connection: a
+    // wait_for_socket probe would consume it before the real peer sends a token.
+    assert!(
+        support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            handoff_socket.exists()
+        }),
+        "handoff socket did not appear at {}",
+        handoff_socket.display()
+    );
+    let mut peer = UnixStream::connect(&handoff_socket).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    writeln!(peer, "non-reading-peer").unwrap();
+
+    // Consume exactly the manifest, without buffering any subsequent data.
+    // Otherwise recvmsg could mistake an unread manifest byte for fd transfer,
+    // or a buffered read could silently discard a descriptor control message.
+    let mut manifest = Vec::new();
+    loop {
+        let mut byte = [0];
+        peer.read_exact(&mut byte).unwrap();
+        if byte[0] == b'\n' {
+            break;
+        }
+        manifest.push(byte[0]);
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["report_bound_sockets"], true);
+    assert_eq!(manifest["panes"].as_array().map(Vec::len), Some(1));
+    // The wire capability is "bound-sockets", not the API method's name.
+    peer.write_all(b"validated bound-sockets\n").unwrap();
+
+    // Deliberately do NOT read peer here. A hang_before_ready importer cannot
+    // cooperate with EOF either; refusal must not depend on such cooperation.
+    let mut response = String::new();
+    BufReader::new(api).read_line(&mut response).unwrap();
+    let refused: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("refusing pull handoff")
+            && message.contains("without a safe process handle")
+            && message.contains("no handoff was performed"),
+        "pull must explicitly refuse an unavailable safe process handle: {refused}"
+    );
+
+    // Only after the API decision inspect the peer. EOF with no ancillary data
+    // proves the source never gave this non-reading importer any pane handles.
+    let mut byte = [0_u8];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    // usize storage gives the control buffer cmsghdr alignment on Linux/macOS.
+    let mut control = [0_usize; 512];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    let received = unsafe { libc::recvmsg(peer.as_raw_fd(), &mut msg, 0) };
+    assert!(
+        received >= 0,
+        "recvmsg: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        msg.msg_flags & libc::MSG_CTRUNC,
+        0,
+        "truncated ancillary data"
+    );
+    assert_eq!(
+        msg.msg_controllen, 0,
+        "refused peer received ancillary data (including possible SCM_RIGHTS)"
+    );
+    assert_eq!(
+        received, 0,
+        "refused peer must see EOF, not an fd carrier byte"
+    );
+
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    let leftovers: Vec<_> = fs::read_dir(api_socket.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".handoff-") || name.contains(".recover"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "refusal parked sockets: {leftovers:?}"
+    );
+    assert!(
+        !handoff_socket.exists(),
+        "refusal left the handoff socket behind"
+    );
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-no-peer-refusal",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(peer);
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// Runs `herdr server --import-from-running` against the server in `base`,
+/// the way a systemd unit's ExecStart would. Killed on drop.
+#[cfg(target_os = "linux")]
+struct PullImporter(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for PullImporter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_pull_importer(
+    base: &Path,
+    api_socket: &Path,
+    args: &[String],
+    extra_env: &[(&str, &str)],
+) -> PullImporter {
+    let runtime_dir = api_socket.parent().unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    command
+        .args(["server", "--import-from-running"])
+        .args(args)
+        .env("XDG_CONFIG_HOME", base.join("config"))
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env(TEST_HANDOFF_OWNER_PID_ENV, std::process::id().to_string())
+        .env("HERDR_SOCKET_PATH", api_socket)
+        .env(
+            "HERDR_CLIENT_SOCKET_PATH",
+            runtime_dir.join("herdr-client.sock"),
+        )
+        .env("SHELL", "/bin/sh")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    PullImporter(command.spawn().unwrap())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "process did not exit in time");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stderr_of(child: &mut std::process::Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    stderr
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pull_import_takes_over_the_running_server_with_its_panes() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
+        spawn_server_with_echo_pane(&base, &[]);
+    let source_pid = spawned.child.process_id().unwrap();
+    let api_inode = socket_inode(&api_socket);
+
+    let mut importer = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[],
+    );
+
+    // The source hands over and exits; the importer keeps running as the server.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while spawned.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "source server did not hand over");
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        importer.0.try_wait().unwrap().is_none(),
+        "importer exited: {}",
+        stderr_of(&mut importer.0)
+    );
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert_ne!(socket_inode(&api_socket), api_inode);
+    let importer_pid = importer.0.id();
+    assert_eq!(
+        server_ptmx_fd_count(importer_pid),
+        1,
+        "the importer holds the pane"
+    );
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-pull",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    assert!(wait_for_exit(&mut importer.0, Duration::from_secs(10)).success());
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+// Linux pidfds let the source stop even an importer that never reads EOF.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_pull_import_leaves_the_source_whole_and_exits_non_zero() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) =
+        spawn_server_with_echo_pane(&base, &[("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "3000")]);
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+
+    // A source other than the one named: refused before anything moves.
+    let mut wrong = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &["--expect-source-pid".into(), (source_pid + 1).to_string()],
+        &[],
+    );
+    let status = wait_for_exit(&mut wrong.0, Duration::from_secs(10));
+    let stderr = stderr_of(&mut wrong.0);
+    assert!(!status.success());
+    assert!(stderr.contains("not the expected pid"), "stderr: {stderr}");
+
+    // A replacement that binds the public sockets but never becomes ready is
+    // killed by the source, which then restores its own sockets.
+    let mut hung = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "hang_before_ready")],
+    );
+    let status = wait_for_exit(&mut hung.0, Duration::from_secs(20));
+    assert!(!status.success(), "a failed importer must exit non-zero");
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "the source stops a hung importer"
+    );
+
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert!(!api_socket.with_file_name("herdr.sock.recover").exists());
+    assert!(!client_socket
+        .with_file_name("herdr-client.sock.recover")
+        .exists());
+    assert_eq!(server_ptmx_fd_count(source_pid), 1);
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-failed-pull",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_pull_import_keeps_a_socket_report_split_across_the_rollback() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    // The importer's last report is cut in two by the ready timeout, and its
+    // second half lands while the source is beginning its rollback.
+    let (mut spawned, api_socket, pane_id, pane_pid, received_marker) = spawn_server_with_echo_pane(
+        &base,
+        &[
+            ("HERDR_TEST_HANDOFF_READY_TIMEOUT_MS", "2000"),
+            ("HERDR_TEST_HANDOFF_ROLLBACK_DELAY_MS", "1500"),
+        ],
+    );
+    let source_pid = spawned.child.process_id().unwrap();
+    let client_socket = api_socket.with_file_name("herdr-client.sock");
+    let api_inode = socket_inode(&api_socket);
+    let client_inode = socket_inode(&client_socket);
+
+    let mut split = spawn_pull_importer(
+        &base,
+        &api_socket,
+        &[
+            "--expect-source-pid".into(),
+            source_pid.to_string(),
+            "--expect-socket-inode".into(),
+            api_inode.to_string(),
+        ],
+        &[
+            (
+                "HERDR_TEST_HANDOFF_IMPORT_FAIL",
+                "split_client_report_before_ready",
+            ),
+            ("HERDR_TEST_HANDOFF_REPORT_SPLIT_MS", "2500"),
+        ],
+    );
+    let status = wait_for_exit(&mut split.0, Duration::from_secs(20));
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    // Both of the importer's sockets were known to be its own, so both
+    // original listeners are back and no recovery socket was needed.
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    assert_eq!(socket_inode(&api_socket), api_inode);
+    assert_eq!(socket_inode(&client_socket), client_inode);
+    assert!(!api_socket.with_file_name("herdr.sock.recover").exists());
+    assert!(!client_socket
+        .with_file_name("herdr-client.sock.recover")
+        .exists());
+    wait_for_api(&api_socket, Duration::from_secs(5));
+    assert_pane_still_served(
+        &api_socket,
+        &pane_id,
+        pane_pid,
+        &received_marker,
+        "after-split-report",
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
