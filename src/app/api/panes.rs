@@ -1852,10 +1852,23 @@ impl App {
         params: PaneSendInputParams,
         context: crate::api::ApiRequestContext,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let pane = self.parse_pane_id(&params.pane_id);
+        let terminal_id =
+            pane.and_then(|(ws_idx, pane_id)| self.state.terminal_id_for_pane(ws_idx, pane_id));
+        if let Err(error) =
+            self.check_expected_terminal(params.expected_terminal.as_deref(), terminal_id.as_ref())
+        {
+            return super::responses::encode_error_body(id, error);
+        }
+        let Some((ws_idx, pane_id)) = pane else {
             return pane_not_found(id, &params.pane_id);
         };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+        // Pin the checked terminal's runtime through logging and enqueue. Server
+        // ownership is held throughout; do not resolve the mutable pane again.
+        let Some(runtime) = terminal_id
+            .as_ref()
+            .and_then(|id| self.terminal_runtimes.get(id))
+        else {
             return pane_not_found(id, &params.pane_id);
         };
         let bytes = match super::super::api_helpers::encode_api_input(
@@ -2346,7 +2359,10 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let (runtime, rx) =
             crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
-        app.state.insert_test_runtime(pane_id, runtime);
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        // Exercise the server-owned registry used by guarded input, not the
+        // legacy pane-keyed test runtime override.
+        app.terminal_runtimes.insert(terminal_id, runtime);
         (app, public_pane_id, rx)
     }
 
@@ -2884,6 +2900,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_terminal_guard_rejects_unknown_malformed_and_missing_targets_before_effects()
+    {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+        let internal = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.terminal_id_for_pane(0, internal).unwrap();
+        for expected in ["", "not-a-terminal", "term_unknown", pane_id.as_str()] {
+            for method in [
+                "pane.send_input",
+                "pane.send_input_guarded",
+                "agent.start",
+                "agent.start_guarded",
+            ] {
+                let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                    "id": "guard-reject", "method": method,
+                    "params": {"pane_id": pane_id, "expected_terminal": expected,
+                        "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
+                })).unwrap();
+                let response = app.handle_api_request(request);
+                let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+                assert_eq!(
+                    error.error.code, "terminal_identity_mismatch",
+                    "{method}: {expected:?}"
+                );
+                assert!(rx.try_recv().is_err());
+                assert_eq!(app.state.terminals[&terminal_id].agent_name, None);
+                assert!(!app.state.terminals[&terminal_id].managed_agent_launch_pending());
+                assert!(!app.api_input_log.exists());
+            }
+        }
+        for method in ["pane.send_input", "agent.start"] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "guard-missing-pane", "method": method,
+                "params": {"pane_id": "w999:p999", "expected_terminal": terminal_id.to_string(),
+                    "name": "worker", "kind": "pi", "text": "must not send"},
+            }))
+            .unwrap();
+            let error: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(error.error.code, "terminal_identity_mismatch");
+        }
+        for method in ["pane.send_input_guarded", "agent.start_guarded"] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "guard-required", "method": method,
+                "params": {"pane_id": pane_id, "name": "worker", "kind": "pi", "text": "must not send"},
+            })).unwrap();
+            let error: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(error.error.code, "terminal_identity_mismatch");
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_terminal_guard_checks_the_current_attachment_not_an_old_pane_resolution() {
+        let (mut app, pane_id, mut original_rx) = app_with_send_key_runtime(2);
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let original_id = app.state.terminal_id_for_pane(0, root).unwrap();
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let replacement_id = app.state.terminal_id_for_pane(0, other).unwrap();
+        let (runtime, mut replacement_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes
+            .insert(replacement_id.clone(), runtime);
+        // The public pane stays the same but now owns another terminal. Keep both
+        // terminal runtimes alive: stale input must reach neither of them.
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root)
+            .unwrap()
+            .attached_terminal_id = replacement_id.clone();
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&other)
+            .unwrap()
+            .attached_terminal_id = original_id.clone();
+        for method in [
+            "pane.send_input",
+            "pane.send_input_guarded",
+            "agent.start",
+            "agent.start_guarded",
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "guard-stale", "method": method,
+                "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+                    "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
+            }))
+            .unwrap();
+            let error: ErrorResponse =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(error.error.code, "terminal_identity_mismatch");
+            assert_eq!(app.state.terminals[&replacement_id].agent_name, None);
+            assert!(!app.state.terminals[&replacement_id].managed_agent_launch_pending());
+            assert!(original_rx.try_recv().is_err());
+            assert!(replacement_rx.try_recv().is_err());
+            assert!(!app.api_input_log.exists());
+        }
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "guard-match", "method": "pane.send_input_guarded",
+            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+                "text": "matched", "keys": ["Enter"]},
+        }))
+        .unwrap();
+        let success: SuccessResponse =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            replacement_rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"matched\r")
+        );
+        assert!(original_rx.try_recv().is_err());
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "guard-start-match", "method": "agent.start_guarded",
+            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+                "name": "worker", "kind": "pi"},
+        }))
+        .unwrap();
+        let success: SuccessResponse =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentStarted { .. }
+        ));
+        assert_eq!(
+            app.state.terminals[&replacement_id].agent_name.as_deref(),
+            Some("worker")
+        );
+        assert!(app.state.terminals[&replacement_id].managed_agent_launch_pending());
+        assert!(replacement_rx.try_recv().is_ok());
+        assert!(original_rx.try_recv().is_err());
+        // A pending launch and its reserved name must not mask a stale identity.
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "guard-pending-stale", "method": "agent.start_guarded",
+            "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+                "name": "worker", "kind": "pi"},
+        }))
+        .unwrap();
+        let error: ErrorResponse = serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(error.error.code, "terminal_identity_mismatch");
+        assert_eq!(
+            app.state.terminals[&replacement_id].agent_name.as_deref(),
+            Some("worker")
+        );
+        assert!(app.state.terminals[&replacement_id].managed_agent_launch_pending());
+        assert!(replacement_rx.try_recv().is_err());
+        assert!(original_rx.try_recv().is_err());
+        let _ = std::fs::remove_file(&app.api_input_log);
+    }
+
+    #[tokio::test]
     async fn api_pane_send_input_brackets_text_and_enter_atomically() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
         let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -2896,6 +3062,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
                 pane_id,
                 text: "A != B".into(),
+                expected_terminal: None,
                 keys: vec!["Enter".into()],
                 allow_cross_pane: false,
             }),
@@ -2919,6 +3086,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
                 pane_id,
                 text: String::new(),
+                expected_terminal: None,
                 keys: vec!["ctrl+j".into()],
                 allow_cross_pane: false,
             }),
@@ -2960,6 +3128,7 @@ mod tests {
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
                 pane_id,
                 text: "hello".into(),
+                expected_terminal: None,
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
                 allow_cross_pane: false,
             }),

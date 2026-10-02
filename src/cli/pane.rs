@@ -1018,7 +1018,7 @@ fn parse_pane_content_args(
     command: &str,
     payload: &str,
     args: &[String],
-) -> Result<(String, Vec<String>, bool), clap::Error> {
+) -> Result<(String, Vec<String>, bool, Option<String>), clap::Error> {
     let matches = super::spec::parse_leaf_args(&["pane", command], args)?;
     Ok((
         matches
@@ -1031,11 +1031,16 @@ fn parse_pane_content_args(
             .cloned()
             .collect(),
         matches.get_flag("allow-cross-pane"),
+        if command == "run" {
+            matches.get_one::<String>("expected-terminal").cloned()
+        } else {
+            None
+        },
     ))
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
-    let (raw_pane_id, text, allow_cross_pane) =
+    let (raw_pane_id, text, allow_cross_pane, _) =
         match parse_pane_content_args("send-text", "text", args) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -1053,7 +1058,7 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
-    let (raw_pane_id, keys, allow_cross_pane) =
+    let (raw_pane_id, keys, allow_cross_pane, _) =
         match parse_pane_content_args("send-keys", "key", args) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -1071,7 +1076,7 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
-    let (raw_pane_id, command, allow_cross_pane) =
+    let (raw_pane_id, command, allow_cross_pane, expected_terminal) =
         match parse_pane_content_args("run", "command", args) {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -1084,6 +1089,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     super::send_ok_request(Method::PaneSendInput(PaneSendInputParams {
         pane_id: super::normalize_pane_id(&raw_pane_id),
         text: command.join(" "),
+        expected_terminal,
         keys: vec!["Enter".into()],
         allow_cross_pane,
     }))
@@ -1728,7 +1734,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
-    eprintln!("  herdr pane run <pane_id> [--allow-cross-pane] <command>");
+    eprintln!("  herdr pane run <pane_id> [--allow-cross-pane] [--expected-terminal TERMINAL_ID] <command>");
 }
 
 #[cfg(test)]
@@ -2203,12 +2209,36 @@ mod tests {
                 &["echo", "ok"][..],
             ),
         ] {
-            let (pane_id, content, allow_cross_pane) =
+            let (pane_id, content, allow_cross_pane, expected_terminal) =
                 parse_pane_content_args(command, payload, &args(values)).unwrap();
             assert_eq!(pane_id, "w1:p1");
             assert_eq!(content, expected);
             assert!(allow_cross_pane);
+            assert_eq!(expected_terminal, None);
         }
+    }
+
+    #[test]
+    fn pane_run_parses_expected_terminal_without_normalizing_it() {
+        for values in [
+            &["--expected-terminal", "term_opaque", "w1:p1", "echo", "ok"][..],
+            &["w1:p1", "echo", "--expected-terminal=term_opaque", "ok"][..],
+        ] {
+            let (pane_id, command, allow_cross_pane, expected_terminal) =
+                parse_pane_content_args("run", "command", &args(values)).unwrap();
+            assert_eq!(pane_id, "w1:p1");
+            assert_eq!(command, ["echo", "ok"]);
+            assert!(!allow_cross_pane);
+            assert_eq!(expected_terminal.as_deref(), Some("term_opaque"));
+        }
+        let (_, command, _, expected_terminal) = parse_pane_content_args(
+            "run",
+            "command",
+            &args(&["w1:p1", "--", "--expected-terminal", "term_opaque"]),
+        )
+        .unwrap();
+        assert_eq!(command, ["--expected-terminal", "term_opaque"]);
+        assert_eq!(expected_terminal, None);
     }
 
     #[test]
@@ -2218,7 +2248,7 @@ mod tests {
             ("send-keys", "key"),
             ("run", "command"),
         ] {
-            let (_, content, allow_cross_pane) = parse_pane_content_args(
+            let (_, content, allow_cross_pane, expected_terminal) = parse_pane_content_args(
                 command,
                 payload,
                 &args(&["w1:p1", "--", "--allow-cross-pane"]),
@@ -2226,6 +2256,7 @@ mod tests {
             .unwrap();
             assert_eq!(content, ["--allow-cross-pane"]);
             assert!(!allow_cross_pane);
+            assert_eq!(expected_terminal, None);
         }
     }
 }

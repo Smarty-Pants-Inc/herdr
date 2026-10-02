@@ -38,24 +38,32 @@ impl App {
 
     fn allows_cross_pane(method: &Method) -> bool {
         match method {
-            Method::AgentStart(params) => params.allow_cross_pane,
+            Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
+                params.allow_cross_pane
+            }
             Method::AgentPrompt(params) => params.allow_cross_pane,
             Method::AgentSendKeys(params) => params.allow_cross_pane,
             Method::PaneSendText(params) => params.allow_cross_pane,
             Method::PaneSendKeys(params) => params.allow_cross_pane,
-            Method::PaneSendInput(params) => params.allow_cross_pane,
+            Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
+                params.allow_cross_pane
+            }
             _ => false,
         }
     }
 
     fn content_write_target(&self, method: &Method) -> Option<TerminalTarget> {
         match method {
-            Method::AgentStart(params) => self.pane_target(&params.pane_id),
+            Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
+                self.pane_target(&params.pane_id)
+            }
             Method::AgentPrompt(params) => self.resolve_agent_target(&params.target).ok(),
             Method::AgentSendKeys(params) => self.resolve_agent_target(&params.target).ok(),
             Method::PaneSendText(params) => self.pane_target(&params.pane_id),
             Method::PaneSendKeys(params) => self.pane_target(&params.pane_id),
-            Method::PaneSendInput(params) => self.pane_target(&params.pane_id),
+            Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
+                self.pane_target(&params.pane_id)
+            }
             _ => None,
         }
     }
@@ -171,6 +179,7 @@ mod tests {
                 name: "new-agent".into(),
                 kind: "pi".into(),
                 pane_id: fixture.target_pane_id.clone(),
+                expected_terminal: None,
                 args: Vec::new(),
                 timeout_ms: None,
                 allow_cross_pane: false,
@@ -199,12 +208,29 @@ mod tests {
             Method::PaneSendInput(PaneSendInputParams {
                 pane_id: fixture.target_pane_id.clone(),
                 text: "run".into(),
+                expected_terminal: None,
                 keys: vec!["enter".into()],
                 allow_cross_pane: false,
             }),
         ];
 
-        for (index, method) in methods.into_iter().enumerate() {
+        let guarded_methods: Vec<_> = methods
+            .iter()
+            .filter_map(|method| match method {
+                Method::AgentStart(params) => {
+                    let mut params = params.clone();
+                    params.expected_terminal = Some("term_guarded".into());
+                    Some(Method::AgentStartGuarded(params))
+                }
+                Method::PaneSendInput(params) => {
+                    let mut params = params.clone();
+                    params.expected_terminal = Some("term_guarded".into());
+                    Some(Method::PaneSendInputGuarded(params))
+                }
+                _ => None,
+            })
+            .collect();
+        for (index, method) in methods.into_iter().chain(guarded_methods).enumerate() {
             let response = fixture.app.handle_api_request_with_context(
                 Request {
                     id: format!("cross-pane-{index}"),
@@ -228,6 +254,7 @@ mod tests {
                 name: "new-agent".into(),
                 kind: "pi".into(),
                 pane_id: fixture.target_pane_id.clone(),
+                expected_terminal: None,
                 args: Vec::new(),
                 timeout_ms: None,
                 allow_cross_pane: true,
