@@ -48,7 +48,8 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # Depot overflow (smarty-dev#2267, Paul YES 2026-10-02): ordinary pull_request runs only; queue drafts, priority-ci, push and other events keep their runner.
+    runs-on: ${{ (startsWith(github.ref, 'refs/heads/mergify/merge-queue/') || startsWith(github.ref, 'refs/heads/tmp-mergify/merge-queue/') || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'ubuntu-latest' || github.event_name == 'pull_request' && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: Checkout

@@ -25,7 +25,8 @@ concurrency:
 jobs:
   conventional-commits:
     if: github.event_name != 'push' || github.ref_name == 'master'
-    runs-on: ubuntu-latest
+    # Depot overflow (smarty-dev#2267, Paul YES 2026-10-02): ordinary pull_request runs only; queue drafts, priority-ci, push and other events keep their runner.
+    runs-on: ${{ (startsWith(github.ref, 'refs/heads/mergify/merge-queue/') || startsWith(github.ref, 'refs/heads/tmp-mergify/merge-queue/') || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'ubuntu-latest' || github.event_name == 'pull_request' && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -59,7 +60,8 @@ jobs:
             nextest_filter: not binary(live_handoff) or test(=live_handoff_import_exits_when_its_test_owner_dies)
           - os: windows-latest
             kind: windows
-    runs-on: ${{ matrix.os }}
+    # Depot overflow (smarty-dev#2267, Paul YES 2026-10-02): ordinary pull_request runs only; only the ubuntu-latest leg; queue drafts, priority-ci, push and other events keep their runner.
+    runs-on: ${{ (startsWith(github.ref, 'refs/heads/mergify/merge-queue/') || startsWith(github.ref, 'refs/heads/tmp-mergify/merge-queue/') || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && matrix.os || matrix.os == 'ubuntu-latest' && github.event_name == 'pull_request' && 'depot-ubuntu-24.04' || matrix.os }}
     # The native-media feature adds a second herdr build with WebRTC and libopus.
     timeout-minutes: 30
     steps:
@@ -308,7 +310,8 @@ jobs:
     name: smarty-ci
     if: ${{ always() }}
     needs: [conventional-commits, check, windows-conpty-package]
-    runs-on: ubuntu-latest
+    # Depot overflow (smarty-dev#2267, Paul YES 2026-10-02): ordinary pull_request runs only; queue drafts, priority-ci, push and other events keep their runner.
+    runs-on: ${{ (startsWith(github.ref, 'refs/heads/mergify/merge-queue/') || startsWith(github.ref, 'refs/heads/tmp-mergify/merge-queue/') || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'ubuntu-latest' || github.event_name == 'pull_request' && 'depot-ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require every CI lane to succeed
