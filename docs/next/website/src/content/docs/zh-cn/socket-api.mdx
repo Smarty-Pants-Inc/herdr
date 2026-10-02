@@ -146,6 +146,19 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 
 客户端可以把 `offset_from_bottom == 0` 视为位于底部。
 
+### 预期终端保护
+
+`agent.start` 和 `pane.send_input` 接受一个可选的字符串 `expected_terminal`。请从目标窗格的当前记录中复制不透明的 `terminal_id`。服务器在处理请求期间，将其与窗格当前连接的终端进行比较，并对已确认的终端执行操作。如果窗格不存在、标识未知、字符串格式错误或连接了其他终端，服务器会在记录输入日志、写入 PTY、绑定代理名称或创建待启动状态之前返回 `terminal_identity_mismatch`。传入 `null` 或非字符串值会返回 `invalid_request`；省略该字段即可保持不带保护的行为。
+
+使用此功能前，请检查 `ping.result.capabilities.expected_terminal_guard == true`。带保护的操作请使用 `agent.start_guarded` 和 `pane.send_input_guarded`：这些方法要求提供 `expected_terminal`，旧版服务器会直接拒绝该方法，而不会静默忽略该字段。能力检查和操作可以使用不同的连接；即使服务器在两者之间被替换，带保护的方法仍会安全地失败。被拒绝后不要回退到不带保护的操作。CLI 在 `agent start --expected-terminal` 和 `pane run --expected-terminal` 中使用这些方法，并以 `expected_terminal_unsupported` 拒绝不支持的服务器。
+
+```json
+{"id":"guarded_input","method":"pane.send_input_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","text":"echo ready","keys":["Enter"]}}
+{"id":"guarded_start","method":"agent.start_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","name":"worker","kind":"pi"}}
+```
+
+此保护标识的是终端，而不是该终端中的代理名称、进程或原生代理会话。它不会改变跨窗格输入策略。
+
 ### 窗格图形
 
 窗格图形允许插件在窗格上放置图像数据。该功能默认可用；当服务器设置 `[terminal].kitty_graphics = false` 时，所有窗格图形方法都返回 `feature_disabled`。更改此设置需要重启服务器。调用 `pane.graphics.info` 会返回所连接客户端的单元格像素宽度和高度,但不会创建图形层。`pane.graphics.set` 接受 `data_base64` 中的 `png`、`rgb` 或 `rgba` 数据,`pane.graphics.clear` 删除该图层。

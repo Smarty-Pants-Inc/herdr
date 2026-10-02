@@ -145,6 +145,19 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 
 クライアントは `offset_from_bottom == 0` を最下部にいる状態として扱えます。
 
+### 想定ターミナルガード
+
+`agent.start` と `pane.send_input` は、省略可能な文字列 `expected_terminal` を受け付けます。対象ペインの現在のレコードから不透明な `terminal_id` をコピーしてください。サーバーはリクエストを処理している間に、その値とペインに接続されたターミナルを比較し、確認したターミナルに対して操作を行います。ペインが存在しない、識別子が不明、文字列の形式が不正、または別のターミナルが接続されている場合は、入力のログ記録、PTY 入力、エージェント名の割り当て、起動待ち状態の作成より前に `terminal_identity_mismatch` を返します。`null` や文字列以外の値を指定すると `invalid_request` になります。ガードなしの動作を維持するには、このフィールドを省略してください。
+
+この機能を使う前に `ping.result.capabilities.expected_terminal_guard == true` を確認してください。ガード付きの操作には `agent.start_guarded` と `pane.send_input_guarded` を使います。これらのメソッドは `expected_terminal` を必須とし、古いサーバーはフィールドを黙って無視せず、メソッド自体を拒否します。機能の確認と操作は別の接続で行ってもかまいません。その間にサーバーが入れ替わっても、ガード付きメソッドは安全側に失敗します。拒否された後にガードなしの操作へフォールバックしないでください。CLI は `agent start --expected-terminal` と `pane run --expected-terminal` でこれらのメソッドを使い、未対応のサーバーは `expected_terminal_unsupported` で拒否します。
+
+```json
+{"id":"guarded_input","method":"pane.send_input_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","text":"echo ready","keys":["Enter"]}}
+{"id":"guarded_start","method":"agent.start_guarded","params":{"pane_id":"w1:p1","expected_terminal":"term_opaque_from_pane_get","name":"worker","kind":"pi"}}
+```
+
+このガードが識別するのはターミナルであり、そのターミナル内のエージェント名、プロセス、ネイティブのエージェントセッションではありません。ペインをまたぐ入力のポリシーは変わりません。
+
 ### ペイングラフィックス
 
 ペイングラフィックスを使うと、プラグインがペイン上に画像データを配置できます。デフォルトで利用でき、サーバーで `[terminal].kitty_graphics = false` が設定されている場合は、すべてのペイングラフィックスメソッドが `feature_disabled` を返します。この設定の変更にはサーバーの再起動が必要です。`pane.graphics.info` はグラフィックスレイヤーを作成せず、接続中クライアントのセルの幅と高さをピクセル単位で返します。`pane.graphics.set` は `data_base64` の `png`、`rgb`、`rgba` データを受け取り、`pane.graphics.clear` はレイヤーを削除します。
