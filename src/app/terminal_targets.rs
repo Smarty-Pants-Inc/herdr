@@ -30,6 +30,29 @@ pub(crate) enum TerminalTargetError {
 }
 
 impl App {
+    /// Compare only opaque identities, never pane positions or agent names. The caller
+    /// holds server ownership through the effect and uses the checked terminal directly.
+    pub(super) fn check_expected_terminal(
+        &self,
+        expected: Option<&str>,
+        actual: Option<&crate::terminal::TerminalId>,
+    ) -> Result<(), crate::api::schema::ErrorBody> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let actual = actual.filter(|id| self.state.terminals.contains_key(*id));
+        if actual.is_some_and(|id| id.as_str() == expected) {
+            return Ok(());
+        }
+        Err(crate::api::schema::ErrorBody {
+            code: "terminal_identity_mismatch".into(),
+            message: format!(
+                "expected terminal {expected:?}, but the target pane owns {}",
+                actual.map_or("no terminal", |id| id.as_str()),
+            ),
+        })
+    }
+
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,

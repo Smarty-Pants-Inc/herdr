@@ -1119,7 +1119,16 @@ impl App {
             Method::AgentViewClear(params) => {
                 return self.handle_agent_view_clear(request.id, params);
             }
-            Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentStartGuarded(params) if params.expected_terminal.is_none() => {
+                return responses::encode_error(
+                    request.id,
+                    "terminal_identity_mismatch",
+                    "agent.start_guarded requires expected_terminal",
+                );
+            }
+            Method::AgentStart(params) | Method::AgentStartGuarded(params) => {
+                return self.handle_agent_start(request.id, params);
+            }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1231,7 +1240,14 @@ impl App {
             Method::PaneSendText(params) => {
                 return self.handle_pane_send_text(request.id, params, context);
             }
-            Method::PaneSendInput(params) => {
+            Method::PaneSendInputGuarded(params) if params.expected_terminal.is_none() => {
+                return responses::encode_error(
+                    request.id,
+                    "terminal_identity_mismatch",
+                    "pane.send_input_guarded requires expected_terminal",
+                );
+            }
+            Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 return self.handle_pane_send_input(request.id, params, context);
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
