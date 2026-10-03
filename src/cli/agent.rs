@@ -354,10 +354,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut response = loop {
         if let Some(previous_busy_response) = previous_busy_response.as_ref() {
             let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
-            if retry_expired
-                || pane_terminal_id(&pane_id)? != pinned_terminal_id
-                || !pane_shell_is_initializing(&pane_id)?
-            {
+            // Let one fresh agent.start ask the server after a transient process snapshot.
+            if retry_expired || pane_terminal_id(&pane_id)? != pinned_terminal_id {
                 return super::print_response(previous_busy_response);
             }
         }
