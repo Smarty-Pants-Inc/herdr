@@ -40,13 +40,22 @@ impl HeadlessServer {
     }
 
     /// Direct terminal clients have no endpoint hello identity. Invalidate only
-    /// attribution in any pane hosting this terminal, leaving media routing intact.
+    /// attribution in the current pane hosting this terminal, leaving media routing intact.
     pub(super) fn invalidate_terminal_input_attribution(&mut self, terminal_id: &str) {
+        // ponytail: use current attachments, not a second index that can go stale on
+        // rebinding. This direct-terminal path skips empty history and stops at its
+        // unique match; unmatched/late attachments still require a linear lookup.
+        if !self.media.has_input_owners() {
+            return;
+        }
         for workspace in &self.app.state.workspaces {
             for tab in &workspace.tabs {
                 for (&pane_id, pane) in &tab.panes {
                     if pane.attached_terminal_id.as_str() == terminal_id {
                         self.media.invalidate_input_attribution(pane_id);
+                        // AppState requires unique terminal attachments. Resolve from
+                        // current topology on every call so moves/rebindings stay correct.
+                        return;
                     }
                 }
             }

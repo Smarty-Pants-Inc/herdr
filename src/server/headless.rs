@@ -1450,14 +1450,18 @@ impl HeadlessServer {
         else {
             return false;
         };
-        let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
+        let terminal_id = terminal_id.clone();
+        let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
             return false;
         };
 
-        if let Err(err) =
-            apply_terminal_attach_scroll(runtime, source, direction, lines, column, row, modifiers)
-        {
-            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+        match apply_terminal_attach_scroll(
+            runtime, source, direction, lines, column, row, modifiers,
+        ) {
+            Ok(()) => self.invalidate_terminal_input_attribution(&terminal_id),
+            Err(err) => {
+                warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+            }
         }
         true
     }
@@ -2545,11 +2549,22 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                let applied = apply_client_pane_input_events(runtime, &events);
+                let mut accepted_interaction = false;
+                for event in &events {
+                    match apply_client_pane_input_events(runtime, std::slice::from_ref(event)) {
+                        Ok(()) => {
+                            accepted_interaction |=
+                                client_pane_input_has_interaction(std::slice::from_ref(event));
+                        }
+                        Err(err) => {
+                            warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                            break;
+                        }
+                    }
+                }
                 let scroll_changed = runtime.scroll_metrics() != scroll_before;
-                if let Err(err) = applied {
-                    warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
-                } else if interaction {
+                // A later enqueue failure does not undo an already accepted prefix.
+                if accepted_interaction {
                     self.media.note_pane_input(
                         client_id,
                         runtime_pane_id,

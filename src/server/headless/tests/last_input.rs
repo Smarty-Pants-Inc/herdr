@@ -67,10 +67,22 @@ fn setup() -> (
     crate::terminal::TerminalId,
     tokio::sync::mpsc::Receiver<Bytes>,
 ) {
+    setup_with_channel_capacity(64)
+}
+
+fn setup_with_channel_capacity(
+    channel_capacity: usize,
+) -> (
+    HeadlessServer,
+    String,
+    crate::terminal::TerminalId,
+    tokio::sync::mpsc::Receiver<Bytes>,
+) {
     let mut server = test_headless_server();
     let workspace = crate::workspace::Workspace::test_new("attribution");
     let pane = workspace.tabs[0].root_pane;
-    let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 64);
+    let (runtime, input) =
+        crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, channel_capacity);
     server.app.state.workspaces = vec![workspace];
     server.app.state.ensure_test_terminals();
     server.app.state.active = Some(0);
@@ -234,6 +246,39 @@ async fn accepted_client_api_direct_and_clipboard_input_have_explicit_sender_sem
         }),
     );
     assert_eq!(missing["error"]["code"], "pane_not_found");
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_shell_input_attributes_only_accepted_prefix() {
+    let (mut server, pane_id, terminal_id, mut input) = setup_with_channel_capacity(2);
+    let _bob = connect(&mut server, 32, Some("Bob"));
+    let _alice = connect(&mut server, 31, Some("Alice"));
+
+    // A wholly rejected Alice event must preserve the last accepted Bob input.
+    type_into(&mut server, 32, &pane_id);
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
+    let runtime = server.app.terminal_runtimes.get(&terminal_id).unwrap();
+    runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+    type_into(&mut server, 31, &pane_id);
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
+
+    // Accept Alice's first event but reject the second: the prefix still wins.
+    input.try_recv().expect("free one queue slot");
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 31,
+        pane_id: pane_id.clone(),
+        events: vec![
+            protocol::ClientPaneInputEvent::TextCommit("first".into()),
+            protocol::ClientPaneInputEvent::TextCommit("second".into()),
+        ],
+    });
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Alice");
+
+    // A later successful Bob retry must still restore Bob, not sticky Alice.
+    input.try_recv().expect("free one queue slot");
+    type_into(&mut server, 32, &pane_id);
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
     shutdown_test_runtimes(&mut server);
 }
 

@@ -211,6 +211,11 @@ impl MediaBroker {
             })
     }
 
+    /// Whether direct input can invalidate any existing pane attribution.
+    pub(crate) fn has_input_owners(&self) -> bool {
+        !self.pane_owners.is_empty()
+    }
+
     /// API input has no trusted client identity. Do not affect media routing or age.
     pub(crate) fn invalidate_input_attribution(&mut self, pane: PaneId) {
         if let Some(owner) = self.pane_owners.get_mut(&pane) {
