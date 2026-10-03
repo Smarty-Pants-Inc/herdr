@@ -55,31 +55,35 @@ pub(super) fn run_voice_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+/// One direction's change from the command line: a name, a reset to default, or none (herdr#127 r2).
+fn change(name: &Option<String>, reset: bool) -> crate::config::DeviceChange<'_> {
+    match name {
+        Some(name) => Some(Some(name.as_str())),
+        None if reset => Some(None),
+        None => None,
+    }
+}
+
 fn devices_at(
     options: &DevicesOptions,
     path: &Path,
     list_devices: impl FnOnce() -> Result<DeviceNames, String>,
 ) -> Result<String, String> {
-    let mut config = VoiceConfig::load_at(path)?;
-    if let Some(name) = &options.input {
-        config.input = Some(name.clone());
-    } else if options.default_input {
-        config.input = None;
-    }
-    if let Some(name) = &options.output {
-        config.output = Some(name.clone());
-    } else if options.default_output {
-        config.output = None;
-    }
-
     if options.changes_preferences() {
-        config.save_at(path)?;
+        // herdr#127 r2: only the directions this command changed, applied to the file as it is at the save.
+        VoiceConfig::save_changes_at(
+            path,
+            change(&options.input, options.default_input),
+            change(&options.output, options.default_output),
+        )?;
+        let config = VoiceConfig::load_at(path)?;
         return Ok(format!(
             "{}Saved native voice device preferences. The next call uses these choices; active calls keep their current devices. No restart is needed.\n",
             preferences_summary(path, &config)
         ));
     }
 
+    let config = VoiceConfig::load_at(path)?;
     let mut output = preferences_summary(path, &config);
     let devices = list_devices()
         .map_err(|error| format!("{output}Native voice device listing is unavailable: {error}"))?;
@@ -127,6 +131,54 @@ mod tests {
         DevicesOptions::from_matches(
             &crate::cli::spec::parse_leaf_args(&["voice", "devices"], &args).unwrap(),
         )
+    }
+
+    /// herdr#127 r2: a concurrent writer holds the config lock and saves both names; this command, which changed
+    /// one direction (a name, then a reset to default), keeps that writer's other direction.
+    fn concurrent_save_keeps_the_other_direction(command: &[&str], expect_input: Option<&str>) {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-voice-cli-race-{}-{}",
+            std::process::id(),
+            command.join("")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[voice]\ninput = \"old mic\"\noutput = \"old speaker\"\n",
+        )
+        .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("toml.lock"))
+            .unwrap();
+        lock.lock().unwrap(); // the other writer is mid-save,
+        let options = parse(command);
+        let saving = {
+            let path = path.clone();
+            std::thread::spawn(move || devices_at(&options, &path, || unreachable!()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // and publishes its whole state: the input it read, and its new output.
+        std::fs::write(
+            &path,
+            "[voice]\ninput = \"old mic\"\noutput = \"new speaker\"\n",
+        )
+        .unwrap();
+        lock.unlock().unwrap();
+        saving.join().unwrap().unwrap();
+        let saved = VoiceConfig::load_at(&path).unwrap();
+        assert_eq!(saved.input.as_deref(), expect_input, "{command:?}");
+        assert_eq!(saved.output.as_deref(), Some("new speaker"), "{command:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_concurrent_output_edit_survives_an_input_save_and_an_input_reset() {
+        concurrent_save_keeps_the_other_direction(&["--input", "new mic"], Some("new mic"));
+        concurrent_save_keeps_the_other_direction(&["--default-input"], None);
     }
 
     #[test]

@@ -46,10 +46,32 @@ impl ConfigEdit<'_> {
     }
 }
 
+/// One direction's change: `None` leaves it as the file has it; `Some(None)` resets it to the system default.
+pub(crate) type DeviceChange<'a> = Option<Option<&'a str>>;
+
 impl super::VoiceConfig {
-    /// Save names in the existing host-local config, preserving unrelated settings and comments.
+    /// Save both names (tests); the CLI saves only what it changed (`save_changes_at`).
+    #[cfg(test)]
     pub(crate) fn save_at(&self, path: &std::path::Path) -> Result<(), String> {
-        self.validate()?;
+        Self::save_changes_at(
+            path,
+            Some(self.input.as_deref()),
+            Some(self.output.as_deref()),
+        )
+    }
+
+    /// Save only the directions a command changed, onto the file as it is when the save runs (herdr#127 r2: a
+    /// stale snapshot of the other direction must not overwrite a concurrent edit of it).
+    pub(crate) fn save_changes_at(
+        path: &std::path::Path,
+        input: DeviceChange<'_>,
+        output: DeviceChange<'_>,
+    ) -> Result<(), String> {
+        super::VoiceConfig {
+            input: input.flatten().map(str::to_owned),
+            output: output.flatten().map(str::to_owned),
+        }
+        .validate()?;
         update_file_at_checked(path, "voice devices", |content| {
             let mut expected = content.parse::<toml::Value>().map_err(|error| {
                 format!(
@@ -61,7 +83,8 @@ impl super::VoiceConfig {
                 .as_table_mut()
                 .ok_or_else(|| "config must be a table; leaving config unchanged".to_string())?;
             let mut updated = content.to_owned();
-            for (key, name) in [("input", &self.input), ("output", &self.output)] {
+            for (key, change) in [("input", input), ("output", output)] {
+                let Some(name) = change else { continue };
                 if let Some(name) = name {
                     let table = root
                         .entry("voice".to_string())
@@ -70,7 +93,7 @@ impl super::VoiceConfig {
                         .ok_or_else(|| {
                             "voice config must be a table; leaving config unchanged".to_string()
                         })?;
-                    table.insert(key.to_string(), toml::Value::String(name.clone()));
+                    table.insert(key.to_string(), toml::Value::String(name.to_owned()));
                     // Keep a one-line basic string, including TOML's additional DEL restriction.
                     let literal = serde_json::to_string(name)
                         .map_err(|error| format!("failed to encode voice device name: {error}"))?
@@ -117,6 +140,16 @@ fn update_file_at_checked(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create config directory: {error}"))?;
     }
+    // herdr#127 r2: read, change and publish under one lock, so two saves never publish from the same old file.
+    let lock_path = path.with_extension("toml.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("failed to lock config before saving {description}: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("failed to lock config before saving {description}: {error}"))?;
     let content = match super::io::read_optional_config(path) {
         Ok(Some(content)) => content,
         Ok(None) => String::new(),
@@ -153,6 +186,21 @@ fn still_parses(content: &str, updated: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Files in a config directory, not counting the save lock: it is kept on purpose (herdr#127 r2).
+    fn staged_and_config_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                !entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".lock")
+            })
+            .count()
+    }
 
     const COMMENTED_ROWS: &str = "[ui]\nsidebar.agents.rows = [\n  [\"terminal_title\"] # row description\n]\nstatus_indicators = \"dots\"\n";
 
@@ -355,11 +403,7 @@ mod tests {
                 old.save_at(path).unwrap();
             }
         });
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            1,
-            "staging files leaked"
-        );
+        assert_eq!(staged_and_config_files(&dir), 1, "staging files leaked");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -397,11 +441,7 @@ mod tests {
         assert!(std::fs::read_to_string(&target)
             .unwrap()
             .contains("# user config"));
-        assert_eq!(
-            std::fs::read_dir(&dir).unwrap().count(),
-            2,
-            "staging files leaked"
-        );
+        assert_eq!(staged_and_config_files(&dir), 2, "staging files leaked");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
