@@ -1088,6 +1088,10 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     // Opt-in comparison against the exact incident-era client. Discovery/bridges and handoff
     // still use the current test server binary. Older clients have no runtime readout.
     let external_client = std::env::var_os("HERDR_RECONNECT_CLIENT_EXE");
+    // Opt in to keeping Steady selected for every handoff, including large snapshots.
+    // The default still clicks Handoff before the 100/110-workspace cases.
+    let inactive_large = std::env::var("HERDR_RECONNECT_INACTIVE_LARGE").as_deref() == Ok("1");
+    eprintln!("handoff inactive_large={inactive_large}");
     let machines_ready = |expected: usize| {
         if external_client.is_some() {
             return [&steady_api, &handoff_api]
@@ -1189,8 +1193,8 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
     let mut count = 1;
     for workspaces in [3, 100, 110] {
-        // Cover both an inactive machine (small) and the selected machine (large).
-        if workspaces == 100 {
+        // By default cover inactive-small and selected-large; opt-in covers inactive-large.
+        if workspaces == 100 && !inactive_large {
             input
                 .write_all(&sidebar_row_click(&screen(), "recovered-3"))
                 .unwrap();
@@ -1290,6 +1294,8 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
         // No input, observer handshake, rename, metadata report or other server mutation may
         // wake rendering here. A new handshake and a post-handoff current-generation readout
         // distinguish recovery from the identical retained pre-handoff frame/count.
+        // Older clients have no readout: observe only PTY/log files in this window, never
+        // poll their servers. Their post-boot count is checked by snapshot_data AFTER it.
         let recovered = wait_until(Duration::from_secs(20), Duration::from_millis(100), || {
             let log = client_log();
             let tail = log.get(log_watermark..).unwrap_or_default();
@@ -1308,7 +1314,7 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
                 && machine_online
                 && !text.contains("reconnecting")
                 && fresh_generation
-                && machines_ready(workspaces)
+                && (external_client.is_some() || machines_ready(workspaces))
         });
         save_evidence(&format!("no-input-after-{workspaces}"));
         if !recovered {
@@ -1323,6 +1329,12 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
             );
         }
         let snapshot = snapshot_data();
+        let snapshot_value: Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(
+            snapshot_value["workspaces"].as_array().unwrap().len(),
+            workspaces,
+            "post-handoff bootstrap must retain the workspace count"
+        );
         if workspaces >= 100 {
             assert!(
                 snapshot.len() >= 200_000,
