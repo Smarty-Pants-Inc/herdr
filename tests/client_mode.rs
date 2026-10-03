@@ -2199,3 +2199,477 @@ fn client_receives_notify_on_agent_state_change() {
 
     cleanup_spawned_herdr(spawned, base);
 }
+
+/// Sender provenance must originate from real TUI input, not a test-authored hello
+/// or an API-supplied user name. Keep both named binary clients attached throughout.
+#[test]
+fn sender_identity_two_real_clients_last_input() {
+    use std::ffi::OsStr;
+
+    // The generic server launcher cannot override HOME/TMPDIR/session. Keep this
+    // stricter launcher local: reuse its command sanitizer and process ownership
+    // guards without changing other integration tests' launch behavior.
+    fn spawn_owned(
+        base: &PathBuf,
+        config_home: &std::path::Path,
+        runtime_dir: &std::path::Path,
+        api_socket: &PathBuf,
+        client_socket: &PathBuf,
+        role: &str,
+    ) -> (SpawnedHerdr, SharedOutput) {
+        assert!(
+            api_socket.starts_with(base),
+            "API socket must be under child TMPDIR"
+        );
+        assert!(
+            client_socket.starts_with(base),
+            "client socket must be under child TMPDIR"
+        );
+        let mut cmd = crate::test_command::herdr_pty_command();
+        for (key, _) in cmd.iter_full_env() {
+            let bytes = key.as_encoded_bytes();
+            assert!(
+                !bytes.starts_with(b"HERDR_") || key == OsStr::new("HERDR_SESSION"),
+                "inherited Herdr context survived sanitization: {key:?}"
+            );
+        }
+        assert_eq!(cmd.get_env("HERDR_SESSION"), Some(OsStr::new("default")));
+        assert_eq!(cmd.get_env("PI_CODING_AGENT_DIR"), None);
+        assert_eq!(cmd.get_env("PI_CONFIG_DIR"), None);
+
+        cmd.arg(role);
+        cmd.cwd(base);
+        for (key, path) in [
+            ("HOME", base.join("home")),
+            ("TMPDIR", base.clone()),
+            ("XDG_CONFIG_HOME", config_home.to_path_buf()),
+            ("XDG_RUNTIME_DIR", runtime_dir.to_path_buf()),
+            ("XDG_STATE_HOME", runtime_dir.join("state")),
+            ("XDG_DATA_HOME", base.join("data")),
+            ("XDG_CACHE_HOME", base.join("cache")),
+        ] {
+            fs::create_dir_all(&path).unwrap();
+            cmd.env(key, &path);
+            assert_eq!(cmd.get_env(key), Some(path.as_os_str()));
+        }
+        cmd.env("SHELL", "/bin/sh");
+        // Prevent the invoking shell's startup hooks from escaping private HOME.
+        cmd.env_remove("ENV");
+        cmd.env_remove("BASH_ENV");
+        cmd.env("HERDR_SESSION", "proof-3937");
+        cmd.env("HERDR_SOCKET_PATH", api_socket);
+        cmd.env("HERDR_CLIENT_SOCKET_PATH", client_socket);
+        cmd.env("HERDR_DISABLE_SOUND", "1");
+        for (key, value) in cmd.iter_full_env() {
+            if key.as_encoded_bytes().starts_with(b"HERDR_") {
+                let expected = match key.to_str().expect("owned Herdr key is UTF-8") {
+                    "HERDR_SESSION" => OsStr::new("proof-3937"),
+                    "HERDR_SOCKET_PATH" => api_socket.as_os_str(),
+                    "HERDR_CLIENT_SOCKET_PATH" => client_socket.as_os_str(),
+                    "HERDR_DISABLE_SOUND" => OsStr::new("1"),
+                    _ => panic!("unexpected Herdr environment key: {key:?}"),
+                };
+                assert_eq!(value, expected, "owned environment {key:?}");
+            }
+        }
+        register_runtime_dir(runtime_dir);
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        register_spawned_herdr_pid(child.process_id());
+        drop(pair.slave);
+        let output = spawn_pty_drain(pair.master.try_clone_reader().unwrap());
+        let process = SpawnedHerdr {
+            _master: Some(pair.master),
+            child,
+        };
+        println!("3937 process role={role} pid={:?} config={} session=proof-3937 HOME={} TMPDIR={} api={} client={} inherited_context=cleared",
+            process.child.process_id(), config_home.display(), base.join("home").display(),
+            base.display(), api_socket.display(), client_socket.display());
+        (process, output)
+    }
+
+    fn request(socket: &PathBuf, id: &str, method: &str, params: Value) -> Value {
+        // Unlike the older generic request helper, a missing API response must
+        // fail a bounded proof rather than hang the entire integration binary.
+        let mut stream = UnixStream::connect(socket).expect("connect to owned API socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id": id, "method": method, "params": params})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("bounded API response");
+        let response: Value = serde_json::from_str(&line).expect("JSON API response");
+        assert_eq!(response["id"], id, "{response}");
+        response
+    }
+
+    fn last_input(socket: &PathBuf, pane: &str, alias: bool) -> Value {
+        let params = if alias {
+            serde_json::json!({"pane_id": pane})
+        } else {
+            serde_json::json!({"pane": pane})
+        };
+        let response = request(socket, "last-input", "pane.last_input", params);
+        assert!(response.get("error").is_none(), "{response}");
+        let result = response["result"]
+            .as_object()
+            .expect("last input result object");
+        assert_eq!(result.len(), 2, "{response}");
+        assert_eq!(result["type"], "pane_last_input", "{response}");
+        assert!(
+            result.contains_key("last_input"),
+            "explicit null is required: {response}"
+        );
+        let input = result["last_input"].clone();
+        if !input.is_null() {
+            let record = input.as_object().expect("last input record");
+            assert_eq!(record.len(), 3, "{response}");
+            assert!(record.contains_key("user"), "{response}");
+            assert!(
+                input["user"].is_null() || input["user"].is_string(),
+                "{response}"
+            );
+            assert!(input["client_id"].as_u64().is_some(), "{response}");
+            assert!(input["at"].as_u64().is_some(), "{response}");
+        }
+        input
+    }
+
+    fn epoch_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn type_and_observe(
+        socket: &PathBuf,
+        pane: &str,
+        writer: &mut dyn Write,
+        outputs: &[&SharedOutput],
+        command: &str,
+        marker: &str,
+        user: &str,
+    ) -> Value {
+        let started = epoch_ms();
+        let mut observed = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                observed = last_input(socket, pane, false);
+                if observed["user"].as_str() == Some(user)
+                    && observed["at"].as_u64().is_some_and(|at| at >= started)
+                    && outputs
+                        .iter()
+                        .all(|output| read_output(output).contains(marker))
+                {
+                    return true;
+                }
+                // Readiness can lag the first frame; retry through the real client's
+                // PTY, never through pane.send_input or a fabricated endpoint hello.
+                writer.write_all(&retry_shell_line(command)).unwrap();
+                writer.flush().unwrap();
+                false
+            }),
+            "real {user} input must reach {pane}; last_input={observed}; outputs={:?}",
+            outputs
+                .iter()
+                .map(|output| read_output(output))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            observed["at"].as_u64().unwrap() <= epoch_ms(),
+            "epoch milliseconds: {observed}"
+        );
+        println!(
+            "3937 typed marker={marker} pane={pane} result={}",
+            serde_json::json!({"type": "pane_last_input", "last_input": observed})
+        );
+        observed
+    }
+
+    struct OwnedScratch(PathBuf);
+    impl Drop for OwnedScratch {
+        fn drop(&mut self) {
+            cleanup_test_base(&self.0);
+        }
+    }
+
+    let _lock = test_lock();
+    // mktemp creates an exclusive owner-only directory; never use a live profile
+    // or trust an inherited TMPDIR to identify a safe scratch session. Use a short
+    // /tmp root rather than nesting below Main's possibly long TMPDIR: Unix socket
+    // paths must fit sockaddr_un (108 bytes on Linux). Child TMPDIR is this root,
+    // so both sockets remain below its owned TMPDIR, with cleanup bound to Drop.
+    let temp = std::process::Command::new("mktemp")
+        .args(["-d", "/tmp/herdr-3937-proof.XXXXXX"])
+        .output()
+        .expect("create owned scratch directory");
+    assert!(temp.status.success(), "mktemp failed: {:?}", temp.stderr);
+    let scratch = OwnedScratch(PathBuf::from(
+        String::from_utf8(temp.stdout).unwrap().trim(),
+    ));
+    let base = &scratch.0;
+    let runtime = base.join("runtime");
+    let api = runtime.join("herdr.sock");
+    let client_socket = runtime.join("herdr-client.sock");
+    let server_config = base.join("server-config");
+    let alice_config = base.join("alice-config");
+    let bob_config = base.join("bob-config");
+    for (home, config) in [
+        (&server_config, "onboarding = false\n[identity]\nname = \"server-not-sender\"\n[ui]\nwindow_title = \"PROOF:{workspace}\"\n"),
+        (&alice_config, "onboarding = false\n[identity]\nname = \"alice\"\n[ui]\nwindow_title = \"PROOF:{workspace}\"\n"),
+        (&bob_config, "onboarding = false\n[identity]\nname = \"bob\"\n[ui]\nwindow_title = \"PROOF:{workspace}\"\n"),
+    ] {
+        fs::create_dir_all(home.join(app_dir_name())).unwrap();
+        fs::write(home.join(app_dir_name()).join("config.toml"), config).unwrap();
+    }
+    let (mut server, _server_output) = spawn_owned(
+        base,
+        &server_config,
+        &runtime,
+        &api,
+        &client_socket,
+        "server",
+    );
+    wait_for_socket(&api, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let created = request(
+        &api,
+        "create-proof",
+        "workspace.create",
+        serde_json::json!({"cwd": base, "focus": true, "label": "sender-proof"}),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created", "{created}");
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(last_input(&api, &pane, false), Value::Null);
+    assert_eq!(last_input(&api, &pane, true), Value::Null);
+    println!(
+        "3937 before-input pane={pane} result={{\"type\":\"pane_last_input\",\"last_input\":null}}"
+    );
+
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({"pane": "p_999999_999999"}),
+    ] {
+        let response = request(&api, "invalid-last-input", "pane.last_input", params);
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+        println!("3937 invalid-query response={response}");
+    }
+
+    let (mut alice, output_a) = spawn_owned(
+        base,
+        &alice_config,
+        &runtime,
+        &api,
+        &client_socket,
+        "client",
+    );
+    let (mut bob, output_b) =
+        spawn_owned(base, &bob_config, &runtime, &api, &client_socket, "client");
+    let outputs = [&output_a, &output_b];
+    for output in &outputs {
+        wait_for_window_title(output, "PROOF:sender-proof");
+    }
+    assert_eq!(
+        last_input(&api, &pane, false),
+        Value::Null,
+        "attach/render/focus are not pane input"
+    );
+    let mut input_a = alice._master.as_ref().unwrap().take_writer().unwrap();
+    let mut input_b = bob._master.as_ref().unwrap().take_writer().unwrap();
+    let a1 = type_and_observe(
+        &api,
+        &pane,
+        &mut *input_a,
+        &outputs,
+        "proof_survivor=ALIVE; printf 'PROOF_%s\\n' ALICE_A",
+        "PROOF_ALICE_A",
+        "alice",
+    );
+    let b1 = type_and_observe(
+        &api,
+        &pane,
+        &mut *input_b,
+        &outputs,
+        "printf 'PROOF_%s_%s\\n' \"$proof_survivor\" BOB_B",
+        "PROOF_ALIVE_BOB_B",
+        "bob",
+    );
+    let a2 = type_and_observe(
+        &api,
+        &pane,
+        &mut *input_a,
+        &outputs,
+        "printf 'PROOF_%s_%s\\n' \"$proof_survivor\" ALICE_A_AGAIN",
+        "PROOF_ALIVE_ALICE_A_AGAIN",
+        "alice",
+    );
+    assert_ne!(
+        a1["client_id"], b1["client_id"],
+        "two attached clients have distinct IDs"
+    );
+    assert_eq!(a1["client_id"], a2["client_id"], "Alice keeps her ID");
+    assert!(a1["at"].as_u64().unwrap() <= b1["at"].as_u64().unwrap());
+    assert!(b1["at"].as_u64().unwrap() <= a2["at"].as_u64().unwrap());
+    assert_eq!(
+        last_input(&api, &pane, true),
+        a2,
+        "alias/read does not change provenance"
+    );
+
+    let rejected = request(
+        &api,
+        "reject-unknown-send",
+        "pane.send_text",
+        serde_json::json!({"pane_id": "p_999999_999999", "text": "must-not-arrive"}),
+    );
+    assert!(rejected.get("error").is_some(), "{rejected}");
+    assert_eq!(
+        last_input(&api, &pane, false),
+        a2,
+        "rejected anonymous input is not accepted input"
+    );
+    println!("3937 rejected-send response={rejected} preserved={a2}");
+
+    // A rejected send with text/valid keys must not attribute or enqueue a partial
+    // prefix. Poisoning the persistent shell variable also makes the later real
+    // typed markers a direct counterexample if rejected bytes leaked into the PTY.
+    let rejected_guard = request(
+        &api,
+        "reject-terminal-guard",
+        "pane.send_input_guarded",
+        serde_json::json!({
+            "pane_id": pane,
+            "expected_terminal": "term_3937_unknown",
+            "text": "proof_survivor=POISONED_GUARD",
+            "keys": ["Enter"],
+        }),
+    );
+    assert_eq!(
+        rejected_guard["error"]["code"], "terminal_identity_mismatch",
+        "{rejected_guard}"
+    );
+    assert!(rejected_guard.get("result").is_none(), "{rejected_guard}");
+    assert_eq!(
+        last_input(&api, &pane, false),
+        a2,
+        "failed terminal guard preserves sender"
+    );
+    println!("3937 rejected-guard response={rejected_guard} preserved={a2}");
+    let rejected_partial = request(
+        &api,
+        "reject-valid-prefix-invalid-key",
+        "pane.send_input_guarded",
+        serde_json::json!({
+            "pane_id": pane,
+            "expected_terminal": created["result"]["root_pane"]["terminal_id"],
+            "text": "proof_survivor=POISONED_PARTIAL",
+            "keys": ["Enter", "SenderProofInvalidKey"],
+        }),
+    );
+    assert_eq!(
+        rejected_partial["error"]["code"], "invalid_key",
+        "{rejected_partial}"
+    );
+    assert!(
+        rejected_partial.get("result").is_none(),
+        "{rejected_partial}"
+    );
+    assert_eq!(
+        last_input(&api, &pane, false),
+        a2,
+        "invalid later key cannot accept a valid prefix or clear sender"
+    );
+    println!("3937 rejected-valid-prefix response={rejected_partial} preserved={a2}");
+
+    // Accepted anonymous input clears attribution without forgetting the attached
+    // clients' identities or replacing the shell whose state they share.
+    let anonymous = request(
+        &api,
+        "anonymous-send",
+        "pane.send_text",
+        serde_json::json!({"pane_id": pane, "text": "printf 'PROOF_%s_%s\\n' \"$proof_survivor\" ANON_ACCEPTED\n"}),
+    );
+    assert_eq!(anonymous["result"]["type"], "ok", "{anonymous}");
+    assert_eq!(
+        last_input(&api, &pane, false),
+        Value::Null,
+        "accepted anonymous API input clears the last sender"
+    );
+    assert_eq!(last_input(&api, &pane, true), Value::Null);
+    assert!(
+        wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
+            outputs
+                .iter()
+                .all(|output| read_output(output).contains("PROOF_ALIVE_ANON_ACCEPTED"))
+        }),
+        "anonymous bytes must reach the preserved shell and both attached clients"
+    );
+    println!("3937 anonymous response={anonymous} pane={pane} result={{\"type\":\"pane_last_input\",\"last_input\":null}}");
+    assert_eq!(
+        last_input(&api, &pane, false),
+        Value::Null,
+        "output/read/render do not restore attribution"
+    );
+
+    let restored_a = type_and_observe(
+        &api,
+        &pane,
+        &mut *input_a,
+        &outputs,
+        "printf 'PROOF_%s_%s\\n' \"$proof_survivor\" ALICE_RESTORED",
+        "PROOF_ALIVE_ALICE_RESTORED",
+        "alice",
+    );
+    assert_eq!(restored_a["client_id"], a1["client_id"]);
+    let restored_b = type_and_observe(
+        &api,
+        &pane,
+        &mut *input_b,
+        &outputs,
+        "printf 'PROOF_%s_%s\\n' \"$proof_survivor\" BOB_RESTORED",
+        "PROOF_ALIVE_BOB_RESTORED",
+        "bob",
+    );
+    assert_eq!(restored_b["client_id"], b1["client_id"]);
+    assert!(
+        alice.child.try_wait().unwrap().is_none(),
+        "Alice remains attached"
+    );
+    assert!(
+        bob.child.try_wait().unwrap().is_none(),
+        "Bob remains attached"
+    );
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "server survives anonymous input"
+    );
+    println!("3937 PASS two real binary TUI clients; A->B->A; anonymous clears attribution; restored Alice/Bob IDs; no Pi proof claimed");
+    drop(input_a);
+    drop(input_b);
+    drop(alice);
+    drop(bob);
+    drop(server);
+    drop(scratch);
+}

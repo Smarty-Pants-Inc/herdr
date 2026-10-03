@@ -1267,10 +1267,14 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                let terminal_id = terminal_id.clone();
+                if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                    match runtime.try_send_bytes(Bytes::from(payload)) {
+                        Ok(()) => self.invalidate_terminal_input_attribution(&terminal_id),
+                        Err(err) => {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed")
+                        }
                     }
                 }
                 true
@@ -1309,6 +1313,13 @@ impl HeadlessServer {
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
                     warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                } else {
+                    self.media.note_pane_input(
+                        client_id,
+                        runtime_pane_id,
+                        &pane_id,
+                        Instant::now(),
+                    );
                 }
                 true
             }
@@ -1495,8 +1506,11 @@ impl HeadlessServer {
             modifiers,
             lines: lines.max(1),
         };
+        let interaction = !client_pane_input_releases_press(&event);
         if let Err(err) = apply_client_pane_input_events(runtime, &[event]) {
             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
+        } else if interaction {
+            self.invalidate_terminal_input_attribution(&terminal_id);
         }
         true
     }
@@ -1934,11 +1948,17 @@ impl HeadlessServer {
 
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
+        // Consume any bootstrap/deferred receipts before a newer client input can win.
+        self.consume_api_input_receipts();
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
             return false;
         }
 
         match ev {
+            ServerEvent::ClientUser { client_id, user } => {
+                self.media.set_client_user(client_id, user.as_deref());
+                false
+            }
             ServerEvent::ClientConnected {
                 client_id,
                 cols,
@@ -2177,9 +2197,15 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                    if let Err(err) = apply_terminal_attach_input(runtime, data) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err);
+                let terminal_id = terminal_id.clone();
+                let has_input = !data.is_empty();
+                if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                    match apply_terminal_attach_input(runtime, data) {
+                        Ok(()) if has_input => {
+                            self.invalidate_terminal_input_attribution(&terminal_id)
+                        }
+                        Ok(()) => {}
+                        Err(err) => warn!(client_id, terminal_id = %terminal_id, err = %err),
                     }
                 }
                 true
@@ -2507,14 +2533,6 @@ impl HeadlessServer {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
-                if interaction {
-                    self.media.note_pane_input(
-                        client_id,
-                        runtime_pane_id,
-                        &pane_id,
-                        Instant::now(),
-                    );
-                }
                 let foreground_changed =
                     interaction && self.promote_client_to_foreground(client_id);
                 let geometry_changed =
@@ -2527,10 +2545,19 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
+                let applied = apply_client_pane_input_events(runtime, &events);
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if let Err(err) = applied {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
+                } else if interaction {
+                    self.media.note_pane_input(
+                        client_id,
+                        runtime_pane_id,
+                        &pane_id,
+                        Instant::now(),
+                    );
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,
@@ -3103,6 +3130,12 @@ impl HeadlessServer {
             return true;
         }
 
+        self.consume_api_input_receipts();
+        if matches!(&msg.request.method, api::schema::Method::PaneLastInput(_)) {
+            self.handle_last_input_api_request(msg);
+            return false;
+        }
+
         if crate::server::headless::media::is_media_method(&msg.request.method) {
             self.handle_media_api_request(msg);
             return false;
@@ -3218,6 +3251,7 @@ impl HeadlessServer {
                 msg.context,
                 msg.respond_to,
             );
+            self.consume_api_input_receipts();
             return changed | deferred_changed;
         }
         if matches!(
@@ -3272,6 +3306,7 @@ impl HeadlessServer {
                     msg.context,
                 )
         };
+        self.consume_api_input_receipts();
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
             {
@@ -3563,6 +3598,7 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(now, self.app.pending_agent_resume_due(now));
         }
+        self.consume_api_input_receipts();
         changed
     }
 }

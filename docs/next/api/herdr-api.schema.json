@@ -2774,6 +2774,18 @@
           ],
           "type": "object"
         },
+        "PaneLastInputParams": {
+          "description": "Queries server-owned sender attribution, independent of the client's pane spelling.",
+          "properties": {
+            "pane": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane"
+          ],
+          "type": "object"
+        },
         "PaneLayoutParams": {
           "properties": {
             "pane_id": {
@@ -6037,6 +6049,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.last_input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneLastInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -8397,6 +8425,33 @@
           ],
           "type": "object"
         },
+        "PaneLastInput": {
+          "description": "Last accepted client-owned pane interaction (including mouse input).\nThe user is self-declared, never authenticated.",
+          "properties": {
+            "at": {
+              "description": "Unix epoch milliseconds, recorded when input was accepted by the server.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "client_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "user": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "client_id",
+            "at"
+          ],
+          "type": "object"
+        },
         "PaneLayoutPane": {
           "properties": {
             "focused": {
@@ -9992,6 +10047,29 @@
               "required": [
                 "type",
                 "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "last_input": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PaneLastInput"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Null for no client input or attribution invalidated by API input.\nAnonymous clients retain client_id/at with a null user."
+                },
+                "type": {
+                  "const": "pane_last_input",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
               ],
               "type": "object"
             },

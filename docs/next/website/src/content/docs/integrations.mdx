@@ -91,6 +91,8 @@ You can include `--agent-session-id` or `--agent-session-path` with `report-agen
 
 Use `HERDR_BIN_PATH` and the CLI wrappers for portable integrations. Code that needs direct IPC can send the equivalent `pane.report_agent`, `pane.report_agent_session`, and `pane.release_agent` requests described in the [Socket API](/docs/socket-api/#agent-state-reporting).
 
+Custom integrations can query [`pane.last_input`](/docs/socket-api/#last-pane-input) with `{"pane":"<pane_id>"}` to read the client display name, connection id, and timestamp for the last accepted client input (which can include mouse input, not only typing). The name comes from the client's optional hello `user` field, normally selected through `identity.name` or the client's `USER`/`USERNAME` environment. It is self-declared metadata, never authentication. This is a per-pane snapshot, not a per-message sender guarantee: accepted API input clears the display attribution to `null` without changing media routing ownership, and unnamed clients have `user: null`. Do not reuse a previous name when the current record is missing or anonymous.
+
 [Prime Agent's built-in Herdr reporter](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/extensions/builtin/herdr-agent-state.ts) is a real-world example. It activates only inside Herdr, maps agent events to `working`, `idle`, and `blocked`, preserves report ordering across sessions, and releases authority on exit.
 
 Some integrations report native agent session references. Herdr uses official session references to resume Claude Code, Codex, Devin CLI, Droid, Kimi Code CLI, Qoder CLI, Qwen Code, Letta Code, Cursor Agent CLI, Grok CLI, GitHub Copilot CLI, Pi, OMP, Hermes Agent, OpenCode, Kilo Code CLI, MastraCode, and Antigravity CLI panes after a Herdr server restart unless `[session] resume_agents_on_restore = false` disables it.
@@ -112,6 +114,14 @@ Herdr writes the bundled extension to:
 ```
 
 If `PI_CODING_AGENT_DIR` is set, Herdr writes to `$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts` instead. Herdr creates the extensions directory when the Pi agent directory already exists. Uninstall removes only that extension file.
+
+### Sender attribution
+
+Herdr currently exposes sender display metadata through `pane.last_input` only. No Pi author badges or sender-attribution session entries are shipped. The API is a latest-input snapshot, not an association with a specific Pi submission: identical follow-up and steering messages can be delivered out of order, and input queued during compaction can be processed after another client's later input. Reading the snapshot then could label the wrong message.
+
+The accepted Pi display and queue-safe metadata follow-up is tracked in [smarty-dev#4078](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4078), separately from Herdr's API scope.
+
+Pi `0.87.1` supports metadata-only custom entries and `registerEntryRenderer()`. Safe attribution still needs an upstream genuine-submission ID and immutable source, with custom-entry metadata carried through every queue and committed immediately before the accepted native user message. Names must stay out of prompts and remain self-declared display metadata, never authentication.
 
 ## OMP
 

@@ -703,6 +703,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
+        Method::PaneLastInput(_) => "pane.last_input",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
         Method::PaneLinkActivate(_) => "pane.link.activate",

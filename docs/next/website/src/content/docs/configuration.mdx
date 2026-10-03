@@ -52,6 +52,19 @@ Reload applies most UI settings without restarting panes. Startup-only settings 
 
 Themes, sidebar layouts, copy behavior, and other presentation settings come from the client's local config, including when viewing an SSH machine. Pane defaults, worktrees, integrations, and custom commands belong to the server where the panes run. The UI's `reload config` action reloads both the client's local settings and the selected server's config. Local keybindings reload too; `--remote-keybindings server` instead uses the selected server's keybindings.
 
+## Client identity
+
+Set the display name your Herdr client declares when connecting to a server:
+
+```toml
+[identity]
+name = "Alice"
+```
+
+`identity.name` is an optional string. By default, the client uses its non-empty `USER` environment variable, falling back to `USERNAME`. Set `name = ""` to disable declaring a name. The name belongs to the client, not the server where panes run, including when connecting over SSH. It is sent as the optional `user` field in the client hello. Clients that do not declare a name are reported with `user: null`.
+
+The [Socket API](/docs/socket-api/#last-pane-input) exposes this name with the last accepted client input for each pane. It is self-declared display metadata, never authentication, authorization, or proof of who sent a message. Do not use it for access control.
+
 ## Headless terminal size
 
 When no client is attached, the server uses a 120×40 virtual terminal for layout and newly created panes. Change that fallback for headless orchestration with:

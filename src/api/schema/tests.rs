@@ -479,6 +479,49 @@ fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
 }
 
 #[test]
+fn pane_last_input_accepts_pane_and_pane_id_alias_without_changing_existing_targets() {
+    for key in ["pane", "pane_id"] {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "last", "method": "pane.last_input", "params": {key: "p_7"}
+        }))
+        .unwrap();
+        let Method::PaneLastInput(ref target) = request.method else {
+            panic!("last input method");
+        };
+        assert_eq!(target.pane, "p_7");
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["params"],
+            serde_json::json!({"pane":"p_7"})
+        );
+    }
+    assert!(serde_json::from_value::<Request>(serde_json::json!({
+        "id":"last", "method":"pane.last_input", "params":{}
+    }))
+    .is_err());
+    let result = ResponseResult::PaneLastInput { last_input: None };
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        serde_json::json!({"type":"pane_last_input","last_input":null})
+    );
+    let result = ResponseResult::PaneLastInput {
+        last_input: Some(PaneLastInput {
+            user: None,
+            client_id: 7,
+            at: 1_700_000_000_001,
+        }),
+    };
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"type":"pane_last_input","last_input":{"user":null,"client_id":7,"at":1_700_000_000_001u64}})
+    );
+    assert_eq!(
+        serde_json::from_value::<ResponseResult>(value).unwrap(),
+        result
+    );
+}
+
+#[test]
 fn pane_send_input_defaults_to_empty_text_and_keys() {
     let json = r#"
     {

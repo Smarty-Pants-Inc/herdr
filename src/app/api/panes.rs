@@ -1839,8 +1839,12 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let has_input = !params.text.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if has_input {
+            self.accepted_api_inputs.push(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1889,8 +1893,12 @@ impl App {
         ) {
             return response;
         }
+        let has_input = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        if has_input {
+            self.accepted_api_inputs.push(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -1990,10 +1998,20 @@ impl App {
         {
             return response;
         }
+        let mut accepted_input = false;
         for bytes in encoded_keys {
+            let has_input = !bytes.is_empty();
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                // A partial multi-key send must invalidate even when a later enqueue fails.
+                if accepted_input {
+                    self.accepted_api_inputs.push(pane_id);
+                }
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+            accepted_input |= has_input;
+        }
+        if accepted_input {
+            self.accepted_api_inputs.push(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})

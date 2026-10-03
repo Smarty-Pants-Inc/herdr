@@ -33,11 +33,61 @@ impl HeadlessServer {
         }
     }
 
+    pub(super) fn consume_api_input_receipts(&mut self) {
+        for pane in self.app.accepted_api_inputs.drain(..) {
+            self.media.invalidate_input_attribution(pane);
+        }
+    }
+
+    /// Direct terminal clients have no endpoint hello identity. Invalidate only
+    /// attribution in any pane hosting this terminal, leaving media routing intact.
+    pub(super) fn invalidate_terminal_input_attribution(&mut self, terminal_id: &str) {
+        for workspace in &self.app.state.workspaces {
+            for tab in &workspace.tabs {
+                for (&pane_id, pane) in &tab.panes {
+                    if pane.attached_terminal_id.as_str() == terminal_id {
+                        self.media.invalidate_input_attribution(pane_id);
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn expire_media_sessions(&mut self, now: Instant) {
+        // Timer maintenance, never pane-scaled work per render/output event. Build
+        // one live-id set so retaining N owners does not perform N topology walks.
+        if self.media.owner_cleanup_due(now) {
+            let live = self
+                .app
+                .state
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.tabs.iter())
+                .flat_map(|tab| tab.panes.keys().copied())
+                .collect::<HashSet<_>>();
+            self.media
+                .retain_live_panes(now, |pane| live.contains(&pane));
+        }
         let actions = self
             .media
             .expire(now, |pane| self.app.find_pane(pane).is_some());
         self.perform_media_actions(actions);
+    }
+
+    pub(super) fn handle_last_input_api_request(&mut self, msg: api::ApiRequestMessage) {
+        let api::schema::Method::PaneLastInput(target) = msg.request.method else {
+            return;
+        };
+        let response = match self.app.parse_pane_id(&target.pane) {
+            Some((_, pane)) => success_response(
+                msg.request.id,
+                api::schema::ResponseResult::PaneLastInput {
+                    last_input: self.media.last_input(pane),
+                },
+            ),
+            None => error_response(msg.request.id, "pane_not_found", "pane not found"),
+        };
+        let _ = msg.respond_to.send(response);
     }
 
     /// `pane.media_open` answers later, when the bound client sends its offer; the other media

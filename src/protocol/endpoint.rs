@@ -45,6 +45,10 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointClientHello {
+    /// Optional self-declared display name, not an authenticated principal.
+    /// This is JSON-only metadata; none of the named binary codecs change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     pub generation: u32,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
@@ -203,6 +207,7 @@ mod tests {
 
     fn hello() -> EndpointClientHello {
         EndpointClientHello {
+            user: None,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,
@@ -232,6 +237,64 @@ mod tests {
         let encoded = serde_json::to_string(&with_media).unwrap();
         let decoded: EndpointClientHello = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, with_media);
+    }
+
+    #[test]
+    fn hello_user_is_optional_and_old_servers_ignore_it() {
+        let mut named = hello();
+        named.user = Some("Alice".into());
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(
+            serde_json::from_value::<EndpointClientHello>(value.clone()).unwrap(),
+            named
+        );
+
+        // The old server's required baseline fields still decode, while unknown JSON
+        // metadata is ignored. Compare every original field, not just generation.
+        #[derive(Serialize, Deserialize)]
+        struct OldHello {
+            generation: u32,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            surface_size: ClientSurfaceSize,
+            pixel_mouse: bool,
+            direct_graphics: bool,
+            endpoint_keybindings: bool,
+            mouse_capture: bool,
+            #[serde(default = "default_true")]
+            surface_active: bool,
+            #[serde(default)]
+            surface_reuse: bool,
+            #[serde(default)]
+            surface_delta: bool,
+            #[serde(default)]
+            snapshot_codecs: Vec<String>,
+            #[serde(default)]
+            surface_codecs: Vec<String>,
+            #[serde(default)]
+            input_codecs: Vec<String>,
+            #[serde(default)]
+            blob_codecs: Vec<String>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            capabilities: Vec<String>,
+        }
+        let old: OldHello = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::to_value(hello()).unwrap()
+        );
+        // A real legacy decoder still rejects malformed load-bearing baseline fields.
+        let mut invalid = value;
+        invalid["generation"] = serde_json::json!("not a number");
+        assert!(serde_json::from_value::<OldHello>(invalid).is_err());
+        let unnamed = serde_json::to_value(hello()).unwrap();
+        assert!(unnamed.get("user").is_none());
+        assert_eq!(
+            serde_json::from_value::<EndpointClientHello>(unnamed)
+                .unwrap()
+                .user,
+            None
+        );
     }
 
     fn snapshot() -> ClientShellSnapshot {
@@ -278,6 +341,7 @@ mod tests {
         )))
         .unwrap();
         assert!(hello.supports_required_codecs());
+        assert_eq!(hello.user, None, "old clients remain anonymous");
 
         let welcome: EndpointServerWelcome = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

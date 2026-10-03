@@ -54,6 +54,17 @@ struct PaneOwner {
     /// The pane id exactly as the client sent it, so the client can match its own record.
     pane_ref: String,
     at: Instant,
+    /// The same last-input owner also supplies self-declared sender attribution.
+    user: Option<String>,
+    input_at: u64,
+    /// API input invalidates attribution without changing media ownership or age.
+    attribution_valid: bool,
+}
+
+#[derive(Debug)]
+struct MediaClient {
+    capable: bool,
+    user: Option<String>,
 }
 
 #[derive(Debug)]
@@ -110,10 +121,11 @@ struct ClosedSession {
 #[derive(Debug)]
 pub(crate) struct MediaBroker {
     /// Attached client-shell clients and whether each advertised media support.
-    clients: HashMap<u64, bool>,
+    clients: HashMap<u64, MediaClient>,
     /// Per pane, the client whose input reached it last. Input to another pane never moves
     /// this owner, so it cannot reroute a pane's microphone to an older client.
     pane_owners: HashMap<PaneId, PaneOwner>,
+    next_owner_cleanup: Option<Instant>,
     sessions: HashMap<String, MediaSession>,
     closed: VecDeque<ClosedSession>,
     id_prefix: String,
@@ -141,6 +153,17 @@ pub(crate) fn error_response(id: String, code: &str, message: impl Into<String>)
     })
 }
 
+/// Remove terminal controls and bidi/zero-width formatting before any UI/API exposure.
+/// Bound by Unicode scalar count (at most 320 UTF-8 bytes), not untrusted source length.
+fn sanitize_user(user: &str) -> Option<String> {
+    let name: String = user.chars()
+        .filter(|ch| !ch.is_control() && !matches!(*ch, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
+        .take(80)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 impl MediaBroker {
     pub(crate) fn new() -> Self {
         // Session ids only need to be unique for this server's lifetime; the boot stamp keeps
@@ -152,6 +175,7 @@ impl MediaBroker {
         Self {
             clients: HashMap::new(),
             pane_owners: HashMap::new(),
+            next_owner_cleanup: None,
             sessions: HashMap::new(),
             closed: VecDeque::new(),
             id_prefix: format!("media_{boot:x}_"),
@@ -160,7 +184,38 @@ impl MediaBroker {
     }
 
     pub(crate) fn client_connected(&mut self, client_id: u64, capable: bool) {
-        self.clients.insert(client_id, capable);
+        self.clients.insert(
+            client_id,
+            MediaClient {
+                capable,
+                user: None,
+            },
+        );
+    }
+
+    /// Display metadata only. Never use this self-declared name for authorization.
+    pub(crate) fn set_client_user(&mut self, client_id: u64, user: Option<&str>) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.user = user.and_then(sanitize_user);
+        }
+    }
+
+    pub(crate) fn last_input(&self, pane: PaneId) -> Option<crate::api::schema::PaneLastInput> {
+        let owner = self.pane_owners.get(&pane)?;
+        owner
+            .attribution_valid
+            .then(|| crate::api::schema::PaneLastInput {
+                user: owner.user.clone(),
+                client_id: owner.client_id,
+                at: owner.input_at,
+            })
+    }
+
+    /// API input has no trusted client identity. Do not affect media routing or age.
+    pub(crate) fn invalidate_input_attribution(&mut self, pane: PaneId) {
+        if let Some(owner) = self.pane_owners.get_mut(&pane) {
+            owner.attribution_valid = false;
+        }
     }
 
     /// Record input that reached a pane the client views.
@@ -171,19 +226,37 @@ impl MediaBroker {
         pane_ref: &str,
         now: Instant,
     ) {
-        if !self.clients.contains_key(&client_id) {
+        let Some(client) = self.clients.get(&client_id) else {
             return;
-        }
-        self.pane_owners
-            .retain(|_, owner| now.saturating_duration_since(owner.at) <= MEDIA_INPUT_WINDOW);
+        };
+        // Attribution has no 10-second TTL. Media still checks its monotonic age in open().
+        let input_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
         self.pane_owners.insert(
             pane,
             PaneOwner {
                 client_id,
                 pane_ref: pane_ref.to_owned(),
                 at: now,
+                user: client.user.clone(),
+                input_at,
+                attribution_valid: true,
             },
         );
+    }
+
+    pub(crate) fn owner_cleanup_due(&self, now: Instant) -> bool {
+        !self.pane_owners.is_empty()
+            && self
+                .next_owner_cleanup
+                .is_none_or(|deadline| now >= deadline)
+    }
+
+    pub(crate) fn retain_live_panes(&mut self, now: Instant, pane_exists: impl Fn(PaneId) -> bool) {
+        self.pane_owners.retain(|pane, _| pane_exists(*pane));
+        self.next_owner_cleanup = Some(now + Duration::from_secs(1));
     }
 
     pub(crate) fn client_removed(&mut self, client_id: u64, now: Instant) -> Vec<MediaAction> {
@@ -230,7 +303,7 @@ impl MediaBroker {
             .get(&pane)
             .filter(|owner| now.saturating_duration_since(owner.at) <= MEDIA_INPUT_WINDOW)
             .and_then(|owner| {
-                let capable = *self.clients.get(&owner.client_id)?;
+                let capable = self.clients.get(&owner.client_id)?.capable;
                 Some((owner.client_id, capable, owner.clone()))
             });
         let handover = fresh.is_none();
@@ -247,11 +320,14 @@ impl MediaBroker {
                     {
                         return None;
                     }
-                    let capable = *self.clients.get(&session.client_id)?;
+                    let capable = self.clients.get(&session.client_id)?.capable;
                     let owner = PaneOwner {
                         client_id: session.client_id,
                         pane_ref: session.pane_ref.clone(),
                         at: now,
+                        user: None,
+                        input_at: 0,
+                        attribution_valid: false,
                     };
                     Some((session.client_id, capable, owner))
                 })
@@ -727,6 +803,103 @@ mod tests {
                 _ => None,
             })
             .expect("an open control")
+    }
+
+    #[test]
+    fn sender_attribution_last_client_wins_and_is_pane_local() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        broker.set_client_user(1, Some("Alice"));
+        broker.set_client_user(2, Some("Bob"));
+        assert_eq!(broker.last_input(pane(7)), None);
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        broker.note_pane_input(1, pane(8), "p_8", now);
+        broker.note_pane_input(2, pane(7), "w1:p7", now + Duration::from_secs(1));
+        let latest = broker.last_input(pane(7)).unwrap();
+        assert_eq!(latest.user.as_deref(), Some("Bob"));
+        assert_eq!(latest.client_id, 2);
+        assert!(
+            latest.at >= 1_000_000_000_000,
+            "unix milliseconds, not monotonic seconds"
+        );
+        assert_eq!(
+            broker.last_input(pane(8)).unwrap().user.as_deref(),
+            Some("Alice")
+        );
+        // Names are self-declared; a missing name never borrows another client's.
+        broker.client_connected(3, false);
+        broker.note_pane_input(3, pane(7), "p_7", now + Duration::from_secs(2));
+        let anonymous = broker.last_input(pane(7)).unwrap();
+        assert_eq!(anonymous.user, None);
+        assert_eq!(anonymous.client_id, 3);
+        assert!(anonymous.at > 0);
+    }
+
+    #[test]
+    fn api_input_clears_attribution_but_preserves_media_owner_and_freshness() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.set_client_user(1, Some("Alice"));
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let input = broker.last_input(pane(7)).unwrap();
+        broker.invalidate_input_attribution(pane(7));
+        assert_eq!(broker.last_input(pane(7)), None);
+        assert_eq!(broker.pane_owners[&pane(7)].at, now);
+        let (sent, _) = open(&mut broker, pane(7), now + Duration::from_secs(1));
+        assert_eq!(
+            opened_session(&sent).0,
+            1,
+            "API input cannot reroute microphone"
+        );
+        let (sent, rx) = open(
+            &mut broker,
+            pane(7),
+            now + MEDIA_INPUT_WINDOW + Duration::from_secs(1),
+        );
+        assert!(sent.is_empty());
+        assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+        broker.note_pane_input(1, pane(7), "p_7", now + Duration::from_secs(20));
+        assert_eq!(broker.last_input(pane(7)).unwrap().user, input.user);
+    }
+
+    #[test]
+    fn attribution_outlives_media_window_but_not_panes_or_disconnect() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.set_client_user(1, Some("Alice"));
+        broker.note_pane_input(1, pane(7), "p_7", now);
+        let input = broker.last_input(pane(7));
+        broker.note_pane_input(1, pane(8), "p_8", now + Duration::from_secs(30));
+        assert_eq!(
+            broker.last_input(pane(7)),
+            input,
+            "input on another pane must not prune attribution"
+        );
+        let (sent, rx) = open(&mut broker, pane(7), now + Duration::from_secs(30));
+        assert!(sent.is_empty());
+        assert_eq!(response(&rx)["error"]["code"], error_code::NO_CLIENT);
+        broker.retain_live_panes(now, |id| id == pane(8));
+        assert_eq!(broker.last_input(pane(7)), None);
+        assert!(broker.last_input(pane(8)).is_some());
+        assert!(!broker.owner_cleanup_due(now));
+        assert!(broker.owner_cleanup_due(now + Duration::from_secs(1)));
+        run(broker.client_removed(1, now));
+        assert_eq!(broker.last_input(pane(8)), None);
+    }
+
+    #[test]
+    fn self_declared_names_are_sanitized_and_bounded() {
+        assert_eq!(
+            sanitize_user("  Al\n\rice\t\u{1b}\u{7}\u{202e}  ").as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(sanitize_user(" \t\u{1b}\u{200b} "), None);
+        let long = "界".repeat(1000);
+        assert_eq!(sanitize_user(&long).unwrap().chars().count(), 80);
     }
 
     #[test]
