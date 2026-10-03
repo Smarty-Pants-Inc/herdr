@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::Stream as _;
+use interprocess::local_socket::ListenerNonblockingMode;
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(test, unix))]
@@ -37,6 +38,43 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+const ACCEPT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+fn is_transient_accept_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) {
+        return true;
+    }
+
+    false
+}
+
+fn handle_fatal_accept_error(
+    err: &io::Error,
+    running: &AtomicBool,
+    server_stop: Option<&AtomicBool>,
+) {
+    // The shared stop flag can precede ServerHandle::drop during graceful
+    // shutdown. Neither that path nor a retired listener may kill the server.
+    if !running.load(Ordering::Relaxed)
+        || server_stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+    {
+        return;
+    }
+    error!(err = %err, "api listener accept failed; exiting for service-manager recovery");
+    std::process::exit(1);
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -125,11 +163,16 @@ fn start_server_inner(
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<ServerHandle> {
+    use interprocess::local_socket::traits::Listener as _;
+
     prepare_socket_path(&path)?;
 
     let listener = bind_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
+    // Accept must not strand a retired listener on an unlinked socket. Keep
+    // accepted streams blocking, as required by the connection handlers.
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
     info!(path = %path.display(), "api server listening");
 
     #[cfg(unix)]
@@ -160,9 +203,16 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
+        let mut retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+        let mut retrying = false;
+        while listener_running.load(Ordering::Relaxed) {
+            match listener.accept() {
                 Ok(stream) => {
+                    if !listener_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+                    retrying = false;
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
@@ -185,8 +235,26 @@ fn start_server_inner(
                         }
                     });
                 }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // An empty nonblocking listener is idle, not a retry failure.
+                    std::thread::sleep(ACCEPT_RETRY_INITIAL_DELAY);
+                }
+                Err(err) if is_transient_accept_error(&err) => {
+                    if !listener_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !retrying {
+                        warn!(err = %err, "temporary api listener accept failure; retrying with backoff");
+                        retrying = true;
+                    }
+                    std::thread::sleep(retry_delay);
+                    if !listener_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_MAX_DELAY);
+                }
                 Err(err) => {
-                    error!(err = %err, "api listener accept failed");
+                    handle_fatal_accept_error(&err, &listener_running, server_stop.as_deref());
                     break;
                 }
             }
@@ -290,6 +358,12 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
+
+    // The owner may have retired this listener while the handler read its
+    // initial request. Do not dispatch that request into the still-live app.
+    if !running.load(Ordering::Relaxed) {
+        return Ok(());
+    }
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -1253,6 +1327,304 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    #[test]
+    fn accept_error_classifier_retries_only_transient_errors() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EACCES] {
+            assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::OutOfMemory,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::from(kind)));
+        }
+    }
+
+    #[derive(Clone)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+    impl Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_listener_logs() -> LogCapture {
+        let logs = LogCapture(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .unwrap();
+        logs
+    }
+
+    #[test]
+    fn active_fatal_accept_exits_process_nonzero() {
+        if run_isolated_listener_test(
+            "api::server::tests::active_fatal_accept_exits_process_nonzero",
+            1,
+        ) {
+            return;
+        }
+        let _logs = capture_listener_logs();
+        handle_fatal_accept_error(
+            &io::Error::from_raw_os_error(libc::EINVAL),
+            &AtomicBool::new(true),
+            Some(&AtomicBool::new(false)),
+        );
+    }
+
+    #[test]
+    fn stopped_fatal_accept_returns_without_logging_or_process_exit() {
+        if run_isolated_listener_test(
+            "api::server::tests::stopped_fatal_accept_returns_without_logging_or_process_exit",
+            0,
+        ) {
+            return;
+        }
+        let logs = capture_listener_logs();
+        let error = io::Error::from_raw_os_error(libc::EINVAL);
+        handle_fatal_accept_error(&error, &AtomicBool::new(false), None);
+        handle_fatal_accept_error(
+            &error,
+            &AtomicBool::new(false),
+            Some(&AtomicBool::new(false)),
+        );
+        // should_quit can precede handle drop: running is still true here.
+        handle_fatal_accept_error(&error, &AtomicBool::new(true), Some(&AtomicBool::new(true)));
+        assert!(logs.0.lock().unwrap().is_empty(), "shutdown must be quiet");
+    }
+
+    #[test]
+    fn listener_drop_during_fd_exhaustion_discards_queued_mutation() {
+        check_listener_fd_exhaustion(true);
+    }
+
+    #[test]
+    fn listener_recovers_after_fd_exhaustion() {
+        check_listener_fd_exhaustion(false);
+    }
+
+    fn assert_listener_channel_closed(rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match rx.try_recv() {
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "retired listener must exit");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(message) => panic!("retired listener dispatched {:?}", message.request),
+            }
+        }
+    }
+
+    #[test]
+    fn listener_drop_without_clients_exits() {
+        if run_isolated_listener_test("api::server::tests::listener_drop_without_clients_exits", 0)
+        {
+            return;
+        }
+        let path = unique_test_path("idle-api");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = start_server_inner(path.clone(), tx, EventHub::default(), None, None).unwrap();
+        drop(handle);
+        assert!(!path.exists());
+        assert_listener_channel_closed(&mut rx);
+    }
+
+    fn run_isolated_listener_test(test_name: &str, expected_exit: i32) -> bool {
+        const CHILD: &str = "HERDR_TEST_LISTENER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        // RLIMIT_NOFILE and tracing are process-wide. Also isolate the SSH
+        // registry created by start_server_inner, even for the idle test.
+        let config_home = unique_test_path("listener-config");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CHILD, "1")
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(config_home);
+        assert_eq!(output.status.code(), Some(expected_exit), "{output:?}");
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        true
+    }
+
+    fn check_listener_fd_exhaustion(drop_during_backoff: bool) {
+        let test_name = if drop_during_backoff {
+            "api::server::tests::listener_drop_during_fd_exhaustion_discards_queued_mutation"
+        } else {
+            "api::server::tests::listener_recovers_after_fd_exhaustion"
+        };
+        if run_isolated_listener_test(test_name, 0) {
+            return;
+        }
+
+        let logs = capture_listener_logs();
+
+        let path = unique_test_path("emfile-api");
+        let config_home = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = start_server_inner(path.clone(), tx, EventHub::default(), None, None).unwrap();
+        let pid = std::process::id();
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(128);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        // Reserve a client FD before exhaustion so connecting cannot steal accept's last FD.
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let mut client = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut files = Vec::new();
+        loop {
+            match fs::File::open("/dev/null") {
+                Ok(file) => files.push(file),
+                Err(err) => {
+                    assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as _;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+            *to = *from as _;
+        }
+        assert_eq!(
+            unsafe {
+                libc::connect(
+                    fd,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&addr) as _,
+                )
+            },
+            0
+        );
+        let queued_request = if drop_during_backoff {
+            b"{\"id\":\"retired-mutation\",\"method\":\"workspace.rename\",\"params\":{\"workspace_id\":\"ws_1\",\"label\":\"must-not-dispatch\"}}\n".as_slice()
+        } else {
+            b"{\"id\":\"queued\",\"method\":\"ping\",\"params\":{}}\n".as_slice()
+        };
+        client.write_all(queued_request).unwrap();
+
+        let warning = "temporary api listener accept failure";
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if String::from_utf8_lossy(&logs.0.lock().unwrap()).contains(warning) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "accept must observe EMFILE");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !handle._thread.is_finished(),
+            "listener must survive EMFILE"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&logs.0.lock().unwrap())
+                .matches(warning)
+                .count(),
+            1
+        );
+        if drop_during_backoff {
+            drop(handle);
+            assert!(!path.exists(), "drop must remove the owned socket name");
+            drop(files);
+            // Only the listener/its handlers own senders. Disconnection proves their
+            // exit, and receiving anything instead catches dispatch of queued work.
+            assert_listener_channel_closed(&mut rx);
+            println!("EMFILE observed; handle dropped during backoff; listener exited after pressure released; queued workspace.rename never dispatched on PID {pid}");
+            drop(client);
+            let _ = fs::remove_dir_all(config_home);
+            return;
+        }
+        drop(files);
+
+        let mut response = String::new();
+        let queued_read = BufReader::new(&mut client).read_line(&mut response);
+        match queued_read {
+            Ok(0) if cfg!(target_os = "macos") => {
+                println!("pressure-era client closed on macOS; requiring fresh recovery");
+            }
+            Err(err)
+                if cfg!(target_os = "macos")
+                    && matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                    ) =>
+            {
+                println!("pressure-era client reset on macOS: {err}; requiring fresh recovery");
+            }
+            result => {
+                assert!(result.unwrap() > 0, "queued client must receive a response");
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["id"], "queued");
+                assert_eq!(response["result"]["type"], "pong");
+            }
+        }
+        drop(client);
+        let mut fresh = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        fresh
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        fresh
+            .write_all(b"{\"id\":\"fresh\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(&mut fresh).read_line(&mut response).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "fresh");
+        assert_eq!(response["result"]["type"], "pong");
+        assert_eq!(std::process::id(), pid);
+        assert!(!handle._thread.is_finished());
+        println!("EMFILE observed; one warning during repeated retries; fresh correlated pong on the same PID {pid} and live listener (queued pong required except macOS EOF/reset)");
+        drop(fresh);
+        drop(handle);
+        let _ = fs::remove_dir_all(config_home);
     }
 
     #[test]
