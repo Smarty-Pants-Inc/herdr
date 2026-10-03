@@ -69,6 +69,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Missing also shows onboarding; set false after you've chosen.
 # onboarding = true
 
+# Self-declared sender display name (not authentication), sent by this client.
+# Default: local USER, then USERNAME if USER is missing/blank.
+# Set name = "" to be anonymous. Controls are stripped; names are limited to 80 characters.
+# [identity]
+# name = "Alice"
+
 [theme]
 # Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
 #                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
