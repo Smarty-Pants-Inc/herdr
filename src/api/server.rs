@@ -37,6 +37,27 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+const ACCEPT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+fn is_transient_accept_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted | io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) {
+        return true;
+    }
+
+    false
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -159,9 +180,13 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
+        let mut retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+        let mut retrying = false;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
+                    retrying = false;
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
@@ -183,6 +208,17 @@ fn start_server_inner(
                             warn!(err = %err, "api connection failed");
                         }
                     });
+                }
+                Err(err) if is_transient_accept_error(&err) => {
+                    if !listener_running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !retrying {
+                        warn!(err = %err, "temporary api listener accept failure; retrying with backoff");
+                        retrying = true;
+                    }
+                    std::thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_MAX_DELAY);
                 }
                 Err(err) => {
                     error!(err = %err, "api listener accept failed");
@@ -1250,6 +1286,182 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    #[test]
+    fn accept_error_classifier_retries_only_transient_errors() {
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EACCES] {
+            assert!(!is_transient_accept_error(&io::Error::from_raw_os_error(
+                errno
+            )));
+        }
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::OutOfMemory,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn listener_recovers_after_fd_exhaustion() {
+        const CHILD: &str = "HERDR_TEST_ACCEPT_EMFILE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // RLIMIT_NOFILE is process-wide: never lower the parallel test runner's limit.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "api::server::tests::listener_recovers_after_fd_exhaustion",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", unique_test_path("emfile-config"))
+                .env_remove("SSH_AUTH_SOCK")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        #[derive(Clone)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogCapture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = LogCapture(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .unwrap();
+
+        let path = unique_test_path("emfile-api");
+        let config_home = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handle = start_server_inner(path.clone(), tx, EventHub::default(), None, None).unwrap();
+        let pid = std::process::id();
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(128);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        // Reserve a client FD before exhaustion so connecting cannot steal accept's last FD.
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        let mut client = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut files = Vec::new();
+        loop {
+            match fs::File::open("/dev/null") {
+                Ok(file) => files.push(file),
+                Err(err) => {
+                    assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as _;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+            *to = *from as _;
+        }
+        assert_eq!(
+            unsafe {
+                libc::connect(
+                    fd,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&addr) as _,
+                )
+            },
+            0
+        );
+        client
+            .write_all(b"{\"id\":\"queued\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+
+        let warning = "temporary api listener accept failure";
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if String::from_utf8_lossy(&logs.0.lock().unwrap()).contains(warning) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "accept must observe EMFILE");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !handle._thread.is_finished(),
+            "listener must survive EMFILE"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&logs.0.lock().unwrap())
+                .matches(warning)
+                .count(),
+            1
+        );
+        drop(files);
+
+        let mut response = String::new();
+        BufReader::new(&mut client)
+            .read_line(&mut response)
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "pong");
+        drop(client);
+        let mut fresh = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        fresh
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        fresh
+            .write_all(b"{\"id\":\"fresh\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(&mut fresh).read_line(&mut response).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "fresh");
+        assert_eq!(response["result"]["type"], "pong");
+        assert_eq!(std::process::id(), pid);
+        assert!(!handle._thread.is_finished());
+        println!("EMFILE observed; one warning during repeated retries; queued and fresh ping returned pong on the same PID {pid}");
+        drop(fresh);
+        drop(handle);
+        let _ = fs::remove_dir_all(config_home);
     }
 
     #[test]
