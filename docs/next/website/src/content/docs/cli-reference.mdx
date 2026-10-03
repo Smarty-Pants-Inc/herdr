@@ -256,7 +256,7 @@ Send input:
 ```bash
 herdr pane send-text <pane_id> <text>
 herdr pane send-keys <pane_id> <key> [key ...]
-herdr pane run <pane_id> <command>
+herdr pane run <pane_id> [--expected-terminal TERMINAL_ID] <command>
 ```
 
 `<key>` uses Herdr key-combo syntax: plain printable keys such as `a`,
@@ -268,6 +268,8 @@ aliases for `ctrl+c`.
 `esc` is the canonical spelling; `escape` is also accepted.
 
 `pane run` honors live bracketed-paste mode and submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands; the separate send operations remain low-level and non-submitting.
+
+Use `--expected-terminal <terminal_id>` on `pane run` or `agent start` to refuse a stale pane target. Copy the opaque `terminal_id` from `pane get` or `pane list`; do not derive it from a pane ID, position, or agent name. The server checks the pane's current attachment before it sends input or binds an agent name. An unknown, malformed, or different identity returns `terminal_identity_mismatch` with no input or startup effects. The CLI returns `expected_terminal_unsupported` without sending the guarded operation if the server does not advertise support. It uses guarded method names so replacement by an older server cannot silently remove the check. Without this flag, existing behavior is unchanged. This guard pins the terminal, not the identity of a process or agent session running inside it.
 
 Report agent state from custom hooks:
 
@@ -342,7 +344,7 @@ herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> [--until STATUS]... [--timeout MS]
 herdr agent attach <target> [--takeover]
-herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]
+herdr agent start <name> --kind KIND --pane ID [--expected-terminal TERMINAL_ID] [--timeout MS] [-- <agent-args...>]
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```

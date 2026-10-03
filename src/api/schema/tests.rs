@@ -98,6 +98,7 @@ fn agent_start_and_prompt_requests_round_trip() {
             name: "reviewer".into(),
             kind: "pi".into(),
             pane_id: "w1:p2".into(),
+            expected_terminal: None,
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
             allow_cross_pane: false,
@@ -438,6 +439,46 @@ fn missing_required_params_are_rejected() {
 }
 
 #[test]
+fn expected_terminal_guard_is_optional_but_present_values_must_be_strings() {
+    for method in [
+        "agent.start",
+        "agent.start_guarded",
+        "pane.send_input",
+        "pane.send_input_guarded",
+    ] {
+        let mut value = serde_json::json!({
+            "id": "guard",
+            "method": method,
+            "params": {"name": "worker", "kind": "pi", "pane_id": "w1:p1"},
+        });
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert!(encoded["params"].get("expected_terminal").is_none());
+        value["params"]["expected_terminal"] = serde_json::json!("term_opaque");
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["params"]["expected_terminal"], "term_opaque");
+        assert_eq!(encoded["method"], method);
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(false),
+            serde_json::json!({}),
+        ] {
+            value["params"]["expected_terminal"] = malformed;
+            assert!(serde_json::from_value::<Request>(value.clone()).is_err());
+        }
+    }
+}
+
+#[test]
+fn old_server_capabilities_do_not_advertise_expected_terminal_guard() {
+    let caps: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff": false})).unwrap();
+    assert!(!caps.expected_terminal_guard);
+}
+
+#[test]
 fn pane_send_input_defaults_to_empty_text_and_keys() {
     let json = r#"
     {
@@ -732,6 +773,7 @@ fn success_response_round_trips() {
                 health_check: true,
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
+                expected_terminal_guard: true,
             }),
         },
     };
