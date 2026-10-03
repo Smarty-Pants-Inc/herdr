@@ -765,6 +765,12 @@ fn output_len(output: &SharedOutput) -> usize {
     output.lock().unwrap_or_else(|p| p.into_inner()).text.len()
 }
 
+fn rendered_active_workspace(screen: &str, endpoint: &str, pane_marker: &str) -> bool {
+    // The federated footer names the actual active endpoint, not keyboard navigation.
+    // The marker belongs to its unique workspace pane, never to the sidebar inventory.
+    screen.contains(&format!("new · {endpoint}")) && screen.contains(pane_marker)
+}
+
 fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
     let sidebar_width = screen
         .lines()
@@ -788,6 +794,40 @@ fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
 }
 
 #[test]
+fn rendered_selection_rejects_ready_inventory_with_ignored_click() {
+    let steady = "machines                 │\n ▾ Steady               ●│STEADY_ACTIVE_WORKSPACE\n   · steady-ready        │\n ▾ Handoff              ●│\n   · recovered-3         │\n new · Steady        menu│\n";
+    assert!(rendered_active_workspace(
+        steady,
+        "Steady",
+        "STEADY_ACTIVE_WORKSPACE"
+    ));
+    assert!(!rendered_active_workspace(
+        steady,
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+    let handoff = steady
+        .replace("new · Steady", "new · Handoff")
+        .replace("STEADY_ACTIVE_WORKSPACE", "HANDOFF_ACTIVE_WORKSPACE");
+    assert!(rendered_active_workspace(
+        &handoff,
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+    assert!(!rendered_active_workspace(
+        &handoff,
+        "Steady",
+        "STEADY_ACTIVE_WORKSPACE"
+    ));
+    // A footer switch alone is insufficient: require the intended workspace's surface.
+    assert!(!rendered_active_workspace(
+        &steady.replace("new · Steady", "new · Handoff"),
+        "Handoff",
+        "HANDOFF_ACTIVE_WORKSPACE"
+    ));
+}
+
+#[test]
 fn sidebar_row_click_ignores_notice_borders() {
     let screen = "┌─────────────────────────┐\n│● Endpoint unavailable   │\n└─────────────────────────┘\n   · local-returned      │\n";
     assert_eq!(
@@ -801,7 +841,11 @@ fn sidebar_row_click_tracks_restored_workspace_count() {
     for restored in [false, true] {
         let screen = format!(
             " machines                │\n                         │\n ▾ Local                 │local-returned in pane output\n{}   · local-returned      └─────────────────\n",
-            if restored { "   · restored            │\n" } else { "" }
+            if restored {
+                "   · restored            │\n"
+            } else {
+                ""
+            }
         );
         let row = if restored { 5 } else { 4 };
         assert_eq!(
@@ -935,15 +979,19 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             // the first rendered frame (the unavailable remote must not extend the wait). Retry
             // the write instead of assuming a single write lands, matching the recovered-Local
             // path below.
-            assert!(wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                if read_output(&output).contains("LOCAL_DIRECT_READY") {
-                    return true;
-                }
-                input
-                    .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' DIRECT_READY"))
-                    .unwrap();
-                false
-            }), "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}", read_output(&output));
+            assert!(
+                wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+                    if read_output(&output).contains("LOCAL_DIRECT_READY") {
+                        return true;
+                    }
+                    input
+                        .write_all(&retry_shell_line("printf 'LOCAL_%s\\n' DIRECT_READY"))
+                        .unwrap();
+                    false
+                }),
+                "Local must accept input without waiting for SSH (remote selected: {select_remote}): {}",
+                read_output(&output)
+            );
             let text = read_output(&output);
             assert!(!text.contains("Local: connecting"), "{text}");
             assert!(!text.contains("Local: reconnecting"), "{text}");
@@ -955,6 +1003,101 @@ fn federated_launch_opens_local_directly_while_saved_ssh_is_unavailable() {
             r#"{"id":"stop","method":"server.stop","params":{}}"#,
         );
         cleanup_test_base(&base);
+    }
+}
+
+#[test]
+fn detached_handoff_importer_is_stopped_before_runtime_removal() {
+    let _lock = test_lock();
+    for early_failure in [false, true] {
+        let base = unique_test_dir();
+        let config = base.join("config");
+        let runtime = base.join("runtime");
+        let api = runtime.join("herdr.sock");
+        let mut owned_pids = None;
+        let exercise =
+            || -> Result<(), &'static str> {
+                let mut cleanup = support::ScopedHandoffServer::new(&base);
+                let original =
+                    spawn_server(&config, &runtime, &api, &runtime.join("herdr-client.sock"));
+                wait_for_socket(&api, Duration::from_secs(10));
+                cleanup.track_original(original.child.process_id().unwrap());
+                let created = send_json_request(&api, &serde_json::json!({
+                "id": "cleanup-workload", "method": "workspace.create", "params": {"cwd": base}
+            }).to_string());
+                let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+                let process = send_json_request(&api, &serde_json::json!({
+                "id": "cleanup-shell", "method": "pane.process_info", "params": {"pane_id": pane}
+            }).to_string());
+                let shell_pid = process["result"]["process_info"]["shell_pid"]
+                    .as_u64()
+                    .unwrap() as u32;
+                let importer = cleanup.importer_exe();
+                let output = crate::test_command::herdr_command()
+                    .args([
+                        "server",
+                        "live-handoff",
+                        "--import-exe",
+                        importer.to_str().unwrap(),
+                    ])
+                    .env("HOME", runtime.join("home"))
+                    .env("TMPDIR", runtime.join("tmp"))
+                    .env("XDG_CONFIG_HOME", &config)
+                    .env("XDG_STATE_HOME", runtime.join("state"))
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env("HERDR_SOCKET_PATH", &api)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let importer_pid = if early_failure {
+                    // Simulate failing before the caller can track the CLI result/socket.
+                    // Drop must recover ownership from the pre-registered wrapper record.
+                    let record = fs::read_to_string(base.join("importer-0.owner")).unwrap();
+                    record.lines().next().unwrap().parse().unwrap()
+                } else {
+                    cleanup.track_importer()
+                };
+                owned_pids = Some((importer_pid, shell_pid));
+                assert!(support::test_process_running(importer_pid));
+                drop(original);
+                assert!(
+                    support::test_process_running(importer_pid),
+                    "original child is not the importer owner"
+                );
+                assert!(
+                    runtime.exists(),
+                    "runtime must remain until importer termination"
+                );
+                if early_failure {
+                    return Err("simulated failure immediately after CLI handoff");
+                }
+                cleanup.stop_and_cleanup().unwrap();
+                Ok(())
+            };
+        let mut exercise = exercise;
+        assert_eq!(exercise().is_err(), early_failure);
+        let (importer_pid, shell_pid) = owned_pids.unwrap();
+        assert!(
+            !support::test_process_running(importer_pid),
+            "detached importer must terminate within test scope"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                !support::test_process_running(shell_pid)
+            }),
+            "imported scratch shell must also terminate"
+        );
+        assert!(
+            !base.exists(),
+            "remove runtime only after verified termination"
+        );
+        eprintln!(
+            "cleanup early_failure={early_failure} importer={importer_pid} shell={shell_pid} terminated; runtime removed"
+        );
     }
 }
 
@@ -975,6 +1118,10 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     let handoff_config = handoff_base.join("config");
     let handoff_runtime = handoff_base.join("runtime");
     let handoff_api = handoff_runtime.join("herdr.sock");
+    // Declared before processes so unwinding drops clients/original children first,
+    // then stops detached importers before removing their exact private runtime.
+    let mut steady_cleanup = support::ScopedHandoffServer::new(&steady_base);
+    let mut handoff_cleanup = support::ScopedHandoffServer::new(&handoff_base);
     let steady = spawn_server(
         &steady_config,
         &steady_runtime,
@@ -989,6 +1136,8 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     );
     wait_for_socket(&steady_api, Duration::from_secs(10));
     wait_for_socket(&handoff_api, Duration::from_secs(10));
+    steady_cleanup.track_original(steady.child.process_id().unwrap());
+    handoff_cleanup.track_original(handoff.child.process_id().unwrap());
     let create = |socket: &PathBuf, label: &str| {
         let response = send_json_request(
             socket,
@@ -1004,8 +1153,22 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
             .unwrap()
             .to_owned()
     };
-    create(&steady_api, "steady-ready");
+    let steady_workspace = create(&steady_api, "steady-ready");
     let first = create(&handoff_api, "handoff-ready");
+    let steady_pane = first_pane_id_in_workspace(&steady_api, &steady_workspace);
+    let handoff_pane = first_pane_id_in_workspace(&handoff_api, &first);
+    // Only the active workspace's pane surface is rendered; inventories alone cannot
+    // distinguish an ignored workspace click from a successful selection.
+    send_pane_shell_command(
+        &steady_api,
+        &steady_pane,
+        "printf 'STEADY_ACTIVE_WORKSPACE\\n'",
+    );
+    send_pane_shell_command(
+        &handoff_api,
+        &handoff_pane,
+        "printf 'HANDOFF_ACTIVE_WORKSPACE\\n'",
+    );
     let snapshot_data = || {
         let mut stream = UnixStream::connect(handoff_runtime.join("herdr-client.sock")).unwrap();
         stream
@@ -1189,6 +1352,13 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
             .unwrap();
         }
     };
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
+            rendered_active_workspace(&screen(), "Steady", "STEADY_ACTIVE_WORKSPACE")
+        }),
+        "bootstrap must render Steady's active workspace: {}",
+        screen()
+    );
     save_evidence("bootstrap");
     let mut input = client._master.as_ref().unwrap().take_writer().unwrap();
     let mut count = 1;
@@ -1200,10 +1370,11 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
                 .unwrap();
             assert!(
                 wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                    machines_ready(count)
+                    rendered_active_workspace(&screen(), "Handoff", "HANDOFF_ACTIVE_WORKSPACE")
+                        && machines_ready(count)
                 }),
-                "selected handoff machine must be ready: {}",
-                status()
+                "selected handoff workspace must actually render after the click: {}",
+                screen()
             );
         }
         while count < workspaces {
@@ -1269,8 +1440,19 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
             "both machine counts must be current before handoff: {}",
             status()
         );
+        let (active_endpoint, active_marker) = if workspaces >= 100 && !inactive_large {
+            ("Handoff", "HANDOFF_ACTIVE_WORKSPACE")
+        } else {
+            ("Steady", "STEADY_ACTIVE_WORKSPACE")
+        };
+        assert!(
+            rendered_active_workspace(&screen(), active_endpoint, active_marker),
+            "before {workspaces}: expected active {active_endpoint} workspace: {}",
+            screen()
+        );
         save_evidence(&format!("before-{workspaces}"));
         let log_watermark = client_log().len();
+        let importer_exe = handoff_cleanup.importer_exe();
         let handoff_result = cli(
             &handoff_config,
             &handoff_runtime,
@@ -1279,9 +1461,10 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
                 "server",
                 "live-handoff",
                 "--import-exe",
-                env!("CARGO_BIN_EXE_herdr"),
+                importer_exe.to_str().unwrap(),
             ],
         );
+        handoff_cleanup.track_importer();
         eprintln!(
             "actual CLI live-handoff workspaces={workspaces} binary={} result={}",
             env!("CARGO_BIN_EXE_herdr"),
@@ -1311,6 +1494,7 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
                 && tail.contains("endpoint handshake succeeded")
                 && text.contains(&label)
                 && text.contains("Steady")
+                && rendered_active_workspace(&text, active_endpoint, active_marker)
                 && machine_online
                 && !text.contains("reconnecting")
                 && fresh_generation
@@ -1353,6 +1537,11 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
             )
             .unwrap();
         }
+        assert!(
+            rendered_active_workspace(&screen(), active_endpoint, active_marker),
+            "after {workspaces}: expected retained active {active_endpoint} workspace: {}",
+            screen()
+        );
         save_evidence(&format!("after-{workspaces}"));
         eprintln!(
             "handoff workspaces={workspaces} recovered={recovered} readout={}\n{}",
@@ -1368,8 +1557,8 @@ fn federated_saved_machines_recover_snapshots_after_live_handoff() {
     drop(client);
     drop(handoff);
     drop(steady);
-    cleanup_test_base(&handoff_base);
-    cleanup_test_base(&steady_base);
+    handoff_cleanup.stop_and_cleanup().unwrap();
+    steady_cleanup.stop_and_cleanup().unwrap();
     cleanup_test_base(&base);
 }
 
