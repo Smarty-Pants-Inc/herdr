@@ -61,6 +61,11 @@ impl ClientShellState {
                 .then_some(self.config.agent_panel_sort),
             collapsed_groups,
             remote_collapsed_groups,
+            grouped_collapsed: {
+                let mut keys = self.grouped_collapsed.iter().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys.into_iter().map(Into::into).collect()
+            },
         };
         if let Err(error) = preferences::store(path, preferences) {
             self.set_endpoint_error(error);
@@ -68,11 +73,36 @@ impl ClientShellState {
         }
     }
 
+    pub(super) fn apply_client_live_config(
+        &mut self,
+        config: &Config,
+        diagnostics: &[String],
+        invalid_sections: &[String],
+    ) -> Vec<String> {
+        let previous_grouping = self.config.grouping.clone();
+        let diagnostics = self
+            .config
+            .apply_live_config(config, diagnostics, invalid_sections);
+        if self.config.grouping != previous_grouping {
+            // Cached Machines hits must not survive an opt-in switch either.
+            self.hits = ShellHitMap::default();
+            self.workspace_press = None;
+            if matches!(self.chrome_drag, Some(ClientChromeDrag::Workspace { .. })) {
+                self.chrome_drag = None;
+            }
+            self.invalidate_grouped_projection();
+            self.workspace_scroll = 0;
+            self.mobile_switcher_scroll = 0;
+            self.reveal_focused_workspace = true;
+        }
+        diagnostics
+    }
+
     pub(crate) fn reload_client_config(&mut self) {
         match crate::config::load_live_config() {
             Ok(loaded) => {
                 let agent_panel_sort = self.config.agent_panel_sort;
-                let diagnostics = self.config.apply_live_config(
+                let diagnostics = self.apply_client_live_config(
                     &loaded.config,
                     &loaded.diagnostics,
                     &loaded.invalid_sections,
@@ -122,6 +152,7 @@ impl ClientShellConfig {
             tab_bar_position: config.ui.tab_bar_position,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             spaces: config.ui.sidebar.spaces.clone(),
+            grouping: config.ui.sidebar.grouping.clone(),
             agents: config.ui.sidebar.agents.clone(),
             agent_panel_sort: config.ui.agent_panel_sort,
             status_indicators: config.ui.status_indicators,
@@ -324,6 +355,7 @@ impl ClientShellConfig {
                 self.tab_bar_position = ui.tab_bar_position;
                 self.hide_tab_bar_when_single_tab = ui.hide_tab_bar_when_single_tab;
                 self.spaces = ui.sidebar.spaces.clone();
+                self.grouping = ui.sidebar.grouping.clone();
                 self.agents = ui.sidebar.agents.clone();
                 self.agent_panel_sort = ui.agent_panel_sort;
                 self.status_indicators = ui.status_indicators;
