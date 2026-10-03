@@ -80,6 +80,9 @@ pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
 
 #[cfg(test)]
+pub(crate) use self::io::{test_config_dirs, TestConfigDirs};
+
+#[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {
     io::app_dir_name()
 }

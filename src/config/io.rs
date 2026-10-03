@@ -30,6 +30,12 @@ pub fn app_dir_name() -> &'static str {
 }
 
 pub fn config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) =
+        TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().as_ref().map(|dirs| dirs.config.clone()))
+    {
+        return dir;
+    }
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
@@ -40,6 +46,12 @@ pub fn config_dir() -> PathBuf {
 }
 
 pub fn state_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) =
+        TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().as_ref().map(|dirs| dirs.state.clone()))
+    {
+        return dir;
+    }
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
     }
@@ -49,9 +61,55 @@ pub fn state_dir() -> PathBuf {
     platform_state_dir()
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TestConfigDirPaths {
+    config: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIRS: std::cell::RefCell<Option<TestConfigDirPaths>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A thread-local config/state scope. Drop nested guards in reverse order.
+/// The marker prevents moving a guard to another thread and restoring its dirs.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct TestConfigDirs {
+    previous: Option<TestConfigDirPaths>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+/// Inject XDG home equivalents without touching process-wide environment.
+/// Both directory accessors append `app_dir_name()`, just as for XDG variables.
+/// Within the scope, `config_path()` is exactly
+/// `config_home.join(app_dir_name()).join("config.toml")`, ignoring
+/// `HERDR_CONFIG_PATH`. Unscoped tests retain the process override behavior.
+#[cfg(test)]
+pub(crate) fn test_config_dirs(config_home: &Path, state_home: &Path) -> TestConfigDirs {
+    let dirs = TestConfigDirPaths {
+        config: config_home.join(app_dir_name()),
+        state: state_home.join(app_dir_name()),
+    };
+    TestConfigDirs {
+        previous: TEST_CONFIG_DIRS.with(|current| current.replace(Some(dirs))),
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestConfigDirs {
+    fn drop(&mut self) {
+        let _ = TEST_CONFIG_DIRS.with(|current| current.replace(self.previous.take()));
+    }
+}
+
 /// Unit tests never fall back to the user's real config or state dirs
 /// (for example `~/.config/herdr/agent-detection`); tests that need a
-/// specific root still set `XDG_CONFIG_HOME` / `XDG_STATE_HOME`.
+/// specific root can use `test_config_dirs` instead of changing XDG variables.
 #[cfg(test)]
 fn test_root() -> PathBuf {
     std::env::temp_dir()
@@ -215,6 +273,14 @@ pub(super) fn resolve_config_relative_path(path: &Path) -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_CONFIG_DIRS.with(|dirs| {
+        dirs.borrow()
+            .as_ref()
+            .map(|dirs| dirs.config.join("config.toml"))
+    }) {
+        return path;
+    }
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
         return PathBuf::from(path);
     }
@@ -791,6 +857,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_config_dirs_nested_scopes_restore_both_homes() {
+        let outer_config = test_root().join("outer-config");
+        let outer_state = test_root().join("outer-state");
+        let inner_config = test_root().join("inner-config");
+        let inner_state = test_root().join("inner-state");
+        assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+        {
+            let _outer = test_config_dirs(&outer_config, &outer_state);
+            assert_eq!(config_dir(), outer_config.join(app_dir_name()));
+            assert_eq!(state_dir(), outer_state.join(app_dir_name()));
+            assert_eq!(
+                config_path(),
+                outer_config.join(app_dir_name()).join("config.toml")
+            );
+            {
+                let _inner = test_config_dirs(&inner_config, &inner_state);
+                assert_eq!(config_dir(), inner_config.join(app_dir_name()));
+                assert_eq!(state_dir(), inner_state.join(app_dir_name()));
+                assert_eq!(
+                    config_path(),
+                    inner_config.join(app_dir_name()).join("config.toml")
+                );
+            }
+            assert_eq!(config_dir(), outer_config.join(app_dir_name()));
+            assert_eq!(state_dir(), outer_state.join(app_dir_name()));
+            assert_eq!(
+                config_path(),
+                outer_config.join(app_dir_name()).join("config.toml")
+            );
+        }
+        assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+    }
+
+    #[test]
+    fn test_config_dirs_restore_on_unwind() {
+        let outer = test_root().join("unwind-outer");
+        let inner = test_root().join("unwind-inner");
+        let outer_guard = test_config_dirs(&outer, &outer.join("state"));
+        let result = std::panic::catch_unwind(|| {
+            let _inner = test_config_dirs(&inner, &inner.join("state"));
+            assert_eq!(config_dir(), inner.join(app_dir_name()));
+            assert_eq!(
+                config_path(),
+                inner.join(app_dir_name()).join("config.toml")
+            );
+            panic!("exercise config-dir cleanup");
+        });
+        assert!(result.is_err());
+        assert_eq!(config_dir(), outer.join(app_dir_name()));
+        assert_eq!(state_dir(), outer.join("state").join(app_dir_name()));
+        assert_eq!(
+            config_path(),
+            outer.join(app_dir_name()).join("config.toml")
+        );
+        drop(outer_guard);
+        assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+    }
+
+    #[test]
+    fn test_config_dirs_are_thread_local_and_not_inherited() {
+        let parent = test_root().join("concurrent-parent");
+        let _parent = test_config_dirs(&parent, &parent.join("state"));
+        let (a_ready, a_wait) = std::sync::mpsc::channel();
+        let (b_ready, b_wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for (name, ready, wait) in [
+                ("concurrent-a", a_ready, b_wait),
+                ("concurrent-b", b_ready, a_wait),
+            ] {
+                scope.spawn(move || {
+                    assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+                    let home = test_root().join(name);
+                    let guard = test_config_dirs(&home, &home.join("state"));
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("peer config scope installed before observations");
+                    assert_eq!(config_dir(), home.join(app_dir_name()));
+                    assert_eq!(state_dir(), home.join("state").join(app_dir_name()));
+                    assert_eq!(config_path(), home.join(app_dir_name()).join("config.toml"));
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("keep both config scopes live until observations finish");
+                    drop(guard);
+                    assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+                });
+            }
+        });
+        assert_eq!(config_dir(), parent.join(app_dir_name()));
+        assert_eq!(state_dir(), parent.join("state").join(app_dir_name()));
+        assert_eq!(
+            config_path(),
+            parent.join(app_dir_name()).join("config.toml")
+        );
+    }
+
+    #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
         let content = "onboarding = true\n[keys]\nprefix = \"ctrl+b\"\n";
         let updated = upsert_top_level_bool(content, "onboarding", false);
@@ -817,6 +979,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_uses_compact_actionable_banner() {
+        let home = test_root().join("summary-compact");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let diagnostics = vec![
             "one".to_string(),
             "two".to_string(),
@@ -833,6 +997,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_unknown_keys_compactly() {
+        let home = test_root().join("summary-unknown-keys");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let diagnostics = vec![
             "unknown config key ui.mouse_captur; ignoring key".to_string(),
             "unknown config key keys.new_tabb; ignoring key".to_string(),
@@ -846,6 +1012,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_keeps_mixed_diagnostics_generic() {
+        let home = test_root().join("summary-mixed");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let diagnostics = vec![
             "invalid ui config: invalid type: string; keeping current ui settings".to_string(),
             "unknown config key keys.new_tabb; ignoring key".to_string(),
@@ -859,6 +1027,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_default_fallback() {
+        let home = test_root().join("summary-default-fallback");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let diagnostics = vec![
             "config parse error: TOML parse error at line 33, column 8\n   |\n33 | type = \"popup\"\n   |        ^^^^^^^\nunknown variant `popup`; using defaults"
                 .to_string(),
@@ -872,6 +1042,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_unreadable_config_impact() {
+        let home = test_root().join("summary-unreadable");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let startup = vec!["config read error: permission denied; using defaults".to_string()];
         assert_eq!(
             config_diagnostic_summary(&startup).as_deref(),
@@ -888,6 +1060,8 @@ mod tests {
 
     #[test]
     fn config_diagnostic_summary_reports_retained_live_config() {
+        let home = test_root().join("summary-retained");
+        let _dirs = test_config_dirs(&home, &home.join("state"));
         let diagnostics = vec![
             "config parse error: TOML parse error at line 7, column 4; keeping current config"
                 .to_string(),
@@ -901,11 +1075,22 @@ mod tests {
 
     #[test]
     fn config_loaders_report_unreadable_path() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path =
             std::env::temp_dir().join(format!("herdr-config-unreadable-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        assert!(TEST_CONFIG_DIRS.with(|dirs| dirs.borrow().is_none()));
+        assert_eq!(config_path(), path);
+        {
+            let home = test_root().join("override-precedence");
+            let _dirs = test_config_dirs(&home, &home.join("state"));
+            assert_eq!(config_path(), home.join(app_dir_name()).join("config.toml"));
+        }
+        assert_eq!(config_path(), path);
 
         let startup = Config::load();
         assert!(startup
@@ -919,6 +1104,14 @@ mod tests {
             diagnostic.contains("config read error")
                 && diagnostic.contains("keeping current config")
         }));
+
+        assert_eq!(
+            config_diagnostic_summary(&startup.diagnostics),
+            Some(format!(
+                "herdr-config-unreadable-{} unreadable; using defaults; herdr config check",
+                std::process::id()
+            ))
+        );
 
         std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path);
@@ -1107,7 +1300,9 @@ mouse_captur = true
 
     #[test]
     fn startup_config_accepts_legacy_agent_panel_scope_without_warning() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
             "herdr-config-legacy-agent-panel-scope-{}.toml",
             std::process::id()
@@ -1125,7 +1320,9 @@ mouse_captur = true
 
     #[test]
     fn startup_config_load_warns_about_unknown_top_level_sections() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
             "herdr-config-unknown-section-{}.toml",
             std::process::id()
@@ -1243,7 +1440,9 @@ mouse_capture = false
 
     #[test]
     fn config_load_recovers_from_a_mid_file_bom() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
             "herdr-config-mid-file-bom-{}.toml",
             std::process::id()

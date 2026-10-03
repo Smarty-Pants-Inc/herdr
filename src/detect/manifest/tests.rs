@@ -41,31 +41,8 @@ id = "codex"
 }
 
 fn with_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
-    let old_config = std::env::var_os("XDG_CONFIG_HOME");
-    let old_state = std::env::var_os("XDG_STATE_HOME");
-    let base = std::env::temp_dir().join(format!(
-        "herdr-manifest-loader-{name}-{}",
-        std::process::id()
-    ));
-    let config_dir = base.join("config");
-    let state_dir = base.join("state");
-    let _ = std::fs::remove_dir_all(&base);
-    std::env::set_var("XDG_CONFIG_HOME", &config_dir);
-    std::env::set_var("XDG_STATE_HOME", &state_dir);
-    reload_manifests();
-    let result = f();
-    match old_config {
-        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
-    match old_state {
-        Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-        None => std::env::remove_var("XDG_STATE_HOME"),
-    }
-    reload_manifests();
-    let _ = std::fs::remove_dir_all(&base);
-    result
+    let _dirs = test_manifest_dirs(&format!("loader-{name}"));
+    f()
 }
 
 fn write_remote_codex(content: &str) {
@@ -86,6 +63,108 @@ fn write_local_codex(content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
     reload_manifests();
+}
+
+#[test]
+fn manifest_scope_unwind_restores_cache_and_allows_the_next_reload() {
+    with_manifest_dirs("unwind-outer", || {
+        write_remote_codex(&remote_manifest("9999.01.01.1", "idle", "outer-ready"));
+        let before = load_manifest(Agent::Codex).unwrap();
+        let config_before = crate::config::config_dir();
+        let state_before = crate::config::state_dir();
+        let mut failed_base = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dirs = test_manifest_dirs("unwind-inner");
+            failed_base = Some(dirs.base.clone());
+            write_local_codex(&local_manifest("blocked", "inner-ready"));
+            assert_eq!(
+                explain(Agent::Codex, "inner-ready").state,
+                AgentState::Blocked
+            );
+            panic!("exercise manifest fixture cleanup");
+        }));
+        assert!(result.is_err());
+        assert!(!failed_base.unwrap().exists());
+        assert_eq!(crate::config::config_dir(), config_before);
+        assert_eq!(crate::config::state_dir(), state_before);
+        let restored = load_manifest(Agent::Codex).unwrap();
+        assert!(Arc::ptr_eq(
+            &before.compiled_rules,
+            &restored.compiled_rules
+        ));
+        assert_eq!(explain(Agent::Codex, "outer-ready").state, AgentState::Idle);
+        assert_eq!(
+            explain(Agent::Codex, "inner-ready").state,
+            AgentState::Unknown
+        );
+
+        // A failed scope must not leak its custom cache or prevent a subsequent
+        // scope from using the normal full and partial reload paths.
+        with_manifest_dirs("unwind-next", || {
+            write_remote_codex(&remote_manifest("9999.01.01.1", "working", "next-ready"));
+            assert_eq!(
+                explain(Agent::Codex, "next-ready").state,
+                AgentState::Working
+            );
+            reload_manifests_for_agents(&[Agent::Codex]);
+            assert_eq!(
+                explain(Agent::Codex, "next-ready").state,
+                AgentState::Working
+            );
+        });
+        assert!(Arc::ptr_eq(
+            &before.compiled_rules,
+            &load_manifest(Agent::Codex).unwrap().compiled_rules
+        ));
+        reload_manifests();
+        assert_eq!(explain(Agent::Codex, "outer-ready").state, AgentState::Idle);
+    });
+    assert!(TEST_MANIFEST_CACHE.with(|cache| cache.borrow().is_none()));
+}
+
+#[test]
+fn parallel_manifest_scopes_do_not_publish_into_each_others_cache() {
+    let (a_ready, a_wait) = std::sync::mpsc::channel();
+    let (b_ready, b_wait) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let workers = [
+            ("parallel-a", "idle", AgentState::Idle, a_ready, b_wait),
+            (
+                "parallel-b",
+                "blocked",
+                AgentState::Blocked,
+                b_ready,
+                a_wait,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, state, expected, ready, wait)| {
+            scope.spawn(move || {
+                with_manifest_dirs(name, || {
+                    write_local_codex(&local_manifest(state, name));
+                    let original = load_manifest(Agent::Codex).unwrap();
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("peer fixture loaded before cache observations");
+                    // A globally shared cache would contain just one of the
+                    // two mutually exclusive fixtures after both loads.
+                    assert_eq!(explain(Agent::Codex, name).state, expected);
+                    assert!(Arc::ptr_eq(
+                        &original.compiled_rules,
+                        &load_manifest(Agent::Codex).unwrap().compiled_rules
+                    ));
+                    ready.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("keep both caches live until observations finish");
+                });
+                assert!(TEST_MANIFEST_CACHE.with(|cache| cache.borrow().is_none()));
+            })
+        })
+        .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
 }
 
 #[test]
@@ -348,10 +427,13 @@ fn compiled_rules_are_shared_until_manifest_reload() {
             AgentState::Working
         );
 
+        let cache = TEST_MANIFEST_CACHE.with(|cache| cache.borrow().as_ref().unwrap().clone());
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 let reloaded = &reloaded;
+                let cache = cache.clone();
                 scope.spawn(move || {
+                    let _cache = TestManifestCache::install(cache);
                     let loaded = load_manifest(Agent::Codex).unwrap();
                     assert_eq!(
                         loaded.compiled_rules.as_ptr(),

@@ -1173,6 +1173,9 @@ mod tests {
             let mut user = [0; 4];
             peer.read_exact(&mut user)
                 .expect("peer receives queued input");
+            // Close the endpoint even if parallel test forks inherited peer descriptors.
+            peer.shutdown(std::net::Shutdown::Both)
+                .expect("peer shutdown");
             (prompt_completed, enter_received, enter, user)
         });
 
@@ -1267,6 +1270,8 @@ mod tests {
             .expect("submission queues");
         let mut prompt = [0; 6];
         peer.read_exact(&mut prompt).expect("peer receives prompt");
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
 
         let err = completion
@@ -1296,6 +1301,8 @@ mod tests {
             )
             .expect("second submission queues");
 
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         let active_err = active
             .recv_timeout(Duration::from_secs(1))
@@ -1347,6 +1354,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
 
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         let err = match attempt_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1509,6 +1518,8 @@ mod tests {
         actor_socket
             .set_nonblocking(true)
             .expect("actor socket nonblocking");
+        peer.shutdown(std::net::Shutdown::Both)
+            .expect("peer shutdown");
         drop(peer);
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
 
