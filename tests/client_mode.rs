@@ -724,6 +724,85 @@ fn read_output(output: &SharedOutput) -> String {
         .clone()
 }
 
+/// Replay the original bytes: differential redraws can retain cells without
+/// ever emitting a contiguous raw marker, or erase a marker from the screen.
+fn read_screen(output: &SharedOutput) -> String {
+    let bytes = output
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .bytes
+        .clone();
+    terminal_screen::text(&bytes, 80, 24)
+}
+
+fn screens_contain_marker(outputs: &[(&str, &SharedOutput)], marker: &str) -> bool {
+    outputs
+        .iter()
+        .all(|(_, output)| read_screen(output).contains(marker))
+}
+
+fn screen_marker_diagnostics(outputs: &[(&str, &SharedOutput)], marker: &str) -> String {
+    let mut missing = Vec::new();
+    let details = outputs
+        .iter()
+        .map(|(name, output)| {
+            let bytes = output
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .bytes
+                .clone();
+            let screen = terminal_screen::text(&bytes, 80, 24);
+            let status = if screen.contains(marker) {
+                "visible"
+            } else {
+                missing.push(*name);
+                "MISSING"
+            };
+            let raw = String::from_utf8_lossy(&bytes);
+            let mut start = raw.len().saturating_sub(4096);
+            while !raw.is_char_boundary(start) {
+                start += 1;
+            }
+            let tail = &raw[start..];
+            format!(
+                "{name}: marker {marker:?} {status}; current screen:\n{screen}\nraw capture tail (<=4096 bytes): {tail:?}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("missing clients: {missing:?}\n{details}")
+}
+
+#[test]
+fn screen_marker_requires_both_current_client_screens() {
+    let marker = "PROOF_ALIVE_ANON_ACCEPTED";
+    let fragmented = b"PROOF_ALIVE_ALICE_A_AGAIN\x1b[1;13HANON_ACCEPTED\x1b[K";
+    let captured = |bytes: &[u8]| {
+        std::sync::Arc::new(Mutex::new(PtyOutput {
+            bytes: bytes.to_vec(),
+            text: String::from_utf8_lossy(bytes).into_owned(),
+        }))
+    };
+    let alice = captured(fragmented);
+    let bob = captured(format!("{marker}\r\x1b[2K").as_bytes());
+    assert!(!read_output(&alice).contains(marker));
+    assert!(read_screen(&alice).contains(marker));
+    assert!(read_output(&bob).contains(marker));
+    assert!(!read_screen(&bob).contains(marker));
+    let outputs = [("Alice", &alice), ("Bob", &bob)];
+    assert!(!screens_contain_marker(&outputs, marker));
+    let diagnostics = screen_marker_diagnostics(&outputs, marker);
+    assert!(diagnostics.contains("missing clients: [\"Bob\"]"));
+    assert!(diagnostics.contains(&format!("Bob: marker {marker:?} MISSING")));
+    assert!(diagnostics.contains("current screen:"));
+    assert!(diagnostics.contains("\\u{1b}[2K"));
+    let bob = captured(fragmented);
+    assert!(screens_contain_marker(
+        &[("Alice", &alice), ("Bob", &bob)],
+        marker
+    ));
+}
+
 /// Current captured byte length, used as a watermark so a test can search only
 /// the output emitted *after* a trigger. The teardown markers also appear in
 /// normal attach-phase output, so matching the whole buffer is meaningless.
@@ -2363,7 +2442,7 @@ fn sender_identity_two_real_clients_last_input() {
         socket: &PathBuf,
         pane: &str,
         writer: &mut dyn Write,
-        outputs: &[&SharedOutput],
+        outputs: &[(&str, &SharedOutput)],
         command: &str,
         marker: &str,
         user: &str,
@@ -2375,9 +2454,7 @@ fn sender_identity_two_real_clients_last_input() {
                 observed = last_input(socket, pane, false);
                 if observed["user"].as_str() == Some(user)
                     && observed["at"].as_u64().is_some_and(|at| at >= started)
-                    && outputs
-                        .iter()
-                        .all(|output| read_output(output).contains(marker))
+                    && screens_contain_marker(outputs, marker)
                 {
                     return true;
                 }
@@ -2387,11 +2464,8 @@ fn sender_identity_two_real_clients_last_input() {
                 writer.flush().unwrap();
                 false
             }),
-            "real {user} input must reach {pane}; last_input={observed}; outputs={:?}",
-            outputs
-                .iter()
-                .map(|output| read_output(output))
-                .collect::<Vec<_>>()
+            "real {user} input must reach {pane}; last_input={observed}; {}",
+            screen_marker_diagnostics(outputs, marker)
         );
         assert!(
             observed["at"].as_u64().unwrap() <= epoch_ms(),
@@ -2487,9 +2561,16 @@ fn sender_identity_two_real_clients_last_input() {
     );
     let (mut bob, output_b) =
         spawn_owned(base, &bob_config, &runtime, &api, &client_socket, "client");
-    let outputs = [&output_a, &output_b];
-    for output in &outputs {
-        wait_for_window_title(output, "PROOF:sender-proof");
+    let outputs = [("Alice", &output_a), ("Bob", &output_b)];
+    for (name, output) in &outputs {
+        let named_output = [(*name, *output)];
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+                screens_contain_marker(&named_output, "sender-proof")
+            }),
+            "{name} must render the sender-proof workspace before input; {}",
+            screen_marker_diagnostics(&named_output, "sender-proof")
+        );
     }
     assert_eq!(
         last_input(&api, &pane, false),
@@ -2620,11 +2701,10 @@ fn sender_identity_two_real_clients_last_input() {
     assert_eq!(last_input(&api, &pane, true), Value::Null);
     assert!(
         wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
-            outputs
-                .iter()
-                .all(|output| read_output(output).contains("PROOF_ALIVE_ANON_ACCEPTED"))
+            screens_contain_marker(&outputs, "PROOF_ALIVE_ANON_ACCEPTED")
         }),
-        "anonymous bytes must reach the preserved shell and both attached clients"
+        "anonymous bytes must reach the preserved shell and both attached clients; {}",
+        screen_marker_diagnostics(&outputs, "PROOF_ALIVE_ANON_ACCEPTED")
     );
     println!("3937 anonymous response={anonymous} pane={pane} result={{\"type\":\"pane_last_input\",\"last_input\":null}}");
     assert_eq!(
