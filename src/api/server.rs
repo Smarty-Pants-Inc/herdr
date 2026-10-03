@@ -27,8 +27,6 @@ use crate::ipc::{
     SocketFileIdentity,
 };
 
-mod pane_graphics_stream;
-
 #[cfg(test)]
 mod subscription_socket_tests;
 
@@ -203,62 +201,36 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        let mut retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
-        let mut retrying = false;
-        while listener_running.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok(stream) => {
-                    if !listener_running.load(Ordering::Relaxed) {
-                        break;
+        run_accept_loop(
+            std::iter::from_fn(|| Some(listener.accept())),
+            &listener_running,
+            server_stop.as_deref(),
+            ACCEPT_RETRY_INITIAL_DELAY,
+            ACCEPT_RETRY_MAX_DELAY,
+            |stream| {
+                let api_tx = api_tx.clone();
+                let event_hub = event_hub.clone();
+                let capabilities = capabilities.clone();
+                let server_stop = server_stop.clone();
+                let connection_running = Arc::clone(&listener_running);
+                #[cfg(unix)]
+                let ssh_agents = ssh_agents.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_connection_with_stop(
+                        stream,
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        server_stop.as_ref(),
+                        #[cfg(unix)]
+                        ssh_agents.as_ref(),
+                    ) {
+                        warn!(err = %err, "api connection failed");
                     }
-                    retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
-                    retrying = false;
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let server_stop = server_stop.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    #[cfg(unix)]
-                    let ssh_agents = ssh_agents.clone();
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                            #[cfg(unix)]
-                            ssh_agents.as_ref(),
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    // An empty nonblocking listener is idle, not a retry failure.
-                    std::thread::sleep(ACCEPT_RETRY_INITIAL_DELAY);
-                }
-                Err(err) if is_transient_accept_error(&err) => {
-                    if !listener_running.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if !retrying {
-                        warn!(err = %err, "temporary api listener accept failure; retrying with backoff");
-                        retrying = true;
-                    }
-                    std::thread::sleep(retry_delay);
-                    if !listener_running.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_MAX_DELAY);
-                }
-                Err(err) => {
-                    handle_fatal_accept_error(&err, &listener_running, server_stop.as_deref());
-                    break;
-                }
-            }
-        }
+                });
+            },
+        );
         debug!("api server thread exiting");
     });
 
@@ -267,6 +239,170 @@ fn start_server_inner(
         path,
         identity,
         running,
+    })
+}
+
+fn run_accept_loop<S>(
+    incoming: impl IntoIterator<Item = io::Result<S>>,
+    running: &AtomicBool,
+    server_stop: Option<&AtomicBool>,
+    initial_delay: Duration,
+    max_delay: Duration,
+    mut handle: impl FnMut(S),
+) {
+    let mut incoming = incoming.into_iter();
+    let mut consecutive_errors = 0_u64;
+    let mut retry_delay = initial_delay;
+    while running.load(Ordering::Relaxed) {
+        let Some(stream) = incoming.next() else {
+            break;
+        };
+        // Retirement can race with accept, including a successful queued accept.
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        match stream {
+            Ok(stream) => {
+                if consecutive_errors > 0 {
+                    info!(consecutive_errors, "api listener accept recovered");
+                    consecutive_errors = 0;
+                }
+                retry_delay = initial_delay;
+                handle(stream);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                // An empty nonblocking listener is idle, not a retry failure.
+                std::thread::sleep(initial_delay);
+            }
+            Err(err) if is_transient_accept_error(&err) => {
+                if consecutive_errors == 0 {
+                    warn!(err = %err, "temporary api listener accept failure; retrying with backoff");
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                std::thread::sleep(retry_delay);
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                retry_delay = (retry_delay * 2).min(max_delay);
+            }
+            Err(err) => {
+                handle_fatal_accept_error(&err, running, server_stop);
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+
+    fn accept_error() -> io::Result<u32> {
+        Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+    }
+
+    #[test]
+    fn keeps_serving_after_repeated_errors() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [Ok(1), accept_error(), accept_error(), Ok(2)],
+            &running,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn exits_when_shutdown_happens_while_errors_continue() {
+        let running = AtomicBool::new(true);
+        let mut attempts = 0;
+        let incoming = std::iter::from_fn(|| {
+            attempts += 1;
+            if attempts == 3 {
+                running.store(false, Ordering::Relaxed);
+            }
+            Some(accept_error())
+        });
+
+        run_accept_loop(
+            incoming,
+            &running,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| panic!("no connection should be handled"),
+        );
+
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn idle_nonblocking_accepts_keep_serving_after_transient_errors() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+        run_accept_loop(
+            [
+                Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                accept_error(),
+                Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                Ok(1),
+                accept_error(),
+                Ok(2),
+            ],
+            &running,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            |stream| handled.push(stream),
+        );
+        assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn retirement_during_successful_accept_discards_the_stream() {
+        let running = AtomicBool::new(true);
+        let incoming = std::iter::once_with(|| {
+            running.store(false, Ordering::Relaxed);
+            Ok(1)
+        });
+        run_accept_loop(
+            incoming,
+            &running,
+            None,
+            Duration::ZERO,
+            Duration::ZERO,
+            |_| panic!("retired listener must not handle a queued connection"),
+        );
+    }
+}
+
+fn retired_pane_graphics_method_error(line: &str, id: &str) -> Option<ErrorResponse> {
+    #[derive(serde::Deserialize)]
+    struct RequestMethod {
+        method: String,
+    }
+
+    let envelope = serde_json::from_str::<RequestMethod>(line).ok()?;
+    let method = envelope.method.as_str();
+    if !matches!(
+        method,
+        "pane.graphics.info" | "pane.graphics.set" | "pane.graphics.clear" | "pane.graphics.stream"
+    ) {
+        return None;
+    }
+
+    Some(ErrorResponse {
+        id: id.into(),
+        error: ErrorBody {
+            code: "unknown_method".into(),
+            message: format!("unknown method: {method}"),
+        },
     })
 }
 
@@ -345,16 +481,15 @@ fn handle_connection_with_stop(
             } else {
                 String::new()
             };
-            write_json_line_allow_disconnect(
-                &mut stream,
-                &ErrorResponse {
+            let response =
+                retired_pane_graphics_method_error(line, &id).unwrap_or_else(|| ErrorResponse {
                     id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
                     },
-                },
-            )?;
+                });
+            write_json_line_allow_disconnect(&mut stream, &response)?;
             return Ok(());
         }
     };
@@ -413,22 +548,6 @@ fn handle_connection_with_stop(
                 }
             }
             Ok(())
-        }
-        Method::PaneGraphicsStream(params) => {
-            let result =
-                pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    "stream_closed",
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
-                }
-            }
-            result
         }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
@@ -624,7 +743,6 @@ fn handle_request_with_context(
         context,
         response_write_complete,
         None,
-        None,
     )
 }
 
@@ -714,14 +832,6 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
-        Method::PaneGraphicsSet(_) => "pane.graphics.set",
-        Method::PaneGraphicsClear(_) => "pane.graphics.clear",
-        Method::PaneGraphicsInfo(_) => "pane.graphics.info",
-        Method::PaneGraphicsStream(_) => "pane.graphics.stream",
-        Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
-        Method::PaneGraphicsStreamDirect(_) => "pane.graphics.stream.direct",
-        Method::PaneGraphicsStreamOpen(_) => "pane.graphics.stream.open",
-        Method::PaneGraphicsStreamClose(_) => "pane.graphics.stream.close",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
@@ -1134,7 +1244,7 @@ pub(super) fn dispatch_to_app_with_timeout_and_context(
     timeout: Option<Duration>,
     context: ApiRequestContext,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, context, None, None, None)
+    dispatch_to_app(request, api_tx, timeout, context, None, None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1149,41 +1259,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         timeout,
         context,
         None,
-        None,
         Some(("timeout", "timed out waiting for agent status")),
-    )
-}
-
-pub(super) fn dispatch_stream_open(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    timeout: Duration,
-    active: Arc<AtomicBool>,
-) -> String {
-    dispatch_to_app(
-        request,
-        api_tx,
-        Some(timeout),
-        ApiRequestContext::default(),
-        None,
-        Some(active),
-        None,
-    )
-}
-
-pub(super) fn dispatch_stream_frame(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    active: Arc<AtomicBool>,
-) -> String {
-    dispatch_to_app(
-        request,
-        api_tx,
-        Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
-        ApiRequestContext::default(),
-        None,
-        Some(active),
-        None,
     )
 }
 
@@ -1193,22 +1269,16 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     context: ApiRequestContext,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
-    stream_active: Option<Arc<AtomicBool>>,
     timeout_response: Option<(&str, &str)>,
 ) -> String {
     let request_id = request.id.clone();
-    let request_active = stream_active.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         context,
         respond_to,
         response_write_complete,
-        stream_active,
     }) {
-        if let Some(active) = request_active {
-            active.store(false, Ordering::Release);
-        }
         return error_response_json(
             request_id,
             "server_unavailable",
@@ -1238,9 +1308,6 @@ fn dispatch_to_app(
     match response {
         Ok(response) => response,
         Err(err) => {
-            if let Some(active) = request_active {
-                active.store(false, Ordering::Release);
-            }
             if err.kind() == std::io::ErrorKind::TimedOut {
                 if let Some((code, message)) = timeout_response {
                     return error_response_json(request_id, code, message.into());
@@ -1819,6 +1886,93 @@ mod tests {
     }
 
     #[test]
+    fn removed_pane_graphics_methods_return_unknown_method_without_stream_upgrade() {
+        for method in [
+            "pane.graphics.info",
+            "pane.graphics.set",
+            "pane.graphics.clear",
+            "pane.graphics.stream",
+        ] {
+            let (mut client, server, _path) = local_stream_pair("removed-pane-graphics");
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            writeln!(
+                client,
+                "{{\"id\":\"removed\",\"method\":\"{method}\",\"params\":{{}}}}"
+            )
+            .unwrap();
+            client.flush().unwrap();
+
+            handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+            )
+            .unwrap();
+
+            let response = read_line(&mut client);
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], "removed", "{method}");
+            assert_eq!(response["error"]["code"], "unknown_method", "{method}");
+            assert!(response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(method)));
+            assert!(response.get("result").is_none(), "{method}");
+            assert!(api_rx.try_recv().is_err(), "{method} reached the app");
+        }
+    }
+
+    #[test]
+    fn unrelated_unknown_method_retains_standard_invalid_request_response() {
+        let (mut client, server, _path) = local_stream_pair("unknown-api-request");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        client
+            .write_all(b"{\"id\":\"unknown\",\"method\":\"nope\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "unknown");
+        assert_eq!(response["error"]["code"], "invalid_request");
+        assert!(api_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ordinary_api_request_still_uses_normal_connection_path() {
+        let (mut client, server, _path) = local_stream_pair("ordinary-api-request");
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        client
+            .write_all(b"{\"id\":\"ordinary\",\"method\":\"ping\",\"params\":{}}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response = read_line(&mut client);
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "ordinary");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
     fn ping_request_returns_pong() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
@@ -2358,41 +2512,5 @@ mod tests {
         assert_eq!(response["error"]["code"], "cross_pane_input_denied");
         server_thread.join().unwrap().unwrap();
         let _ = std::fs::remove_file(path);
-    }
-}
-
-#[cfg(test)]
-mod pane_graphics_request_tests {
-    use super::*;
-    use base64::Engine as _;
-
-    #[test]
-    fn maximum_public_graphics_request_fits_initial_json_line() {
-        let request = Request {
-            id: "graphics-max".into(),
-            method: Method::PaneGraphicsSet(crate::api::schema::PaneGraphicsSetParams {
-                pane_id: "pane_1".into(),
-                layer_id: None,
-                z_index: 0,
-                owner: String::new(),
-                format: crate::api::schema::PaneGraphicsFormat::Png,
-                image_width: 1,
-                image_height: 1,
-                data_base64: base64::engine::general_purpose::STANDARD
-                    .encode(vec![1_u8; crate::api::schema::PANE_GRAPHICS_SET_MAX_BYTES]),
-                data: None,
-                placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
-            }),
-        };
-        let encoded = serde_json::to_vec(&request).unwrap();
-
-        assert!(encoded.len() < MAX_INITIAL_REQUEST_BYTES);
-    }
-
-    #[test]
-    fn duplicate_method_cannot_be_reinterpreted_as_graphics_stream() {
-        let encoded = r#"{"id":"duplicate","method":"ping","method":"pane.graphics.stream","params":{"pane_id":"pane_1"}}"#;
-
-        assert!(serde_json::from_str::<Request>(encoded).is_err());
     }
 }

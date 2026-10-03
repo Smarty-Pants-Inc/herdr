@@ -65,6 +65,9 @@ pub struct EndpointClientHello {
     /// Accept the optional surface-delta encoding on this connection.
     #[serde(default)]
     pub surface_delta: bool,
+    /// Accept the optional scroll-aware patch encoding on this connection.
+    #[serde(default)]
+    pub surface_scroll: bool,
     #[serde(default)]
     pub snapshot_codecs: Vec<String>,
     #[serde(default)]
@@ -173,6 +176,7 @@ impl EndpointServerWelcome {
             capabilities: vec![
                 super::surface_reuse::CAPABILITY.into(),
                 super::surface_delta::CAPABILITY.into(),
+                super::surface_scroll::CAPABILITY.into(),
                 SURFACE_INTEREST_CAPABILITY.into(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
                 HEALTH_CHECK_CAPABILITY.into(),
@@ -219,6 +223,7 @@ mod tests {
             surface_active: true,
             surface_reuse: false,
             surface_delta: false,
+            surface_scroll: false,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
             surface_codecs: vec![SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
@@ -243,14 +248,16 @@ mod tests {
     fn hello_user_is_optional_and_old_servers_ignore_it() {
         let mut named = hello();
         named.user = Some("Alice".into());
+        named.surface_scroll = true;
         let value = serde_json::to_value(&named).unwrap();
         assert_eq!(
             serde_json::from_value::<EndpointClientHello>(value.clone()).unwrap(),
             named
         );
 
-        // The old server's required baseline fields still decode, while unknown JSON
-        // metadata is ignored. Compare every original field, not just generation.
+        // The pre-scroll server's required baseline fields still decode, while user
+        // metadata and the enabled scroll extension are ignored. Compare every original
+        // field, not just generation.
         #[derive(Serialize, Deserialize)]
         struct OldHello {
             generation: u32,
@@ -279,10 +286,12 @@ mod tests {
             capabilities: Vec<String>,
         }
         let old: OldHello = serde_json::from_value(value.clone()).unwrap();
+        let mut baseline = serde_json::to_value(hello()).unwrap();
         assert_eq!(
-            serde_json::to_value(old).unwrap(),
-            serde_json::to_value(hello()).unwrap()
+            baseline.as_object_mut().unwrap().remove("surface_scroll"),
+            Some(serde_json::json!(false))
         );
+        assert_eq!(serde_json::to_value(old).unwrap(), baseline);
         // A real legacy decoder still rejects malformed load-bearing baseline fields.
         let mut invalid = value;
         invalid["generation"] = serde_json::json!("not a number");
@@ -439,10 +448,12 @@ mod tests {
         value.as_object_mut().unwrap().remove("surface_active");
         value.as_object_mut().unwrap().remove("surface_reuse");
         value.as_object_mut().unwrap().remove("surface_delta");
+        value.as_object_mut().unwrap().remove("surface_scroll");
         let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
         assert!(decoded.surface_active);
         assert!(!decoded.surface_reuse);
         assert!(!decoded.surface_delta);
+        assert!(!decoded.surface_scroll);
     }
 
     #[test]
@@ -453,6 +464,7 @@ mod tests {
             vec![
                 super::super::surface_reuse::CAPABILITY.to_string(),
                 super::super::surface_delta::CAPABILITY.to_string(),
+                super::super::surface_scroll::CAPABILITY.to_string(),
                 SURFACE_INTEREST_CAPABILITY.to_string(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.to_string(),
                 HEALTH_CHECK_CAPABILITY.to_string(),

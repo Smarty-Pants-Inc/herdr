@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use portable_pty::{native_pty_system, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 // No real SSH connection or server is started. Stop at startup after recording setup actions.
 const SSH: &str = r#"#!/bin/sh
@@ -23,7 +23,7 @@ if [ "$FAKE_STRICT_HOST_KEY_FAILURE" = yes ] && [ "$strict_host_key_check" = yes
     exit 255
 fi
 if [ "$last" = 'command -v herdr' ]; then
-    echo /home/remote/.local/bin/herdr
+    if [ "$FAKE_INSTALLED" != missing ]; then echo /home/remote/.local/bin/herdr; fi
     exit 0
 fi
 case "$last" in
@@ -35,8 +35,10 @@ case "$last" in
 esac
 printf '\n%s\n' 'herdr-remote-output-ready:1'
 case "$script" in
-    *'uname -s'*) uname -s; uname -m ;;
-    *'version='*) echo /home/remote/.local/bin/herdr ;;
+    *'uname -s'*) echo platform >>"$FAKE_ROOT/probes"; uname -s; uname -m ;;
+    *'version='*)
+        echo candidates >>"$FAKE_ROOT/probes"
+        if [ "$FAKE_INSTALLED" != missing ]; then echo /home/remote/.local/bin/herdr; fi ;;
     *'status client --json'*)
         if [ "$FAKE_INSTALLED" = new ] || [ -f "$FAKE_ROOT/installed" ]; then
             printf '%s\n' "$FAKE_CLIENT_STATUS"
@@ -53,10 +55,17 @@ case "$script" in
         fi ;;
     *'server live-handoff'*) echo handoff >>"$FAKE_ROOT/actions"; exit 1 ;;
     *'server stop'*) echo stop >>"$FAKE_ROOT/actions"; touch "$FAKE_ROOT/stopped" ;;
-    *'remote-client-bridge'*) echo start >>"$FAKE_ROOT/actions"; echo 'test startup failure' >&2; exit 1 ;;
+    *'session list --json'*)
+        echo sessions >>"$FAKE_ROOT/probes"
+        if [ "$FAKE_SESSIONS" = failed ]; then echo 'session query denied' >&2; exit 1; fi
+        printf '%s\n' "$FAKE_SESSIONS" ;;
+    *'remote-client-bridge'*)
+        printf '%s\n' "$script" >"$FAKE_ROOT/start-command"
+        echo start >>"$FAKE_ROOT/actions"; echo 'test startup failure' >&2; exit 1 ;;
     *'mkdir -p'*) printf '/fake/tmp\000/fake/herdr\000' ;;
     *'chmod 755'*) echo install >>"$FAKE_ROOT/actions"; touch "$FAKE_ROOT/installed" ;;
-    *'command -v herdr'*) echo /home/remote/.local/bin/herdr ;;
+    *'command -v herdr'*) if [ "$FAKE_INSTALLED" != missing ]; then echo /home/remote/.local/bin/herdr; fi ;;
+    *'test -x '*) exit 1 ;;
     *) echo "unexpected fake SSH script: $script" >&2; exit 1 ;;
 esac
 "#;
@@ -66,6 +75,16 @@ struct SetupResult {
     actions: String,
     prompts: usize,
     success: bool,
+    probes: String,
+    start_command: String,
+}
+
+#[derive(Default)]
+struct SetupOptions<'a> {
+    sessions: Option<&'a str>,
+    selection: &'a [u8],
+    explicit_session: Option<&'a str>,
+    noninteractive: bool,
 }
 
 fn setup(installed: &str, answer: &str, handoff: bool) -> SetupResult {
@@ -78,13 +97,33 @@ fn setup_with_strict_host_key_failure(
     handoff: bool,
     strict_host_key_failure: bool,
 ) -> SetupResult {
+    setup_options(
+        installed,
+        answer,
+        handoff,
+        strict_host_key_failure,
+        SetupOptions::default(),
+    )
+}
+
+fn setup_options(
+    installed: &str,
+    answer: &str,
+    handoff: bool,
+    strict_host_key_failure: bool,
+    options: SetupOptions<'_>,
+) -> SetupResult {
     let root = std::path::PathBuf::from(format!(
-        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}",
+        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}-{}",
         std::process::id(),
         installed,
         answer.trim().is_empty(),
         handoff,
-        strict_host_key_failure
+        strict_host_key_failure,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let app = if cfg!(debug_assertions) {
         "herdr-dev"
@@ -112,6 +151,9 @@ fn setup_with_strict_host_key_failure(
         command.args(["--remote", "fake-host", "--handoff"]);
     } else {
         command.args(["machine", "add", "fake-host", "--label", "VPS"]);
+        if let Some(session) = options.explicit_session {
+            command.args(["--remote-session", session]);
+        }
     }
     command.env(
         "PATH",
@@ -124,6 +166,12 @@ fn setup_with_strict_host_key_failure(
     command.env("FAKE_ROOT", &root);
     command.env("FAKE_INSTALLED", installed);
     command.env(
+        "FAKE_SESSIONS",
+        options
+            .sessions
+            .unwrap_or(r#"{"sessions":[{"name":"default","running":true}]}"#),
+    );
+    command.env(
         "FAKE_STRICT_HOST_KEY_FAILURE",
         if strict_host_key_failure { "yes" } else { "no" },
     );
@@ -131,6 +179,18 @@ fn setup_with_strict_host_key_failure(
         "FAKE_CLIENT_STATUS",
         String::from_utf8(status.stdout).unwrap(),
     );
+    if options.noninteractive {
+        // A redirected stdin makes machine add non-interactive while retaining
+        // the same isolated SSH fixture and captured terminal diagnostics.
+        let mut shell = CommandBuilder::new("/bin/sh");
+        shell.args(["-c", "exec \"$@\" </dev/null", "sh"]);
+        shell.args(command.get_argv());
+        shell.env_clear();
+        for (key, value) in command.iter_full_env() {
+            shell.env(key, value);
+        }
+        command = shell;
+    }
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().unwrap();
@@ -147,10 +207,16 @@ fn setup_with_strict_host_key_failure(
     let mut output = String::new();
     let mut prompts = 0;
     let mut timed_out = false;
+    let mut picked = false;
     loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
             Ok(bytes) => {
                 output.push_str(&String::from_utf8_lossy(&bytes));
+                if !picked && output.contains("Esc cancel") {
+                    writer.write_all(options.selection).unwrap();
+                    writer.flush().unwrap();
+                    picked = true;
+                }
                 let count = output.matches("[y/N]").count() + output.matches("[Y/n]").count();
                 if count > prompts {
                     writer
@@ -177,6 +243,8 @@ fn setup_with_strict_host_key_failure(
     drop(pair.master);
     reading.join().unwrap();
     let actions = fs::read_to_string(root.join("actions")).unwrap_or_default();
+    let probes = fs::read_to_string(root.join("probes")).unwrap_or_default();
+    let start_command = fs::read_to_string(root.join("start-command")).unwrap_or_default();
     // Every scenario either cancels or reaches the intentionally failed startup.
     let saved = root
         .join("state")
@@ -194,6 +262,8 @@ fn setup_with_strict_host_key_failure(
         actions,
         prompts,
         success: status.success(),
+        probes,
+        start_command,
     }
 }
 
@@ -238,6 +308,155 @@ fn machine_add_accepts_help_argument_order() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("machine was not saved"), "{stderr}");
     assert!(!saved, "failed preparation must not save a machine");
+}
+
+#[test]
+fn machine_add_fresh_host_offers_installation_and_cancellation_saves_nothing() {
+    let result = setup("missing", "n\n", false);
+    assert_eq!(result.probes, "platform\ncandidates\n", "{}", result.output);
+    assert_eq!(result.prompts, 1, "{}", result.output);
+    assert!(
+        result.output.contains("installation cancelled"),
+        "{}",
+        result.output
+    );
+    assert!(result.actions.is_empty(), "{}", result.output);
+}
+
+#[test]
+fn machine_add_discovers_sessions_once_and_prepares_the_selected_session() {
+    for (sessions, selection, expected) in [
+        (r#"{"sessions":[]}"#, &b""[..], "default"),
+        (
+            r#"{"extra":1,"sessions":[{"name":"stopped","running":false},{"name":"bad/name","running":true},{"name":"agents","running":true,"future":true}]}"#,
+            &b""[..],
+            "agents",
+        ),
+        (
+            r#"{"sessions":[{"name":"default","running":true},{"name":"agents","running":true}]}"#,
+            &b"\x1b[B\r"[..],
+            "agents",
+        ),
+    ] {
+        let result = setup_options(
+            "new",
+            "y\n",
+            false,
+            false,
+            SetupOptions {
+                sessions: Some(sessions),
+                selection,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            result.probes, "platform\ncandidates\nsessions\n",
+            "{}",
+            result.output
+        );
+        assert_eq!(result.actions, "stop\nstart\n", "{}", result.output);
+        if expected == "default" {
+            assert!(
+                !result.start_command.contains("--session"),
+                "{}",
+                result.start_command
+            );
+        } else {
+            assert!(
+                result.start_command.contains("--session agents"),
+                "{}",
+                result.start_command
+            );
+        }
+        if !selection.is_empty() {
+            let picker = result
+                .output
+                .split("Running sessions on fake-host:")
+                .nth(1)
+                .unwrap();
+            assert!(
+                picker.starts_with("\r\n"),
+                "picker did not return to column zero: {picker:?}"
+            );
+            assert!(picker.contains("default\u{1b}[0m\r\n"), "{picker:?}");
+            assert!(picker.contains("  agents\r\n"), "{picker:?}");
+        }
+    }
+}
+
+#[test]
+fn machine_add_failed_discovery_and_cancel_never_prepare_or_save() {
+    for (sessions, selection, expected) in [
+        ("failed", &b""[..], "session query denied"),
+        ("not json", &b""[..], "--remote-session"),
+        (
+            r#"{"sessions":[{"name":"agents"}]}"#,
+            &b""[..],
+            "--remote-session",
+        ),
+        (
+            r#"{"sessions":[{"name":"default","running":true},{"name":"agents","running":true}]}"#,
+            &b"\x1b"[..],
+            "selection cancelled",
+        ),
+    ] {
+        let result = setup_options(
+            "new",
+            "y\n",
+            false,
+            false,
+            SetupOptions {
+                sessions: Some(sessions),
+                selection,
+                ..Default::default()
+            },
+        );
+        assert!(!result.success, "{}", result.output);
+        assert!(result.actions.is_empty(), "{}", result.output);
+        assert!(result.output.contains(expected), "{}", result.output);
+        assert!(
+            result.output.contains("machine was not saved"),
+            "{}",
+            result.output
+        );
+    }
+}
+
+#[test]
+fn machine_add_skips_discovery_for_scripts_and_explicit_sessions() {
+    for (noninteractive, explicit_session) in [
+        (true, None),
+        (true, Some("agents")),
+        (false, Some("agents")),
+    ] {
+        let result = setup_options(
+            "new",
+            "y\n",
+            false,
+            false,
+            SetupOptions {
+                noninteractive,
+                explicit_session,
+                sessions: Some("failed"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.probes, "platform\ncandidates\n", "{}", result.output);
+        assert!(
+            result.output.contains(if explicit_session.is_some() {
+                "session agents"
+            } else {
+                "session default"
+            }),
+            "{}",
+            result.output
+        );
+        if noninteractive {
+            assert!(result.actions.is_empty(), "{}", result.output);
+        } else {
+            assert_eq!(result.actions, "stop\nstart\n", "{}", result.output);
+        }
+    }
 }
 
 #[test]

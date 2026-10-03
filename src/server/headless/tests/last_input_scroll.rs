@@ -49,6 +49,7 @@ fn setup() -> (
         surface_active: true,
         surface_reuse: false,
         surface_delta: false,
+        surface_scroll: false,
         media_capable: true,
         writer,
     });
@@ -130,7 +131,6 @@ fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     let response: serde_json::Value =
         serde_json::from_str(&response.try_recv().expect("immediate last-input response")).unwrap();

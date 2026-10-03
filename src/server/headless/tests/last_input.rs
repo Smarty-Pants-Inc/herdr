@@ -19,6 +19,7 @@ pub(super) fn connect(
         surface_active: true,
         surface_reuse: false,
         surface_delta: false,
+        surface_scroll: false,
         media_capable: true,
         writer,
     });
@@ -39,7 +40,6 @@ fn request(server: &mut HeadlessServer, method: api::schema::Method) -> serde_js
         },
         respond_to,
         response_write_complete: None,
-        stream_active: None,
     });
     serde_json::from_str(&response.try_recv().expect("immediate response")).unwrap()
 }
