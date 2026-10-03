@@ -34,6 +34,10 @@ enum RuntimeExitAction {
 impl App {
     pub(crate) fn handle_internal_event_with_render_impact(&mut self, ev: AppEvent) -> bool {
         match ev {
+            AppEvent::GitFilesChanged => {
+                self.handle_git_files_changed(Instant::now());
+                false
+            }
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
@@ -80,6 +84,7 @@ impl App {
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        self.sync_git_watches();
         if changed {
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
@@ -116,6 +121,11 @@ impl App {
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
         ) {
+            return Vec::new();
+        }
+
+        if matches!(ev, AppEvent::GitFilesChanged) {
+            self.handle_git_files_changed(Instant::now());
             return Vec::new();
         }
 
