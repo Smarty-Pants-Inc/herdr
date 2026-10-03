@@ -196,6 +196,8 @@ fn apply_scroll(
     Ok(false)
 }
 
+/// Returns whether input was actually enqueued, not whether it was a new
+/// interaction. Raw key/mouse releases still need delivery to the child.
 pub(super) fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
     data: Vec<u8>,
@@ -521,6 +523,62 @@ mod tests {
             &[ClientPaneInputEvent::TextCommit("rejected".to_owned())],
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_release_receipts_preserve_exact_bytes() {
+        for packet in [
+            b"\x1b[97;1:3u".as_slice(),
+            b"\x1b[97;1:3u\x1b[98;1:3u",
+            b"\x1b[97;1:3u\x1b[<0;3;2m",
+            b"\x1b[97;1:3ux", // Mixed input is also delivered as one exact packet.
+            b"\x1b\x1b\x1b\x1b",
+            b"\x1b\x1b\x1b\x1btext",
+            b"\x1b\x1b\x1b\x1b[98;1:3u",
+            b"\x1b[97;1:3u\x1b\x1b\x1b\x1b",
+            b"\x1b[<0;3;2;\x1b[98;1:1um",
+            b"\x1b[97;1:3u\x1b[<0;3;2;999m",
+        ] {
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            assert_eq!(
+                apply_terminal_attach_input(&runtime, packet.to_vec()),
+                Ok(true),
+                "successful enqueue must not be confused with interaction: {packet:?}"
+            );
+            assert_eq!(
+                input_rx.try_recv().expect("raw release or mixed packet"),
+                Bytes::copy_from_slice(packet)
+            );
+            assert!(input_rx.try_recv().is_err(), "one packet, one enqueue");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_rejected_packets_do_not_report_an_enqueue() {
+        for packet in [
+            b"\x1b[97;1:3u".as_slice(),
+            b"\x1b[97;1:3ux",
+            b"\x1b[200~\x1b[97;1:3u\x1b[201~",
+            b"\x1b\x1b\x1b\x1b",
+            b"\x1b\x1b\x1b\x1btext",
+            b"\x1b\x1b\x1b\x1b[98;1:3u",
+            b"\x1b[97;1:3u\x1b\x1b\x1b\x1b",
+            b"\x1b[<0;3;2;\x1b[98;1:1um",
+            b"\x1b[97;1:3u\x1b[<0;3;2;999m",
+        ] {
+            let (runtime, mut input_rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            runtime
+                .try_send_bytes(Bytes::from_static(b"occupied"))
+                .expect("fill input queue");
+            assert!(apply_terminal_attach_input(&runtime, packet.to_vec()).is_err());
+            assert_eq!(
+                input_rx.try_recv().expect("previous queue contents"),
+                Bytes::from_static(b"occupied")
+            );
+            assert!(input_rx.try_recv().is_err(), "rejected packet not queued");
+        }
     }
 
     #[tokio::test]

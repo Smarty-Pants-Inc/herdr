@@ -2210,9 +2210,12 @@ impl HeadlessServer {
                 };
                 let terminal_id = terminal_id.clone();
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                    let interaction = !crate::raw_input::is_release_only(&data);
                     match apply_terminal_attach_input(runtime, data) {
-                        Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
-                        Ok(false) => {}
+                        Ok(true) if interaction => {
+                            self.invalidate_terminal_input_attribution(&terminal_id)
+                        }
+                        Ok(_) => {}
                         Err(err) => warn!(client_id, terminal_id = %terminal_id, err = %err),
                     }
                 }
@@ -3631,16 +3634,18 @@ impl HeadlessServer {
 }
 
 fn client_pane_input_releases_press(event: &protocol::ClientPaneInputEvent) -> bool {
-    matches!(
-        event,
-        protocol::ClientPaneInputEvent::Key {
-            kind: protocol::ClientKeyKind::Release,
-            ..
-        } | protocol::ClientPaneInputEvent::Mouse {
-            kind: protocol::ClientMouseKind::Up(_),
-            ..
+    use crate::raw_input::InputEventKind;
+
+    match event {
+        protocol::ClientPaneInputEvent::Key { kind, .. } => {
+            InputEventKind::Key(kind.to_crossterm())
         }
-    )
+        protocol::ClientPaneInputEvent::Mouse { kind, .. } => {
+            InputEventKind::Mouse(kind.to_crossterm())
+        }
+        _ => InputEventKind::Other,
+    }
+    .releases_press()
 }
 
 fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) -> bool {

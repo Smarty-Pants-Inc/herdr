@@ -3,6 +3,9 @@ use super::*;
 const ALICE: u64 = 31;
 const DIRECT: u64 = 90;
 const CAPACITY: usize = 64;
+const KITTY_EVENT_TYPES: &[u8] = b"\x1b[>3u";
+const DIRECT_PRESS: &[u8] = b"\x1b[97;1:1u";
+const DIRECT_RELEASE: &[u8] = b"\x1b[97;1:3u";
 
 type InputReceiver = tokio::sync::mpsc::Receiver<Bytes>;
 
@@ -86,6 +89,35 @@ fn named_input(server: &mut HeadlessServer, pane: &str, input: &mut InputReceive
     assert_eq!(last_input(server, pane)["user"], "Alice");
 }
 
+fn enable_kitty_event_types(
+    server: &mut HeadlessServer,
+    terminal_id: &crate::terminal::TerminalId,
+) {
+    let runtime = server
+        .app
+        .terminal_runtimes
+        .get(terminal_id)
+        .expect("registered terminal runtime");
+    runtime.test_process_pty_bytes(KITTY_EVENT_TYPES);
+    assert!(runtime.keyboard_protocol().reports_event_types());
+}
+
+fn alice_record_and_media_age(
+    server: &mut HeadlessServer,
+    pane_id: &str,
+    input: &mut InputReceiver,
+) -> (serde_json::Value, Instant) {
+    named_input(server, pane_id, input);
+    let (_, pane) = server.app.parse_pane_id(pane_id).unwrap();
+    let owner_at = Instant::now() - Duration::from_secs(9);
+    server.media.note_pane_input(ALICE, pane, pane_id, owner_at);
+    let before = last_input(server, pane_id);
+    assert_eq!(before["user"], "Alice");
+    assert_eq!(before["client_id"], ALICE);
+    assert!(before["at"].as_u64().is_some());
+    (before, owner_at)
+}
+
 fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
     let (respond_to, response) = std::sync::mpsc::channel();
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
@@ -104,6 +136,237 @@ fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
         serde_json::from_str(&response.try_recv().expect("immediate last-input response")).unwrap();
     assert_eq!(response["result"]["type"], "pane_last_input");
     response["result"]["last_input"].clone()
+}
+
+#[tokio::test]
+async fn direct_raw_key_release_preserves_complete_sender_and_media_age() {
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    enable_kitty_event_types(&mut server, &terminal_id);
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: DIRECT_PRESS.to_vec(),
+    });
+    assert_eq!(
+        input
+            .try_recv()
+            .expect("accepted direct Kitty press")
+            .as_ref(),
+        DIRECT_PRESS
+    );
+
+    let (before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: DIRECT_RELEASE.to_vec(),
+    });
+    assert_eq!(
+        input
+            .try_recv()
+            .expect("accepted direct Kitty release")
+            .as_ref(),
+        DIRECT_RELEASE,
+        "release bytes must reach the child unchanged"
+    );
+    assert!(input.try_recv().is_err(), "release packet was not split");
+    assert_eq!(last_input(&mut server, &pane_id), before);
+    super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn direct_raw_release_packets_preserve_sender_when_repeated_or_coalesced() {
+    let cases: Vec<Vec<Vec<u8>>> = vec![
+        vec![DIRECT_RELEASE.to_vec()],
+        vec![DIRECT_RELEASE.to_vec(), DIRECT_RELEASE.to_vec()],
+        vec![[DIRECT_RELEASE, DIRECT_RELEASE].concat()],
+    ];
+
+    for (case_index, packets) in cases.into_iter().enumerate() {
+        let (mut server, pane_id, terminal_id, mut input) = setup();
+        enable_kitty_event_types(&mut server, &terminal_id);
+        let (before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+
+        for (packet_index, packet) in packets.into_iter().enumerate() {
+            server.handle_server_event(ServerEvent::ClientInput {
+                client_id: DIRECT,
+                data: packet.clone(),
+            });
+            assert_eq!(
+                input
+                    .try_recv()
+                    .expect("accepted pure release packet")
+                    .as_ref(),
+                packet.as_slice(),
+                "case {case_index}, packet {packet_index}"
+            );
+            assert_eq!(last_input(&mut server, &pane_id), before);
+            super::last_input_tests::assert_media_owner_and_age(
+                &mut server,
+                &pane_id,
+                ALICE,
+                owner_at,
+            );
+        }
+        shutdown_test_runtimes(&mut server);
+    }
+}
+
+#[tokio::test]
+async fn direct_raw_mixed_input_clears_only_after_accepted_enqueue() {
+    let mixed_cases: &[&[u8]] = &[
+        b"\x1b[97;1:3u\x1b[98;1:1u",
+        b"\x1b[97;1:3uX",
+        b"\x1b[97;1:3u\x1b[200~paste\x1b[201~",
+    ];
+
+    for (case_index, data) in mixed_cases.iter().enumerate() {
+        let (mut server, pane_id, terminal_id, mut input) = setup();
+        enable_kitty_event_types(&mut server, &terminal_id);
+        let (_before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: DIRECT,
+            data: data.to_vec(),
+        });
+        assert_eq!(
+            input
+                .try_recv()
+                .expect("accepted mixed direct packet")
+                .as_ref(),
+            *data,
+            "case {case_index} must remain one byte-for-byte packet"
+        );
+        assert!(input.try_recv().is_err(), "mixed packet was split");
+        assert!(last_input(&mut server, &pane_id).is_null());
+        super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+        shutdown_test_runtimes(&mut server);
+    }
+
+    let mixed = mixed_cases[0];
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    enable_kitty_event_types(&mut server, &terminal_id);
+    let (before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+    for _ in 0..CAPACITY {
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .try_send_bytes(Bytes::from_static(b"fill"))
+            .expect("fill exact channel capacity");
+    }
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: mixed.to_vec(),
+    });
+    assert_eq!(last_input(&mut server, &pane_id), before);
+    super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+
+    input.try_recv().expect("free one queue slot for retry");
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: mixed.to_vec(),
+    });
+    for _ in 1..CAPACITY {
+        assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"fill"));
+    }
+    assert_eq!(
+        input.try_recv().expect("accepted mixed retry").as_ref(),
+        mixed
+    );
+    assert!(input.try_recv().is_err(), "mixed retry packet was split");
+    assert!(last_input(&mut server, &pane_id).is_null());
+    super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+    shutdown_test_runtimes(&mut server);
+
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    enable_kitty_event_types(&mut server, &terminal_id);
+    let (before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+    // A closed receiver rejects the mixed packet without erasing Alice.
+    // Keep this as a real ClientInput delivery through the registry path.
+    drop(input);
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: mixed.to_vec(),
+    });
+    assert_eq!(last_input(&mut server, &pane_id), before);
+    super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn direct_raw_malformed_and_long_packets_follow_enqueue_receipts() {
+    // Both long packets fit the transport's inclusive 1 MiB input limit.
+    const MAX_INPUT_BYTES: usize = 1024 * 1024;
+    let mut release_then_esc = vec![0x1b; MAX_INPUT_BYTES];
+    release_then_esc[..DIRECT_RELEASE.len()].copy_from_slice(DIRECT_RELEASE);
+    let cases = [
+        (
+            "sgr-embedded-kitty-press",
+            b"\x1b[<0;3;2;\x1b[98;1:1um".to_vec(),
+        ),
+        ("sgr-extra-parameter", b"\x1b[<0;3;2;999m".to_vec()),
+        ("one-mib-esc", vec![0x1b; MAX_INPUT_BYTES]),
+        ("release-then-esc-one-mib", release_then_esc),
+    ];
+
+    for (case, data) in cases {
+        for queue in ["accepted", "full", "closed"] {
+            let (mut server, pane_id, terminal_id, mut input) = setup();
+            enable_kitty_event_types(&mut server, &terminal_id);
+            let (before, owner_at) = alice_record_and_media_age(&mut server, &pane_id, &mut input);
+            if queue == "full" {
+                for _ in 0..CAPACITY {
+                    server
+                        .app
+                        .terminal_runtimes
+                        .get(&terminal_id)
+                        .unwrap()
+                        .try_send_bytes(Bytes::from_static(b"fill"))
+                        .expect("fill exact channel capacity");
+                }
+            } else if queue == "closed" {
+                input.close();
+            }
+
+            server.handle_server_event(ServerEvent::ClientInput {
+                client_id: DIRECT,
+                data: data.clone(),
+            });
+            if queue == "accepted" {
+                let received = input.try_recv().expect(case);
+                assert_eq!(received.len(), data.len(), "{case}: accepted length");
+                // Boolean comparison avoids dumping a megabyte on failure.
+                assert!(
+                    received.as_ref() == data.as_slice(),
+                    "{case}: changed bytes"
+                );
+                assert!(last_input(&mut server, &pane_id).is_null(), "{case}");
+            } else {
+                assert_eq!(
+                    last_input(&mut server, &pane_id),
+                    before,
+                    "{case}: {queue} rejection must retain the complete Alice record"
+                );
+                if queue == "full" {
+                    for _ in 0..CAPACITY {
+                        assert_eq!(
+                            input.try_recv().expect("original queue filler"),
+                            Bytes::from_static(b"fill"),
+                            "{case}: {queue} must not replace queued bytes"
+                        );
+                    }
+                }
+            }
+            assert!(input.try_recv().is_err(), "{case}: {queue} extra packet");
+            super::last_input_tests::assert_media_owner_and_age(
+                &mut server,
+                &pane_id,
+                ALICE,
+                owner_at,
+            );
+            shutdown_test_runtimes(&mut server);
+        }
+    }
 }
 
 fn scroll(
