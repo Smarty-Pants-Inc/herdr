@@ -859,18 +859,23 @@ impl ClientShellState {
     }
 
     pub(super) fn indexed_navigation_target_exists(
-        &self,
+        &mut self,
         binding: &crate::input::KeybindMatch,
     ) -> bool {
         use crate::input::{KeybindAction, KeybindMatch};
 
         match binding {
             KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)) => {
-                self.snapshot.as_deref().is_some_and(|snapshot| {
-                    self.navigation_workspace_entries(snapshot)
-                        .get(*index)
-                        .is_some()
-                })
+                if self.config.grouping.enabled {
+                    // Validate the same visible online leaf order used by grouped dispatch.
+                    self.grouped_navigation_targets().get(*index).is_some()
+                } else {
+                    self.snapshot.as_deref().is_some_and(|snapshot| {
+                        self.navigation_workspace_entries(snapshot)
+                            .get(*index)
+                            .is_some()
+                    })
+                }
             }
             KeybindMatch::Action(KeybindAction::SwitchTab(index)) => self
                 .snapshot

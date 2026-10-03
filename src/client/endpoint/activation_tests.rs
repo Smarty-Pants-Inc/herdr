@@ -413,6 +413,20 @@ fn source_release_is_sent_and_acknowledged_before_target_activation() {
 
 #[test]
 fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_colliding_ids() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w2x");
+}
+
+#[test]
+fn grouped_preview_enter_batch_fences_typing_until_safe_completion_with_colliding_ids() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w\x1b[B\rx");
+}
+
+#[test]
+fn grouped_activation_intent_batch_cancels_post_choice_endpoint_action() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w2x\x02c");
+}
+
+fn grouped_activation_intent_batch_fences_typing(selection_batch: &[u8]) {
     use crate::client::{
         endpoint_commands::EndpointCommands,
         shell_runtime::{
@@ -424,6 +438,7 @@ fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_coll
 
     let mut config = crate::config::Config::default();
     config.ui.sidebar.grouping.enabled = true;
+    config.ui.prompt_new_tab_name = false;
     let (mut shell, mut endpoints, local_sent, remote_sent) =
         shell_and_registry_with_config(&config, false);
     let target = endpoint();
@@ -494,19 +509,84 @@ fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_coll
     shell.set_endpoint_snapshot_for_generation(&target, 7, Box::new(snapshot("remote-boot", 1)));
     shell.set_pane_surface(surface("local-boot", 1, "pane_1"));
     shell.compose(100, 30).unwrap();
-    // Follow the public grouped keyboard path, not a fabricated ActivateEndpoint action.
-    for bytes in [b"\x02".as_slice(), b"w", b"\x1b[B"] {
-        let preview = shell.handle_input_bytes(bytes);
-        assert!(preview.requests.is_empty());
-        assert!(preview.actions.is_empty());
-    }
-    let selection = shell.handle_input_bytes(b"\r");
     let mut state = ClientState::test_new();
     state.shell = Some(shell);
     let mut commands = EndpointCommands::default();
     let mut pending = None;
     let mut scheduled = None;
     let mut input_source = crate::platform::RealPrefixInputSource::default();
+
+    // Allowed counterexample: ordinary typing on a coherent source still travels to Local.
+    let ordinary = state.shell.as_mut().unwrap().handle_input_bytes(b"a");
+    assert!(ordinary.actions.is_empty());
+    let ordinary_requests = ordinary.requests.clone();
+    assert!(matches!(ordinary_requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"));
+    finish_client_shell_input(
+        &mut state,
+        ordinary,
+        None,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+        &mut input_source,
+        &mut scheduled,
+    )
+    .unwrap();
+    assert_eq!(*local_sent.lock().unwrap(), ordinary_requests);
+    assert!(remote_sent.lock().unwrap().is_empty());
+    assert!(scheduled.is_none());
+    local_sent.lock().unwrap().clear();
+
+    // A command already queued on the source must not be drained by choice-batch dispatch.
+    commands.enqueue(
+        ClientEndpointId::Local,
+        1,
+        "local-boot".into(),
+        Box::new(crate::api::schema::Request {
+            id: "queued-source-before-choice".into(),
+            method: crate::api::schema::Method::WorkspaceList(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        }),
+    );
+
+    // Follow the complete parsed grouped keyboard batch. In particular, do NOT begin the
+    // transaction between the choice and its trailing typing: that was the missing fence.
+    let selection = state
+        .shell
+        .as_mut()
+        .unwrap()
+        .handle_input_bytes(selection_batch);
+    assert!(matches!(selection.actions.first(),
+        Some(crate::client::shell::ClientShellAction::ActivateEndpoint { endpoint_id, .. })
+        if endpoint_id == &target));
+    let post_choice_requests = selection.actions[1..]
+        .iter()
+        .map(|action| {
+            let crate::client::shell::ClientShellAction::Endpoint {
+                endpoint_id,
+                boot_id,
+                request,
+            } = action
+            else {
+                panic!("expected old-source API action after choice");
+            };
+            assert_eq!(endpoint_id, &ClientEndpointId::Local);
+            assert_eq!(boot_id, "local-boot");
+            assert!(matches!(
+                request.method,
+                crate::api::schema::Method::TabCreate(_)
+            ));
+            request.id.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        post_choice_requests.len(),
+        usize::from(selection_batch.ends_with(b"\x02c"))
+    );
+    assert!(matches!(selection.requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"));
     finish_client_shell_input(
         &mut state,
         selection,
@@ -518,6 +598,31 @@ fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_coll
         &mut scheduled,
     )
     .unwrap();
+    for request_id in post_choice_requests {
+        assert!(
+            !state
+                .shell
+                .as_mut()
+                .unwrap()
+                .cancel_endpoint_request(&request_id),
+            "dispatch already cancelled the old-source action instead of queueing it"
+        );
+        assert!(!commands.accepts_response(&ClientEndpointId::Local, 1, "local-boot", &request_id));
+    }
+    assert!(pending.is_none(), "bootstrap has not run yet");
+    assert!(
+        endpoints.active_surface_available(),
+        "intent does not alter registry leases"
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert!(
+        local_sent.lock().unwrap().is_empty(),
+        "choice-batch typing cannot reach Local"
+    );
+    assert!(
+        remote_sent.lock().unwrap().is_empty(),
+        "choice-batch typing cannot reach the target"
+    );
     let ClientLoopEvent::ActivateEndpoint {
         endpoint_id,
         target: focus,
@@ -567,6 +672,14 @@ fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_coll
         "host focus is revoked before source-off"
     );
     assert!(remote_sent.lock().unwrap().is_empty());
+    assert!(commands
+        .send_next(&ClientEndpointId::Local, &mut endpoints)
+        .is_empty());
+    assert_eq!(
+        local_sent.lock().unwrap().len(),
+        2,
+        "bootstrap retired the queued source command, leaving only focus-revoke and source-off"
+    );
 
     let mut type_key = |state: &mut ClientState,
                         endpoints: &mut EndpointRegistry,

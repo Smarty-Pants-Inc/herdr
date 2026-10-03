@@ -224,6 +224,205 @@ fn grouped_navigation_uses_visible_display_order_and_never_selects_headings() {
     assert!(collapsed.actions.is_empty());
 }
 
+fn configure_workspace_index_binding(state: &mut ClientShellState, binding: &str) {
+    let config: Config =
+        toml::from_str(&format!("[keys]\nswitch_workspace = \"{binding}\"\n")).unwrap();
+    assert!(config.collect_diagnostics().is_empty());
+    state.config.keybinds = ClientShellConfig::from_config(&config).keybinds;
+}
+
+fn assert_workspace_activation(
+    outcome: &ClientShellInput,
+    endpoint: &ClientEndpointId,
+    workspace: &str,
+) {
+    assert!(matches!(
+        outcome.actions.as_slice(),
+        [ClientShellAction::ActivateEndpoint {
+            endpoint_id,
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
+        }] if endpoint_id == endpoint && workspace_id == workspace
+    ));
+    assert!(outcome.requests.is_empty());
+}
+
+#[test]
+fn grouped_configured_shifted_workspace_index_selects_remote_second_leaf() {
+    // Cover the reported legacy byte sequence, its semantic equivalent, and bare digits.
+    for input in [
+        b"\x02w@".as_slice(),
+        b"\x02w2".as_slice(),
+        b"\x02w".as_slice(),
+    ] {
+        let (mut state, remote) = grouped_state();
+        configure_workspace_index_binding(&mut state, "prefix+shift+1..9");
+        state.compose(120, 50).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().workspaces.len(), 1);
+        assert_eq!(state.hits.workspaces[1].endpoint_id, remote);
+        assert_eq!(
+            state.hits.workspaces[0].workspace_id, state.hits.workspaces[1].workspace_id,
+            "colliding IDs must retain endpoint attribution"
+        );
+        let mut outcome = state.handle_input_bytes(input);
+        if input == b"\x02w" {
+            assert!(outcome.actions.is_empty());
+            outcome = state.handle_raw_events(vec![RawInputEvent::Key(
+                crate::input::TerminalKey::new(KeyCode::Char('2'), KeyModifiers::SHIFT),
+            )]);
+        }
+        assert_workspace_activation(&outcome, &remote, "ws_1");
+        assert_eq!(state.mode, ClientShellMode::Terminal);
+        assert!(state.navigate_workspace_id.is_none());
+        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    }
+}
+
+#[test]
+fn grouped_configured_workspace_index_rejects_hidden_or_offline_destination_then_recovers() {
+    for collapsed in [true, false] {
+        let (mut state, remote) = grouped_state();
+        configure_workspace_index_binding(&mut state, "prefix+shift+1..9");
+        // Keep the Local preview visible while independently hiding the second leaf.
+        let mut remote_snapshot = state.endpoints[1].snapshot.clone().unwrap();
+        remote_snapshot.revision += 1;
+        stamp(&mut remote_snapshot.workspaces[0], "org", "z-project", true);
+        state.set_endpoint_snapshot(&remote, remote_snapshot);
+        state.compose(120, 50).unwrap();
+        assert_eq!(state.hits.workspaces[1].endpoint_id, remote);
+        let project = GroupKey::Project("org".into(), "z-project".into());
+        if collapsed {
+            state.toggle_grouped_heading(project.clone());
+        } else {
+            state.mark_endpoint_disconnected(&remote);
+            assert!(state.endpoint_has_snapshot(&remote), "cached is not online");
+            assert!(state.grouped_projection_dirty);
+        }
+        // No intervening compose/helper refresh: the input guard must consume current state.
+        let rejected = state.handle_input_bytes(b"\x02w@");
+        assert!(rejected.actions.is_empty());
+        assert!(rejected.requests.is_empty());
+        assert_eq!(state.mode, ClientShellMode::Navigate);
+        assert_eq!(
+            state.navigate_workspace_id.as_ref().unwrap().endpoint_id,
+            ClientEndpointId::Local
+        );
+        if collapsed {
+            assert!(state.grouped_collapsed.contains(&project));
+            state.toggle_grouped_heading(project);
+        } else {
+            state.set_endpoint_status(&remote, ClientEndpointStatus::Online);
+            assert!(state.grouped_projection_dirty);
+        }
+        // Restoration is immediately actionable, without waiting for another rendered frame.
+        let accepted = state.handle_input_bytes(b"@");
+        assert_workspace_activation(&accepted, &remote, "ws_1");
+        assert_eq!(state.mode, ClientShellMode::Terminal);
+        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    }
+}
+
+#[test]
+fn grouped_arbitrary_configured_workspace_index_follows_display_not_endpoint_order() {
+    for (number, local_target) in [('1', false), ('2', true)] {
+        let (mut state, remote) = grouped_state();
+        configure_workspace_index_binding(&mut state, "prefix+alt+1..9");
+        // Endpoint storage stays Local first; a remote lead renders before its Local lane.
+        let mut local = state.snapshot.clone().unwrap();
+        local.revision += 1;
+        stamp(&mut local.workspaces[0], "org", "project", true);
+        // Present the matching Local projection before composing the new display order.
+        // A snapshot-only revision advance intentionally leaves compose unavailable.
+        let mut local_surface = surface();
+        local_surface.projection_revision = local.revision;
+        state.set_snapshot(local);
+        state.set_pane_surface(local_surface);
+        let mut remote_snapshot = state.endpoints[1]
+            .snapshot
+            .clone()
+            .expect("a same-boot Local projection update must retain the remote cache");
+        remote_snapshot.revision += 1;
+        stamp(&mut remote_snapshot.workspaces[0], "org", "project", false);
+        state.set_endpoint_snapshot(&remote, remote_snapshot);
+        state.compose(120, 50).unwrap();
+        assert_eq!(state.endpoints[0].endpoint_id, ClientEndpointId::Local);
+        assert_eq!(state.hits.workspaces[0].endpoint_id, remote);
+        assert_eq!(
+            state.hits.workspaces[1].endpoint_id,
+            ClientEndpointId::Local
+        );
+        assert_eq!(
+            state.hits.workspaces[0].workspace_id, state.hits.workspaces[1].workspace_id,
+            "colliding IDs must retain endpoint attribution in reversed display order"
+        );
+        let entered = state.handle_input_bytes(b"\x02w");
+        assert!(entered.actions.is_empty());
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Key(
+            crate::input::TerminalKey::new(KeyCode::Char(number), KeyModifiers::ALT),
+        )]);
+        let expected = if local_target {
+            ClientEndpointId::Local
+        } else {
+            remote
+        };
+        assert_workspace_activation(&outcome, &expected, "ws_1");
+        assert_eq!(state.mode, ClientShellMode::Terminal);
+        assert!(state.navigate_workspace_id.is_none());
+        assert_eq!(state.active_endpoint_id, ClientEndpointId::Local);
+    }
+}
+
+#[test]
+fn machines_default_and_configured_workspace_indices_stay_server_local() {
+    for configured in [false, true] {
+        let (mut state, remote) = grouped_state();
+        state.apply_client_live_config(&Config::default(), &[], &[]);
+        assert!(!state.config.grouping.enabled);
+        if configured {
+            configure_workspace_index_binding(&mut state, "prefix+shift+1..9");
+        }
+        state.compose(120, 50).unwrap();
+        assert!(state
+            .hits
+            .workspaces
+            .iter()
+            .any(|hit| hit.endpoint_id == remote));
+        assert_eq!(state.snapshot.as_ref().unwrap().workspaces.len(), 1);
+        let rejected = state.handle_input_bytes(if configured { b"\x02w@" } else { b"\x02w2" });
+        assert!(rejected.actions.is_empty());
+        assert!(rejected.requests.is_empty());
+        assert_eq!(state.mode, ClientShellMode::Navigate);
+        let accepted = state.handle_input_bytes(if configured { b"!" } else { b"1" });
+        assert!(
+            matches!(accepted.actions.as_slice(), [ClientShellAction::Endpoint {
+            endpoint_id: ClientEndpointId::Local, boot_id, request,
+        }] if boot_id == "boot-1" && matches!(&request.method,
+            crate::api::schema::Method::WorkspaceFocus(params) if params.workspace_id == "ws_1"))
+        );
+        assert!(accepted.requests.is_empty());
+        assert_eq!(state.mode, ClientShellMode::Terminal);
+    }
+}
+
+#[test]
+fn grouped_configured_workspace_index_keeps_foreign_preview_action_gate() {
+    let (mut state, remote) = grouped_state();
+    configure_workspace_index_binding(&mut state, "prefix+shift+1..9");
+    state.compose(120, 50).unwrap();
+    let rejected = state.handle_input_bytes(b"\x02w\x1b[B@");
+    assert!(rejected.actions.is_empty());
+    assert!(rejected.requests.is_empty());
+    assert_eq!(state.mode, ClientShellMode::Navigate);
+    assert_eq!(
+        state.navigate_workspace_id.as_ref().unwrap().endpoint_id,
+        remote
+    );
+    assert!(state.workspace_preview_action_blocked());
+    assert!(state.visible_endpoint_notice.is_some());
+    let accepted = state.handle_input_bytes(b"\r");
+    assert_workspace_activation(&accepted, &remote, "ws_1");
+    assert_eq!(state.mode, ClientShellMode::Terminal);
+}
+
 #[test]
 fn grouped_stale_leaves_are_dim_nonactionable_but_connection_diagnostics_remain() {
     let (mut state, remote) = grouped_state();
