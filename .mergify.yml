@@ -8,7 +8,8 @@ merge_queue:
 # titles keep a PR out.
 queue_rules:
   - name: default
-    batch_size: 1
+    batch_size: 4
+    batch_max_wait_time: 2 min
     checks_timeout: 30 min
     merge_method: merge
     # The push check (scripts/conventional_commits.py) reads every new subject on master, the merge commit's
@@ -56,3 +57,13 @@ commands_restrictions:
           - sender = smarty-fleet-write-leads[bot]
           - sender = smarty-fleet-write-lanes[bot]
           - sender = smarty-fleet-write-versehq[bot]
+
+# Sanctioned front-of-queue route, as smarty-dev (#2004 T10; org for Paul 2026-10-02): a PR labelled p0 is
+# checked ahead of the rest of the queue.
+priority_rules:
+  - name: p0
+    conditions:
+      - label = p0
+    priority: high
+    # Priority must not discard in-flight CI (smarty-dev decision #2143, proven #2356).
+    allow_checks_interruption: false
