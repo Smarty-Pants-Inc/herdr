@@ -34,6 +34,7 @@ pub(super) fn command() -> Command {
         .subcommand(status_command())
         .subcommand(config_command())
         .subcommand(channel_command())
+        .subcommand(voice_command())
         .subcommand(machine::command())
         .subcommand(server_command())
         .subcommand(api_command())
@@ -173,6 +174,36 @@ fn channel_command() -> Command {
                     .value_parser(["stable", "preview"]),
             ),
         )
+}
+
+fn voice_command() -> Command {
+    Command::new("voice")
+        .about("Manage native audio devices on this client host")
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("devices")
+                .about("List native audio devices or save preferred device names")
+                .arg(
+                    option("input", "NAME")
+                        .value_parser(parse_voice_device_name)
+                        .conflicts_with("default-input")
+                        .help("Save the exact microphone name, even if it is not connected"),
+                )
+                .arg(
+                    option("output", "NAME")
+                        .value_parser(parse_voice_device_name)
+                        .conflicts_with("default-output")
+                        .help("Save the exact speaker name, even if it is not connected"),
+                )
+                .arg(flag("default-input").help("Clear the saved microphone name; use the system default"))
+                .arg(flag("default-output").help("Clear the saved speaker name; use the system default"))
+                .after_help("Without options, lists devices, saved choices, and the local config path. Names are exact, nonempty, and at most 512 UTF-8 bytes. Setting names does not require native audio support or connected hardware. Use --input=NAME or --output=NAME for names starting with a hyphen. No device name is reserved for the system default. This command never connects to a server; --machine and --remote are not supported. Changes apply to the next call; active calls keep their current devices. No client or server restart is needed."),
+        )
+}
+
+fn parse_voice_device_name(name: &str) -> Result<String, String> {
+    crate::config::VoiceConfig::validate_name(name)?;
+    Ok(name.to_string())
 }
 
 fn server_command() -> Command {
@@ -1211,6 +1242,69 @@ mod tests {
                     path.join(" ")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn voice_devices_parses_names_resets_and_rejects_conflicts() {
+        for options in [
+            &[][..],
+            &["--input", "default", "--output", "USB speakers"][..],
+            &["--default-input", "--default-output"][..],
+            &["--input=--help", "--default-output"][..],
+        ] {
+            let mut args = vec!["herdr", "voice", "devices"];
+            args.extend_from_slice(options);
+            assert!(
+                super::command().try_get_matches_from(args).is_ok(),
+                "{options:?}"
+            );
+        }
+        for options in [
+            &["--input", "mic", "--default-input"][..],
+            &["--output", "speaker", "--default-output"][..],
+            &["--input"][..],
+            &["--input", ""][..],
+            &["--output", " \t"][..],
+            &["--bogus"][..],
+            &["--machine", "mac"][..],
+            &["--remote", "mac"][..],
+            &["--input", "mic", "--input", "other"][..],
+        ] {
+            let mut args = vec!["herdr", "voice", "devices"];
+            args.extend_from_slice(options);
+            assert!(
+                super::command().try_get_matches_from(args).is_err(),
+                "{options:?}"
+            );
+        }
+        let limit = crate::protocol::media::MAX_MEDIA_TEXT_BYTES;
+        let allowed = format!("--input={}", "é".repeat(limit / 2));
+        assert!(super::command()
+            .try_get_matches_from(["herdr", "voice", "devices", &allowed])
+            .is_ok());
+        let oversized = format!("{allowed}é");
+        assert!(super::command()
+            .try_get_matches_from(["herdr", "voice", "devices", &oversized])
+            .is_err());
+    }
+
+    #[test]
+    fn voice_devices_help_explains_host_local_names_and_system_defaults() {
+        let help = long_help(&["voice", "devices"]);
+        for text in [
+            "--input",
+            "--output",
+            "--default-input",
+            "--default-output",
+            "local config path",
+            "No device name is reserved",
+            "never connects to a server",
+            "512 UTF-8 bytes",
+            "Changes apply to the next call",
+            "No client or server restart is needed",
+        ] {
+            assert!(help.contains(text), "missing {text}: {help}");
         }
     }
 

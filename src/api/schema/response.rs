@@ -308,6 +308,9 @@ pub enum ResponseResult {
     MediaOffer {
         session_id: String,
         sdp: String,
+        /// Audio devices actually opened by the client for this offer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio_devices: Option<crate::protocol::media::MediaAudioDevices>,
     },
     MediaSession {
         session_id: String,
@@ -338,4 +341,85 @@ pub struct AgentManifestInfo {
     pub remote_last_checked_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::media::{MediaAudioDevice, MediaAudioDevices};
+
+    #[test]
+    fn media_offer_response_accepts_old_absence_and_round_trips_device_metadata() {
+        let old = serde_json::json!({"type": "media_offer", "session_id": "m", "sdp": "v=0"});
+        let decoded: ResponseResult = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(
+            decoded,
+            ResponseResult::MediaOffer {
+                session_id: "m".into(),
+                sdp: "v=0".into(),
+                audio_devices: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(decoded).unwrap(), old);
+
+        let result = ResponseResult::MediaOffer {
+            session_id: "m".into(),
+            sdp: "v=0".into(),
+            audio_devices: Some(MediaAudioDevices {
+                input: MediaAudioDevice {
+                    name: "Mic".into(),
+                    missing: None,
+                },
+                output: MediaAudioDevice {
+                    name: "Speakers".into(),
+                    missing: Some("Preferred speakers".into()),
+                },
+            }),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "media_offer", "session_id": "m", "sdp": "v=0",
+                "audio_devices": {
+                    "input": {"name": "Mic"},
+                    "output": {"name": "Speakers", "missing": "Preferred speakers"}
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ResponseResult>(value).unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn media_offer_json_schema_exposes_optional_devices() {
+        fn offer_schema(value: &serde_json::Value) -> Option<&serde_json::Value> {
+            if value
+                .get("properties")
+                .and_then(|properties| properties.get("audio_devices"))
+                .is_some()
+            {
+                return Some(value);
+            }
+            match value {
+                serde_json::Value::Object(object) => object.values().find_map(offer_schema),
+                serde_json::Value::Array(array) => array.iter().find_map(offer_schema),
+                _ => None,
+            }
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(SuccessResponse)).unwrap();
+        let offer = offer_schema(&schema).expect("the response schema includes offer devices");
+        assert!(!offer["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("audio_devices")));
+        let devices = &schema["$defs"]["MediaAudioDevices"];
+        assert!(devices["properties"].get("input").is_some());
+        assert!(devices["properties"].get("output").is_some());
+        let device = &schema["$defs"]["MediaAudioDevice"];
+        assert_eq!(device["required"], serde_json::json!(["name"]));
+        assert!(device["properties"].get("missing").is_some());
+    }
 }

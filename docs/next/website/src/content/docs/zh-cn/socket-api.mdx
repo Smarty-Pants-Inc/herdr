@@ -108,6 +108,14 @@ herdr pane read w1:p2 --source recent --lines 50
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 | 媒体 | `pane.media_open`、`media.answer`、`media.mute`、`media.state`、`media.close` |
 
+`pane.media_open` 的 `media_offer` 响应在客户端报告已打开的音频设备时,还包含可选的 `audio_devices`:
+
+```json
+{"id":"voice","result":{"type":"media_offer","session_id":"media_1","sdp":"v=0...","audio_devices":{"input":{"name":"USB microphone"},"output":{"name":"Headphones","missing":"Preferred headphones"}}}}
+```
+
+`input` 和 `output` 描述客户端机器上实际打开的设备,不是服务器选择设备的请求。每个设备都有非空的 `name`:可报告时为实际打开的设备名称;所选操作系统默认设备句柄无法报告名称时,显示字面标签 `"default"`。此标签绝不是设备选择器。请求的设备不可用而改用默认设备时,可包含与请求偏好完全一致的 `missing`。设备名称和缺失设备名称分别最多为 512 个 UTF-8 字节。旧客户端省略 `audio_devices`,API 调用方必须兼容缺失情况。这些元数据只随 offer 返回,不通过 `media.state` 返回,`media.answer` 也不选择设备。
+
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。

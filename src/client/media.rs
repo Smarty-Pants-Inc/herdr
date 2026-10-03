@@ -5,6 +5,7 @@
 //! media controls for the owning endpoint. It does no I/O: the client loop passes in the view
 //! facts and the clock, then applies the returned [`MediaEffect`]s.
 
+pub(crate) mod devices;
 #[cfg(feature = "native-media")]
 mod native;
 pub(crate) mod peer;
@@ -323,10 +324,18 @@ impl ClientMedia {
             return;
         };
         match event {
-            PeerEvent::Offer { session_id, sdp } if session_id == current => {
+            PeerEvent::Offer {
+                session_id,
+                sdp,
+                audio_devices,
+            } if session_id == current => {
                 self.effects.push(MediaEffect::Send(
                     endpoint_id,
-                    MediaControl::Offer(MediaSdp { session_id, sdp }),
+                    MediaControl::Offer(MediaSdp {
+                        session_id,
+                        sdp,
+                        audio_devices,
+                    }),
                 ));
             }
             PeerEvent::State {
@@ -495,7 +504,20 @@ mod tests {
 
     use super::*;
     use crate::api::schema::MediaSessionState;
-    use crate::protocol::media::MediaPeerState;
+    use crate::protocol::media::{MediaAudioDevice, MediaAudioDevices, MediaPeerState};
+
+    fn audio_devices() -> MediaAudioDevices {
+        MediaAudioDevices {
+            input: MediaAudioDevice {
+                name: "USB microphone".into(),
+                missing: Some("Preferred microphone".into()),
+            },
+            output: MediaAudioDevice {
+                name: "Headphones".into(),
+                missing: None,
+            },
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum PeerCall {
@@ -768,6 +790,7 @@ mod tests {
         media.handle_peer_event(PeerEvent::Offer {
             session_id: "m1".into(),
             sdp: "v=0".into(),
+            audio_devices: Some(audio_devices()),
         });
         media.handle_peer_event(PeerEvent::State {
             session_id: "m1".into(),
@@ -778,6 +801,7 @@ mod tests {
         media.handle_peer_event(PeerEvent::Offer {
             session_id: "stale".into(),
             sdp: "v=0".into(),
+            audio_devices: Some(audio_devices()),
         });
         assert_eq!(
             media.take_effects(),
@@ -787,6 +811,7 @@ mod tests {
                     MediaControl::Offer(MediaSdp {
                         session_id: "m1".into(),
                         sdp: "v=0".into(),
+                        audio_devices: Some(audio_devices()),
                     })
                 ),
                 MediaEffect::Send(
@@ -799,6 +824,73 @@ mod tests {
                     })
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn offer_metadata_from_replaced_closed_or_unknown_peers_is_ignored() {
+        let (mut media, _) = started(MediaMode::Auto);
+        let now = Instant::now();
+        open(&mut media, "m2", "pane_1", now);
+        media.take_effects();
+
+        for session_id in ["m1", "unknown"] {
+            media.handle_peer_event(PeerEvent::Offer {
+                session_id: session_id.into(),
+                sdp: "v=0 stale".into(),
+                audio_devices: Some(audio_devices()),
+            });
+        }
+        assert!(media.take_effects().is_empty());
+
+        // Only the current peer's offer, including its exact metadata, is forwarded.
+        let mut devices = audio_devices();
+        devices.output.name = "Replacement speakers".into();
+        media.handle_peer_event(PeerEvent::Offer {
+            session_id: "m2".into(),
+            sdp: "v=0 replacement".into(),
+            audio_devices: Some(devices.clone()),
+        });
+        assert_eq!(
+            media.take_effects(),
+            vec![MediaEffect::Send(
+                local(),
+                MediaControl::Offer(MediaSdp {
+                    session_id: "m2".into(),
+                    sdp: "v=0 replacement".into(),
+                    audio_devices: Some(devices),
+                })
+            )]
+        );
+
+        media.endpoint_gone(&local());
+        media.take_effects();
+        media.handle_peer_event(PeerEvent::Offer {
+            session_id: "m2".into(),
+            sdp: "v=0 closed".into(),
+            audio_devices: Some(audio_devices()),
+        });
+        assert!(media.take_effects().is_empty());
+    }
+
+    #[test]
+    fn a_live_offer_without_device_metadata_remains_compatible() {
+        let (mut media, _) = started(MediaMode::Auto);
+        media.handle_peer_event(PeerEvent::Offer {
+            session_id: "m1".into(),
+            sdp: "v=0".into(),
+            audio_devices: None,
+        });
+        assert_eq!(
+            media.take_effects(),
+            vec![MediaEffect::Send(
+                local(),
+                MediaControl::Offer(MediaSdp {
+                    session_id: "m1".into(),
+                    sdp: "v=0".into(),
+                    audio_devices: None,
+                })
+            )]
         );
     }
 
@@ -991,6 +1083,7 @@ mod tests {
         client.handle_peer_event(PeerEvent::Offer {
             session_id: old.clone(),
             sdp: "v=0".into(),
+            audio_devices: None,
         });
         for control in to_broker(&mut client) {
             to_client(broker.client_control(1, control, now));
@@ -1050,12 +1143,17 @@ mod tests {
         client.handle_peer_event(PeerEvent::Offer {
             session_id: new.clone(),
             sdp: "v=0 new".into(),
+            audio_devices: Some(audio_devices()),
         });
         for control in to_broker(&mut client) {
             to_client(broker.client_control(1, control, later));
         }
         let body: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
         assert_eq!(body["result"]["session_id"], new.as_str());
+        assert_eq!(
+            body["result"]["audio_devices"],
+            serde_json::to_value(audio_devices()).unwrap()
+        );
         assert_ne!(
             broker.state(&old).map(|view| view.state),
             Some(MediaSessionState::Connected)
@@ -1177,6 +1275,7 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: new.clone(),
                 sdp: "v=0 late".into(),
+                audio_devices: Some(audio_devices()),
             }),
             later,
         ));
@@ -1226,6 +1325,7 @@ mod tests {
             MediaControl::Answer(MediaSdp {
                 session_id: session_id.into(),
                 sdp: "answer".into(),
+                audio_devices: None,
             })
         };
         media.handle_server_control(&local(), answer("m1"), true, |_| None, now);

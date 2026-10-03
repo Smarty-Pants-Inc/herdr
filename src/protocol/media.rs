@@ -80,10 +80,31 @@ pub struct MediaOpen {
     pub pane_id: String,
 }
 
+/// One audio device opened on the client, not a server-side selection request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaAudioDevice {
+    /// Actual opened device name, or display-only `default` for an unreportable OS default.
+    /// This label is never a device selector.
+    pub name: String,
+    /// Requested device that was missing when the client used the default, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing: Option<String>,
+}
+
+/// The local devices actually opened for this offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MediaAudioDevices {
+    pub input: MediaAudioDevice,
+    pub output: MediaAudioDevice,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaSdp {
     pub session_id: String,
     pub sdp: String,
+    /// Offer-only device metadata. Older clients omit it; answers emit `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_devices: Option<MediaAudioDevices>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,7 +217,15 @@ impl MediaControl {
             && match self {
                 Self::Open(open) => !open.pane_id.is_empty() && text_ok(&open.pane_id),
                 Self::Offer(sdp) | Self::Answer(sdp) => {
-                    !sdp.sdp.is_empty() && sdp.sdp.len() <= MAX_MEDIA_SDP_BYTES
+                    !sdp.sdp.is_empty()
+                        && sdp.sdp.len() <= MAX_MEDIA_SDP_BYTES
+                        && sdp.audio_devices.as_ref().is_none_or(|devices| {
+                            [&devices.input, &devices.output].into_iter().all(|device| {
+                                !device.name.is_empty()
+                                    && text_ok(&device.name)
+                                    && optional_ok(&device.missing)
+                            })
+                        })
                 }
                 Self::Mute(_) => true,
                 Self::State(state) => optional_ok(&state.detail),
@@ -238,6 +267,19 @@ impl MediaControl {
 mod tests {
     use super::*;
 
+    fn audio_devices() -> MediaAudioDevices {
+        MediaAudioDevices {
+            input: MediaAudioDevice {
+                name: "USB microphone".into(),
+                missing: Some("Preferred microphone".into()),
+            },
+            output: MediaAudioDevice {
+                name: "Headphones".into(),
+                missing: None,
+            },
+        }
+    }
+
     fn all_controls() -> Vec<MediaControl> {
         vec![
             MediaControl::Open(MediaOpen {
@@ -247,10 +289,12 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: "media_1".into(),
                 sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n".into(),
+                audio_devices: Some(audio_devices()),
             }),
             MediaControl::Answer(MediaSdp {
                 session_id: "media_1".into(),
                 sdp: "v=0\r\n".into(),
+                audio_devices: None,
             }),
             MediaControl::Mute(MediaMute {
                 session_id: "media_1".into(),
@@ -298,6 +342,17 @@ mod tests {
             )
             .unwrap();
             assert_eq!(decoded, message);
+
+            // The answer and offer use the same two-string frozen envelope in either direction.
+            let message = control.server_message().unwrap();
+            let mut framed = Vec::new();
+            crate::protocol::write_message(&mut framed, &message).unwrap();
+            let decoded: ServerMessage = crate::protocol::read_message(
+                &mut framed.as_slice(),
+                crate::protocol::MAX_FRAME_SIZE,
+            )
+            .unwrap();
+            assert_eq!(decoded, message);
         }
     }
 
@@ -339,6 +394,113 @@ mod tests {
     }
 
     #[test]
+    fn sdp_device_metadata_is_optional_for_older_offers_and_answers() {
+        for kind in [MEDIA_OFFER_KIND, MEDIA_ANSWER_KIND] {
+            for data in [
+                r#"{"session_id":"m","sdp":"v=0"}"#,
+                r#"{"session_id":"m","sdp":"v=0","audio_devices":null}"#,
+            ] {
+                let control = MediaControl::decode(kind, data).unwrap().unwrap();
+                let sdp = match &control {
+                    MediaControl::Offer(sdp) | MediaControl::Answer(sdp) => sdp,
+                    _ => panic!("expected SDP"),
+                };
+                assert!(sdp.audio_devices.is_none());
+                assert_eq!(control.data().unwrap(), r#"{"session_id":"m","sdp":"v=0"}"#);
+            }
+        }
+    }
+
+    #[test]
+    fn offer_metadata_has_the_exact_optional_json_shape() {
+        let control = MediaControl::Offer(MediaSdp {
+            session_id: "m".into(),
+            sdp: "v=0".into(),
+            audio_devices: Some(audio_devices()),
+        });
+        let data = serde_json::from_str::<serde_json::Value>(&control.data().unwrap()).unwrap();
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "session_id": "m",
+                "sdp": "v=0",
+                "audio_devices": {
+                    "input": {"name": "USB microphone", "missing": "Preferred microphone"},
+                    "output": {"name": "Headphones"}
+                }
+            })
+        );
+        assert_eq!(
+            MediaControl::decode(MEDIA_OFFER_KIND, &data.to_string()),
+            Some(Ok(control))
+        );
+    }
+
+    #[test]
+    fn sdp_device_metadata_is_bounded_at_decode_in_both_directions() {
+        for kind in [MEDIA_OFFER_KIND, MEDIA_ANSWER_KIND] {
+            for input in [true, false] {
+                for invalid in ["", &"x".repeat(MAX_MEDIA_TEXT_BYTES + 1), &"é".repeat(257)] {
+                    let mut devices = audio_devices();
+                    let device = if input {
+                        &mut devices.input
+                    } else {
+                        &mut devices.output
+                    };
+                    device.name = invalid.to_owned();
+                    let data = serde_json::to_string(&MediaSdp {
+                        session_id: "m".into(),
+                        sdp: "v=0".into(),
+                        audio_devices: Some(devices),
+                    })
+                    .unwrap();
+                    assert!(matches!(MediaControl::decode(kind, &data), Some(Err(_))));
+                }
+                let mut devices = audio_devices();
+                let device = if input {
+                    &mut devices.input
+                } else {
+                    &mut devices.output
+                };
+                device.missing = Some("x".repeat(MAX_MEDIA_TEXT_BYTES + 1));
+                let data = serde_json::to_string(&MediaSdp {
+                    session_id: "m".into(),
+                    sdp: "v=0".into(),
+                    audio_devices: Some(devices),
+                })
+                .unwrap();
+                assert!(matches!(MediaControl::decode(kind, &data), Some(Err(_))));
+            }
+            // Bounds count UTF-8 bytes, not characters, and include both device directions.
+            let devices = MediaAudioDevices {
+                input: MediaAudioDevice {
+                    name: "é".repeat(MAX_MEDIA_TEXT_BYTES / 2),
+                    missing: Some("x".repeat(MAX_MEDIA_TEXT_BYTES)),
+                },
+                output: MediaAudioDevice {
+                    name: "x".repeat(MAX_MEDIA_TEXT_BYTES),
+                    missing: Some(String::new()),
+                },
+            };
+            let data = serde_json::to_string(&MediaSdp {
+                session_id: "m".into(),
+                sdp: "v=0".into(),
+                audio_devices: Some(devices),
+            })
+            .unwrap();
+            assert!(matches!(MediaControl::decode(kind, &data), Some(Ok(_))));
+            // Partial metadata is invalid: omission is supported only for the whole optional field.
+            assert!(matches!(
+                MediaControl::decode(
+                    kind,
+                    r#"{"session_id":"m","sdp":"v=0","audio_devices":{"input":{"name":"Mic"}}}"#
+                ),
+                Some(Err(_))
+            ));
+        }
+    }
+
+    #[test]
     fn media_controls_reject_invalid_payloads() {
         assert!(matches!(
             MediaControl::decode(MEDIA_OFFER_KIND, "not json"),
@@ -351,6 +513,7 @@ mod tests {
         let huge = serde_json::to_string(&MediaSdp {
             session_id: "m".into(),
             sdp: "a".repeat(MAX_MEDIA_SDP_BYTES + 1),
+            audio_devices: None,
         })
         .unwrap();
         assert!(matches!(

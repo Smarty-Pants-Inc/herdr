@@ -26,7 +26,7 @@ pub use self::{
         ConfigReloadStatus, HostCursorModeConfig, MediaMode, NewTerminalCwdConfig,
         PaneBordersConfig, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
         TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
-        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        ToastHerdrPosition, UpdateChannelConfig, VoiceConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -199,6 +199,32 @@ pub(crate) fn keybindings_from_profile_toml(profile: &str) -> Result<LiveKeybind
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_names_validate_utf8_bytes_on_load_and_serialization() {
+        let limit = crate::protocol::media::MAX_MEDIA_TEXT_BYTES;
+        let allowed = "é".repeat(limit / 2);
+        let voice = VoiceConfig {
+            input: Some(allowed.clone()),
+            output: Some("default".to_string()),
+        };
+        let serialized = toml::to_string(&voice).unwrap();
+        assert_eq!(toml::from_str::<VoiceConfig>(&serialized).unwrap(), voice);
+        assert_eq!(allowed.len(), limit);
+        for invalid in [String::new(), " \t\n".to_string(), format!("{allowed}é")] {
+            let voice = VoiceConfig {
+                input: Some(invalid.clone()),
+                output: None,
+            };
+            assert!(voice.validate().is_err());
+            assert!(toml::to_string(&voice).is_err());
+            let literal = toml::Value::String(invalid).to_string();
+            let text = format!("[voice]\ninput = {literal}\n");
+            assert!(toml::from_str::<Config>(&text).is_err());
+        }
+        let default: Config = toml::from_str("").unwrap();
+        assert_eq!(default.voice, VoiceConfig::default());
+    }
 
     #[test]
     fn local_keybindings_profile_includes_defaults_and_excludes_commands() {

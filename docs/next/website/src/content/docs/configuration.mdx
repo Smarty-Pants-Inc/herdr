@@ -52,6 +52,32 @@ Reload applies most UI settings without restarting panes. Startup-only settings 
 
 Themes, sidebar layouts, copy behavior, and other presentation settings come from the client's local config, including when viewing an SSH machine. Pane defaults, worktrees, integrations, and custom commands belong to the server where the panes run. The UI's `reload config` action reloads both the client's local settings and the selected server's config. Local keybindings reload too; `--remote-keybindings server` instead uses the selected server's keybindings.
 
+## Native voice devices
+
+Choose the microphone and speaker used by native voice calls on the host where the Herdr client runs:
+
+```bash
+herdr voice devices
+herdr voice devices --input "USB microphone" --output "USB speakers"
+herdr voice devices --default-input --default-output
+```
+
+Without options, `herdr voice devices` lists native input/output names, the saved choices, and the resolved config path. Listing reports a clear error on hosts or builds without native audio support. Saving or clearing names does not enumerate devices and works without connected hardware, including on Linux.
+
+Preferences live in the existing **client host's** `config.toml`, not server config, a saved SSH machine, or endpoint-specific settings. One choice applies across all endpoints on that host. You can also edit them directly:
+
+```toml
+[voice]
+input = "USB microphone"
+output = "USB speakers"
+```
+
+Names match exactly, are nonempty, and may contain at most 512 UTF-8 bytes. Use `--input=NAME` or `--output=NAME` if a name starts with a hyphen. No device name, including `default`, is reserved: use `--default-input` or `--default-output` to remove the corresponding key and choose the system default. If a saved device is unavailable, the call falls back to the system default and reports the actual device used.
+
+Changes apply to the **next call**, with no client or server restart. An active call keeps the devices it opened. Preferences survive a client restart. At each new call, the client reloads valid voice settings; if the file cannot be read, has invalid TOML, or contains an invalid `[voice]` section, it keeps both previously accepted choices. Removing `[voice]` from a valid config resets both directions to the system defaults.
+
+The command is entirely local: it does not start or contact a Herdr server and rejects `--machine` and `--remote` routing. Device selection does not grant microphone permission or change the `media` consent policy.
+
 ## Headless terminal size
 
 When no client is attached, the server uses a 120×40 virtual terminal for layout and newly created panes. Change that fallback for headless orchestration with:

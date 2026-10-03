@@ -17,6 +17,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "theme",
     "ui",
     "update",
+    "voice",
     "worktrees",
 ];
 
@@ -148,10 +149,32 @@ pub(super) fn read_optional_config(path: &Path) -> std::io::Result<Option<String
     }
 }
 
+impl super::VoiceConfig {
+    /// Read host-local audio preferences without inspecting hardware or contacting a server.
+    pub(crate) fn load_at(path: &Path) -> Result<Self, String> {
+        let content = read_optional_config(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let Some(content) = content else {
+            return Ok(Self::default());
+        };
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct VoiceSettings {
+            voice: super::VoiceConfig,
+        }
+        toml::from_str::<VoiceSettings>(&content)
+            .map(|settings| settings.voice)
+            .map_err(|error| format!("invalid config at {}: {error}", path.display()))
+    }
+}
+
 impl Config {
     pub fn load() -> LoadedConfig {
-        let path = config_path();
-        let content = match read_optional_config(&path) {
+        Self::load_at(&config_path())
+    }
+
+    pub(crate) fn load_at(path: &Path) -> LoadedConfig {
+        let content = match read_optional_config(path) {
             Ok(Some(content)) => content,
             Ok(None) => {
                 return LoadedConfig {
@@ -317,6 +340,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         }
     }
 
+    load_live_section(
+        table,
+        "voice",
+        "voice config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.voice = section,
+    );
     load_live_section(
         table,
         "theme",
@@ -634,8 +665,8 @@ pub fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool)
 }
 
 pub fn remove_section_key(content: &str, section: &str, key: &str) -> String {
-    let header = format!("[{section}]");
     let lines: Vec<&str> = content.lines().collect();
+    let structural = toml_structural_lines(content);
     let mut result = Vec::new();
     let mut i = 0;
     let mut in_section = false;
@@ -644,16 +675,21 @@ pub fn remove_section_key(content: &str, section: &str, key: &str) -> String {
         let line = lines[i];
         let trimmed = line.trim();
 
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed == header;
+        if let Some(name) = structural[i]
+            .then(|| toml_table_header_name(toml_line_without_comment(trimmed)))
+            .flatten()
+        {
+            in_section = !trimmed.starts_with("[[") && name == section;
             result.push(line.to_string());
             i += 1;
             continue;
         }
 
-        if in_section
-            && (trimmed.starts_with(&format!("{key} ")) || trimmed.starts_with(&format!("{key}=")))
-        {
+        if structural[i] && in_section && toml_line_assigns_key(trimmed, key) {
+            let value_part = toml_line_without_comment(line);
+            if value_part.len() < line.len() {
+                result.push(line[value_part.len()..].to_string());
+            }
             i += 1;
             continue;
         }
@@ -697,6 +733,7 @@ pub fn remove_keybinding_config_sections(content: &str) -> (String, bool) {
 }
 
 fn toml_table_header_name(trimmed: &str) -> Option<&str> {
+    let trimmed = trimmed.trim();
     if let Some(name) = trimmed
         .strip_prefix("[[")
         .and_then(|value| value.strip_suffix("]]"))
@@ -717,10 +754,81 @@ fn is_top_level_keys_assignment(trimmed: &str) -> bool {
     trimmed.starts_with("keys ") || trimmed.starts_with("keys=") || trimmed.starts_with("keys.")
 }
 
+/// Find a trailing comment without confusing a # inside a quoted string for one.
+fn toml_line_without_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if quote == Some('"') && escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, ch) {
+            (Some('"'), '\\') => escaped = true,
+            (Some(current), ch) if current == ch => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '#') => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Lines beginning inside a multiline TOML string are data, not table headers or keys.
+/// Track lexical quote state across lines without changing the original string contents.
+fn toml_structural_lines(content: &str) -> Vec<bool> {
+    let mut quote: Option<(u8, bool)> = None;
+    content
+        .lines()
+        .map(|line| {
+            let structural = quote.is_none();
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                match quote {
+                    None if bytes[i] == b'#' => break,
+                    None if matches!(bytes[i], b'\'' | b'"') => {
+                        let ch = bytes[i];
+                        let multiline = bytes[i..].starts_with(&[ch; 3]);
+                        quote = Some((ch, multiline));
+                        i += if multiline { 3 } else { 1 };
+                    }
+                    Some((b'"', _)) if bytes[i] == b'\\' => i += 2,
+                    Some((ch, true)) if bytes[i..].starts_with(&[ch; 3]) => {
+                        // Four/five closing quotes include one/two literal quote characters.
+                        while i < bytes.len() && bytes[i] == ch {
+                            i += 1;
+                        }
+                        quote = None;
+                    }
+                    Some((ch, false)) if bytes[i] == ch => {
+                        quote = None;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            if quote.is_some_and(|(_, multiline)| !multiline) {
+                quote = None;
+            }
+            structural
+        })
+        .collect()
+}
+
+fn toml_line_assigns_key(line: &str, key: &str) -> bool {
+    let Some((name, _)) = line.split_once('=') else {
+        return false;
+    };
+    let name = name.trim();
+    name == key || name == format!("\"{key}\"") || name == format!("'{key}'")
+}
+
 fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> String {
     let header = format!("[{section}]");
     let assignment = format!("{key} = {value}");
     let lines: Vec<&str> = content.lines().collect();
+    let structural = toml_structural_lines(content);
     let mut result = Vec::new();
     let mut i = 0;
     let mut found_section = false;
@@ -730,7 +838,10 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
         let line = lines[i];
         let trimmed = line.trim();
 
-        if trimmed == header {
+        if structural[i]
+            && !trimmed.starts_with("[[")
+            && toml_table_header_name(toml_line_without_comment(trimmed)) == Some(section)
+        {
             found_section = true;
             result.push(line.to_string());
             i += 1;
@@ -738,7 +849,9 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
             while i < lines.len() {
                 let current = lines[i];
                 let current_trimmed = current.trim();
-                if current_trimmed.starts_with('[') && current_trimmed.ends_with(']') {
+                if structural[i]
+                    && toml_table_header_name(toml_line_without_comment(current_trimmed)).is_some()
+                {
                     if !inserted {
                         result.push(assignment.clone());
                         inserted = true;
@@ -746,10 +859,15 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
                     break;
                 }
 
-                if current_trimmed.starts_with(&format!("{key} "))
-                    || current_trimmed.starts_with(&format!("{key}="))
-                {
-                    result.push(assignment.clone());
+                if structural[i] && toml_line_assigns_key(current_trimmed, key) {
+                    let value_part = toml_line_without_comment(current);
+                    let comment = &current[value_part.len()..];
+                    let indentation = &current[..current.len() - current.trim_start().len()];
+                    result.push(if comment.is_empty() {
+                        format!("{indentation}{assignment}")
+                    } else {
+                        format!("{indentation}{assignment} {comment}")
+                    });
                     inserted = true;
                 } else {
                     result.push(current.to_string());
@@ -804,6 +922,87 @@ mod tests {
         assert!(!updated.contains("[ui.toast]\nenabled = true"));
         assert!(updated.contains("delivery = \"herdr\""));
         assert!(updated.contains("[ui.sound]\nenabled = true"));
+    }
+
+    #[test]
+    fn section_edits_preserve_comments_and_respect_commented_headers() {
+        let content = "# host settings\n[ voice ] # local audio\n\t'input'\t= 'old # mic' # keep this\n[ui] # unrelated\ninput = 'not audio'\n";
+        let updated = upsert_section_value(content, "voice", "input", "\"new # mic\"");
+        assert!(updated.contains("# host settings\n[ voice ] # local audio"));
+        assert!(updated.contains("\tinput = \"new # mic\" # keep this"));
+        assert!(updated.contains("[ui] # unrelated\ninput = 'not audio'"));
+        let cleared = remove_section_key(&updated, "voice", "input");
+        assert!(cleared.contains("# keep this"));
+        assert!(cleared.contains("input = 'not audio'"));
+        assert_eq!(
+            cleared.parse::<toml::Value>().unwrap()["voice"]
+                .as_table()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn settings_edits_preserve_commented_headers_inside_multiline_commands() {
+        for delimiter in ["'''", "\"\"\""] {
+            let content = format!(
+                "[[keys.command]]\nkey = 'prefix+alt+p'\ntype = 'shell'\ncommand = {delimiter}\ncat <<'EOF'\n[ui.sound] # sample text, not a table\n enabled = true\nEOF\n{delimiter}\n"
+            );
+            let original: toml::Value = content.parse().unwrap();
+            let updated = crate::config::ConfigEdit::Sound(false).apply(&content);
+            let updated: toml::Value = updated.parse().unwrap();
+            assert_eq!(updated["keys"], original["keys"], "changed a command");
+            assert_eq!(updated["ui"]["sound"]["enabled"].as_bool(), Some(false));
+        }
+    }
+
+    #[test]
+    fn section_upsert_and_remove_preserve_multiline_values_in_real_sections() {
+        for delimiter in ["'''", "\"\"\""] {
+            let content = format!(
+                "[voice]\nnotes = {delimiter}\n[voice] # literal header\ninput = 'sample text'\n[ui] # also literal\n{delimiter}\ninput = 'actual mic'\noutput = 'speaker'\n[ui] # real table\nmouse_capture = false\n"
+            );
+            let original: toml::Value = content.parse().unwrap();
+            let updated = upsert_section_value(&content, "voice", "input", "'new mic'");
+            let parsed: toml::Value = updated.parse().unwrap();
+            assert_eq!(parsed["voice"]["notes"], original["voice"]["notes"]);
+            assert_eq!(parsed["voice"]["input"].as_str(), Some("new mic"));
+            assert_eq!(parsed["ui"], original["ui"]);
+            let removed: toml::Value = remove_section_key(&updated, "voice", "input")
+                .parse()
+                .unwrap();
+            assert!(removed["voice"].get("input").is_none());
+            assert_eq!(removed["voice"]["notes"], original["voice"]["notes"]);
+            assert_eq!(removed["voice"]["output"], original["voice"]["output"]);
+        }
+    }
+
+    #[test]
+    fn section_edits_do_not_close_multiline_basic_strings_at_escaped_quotes() {
+        let content = r#"[[keys.command]]
+key = 'prefix+alt+p'
+type = 'shell'
+command = """
+\"""
+[ui.sound] # still inside the command
+enabled = true
+"""
+"#;
+        let original: toml::Value = content.parse().unwrap();
+        let updated: toml::Value = crate::config::ConfigEdit::Sound(false)
+            .apply(content)
+            .parse()
+            .unwrap();
+        assert_eq!(updated["keys"], original["keys"]);
+        assert_eq!(updated["ui"]["sound"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn section_edits_ignore_hashes_inside_escaped_strings() {
+        let content = "[voice]\ninput = \"old \\\"# mic\" # comment\n";
+        let updated = upsert_section_value(content, "voice", "input", "\"new\"");
+        assert_eq!(updated, "[voice]\ninput = \"new\" # comment\n");
     }
 
     #[test]
@@ -927,6 +1126,59 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.starts_with("invalid media setting")));
+    }
+
+    #[test]
+    fn load_live_config_parses_voice_names_and_reports_unknown_keys() {
+        let loaded = load_live_config_from_str(
+            "[voice]\ninput = 'USB microphone'\noutput = 'default'\nextra = true\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.voice.input.as_deref(), Some("USB microphone"));
+        assert_eq!(loaded.config.voice.output.as_deref(), Some("default"));
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["unknown config key voice.extra; ignoring key"]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_rejects_invalid_voice_section_without_losing_siblings() {
+        let loaded =
+            load_live_config_from_str("[voice]\ninput = 42\n[server]\nheadless_cols = 160\n")
+                .unwrap();
+        assert_eq!(loaded.config.voice, super::super::VoiceConfig::default());
+        assert_eq!(loaded.config.server.headless_cols, 160);
+        assert_eq!(loaded.invalid_sections, vec!["voice"]);
+        assert!(loaded.diagnostics[0].starts_with("invalid voice config:"));
+    }
+
+    #[test]
+    fn load_live_config_accepts_voice_when_an_unrelated_section_is_invalid() {
+        let loaded = load_live_config_from_str(
+            "[voice]\ninput = 'Built-in Microphone'\noutput = 'Built-in Output'\n[ui]\nmouse_capture = 'invalid'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.config.voice.input.as_deref(),
+            Some("Built-in Microphone")
+        );
+        assert_eq!(
+            loaded.config.voice.output.as_deref(),
+            Some("Built-in Output")
+        );
+        assert_eq!(loaded.invalid_sections, vec!["ui"]);
+    }
+
+    #[test]
+    fn load_live_config_marks_oversized_voice_names_invalid() {
+        let name = "é".repeat(crate::protocol::media::MAX_MEDIA_TEXT_BYTES / 2 + 1);
+        let content = format!("[voice]\noutput = {name:?}\n");
+        let loaded = load_live_config_from_str(&content).unwrap();
+        assert_eq!(loaded.config.voice, super::super::VoiceConfig::default());
+        assert_eq!(loaded.invalid_sections, vec!["voice"]);
+        assert!(loaded.diagnostics[0].contains("UTF-8 bytes"));
     }
 
     #[test]

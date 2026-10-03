@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::protocol::media::{MediaControl, MediaOpen, MediaSdp};
+use crate::protocol::media::{
+    MediaAudioDevice, MediaAudioDevices, MediaControl, MediaOpen, MediaSdp,
+};
 
 fn connect_media_shell(
     server: &mut HeadlessServer,
@@ -111,16 +113,52 @@ async fn pane_media_open_binds_to_the_client_that_typed_last() {
     assert_eq!(open.pane_id, pane_id);
     assert!(media_open_sent(&legacy, Duration::from_millis(200)).is_none());
 
+    let devices = MediaAudioDevices {
+        input: MediaAudioDevice {
+            name: "USB microphone".into(),
+            missing: Some("Preferred microphone".into()),
+        },
+        output: MediaAudioDevice {
+            name: "Headphones".into(),
+            missing: None,
+        },
+    };
+    // Metadata is supplied by the bound client's opened devices, never by another client.
+    server.handle_server_event(ServerEvent::ClientMediaControl {
+        client_id: 32,
+        control: MediaControl::Offer(MediaSdp {
+            session_id: open.session_id.clone(),
+            sdp: "v=0 wrong client".into(),
+            audio_devices: Some(devices.clone()),
+        }),
+    });
+    assert!(
+        rx.try_recv().is_err(),
+        "wrong client cannot complete media_open"
+    );
     server.handle_server_event(ServerEvent::ClientMediaControl {
         client_id: 31,
         control: MediaControl::Offer(MediaSdp {
             session_id: open.session_id.clone(),
             sdp: "v=0 offer".into(),
+            audio_devices: Some(devices),
         }),
     });
-    let offer = json(&rx);
-    assert_eq!(offer["result"]["type"], "media_offer");
-    assert_eq!(offer["result"]["sdp"], "v=0 offer");
+    assert_eq!(
+        json(&rx),
+        serde_json::json!({
+            "id": "media",
+            "result": {
+                "type": "media_offer",
+                "session_id": open.session_id,
+                "sdp": "v=0 offer",
+                "audio_devices": {
+                    "input": {"name": "USB microphone", "missing": "Preferred microphone"},
+                    "output": {"name": "Headphones"}
+                }
+            }
+        })
+    );
 
     // A newer keystroke from a client without media support wins the binding and fails clearly.
     type_into(&mut server, 32, &pane_id);

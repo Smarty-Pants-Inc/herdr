@@ -114,6 +114,14 @@ Raw socket method names use dot notation:
 
 `pane.media_open` asks the attached Herdr client whose input last reached the pane, within 10 seconds, to act as the WebRTC audio peer for that pane: it captures the microphone and plays the reply on the user's machine, and the server carries only SDP and control. It routes only to that client, and only when it advertises native media support (`media.webrtc.v1`). The response is `media_offer` with a `session_id` and the client's SDP offer. Post the remote answer with `media.answer`, mute with `media.mute`, poll `media.state` (`opening`, `offered`, `connecting`, `connected`, `failed` or `closed` with a `code`), and end the call with `media.close`, which releases the microphone. Errors: `media_no_client` (no recent input from an attached client), `media_unsupported_client` (the client that typed last has no media support), `media_refused` (the client declined; the message starts with a code such as `declined`, `disabled`, `not_viewed` or `stale_input`) and `media_timeout`. The client setting `media = "off" | "ask" | "auto"` controls consent; `ask`, the default, prompts once per client run.
 
+When the client reports its opened audio devices, `media_offer` also includes optional `audio_devices` metadata:
+
+```json
+{"id":"voice","result":{"type":"media_offer","session_id":"media_1","sdp":"v=0...","audio_devices":{"input":{"name":"USB microphone"},"output":{"name":"Headphones","missing":"Preferred headphones"}}}}
+```
+
+`input` and `output` describe the devices actually opened on the client's machine, not a server-side device selection. Each has a nonempty `name`: the actual opened device name when reportable, or the literal display label `"default"` when the selected OS default handle has no reportable name. This label is never a device selector. A device may include `missing`, the exact requested preference that was unavailable when the client used its default device. Device names and missing-device names are bounded to 512 UTF-8 bytes each. Older clients omit `audio_devices`; API callers must support that absence. This metadata belongs to the offer, not `media.state`, and `media.answer` does not select devices.
+
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.

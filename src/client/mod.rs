@@ -27,7 +27,7 @@ mod frame_output;
 mod handshake;
 mod input;
 mod loop_config;
-mod media;
+pub(crate) mod media;
 mod notifications;
 mod shell;
 mod shell_runtime;
@@ -196,6 +196,7 @@ fn run_client_with_mode(
         remote_image_paste_key,
         shell_config,
         media_mode: loaded_config.config.media,
+        voice_config: loaded_config.config.voice,
     };
 
     crate::logging::startup("client");
@@ -437,7 +438,7 @@ async fn run_client_loop(
         shell: config.shell_config.map(shell::ClientShellState::new),
         media: media::ClientMedia::new(
             config.media_mode,
-            media::peer::native_peer_factory(),
+            media::peer::native_peer_factory(config.voice_config),
             media_sink,
         ),
     };
