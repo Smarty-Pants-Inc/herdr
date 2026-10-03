@@ -395,7 +395,15 @@ mod remote_bridge_tests;
 mod unix_common;
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, RemoteBridgeWake,
+    begin_cli_output, diagnostic_process_exists, end_cli_output, forward_remote_bridge_stdio,
+    DiagnosticDirectoryScan, PrivateDiagnosticDirectory, RemoteBridgeWake,
+};
+
+#[cfg(not(any(unix, windows)))]
+mod unsupported_diagnostics;
+#[cfg(not(any(unix, windows)))]
+pub(crate) use unsupported_diagnostics::{
+    diagnostic_process_exists, DiagnosticDirectoryScan, PrivateDiagnosticDirectory,
 };
 
 mod client_state;

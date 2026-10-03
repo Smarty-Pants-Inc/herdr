@@ -27,6 +27,7 @@ mod frame_output;
 mod handshake;
 mod input;
 mod loop_config;
+pub(crate) mod machine_status;
 mod media;
 mod notifications;
 mod shell;
@@ -616,6 +617,10 @@ async fn run_client_loop(
     // This (foreground) client owns the prefix ASCII input-source switch
     // (implemented on macOS and Windows; a no-op on other platforms).
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
+
+    let mut machine_status_publisher =
+        (state.shell.is_some() && !is_remote_client && state.attach_escape.is_none())
+            .then(|| machine_status::MachineStatusPublisher::new(&client_socket_path()));
 
     // Main event loop.
     let mut client_timer = timer::ClientLoopTimer::new();
@@ -2166,6 +2171,11 @@ async fn run_client_loop(
                         format!("{label} did not produce a coherent surface in time"),
                         false,
                     );
+                }
+                if let (Some(publisher), Some(shell)) =
+                    (machine_status_publisher.as_mut(), state.shell.as_ref())
+                {
+                    publisher.publish_if_due(now, &endpoint_catalog.ssh, shell, &write_stream);
                 }
                 if state.shell.is_some() {
                     let expired_endpoints = endpoint_commands

@@ -67,6 +67,13 @@ use crate::protocol::{
 #[cfg(test)]
 use crate::raw_input::RawInputEvent;
 
+impl ClientShellState {
+    /// Machine model consumed by sidebar and mobile navigation, not scroll-clipped hit rows.
+    pub(super) fn endpoint_views(&self) -> &[ClientShellEndpoint] {
+        &self.endpoints
+    }
+}
+
 fn target_event_message(target: ClientInputTarget, event: ClientPaneInputEvent) -> ClientMessage {
     match target {
         ClientInputTarget::Pane(pane_id) => ClientMessage::ClientShellPaneInput {

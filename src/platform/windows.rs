@@ -15,6 +15,10 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+mod diagnostics;
+pub(crate) use diagnostics::{
+    diagnostic_process_exists, DiagnosticDirectoryScan, PrivateDiagnosticDirectory,
+};
 
 pub(crate) fn windows_virtual_terminal_input_active() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
