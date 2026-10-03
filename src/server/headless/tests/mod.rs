@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "last_input_alt_read.rs"]
+mod last_input_alt_read_tests;
 #[path = "last_input_scroll.rs"]
 mod last_input_scroll_tests;
 #[path = "last_input.rs"]

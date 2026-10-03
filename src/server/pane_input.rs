@@ -111,7 +111,7 @@ pub(super) fn apply_terminal_attach_scroll(
     column: Option<u16>,
     row: Option<u16>,
     modifiers: u8,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     apply_scroll(
         runtime,
         source,
@@ -132,7 +132,7 @@ fn apply_scroll(
     lines: u16,
     position: crate::input::mouse::Position,
     modifiers: u8,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let wheel_kind = match direction {
         AttachScrollDirection::Up => MouseEventKind::ScrollUp,
         AttachScrollDirection::Down => MouseEventKind::ScrollDown,
@@ -146,7 +146,7 @@ fn apply_scroll(
                 AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
                 AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
             }
-            return Ok(());
+            return Ok(true);
         }
         return apply_terminal_attach_input(runtime, input);
     }
@@ -166,51 +166,67 @@ fn apply_scroll(
             runtime
                 .try_send_bytes(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
+            return Ok(true);
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
             runtime.scroll_reset();
             let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
-                return Ok(());
+                return Ok(false);
             };
+            if bytes.is_empty() {
+                return Ok(false);
+            }
             runtime
                 .try_send_bytes(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
+            return Ok(true);
         }
-        Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
+        Some(crate::pane::WheelRouting::HostScroll) => {
+            match direction {
+                AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
+                AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
+            }
+            return Ok(true);
+        }
+        None => match direction {
             AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
             AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
         },
     }
-    Ok(())
+    Ok(false)
 }
 
 pub(super) fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
     data: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     runtime.scroll_reset();
     if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
         runtime
             .try_send_paste(text.to_owned())
             .map_err(|err| format!("terminal attach paste failed: {err}"))
     } else {
+        if data.is_empty() {
+            return Ok(false);
+        }
         runtime
             .try_send_bytes(Bytes::from(data))
-            .map_err(|err| format!("terminal attach input failed: {err}"))
+            .map_err(|err| format!("terminal attach input failed: {err}"))?;
+        Ok(true)
     }
 }
 
 pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     apply_client_terminal_input_events(runtime, events, true)
 }
 
 pub(super) fn apply_client_popup_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     apply_client_terminal_input_events(runtime, events, false)
 }
 
@@ -218,7 +234,8 @@ fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let mut accepted = false;
     for event in events {
         if let ClientPaneInputEvent::Mouse {
             kind,
@@ -255,7 +272,7 @@ fn apply_client_terminal_input_events(
                     } else {
                         AttachScrollDirection::Down
                     };
-                    apply_scroll(
+                    accepted |= apply_scroll(
                         runtime,
                         AttachScrollSource::Wheel,
                         direction,
@@ -284,6 +301,7 @@ fn apply_client_terminal_input_events(
                 runtime
                     .try_send_bytes(Bytes::from(bytes))
                     .map_err(|err| format!("targeted pane mouse input failed: {err}"))?;
+                accepted = true;
             }
             continue;
         }
@@ -305,6 +323,7 @@ fn apply_client_terminal_input_events(
                             } else {
                                 runtime.scroll_down(lines);
                             }
+                            accepted = true;
                             continue;
                         }
                     }
@@ -316,17 +335,23 @@ fn apply_client_terminal_input_events(
                     runtime
                         .try_send_bytes(Bytes::from(bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
+                    accepted = true;
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
                 runtime.scroll_reset();
+                let bytes = text.as_str().as_bytes();
+                if bytes.is_empty() {
+                    continue;
+                }
                 runtime
-                    .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
+                    .try_send_bytes(Bytes::copy_from_slice(bytes))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
+                accepted = true;
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
-                runtime
+                accepted |= runtime
                     .try_send_paste(text)
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
             }
@@ -342,7 +367,7 @@ fn apply_client_terminal_input_events(
             }
         }
     }
-    Ok(())
+    Ok(accepted)
 }
 
 #[cfg(test)]
@@ -447,6 +472,76 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[tokio::test]
+    async fn input_receipts_distinguish_accepted_ignored_and_rejected() {
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        assert_eq!(
+            apply_client_pane_input_events(
+                &runtime,
+                &[ClientPaneInputEvent::TextCommit("x".to_owned())],
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("accepted input"),
+            Bytes::from_static(b"x")
+        );
+
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            apply_client_pane_input_events(
+                &runtime,
+                &[ClientPaneInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Moved,
+                    position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+                    geometry: None,
+                    modifiers: 0,
+                    lines: 1,
+                }],
+            ),
+            Ok(false)
+        );
+        assert!(
+            input_rx.try_recv().is_err(),
+            "ignored motion must not enqueue"
+        );
+
+        let (runtime, _input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .expect("fill input queue");
+        assert!(apply_client_pane_input_events(
+            &runtime,
+            &[ClientPaneInputEvent::TextCommit("rejected".to_owned())],
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_paste_receipt_matches_actual_enqueued_payload() {
+        let empty_paste = b"\x1b[200~\x1b[201~".to_vec();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        assert_eq!(
+            apply_terminal_attach_input(&runtime, empty_paste.clone()),
+            Ok(false)
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        assert_eq!(apply_terminal_attach_input(&runtime, empty_paste), Ok(true));
+        assert_eq!(
+            input_rx.try_recv().expect("bracketed paste wrappers"),
+            Bytes::from_static(b"\x1b[200~\x1b[201~")
+        );
     }
 
     #[test]

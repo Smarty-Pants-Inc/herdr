@@ -3465,8 +3465,16 @@ impl PaneRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.try_send_bytes(self.paste_payload(text))
+    pub(crate) fn try_send_paste(
+        &self,
+        text: String,
+    ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
+        let payload = self.paste_payload(text);
+        if payload.is_empty() {
+            return Ok(false);
+        }
+        self.try_send_bytes(payload)?;
+        Ok(true)
     }
 
     fn paste_payload(&self, text: String) -> Bytes {

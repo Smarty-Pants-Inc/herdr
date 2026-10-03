@@ -176,33 +176,7 @@ async fn accepted_direct_page_and_wheel_scroll_clear_display_only_and_named_inpu
             "one scroll must enqueue only once"
         );
 
-        // Synthetic clock checks media owner/reference and the unchanged 10-second age.
-        let (respond_to, _response) = std::sync::mpsc::channel();
-        let actions = server.media.open(
-            "fresh-owner".into(),
-            respond_to,
-            pane,
-            |_| true,
-            owner_at + Duration::from_secs(9),
-        );
-        assert!(actions.iter().any(|action| matches!(action,
-            crate::server::media::MediaAction::Send {
-                client_id: ALICE,
-                control: crate::protocol::media::MediaControl::Open(open),
-            } if open.pane_id == pane_id
-        )));
-        let (respond_to, response) = std::sync::mpsc::channel();
-        let actions = server.media.open(
-            "stale-owner".into(),
-            respond_to,
-            pane,
-            |_| true,
-            owner_at + Duration::from_secs(11),
-        );
-        server.perform_media_actions(actions);
-        let stale: serde_json::Value =
-            serde_json::from_str(&response.try_recv().expect("expired owner response")).unwrap();
-        assert_eq!(stale["error"]["code"], "media_no_client");
+        super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
 
         named_input(&mut server, &pane_id, &mut input);
         shutdown_test_runtimes(&mut server);
@@ -408,6 +382,179 @@ async fn direct_scroll_invalidates_only_the_current_attachment_after_rebinding()
         Bytes::from_static(b"\x1b[6~")
     );
     assert_eq!(last_input(&mut server, &other_ref), other_before);
+    shutdown_test_runtimes(&mut server);
+}
+
+fn mouse(server: &mut HeadlessServer, client_id: u64, pane: &str) {
+    if client_id == DIRECT {
+        server.handle_server_event(ServerEvent::ClientAttachMouse {
+            client_id,
+            kind: protocol::ClientMouseKind::Moved,
+            position: protocol::ClientMousePosition::Cell { column: 10, row: 5 },
+            geometry: None,
+            modifiers: 0,
+            lines: 1,
+        });
+    } else {
+        server.handle_server_event(ServerEvent::ClientShellPaneInput {
+            client_id,
+            pane_id: pane.into(),
+            events: vec![protocol::ClientPaneInputEvent::Mouse {
+                kind: protocol::ClientMouseKind::Moved,
+                position: protocol::ClientMousePosition::Cell { column: 10, row: 5 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            }],
+        });
+    }
+}
+
+#[tokio::test]
+async fn empty_clipboard_and_direct_input_preserve_complete_sender_and_media_age() {
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    let _bob = super::last_input_tests::connect(&mut server, 32, Some("Bob"));
+    named_input(&mut server, &pane_id, &mut input);
+    let (_, pane) = server.app.parse_pane_id(&pane_id).unwrap();
+    let owner_at = Instant::now() - Duration::from_secs(9);
+    server
+        .media
+        .note_pane_input(ALICE, pane, &pane_id, owner_at);
+    let before = last_input(&mut server, &pane_id);
+    server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?2004l");
+    // No bracketed-paste mode: empty paste has no child bytes to accept.
+    for (client_id, target) in [
+        (
+            32,
+            protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
+        ),
+        (DIRECT, protocol::ClientClipboardImageTarget::DirectTerminal),
+    ] {
+        server.paste_client_clipboard_image_path(client_id, target, String::new());
+        assert_eq!(last_input(&mut server, &pane_id), before);
+        assert!(input.try_recv().is_err());
+    }
+    for data in [Vec::new(), b"\x1b[200~\x1b[201~".to_vec()] {
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: DIRECT,
+            data,
+        });
+        assert_eq!(last_input(&mut server, &pane_id), before);
+        assert!(input.try_recv().is_err());
+    }
+    // Even with bracketed-paste enabled, a truly empty raw event is ignored.
+    server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?2004h");
+    server.handle_server_event(ServerEvent::ClientInput {
+        client_id: DIRECT,
+        data: Vec::new(),
+    });
+    assert_eq!(last_input(&mut server, &pane_id), before);
+    assert!(input.try_recv().is_err());
+    super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn ignored_direct_and_bob_motion_preserve_complete_sender_and_media_age() {
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    let _bob = super::last_input_tests::connect(&mut server, 32, Some("Bob"));
+    server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    named_input(&mut server, &pane_id, &mut input);
+    let (_, pane) = server.app.parse_pane_id(&pane_id).unwrap();
+    let owner_at = Instant::now() - Duration::from_secs(9);
+    server
+        .media
+        .note_pane_input(ALICE, pane, &pane_id, owner_at);
+    let before = last_input(&mut server, &pane_id);
+    for client_id in [DIRECT, 32] {
+        mouse(&mut server, client_id, &pane_id);
+        assert!(
+            input.try_recv().is_err(),
+            "DEC1000 ignores unpressed motion"
+        );
+        assert_eq!(last_input(&mut server, &pane_id), before);
+        super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn accepted_and_rejected_direct_and_bob_motion_follow_enqueue_receipts() {
+    let (mut server, pane_id, terminal_id, mut input) = setup();
+    let _bob = super::last_input_tests::connect(&mut server, 32, Some("Bob"));
+    server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?1003h\x1b[?1006h");
+    for client_id in [DIRECT, 32] {
+        named_input(&mut server, &pane_id, &mut input);
+        let (_, pane) = server.app.parse_pane_id(&pane_id).unwrap();
+        let owner_at = Instant::now() - Duration::from_secs(9);
+        server
+            .media
+            .note_pane_input(ALICE, pane, &pane_id, owner_at);
+        let before = last_input(&mut server, &pane_id);
+        for _ in 0..CAPACITY {
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .try_send_bytes(Bytes::from_static(b"fill"))
+                .unwrap();
+        }
+        mouse(&mut server, client_id, &pane_id);
+        assert_eq!(last_input(&mut server, &pane_id), before);
+        super::last_input_tests::assert_media_owner_and_age(&mut server, &pane_id, ALICE, owner_at);
+        for _ in 0..CAPACITY {
+            assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"fill"));
+        }
+        assert!(
+            input.try_recv().is_err(),
+            "rejected motion enqueues no bytes"
+        );
+        let accepted_at = Instant::now();
+        mouse(&mut server, client_id, &pane_id);
+        assert_eq!(
+            input.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[<35;11;6M")
+        );
+        assert!(input.try_recv().is_err());
+        if client_id == DIRECT {
+            assert!(last_input(&mut server, &pane_id).is_null());
+            super::last_input_tests::assert_media_owner_and_age(
+                &mut server,
+                &pane_id,
+                ALICE,
+                owner_at,
+            );
+        } else {
+            assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
+            super::last_input_tests::assert_media_owner_and_age(
+                &mut server,
+                &pane_id,
+                32,
+                accepted_at,
+            );
+        }
+    }
     shutdown_test_runtimes(&mut server);
 }
 

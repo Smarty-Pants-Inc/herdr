@@ -33,6 +33,7 @@ use tracing::error;
 use tracing::{debug, info, warn};
 
 use base64::Engine;
+#[cfg(test)]
 use bytes::Bytes;
 
 use crate::api;
@@ -1270,8 +1271,9 @@ impl HeadlessServer {
                 let terminal_id = terminal_id.clone();
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    match runtime.try_send_bytes(Bytes::from(payload)) {
-                        Ok(()) => self.invalidate_terminal_input_attribution(&terminal_id),
+                    match apply_terminal_attach_input(runtime, payload.into_bytes()) {
+                        Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
+                        Ok(false) => {}
                         Err(err) => {
                             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed")
                         }
@@ -1308,18 +1310,20 @@ impl HeadlessServer {
                 ) else {
                     return foreground_changed | geometry_changed;
                 };
-                if let Err(err) = apply_client_pane_input_events(
+                match apply_client_pane_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
-                } else {
-                    self.media.note_pane_input(
+                    Ok(true) => self.media.note_pane_input(
                         client_id,
                         runtime_pane_id,
                         &pane_id,
                         Instant::now(),
-                    );
+                    ),
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                    }
                 }
                 true
             }
@@ -1458,7 +1462,8 @@ impl HeadlessServer {
         match apply_terminal_attach_scroll(
             runtime, source, direction, lines, column, row, modifiers,
         ) {
-            Ok(()) => self.invalidate_terminal_input_attribution(&terminal_id),
+            Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
+            Ok(false) => {}
             Err(err) => {
                 warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
             }
@@ -1511,10 +1516,12 @@ impl HeadlessServer {
             lines: lines.max(1),
         };
         let interaction = !client_pane_input_releases_press(&event);
-        if let Err(err) = apply_client_pane_input_events(runtime, &[event]) {
-            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
-        } else if interaction {
-            self.invalidate_terminal_input_attribution(&terminal_id);
+        match apply_client_pane_input_events(runtime, &[event]) {
+            Ok(true) if interaction => self.invalidate_terminal_input_attribution(&terminal_id),
+            Ok(_) => {}
+            Err(err) => {
+                warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
+            }
         }
         true
     }
@@ -2202,13 +2209,10 @@ impl HeadlessServer {
                     return false;
                 };
                 let terminal_id = terminal_id.clone();
-                let has_input = !data.is_empty();
                 if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     match apply_terminal_attach_input(runtime, data) {
-                        Ok(()) if has_input => {
-                            self.invalidate_terminal_input_attribution(&terminal_id)
-                        }
-                        Ok(()) => {}
+                        Ok(true) => self.invalidate_terminal_input_attribution(&terminal_id),
+                        Ok(false) => {}
                         Err(err) => warn!(client_id, terminal_id = %terminal_id, err = %err),
                     }
                 }
@@ -2552,10 +2556,11 @@ impl HeadlessServer {
                 let mut accepted_interaction = false;
                 for event in &events {
                     match apply_client_pane_input_events(runtime, std::slice::from_ref(event)) {
-                        Ok(()) => {
+                        Ok(true) => {
                             accepted_interaction |=
                                 client_pane_input_has_interaction(std::slice::from_ref(event));
                         }
+                        Ok(false) => {}
                         Err(err) => {
                             warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
                             break;
@@ -2910,7 +2915,8 @@ impl HeadlessServer {
     fn poll_pending_alt_screen_reads(&mut self, now: Instant) {
         let pending = std::mem::take(&mut self.pending_alt_screen_reads);
         for read in pending {
-            let runtime = self.app.terminal_runtimes.get(&read.terminal_id);
+            let terminal_id = read.terminal_id.clone();
+            let runtime = self.app.terminal_runtimes.get(&terminal_id);
             let remains_idle = self
                 .app
                 .state
@@ -2925,7 +2931,13 @@ impl HeadlessServer {
             } else {
                 read.abort(runtime, now)
             };
-            if let Some(read) = outcome {
+            // Polling and abort/restore can enqueue anonymous wheel input even
+            // when the read completes or falls back. Resolve the current attachment
+            // after the runtime borrow ends; never refresh the media owner or age.
+            if outcome.input_accepted {
+                self.invalidate_terminal_input_attribution(terminal_id.as_str());
+            }
+            if let Some(read) = outcome.pending {
                 self.pending_alt_screen_reads.push(read);
             }
         }

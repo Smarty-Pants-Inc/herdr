@@ -1,6 +1,6 @@
 use super::*;
 
-fn connect(
+pub(super) fn connect(
     server: &mut HeadlessServer,
     client_id: u64,
     user: Option<&str>,
@@ -44,7 +44,7 @@ fn request(server: &mut HeadlessServer, method: api::schema::Method) -> serde_js
     serde_json::from_str(&response.try_recv().expect("immediate response")).unwrap()
 }
 
-fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
+pub(super) fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
     let response = request(
         server,
         api::schema::Method::PaneLastInput(api::schema::PaneLastInputParams { pane: pane.into() }),
@@ -53,7 +53,7 @@ fn last_input(server: &mut HeadlessServer, pane: &str) -> serde_json::Value {
     response["result"]["last_input"].clone()
 }
 
-fn type_into(server: &mut HeadlessServer, client_id: u64, pane_id: &str) {
+pub(super) fn type_into(server: &mut HeadlessServer, client_id: u64, pane_id: &str) {
     server.handle_server_event(ServerEvent::ClientShellPaneInput {
         client_id,
         pane_id: pane_id.into(),
@@ -70,7 +70,7 @@ fn setup() -> (
     setup_with_channel_capacity(64)
 }
 
-fn setup_with_channel_capacity(
+pub(super) fn setup_with_channel_capacity(
     channel_capacity: usize,
 ) -> (
     HeadlessServer,
@@ -100,6 +100,43 @@ fn setup_with_channel_capacity(
         .terminal_runtimes
         .insert(terminal_id.clone(), runtime);
     (server, pane_id, terminal_id, input)
+}
+
+// A synthetic clock proves both the routing reference and the unchanged owner age
+// without sleeps or access to the broker's private owner record.
+pub(super) fn assert_media_owner_and_age(
+    server: &mut HeadlessServer,
+    pane_ref: &str,
+    client_id: u64,
+    owner_at: Instant,
+) {
+    let (_, pane) = server.app.parse_pane_id(pane_ref).unwrap();
+    let (respond_to, _response) = std::sync::mpsc::channel();
+    let actions = server.media.open(
+        "fresh-owner".into(),
+        respond_to,
+        pane,
+        |_| true,
+        owner_at + Duration::from_secs(9),
+    );
+    assert!(actions.iter().any(|action| matches!(action,
+        crate::server::media::MediaAction::Send {
+            client_id: owner,
+            control: crate::protocol::media::MediaControl::Open(open),
+        } if *owner == client_id && open.pane_id == pane_ref
+    )));
+    let (respond_to, response) = std::sync::mpsc::channel();
+    let actions = server.media.open(
+        "stale-owner".into(),
+        respond_to,
+        pane,
+        |_| true,
+        owner_at + Duration::from_secs(11),
+    );
+    server.perform_media_actions(actions);
+    let stale: serde_json::Value =
+        serde_json::from_str(&response.try_recv().expect("expired owner response")).unwrap();
+    assert_eq!(stale["error"]["code"], "media_no_client");
 }
 
 #[tokio::test]
@@ -274,9 +311,43 @@ async fn client_shell_input_attributes_only_accepted_prefix() {
         ],
     });
     assert_eq!(last_input(&mut server, &pane_id)["user"], "Alice");
+    assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"fill"));
+    assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"first"));
+    assert!(
+        input.try_recv().is_err(),
+        "rejected suffix was not enqueued"
+    );
 
-    // A later successful Bob retry must still restore Bob, not sticky Alice.
-    input.try_recv().expect("free one queue slot");
+    // An accepted text prefix followed by ignored DEC1000 motion still wins;
+    // the ignored suffix must neither erase the prefix nor consume a queue slot.
+    server
+        .app
+        .terminal_runtimes
+        .get(&terminal_id)
+        .unwrap()
+        .test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    server.handle_server_event(ServerEvent::ClientShellPaneInput {
+        client_id: 32,
+        pane_id: pane_id.clone(),
+        events: vec![
+            protocol::ClientPaneInputEvent::TextCommit("prefix".into()),
+            protocol::ClientPaneInputEvent::Mouse {
+                kind: protocol::ClientMouseKind::Moved,
+                position: protocol::ClientMousePosition::Cell { column: 0, row: 0 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            },
+        ],
+    });
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
+    assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"prefix"));
+    assert!(input.try_recv().is_err());
+
+    // Sender identity is not sticky after either kind of suffix.
+    type_into(&mut server, 31, &pane_id);
+    assert_eq!(last_input(&mut server, &pane_id)["user"], "Alice");
+    assert_eq!(input.try_recv().unwrap(), Bytes::from_static(b"hello"));
     type_into(&mut server, 32, &pane_id);
     assert_eq!(last_input(&mut server, &pane_id)["user"], "Bob");
     shutdown_test_runtimes(&mut server);
