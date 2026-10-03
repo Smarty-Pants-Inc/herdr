@@ -1358,6 +1358,10 @@
               },
               "type": "array"
             },
+            "expected_terminal": {
+              "description": "Refuse startup unless the pane still owns this opaque terminal identity.",
+              "type": "string"
+            },
             "kind": {
               "type": "string"
             },
@@ -3301,6 +3305,10 @@
             "allow_cross_pane": {
               "description": "Deliberately allow an agent-originated request to target another pane.",
               "type": "boolean"
+            },
+            "expected_terminal": {
+              "description": "Refuse input unless the pane still owns this opaque terminal identity.",
+              "type": "string"
             },
             "keys": {
               "items": {
@@ -5626,6 +5634,23 @@
           "type": "object"
         },
         {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "agent.start_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "method": {
               "const": "agent.prompt",
@@ -6125,6 +6150,23 @@
           "properties": {
             "method": {
               "const": "pane.send_input",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Requires `expected_terminal`; older servers reject instead of ignoring the guard.",
+          "properties": {
+            "method": {
+              "const": "pane.send_input_guarded",
               "type": "string"
             },
             "params": {
@@ -10953,6 +10995,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "expected_terminal_guard": {
+              "default": false,
+              "description": "Supports the fail-closed `expected_terminal` guard on `agent.start` and `pane.send_input`.",
+              "type": "boolean"
             },
             "guarded_live_handoff": {
               "default": false,

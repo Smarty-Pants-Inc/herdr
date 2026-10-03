@@ -114,6 +114,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         guarded_live_handoff: crate::platform::capabilities().live_handoff,
+        expected_terminal_guard: true,
     })
 }
 
@@ -603,6 +604,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentStartGuarded(_) => "agent.start_guarded",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
@@ -635,6 +637,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
+        Method::PaneSendInputGuarded(_) => "pane.send_input_guarded",
         Method::PaneRead(_) => "pane.read",
         Method::PaneGraphicsSet(_) => "pane.graphics.set",
         Method::PaneGraphicsClear(_) => "pane.graphics.clear",
@@ -1461,6 +1464,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 guarded_live_handoff: true,
+                expected_terminal_guard: true,
             }),
             None,
             None,

@@ -351,6 +351,14 @@ pub struct PaneSendKeysParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendInputParams {
     pub pane_id: String,
+    /// Refuse input unless the pane still owns this opaque terminal identity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_expected_terminal"
+    )]
+    #[schemars(with = "String")]
+    pub expected_terminal: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
