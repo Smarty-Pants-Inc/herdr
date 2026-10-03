@@ -47,6 +47,8 @@ pub(crate) struct PendingAltScreenRead {
     upward_events: usize,
     reached_top: bool,
     valid: bool,
+    /// Nonempty wheel input accepted since the last poll/abort outcome.
+    input_accepted: bool,
 }
 
 impl PendingAltScreenRead {
@@ -85,6 +87,7 @@ impl PendingAltScreenRead {
             upward_events: 0,
             reached_top: false,
             valid: true,
+            input_accepted: false,
         }
     }
 
@@ -170,23 +173,23 @@ impl PendingAltScreenRead {
             } else {
                 self.output_quiet_until = Some(now + OUTPUT_QUIET);
                 if !traversal_expired {
-                    return Some(self);
+                    return self.into_outcome();
                 }
             }
         }
         if !traversal_expired && self.output_quiet_until.is_some_and(|quiet| now < quiet) {
-            return Some(self);
+            return self.into_outcome();
         }
         self.output_quiet_until = None;
         if !traversal_expired && runtime.synchronized_output_active() {
             self.synchronized_redraw_pending = true;
             self.next_poll_at = now + OUTPUT_QUIET;
-            return Some(self);
+            return self.into_outcome();
         }
         let step_expired = now >= self.step_deadline;
         let output_observed = self.step_observed_output;
         if !step_expired && !output_observed {
-            return Some(self);
+            return self.into_outcome();
         }
         let Some((screen, snapshot, snapshot_seq)) = runtime.screen_text_snapshot_with_seq() else {
             if traversal_expired {
@@ -196,13 +199,13 @@ impl PendingAltScreenRead {
             self.step_observed_output = false;
             self.output_quiet_until = None;
             self.next_poll_at = now + OUTPUT_QUIET;
-            return Some(self);
+            return self.into_outcome();
         };
         if runtime.content_seq() != snapshot_seq {
             self.observed_content_seq = snapshot_seq;
             self.step_observed_output = false;
             self.next_poll_at = now + OUTPUT_QUIET;
-            return Some(self);
+            return self.into_outcome();
         }
         if screen != crate::ghostty::ActiveScreen::Alternate
             || snapshot.cols != self.initial.cols
@@ -220,13 +223,14 @@ impl PendingAltScreenRead {
                     self.step_observed_output = false;
                     self.next_poll_at = now + INITIAL_QUIET;
                     self.step_deadline = self.next_poll_at;
-                    return Some(self);
+                    return self.into_outcome();
                 }
                 if send_wheel(
                     runtime,
                     MouseEventKind::ScrollDown,
                     WHEEL_STEP_EVENTS,
                     &snapshot,
+                    &mut self.input_accepted,
                 )
                 .is_err()
                 {
@@ -234,13 +238,13 @@ impl PendingAltScreenRead {
                 }
                 self.phase = Phase::ProbeBottom;
                 self.arm_step(snapshot_seq, now);
-                Some(self)
+                self.into_outcome()
             }
             Phase::ProbeBottom => {
                 let at_bottom = snapshot.similar_text(&self.initial);
                 if output_observed && at_bottom && !step_expired && !traversal_expired {
                     self.step_observed_output = false;
-                    return Some(self);
+                    return self.into_outcome();
                 }
                 debug!(
                     terminal_id = %self.terminal_id,
@@ -259,6 +263,7 @@ impl PendingAltScreenRead {
                         MouseEventKind::ScrollUp,
                         WHEEL_STEP_EVENTS,
                         &snapshot,
+                        &mut self.input_accepted,
                     )
                     .is_err()
                     {
@@ -267,7 +272,7 @@ impl PendingAltScreenRead {
                     self.phase = Phase::RestoreProbe;
                     self.restore_started_at = Some(now);
                     self.arm_step(snapshot_seq, now);
-                    Some(self)
+                    self.into_outcome()
                 }
             }
             Phase::RestoreProbe => {
@@ -279,7 +284,7 @@ impl PendingAltScreenRead {
                         self.next_poll_at = now + STEP_TIMEOUT;
                         self.step_deadline = self.next_poll_at;
                     }
-                    Some(self)
+                    self.into_outcome()
                 }
             }
             Phase::Harvest => {
@@ -315,7 +320,7 @@ impl PendingAltScreenRead {
                     }
                     UpwardMerge::Unchanged | UpwardMerge::Unaligned => {
                         self.step_observed_output = false;
-                        Some(self)
+                        self.into_outcome()
                     }
                 }
             }
@@ -332,6 +337,7 @@ impl PendingAltScreenRead {
                         MouseEventKind::ScrollDown,
                         restore_batch_size(&snapshot),
                         &snapshot,
+                        &mut self.input_accepted,
                     )
                     .is_err()
                     {
@@ -339,10 +345,10 @@ impl PendingAltScreenRead {
                     }
                     self.previous = snapshot;
                     self.arm_step(snapshot_seq, now);
-                    Some(self)
+                    self.into_outcome()
                 } else {
                     self.step_observed_output = false;
-                    Some(self)
+                    self.into_outcome()
                 }
             }
         }
@@ -355,13 +361,21 @@ impl PendingAltScreenRead {
         baseline_seq: u64,
     ) -> PollOutcome {
         let events = WHEEL_STEP_EVENTS;
-        if send_wheel(runtime, MouseEventKind::ScrollUp, events, &self.previous).is_err() {
+        if send_wheel(
+            runtime,
+            MouseEventKind::ScrollUp,
+            events,
+            &self.previous,
+            &mut self.input_accepted,
+        )
+        .is_err()
+        {
             return self.complete_fallback();
         }
         self.upward_events = self.upward_events.saturating_add(events);
         self.phase = Phase::Harvest;
         self.arm_step(baseline_seq, now);
-        Some(self)
+        self.into_outcome()
     }
 
     fn start_restore(
@@ -379,6 +393,7 @@ impl PendingAltScreenRead {
             MouseEventKind::ScrollDown,
             self.upward_events,
             &self.previous,
+            &mut self.input_accepted,
         )
         .is_err()
         {
@@ -387,7 +402,15 @@ impl PendingAltScreenRead {
         self.phase = Phase::Restore;
         self.restore_started_at = Some(now);
         self.arm_step(baseline_seq, now);
-        Some(self)
+        self.into_outcome()
+    }
+
+    fn into_outcome(mut self) -> PollOutcome {
+        let input_accepted = std::mem::take(&mut self.input_accepted);
+        PollOutcome {
+            pending: Some(self),
+            input_accepted,
+        }
     }
 
     fn arm_step(&mut self, baseline_seq: u64, now: Instant) {
@@ -418,7 +441,10 @@ impl PendingAltScreenRead {
         })
         .unwrap_or(self.fallback_response);
         let _ = self.respond_to.send(response);
-        None
+        PollOutcome {
+            pending: None,
+            input_accepted: self.input_accepted,
+        }
     }
 
     fn complete_fallback(self) -> PollOutcome {
@@ -431,11 +457,19 @@ impl PendingAltScreenRead {
             "alternate-screen read fell back to passive snapshot"
         );
         let _ = self.respond_to.send(self.fallback_response);
-        None
+        PollOutcome {
+            pending: None,
+            input_accepted: self.input_accepted,
+        }
     }
 }
 
-pub(crate) type PollOutcome = Option<PendingAltScreenRead>;
+pub(crate) struct PollOutcome {
+    pub(crate) pending: Option<PendingAltScreenRead>,
+    /// True only for successful nonempty wheel enqueues during this step,
+    /// including an accepted prefix before a later fallback or error.
+    pub(crate) input_accepted: bool,
+}
 
 fn restore_batch_size(snapshot: &ScreenSnapshot) -> usize {
     snapshot.rows.len().saturating_div(2).max(1)
@@ -446,6 +480,7 @@ fn send_wheel(
     kind: MouseEventKind,
     events: usize,
     snapshot: &ScreenSnapshot,
+    input_accepted: &mut bool,
 ) -> Result<(), ()> {
     if runtime.wheel_routing() != Some(crate::pane::WheelRouting::MouseReport) {
         return Err(());
@@ -463,7 +498,12 @@ fn send_wheel(
     for _ in 0..events {
         bytes.extend_from_slice(&event);
     }
-    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|_| ())
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|_| ())?;
+    *input_accepted = true;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -526,6 +566,281 @@ mod tests {
     }
 
     #[test]
+    fn abort_reports_harvest_restoration_input_only_once() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+        let started = Instant::now();
+        let (pending, response_rx) = pending_read(&runtime, started, 8);
+
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("bottom probe");
+        assert!(!input_rx.try_recv().expect("probe input").is_empty());
+        let harvest_at = started + INITIAL_QUIET + STEP_TIMEOUT;
+        let outcome = pending.poll(Some(&runtime), harvest_at);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("harvest");
+        assert!(!input_rx.try_recv().expect("harvest input").is_empty());
+
+        let restore_at = harvest_at + Duration::from_millis(1);
+        let outcome = pending.abort(Some(&runtime), restore_at);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("abort must restore");
+        assert!(!input_rx.try_recv().expect("restore input").is_empty());
+        let outcome = pending.abort(Some(&runtime), restore_at + Duration::from_millis(1));
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("restore is still waiting");
+        assert!(input_rx.try_recv().is_err());
+        let outcome = pending.abort(Some(&runtime), restore_at + STEP_TIMEOUT);
+        assert!(!outcome.input_accepted);
+        assert!(outcome.pending.is_none());
+        assert_eq!(
+            response_rx.try_recv().expect("fallback response"),
+            "fallback"
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn abort_reports_probe_restoration_but_not_waiting_or_completion() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        let initial = ["16", "17", "18", "19", "20"];
+        runtime.test_process_pty_bytes(&draw(&initial, true));
+        let started = Instant::now();
+        let (pending, response_rx) = pending_read(&runtime, started, 8);
+        let probe_at = started + INITIAL_QUIET;
+        let outcome = pending.poll(Some(&runtime), probe_at);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("bottom probe");
+        input_rx.try_recv().expect("probe input");
+
+        runtime.test_process_pty_bytes(&draw(&["17", "18", "19", "20", "21"], false));
+        let outcome = pending.abort(Some(&runtime), probe_at + Duration::from_millis(1));
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("probe redraw coalescing");
+        let restore_at = probe_at + Duration::from_millis(11);
+        let outcome = pending.abort(Some(&runtime), restore_at);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("restore probe");
+        assert!(!input_rx
+            .try_recv()
+            .expect("probe restoration input")
+            .is_empty());
+        let outcome = pending.abort(Some(&runtime), restore_at + Duration::from_millis(1));
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("probe restoration still waiting");
+        assert!(input_rx.try_recv().is_err());
+
+        runtime.test_process_pty_bytes(&draw(&initial, false));
+        let outcome = pending.abort(Some(&runtime), restore_at + Duration::from_millis(2));
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("restored redraw coalescing");
+        let outcome = pending.abort(Some(&runtime), restore_at + Duration::from_millis(12));
+        assert!(!outcome.input_accepted);
+        assert!(outcome.pending.is_none());
+        assert_eq!(
+            response_rx.try_recv().expect("fallback response"),
+            "fallback"
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn rejected_probe_queues_do_not_report_input() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        for closed in [false, true] {
+            let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+            if closed {
+                input_rx.close();
+            } else {
+                runtime
+                    .try_send_bytes(Bytes::from_static(b"occupied"))
+                    .expect("fill queue");
+            }
+            let started = Instant::now();
+            let (pending, response_rx) = pending_read(&runtime, started, 8);
+            let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+            assert!(!outcome.input_accepted);
+            assert!(outcome.pending.is_none());
+            assert_eq!(
+                response_rx.try_recv().expect("fallback response"),
+                "fallback"
+            );
+            if !closed {
+                assert_eq!(
+                    input_rx.try_recv().expect("unchanged queue"),
+                    Bytes::from_static(b"occupied")
+                );
+            }
+            assert!(input_rx.try_recv().is_err());
+        }
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn rejected_abort_restore_does_not_repeat_the_harvest_receipt() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        for closed in [false, true] {
+            let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+            let started = Instant::now();
+            let (pending, response_rx) = pending_read(&runtime, started, 8);
+            let outcome = pending.start_harvest(&runtime, started, runtime.content_seq());
+            assert!(outcome.input_accepted);
+            let pending = outcome.pending.expect("accepted harvest filled queue");
+            if closed {
+                input_rx.close();
+            }
+            let outcome = pending.abort(Some(&runtime), started);
+            assert!(!outcome.input_accepted, "rejected restore is not new input");
+            assert!(outcome.pending.is_none());
+            assert_eq!(
+                response_rx.try_recv().expect("fallback response"),
+                "fallback"
+            );
+            assert!(!input_rx.try_recv().expect("accepted harvest").is_empty());
+            assert!(input_rx.try_recv().is_err());
+        }
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn empty_wheel_batch_and_unavailable_runtime_do_not_report_input() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+        runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+        let started = Instant::now();
+        let (mut pending, response_rx) = pending_read(&runtime, started, 8);
+        assert!(send_wheel(
+            &runtime,
+            MouseEventKind::ScrollDown,
+            0,
+            &pending.initial,
+            &mut pending.input_accepted,
+        )
+        .is_ok());
+        assert!(!pending.input_accepted);
+        assert!(input_rx.try_recv().is_err(), "empty batch must not enqueue");
+        let outcome = pending.poll(Some(&runtime), started);
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("initial quiet wait");
+        let outcome = pending.poll(None, started);
+        assert!(!outcome.input_accepted);
+        assert!(outcome.pending.is_none());
+        assert_eq!(
+            response_rx.try_recv().expect("fallback response"),
+            "fallback"
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        runtime.test_process_pty_bytes(b"\x1b[?1000l\x1b[?1006l");
+        let (pending, response_rx) = pending_read(&runtime, started, 8);
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+        assert!(
+            !outcome.input_accepted,
+            "disabled mouse reporting cannot enqueue"
+        );
+        assert!(outcome.pending.is_none());
+        assert_eq!(
+            response_rx.try_recv().expect("fallback response"),
+            "fallback"
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn accepted_prefix_survives_rejection_and_response_completion() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        for success in [false, true] {
+            let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(20, 5, 1);
+            runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+            let (mut pending, response_rx) = pending_read(&runtime, Instant::now(), 8);
+            assert!(send_wheel(
+                &runtime,
+                MouseEventKind::ScrollUp,
+                1,
+                &pending.initial,
+                &mut pending.input_accepted,
+            )
+            .is_ok());
+            assert!(pending.input_accepted);
+            if !success {
+                assert!(
+                    send_wheel(
+                        &runtime,
+                        MouseEventKind::ScrollDown,
+                        1,
+                        &pending.initial,
+                        &mut pending.input_accepted,
+                    )
+                    .is_err(),
+                    "accepted prefix filled the queue"
+                );
+            }
+            let outcome = if success {
+                pending.complete_success()
+            } else {
+                pending.complete_fallback()
+            };
+            assert!(outcome.input_accepted);
+            assert!(outcome.pending.is_none());
+            if success {
+                assert_eq!(response_text(&response_rx), "16\n17\n18\n19\n20\n");
+            } else {
+                assert_eq!(
+                    response_rx.try_recv().expect("fallback response"),
+                    "fallback"
+                );
+            }
+            assert!(!input_rx.try_recv().expect("accepted prefix").is_empty());
+            assert!(input_rx.try_recv().is_err());
+        }
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
     fn hard_deadline_wins_over_continuous_output_coalescing() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -538,9 +853,9 @@ mod tests {
         let (pending, response_rx) = pending_read(&runtime, started, 8);
 
         runtime.test_process_pty_bytes(b"\x1b]0;still changing\x07");
-        assert!(pending
-            .poll(Some(&runtime), started + MAX_DURATION)
-            .is_none());
+        let outcome = pending.poll(Some(&runtime), started + MAX_DURATION);
+        assert!(outcome.pending.is_none());
+        assert!(!outcome.input_accepted);
         assert_eq!(
             response_rx
                 .recv_timeout(Duration::from_millis(50))
@@ -564,15 +879,15 @@ mod tests {
         runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
         let started = Instant::now();
         let (pending, response_rx) = pending_read(&runtime, started, 8);
-        let pending = pending
-            .poll(Some(&runtime), started + INITIAL_QUIET)
-            .expect("bottom probe");
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
 
         runtime.test_process_pty_bytes(b"\x1b]0;still changing\x07");
-        assert!(pending
-            .poll(Some(&runtime), started + MAX_DURATION)
-            .is_none());
+        let outcome = pending.poll(Some(&runtime), started + MAX_DURATION);
+        assert!(outcome.pending.is_none());
+        assert!(!outcome.input_accepted);
         assert_eq!(
             response_rx
                 .recv_timeout(Duration::from_millis(50))
@@ -596,15 +911,15 @@ mod tests {
         runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
         let started = Instant::now();
         let (pending, response_rx) = pending_read(&runtime, started, 8);
-        let pending = pending
-            .poll(Some(&runtime), started + INITIAL_QUIET)
-            .expect("bottom probe");
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
 
         runtime.test_process_pty_bytes(b"\x1b[?2026h");
-        assert!(pending
-            .poll(Some(&runtime), started + MAX_DURATION)
-            .is_none());
+        let outcome = pending.poll(Some(&runtime), started + MAX_DURATION);
+        assert!(outcome.pending.is_none());
+        assert!(!outcome.input_accepted);
         assert_eq!(
             response_rx
                 .recv_timeout(Duration::from_millis(50))
@@ -630,45 +945,45 @@ mod tests {
         let started = Instant::now();
         let (pending, response_rx) = pending_read(&runtime, started, 8);
 
-        let pending = pending
-            .poll(Some(&runtime), started + INITIAL_QUIET)
-            .expect("bottom probe");
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
-        let pending = pending
-            .poll(Some(&runtime), started + INITIAL_QUIET + STEP_TIMEOUT)
-            .expect("history harvest");
+        let outcome = pending.poll(Some(&runtime), started + INITIAL_QUIET + STEP_TIMEOUT);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
 
         runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17"], false));
-        let pending = pending
-            .poll(
-                Some(&runtime),
-                started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(1),
-            )
-            .expect("redraw coalescing");
+        let outcome = pending.poll(
+            Some(&runtime),
+            started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(1),
+        );
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("redraw coalescing");
         assert!(input_rx.try_recv().is_err());
-        let pending = pending
-            .poll(
-                Some(&runtime),
-                started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(11),
-            )
-            .expect("viewport restore");
+        let outcome = pending.poll(
+            Some(&runtime),
+            started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(11),
+        );
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("viewport restore");
         input_rx.try_recv().expect("restore wheel batch");
 
         runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], false));
-        let pending = pending
-            .poll(
-                Some(&runtime),
-                started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(12),
-            )
-            .expect("restore redraw coalescing");
+        let outcome = pending.poll(
+            Some(&runtime),
+            started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(12),
+        );
+        assert!(!outcome.input_accepted);
+        let pending = outcome.pending.expect("restore redraw coalescing");
+        let outcome = pending.poll(
+            Some(&runtime),
+            started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(22),
+        );
+        assert!(!outcome.input_accepted);
         assert!(
-            pending
-                .poll(
-                    Some(&runtime),
-                    started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(22),
-                )
-                .is_none(),
+            outcome.pending.is_none(),
             "restored redraw should complete after coalescing"
         );
         assert_eq!(
@@ -696,34 +1011,40 @@ mod tests {
 
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET)
+            .pending
             .expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
         let pending = pending
             .poll(Some(&runtime), harvest_started)
+            .pending
             .expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
         runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17"], false));
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(1))
+            .pending
             .expect("redraw coalescing");
         let restore_started = harvest_started + Duration::from_millis(11);
         let pending = pending
             .poll(Some(&runtime), restore_started)
+            .pending
             .expect("viewport restore");
         input_rx.try_recv().expect("restore wheel batch");
 
         let retry_at = restore_started + STEP_TIMEOUT;
-        let pending = pending
-            .poll(Some(&runtime), retry_at)
-            .expect("slow restore must remain pending");
+        let outcome = pending.poll(Some(&runtime), retry_at);
+        assert!(outcome.input_accepted);
+        let pending = outcome.pending.expect("slow restore must remain pending");
         input_rx.try_recv().expect("retry restore wheel batch");
 
         runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], false));
         let pending = pending
             .poll(Some(&runtime), retry_at + Duration::from_millis(1))
+            .pending
             .expect("restore redraw coalescing");
         assert!(pending
             .poll(Some(&runtime), retry_at + Duration::from_millis(11))
+            .pending
             .is_none());
         assert_eq!(
             response_text(&response_rx),
@@ -751,37 +1072,45 @@ mod tests {
 
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET)
+            .pending
             .expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
         let pending = pending
             .poll(Some(&runtime), harvest_started)
+            .pending
             .expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
         runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17"], false));
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(1))
+            .pending
             .expect("redraw coalescing");
         let restore_started = harvest_started + Duration::from_millis(11);
         let pending = pending
             .poll(Some(&runtime), restore_started)
+            .pending
             .expect("viewport restore");
         input_rx.try_recv().expect("restore wheel batch");
 
         runtime.test_process_pty_bytes(b"\x1b]0;unrelated title\x07");
         let pending = pending
             .poll(Some(&runtime), restore_started + Duration::from_millis(1))
+            .pending
             .expect("unrelated output coalescing");
         let pending = pending
             .poll(Some(&runtime), restore_started + Duration::from_millis(11))
+            .pending
             .expect("restore remains pending");
         assert!(input_rx.try_recv().is_err());
 
         runtime.test_process_pty_bytes(&draw(&initial, false));
         let pending = pending
             .poll(Some(&runtime), restore_started + Duration::from_millis(12))
+            .pending
             .expect("restore redraw coalescing");
         assert!(pending
             .poll(Some(&runtime), restore_started + Duration::from_millis(22))
+            .pending
             .is_none());
         assert_eq!(
             response_text(&response_rx),
@@ -809,10 +1138,12 @@ mod tests {
 
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET)
+            .pending
             .expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
         let pending = pending
             .poll(Some(&runtime), harvest_started)
+            .pending
             .expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
 
@@ -821,12 +1152,14 @@ mod tests {
         runtime.test_process_pty_bytes(&synchronized);
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(1))
+            .pending
             .expect("synchronized redraw observed");
         let pending = pending
             .poll(
                 Some(&runtime),
                 harvest_started + STEP_TIMEOUT + Duration::from_millis(1),
             )
+            .pending
             .expect("synchronized redraw must remain pending");
         assert!(input_rx.try_recv().is_err());
 
@@ -836,6 +1169,7 @@ mod tests {
                 Some(&runtime),
                 harvest_started + STEP_TIMEOUT + Duration::from_millis(2),
             )
+            .pending
             .expect("viewport restore after synchronized redraw");
         input_rx.try_recv().expect("restore wheel batch");
 
@@ -845,12 +1179,14 @@ mod tests {
                 Some(&runtime),
                 harvest_started + STEP_TIMEOUT + Duration::from_millis(3),
             )
+            .pending
             .expect("restore redraw coalescing");
         assert!(pending
             .poll(
                 Some(&runtime),
                 harvest_started + STEP_TIMEOUT + Duration::from_millis(13)
             )
+            .pending
             .is_none());
         assert_eq!(
             response_text(&response_rx),
@@ -878,34 +1214,41 @@ mod tests {
 
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET)
+            .pending
             .expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
         let pending = pending
             .poll(Some(&runtime), harvest_started)
+            .pending
             .expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
 
         runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17", "loading"], false));
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(1))
+            .pending
             .expect("intermediate redraw coalescing");
         assert!(input_rx.try_recv().is_err());
         runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17", "ready"], false));
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(5))
+            .pending
             .expect("completed redraw coalescing");
         assert!(input_rx.try_recv().is_err());
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(15))
+            .pending
             .expect("viewport restore after completed redraw");
         input_rx.try_recv().expect("restore wheel batch");
 
         runtime.test_process_pty_bytes(&draw(&initial, false));
         let pending = pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(16))
+            .pending
             .expect("restore redraw coalescing");
         assert!(pending
             .poll(Some(&runtime), harvest_started + Duration::from_millis(26))
+            .pending
             .is_none());
         assert_eq!(
             response_text(&response_rx),
@@ -932,10 +1275,12 @@ mod tests {
 
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET)
+            .pending
             .expect("bottom probe");
         input_rx.try_recv().expect("bottom wheel probe");
         let pending = pending
             .poll(Some(&runtime), started + INITIAL_QUIET + STEP_TIMEOUT)
+            .pending
             .expect("history harvest");
         input_rx.try_recv().expect("upward wheel batch");
 
@@ -945,12 +1290,14 @@ mod tests {
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(1),
             )
+            .pending
             .expect("partial redraw coalescing");
         let pending = pending
             .poll(
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(11),
             )
+            .pending
             .expect("partial redraw must not complete");
         assert!(
             input_rx.try_recv().is_err(),
@@ -963,12 +1310,14 @@ mod tests {
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(12),
             )
+            .pending
             .expect("aligned redraw coalescing");
         let pending = pending
             .poll(
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(22),
             )
+            .pending
             .expect("aligned redraw should start restore");
         input_rx.try_recv().expect("restore wheel batch");
         runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], false));
@@ -977,12 +1326,14 @@ mod tests {
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(23),
             )
+            .pending
             .expect("restore redraw coalescing");
         assert!(pending
             .poll(
                 Some(&runtime),
                 started + INITIAL_QUIET + STEP_TIMEOUT + Duration::from_millis(33),
             )
+            .pending
             .is_none());
         assert_eq!(
             response_text(&response_rx),

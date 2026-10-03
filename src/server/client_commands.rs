@@ -26,6 +26,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.focus",
     "pane.focus_direction",
     "pane.input.set",
+    "pane.last_input",
     "pane.link.activate",
     "pane.link.resolve",
     "pane.rename",
@@ -297,6 +298,10 @@ mod tests {
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
         );
+
+        // New optional API surface is not part of the frozen generation-1 fixture.
+        // Its canonical params and response are covered by schema::tests.
+        assert!(actual.remove("pane.last_input").is_some());
 
         assert_eq!(
             actual, expected,

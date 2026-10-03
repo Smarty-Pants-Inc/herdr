@@ -42,6 +42,23 @@ pub struct PaneSplitParams {
     pub env: HashMap<String, String>,
 }
 
+/// Queries server-owned sender attribution, independent of the client's pane spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLastInputParams {
+    #[serde(alias = "pane_id")]
+    pub pane: String,
+}
+
+/// Last accepted client-owned pane interaction (including mouse input).
+/// The user is self-declared, never authenticated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLastInput {
+    pub user: Option<String>,
+    pub client_id: u64,
+    /// Unix epoch milliseconds, recorded when input was accepted by the server.
+    pub at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInputSetParams {
     pub pane_id: String,

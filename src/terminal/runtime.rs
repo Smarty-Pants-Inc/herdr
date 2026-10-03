@@ -481,7 +481,10 @@ impl TerminalRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub(crate) fn try_send_paste(
+        &self,
+        text: String,
+    ) -> Result<bool, mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_paste(text)
     }
 

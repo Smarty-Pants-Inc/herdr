@@ -230,6 +230,8 @@ impl App {
                 submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
+        // Receipt is issued on enqueue, before the asynchronous submission completes.
+        self.accepted_api_inputs.push(resolved.pane_id);
         Ok((id, agent, completion))
     }
 
@@ -394,8 +396,12 @@ impl App {
         ) {
             return response;
         }
+        let has_input = !bytes.is_empty();
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
+        }
+        if has_input {
+            self.accepted_api_inputs.push(resolved.pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})

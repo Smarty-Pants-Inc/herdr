@@ -404,6 +404,11 @@ pub(crate) enum ServerEvent {
         media_capable: bool,
         writer: ClientWriter,
     },
+    /// JSON-only self-declared display metadata, ordered after connection registration.
+    ClientUser {
+        client_id: u64,
+        user: Option<String>,
+    },
     /// A client sent an input message.
     ClientInput { client_id: u64, data: Vec<u8> },
     /// A client reported the one armed Kitty regular-file response.
@@ -777,6 +782,7 @@ pub(crate) fn handle_client_handshake(
                     hello.capabilities.iter().any(|capability| {
                         capability == crate::protocol::media::MEDIA_WEBRTC_CAPABILITY
                     }),
+                    hello.user,
                 )),
             )
         }
@@ -865,6 +871,8 @@ pub(crate) fn handle_client_handshake(
 
     // Notify the main loop about the new client.
     let endpoint_control_writer = shell_options.as_ref().map(|_| writer.control.clone());
+    let user = shell_options.as_ref().and_then(|options| options.8.clone());
+    let is_shell = shell_options.is_some();
     let connected = if let Some((
         pixel_mouse,
         direct_graphics,
@@ -874,6 +882,7 @@ pub(crate) fn handle_client_handshake(
         surface_reuse,
         surface_delta,
         media_capable,
+        _user,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -911,6 +920,11 @@ pub(crate) fn handle_client_handshake(
             }
             _ => {}
         }
+    }
+
+    if is_shell {
+        // The event channel is ordered: identity is installed before any client input.
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientUser { client_id, user });
     }
 
     // Enter read loop — read client messages and forward to main loop.
@@ -1467,6 +1481,7 @@ mod tests {
 
     fn endpoint_hello(surface_cols: u16, surface_rows: u16) -> ClientMessage {
         let hello = EndpointClientHello {
+            user: None,
             generation: ENDPOINT_PROTOCOL_GENERATION,
             cell_width_px: 8,
             cell_height_px: 16,
@@ -1974,8 +1989,19 @@ mod tests {
             handle_client_handshake(server_stream, 43, &server_event_tx, &handshake_quit)
         });
 
-        protocol::write_message(&mut client_stream, &endpoint_hello(80, 29))
-            .expect("write shell hello");
+        let ClientMessage::EndpointControl { kind, data } = endpoint_hello(80, 29) else {
+            panic!("JSON hello");
+        };
+        let mut hello: EndpointClientHello = serde_json::from_str(&data).unwrap();
+        hello.user = Some("Alice".into());
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind,
+                data: serde_json::to_string(&hello).unwrap(),
+            },
+        )
+        .expect("write shell hello");
 
         let welcome: ServerMessage =
             protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
@@ -2017,6 +2043,10 @@ mod tests {
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),
         }
+        assert!(
+            matches!(server_event_rx.blocking_recv(), Some(ServerEvent::ClientUser { client_id: 43, user: Some(user) }) if user == "Alice"),
+            "identity follows registration before the input read loop"
+        );
 
         drop(client_stream);
         should_quit.store(true, Ordering::Release);

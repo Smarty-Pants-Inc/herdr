@@ -24,6 +24,18 @@
       ]
     },
     {
+      "id": "identity",
+      "title": "Client identity",
+      "keys": [
+        {
+          "key": "identity.name",
+          "type": "string",
+          "default": "USER / USERNAME",
+          "description": "Optional self-declared client display name sent as user in the JSON hello. The default is dynamic: the client's non-empty USER environment variable, then USERNAME, or no name when neither is available. An empty string disables declaring a name. Exposed by pane.last_input for the last accepted client input, which can include mouse input. This is display metadata, never authentication or authorization."
+        }
+      ]
+    },
+    {
       "id": "server",
       "title": "Server",
       "keys": [

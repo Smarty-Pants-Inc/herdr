@@ -93,6 +93,8 @@ Herdr 以两种不同方式使用集成:
 
 要实现可移植的集成,请使用 `HERDR_BIN_PATH` 和 CLI 包装命令。需要直接 IPC 的代码可以发送 [Socket API](/zh-cn/docs/socket-api/) 中说明的等效 `pane.report_agent`、`pane.report_agent_session` 和 `pane.release_agent` 请求。
 
+自定义集成可以使用 `{"pane":"<pane_id>"}` 查询 [`pane.last_input`](/zh-cn/docs/socket-api/#窗格最近的输入)，读取最后一次被接受的客户端输入所对应的显示名称、连接 id 和时间戳。输入也可能包含鼠标输入，而不仅是打字。名称来自客户端 hello 中可选的 `user` 字段，通常由 `identity.name` 或客户端的 `USER`/`USERNAME` 环境变量决定。这是自行声明的元数据，绝不是身份验证。它是逐窗格的快照，而非逐消息的发送者保证：接受 API 输入后会将显示用的归属信息清除为 `null`，但不改变媒体路由所属的客户端；未声明名称的客户端则有 `user: null`。当前记录缺失或匿名时，请勿复用之前的名称。
+
 [Prime Agent 内置的 Herdr 上报器](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/extensions/builtin/herdr-agent-state.ts)是一个真实实现示例。它只在 Herdr 中启用,将智能体事件映射为 `working`、`idle` 和 `blocked`,跨会话保持上报顺序,并在退出时释放权威。
 
 一些集成会上报智能体的原生会话引用。除非被 `[session] resume_agents_on_restore = false` 禁用,Herdr 会在服务器重启后使用官方会话引用恢复 Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Qwen Code、Letta Code、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode 和 Antigravity CLI 的窗格。
@@ -114,6 +116,14 @@ Herdr 把内置扩展写入:
 ```
 
 如果设置了 `PI_CODING_AGENT_DIR`,Herdr 会改为写入 `$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts`。如果 Pi agent 目录已经存在,Herdr 会创建 extensions 目录。卸载只删除那个扩展文件。
+
+### 发送者归属
+
+Herdr 目前只通过 `pane.last_input` API 提供发送者显示元数据，尚未提供 Pi 作者标记或发送者归属会话条目。该 API 是最近输入的快照，而非与某次 Pi 提交的绑定：内容相同的 follow-up 和 steering 消息可能乱序交付，而压缩期间排队的输入可能在另一个客户端的后续输入之后才被处理。届时读取快照可能会为错误的消息标注名称。
+
+已接受的 Pi 显示和队列安全元数据后续工作在 [smarty-dev#4078](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4078) 中跟踪，与 Herdr 的 API 范围分开推进。
+
+Pi `0.87.1` 支持仅含元数据的自定义条目和 `registerEntryRenderer()`。但安全归属仍需要上游提供真实提交的 ID 和不可变来源，使自定义条目元数据随输入经过所有队列，并在被接受的原生用户消息之前立即提交。名称不得进入提示，且始终只是自行声明的显示元数据，绝不是身份验证。
 
 ## OMP
 

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 /// Parse raw terminal input bytes into a list of `RawInputEvent`s.
 ///
@@ -69,6 +69,33 @@ pub enum RawInputEvent {
         height_px: u32,
     },
     Unsupported,
+}
+
+/// Payload-free classification shared by raw and semantic input paths.
+pub(crate) enum InputEventKind {
+    Key(KeyEventKind),
+    Mouse(MouseEventKind),
+    Other,
+}
+
+impl InputEventKind {
+    pub(crate) fn releases_press(self) -> bool {
+        matches!(
+            self,
+            Self::Key(KeyEventKind::Release) | Self::Mouse(MouseEventKind::Up(_))
+        )
+    }
+}
+
+impl RawInputEvent {
+    pub(crate) fn releases_press(&self) -> bool {
+        match self {
+            Self::Key(key) => InputEventKind::Key(key.kind),
+            Self::Mouse(mouse) => InputEventKind::Mouse(mouse.kind),
+            _ => InputEventKind::Other,
+        }
+        .releases_press()
+    }
 }
 
 #[derive(Default)]
@@ -587,6 +614,116 @@ pub(crate) fn events_require_host_terminal_theme_query(events: &[RawInputEvent])
     events
         .iter()
         .any(|event| matches!(event, RawInputEvent::HostColorSchemeChanged(_)))
+}
+
+/// True only for a nonempty packet fully parsed as key or mouse releases.
+/// Unknown, incomplete, or trailing bytes remain possible interactions. Do not
+/// use the host framer here: its recovery policy can discard such bytes.
+pub(crate) fn is_release_only(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        // A paste is an interaction regardless of its payload. Avoid allocating
+        // that payload merely to classify it (including after a release prefix).
+        if remaining.starts_with(BRACKETED_PASTE_START) {
+            return false;
+        }
+        // Double ESC cannot be release-only: Kitty needs a single ESC-[,
+        // legacy Alt forms are presses, and ESC before a mouse report splits
+        // off an Escape press. Avoid the repeated-ESC parser's recursion here,
+        // including when these bytes follow a valid release prefix.
+        if remaining.starts_with(b"\x1b\x1b") {
+            return false;
+        }
+        let Some((event, consumed)) = extract_one_event(remaining) else {
+            return false;
+        };
+        if !event.releases_press() || !release_candidate_has_known_syntax(&remaining[..consumed]) {
+            return false;
+        }
+        remaining = &remaining[consumed..];
+    }
+    true
+}
+
+/// The event decoder can ignore malformed/extra parameters. A consumed span
+/// proves release-only input only when every byte also has known wire syntax.
+/// This checks structure and ignored alternate-codepoint validity, not decoded
+/// key identity, modifiers, coordinates, or event kinds; those remain the
+/// decoder's responsibility.
+fn release_candidate_has_known_syntax(sequence: &[u8]) -> bool {
+    fn decimal(field: &[u8]) -> bool {
+        !field.is_empty() && field.iter().all(u8::is_ascii_digit)
+    }
+
+    if let Some(body) = sequence.strip_prefix(b"\x1b[<") {
+        let Some((&final_byte, params)) = body.split_last() else {
+            return false;
+        };
+        if !matches!(final_byte, b'M' | b'm') {
+            return false;
+        }
+        let mut fields = params.split(|byte| *byte == b';');
+        return (0..3).all(|_| fields.next().is_some_and(decimal)) && fields.next().is_none();
+    }
+    // X10 mouse coordinates are raw bytes, not decimal CSI parameters.
+    if sequence.starts_with(b"\x1b[M") {
+        return sequence.len() == 6;
+    }
+    let Some(body) = sequence.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    let Some((&final_byte, params)) = body.split_last() else {
+        return false;
+    };
+    let mut fields = params.split(|byte| *byte == b';');
+    let Some(key) = fields.next() else {
+        return false;
+    };
+    if final_byte == b'u' {
+        // Kitty: codepoint[:shifted[:base-layout]], with omitted alternates
+        // allowed. Extra alternate fields are not known protocol syntax.
+        let mut alternates = key.split(|byte| *byte == b':');
+        if !alternates.next().is_some_and(decimal) {
+            return false;
+        }
+        for (index, alternate) in alternates.enumerate() {
+            if index >= 2 {
+                return false;
+            }
+            if !alternate.is_empty()
+                && (!decimal(alternate)
+                    || std::str::from_utf8(alternate)
+                        .ok()
+                        .and_then(|text| text.parse::<u32>().ok())
+                        .and_then(char::from_u32)
+                        .is_none())
+            {
+                return false;
+            }
+        }
+    } else if !decimal(key) {
+        return false;
+    }
+    // Kitty and modified xterm keys: modifiers[:event][;associated-text].
+    // Associated text is a colon-separated list of decimal codepoints.
+    if let Some(modifier) = fields.next() {
+        let mut parts = modifier.split(|byte| *byte == b':');
+        if !parts.next().is_some_and(decimal)
+            || parts.next().is_some_and(|event| !decimal(event))
+            || parts.next().is_some()
+        {
+            return false;
+        }
+    }
+    if let Some(text) = fields.next() {
+        if !text.split(|byte| *byte == b':').all(decimal) {
+            return false;
+        }
+    }
+    fields.next().is_none()
 }
 
 fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
@@ -1202,6 +1339,143 @@ mod tests {
             }
         }
         modifiers
+    }
+
+    #[test]
+    fn release_only_packets_require_full_consumption() {
+        for packet in [
+            b"\x1b[97;1:3u".as_slice(),
+            b"\x1b[108:76;2:3u",
+            b"\x1b[97;1:3u\x1b[98;1:3u",
+            b"\x1b[<0;3;2m",
+            b"\x1b[M#!!",
+            b"\x1b[97;1:3u\x1b[<0;3;2m\x1b[98;1:3u",
+            b"\x1b[97::113;5:3u",         // Kitty omitted shifted alternate.
+            b"\x1b[97:65:113;2:3;97:98u", // Kitty alternates and associated text.
+            b"\x1b[1;5:3A",               // Modified xterm release.
+            b"\x1b[5;2:3~",               // Modified xterm tilde release.
+            b"\x1b[1;2:3;57352A",         // Valid xterm associated text.
+            b"\x1b[<4;3;2m\x1b[<3;4;5M",  // Modified/legacy-style mouse ups.
+        ] {
+            assert!(is_release_only(packet), "release packet: {packet:?}");
+        }
+
+        for packet in [
+            b"".as_slice(),
+            b"\x1b[97;1:1u", // Press.
+            b"\x1b[97;1:2u", // Repeat.
+            b"text",
+            b"\x1b[<0;3;2M",                   // Mouse press.
+            b"\x1b[<32;3;2M",                  // Mouse drag.
+            b"\x1b[<35;3;2M",                  // Mouse motion.
+            b"\x1b[<64;3;2M",                  // Wheel.
+            b"\x1b[200~\x1b[97;1:3u\x1b[201~", // Paste, not a release.
+            b"\x1b[200~\x1b[201~",             // Even an empty paste is not a release.
+            b"\x1b[?9999z",                    // Unsupported sequence.
+            b"\x1b[I",                         // Non-pane event.
+            b"\xff",                           // Unparsed byte.
+            b"\x1b[97;1:3",                    // Incomplete release.
+            b"\x1b[97;1:3ux",                  // Release plus text.
+            b"x\x1b[97;1:3u",
+            b"\x1b[97;1:3u\x1b[98;1:1u", // Release plus press.
+            b"\x1b[97;1:3u\x1b[98;1:2u", // Release plus repeat.
+            b"\x1b[97;1:3u\x1b[200~\x1b[98;1:3u\x1b[201~",
+            b"\x1b[97;1:3u\x1b[?9999z", // Never drop an unknown suffix.
+            b"\x1b[?9999z\x1b[97;1:3u",
+            b"\x1b[97;1:3u\xff",        // Never drop an unparsed suffix.
+            b"\x1b[97;1:3u\x1b[98;1:3", // Incomplete suffix.
+            b"\x1b[97;1:3u\x1b",        // Trailing escape.
+            b"\x1b[97;1:3u\x1b[200~",   // Incomplete paste suffix.
+        ] {
+            assert!(!is_release_only(packet), "possible interaction: {packet:?}");
+        }
+    }
+
+    #[test]
+    fn release_only_rejects_decoder_ignored_mouse_and_csi_syntax() {
+        for malformed in [
+            b"\x1b[<0;3;2;\x1b[98;1:1um".as_slice(),
+            b"\x1b[<0;3;2;999m",
+            b"\x1b[<0;3;2;m",
+            b"\x1b[<0;;2m",
+            b"\x1b[<;3;2m",
+            b"\x1b[<0;3;m",
+            b"\x1b[<0;3;2;\x00m",
+            b"\x1b[<0;3;2;\x07m",
+            b"\x1b[<0;3;2;\r\nm",
+            b"\x1b[<+0;3;2m",
+            b"\x1b[97:!;1:3u",          // Ignored invalid shifted alternate.
+            b"\x1b[97::?;1:3u",         // Ignored invalid base-layout alternate.
+            b"\x1b[97:65:113:999;2:3u", // Ignored fourth alternate.
+            b"\x1b[97:4294967296;1:3u", // Ignored overflowed shifted alternate.
+            b"\x1b[97:1114112;1:3u",    // Invalid alternate codepoint.
+            b"\x1b[97::55296;1:3u",     // Invalid base-layout surrogate.
+            b"\x1b[97:\x00;1:3u",
+            b"\x1b[97:\x1b;1:3u",
+            b"\x1b[+97;1:3u",
+            b"\x1b[97;+1:3u",
+            b"\x1b[1;+2:3A",
+        ] {
+            for prefix in [b"".as_slice(), b"\x1b[97;1:3u"] {
+                let mut packet = prefix.to_vec();
+                packet.extend_from_slice(malformed);
+                assert!(
+                    !is_release_only(&packet),
+                    "malformed candidate after prefix length {}: {malformed:?}",
+                    prefix.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_only_rejects_max_packet_repeated_escape_without_recursive_parsing() {
+        const MAX_PACKET_BYTES: usize = 1024 * 1024;
+        for prefix in [b"".as_slice(), b"\x1b[97;1:3u"] {
+            for suffix in [b"".as_slice(), b"text", b"\x1b[98;1:3u", b"\x1b[<0;3;2m"] {
+                let mut packet = prefix.to_vec();
+                packet.resize(MAX_PACKET_BYTES - suffix.len(), ESC);
+                packet.extend_from_slice(suffix);
+                assert_eq!(packet.len(), MAX_PACKET_BYTES);
+                assert!(packet[prefix.len()..].starts_with(b"\x1b\x1b"));
+                assert!(
+                    !is_release_only(&packet),
+                    "repeated ESC: prefix length {}, suffix length {}",
+                    prefix.len(),
+                    suffix.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_only_accepts_long_coalesced_releases_without_a_size_cap() {
+        let release = b"\x1b[97;1:3u";
+        let packet = release.repeat((1024 * 1024) / release.len());
+        assert!(is_release_only(&packet));
+    }
+
+    #[test]
+    fn release_kind_classification_excludes_all_other_mouse_and_key_kinds() {
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+            assert!(!InputEventKind::Key(kind).releases_press());
+        }
+        assert!(InputEventKind::Key(KeyEventKind::Release).releases_press());
+        for button in [MouseButton::Left, MouseButton::Middle, MouseButton::Right] {
+            assert!(InputEventKind::Mouse(MouseEventKind::Up(button)).releases_press());
+            assert!(!InputEventKind::Mouse(MouseEventKind::Down(button)).releases_press());
+            assert!(!InputEventKind::Mouse(MouseEventKind::Drag(button)).releases_press());
+        }
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert!(!InputEventKind::Mouse(kind).releases_press());
+        }
+        assert!(!InputEventKind::Other.releases_press());
     }
 
     #[test]

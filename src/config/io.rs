@@ -7,6 +7,7 @@ use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
+    "identity",
     "keys",
     "media",
     "onboarding",
@@ -317,6 +318,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         }
     }
 
+    load_live_section(
+        table,
+        "identity",
+        "identity config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.identity = section,
+    );
     load_live_section(
         table,
         "theme",
@@ -913,6 +922,18 @@ mod tests {
 
         std::env::remove_var(CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn load_live_config_recognizes_client_identity() {
+        let loaded = load_live_config_from_str("[identity]\nname = \"Alice\"\n").unwrap();
+        assert_eq!(loaded.config.identity.name.as_deref(), Some("Alice"));
+        assert!(loaded.diagnostics.is_empty());
+        let loaded = load_live_config_from_str("[identity]\nname = 42\n").unwrap();
+        assert!(loaded
+            .invalid_sections
+            .iter()
+            .any(|section| section == "identity"));
     }
 
     #[test]

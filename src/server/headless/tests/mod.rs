@@ -1,5 +1,11 @@
 use super::*;
 
+#[path = "last_input_alt_read.rs"]
+mod last_input_alt_read_tests;
+#[path = "last_input_scroll.rs"]
+mod last_input_scroll_tests;
+#[path = "last_input.rs"]
+mod last_input_tests;
 #[path = "media.rs"]
 mod media_tests;
 #[path = "pane_graphics.rs"]
