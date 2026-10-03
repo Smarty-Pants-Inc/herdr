@@ -132,14 +132,56 @@ fn update_file_at_checked(
 }
 
 pub(crate) fn write_edit(edit: ConfigEdit<'_>) -> Result<(), String> {
-    update_file_at(&super::config_path(), edit.description(), |content| {
-        edit.apply(content)
+    update_file_at_checked(&super::config_path(), edit.description(), |content| {
+        still_parses(content, edit.apply(content))
     })
+}
+
+/// A settings save never turns a config that parses into one that does not (herdr#127 r1): the file is left as is.
+fn still_parses(content: &str, updated: String) -> Result<String, String> {
+    match (
+        content.parse::<toml::Value>(),
+        updated.parse::<toml::Value>(),
+    ) {
+        (Ok(_), Err(error)) => Err(format!(
+            "could not safely edit the config: {error}; leaving it unchanged"
+        )),
+        _ => Ok(updated),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMMENTED_ROWS: &str = "[ui]\nsidebar.agents.rows = [\n  [\"terminal_title\"] # row description\n]\nstatus_indicators = \"dots\"\n";
+
+    #[test]
+    fn indicator_edit_keeps_commented_array_rows_and_stays_parseable() {
+        let updated = ConfigEdit::StatusIndicators(super::super::StatusIndicatorStyle::Symbols)
+            .apply(COMMENTED_ROWS);
+        let parsed = updated
+            .parse::<toml::Value>()
+            .unwrap_or_else(|error| panic!("invalid TOML after the edit: {error}\n{updated}"));
+        let ui = &parsed["ui"];
+        assert_eq!(ui["status_indicators"].as_str(), Some("symbols"));
+        assert_eq!(
+            ui["sidebar"]["agents"]["rows"],
+            COMMENTED_ROWS.parse::<toml::Value>().unwrap()["ui"]["sidebar"]["agents"]["rows"]
+        );
+        assert_eq!(updated.matches("status_indicators").count(), 1, "{updated}");
+        assert!(
+            updated.contains("[\"terminal_title\"] # row description"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn a_settings_save_never_publishes_toml_that_does_not_parse() {
+        assert!(still_parses(COMMENTED_ROWS, "[ui]\nrows = [\nx = 1\n".to_string()).is_err());
+        let ok = still_parses(COMMENTED_ROWS, COMMENTED_ROWS.to_string()).unwrap();
+        assert_eq!(ok, COMMENTED_ROWS);
+    }
 
     #[test]
     fn voice_names_persist_across_explicit_path_restart_and_clear_independently() {

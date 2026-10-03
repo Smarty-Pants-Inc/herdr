@@ -774,19 +774,29 @@ fn toml_line_without_comment(line: &str) -> &str {
     line
 }
 
-/// Lines beginning inside a multiline TOML string are data, not table headers or keys.
-/// Track lexical quote state across lines without changing the original string contents.
+/// Lines beginning inside a multiline TOML string, array or inline table are data, not table headers or keys
+/// (a commented array row such as `["terminal_title"] # note` is not a header, herdr#127 r1).
+/// Track lexical quote state and bracket depth across lines without changing the original contents.
 fn toml_structural_lines(content: &str) -> Vec<bool> {
     let mut quote: Option<(u8, bool)> = None;
+    let mut depth = 0usize;
     content
         .lines()
         .map(|line| {
-            let structural = quote.is_none();
+            let structural = quote.is_none() && depth == 0;
             let bytes = line.as_bytes();
             let mut i = 0;
             while i < bytes.len() {
                 match quote {
                     None if bytes[i] == b'#' => break,
+                    None if matches!(bytes[i], b'[' | b'{') => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    None if matches!(bytes[i], b']' | b'}') => {
+                        depth = depth.saturating_sub(1);
+                        i += 1;
+                    }
                     None if matches!(bytes[i], b'\'' | b'"') => {
                         let ch = bytes[i];
                         let multiline = bytes[i..].starts_with(&[ch; 3]);
@@ -912,6 +922,17 @@ mod tests {
         let updated = upsert_section_bool("", "ui.toast", "enabled", true);
         assert!(updated.contains("[ui.toast]"));
         assert!(updated.contains("enabled = true"));
+    }
+
+    #[test]
+    fn remove_section_key_ignores_array_rows_that_look_like_headers() {
+        let content =
+            "[voice]\ndevices = [\n  [\"ui\"] # note\n]\ninput = \"a\"\n[ui]\ninput = \"x\"\n";
+        let updated = remove_section_key(content, "voice", "input");
+        let parsed = updated.parse::<toml::Value>().unwrap();
+        assert!(parsed["voice"].get("input").is_none(), "{updated}");
+        assert_eq!(parsed["ui"]["input"].as_str(), Some("x"));
+        assert!(updated.contains("[\"ui\"] # note"), "{updated}");
     }
 
     #[test]
