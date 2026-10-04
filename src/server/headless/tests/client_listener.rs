@@ -223,7 +223,7 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
     let second_should_quit = should_quit.clone();
     let second_render_notify = render_notify.clone();
     let second = async move {
-        let _first_client = first.await.unwrap();
+        let mut first_client = first.await.unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let second_path = path.clone();
         let welcome = tokio::task::spawn_blocking(move || {
@@ -248,6 +248,12 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
             .await
             .expect("fresh attach must not wait behind rendering")
             .unwrap());
+        tokio::task::spawn_blocking(move || {
+            protocol::write_message(&mut first_client, &protocol::ClientMessage::Detach).unwrap();
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
         second_should_quit.store(true, Ordering::Release);
         event_tx.send(ServerEvent::QuitSignal).await.unwrap();
         second_render_notify.notify_one();
