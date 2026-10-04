@@ -140,6 +140,18 @@ fn update_file_at_checked(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create config directory: {error}"))?;
     }
+    // herdr#127 r3: the file a save really changes (its symlinks followed, its directory canonical), so a save through
+    // a symlink and one through HERDR_CONFIG_PATH to the target take the same lock, read and publish the same file.
+    let path = &crate::integration::config_file::resolve_target(path).map_err(|error| {
+        format!("failed to resolve config before saving {description}: {error}")
+    })?;
+    let path = &match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| path.clone()),
+        _ => path.clone(),
+    };
     // herdr#127 r2: read, change and publish under one lock, so two saves never publish from the same old file.
     let lock_path = path.with_extension("toml.lock");
     let lock = std::fs::OpenOptions::new()

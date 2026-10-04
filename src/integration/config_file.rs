@@ -40,7 +40,7 @@ fn reject_hard_links(path: &Path) -> io::Result<()> {
 }
 
 // Unlike canonicalize, this also follows dangling symlinks on a first install.
-fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
         match fs::symlink_metadata(&current) {

@@ -175,6 +175,53 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// herdr#127 r3: one save through a symlink, one through the target's own path, at the same time: each changes
+    /// one direction, and both survive (one lock for the file, whichever path names it).
+    #[cfg(unix)]
+    #[test]
+    fn saves_through_a_symlink_and_through_its_target_share_one_lock() {
+        for round in 0..20 {
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-voice-cli-link-{}-{round}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(dir.join("real")).unwrap();
+            let target = dir.join("real").join("config.toml");
+            let link = dir.join("config.toml");
+            std::fs::write(
+                &target,
+                "[voice]\ninput = \"old mic\"\noutput = \"old speaker\"\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let save = |path: std::path::PathBuf, command: &'static [&'static str]| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let options = parse(command);
+                    barrier.wait();
+                    devices_at(&options, &path, || unreachable!()).unwrap();
+                })
+            };
+            let a = save(link.clone(), &["--input", "new mic"]);
+            let b = save(target.clone(), &["--output", "new speaker"]);
+            a.join().unwrap();
+            b.join().unwrap();
+            let saved = VoiceConfig::load_at(&target).unwrap();
+            assert_eq!(saved.input.as_deref(), Some("new mic"), "round {round}");
+            assert_eq!(
+                saved.output.as_deref(),
+                Some("new speaker"),
+                "round {round}"
+            );
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn a_concurrent_output_edit_survives_an_input_save_and_an_input_reset() {
         concurrent_save_keeps_the_other_direction(&["--input", "new mic"], Some("new mic"));
