@@ -277,6 +277,12 @@ impl App {
         peer_identity: crate::platform::ProcessIdentity,
         allow_outside_proof: bool,
     ) -> Result<Option<TerminalTarget>, ()> {
+        // Darwin's ordinary server descendants must not need access to launchd.
+        // Pin this server instance, but only stop after the complete peer-to-server
+        // walk has checked every live pane at every step (including the server).
+        #[cfg(target_os = "macos")]
+        let server_boundary =
+            Some(crate::platform::process_identity(std::process::id()).ok_or(())?);
         if allow_outside_proof {
             match crate::platform::process_identity_server_ancestry(peer_identity) {
                 crate::platform::ServerAncestry::Outside => return Ok(None),
@@ -342,12 +348,22 @@ impl App {
             }
             target
         } else {
-            find_in_ancestors(
+            #[cfg(target_os = "macos")]
+            let target = find_in_ancestors_until_boundary(
+                peer_identity,
+                server_boundary,
+                crate::platform::process_identity,
+                crate::platform::parent_process_identity,
+                find,
+            )?;
+            #[cfg(not(target_os = "macos"))]
+            let target = find_in_ancestors(
                 peer_identity,
                 crate::platform::process_identity,
                 crate::platform::parent_process_identity,
                 find,
-            )?
+            )?;
+            target
         };
         if target.is_none() && missing_root {
             return Err(());
@@ -383,12 +399,29 @@ const MAX_ANCESTOR_DEPTH: usize = 32;
 /// Nearest-first, bounded ancestry with pinned origin/current validation across
 /// successful hits and parent transitions. Unknown or replaced instances stop
 /// attribution, rather than restarting from a replacement PID.
+#[cfg(any(not(target_os = "macos"), test))]
 fn find_in_ancestors<T>(
     peer: crate::platform::ProcessIdentity,
     identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
     parent_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::ProcessIdentity>,
+    found: impl FnMut(crate::platform::ProcessIdentity) -> Result<Option<T>, ()>,
+) -> Result<Option<T>, ()> {
+    find_in_ancestors_until_boundary(peer, None, identity_of, parent_of, found)
+}
+
+/// An optional pinned server is a negative boundary only after pane membership
+/// checks. Failure to reach it is not a negative proof. The unbounded wrapper
+/// retains its original PID-1 policy on Linux and other POSIX platforms.
+fn find_in_ancestors_until_boundary<T>(
+    peer: crate::platform::ProcessIdentity,
+    boundary: Option<crate::platform::ProcessIdentity>,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+    parent_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::ProcessIdentity>,
     mut found: impl FnMut(crate::platform::ProcessIdentity) -> Result<Option<T>, ()>,
 ) -> Result<Option<T>, ()> {
+    if boundary.is_some_and(|server| server.pid == 0 || identity_of(server.pid) != Some(server)) {
+        return Err(());
+    }
     let mut current = peer;
     for _ in 0..=MAX_ANCESTOR_DEPTH {
         if current.pid == 0
@@ -404,9 +437,24 @@ fn find_in_ancestors<T>(
         if let Some(hit) = hit {
             return Ok(Some(hit));
         }
-        // Only a validated walk to the process-tree root proves an out-of-pane caller.
-        if current.pid == 1 {
+        if boundary == Some(current) {
+            // Recheck all three pinned endpoints before terminal negative proof.
+            // `found` has already checked every pane root at this step.
+            if identity_of(peer.pid) != Some(peer)
+                || identity_of(current.pid) != Some(current)
+                || boundary.is_some_and(|server| identity_of(server.pid) != Some(server))
+            {
+                return Err(());
+            }
             return Ok(None);
+        }
+        // Without a server boundary, preserve the original process-tree-root proof.
+        if current.pid == 1 {
+            return if boundary.is_none() {
+                Ok(None)
+            } else {
+                Err(())
+            };
         }
         let parent = parent_of(current).ok_or(())?;
         if identity_of(peer.pid) != Some(peer)
@@ -447,6 +495,211 @@ mod tests {
         )
         .ok()
         .flatten()
+    }
+
+    fn boundary_identity(pid: u32) -> crate::platform::ProcessIdentity {
+        crate::platform::ProcessIdentity {
+            pid,
+            start_time: u64::from(pid),
+        }
+    }
+
+    #[test]
+    fn server_boundary_checks_every_pane_before_ordinary_proof() {
+        // The server's parent (launchd on Darwin) is inaccessible. Sibling pane
+        // roots are live, but neither owns any step of the caller's ancestry.
+        let peer = boundary_identity(300);
+        let intermediate = boundary_identity(200);
+        let server = boundary_identity(100);
+        let roots = [boundary_identity(400), boundary_identity(500)];
+        let mut checked = Vec::new();
+        assert_eq!(
+            find_in_ancestors_until_boundary(
+                peer,
+                Some(server),
+                |pid| Some(boundary_identity(pid)),
+                |current| match current.pid {
+                    300 => Some(intermediate),
+                    200 => Some(server),
+                    _ => panic!("must not read ancestors above pinned server"),
+                },
+                |current| {
+                    for root in roots {
+                        checked.push((current, root));
+                    }
+                    Ok::<Option<&str>, ()>(None)
+                },
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            checked,
+            [peer, intermediate, server]
+                .into_iter()
+                .flat_map(|current| roots.map(|root| (current, root)))
+                .collect::<Vec<_>>()
+        );
+        // The original wrapper still needs the next link, not a server exemption.
+        assert_eq!(
+            find_in_ancestors(
+                peer,
+                |pid| Some(boundary_identity(pid)),
+                |current| match current.pid {
+                    300 => Some(intermediate),
+                    200 => Some(server),
+                    _ => None,
+                },
+                |_| Ok::<Option<&str>, ()>(None),
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn pane_ancestor_precedes_server_boundary_including_boundary_itself() {
+        let peer = boundary_identity(300);
+        let server = boundary_identity(100);
+        for pane_pid in [300, 200, 100] {
+            assert_eq!(
+                find_in_ancestors_until_boundary(
+                    peer,
+                    Some(server),
+                    |pid| Some(boundary_identity(pid)),
+                    |current| Some(boundary_identity(current.pid - 100)),
+                    |current| Ok((current.pid == pane_pid).then_some("pane")),
+                ),
+                Ok(Some("pane"))
+            );
+        }
+    }
+
+    #[test]
+    fn server_boundary_requires_live_identity_and_complete_link() {
+        let peer = boundary_identity(300);
+        let server = boundary_identity(100);
+        for invalid in [peer, server] {
+            for replacement in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: invalid.start_time + 1,
+                    ..invalid
+                }),
+            ] {
+                assert_eq!(
+                    find_in_ancestors_until_boundary(
+                        peer,
+                        Some(server),
+                        |pid| if pid == invalid.pid {
+                            replacement
+                        } else {
+                            Some(boundary_identity(pid))
+                        },
+                        |_| panic!("invalid endpoint must stop"),
+                        |_| Ok::<Option<&str>, ()>(None),
+                    ),
+                    Err(())
+                );
+            }
+        }
+        for premature_parent in [None, Some(boundary_identity(1))] {
+            assert_eq!(
+                find_in_ancestors_until_boundary(
+                    peer,
+                    Some(server),
+                    |pid| Some(boundary_identity(pid)),
+                    |_| premature_parent,
+                    |_| Ok::<Option<&str>, ()>(None),
+                ),
+                Err(())
+            );
+        }
+        assert_eq!(
+            find_in_ancestors_until_boundary(
+                peer,
+                Some(crate::platform::ProcessIdentity {
+                    pid: 0,
+                    start_time: 0
+                }),
+                |pid| Some(boundary_identity(pid)),
+                |_| panic!("zero boundary must stop"),
+                |_| Ok::<Option<&str>, ()>(None),
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn server_boundary_rechecks_peer_server_and_current_after_pane_checks() {
+        use std::cell::Cell;
+        let peer = boundary_identity(300);
+        let server = boundary_identity(100);
+        let intermediate = boundary_identity(200);
+        for changed in [peer, server, intermediate] {
+            for replacement in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: changed.start_time + 1,
+                    ..changed
+                }),
+            ] {
+                let live = Cell::new(Some(changed));
+                assert_eq!(
+                    find_in_ancestors_until_boundary(
+                        peer,
+                        Some(server),
+                        |pid| if pid == changed.pid {
+                            live.get()
+                        } else {
+                            Some(boundary_identity(pid))
+                        },
+                        |current| Some(boundary_identity(current.pid - 100)),
+                        |current| {
+                            if current == intermediate && changed == intermediate
+                                || current == server
+                            {
+                                live.set(replacement);
+                            }
+                            Ok::<Option<&str>, ()>(None)
+                        },
+                    ),
+                    Err(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn server_boundary_never_masks_invalid_or_missing_pane_membership() {
+        let peer = boundary_identity(300);
+        let server = boundary_identity(100);
+        let root = boundary_identity(400);
+        for invalid_at in [peer, server] {
+            for root_now in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: root.start_time + 1,
+                    ..root
+                }),
+            ] {
+                assert_eq!(
+                    find_in_ancestors_until_boundary(
+                        peer,
+                        Some(server),
+                        |pid| Some(boundary_identity(pid)),
+                        |_| Some(server),
+                        |current| {
+                            // Model the production checked membership failure for a
+                            // missing/replaced root, even at the terminal boundary.
+                            if current == invalid_at && root_now != Some(root) {
+                                return Err(());
+                            }
+                            Ok::<Option<&str>, ()>(None)
+                        },
+                    ),
+                    Err(())
+                );
+            }
+        }
     }
 
     #[test]

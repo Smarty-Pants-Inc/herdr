@@ -370,11 +370,70 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn detached_sleep_child() -> std::process::Child {
+    struct GuardTestChild(std::process::Child);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl std::ops::Deref for GuardTestChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl std::ops::DerefMut for GuardTestChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for GuardTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // A real exec of this unsigned test binary preserves observable initial
+    // environment on Darwin, unlike protected system sleep/Python binaries.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn guard_exec_peer_helper() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("HERDR_GUARD_EXEC_HELPER") else {
+            return;
+        };
+        let marked = std::env::var("HERDR_ENV").as_deref() == Ok("1")
+            && std::env::var("HERDR_PANE_ID").is_ok_and(|value| !value.is_empty());
+        match mode.as_str() {
+            "marked" => assert!(marked, "exec-inherited markers missing"),
+            "ordinary" => {
+                for key in [
+                    "HERDR_ENV",
+                    "HERDR_PANE_ID",
+                    "HERDR_WORKSPACE_ID",
+                    "HERDR_TAB_ID",
+                ] {
+                    assert!(
+                        std::env::var_os(key).is_none(),
+                        "ordinary exec inherited markers"
+                    );
+                }
+            }
+            _ => panic!("invalid helper mode"),
+        }
+        println!("guard-exec-ready {}", std::process::id());
+        std::io::stdout().flush().expect("readiness receipt");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn detached_sleep_child() -> GuardTestChild {
         let mut command = std::process::Command::new("sleep");
         command.arg("60");
         crate::platform::detach_server_daemon_command(&mut command);
-        command.spawn().expect("spawn detached sleep child")
+        GuardTestChild(command.spawn().expect("spawn detached sleep child"))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1177,7 +1236,7 @@ mod tests {
         let mut roots = Vec::new();
         for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
             let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
-            let root = OwnedChild(detached_sleep_child());
+            let root = detached_sleep_child();
             fixture
                 .app
                 .state
@@ -1726,7 +1785,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct OrphanTree {
-        root: std::process::Child,
+        root: GuardTestChild,
         output: std::io::BufReader<std::process::ChildStdout>,
         peer: crate::platform::ProcessIdentity,
     }
@@ -1739,7 +1798,26 @@ mod tests {
             let script = r#"
 import os, signal, subprocess, sys
 assert os.getsid(os.getpid()) == os.getpid(), 'pane root must lead its own session'
-middle = subprocess.Popen([sys.executable, '-c', "import subprocess,sys; p=subprocess.Popen(['sleep','60'],start_new_session=True); print(p.pid,flush=True); sys.stdin.readline(); p.terminate(); p.wait()"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+middle_script = r'''
+import os, subprocess, sys
+p = None
+try:
+    env = dict(os.environ, HERDR_GUARD_EXEC_HELPER='marked')
+    p = subprocess.Popen([sys.argv[1], '--exact', 'app::api::input_guard::tests::guard_exec_peer_helper', '--nocapture'], env=env, stdout=subprocess.PIPE, text=True, start_new_session=True)
+    for line in p.stdout:
+        if 'guard-exec-ready ' in line:
+            assert int(line.rsplit('guard-exec-ready ', 1)[1]) == p.pid
+            break
+    else:
+        raise RuntimeError('exec marker readiness missing')
+    print(p.pid, flush=True)
+    sys.stdin.readline()
+finally:
+    if p is not None:
+        p.terminate()
+        p.wait()
+'''
+middle = subprocess.Popen([sys.executable, '-c', middle_script, sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 peer = int(middle.stdout.readline())
 try:
     print(peer, os.getsid(os.getpid()), os.getsid(peer), flush=True)
@@ -1757,14 +1835,17 @@ finally:
             let mut command = Command::new("python3");
             command
                 .args(["-c", script])
+                .arg(std::env::current_exe().expect("test helper executable"))
                 .env("HERDR_ENV", "1")
                 .env("HERDR_PANE_ID", pane)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped());
             crate::platform::detach_server_daemon_command(&mut command);
-            let mut root = command
-                .spawn()
-                .expect("owned pane root and detached child tree");
+            let mut root = GuardTestChild(
+                command
+                    .spawn()
+                    .expect("owned pane root and detached child tree"),
+            );
             let output = std::io::BufReader::new(root.stdout.take().expect("root stdout"));
             // Cleanup is installed before reading, parsing, or asserting stdout.
             let mut owned = Self {
@@ -1969,8 +2050,16 @@ finally:
         }
         // A genuine ordinary caller has no inherited pane launch markers. Do
         // not rely on this test process's environment under a Herdr harness.
-        let mut command = std::process::Command::new("sleep");
-        command.arg("60");
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "app::api::input_guard::tests::guard_exec_peer_helper",
+                "--nocapture",
+            ])
+            .env("HERDR_GUARD_EXEC_HELPER", "ordinary")
+            .stdout(std::process::Stdio::piped());
         for key in [
             "HERDR_ENV",
             "HERDR_PANE_ID",
@@ -1980,7 +2069,15 @@ finally:
             command.env_remove(key);
         }
         crate::platform::detach_server_daemon_command(&mut command);
-        let mut ordinary_peer = command.spawn().expect("marker-free ordinary caller");
+        let mut ordinary_peer =
+            GuardTestChild(command.spawn().expect("marker-free ordinary caller"));
+        use std::io::BufRead;
+        let output = std::io::BufReader::new(ordinary_peer.stdout.take().expect("helper stdout"));
+        let ready = output.lines().any(|line| {
+            line.expect("helper receipt")
+                .ends_with(&format!("guard-exec-ready {}", ordinary_peer.id()))
+        });
+        assert!(ready, "marker-free exec readiness missing");
         let context = ApiRequestContext::for_local_peer_pid(Some(ordinary_peer.id()));
         assert_eq!(
             context.local_peer_pane_origin,

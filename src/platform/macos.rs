@@ -1191,6 +1191,11 @@ fn procargs2_env(buf: &[u8]) -> Option<&[u8]> {
     let argv_start = procargs2_argv_start(rest)?;
     let env_start = skip_nul_strings(rest, argv_start, argc as usize)?;
     let environment = rest.get(env_start..)?;
+    // Darwin can omit the entire environment even for a known marked exec.
+    // No bytes after argv is missing evidence, not an explicit empty record.
+    if environment.is_empty() {
+        return None;
+    }
     let mut end = 0;
     while end < environment.len() {
         let record_len = environment[end..].iter().position(|&byte| byte == 0)?;
@@ -1201,8 +1206,8 @@ fn procargs2_env(buf: &[u8]) -> Option<&[u8]> {
         }
         end += record_len + 1;
     }
-    // Also accept a readable empty environment or a final NUL-ended record
-    // when the kernel buffer ends without an Apple vector.
+    // Retain complete NUL-ended environment prefixes without an Apple vector.
+    // An empty environment is readable only via the explicit terminator above.
     Some(environment)
 }
 
@@ -1363,19 +1368,92 @@ mod tests {
         assert_eq!(process_identity(peer.pid), Some(original));
     }
 
+    struct OwnedTestChild(std::process::Child);
+
+    impl Drop for OwnedTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn native_known_marked_sleep_never_reports_absent() {
+        let child = OwnedTestChild(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .env_clear()
+                .env("LANG", "C")
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", "w9V:p1")
+                .spawn()
+                .expect("real known-marked sleep exec"),
+        );
+        let peer = process_identity(child.0.id()).expect("live sleep pin");
+        let environment = process_initial_environment(peer);
+        let origin = super::super::process_initial_pane_origin(peer);
+        eprintln!(
+            "known_marked_sleep pid={} initial_environment_readable={} origin={origin:?}",
+            peer.pid,
+            environment.is_some()
+        );
+        assert_eq!(
+            origin,
+            if environment.is_some() {
+                super::super::PeerPaneOrigin::HasPane
+            } else {
+                super::super::PeerPaneOrigin::Unknown
+            },
+            "a known marked exec must never become positive absence"
+        );
+    }
+
+    #[test]
+    fn native_real_exec_test_binary_markers_are_readable_has_pane() {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let mut child = OwnedTestChild(
+            Command::new(std::env::current_exe().expect("unsigned test executable"))
+                .args([
+                    "--exact",
+                    "app::api::input_guard::tests::guard_exec_peer_helper",
+                    "--nocapture",
+                ])
+                .env("HERDR_GUARD_EXEC_HELPER", "marked")
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", "w9V:p1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("real marked test binary exec"),
+        );
+        let output = std::io::BufReader::new(child.0.stdout.take().expect("helper stdout"));
+        let ready = output.lines().any(|line| {
+            line.expect("exec marker receipt")
+                .ends_with(&format!("guard-exec-ready {}", child.0.id()))
+        });
+        assert!(ready, "exec marker receipt missing");
+        let peer = process_identity(child.0.id()).expect("live test binary pin");
+        assert_eq!(
+            super::super::process_initial_pane_origin(peer),
+            super::super::PeerPaneOrigin::HasPane,
+            "test binary confirmed exec markers but Darwin environment is unobservable or malformed"
+        );
+    }
+
     #[test]
     fn live_ordinary_child_reaches_this_server() {
-        let mut child = Command::new("/bin/sleep")
-            .arg("1")
-            .spawn()
-            .expect("spawn ordinary child");
-        let identity = process_identity(child.id()).expect("child identity");
+        let child = OwnedTestChild(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn ordinary child"),
+        );
+        let identity = process_identity(child.0.id()).expect("child identity");
         assert_eq!(
             process_identity_outside_server_ancestry(identity),
             Some(false)
         );
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[test]
@@ -1499,6 +1577,10 @@ mod tests {
             ),
         ] {
             let mut buf = build_procargs2("/bin/tool", &["tool", "arg"], &entries);
+            // Empty environments require their own explicit record terminator.
+            if entries.is_empty() {
+                buf.push(0);
+            }
             let expected_env = procargs2_env(&buf)
                 .expect("legacy NUL-ended environment")
                 .to_vec();
@@ -1516,6 +1598,25 @@ mod tests {
         assert_eq!(
             super::super::parse_agent_env_hint(procargs2_env(&buf).expect("env prefix")),
             Some(crate::detect::Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn procargs2_env_missing_block_is_unknown_but_explicit_empty_is_readable() {
+        let mut buf = build_procargs2("/bin/sleep", &["sleep", "60"], &[]);
+        assert_eq!(procargs2_env(&buf), None, "no environment bytes");
+        buf.push(0);
+        assert_eq!(procargs2_env(&buf), Some(&b""[..]));
+        // Do not scan behind an empty separator for apparent hidden markers:
+        // those are Apple-vector strings, not environment evidence.
+        buf.extend_from_slice(b"HERDR_ENV=1\0HERDR_PANE_ID=w9V:p1\0");
+        let env = procargs2_env(&buf).expect("explicit empty record");
+        assert_eq!(env, b"");
+        assert_eq!(
+            super::super::pane_origin_from_environment(
+                &parse_initial_environment(env).expect("readable empty environment")
+            ),
+            super::super::PeerPaneOrigin::Absent
         );
     }
 
