@@ -8196,6 +8196,42 @@
             }
           ]
         },
+        "MediaAudioDevice": {
+          "description": "One audio device opened on the client, not a server-side selection request.",
+          "properties": {
+            "missing": {
+              "description": "Requested device that was missing when the client used the default, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "Actual opened device name, or display-only `default` for an unreportable OS default.\nThis label is never a device selector.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "MediaAudioDevices": {
+          "description": "The local devices actually opened for this offer.",
+          "properties": {
+            "input": {
+              "$ref": "#/schemas/success_response/$defs/MediaAudioDevice"
+            },
+            "output": {
+              "$ref": "#/schemas/success_response/$defs/MediaAudioDevice"
+            }
+          },
+          "required": [
+            "input",
+            "output"
+          ],
+          "type": "object"
+        },
         "MediaSessionState": {
           "enum": [
             "opening",
@@ -11003,6 +11039,17 @@
             },
             {
               "properties": {
+                "audio_devices": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/MediaAudioDevices"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Audio devices actually opened by the client for this offer."
+                },
                 "sdp": {
                   "type": "string"
                 },

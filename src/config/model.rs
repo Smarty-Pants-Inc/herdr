@@ -322,6 +322,66 @@ pub enum MediaMode {
     Auto,
 }
 
+/// Native audio device names on the client host, shared by all its endpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Preferred microphone name. Unset uses the system default.
+    #[serde(
+        deserialize_with = "deserialize_voice_name",
+        serialize_with = "serialize_voice_name"
+    )]
+    pub input: Option<String>,
+    /// Preferred speaker name. Unset uses the system default.
+    #[serde(
+        deserialize_with = "deserialize_voice_name",
+        serialize_with = "serialize_voice_name"
+    )]
+    pub output: Option<String>,
+}
+
+impl VoiceConfig {
+    pub(crate) fn validate_name(name: &str) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("audio device name must not be empty".to_string());
+        }
+        let limit = crate::protocol::media::MAX_MEDIA_TEXT_BYTES;
+        if name.len() > limit {
+            return Err(format!("audio device name exceeds {limit} UTF-8 bytes"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (key, name) in [("input", &self.input), ("output", &self.output)] {
+            if let Some(name) = name {
+                Self::validate_name(name).map_err(|error| format!("voice.{key}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_voice_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let name = Option::<String>::deserialize(deserializer)?;
+    if let Some(name) = &name {
+        VoiceConfig::validate_name(name).map_err(de::Error::custom)?;
+    }
+    Ok(name)
+}
+
+fn serialize_voice_name<S: serde::Serializer>(
+    name: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if let Some(name) = name {
+        VoiceConfig::validate_name(name).map_err(serde::ser::Error::custom)?;
+    }
+    name.serialize(serializer)
+}
+
 /// Client-local, self-declared identity. This is a display label, not authentication.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -348,6 +408,7 @@ pub struct Config {
     pub onboarding: Option<bool>,
     pub identity: IdentityConfig,
     pub media: MediaMode,
+    pub voice: VoiceConfig,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,

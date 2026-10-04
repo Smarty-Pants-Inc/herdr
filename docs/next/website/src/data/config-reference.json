@@ -24,6 +24,24 @@
       ]
     },
     {
+      "id": "voice",
+      "title": "Voice devices (client host)",
+      "keys": [
+        {
+          "key": "voice.input",
+          "type": "string",
+          "default": "unset",
+          "description": "Exact preferred native microphone name on this client host, shared by all local and SSH endpoints. Unset uses the system default; an unavailable name falls back to it. Must be nonempty and at most 512 UTF-8 bytes. Set with herdr voice devices --input NAME; clear with --default-input. Applies to the next call with no restart; active calls keep their current devices. Survives a client restart. Invalid config edits retain the previously accepted choices."
+        },
+        {
+          "key": "voice.output",
+          "type": "string",
+          "default": "unset",
+          "description": "Exact preferred native speaker name on this client host, shared by all local and SSH endpoints. Unset uses the system default; an unavailable name falls back to it. Must be nonempty and at most 512 UTF-8 bytes. Set with herdr voice devices --output NAME; clear with --default-output. Applies to the next call with no restart; active calls keep their current devices. Survives a client restart. Invalid config edits retain the previously accepted choices."
+        }
+      ]
+    },
+    {
       "id": "identity",
       "title": "Client identity",
       "keys": [

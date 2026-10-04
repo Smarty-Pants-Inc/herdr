@@ -36,7 +36,7 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_remote::TrackRemote;
 
 use super::peer::{MediaPeer, PeerEvent, PeerEventSink};
-use crate::protocol::media::{close_code, MediaPeerState};
+use crate::protocol::media::{close_code, MediaAudioDevices, MediaPeerState};
 
 /// The Opus and pipeline sample rate.
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
@@ -70,11 +70,17 @@ pub(crate) struct AudioIo {
     pub(crate) error: Arc<dyn Fn(String) + Send + Sync>,
 }
 
+/// Successfully opened audio. The guard stops both streams and releases the devices
+/// when dropped on the peer thread; metadata describes those same devices.
+pub(crate) struct OpenedAudio {
+    pub(crate) guard: Box<dyn std::any::Any>,
+    pub(crate) devices: Option<MediaAudioDevices>,
+}
+
 /// Microphone and speaker access.
 pub(crate) trait AudioBackend: Send {
-    /// Start capture and playback. Dropping the returned guard stops both streams and
-    /// releases the devices. It is dropped on the peer thread.
-    fn open(self: Box<Self>, io: AudioIo) -> Result<Box<dyn std::any::Any>, String>;
+    /// Start capture and playback. Return metadata only after both streams are running.
+    fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String>;
 }
 
 enum Command {
@@ -111,15 +117,25 @@ pub(crate) struct NativePeer {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Start a peer with the default microphone and speaker.
+/// Start a peer with the accepted client-local preferences supplied by its factory.
 #[cfg(target_os = "macos")]
-pub(crate) fn start(session_id: String, sink: PeerEventSink) -> Result<NativePeer, String> {
-    start_with_audio(session_id, sink, Box::new(cpal_audio::CpalAudio))
+pub(crate) fn start(
+    session_id: String,
+    sink: PeerEventSink,
+    voice: crate::config::VoiceConfig,
+) -> Result<NativePeer, String> {
+    // The factory supplies accepted local settings, never an attached server's config.
+    // It retains the last good voice section when a reload fails.
+    start_with_audio(session_id, sink, Box::new(cpal_audio::CpalAudio { voice }))
 }
 
-/// Start a peer with the default microphone and speaker.
+/// Refuse a peer on platforms without a native audio backend.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn start(_session_id: String, _sink: PeerEventSink) -> Result<NativePeer, String> {
+pub(crate) fn start(
+    _session_id: String,
+    _sink: PeerEventSink,
+    _voice: crate::config::VoiceConfig,
+) -> Result<NativePeer, String> {
     Err("native media audio is only supported on macOS".to_owned())
 }
 
@@ -268,7 +284,10 @@ async fn session(
     let (frames_tx, frames) = mpsc::channel(CAPTURE_QUEUE_FRAMES);
     let muted = Arc::new(AtomicBool::new(false));
 
-    let audio_guard = audio.open(audio_io(frames_tx, Arc::clone(&playback), &internal_tx))?;
+    let OpenedAudio {
+        guard: audio_guard,
+        devices,
+    } = audio.open(audio_io(frames_tx, Arc::clone(&playback), &internal_tx))?;
     // A close that arrived while the device opened releases it here, before any WebRTC work.
     if *cancel.borrow() {
         return Ok(None);
@@ -295,6 +314,7 @@ async fn session(
                 playback,
                 muted,
             },
+            devices,
         ) => result,
     };
     drop(audio_guard);
@@ -354,7 +374,12 @@ async fn new_peer_connection() -> webrtc::error::Result<RTCPeerConnection> {
 }
 
 /// Negotiate, then run the control loop until close or failure.
-async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Channels) -> SessionEnd {
+async fn drive(
+    emitter: &Emitter,
+    peer: &Arc<RTCPeerConnection>,
+    channels: Channels,
+    audio_devices: Option<MediaAudioDevices>,
+) -> SessionEnd {
     let Channels {
         mut commands,
         mut internal,
@@ -448,6 +473,7 @@ async fn drive(emitter: &Emitter, peer: &Arc<RTCPeerConnection>, channels: Chann
     emitter.emit(PeerEvent::Offer {
         session_id: emitter.session_id.clone(),
         sdp,
+        audio_devices,
     });
 
     let mut connected = false;
@@ -663,25 +689,33 @@ impl Resampler {
 mod cpal_audio {
     use std::sync::Arc;
 
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 
     use super::{
-        AudioBackend, AudioIo, CaptureFn, PlaybackFn, Resampler, FRAME_SAMPLES, SAMPLE_RATE,
+        AudioBackend, AudioIo, CaptureFn, OpenedAudio, PlaybackFn, Resampler, FRAME_SAMPLES,
+        SAMPLE_RATE,
     };
+    use crate::client::media::devices::cpal_devices::CpalDevices;
+    use crate::client::media::devices::selection::{select, SelectedDevices};
+    use crate::config::VoiceConfig;
 
-    /// The default CoreAudio microphone and speaker.
-    pub(super) struct CpalAudio;
+    /// Client-local CoreAudio preferences, captured anew at each session start.
+    pub(super) struct CpalAudio {
+        pub(super) voice: VoiceConfig,
+    }
 
     impl AudioBackend for CpalAudio {
-        fn open(self: Box<Self>, io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
-            let host = cpal::default_host();
-            let input = host
-                .default_input_device()
-                .ok_or_else(|| "no default microphone".to_owned())?;
-            let output = host
-                .default_output_device()
-                .ok_or_else(|| "no default speaker".to_owned())?;
+        fn open(self: Box<Self>, io: AudioIo) -> Result<OpenedAudio, String> {
+            let SelectedDevices {
+                input,
+                output,
+                metadata,
+            } = select(
+                &CpalDevices::new(),
+                self.voice.input.as_deref(),
+                self.voice.output.as_deref(),
+            )?;
             let input_config = input
                 .default_input_config()
                 .map_err(|error| format!("microphone: {error}"))?;
@@ -713,7 +747,10 @@ mod cpal_audio {
             playback
                 .play()
                 .map_err(|error| format!("speaker: {error}"))?;
-            Ok(Box::new((capture, playback)))
+            Ok(OpenedAudio {
+                guard: Box::new((capture, playback)),
+                devices: Some(metadata),
+            })
         }
     }
 
@@ -795,7 +832,10 @@ mod tests {
         released: AtomicBool,
     }
 
-    struct FakeAudio(Arc<FakeDevices>);
+    struct FakeAudio {
+        state: Arc<FakeDevices>,
+        devices: Option<MediaAudioDevices>,
+    }
 
     struct FakeGuard(Arc<FakeDevices>);
 
@@ -806,16 +846,25 @@ mod tests {
     }
 
     impl AudioBackend for FakeAudio {
-        fn open(self: Box<Self>, mut io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+        fn open(self: Box<Self>, mut io: AudioIo) -> Result<OpenedAudio, String> {
             // Exercise both paths once: 40 ms of tone in, 10 ms out.
             (io.capture)(&vec![0.1; FRAME_SAMPLES * 2]);
             (io.playback)(&mut [1.0; 480]);
-            self.0.opened.store(true, Ordering::SeqCst);
-            Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
+            self.state.opened.store(true, Ordering::SeqCst);
+            Ok(OpenedAudio {
+                guard: Box::new(FakeGuard(Arc::clone(&self.state))),
+                devices: self.devices,
+            })
         }
     }
 
     fn start_fake() -> (NativePeer, Arc<FakeDevices>, std_mpsc::Receiver<PeerEvent>) {
+        start_fake_with_devices(None)
+    }
+
+    fn start_fake_with_devices(
+        audio_devices: Option<MediaAudioDevices>,
+    ) -> (NativePeer, Arc<FakeDevices>, std_mpsc::Receiver<PeerEvent>) {
         let devices = Arc::new(FakeDevices::default());
         let (events_tx, events) = std_mpsc::channel();
         let events_tx = Mutex::new(events_tx);
@@ -827,7 +876,10 @@ mod tests {
         let peer = start_with_audio(
             "media_test".to_owned(),
             sink,
-            Box::new(FakeAudio(Arc::clone(&devices))),
+            Box::new(FakeAudio {
+                state: Arc::clone(&devices),
+                devices: audio_devices,
+            }),
         )
         .expect("peer starts");
         (peer, devices, events)
@@ -844,14 +896,192 @@ mod tests {
         flag.load(Ordering::SeqCst)
     }
 
-    fn wait_offer(events: &std_mpsc::Receiver<PeerEvent>) -> String {
+    fn wait_offer_with_devices(
+        events: &std_mpsc::Receiver<PeerEvent>,
+    ) -> (String, Option<MediaAudioDevices>) {
         match events.recv_timeout(Duration::from_secs(10)) {
-            Ok(PeerEvent::Offer { session_id, sdp }) => {
+            Ok(PeerEvent::Offer {
+                session_id,
+                sdp,
+                audio_devices,
+            }) => {
                 assert_eq!(session_id, "media_test");
-                sdp
+                (sdp, audio_devices)
             }
             other => panic!("expected an offer, got {other:?}"),
         }
+    }
+
+    fn wait_offer(events: &std_mpsc::Receiver<PeerEvent>) -> String {
+        let (sdp, devices) = wait_offer_with_devices(events);
+        assert_eq!(devices, None, "this fake backend reports no metadata");
+        sdp
+    }
+
+    fn default_devices() -> MediaAudioDevices {
+        use crate::protocol::media::MediaAudioDevice;
+        MediaAudioDevices {
+            input: MediaAudioDevice {
+                name: "Built-in microphone".into(),
+                missing: None,
+            },
+            output: MediaAudioDevice {
+                name: "Built-in speaker".into(),
+                missing: None,
+            },
+        }
+    }
+
+    fn assert_offer_devices(expected: MediaAudioDevices) {
+        let (mut peer, state, events) = start_fake_with_devices(Some(expected.clone()));
+        let (_, devices) = wait_offer_with_devices(&events);
+        assert!(
+            state.opened.load(Ordering::SeqCst),
+            "audio opened before offer"
+        );
+        assert_eq!(devices, Some(expected));
+        peer.close();
+        assert!(wait_until(&state.released, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn native_offer_reports_successfully_opened_default_devices() {
+        assert_offer_devices(default_devices());
+    }
+
+    #[test]
+    fn native_offer_reports_named_devices_without_fallback() {
+        use crate::protocol::media::MediaAudioDevice;
+        assert_offer_devices(MediaAudioDevices {
+            input: MediaAudioDevice {
+                name: "USB microphone".into(),
+                missing: None,
+            },
+            output: MediaAudioDevice {
+                name: "Headphones".into(),
+                missing: None,
+            },
+        });
+    }
+
+    #[test]
+    fn native_offer_reports_fallback_devices_but_state_detail_stays_empty() {
+        let mut expected = default_devices();
+        expected.input.missing = Some("Missing microphone".into());
+        expected.output.missing = Some("Missing headphones".into());
+        let (mut peer, state, events) = start_fake_with_devices(Some(expected.clone()));
+        let (_, devices) = wait_offer_with_devices(&events);
+        assert!(state.opened.load(Ordering::SeqCst));
+        assert_eq!(devices, Some(expected));
+        peer.set_muted(true);
+        match events.recv_timeout(Duration::from_secs(5)) {
+            Ok(PeerEvent::State { muted, detail, .. }) => {
+                assert!(muted);
+                assert_eq!(detail, None, "device metadata belongs to Offer, not State");
+            }
+            other => panic!("expected a mute state, got {other:?}"),
+        }
+        peer.close();
+    }
+
+    #[test]
+    fn native_offer_keeps_missing_preference_when_default_device_name_is_unavailable() {
+        let mut expected = default_devices();
+        expected.input.name = "default".into();
+        expected.input.missing = Some("USB microphone".into());
+        assert_offer_devices(expected);
+    }
+
+    #[test]
+    fn native_offer_is_not_emitted_until_audio_has_successfully_opened() {
+        struct GatedAudio {
+            state: Arc<FakeDevices>,
+            entered: std_mpsc::Sender<()>,
+            resume: std_mpsc::Receiver<()>,
+        }
+        impl AudioBackend for GatedAudio {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
+                self.entered.send(()).expect("open entered");
+                self.resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("resume open");
+                self.state.opened.store(true, Ordering::SeqCst);
+                Ok(OpenedAudio {
+                    guard: Box::new(FakeGuard(Arc::clone(&self.state))),
+                    devices: Some(default_devices()),
+                })
+            }
+        }
+        let state = Arc::new(FakeDevices::default());
+        let (entered_tx, entered) = std_mpsc::channel();
+        let (resume_tx, resume) = std_mpsc::channel();
+        let (events_tx, events) = std_mpsc::channel();
+        let sink: PeerEventSink = Arc::new(move |event| {
+            let _ = events_tx.send(event);
+        });
+        let mut peer = start_with_audio(
+            "media_test".into(),
+            sink,
+            Box::new(GatedAudio {
+                state: Arc::clone(&state),
+                entered: entered_tx,
+                resume,
+            }),
+        )
+        .expect("peer starts");
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening audio");
+        assert!(!state.opened.load(Ordering::SeqCst));
+        assert!(matches!(
+            events.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        resume_tx.send(()).expect("allow open");
+        let (_, devices) = wait_offer_with_devices(&events);
+        assert!(state.opened.load(Ordering::SeqCst));
+        assert_eq!(devices, Some(default_devices()));
+        peer.close();
+        assert!(wait_until(&state.released, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cancelled_failed_audio_open_emits_no_offer_or_stale_closed_event() {
+        struct GatedFailure {
+            entered: std_mpsc::Sender<()>,
+            resume: std_mpsc::Receiver<()>,
+        }
+        impl AudioBackend for GatedFailure {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
+                self.entered.send(()).expect("open entered");
+                self.resume
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("resume open");
+                Err("microphone disappeared".into())
+            }
+        }
+        let (entered_tx, entered) = std_mpsc::channel();
+        let (resume_tx, resume) = std_mpsc::channel();
+        let (events_tx, events) = std_mpsc::channel();
+        let sink: PeerEventSink = Arc::new(move |event| {
+            let _ = events_tx.send(event);
+        });
+        let mut peer = start_with_audio(
+            "media_test".into(),
+            sink,
+            Box::new(GatedFailure {
+                entered: entered_tx,
+                resume,
+            }),
+        )
+        .expect("peer starts");
+        entered
+            .recv_timeout(Duration::from_secs(2))
+            .expect("opening audio");
+        peer.close();
+        resume_tx.send(()).expect("allow failed open");
+        assert!(wait_until(&peer.stopped, Duration::from_secs(3)));
+        assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     #[test]
@@ -901,10 +1131,13 @@ mod tests {
     fn close_during_a_slow_device_open_returns_at_once_and_starts_no_media() {
         struct SlowAudio(Arc<FakeDevices>);
         impl AudioBackend for SlowAudio {
-            fn open(self: Box<Self>, _io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
                 std::thread::sleep(Duration::from_millis(300));
                 self.0.opened.store(true, Ordering::SeqCst);
-                Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
+                Ok(OpenedAudio {
+                    guard: Box::new(FakeGuard(Arc::clone(&self.0))),
+                    devices: Some(default_devices()),
+                })
             }
         }
         let devices = Arc::new(FakeDevices::default());
@@ -1058,7 +1291,7 @@ mod tests {
     fn native_peer_reports_device_failure_as_closed() {
         struct BrokenAudio;
         impl AudioBackend for BrokenAudio {
-            fn open(self: Box<Self>, _io: AudioIo) -> Result<Box<dyn std::any::Any>, String> {
+            fn open(self: Box<Self>, _io: AudioIo) -> Result<OpenedAudio, String> {
                 Err("no microphone".to_owned())
             }
         }

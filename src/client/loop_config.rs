@@ -16,4 +16,6 @@ pub(super) struct ClientLoopConfig {
         Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(super) shell_config: Option<shell::ClientShellConfig>,
     pub(super) media_mode: crate::config::MediaMode,
+    /// Initial host-local device preferences for the peer factory's retained configuration.
+    pub(super) voice_config: crate::config::VoiceConfig,
 }

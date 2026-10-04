@@ -40,7 +40,7 @@ fn reject_hard_links(path: &Path) -> io::Result<()> {
 }
 
 // Unlike canonicalize, this also follows dangling symlinks on a first install.
-fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     for _ in 0..40 {
         match fs::symlink_metadata(&current) {
@@ -69,7 +69,7 @@ fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     )))
 }
 
-pub(super) fn write_config(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+pub(crate) fn write_config(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     check_config_target(path)?;
     let target = resolve_target(path)?;
     if crate::platform::write_existing_config(&target, contents.as_ref())? {

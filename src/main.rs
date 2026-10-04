@@ -69,6 +69,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Missing also shows onboarding; set false after you've chosen.
 # onboarding = true
 
+[voice]
+# Native microphone and speaker names on this client host, across all endpoints.
+# Unset names use the system default; unavailable names fall back to that default.
+# List names with `herdr voice devices`; set them even without connected hardware.
+# Names must be nonempty and at most 512 UTF-8 bytes. No name is reserved.
+# Clear a preference with --default-input or --default-output, not a special name.
+# Changes apply to the next call, not an active call. No restart is needed.
+# These are not server/SSH settings.
+# input = "USB microphone"
+# output = "USB speakers"
+
 # Self-declared sender display name (not authentication), sent by this client.
 # Default: local USER, then USERNAME if USER is missing/blank.
 # Set name = "" to be anonymous. Controls are stripped; names are limited to 80 characters.
@@ -518,6 +529,11 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    // Local management must validate its own flags before launch-option extraction,
+    // which could otherwise consume a device name or hide an unsupported routing flag.
+    if raw_args.get(1).map(String::as_str) == Some("voice") {
+        return finish_cli(cli::maybe_run(&raw_args));
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }
@@ -537,6 +553,11 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+
+    if remote_launch.is_some() && args.get(1).map(String::as_str) == Some("voice") {
+        eprintln!("error: voice devices are local to this client host; --remote is not supported");
+        std::process::exit(2);
+    }
 
     if remote_launch.is_some()
         && args.get(1).is_some()
@@ -619,6 +640,7 @@ fn main() -> io::Result<()> {
         println!("       herdr completion <shell>");
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");
+        println!("       herdr voice devices [options]");
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
@@ -658,6 +680,10 @@ fn main() -> io::Result<()> {
                 "Manage the stable or preview update channel",
             ),
             ("herdr machine <subcommand>", "Manage saved SSH machines"),
+            (
+                "herdr voice devices [options]",
+                "List or select this host's native audio devices",
+            ),
             (
                 "herdr api <subcommand>",
                 "Inspect socket API metadata and live runtime state",
@@ -806,6 +832,16 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_documents_host_local_voice_and_parses_with_default_devices() {
+        let loaded: config::Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(loaded.voice, config::VoiceConfig::default());
+        assert!(DEFAULT_CONFIG.contains("[voice]"));
+        assert!(DEFAULT_CONFIG.contains("# input = \"USB microphone\""));
+        assert!(DEFAULT_CONFIG.contains("# output = \"USB speakers\""));
+        assert!(DEFAULT_CONFIG.contains("--default-input or --default-output"));
+    }
 
     #[test]
     fn default_config_lists_ui_accent_before_nested_tables() {

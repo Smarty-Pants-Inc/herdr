@@ -101,7 +101,7 @@ impl ClientState {
             )),
             media: media::ClientMedia::new(
                 crate::config::MediaMode::default(),
-                media::peer::native_peer_factory(),
+                media::peer::native_peer_factory(Default::default()),
                 Arc::new(|_: media::peer::PeerEvent| {}),
             ),
         }

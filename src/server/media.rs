@@ -461,7 +461,9 @@ impl MediaBroker {
             return actions;
         }
         match control {
-            MediaControl::Offer(MediaSdp { sdp, .. }) => {
+            MediaControl::Offer(MediaSdp {
+                sdp, audio_devices, ..
+            }) => {
                 let Some(pending) = session.pending.take() else {
                     return actions;
                 };
@@ -481,7 +483,11 @@ impl MediaBroker {
                     respond_to: pending.respond_to,
                     response: success_response(
                         pending.request_id,
-                        ResponseResult::MediaOffer { session_id, sdp },
+                        ResponseResult::MediaOffer {
+                            session_id,
+                            sdp,
+                            audio_devices,
+                        },
                     ),
                 });
             }
@@ -527,6 +533,7 @@ impl MediaBroker {
             control: MediaControl::Answer(MediaSdp {
                 session_id: session_id.to_owned(),
                 sdp,
+                audio_devices: None,
             }),
         }])
     }
@@ -761,7 +768,7 @@ impl MediaBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::media::MediaStateUpdate;
+    use crate::protocol::media::{MediaAudioDevice, MediaAudioDevices, MediaStateUpdate};
     use std::sync::mpsc;
 
     fn pane(raw: u32) -> PaneId {
@@ -1054,7 +1061,8 @@ mod tests {
             2,
             MediaControl::Offer(MediaSdp {
                 session_id: session_id.clone(),
-                sdp: "x".into()
+                sdp: "x".into(),
+                audio_devices: None,
             }),
             now
         ))
@@ -1066,6 +1074,7 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: session_id.clone(),
                 sdp: "v=0 offer".into(),
+                audio_devices: None,
             }),
             now,
         ));
@@ -1073,9 +1082,11 @@ mod tests {
         assert_eq!(body["result"]["type"], "media_offer");
         assert_eq!(body["result"]["session_id"], session_id.as_str());
         assert_eq!(body["result"]["sdp"], "v=0 offer");
+        assert!(body["result"].get("audio_devices").is_none());
 
         let sent = run(broker.answer(&session_id, "v=0 answer".into()).unwrap());
-        assert!(matches!(&sent[..], [(1, MediaControl::Answer(sdp))] if sdp.sdp == "v=0 answer"));
+        assert!(matches!(&sent[..], [(1, MediaControl::Answer(sdp))]
+            if sdp.sdp == "v=0 answer" && sdp.audio_devices.is_none()));
         assert_eq!(
             broker.state(&session_id).unwrap().state,
             MediaSessionState::Connecting
@@ -1112,6 +1123,90 @@ mod tests {
         ));
         // Closing again is a no-op.
         assert!(run(broker.close(&session_id, now)).is_empty());
+    }
+
+    fn audio_devices() -> MediaAudioDevices {
+        MediaAudioDevices {
+            input: MediaAudioDevice {
+                name: "USB microphone".into(),
+                missing: Some("Preferred microphone".into()),
+            },
+            output: MediaAudioDevice {
+                name: "Headphones".into(),
+                missing: None,
+            },
+        }
+    }
+
+    #[test]
+    fn offer_devices_reach_only_the_matching_pending_api_result_from_its_bound_client() {
+        let now = Instant::now();
+        let mut broker = MediaBroker::new();
+        broker.client_connected(1, true);
+        broker.client_connected(2, true);
+        broker.note_pane_input(1, pane(7), "w1:p7", now);
+        let (sent, first_rx) = open(&mut broker, pane(7), now);
+        let (_, replaced, _) = opened_session(&sent);
+        let (sent, rx) = open(&mut broker, pane(7), now);
+        let (_, session_id, _) = opened_session(&sent);
+        assert_eq!(response(&first_rx)["error"]["code"], error_code::REFUSED);
+
+        let offer = |id: &str| {
+            MediaControl::Offer(MediaSdp {
+                session_id: id.into(),
+                sdp: "v=0 offer".into(),
+                audio_devices: Some(audio_devices()),
+            })
+        };
+        // Stale/replaced ids and a different attached client cannot satisfy this caller.
+        for (client, id) in [
+            (1, replaced.as_str()),
+            (1, "unknown"),
+            (2, session_id.as_str()),
+        ] {
+            assert!(run(broker.client_control(client, offer(id), now)).is_empty());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(
+                broker.state(&session_id).unwrap().state,
+                MediaSessionState::Opening
+            );
+        }
+
+        run(broker.client_control(1, offer(&session_id), now));
+        assert_eq!(
+            response(&rx),
+            serde_json::json!({
+                "id": "req",
+                "result": {
+                    "type": "media_offer",
+                    "session_id": session_id,
+                    "sdp": "v=0 offer",
+                    "audio_devices": {
+                        "input": {"name": "USB microphone", "missing": "Preferred microphone"},
+                        "output": {"name": "Headphones"}
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            broker.state(&session_id).unwrap().state,
+            MediaSessionState::Offered
+        );
+
+        // An already-completed offer cannot replace the result or later state.
+        run(broker.answer(&session_id, "v=0 answer".into()).unwrap());
+        assert!(run(broker.client_control(1, offer(&session_id), now)).is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            broker.state(&session_id).unwrap().state,
+            MediaSessionState::Connecting
+        );
+        run(broker.close(&session_id, now));
+        assert!(run(broker.client_control(1, offer(&session_id), now)).is_empty());
+        assert_eq!(
+            broker.state(&session_id).unwrap().state,
+            MediaSessionState::Closed
+        );
     }
 
     #[test]
@@ -1193,6 +1288,7 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: third.clone(),
                 sdp: "v=0".into(),
+                audio_devices: None,
             }),
             now,
         ));
@@ -1222,6 +1318,7 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: session_id.clone(),
                 sdp: "v=0 offer".into(),
+                audio_devices: None,
             }),
             now,
         ));
@@ -1273,6 +1370,7 @@ mod tests {
             MediaControl::Offer(MediaSdp {
                 session_id: new.clone(),
                 sdp: "v=0 new".into(),
+                audio_devices: None,
             }),
             later,
         ));
@@ -1304,6 +1402,7 @@ mod tests {
                     MediaControl::Offer(MediaSdp {
                         session_id: session_id.clone(),
                         sdp: "v=0".into(),
+                        audio_devices: None,
                     }),
                     now,
                 ));

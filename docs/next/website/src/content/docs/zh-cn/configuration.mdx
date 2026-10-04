@@ -52,6 +52,32 @@ herdr server reload-config
 
 主题、侧边栏布局、复制行为等显示设置来自客户端的本地配置，查看 SSH 机器时也一样。窗格默认值、worktree、集成和自定义命令属于运行窗格的服务器。UI 中的 `reload config` 会同时重载客户端本地设置和选中服务器的配置，本地按键绑定也会更新；指定 `--remote-keybindings server` 时则使用选中服务器的按键绑定。
 
+## 原生语音设备
+
+选择 Herdr 客户端所在主机的麦克风和扬声器，用于原生语音通话：
+
+```bash
+herdr voice devices
+herdr voice devices --input "USB microphone" --output "USB speakers"
+herdr voice devices --default-input --default-output
+```
+
+不带选项时，命令列出原生输入和输出设备名称、已保存的选择，以及配置文件路径。不支持原生音频的主机或构建会返回明确的列表错误。保存或清除名称无需枚举硬件，因此在 Linux 或设备未连接时也能使用。
+
+偏好保存在 **客户端主机**现有的 `config.toml` 中，同一主机的所有本地和 SSH 连接共用。它不属于服务器配置、已保存的 SSH 机器或特定连接的设置。也可以直接编辑：
+
+```toml
+[voice]
+input = "USB microphone"
+output = "USB speakers"
+```
+
+名称精确匹配，不能只包含空白，最多为 512 个 UTF-8 字节。名称以连字符开头时，使用 `--input=NAME` 或 `--output=NAME`。包括 `default` 在内，没有保留设备名称。使用 `--default-input` 或 `--default-output` 删除对应键，恢复系统默认设备。已保存的设备不可用时，也会回退到系统默认设备，并在通话日志中报告实际使用的设备。
+
+修改从 **下一次通话**开始生效，无需重启客户端或服务器。进行中的通话继续使用已经打开的设备。偏好在客户端重启后仍保留。客户端在每次新通话时读取有效的语音配置；如果文件无法读取、TOML 无效或 `[voice]` 无效，会保留之前接受的两个设备选择。从有效配置中删除 `[voice]` 会将两个方向都恢复为系统默认设备。
+
+该命令完全在本地运行，不启动或连接服务器，并拒绝 `--machine` 和 `--remote`。选择设备不会授予麦克风权限，也不会改变 `media` 的同意策略。
+
 ## 客户端身份名称
 
 设置 Herdr 客户端连接服务器时声明的显示名称：
