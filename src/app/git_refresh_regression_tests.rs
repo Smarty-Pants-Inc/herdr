@@ -170,7 +170,7 @@ fn git_watch_repair_user_config_fetch_refspec_and_missing_parent_creation() {
     let include = home.0.join("xdg-include");
     std::fs::write(
         &xdg_config,
-        format!("[include]\npath = {}\n", include.display()),
+        format!("[include]\npath = {}\n", git_config_path(&include)),
     )
     .unwrap();
     drive_git_watch_refresh(&mut app);
