@@ -660,6 +660,382 @@ fn server_stop_then_restart_restores_pane_history() {
     cleanup_spawned_herdr(restarted, base);
 }
 
+// The fixture pair is produced by the unchanged pre-4508 server. Keep the
+// fingerprint opaque here: this test must exercise the on-disk compatibility
+// contract rather than derive an expectation with the current implementation.
+#[cfg(target_os = "linux")]
+const HISTORICAL_SESSION: &str =
+    include_str!("../fixtures/session/cold-restore-history-pre-4508-session.json");
+#[cfg(target_os = "linux")]
+const HISTORICAL_HISTORY: &str =
+    include_str!("../fixtures/session/cold-restore-history-pre-4508-history.json");
+#[cfg(target_os = "linux")]
+const HISTORICAL_MARKER: &str = "HERDR_PRE_PR_HISTORY_4508";
+#[cfg(target_os = "linux")]
+const HISTORICAL_FINGERPRINT: &str =
+    "0887c13fc8bee2daf7729444b633812305ce117d40934af9964b16b02b83d99b";
+
+#[cfg(target_os = "linux")]
+fn historical_fixture_values() -> (serde_json::Value, serde_json::Value) {
+    let session: serde_json::Value = serde_json::from_str(HISTORICAL_SESSION).unwrap();
+    let history: serde_json::Value = serde_json::from_str(HISTORICAL_HISTORY).unwrap();
+    assert_eq!(session["version"], 3);
+    assert_eq!(history["version"], 3);
+    assert_eq!(
+        history["layout_fingerprint"],
+        serde_json::json!(HISTORICAL_FINGERPRINT),
+        "historical history must carry the fixed producer fingerprint"
+    );
+    assert!(
+        HISTORICAL_HISTORY.contains(HISTORICAL_MARKER),
+        "historical fixture must contain the producer's distinctive marker"
+    );
+    (session, history)
+}
+
+#[cfg(target_os = "linux")]
+fn stage_historical_pair(
+    base: &Path,
+    session: &[u8],
+    history: &[u8],
+    make_session_untrusted: bool,
+) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data_dir = base.join("config").join(app_dir_name());
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(data_dir.join("session.json"), session).unwrap();
+    fs::write(data_dir.join("session-history.json"), history).unwrap();
+    if make_session_untrusted {
+        fs::set_permissions(
+            data_dir.join("session.json"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+    }
+    data_dir
+}
+
+#[cfg(target_os = "linux")]
+fn start_historical_server(base: &Path) -> SpawnedHerdr {
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server = spawn_herdr_with_pane_history(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    // Socket binding precedes restore. This read is the App-startup barrier.
+    let ready = run_cli_json(&socket_path, &["workspace", "list"]);
+    assert!(
+        ready["result"]["workspaces"]
+            .as_array()
+            .is_some_and(|workspaces| !workspaces.is_empty()),
+        "historical session must be restored before the readiness probe returns"
+    );
+    server
+}
+
+#[cfg(target_os = "linux")]
+fn stop_historical_server(server: &mut SpawnedHerdr, socket_path: &Path) {
+    let stopped = run_cli(socket_path, &["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let pid = server.child.process_id();
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+            server.child.try_wait().unwrap().is_some()
+        }),
+        "server stop must terminate the owned server"
+    );
+    let status = server.child.wait().unwrap();
+    unregister_spawned_herdr_pid(pid);
+    assert!(status.success(), "server stop should exit cleanly");
+}
+
+#[cfg(target_os = "linux")]
+fn restored_pane_ids(socket_path: &Path) -> Vec<String> {
+    let workspaces = run_cli_json(socket_path, &["workspace", "list"]);
+    workspaces["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|workspace| {
+            let workspace_id = workspace["workspace_id"].as_str().unwrap();
+            let panes = run_cli_json(socket_path, &["pane", "list", "--workspace", workspace_id]);
+            panes["result"]["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pane| pane["pane_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn pane_read_recent_contains_200(socket_path: &Path, pane_id: &str, expected: &str) -> bool {
+    let output = run_cli(
+        socket_path,
+        &[
+            "pane", "read", pane_id, "--source", "recent", "--lines", "200",
+        ],
+    );
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected)
+}
+
+#[cfg(target_os = "linux")]
+fn pane_with_marker(socket_path: &Path, marker: &str) -> String {
+    let mut found = None;
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            found = restored_pane_ids(socket_path)
+                .into_iter()
+                .find(|pane_id| pane_read_recent_contains_200(socket_path, pane_id, marker));
+            found.is_some()
+        }),
+        "restored pane history did not contain {marker}"
+    );
+    found.unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn first_restored_pane(socket_path: &Path) -> String {
+    restored_pane_ids(socket_path)
+        .into_iter()
+        .next()
+        .expect("historical session must restore at least one pane")
+}
+
+#[cfg(target_os = "linux")]
+fn add_consent_marks(snapshot: &mut serde_json::Value) -> usize {
+    let mut changed = 0;
+    for workspace in snapshot["workspaces"].as_array_mut().unwrap() {
+        for tab in workspace["tabs"].as_array_mut().unwrap() {
+            for pane in tab["panes"].as_object_mut().unwrap().values_mut() {
+                pane["cold_restore_argv"] = serde_json::json!(true);
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(target_os = "linux")]
+fn replace_historical_cwds(value: &mut serde_json::Value) -> usize {
+    let workspaces = value["workspaces"].as_array_mut().unwrap();
+    assert_eq!(workspaces.len(), 1);
+    let workspace = &mut workspaces[0];
+    assert_eq!(workspace["identity_cwd"], serde_json::json!("/tmp"));
+    assert_eq!(
+        workspace["tabs"][0]["panes"]["1"]["cwd"],
+        serde_json::json!("/tmp")
+    );
+    workspace["identity_cwd"] = serde_json::json!("/var/tmp");
+    workspace["tabs"][0]["panes"]["1"]["cwd"] = serde_json::json!("/var/tmp");
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_panes_have_false_consent(snapshot: &serde_json::Value) -> bool {
+    snapshot["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|workspace| workspace["tabs"].as_array().unwrap())
+        .flat_map(|tab| tab["panes"].as_object().unwrap().values())
+        .all(|pane| pane["cold_restore_argv"] == serde_json::json!(false))
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_saved_upgrade_pair(
+    data_dir: &Path,
+    fresh_marker: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let mut saved = None;
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+            let Ok(session_bytes) = fs::read(data_dir.join("session.json")) else {
+                return false;
+            };
+            let Ok(history_bytes) = fs::read(data_dir.join("session-history.json")) else {
+                return false;
+            };
+            let Ok(session) = serde_json::from_slice::<serde_json::Value>(&session_bytes) else {
+                return false;
+            };
+            let Ok(history) = serde_json::from_slice::<serde_json::Value>(&history_bytes) else {
+                return false;
+            };
+            let renamed_workspace = session["workspaces"].as_array().is_some_and(|workspaces| {
+                workspaces
+                    .iter()
+                    .any(|workspace| workspace["custom_name"] == "history-upgrade-autosaved")
+            });
+            let replaced_history = history["layout_fingerprint"]
+                .as_str()
+                .is_some_and(|fingerprint| fingerprint != HISTORICAL_FINGERPRINT);
+            if snapshot_panes_have_false_consent(&session)
+                && renamed_workspace
+                && replaced_history
+                && history.to_string().contains(HISTORICAL_MARKER)
+                && history.to_string().contains(fresh_marker)
+            {
+                saved = Some((session, history));
+                true
+            } else {
+                false
+            }
+        }),
+        "ordinary autosave must replace history with false consent and both old and fresh output"
+    );
+    saved.unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn trigger_ordinary_autosave(socket_path: &Path, pane_id: &str, marker: &str) {
+    let midpoint = marker.len() / 2;
+    let (first, second) = marker.split_at(midpoint);
+    let command = format!("printf '%s%s\\n' '{first}' '{second}'\n");
+    let sent = run_cli(socket_path, &["pane", "send-text", pane_id, &command]);
+    assert!(
+        sent.status.success(),
+        "fresh shell input failed: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            pane_read_recent_contains_200(socket_path, pane_id, marker)
+        }),
+        "fresh shell input did not reach the restored pane"
+    );
+    let workspaces = run_cli_json(socket_path, &["workspace", "list"]);
+    let workspace_id = workspaces["result"]["workspaces"][0]["workspace_id"]
+        .as_str()
+        .unwrap();
+    // A normal API mutation schedules the real debounced autosave; the test does
+    // not calculate or replace the historical fingerprint itself.
+    let renamed = run_cli(
+        socket_path,
+        &[
+            "workspace",
+            "rename",
+            workspace_id,
+            "history-upgrade-autosaved",
+        ],
+    );
+    assert!(
+        renamed.status.success(),
+        "autosave trigger failed: {}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cold_restore_historical_pane_history_survives_upgrade_autosave_and_restart() {
+    let base = unique_test_dir();
+    let _ = historical_fixture_values();
+    let data_dir = stage_historical_pair(
+        &base,
+        HISTORICAL_SESSION.as_bytes(),
+        HISTORICAL_HISTORY.as_bytes(),
+        false,
+    );
+    let socket_path = base.join("runtime/herdr.sock");
+    let mut first = start_historical_server(&base);
+    let pane_id = pane_with_marker(&socket_path, HISTORICAL_MARKER);
+
+    let fresh_marker = "HERDR_UPGRADE_AUTOSAVE_INPUT";
+    trigger_ordinary_autosave(&socket_path, &pane_id, fresh_marker);
+    let (saved_session, saved_history) = wait_for_saved_upgrade_pair(&data_dir, fresh_marker);
+    assert!(snapshot_panes_have_false_consent(&saved_session));
+    assert!(saved_history.to_string().contains(HISTORICAL_MARKER));
+
+    stop_historical_server(&mut first, &socket_path);
+    drop(first);
+
+    let mut second = start_historical_server(&base);
+    let second_pane = pane_with_marker(&socket_path, HISTORICAL_MARKER);
+    assert!(!second_pane.is_empty());
+    stop_historical_server(&mut second, &socket_path);
+    cleanup_spawned_herdr(second, base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cold_restore_historical_history_rejects_a_genuine_layout_mismatch() {
+    let base = unique_test_dir();
+    let (mut session, _history) = historical_fixture_values();
+    assert!(replace_historical_cwds(&mut session) > 0);
+    let session_bytes = serde_json::to_vec(&session).unwrap();
+    stage_historical_pair(&base, &session_bytes, HISTORICAL_HISTORY.as_bytes(), false);
+    let socket_path = base.join("runtime/herdr.sock");
+    let mut server = start_historical_server(&base);
+    let pane_id = first_restored_pane(&socket_path);
+    assert!(
+        !pane_read_recent_contains_200(&socket_path, &pane_id, HISTORICAL_MARKER),
+        "a genuinely different cwd must discard the old pane history"
+    );
+    let fresh_marker = "HERDR_LAYOUT_MISMATCH_FRESH_SHELL";
+    let midpoint = fresh_marker.len() / 2;
+    let (first, second) = fresh_marker.split_at(midpoint);
+    let command = format!("printf '%s%s\\n' '{first}' '{second}'\n");
+    let sent = run_cli(&socket_path, &["pane", "send-text", &pane_id, &command]);
+    assert!(sent.status.success());
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            pane_read_recent_contains_200(&socket_path, &pane_id, fresh_marker)
+        }),
+        "mismatched-layout restore must still provide fresh shell I/O"
+    );
+    stop_historical_server(&mut server, &socket_path);
+    cleanup_spawned_herdr(server, base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cold_restore_historical_history_strips_untrusted_consent_without_losing_history() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let (mut session, _history) = historical_fixture_values();
+    assert!(add_consent_marks(&mut session) > 0);
+    let session_bytes = serde_json::to_vec(&session).unwrap();
+    let data_dir =
+        stage_historical_pair(&base, &session_bytes, HISTORICAL_HISTORY.as_bytes(), true);
+    assert_eq!(
+        fs::metadata(data_dir.join("session.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666
+    );
+    let socket_path = base.join("runtime/herdr.sock");
+    let mut server = start_historical_server(&base);
+    let pane_id = pane_with_marker(&socket_path, HISTORICAL_MARKER);
+    let fresh_marker = "HERDR_UNTRUSTED_CONSENT_AUTOSAVE";
+    trigger_ordinary_autosave(&socket_path, &pane_id, fresh_marker);
+    let (saved_session, saved_history) = wait_for_saved_upgrade_pair(&data_dir, fresh_marker);
+    assert!(snapshot_panes_have_false_consent(&saved_session));
+    assert!(saved_history.to_string().contains(HISTORICAL_MARKER));
+    assert_eq!(
+        fs::metadata(data_dir.join("session.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "authoritative autosave must rewrite the refused consent safely"
+    );
+    stop_historical_server(&mut server, &socket_path);
+    cleanup_spawned_herdr(server, base);
+}
+
 // ponytail: these disk-replay tests need Linux snapshot trust and real Unix
 // scripts; macOS and Windows disk marks fail closed in persist::io tests.
 #[cfg(target_os = "linux")]
