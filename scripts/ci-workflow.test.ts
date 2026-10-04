@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-type Step = { name: string; if?: string; env?: Record<string, string>; run: string };
+type Step = { name: string; if?: string; env?: Record<string, string>; run: string; "continue-on-error"?: boolean; "timeout-minutes"?: number };
 type Job = {
   name?: string;
   if?: string;
@@ -187,6 +187,51 @@ fi
         expect(result.status).toBe(0);
         const decisions = readFileSync(output, "utf8").trim().split("\n");
         expect(decisions.at(-1)).toBe(`dedupe=${dedupe}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("workflow-token log probe cannot change planning", () => {
+  const probe = jobs.plan.steps.find((candidate) => candidate.name === "Probe queue log fetch with the workflow token")!;
+  test("is a bounded, nonblocking PR-only read with the job token", () => {
+    expect(probe.if).toBe("github.event_name == 'pull_request'");
+    expect(probe["continue-on-error"]).toBe(true);
+    expect(probe["timeout-minutes"]).toBe(3);
+    expect(probe.env).toEqual({ GH_TOKEN: "${{ github.token }}" });
+    expect(probe.run).toContain("--dry-run --last 1 --compare-log-fetch");
+    expect(probe.run).not.toContain("--github-output");
+  });
+
+  for (const eligible of [true, false]) {
+    test.skipIf(process.platform === "win32")(`prints evidence and eligibility ${eligible} without writing plan outputs`, () => {
+      const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), "herdr-ci-probe-"));
+      try {
+        const output = join(dir, "output");
+        writeFileSync(output, "dedupe=false\n");
+        const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
+        for (const command of ["gh", "curl"]) {
+          writeFileSync(join(dir, command), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+        }
+        writeFileSync(join(dir, "python3"), `#!/bin/bash
+if [ "$1" = scripts/ci_queue_dedupe.py ]; then
+  printf '%s\\n' "$PROBE_REPORT"
+else
+  exec "$REAL_PYTHON" "$@"
+fi
+`, { mode: 0o755 });
+        const report = { results: [{ dedupe: eligible, candidates: [{ checkouts: eligible ? [{}, {}, {}] : [] }] }] };
+        const result = runShell(probe.run, {
+          PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          GITHUB_OUTPUT: output, GITHUB_REPOSITORY: "example/herdr",
+          PROBE_REPORT: JSON.stringify(report), REAL_PYTHON: python,
+        }, dir);
+        expect(result.status).toBe(0);
+        const lines = result.stdout.trim().split("\n").map((line) => JSON.parse(line));
+        expect(lines).toEqual([report, { eligible, checkouts: eligible ? 3 : 0 }]);
+        expect(readFileSync(output, "utf8")).toBe("dedupe=false\n");
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

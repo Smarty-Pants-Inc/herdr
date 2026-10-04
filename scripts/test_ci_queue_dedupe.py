@@ -1,12 +1,17 @@
-"""Behavioral fixtures for the actual GET/CLI evidence path (no network)."""
-from contextlib import redirect_stdout
+"""Behavioral fixtures for GET/CLI evidence; HTTP probes use loopback only."""
+from contextlib import contextmanager, redirect_stdout
 from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -22,6 +27,67 @@ STARTED = "2026-10-03T11:00:00Z"
 FINISHED = "2026-10-03T11:30:00Z"
 EXPECTED_JOBS = {"smarty-ci", "check (ubuntu-latest)", "check (macos-latest)",
                  "check (windows-latest)", "conventional-commits"}
+FAKE_TOKEN = "fake-job-log-token"
+REAL_POPEN = subprocess.Popen
+
+
+@contextmanager
+def local_log_server(routes):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization")))
+            response = routes.get(urlsplit(self.path).path, (404, b"not found", {}))
+            if callable(response):
+                response = response(self)
+            status, body, headers = response
+            try:
+                self.send_response(status)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Expected when curl's byte/deadline guard stops a read.
+
+        def log_message(self, *args):
+            pass  # Never print HTTP paths (including fake signed query strings).
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@contextmanager
+def log_transport(base_url=None, scripts=None):
+    """Keep the real Popen/pipe path; redirect curl to loopback or stub a CLI."""
+    commands = []
+
+    def start(command, **kwargs):
+        commands.append(command)
+        method = command[0]
+        if scripts and method in scripts:
+            rewritten = [sys.executable, "-c", scripts[method]]
+        else:
+            if method != "curl" or base_url is None:
+                raise AssertionError("unexpected subprocess: " + method)
+            rewritten = list(command)
+            rewritten[-1] = base_url + urlsplit(command[-1]).path
+            # Production permits HTTPS only; this test override permits loopback.
+            rewritten = ["=http,https" if arg == "=https" else arg for arg in rewritten]
+            rewritten.extend(["--noproxy", "*"])
+        return REAL_POPEN(rewritten, **kwargs)
+
+    with patch.dict(os.environ, {"GH_TOKEN": FAKE_TOKEN}), patch.object(subprocess, "Popen", side_effect=start):
+        yield commands
 
 
 def commit(sha, parents=(), subject="fix: repair pane (#42)", tree=TREE):
@@ -544,33 +610,28 @@ class CliTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["timeout"], 5)
 
     def test_last_and_push_choose_separate_finite_api_budgets(self):
-        for flags, expected in [([], 120), (["--last", "10"], 600)]:
+        for flags, expected in [([], 120), (["--last", "1"], 120), (["--last", "10"], 600)]:
             with self.subTest(mode=flags), patch.object(dedupe, "GhApi", return_value=FixtureApi()) as api:
                 args = flags or ["--sha", AFTER, "--before", BEFORE]
                 with redirect_stdout(io.StringIO()):
                     dedupe.main(["--repo", REPO, "--dry-run", *args])
-                api.assert_called_once_with(budget_seconds=expected)
+                api.assert_called_once_with(budget_seconds=expected, compare_log_fetch=False)
 
-    def test_log_get_is_bounded_cached_deadlined_and_does_not_leak(self):
-        with patch.object(subprocess, "Popen") as popen, patch.object(dedupe.threading, "Timer"):
-            process = popen.return_value.__enter__.return_value
-            process.stdout = io.BytesIO(b"safe log")
-            process.wait.return_value = 0
-            api = dedupe.GhApi()
-            self.assertEqual(api.text("logs"), "safe log")
-            api.deadline = 0
-            self.assertEqual(api.text("logs"), "safe log")
-            popen.assert_called_once()
-            self.assertEqual(popen.call_args.args[0][:4], ["gh", "api", "--method", "GET"])
-            with self.assertRaises(dedupe.EvidenceError):
-                api.text("another")
-            popen.assert_called_once()
-            api = dedupe.GhApi()
-            process.stdout = io.BytesIO(b"SECRET_TOKEN" * 10)
-            with patch.object(dedupe, "MAX_LOG_BYTES", 8), self.assertRaises(dedupe.EvidenceError) as error:
-                api.text("too large")
-            self.assertNotIn("SECRET_TOKEN", str(error.exception))
-            process.kill.assert_called_once()
+    def test_last_one_returns_exact_proof_without_writing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            result = self.cli(FixtureApi(), "--last", "1", "--dry-run", "--github-output", str(output))
+            self.assertEqual(len(result["results"]), 1)
+            self.assertTrue(result["results"][0]["dedupe"])
+            self.assertFalse(output.exists())
+
+    def test_comparison_requires_dry_run_before_any_api_call(self):
+        api = FixtureApi()
+        with redirect_stdout(io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                dedupe.main(["--repo", REPO, "--last", "1", "--compare-log-fetch"], api=api)
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(api.calls, [])
 
     def test_gh_adapter_get_only_cached_and_errors_do_not_leak(self):
         with patch.object(subprocess, "run") as run:
@@ -594,6 +655,255 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(dedupe.EvidenceError) as error:
                 api.get("repos/example/herdr/pulls")
             self.assertNotIn("SECRET_TOKEN", str(error.exception))
+
+
+@unittest.skipUnless(shutil.which("curl"), "curl is needed for local HTTP probes")
+# ponytail: the job-log fetch only ever runs in the ubuntu `plan` job, with the runner's
+# curl; Windows curl reports its write-out differently, so these real-curl tests are Unix-only.
+@unittest.skipIf(os.name == "nt", "the queue-dedupe log fetch runs only on the ubuntu CI runner")
+class LogFetchTests(unittest.TestCase):
+    def test_real_http_failure_retains_status_and_first_stderr_not_body(self):
+        for status in [401, 403, 404, 500]:
+            with self.subTest(status=status), local_log_server({"/logs": (status, b"PRIVATE_LOG_BODY", {})}) as (url, requests):
+                with log_transport(url) as commands:
+                    api = dedupe.GhApi()
+                    with self.assertRaises(dedupe.EvidenceError) as error:
+                        api.text("logs")
+                    reason = str(error.exception)
+                    self.assertIn(f"HTTP {status}", reason)
+                    self.assertIn("curl: (22)", reason)
+                    self.assertNotIn("PRIVATE_LOG_BODY", reason)
+                    self.assertNotIn(FAKE_TOKEN, reason)
+                    self.assertNotIn("logs", api.cache)
+                    command = commands[0]
+                    self.assertEqual(command[:3], ["curl", "--disable", "-fsSL"])
+                    self.assertNotIn("--location-trusted", command)
+                    self.assertEqual(command[command.index("--proto-redir") + 1], "=https")
+                    self.assertNotIn(FAKE_TOKEN, " ".join(command))
+                    self.assertEqual(requests[0][1], "Bearer " + FAKE_TOKEN)
+
+    def test_redirect_strips_cross_host_authorization_and_retains_final_status(self):
+        with local_log_server({"/signed": (403, b"PRIVATE", {})}) as (target, target_requests):
+            signed = target.replace("127.0.0.1", "localhost") + "/signed?sig=PRIVATE_SIGNATURE"
+            with local_log_server({"/logs": (302, b"", {"Location": signed})}) as (source, source_requests):
+                with log_transport(source), self.assertRaises(dedupe.EvidenceError) as error:
+                    dedupe.GhApi().text("logs")
+                self.assertIn("HTTP 403", str(error.exception))
+                self.assertNotIn("PRIVATE_SIGNATURE", str(error.exception))
+                self.assertEqual(source_requests[0][1], "Bearer " + FAKE_TOKEN)
+                self.assertIsNone(target_requests[0][1])
+
+    def test_exact_byte_cap_cached_after_deadline_and_uncached_read_rejected(self):
+        with local_log_server({"/logs": (200, b"12345678", {}), "/large": (200, b"PRIVATE_LOG_BODY", {})}) as (url, requests):
+            with log_transport(url) as commands, patch.object(dedupe, "MAX_LOG_BYTES", 8):
+                api = dedupe.GhApi()
+                self.assertEqual(api.text("logs"), "12345678")
+                with self.assertRaises(dedupe.EvidenceError) as error:
+                    api.text("large")
+                self.assertIn("byte cap", str(error.exception))
+                self.assertNotIn("PRIVATE_LOG_BODY", str(error.exception))
+                self.assertNotIn("large", api.cache)
+                api.deadline = 0
+                self.assertEqual(api.text("logs"), "12345678")
+                with self.assertRaises(dedupe.EvidenceError) as error:
+                    api.text("uncached")
+                self.assertIn("cumulative deadline exhausted", str(error.exception))
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(len(requests), 2)
+
+    def test_stalled_real_http_request_stops_at_cumulative_deadline(self):
+        release = threading.Event()
+        def stalled(request):
+            release.wait(2)
+            return 200, b"late", {}
+        try:
+            with local_log_server({"/logs": stalled}) as (url, requests), log_transport(url):
+                api = dedupe.GhApi(budget_seconds=0.15)
+                start = time.monotonic()
+                with self.assertRaises(dedupe.EvidenceError) as error:
+                    api.text("logs")
+                self.assertLess(time.monotonic() - start, 1)
+                self.assertIn("deadline exhausted", str(error.exception))
+                self.assertNotIn("logs", api.cache)
+                release.set()
+        finally:
+            release.set()
+
+    def test_per_request_30_second_cap_and_budget_remaining_are_not_reset(self):
+        real_timer = threading.Timer
+        intervals = []
+        def bounded_timer(interval, function):
+            intervals.append(interval)
+            return real_timer(min(interval, 0.05), function)
+        script = "import sys, time; sys.stdin.buffer.read(); time.sleep(10)"
+        with log_transport(scripts={"curl": script}), patch.object(dedupe.threading, "Timer", side_effect=bounded_timer):
+            api = dedupe.GhApi(budget_seconds=120)
+            with self.assertRaises(dedupe.EvidenceError):
+                api.text("logs")
+            self.assertGreater(intervals[0], 29)
+            self.assertLessEqual(intervals[0], 30)
+            api.deadline = time.monotonic() + 0.02
+            with self.assertRaises(dedupe.EvidenceError):
+                api.text("second")
+            self.assertGreater(intervals[1], 0)
+            self.assertLessEqual(intervals[1], 0.02)
+            self.assertFalse(api.cache)
+
+    def test_stderr_is_drained_bounded_and_redacted_before_display_truncation(self):
+        script = ("import os, sys; sys.stdin.buffer.read(); "
+                  "sys.stderr.write('curl error ' + 'a' * 480 + os.environ['GH_TOKEN'] + "
+                  "' https://blob.invalid/log?sig=PRIVATE_SIGNATURE\\nSECOND_PRIVATE_LINE\\n' + 'z' * 200000 + "
+                  "'\\nHERDR_JOB_LOG_HTTP_STATUS:403\\n'); sys.exit(22)")
+        with log_transport(scripts={"curl": script}), self.assertRaises(dedupe.EvidenceError) as error:
+            dedupe.GhApi().text("logs")
+        reason = str(error.exception)
+        self.assertIn("HTTP 403", reason)
+        self.assertIn("curl error", reason)
+        self.assertNotIn(FAKE_TOKEN, reason)
+        self.assertNotIn(FAKE_TOKEN[:5], reason)
+        self.assertNotIn("PRIVATE_SIGNATURE", reason)
+        self.assertNotIn("SECOND_PRIVATE_LINE", reason)
+        self.assertLess(len(reason), 600)
+        # Capture boundary through a token: discard the incomplete line, don't
+        # expose a partial token that literal redaction could no longer match.
+        script = ("import os, sys; sys.stdin.buffer.read(); "
+                  "sys.stderr.write('\\n' + 'x' * 4090 + os.environ['GH_TOKEN'] + "
+                  "'\\nHERDR_JOB_LOG_HTTP_STATUS:401\\n'); sys.exit(22)")
+        with log_transport(scripts={"curl": script}), self.assertRaises(dedupe.EvidenceError) as error:
+            dedupe.GhApi().text("logs")
+        self.assertIn("HTTP 401", str(error.exception))
+        self.assertIn("capture limit", str(error.exception))
+        self.assertNotIn(FAKE_TOKEN[:4], str(error.exception))
+
+    def test_invalid_token_no_process_and_spawn_or_decode_failure_not_cached(self):
+        for token in ["", "secret\ninjected", "secret\rinjected", "secret\x00injected"]:
+            with self.subTest(token=repr(token)), patch.object(os, "environ", {"GH_TOKEN": token}), patch.object(subprocess, "Popen") as popen:
+                with self.assertRaises(dedupe.EvidenceError) as error:
+                    dedupe.GhApi().text("logs")
+                self.assertIn("GH_TOKEN", str(error.exception))
+                self.assertNotIn("secret", str(error.exception))
+                popen.assert_not_called()
+        with patch.dict(os.environ, {"GH_TOKEN": FAKE_TOKEN}), patch.object(subprocess, "Popen", side_effect=OSError(FAKE_TOKEN)):
+            with self.assertRaises(dedupe.EvidenceError) as error:
+                dedupe.GhApi().text("logs")
+            self.assertNotIn(FAKE_TOKEN, str(error.exception))
+        with local_log_server({"/logs": (200, b"\xffPRIVATE", {})}) as (url, requests), log_transport(url):
+            api = dedupe.GhApi()
+            with self.assertRaises(dedupe.EvidenceError) as error:
+                api.text("logs")
+            self.assertIn("HTTP 200", str(error.exception))
+            self.assertNotIn("PRIVATE", str(error.exception))
+            self.assertNotIn("logs", api.cache)
+
+    def test_comparison_gh_failure_curl_success_and_both_success_remain_eligible(self):
+        fixture = FixtureApi()
+        routes = {"/" + endpoint: (200, log.encode(), {}) for endpoint, log in fixture.logs.items()}
+        for success in [False, True]:
+            script = ("import sys; sys.stdout.write(" + repr("HTTP/2.0 200 OK\r\nLocation: https://blob.invalid?sig=PRIVATE_SIGNATURE\r\n\r\n" + checkout_log()) + ")" if success else
+                      "import os, sys; sys.stderr.write('gh: (HTTP 403) ' + os.environ['GH_TOKEN'] + "
+                      "' https://blob.invalid?sig=PRIVATE_SIGNATURE\\n'); sys.exit(1)")
+            with self.subTest(gh_success=success), local_log_server(routes) as (url, requests):
+                with log_transport(url, {"gh": script}) as commands:
+                    api = dedupe.GhApi(compare_log_fetch=True)
+                    api.get = fixture.get
+                    buffer = io.StringIO()
+                    with redirect_stdout(buffer):
+                        dedupe.main(["--repo", REPO, "--last", "1", "--dry-run", "--compare-log-fetch"], api=api)
+                    report = json.loads(buffer.getvalue())
+                    self.assertTrue(report["results"][0]["dedupe"], report)
+                    comparisons = report["log_fetch_comparison"]
+                    self.assertEqual(len(comparisons), 3)
+                    for comparison in comparisons:
+                        gh, curl = comparison["methods"]
+                        self.assertEqual(gh["success"], success)
+                        self.assertEqual(gh["method"], "gh")
+                        self.assertEqual(gh["http_status"], "200" if success else "403")
+                        self.assertEqual(gh["include"], "output-only")
+                        self.assertTrue(curl["success"])
+                        self.assertEqual(curl["http_status"], "200")
+                        if not success:
+                            self.assertEqual(gh["http_status"], "403")
+                            self.assertIn("gh: (HTTP 403)", gh["first_stderr"])
+                    emitted = buffer.getvalue()
+                    for private in [FAKE_TOKEN, "PRIVATE_SIGNATURE", "[command]", "https://blob.invalid"]:
+                        self.assertNotIn(private, emitted)
+                    self.assertEqual(len(commands), 6)
+                    for command in commands[::2]:
+                        self.assertEqual(command[:4], ["gh", "api", "--method", "GET"])
+                        self.assertEqual(command[-1], "--include")
+                    api.deadline = 0
+                    for endpoint, log in fixture.logs.items():
+                        self.assertEqual(api.text(endpoint), log)
+                    self.assertEqual(len(commands), 6)
+
+    def test_comparison_failure_never_substitutes_legacy_success_or_caches_failure(self):
+        for gh_success in [False, True]:
+            script = ("import sys; sys.stdout.write(" + repr(checkout_log()) + ")" if gh_success else
+                      "import sys; sys.stderr.write('gh: (HTTP 401) github_pat_PRIVATE\\n'); sys.exit(1)")
+            with self.subTest(gh_success=gh_success), local_log_server({"/logs": (403, b"PRIVATE_LOG", {})}) as (url, requests):
+                with log_transport(url, {"gh": script}) as commands:
+                    api = dedupe.GhApi(compare_log_fetch=True)
+                    for _ in range(2):
+                        with self.assertRaises(dedupe.EvidenceError) as error:
+                            api.text("logs")
+                        self.assertIn("HTTP 403", str(error.exception))
+                    self.assertNotIn("logs", api.cache)
+                    self.assertEqual(len(commands), 4)
+                    emitted = json.dumps(api.log_fetch_comparison)
+                    self.assertNotIn("github_pat_PRIVATE", emitted)
+                    self.assertNotIn("PRIVATE_LOG", emitted)
+                    self.assertNotIn("[command]", emitted)
+                    self.assertEqual(api.log_fetch_comparison[0]["methods"][0]["success"], gh_success)
+
+    def test_comparison_all_matrix_failures_report_both_methods_without_output_writes(self):
+        fixture = FixtureApi()
+        routes = {"/" + endpoint: (403, b"PRIVATE_LOG", {}) for endpoint in fixture.logs}
+        script = "import sys; sys.stderr.write('gh: failure (HTTP 401)\\n'); sys.exit(1)"
+        with tempfile.TemporaryDirectory() as directory, local_log_server(routes) as (url, requests):
+            output = Path(directory) / "output"
+            with log_transport(url, {"gh": script}) as commands:
+                api = dedupe.GhApi(compare_log_fetch=True)
+                api.get = fixture.get
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    dedupe.main(["--repo", REPO, "--last", "1", "--dry-run", "--compare-log-fetch",
+                                 "--github-output", str(output)], api=api)
+                report = json.loads(buffer.getvalue())
+                self.assertFalse(report["results"][0]["dedupe"])
+                self.assertIn("HTTP 403", report["results"][0]["reason"])
+                self.assertEqual(len(report["log_fetch_comparison"]), 3)
+                self.assertEqual(len(commands), 6)
+                self.assertFalse(output.exists())
+                for comparison in report["log_fetch_comparison"]:
+                    gh, curl = comparison["methods"]
+                    self.assertFalse(gh["success"] or curl["success"])
+                    self.assertEqual((gh["http_status"], curl["http_status"]), ("401", "403"))
+                self.assertNotIn("PRIVATE_LOG", buffer.getvalue())
+
+    def test_legacy_include_malformed_utf8_keeps_status_not_headers_or_body(self):
+        script = ("import sys; sys.stdout.buffer.write("
+                  "b'HTTP/2.0 200 OK\\r\\nLocation: https://blob.invalid?sig=PRIVATE_SIGNATURE\\r\\n\\r\\n\\xffPRIVATE_BODY')")
+        with log_transport(scripts={"gh": script}):
+            data, diagnostic = dedupe.GhApi().fetch_log("logs", "gh")
+        self.assertIsNone(data)
+        self.assertFalse(diagnostic["success"])
+        self.assertEqual(diagnostic["http_status"], "200")
+        self.assertEqual(diagnostic["include"], "output-only")
+        self.assertNotIn("PRIVATE", json.dumps(diagnostic))
+        self.assertNotIn("Location", json.dumps(diagnostic))
+
+    def test_comparison_shares_deadline_and_does_not_start_curl_after_exhaustion(self):
+        script = "import time; time.sleep(10)"
+        with log_transport(scripts={"gh": script}) as commands:
+            api = dedupe.GhApi(budget_seconds=0.05, compare_log_fetch=True)
+            with self.assertRaises(dedupe.EvidenceError) as error:
+                api.text("logs")
+            self.assertIn("cumulative deadline exhausted", str(error.exception))
+            self.assertEqual(len(commands), 1)
+            gh, curl = api.log_fetch_comparison[0]["methods"]
+            self.assertIn("deadline exhausted", gh["reason"])
+            self.assertIn("deadline exhausted", curl["reason"])
+            self.assertFalse(gh["success"] or curl["success"])
 
 
 if __name__ == "__main__":
