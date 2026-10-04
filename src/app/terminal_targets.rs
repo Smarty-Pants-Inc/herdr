@@ -237,7 +237,16 @@ impl App {
             return InputOrigin::Unknown;
         };
         match context.local_peer_pane_origin {
-            crate::platform::PeerPaneOrigin::Unknown => InputOrigin::Unknown,
+            crate::platform::PeerPaneOrigin::Unknown => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.input_origin_for_unknown_pane_origin(peer)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    InputOrigin::Unknown
+                }
+            }
             crate::platform::PeerPaneOrigin::Absent => self.input_origin_for_peer_identity(peer),
             crate::platform::PeerPaneOrigin::HasPane => {
                 match self.checked_pane_target_for_peer_identity_with_outside_proof(peer, false) {
@@ -246,6 +255,20 @@ impl App {
                     Ok(None) | Err(()) => InputOrigin::Unknown,
                 }
             }
+        }
+    }
+
+    /// Darwin recovery for protected executables whose initial environment is
+    /// unobservable: a live, checked pane link may still positively attribute a
+    /// known agent. Never infer ordinary origin from this path.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn input_origin_for_unknown_pane_origin(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+    ) -> InputOrigin {
+        match self.checked_pane_target_for_peer_identity_with_outside_proof(peer_identity, false) {
+            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(_) | Err(()) => InputOrigin::Unknown,
         }
     }
 

@@ -887,10 +887,16 @@ mod tests {
         let mut fixture = attributed_agent_fixture();
         let mut context = attributed_context();
         context.local_peer_pane_origin = crate::platform::PeerPaneOrigin::Unknown;
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             fixture.app.input_origin_for_context(context),
             InputOrigin::Unknown
         );
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Agent(_)
+        ));
         context.local_peer_pane_origin = crate::platform::PeerPaneOrigin::HasPane;
         assert!(matches!(
             fixture.app.input_origin_for_context(context),
@@ -968,6 +974,65 @@ mod tests {
                 assert!(fixture.target_rx.try_recv().is_err());
             });
         });
+    }
+
+    #[tokio::test]
+    async fn unknown_pane_origin_recovery_only_returns_a_proven_agent_link() {
+        let mut fixture = attributed_agent_fixture();
+        let peer = attributed_context().local_peer_identity.expect("live peer");
+
+        // This is the portable seam used by Darwin's protected-executable path.
+        assert!(matches!(
+            fixture.app.input_origin_for_unknown_pane_origin(peer),
+            InputOrigin::Agent(_)
+        ));
+
+        // A linked non-agent is not ordinary when the environment is unknown.
+        let (_, source_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source pane");
+        let source_terminal_id = fixture.app.state.workspaces[0]
+            .terminal_id(source_pane)
+            .cloned()
+            .expect("source terminal");
+        let source_terminal = fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&source_terminal_id)
+            .expect("source state");
+        source_terminal.clear_agent_name();
+        source_terminal.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(
+            fixture.app.input_origin_for_unknown_pane_origin(peer),
+            InputOrigin::Unknown
+        );
+
+        // Missing roots, stale peers, and an unlinked peer are all non-proofs;
+        // outside-server evidence must not turn this recovery into Ordinary.
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target pane");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(0);
+        assert_eq!(
+            fixture.app.input_origin_for_unknown_pane_origin(peer),
+            InputOrigin::Unknown
+        );
+        let stale = crate::platform::ProcessIdentity {
+            start_time: peer.start_time.wrapping_add(1),
+            ..peer
+        };
+        assert_eq!(
+            fixture.app.input_origin_for_unknown_pane_origin(stale),
+            InputOrigin::Unknown
+        );
     }
 
     fn exercise_server_ancestry_sequence(observation: Option<bool>) {
