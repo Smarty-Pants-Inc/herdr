@@ -218,15 +218,17 @@ fn agent_start_command_works() {
     let bin = base.join("bin");
     let captured_args = base.join("pi-args");
     let captured_prompts = base.join("pi-prompts");
+    let received_prompts = base.join("pi-received-prompts");
     fs::create_dir_all(&bin).unwrap();
     let fake_pi = bin.join("pi");
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}'\nexport HERDR_AGENT=pi\n'{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do\n  case \"$prompt\" in\n    \"do not transition\") continue ;;\n    \"done churn\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state done >/dev/null\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n      continue\n      ;;\n    \"session churn\")\n      '{1}' pane report-agent-session \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --agent-session-id replacement >/dev/null\n      continue\n      ;;\n    \"block after submit\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state blocked >/dev/null\n      continue\n      ;;\n  esac\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state working >/dev/null\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n  printf '%s\\n' \"$prompt\" >> '{2}'\ndone\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}'\nexport HERDR_AGENT=pi\n'{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do\n  printf '%s\\n' \"$prompt\" >> '{3}'\n  case \"$prompt\" in\n    \"do not transition\") continue ;;\n    \"done churn\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state done >/dev/null\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n      continue\n      ;;\n    \"session churn\")\n      '{1}' pane report-agent-session \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --agent-session-id replacement >/dev/null\n      continue\n      ;;\n    \"block after submit\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state blocked >/dev/null\n      continue\n      ;;\n  esac\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state working >/dev/null\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n  printf '%s\\n' \"$prompt\" >> '{2}'\ndone\n",
             captured_args.display(),
             env!("CARGO_BIN_EXE_herdr"),
             captured_prompts.display(),
+            received_prompts.display(),
         ),
     )
     .unwrap();
@@ -322,6 +324,7 @@ fn agent_start_command_works() {
     assert_eq!(started["result"]["agent"]["name"], "main");
     assert_eq!(started["result"]["agent"]["agent"], "pi");
     assert_eq!(started["result"]["agent"]["pane_id"], pane_id);
+    assert_eq!(started["result"]["agent"]["interactive_ready"], true);
     assert_eq!(
         run_cli_json(&socket_path, &["pane", "get", &pane_id])["result"]["pane"]["label"],
         "shell-pane"
@@ -425,19 +428,52 @@ fn agent_start_command_works() {
         )
     };
 
+    let wait_for_received_prompts = |expected: &[&str]| {
+        let expected = format!("{}\n", expected.join("\n"));
+        assert!(
+            wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
+                fs::read_to_string(&received_prompts).is_ok_and(|received| received == expected)
+            }),
+            "fake Pi did not receive the submitted prompts: expected {expected:?}, got {:?}",
+            fs::read_to_string(&received_prompts)
+        );
+    };
+
     assert!(report_agent("idle"));
+    let idle_before = run_cli_json(&socket_path, &["agent", "get", "main"]);
+    assert_eq!(idle_before["result"]["agent"]["interactive_ready"], true);
+    assert_eq!(idle_before["result"]["agent"]["agent_status"], "idle");
+    let idle_sequence = idle_before["result"]["agent"]["state_change_seq"]
+        .as_u64()
+        .unwrap();
+
+    // A caller budget shorter than the activity gate must still win.
     let stale_idle = prompt_wait("do not transition", "500");
     assert_eq!(stale_idle.status.code(), Some(1));
     let stale_idle: serde_json::Value = serde_json::from_slice(&stale_idle.stderr).unwrap();
     assert_eq!(stale_idle["error"]["code"], "timeout");
+    wait_for_received_prompts(&["--wait", "do not transition"]);
 
-    let stalled = prompt_wait("do not transition", "6000");
+    // No caller deadline: only the 5000ms activity gate decides this error.
+    // A 6000ms total budget incorrectly assumes get + dispatch + submission
+    // always take less than 1000ms, which is not guaranteed under load.
+    let stalled = run_cli(
+        &socket_path,
+        &["agent", "prompt", "main", "do not transition", "--wait"],
+    );
     assert_eq!(stalled.status.code(), Some(1));
     let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
     assert_eq!(stalled["error"]["code"], "agent_prompt_stalled");
     assert!(stalled["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("no observed working or blocked state")));
+    wait_for_received_prompts(&["--wait", "do not transition", "do not transition"]);
+    let idle_after = run_cli_json(&socket_path, &["agent", "get", "main"]);
+    assert_eq!(idle_after["result"]["agent"]["agent_status"], "idle");
+    assert_eq!(
+        idle_after["result"]["agent"]["state_change_seq"],
+        idle_sequence
+    );
 
     for prompt in ["done churn", "session churn"] {
         let settled_only = prompt_wait(prompt, "500");
