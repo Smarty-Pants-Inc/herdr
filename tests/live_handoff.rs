@@ -5,15 +5,17 @@ pub mod support;
 pub mod test_command;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::{ConnectOptions, GenericFilePath, ToFsName};
+use interprocess::ConnectWaitMode;
 use portable_pty::{native_pty_system, Child, MasterPty, PtySize};
 use support::{
     cleanup_test_base, client_shell_handshake, register_runtime_dir, register_spawned_herdr_pid,
@@ -2217,6 +2219,453 @@ fn write_import_stub(stub: &Path, import_pid_marker: &Path, helper_pid_marker: &
     fs::set_permissions(stub, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+fn startup_log_tail(config_home: &Path) -> String {
+    let path = config_home.join("herdr-dev/herdr-server.log");
+    let mut tail = Vec::new();
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(16 * 1024)))?;
+        file.take(16 * 1024).read_to_end(&mut tail)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => format!("{}:\n{}", path.display(), String::from_utf8_lossy(&tail)),
+        Err(err) => format!("{}: {err}", path.display()),
+    }
+}
+
+/// Timeout mode makes the initial connect nonblocking, including on a full
+/// listener queue. interprocess treats EAGAIN as pending and can return an
+/// unconnected fd after POLLHUP with SO_ERROR=0; verify actual connection too.
+fn bootstrap_connect(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let stream = ConnectOptions::new()
+        .name(path.to_fs_name::<GenericFilePath>()?)
+        .wait_mode(ConnectWaitMode::Timeout(timeout))
+        .connect_sync_as::<interprocess::os::unix::uds_local_socket::Stream>()?;
+    stream.inner().peer_addr().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotConnected {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "connect is still pending")
+        } else {
+            err
+        }
+    })?;
+    stream.inner().try_clone()
+}
+
+fn bootstrap_connect_before(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "startup deadline expired before socket connect",
+        ));
+    }
+    bootstrap_connect(path, remaining)
+}
+
+/// API bind (and even ping) precedes App initialization. Wait for the existing
+/// post-bind ready event, then a real client welcome + snapshot, not socket files.
+/// The deadline is shared by all stages: the old 10s + 5s allowance is unchanged.
+fn wait_for_server_bootstrap(
+    spawned: &mut SpawnedHerdr,
+    api_socket: &Path,
+    client_socket: &Path,
+    config_home: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut phase = "waiting for post-bind ready event";
+    let result = (|| -> Result<(), String> {
+        let mut reader = spawned
+            ._master
+            .try_clone_reader()
+            .map_err(|err| err.to_string())?;
+        let fd = spawned
+            ._master
+            .as_raw_fd()
+            .ok_or("PTY has no pollable fd")?;
+        let mut output_closed = false;
+        let mut child_exit = None;
+        loop {
+            if let Some(status) = spawned.child.try_wait().map_err(|err| err.to_string())? {
+                child_exit = Some(format!("child exited: {status} ({status:?})"));
+            }
+            // Drain final stderr through EOF before reporting a child's exit.
+            if output_closed {
+                if let Some(error) = &child_exit {
+                    return Err(error.clone());
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(child_exit
+                    .unwrap_or_else(|| format!("startup deadline expired after {timeout:?}")));
+            }
+            let mut poll = libc::pollfd {
+                fd: if output_closed { -1 } else { fd },
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // The only reader, so readiness permits a nonblocking-in-practice
+            // read. A closed PTY uses fd=-1 to keep child-exit checks bounded.
+            let ready = unsafe { libc::poll(&mut poll, 1, remaining.as_millis().min(25) as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("poll startup PTY: {error}"));
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut buf = [0; 1024];
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => output_closed = true,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+            }
+            if output.len() > 16 * 1024 {
+                output.drain(..output.len() - 16 * 1024);
+            }
+            if child_exit.is_none()
+                && String::from_utf8_lossy(&output).contains("herdr server running;")
+            {
+                bootstrap_connect_before(api_socket, deadline)
+                    .map_err(|err| format!("API unavailable after ready event: {err}"))?;
+                let stream = bootstrap_connect_before(client_socket, deadline)
+                    .map_err(|err| format!("client unavailable after ready event: {err}"))?;
+                phase = "waiting for client protocol welcome and bootstrap snapshot";
+                return client_bootstrap_before(stream, deadline);
+            }
+        }
+    })();
+    if result.is_ok() {
+        return result;
+    }
+    let failure = match spawned.child.try_wait() {
+        Ok(Some(status)) => format!(
+            "child exited: {status} ({status:?}); {}",
+            result.unwrap_err()
+        ),
+        _ => result.unwrap_err(),
+    };
+    // Diagnostics run even after expiry: attempt immediately, never grant a
+    // fresh waiting budget, and never call a pending unconnected fd success.
+    let probe = |path: &Path| match bootstrap_connect(path, Duration::ZERO) {
+        Ok(_) => "connect succeeds (not proof of protocol readiness)".to_string(),
+        Err(err) => format!("connect failed: {err}"),
+    };
+    Err(format!(
+        "server bootstrap failed: {failure}; phase: {phase}; pid: {:?}\nAPI {}: {}\nclient {}: {}\nPTY output:\n{}\n{}",
+        spawned.child.process_id(), api_socket.display(), probe(api_socket),
+        client_socket.display(), probe(client_socket), String::from_utf8_lossy(&output),
+        startup_log_tail(config_home),
+    ))
+}
+
+fn client_bootstrap_before(mut stream: UnixStream, deadline: Instant) -> Result<(), String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("startup deadline expired before client bootstrap".to_string());
+    }
+    stream
+        .set_write_timeout(Some(remaining))
+        .map_err(|err| err.to_string())?;
+    let cancel = stream.try_clone().map_err(|err| err.to_string())?;
+    // The shared handshake helper overwrites read_timeout with 5s. One scoped
+    // worker enforces our remaining aggregate budget without changing support.
+    // Shutdown interrupts all reads/writes, then scope joins it on every path.
+    thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        scope.spawn(move || {
+            let result = (|| {
+                let generation = support::CURRENT_ENDPOINT_PROTOCOL_GENERATION;
+                let (actual, error) = client_shell_handshake(&mut stream, generation, 80, 24)?;
+                if actual != generation || error.is_some() {
+                    return Err(format!(
+                        "client welcome generation={actual}, error={error:?}"
+                    ));
+                }
+                wait_for_client_shell_bootstrap(
+                    &mut stream,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+            })();
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|err| {
+                format!("startup deadline expired or client bootstrap worker failed: {err}")
+            })
+            .and_then(|result| result);
+        let _ = cancel.shutdown(std::net::Shutdown::Both);
+        result
+    })
+}
+
+fn spawn_bootstrap_fixture(base: &Path, output_command: &str) -> SpawnedHerdr {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+    crate::test_command::sanitize_pty_command_env(&mut command);
+    let marker = base.join("fixture-ready");
+    command.args([
+        "-c",
+        &format!(
+            "{output_command}; printf 'ready\\n' > {}; exec /bin/sleep 60",
+            marker.display()
+        ),
+    ]);
+    let child = pair.slave.spawn_command(command).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    let spawned = SpawnedHerdr {
+        _master: pair.master,
+        child,
+    };
+    // Prime the PTY before starting the deliberately short deadline: scheduling
+    // the fixture shell is not part of the unavailable-listener counterexample.
+    wait_for_file_contains(&marker, "ready\n", Duration::from_secs(5));
+    spawned
+}
+
+#[test]
+fn server_bootstrap_reports_an_unavailable_client_listener() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(base.join("config/herdr-dev")).unwrap();
+    let api = base.join("herdr.sock");
+    let client = base.join("herdr-client.sock");
+    let _api_listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
+    fs::write(
+        base.join("config/herdr-dev/herdr-server.log"),
+        "last checkpoint: App initialization\n",
+    )
+    .unwrap();
+    let mut spawned = spawn_bootstrap_fixture(&base, "printf 'waiting-for-client-bind\\n'");
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_millis(250),
+    )
+    .expect_err("an API listener must not conceal an unavailable client listener");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    assert!(
+        error.contains("waiting for post-bind ready event"),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("client {}: connect failed:", client.display())),
+        "{error}"
+    );
+    assert!(error.contains("waiting-for-client-bind"), "{error}");
+    assert!(
+        error.contains("last checkpoint: App initialization"),
+        "{error}"
+    );
+    assert!(spawned.child.try_wait().unwrap().is_none());
+    spawned.child.kill().unwrap();
+    spawned.child.wait().unwrap();
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn server_bootstrap_requires_a_client_protocol_snapshot() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let api = base.join("herdr.sock");
+    let client = base.join("herdr-client.sock");
+    // Genuine listeners, deliberately no protocol service. The old helper's
+    // two connect probes accept these immediately (deterministic false GREEN).
+    let _api_listener = std::os::unix::net::UnixListener::bind(&api).unwrap();
+    let _client_listener = std::os::unix::net::UnixListener::bind(&client).unwrap();
+    let mut spawned = spawn_bootstrap_fixture(&base, "printf 'herdr server running;\\n'");
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_millis(250),
+    )
+    .expect_err("bound sockets and a ready event aren't a protocol bootstrap");
+    assert!(error.contains("startup deadline expired"), "{error}");
+    // Expiry can precede dispatch of the already-emitted ready event.
+    assert!(
+        error.contains("waiting for client protocol welcome and bootstrap snapshot")
+            || error.contains("waiting for post-bind ready event"),
+        "{error}"
+    );
+    assert!(
+        error.contains("connect succeeds (not proof of protocol readiness)"),
+        "{error}"
+    );
+    spawned.child.kill().unwrap();
+    spawned.child.wait().unwrap();
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn server_bootstrap_bounds_saturated_backlog_connects() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let _lock = test_lock();
+    for saturated_endpoint in ["API", "client"] {
+        // ZERO deterministically expires before reading the primed ready event.
+        for (ready_event, budget) in [
+            (false, Duration::from_millis(100)),
+            (true, Duration::from_millis(100)),
+            (true, Duration::ZERO),
+        ] {
+            let base = unique_test_dir();
+            fs::create_dir_all(&base).unwrap();
+            let api = base.join("herdr.sock");
+            let client = base.join("herdr-client.sock");
+            let api_listener = UnixListener::bind(&api).unwrap();
+            let client_listener = UnixListener::bind(&client).unwrap();
+            let (listener, saturated, healthy) = if saturated_endpoint == "API" {
+                (&api_listener, &api, &client)
+            } else {
+                (&client_listener, &client, &api)
+            };
+            let inode = socket_inode(saturated);
+            // Shrink a real listening queue, then fill it until a nonblocking
+            // attempt cannot connect. No acceptor, sleeps, or guessed capacity.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            let mut queued = Vec::new();
+            loop {
+                match bootstrap_connect(saturated, Duration::ZERO) {
+                    Ok(stream) => queued.push(stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("saturate {saturated_endpoint}: {err}"),
+                }
+                assert!(queued.len() < 16, "listener queue did not saturate");
+            }
+            assert!(!queued.is_empty(), "must retain real pending connections");
+            // Counterexample: a zero-budget probe can confirm an immediately
+            // connected healthy listener, but never an unconnected pending fd.
+            let healthy_probe = bootstrap_connect(healthy, Duration::ZERO).unwrap();
+            healthy_probe.peer_addr().unwrap();
+            assert_eq!(
+                bootstrap_connect_before(healthy, Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::TimedOut,
+                "readiness must not connect after its original deadline",
+            );
+            let started = Instant::now();
+            let error = bootstrap_connect(saturated, Duration::ZERO).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let mut spawned = spawn_bootstrap_fixture(
+                &base,
+                if ready_event {
+                    "printf 'herdr server running;\\n'"
+                } else {
+                    "printf 'waiting-for-client-bind\\n'"
+                },
+            );
+            eprintln!(
+                "saturated backlog: endpoint={saturated_endpoint}, ready={ready_event}, budget={budget:?}, queued={}, fixture_pid={:?}, base={}",
+                queued.len(), spawned.child.process_id(), base.display()
+            );
+            let started = Instant::now();
+            let error = wait_for_server_bootstrap(
+                &mut spawned,
+                &api,
+                &client,
+                &base.join("config"),
+                budget,
+            )
+            .expect_err("saturated listeners must fail, not hang or pass readiness");
+            assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+            if error.contains("startup deadline expired") {
+                assert!(
+                    started.elapsed() >= budget,
+                    "deadline failed early: {error}"
+                );
+            } else {
+                assert!(ready_event, "unexpected non-expiry diagnostic: {error}");
+                assert!(
+                    error.contains(&format!(
+                        "{saturated_endpoint} unavailable after ready event"
+                    )),
+                    "{error}"
+                );
+            }
+            assert!(
+                error.contains(&format!(
+                    "{saturated_endpoint} {}: connect failed:",
+                    saturated.display()
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains("connect succeeds (not proof of protocol readiness)"),
+                "{error}"
+            );
+            assert_eq!(socket_inode(saturated), inode);
+            assert!(spawned.child.try_wait().unwrap().is_none());
+            spawned.child.kill().unwrap();
+            spawned.child.wait().unwrap();
+            drop(spawned);
+            drop((queued, healthy_probe, api_listener, client_listener));
+            cleanup_test_base(&base);
+        }
+    }
+}
+
+#[test]
+fn server_bootstrap_reports_a_real_client_bind_failure() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime = base.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let api = runtime.join("herdr.sock");
+    let client = runtime.join("herdr-client.sock");
+    let foreign = std::os::unix::net::UnixListener::bind(&client).unwrap();
+    let original_inode = socket_inode(&client);
+    let mut spawned = spawn_server(&base.join("config"), &runtime, &api);
+    let error = wait_for_server_bootstrap(
+        &mut spawned,
+        &api,
+        &client,
+        &base.join("config"),
+        Duration::from_secs(15),
+    )
+    .expect_err("a genuine client bind failure must not pass readiness");
+    assert!(
+        error.contains("child exited: Exited with code 1"),
+        "{error}"
+    );
+    assert!(!error.contains("startup deadline expired"), "{error}");
+    assert!(error.contains("already running"), "{error}");
+    assert!(
+        error.contains(&format!("client socket: {}", client.display())),
+        "{error}"
+    );
+    assert!(error.contains("api server listening"), "{error}");
+    assert_eq!(socket_inode(&client), original_inode);
+    assert!(UnixStream::connect(&client).is_ok());
+    drop(foreign);
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
 /// Starts a server with one pane running a line echo loop. Returns the server,
 /// the pane id, the pane process id and the file the pane appends input to.
 fn spawn_server_with_echo_pane(
@@ -2228,25 +2677,27 @@ fn spawn_server_with_echo_pane(
     let api_socket = runtime_dir.join("herdr.sock");
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
-    let spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, extra_env);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(
-        &runtime_dir.join("herdr-client.sock"),
-        Duration::from_secs(5),
-    );
-    register_runtime_dir(&runtime_dir);
-    let created = request(
+    let mut spawned = spawn_server_with_env(&config_home, &runtime_dir, &api_socket, extra_env);
+    wait_for_server_bootstrap(
+        &mut spawned,
         &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
+        &runtime_dir.join("herdr-client.sock"),
+        &config_home,
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+    register_runtime_dir(&runtime_dir);
+    // A real client bootstrap creates the default workspace. Reuse its pane
+    // rather than creating a second one and weakening the handoff fd counts.
+    let listed = request(
+        &api_socket,
+        serde_json::json!({"id":"test:bootstrap-panes","method":"pane.list","params":{}}),
     );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let panes = listed["result"]["panes"]
+        .as_array()
+        .expect("bootstrap panes");
+    assert_eq!(panes.len(), 1, "echo fixture must have one pane: {listed}");
+    let pane_id = panes[0]["pane_id"].as_str().unwrap().to_string();
     let command = format!(
         "sh -c 'echo READY $$ > {}; while read line; do echo got:$line; echo got:$line >> {}; done'",
         marker.display(),
