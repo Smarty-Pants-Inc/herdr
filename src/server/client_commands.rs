@@ -18,6 +18,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "integration.install",
     "integration.list",
     "layout.apply_project_checked",
+    "layout.apply_restorable",
     "layout.set_split_ratio",
     "pane.clear",
     "pane.close",
@@ -306,6 +307,7 @@ mod tests {
         // New optional API surface is not part of the frozen generation-1 fixture.
         // Its canonical params and response are covered by schema::tests.
         assert!(actual.remove("pane.last_input").is_some());
+        assert!(actual.remove("layout.apply_restorable").is_some());
         // Additive, safety-guaranteed topology method, not a generation-1 change.
         assert!(actual.remove("pane.move_project_checked").is_some());
         assert!(actual.remove("tab.move_project_checked").is_some());
@@ -315,6 +317,41 @@ mod tests {
         assert_eq!(
             actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"
+        );
+    }
+
+    #[test]
+    fn restorable_layout_endpoint_shape_is_separately_frozen() {
+        assert_eq!(
+            endpoint_method_shape_digests()
+                .get("layout.apply_restorable")
+                .map(String::as_str),
+            Some("cde5f69cacb72e37d9dd3d98fdf59c6d7589efdef315571056765ad08e744fe3")
+        );
+        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "restorable", "method": "layout.apply_restorable",
+            "params": {"root": {"type": "pane", "command": ["/absolute/program", "a b"]}}
+        }))
+        .unwrap();
+        assert!(supports_client_shell_method(&request.method));
+        assert!(crate::api::request_changes_ui(&request));
+        assert_eq!(
+            crate::api::api_method_name(&request.method),
+            "layout.apply_restorable"
+        );
+        let crate::api::schema::Method::LayoutApplyRestorable(params) = request.method else {
+            panic!("wrong method");
+        };
+        let ordinary = crate::api::schema::Request {
+            id: request.id,
+            method: crate::api::schema::Method::LayoutApply(params),
+        };
+        let ordinary_json = serde_json::to_value(ordinary).unwrap();
+        assert_eq!(
+            ordinary_json["params"],
+            serde_json::json!({
+                "focus": false, "root": {"type": "pane", "command": ["/absolute/program", "a b"]}
+            })
         );
     }
 
