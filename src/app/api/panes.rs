@@ -942,6 +942,7 @@ impl App {
             pane_id,
             destination,
             focus,
+            allow_project_change,
         } = params;
         let Some((source_ws_idx, source_pane_id)) = self.parse_pane_id(&pane_id) else {
             return encode_error(id, "pane_not_found", "source pane not found");
@@ -1123,6 +1124,63 @@ impl App {
             PaneMoveDestination::NewWorkspace { label, tab_label } => {
                 ResolvedPaneMoveDestination::NewWorkspace { label, tab_label }
             }
+        };
+
+        // Extraction can re-project sessions which do not themselves move.
+        let mut projected = self.project_topology();
+        projected[source_ws_idx].remove_pane(source_pane_id);
+        match &resolved {
+            ResolvedPaneMoveDestination::ExistingTab {
+                tab_id,
+                target_pane_id,
+                ..
+            } => {
+                let Some((ws_idx, tab_idx)) = self.parse_tab_id(tab_id) else {
+                    return encode_error(id, "tab_not_found", "target tab not found");
+                };
+                let root = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+                let Some(tab) = projected[ws_idx]
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.root == root)
+                else {
+                    return encode_error(id, "tab_not_found", "target tab not found");
+                };
+                let Some(position) = tab.panes.iter().position(|pane| pane == target_pane_id)
+                else {
+                    return encode_error(id, "target_pane_not_found", "target pane not found");
+                };
+                // Right/Down insertion creates the next layout leaf, not the last.
+                tab.panes.insert(position + 1, source_pane_id);
+            }
+            ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
+                let Some(ws) = projected.iter_mut().find(|ws| &ws.id == workspace_id) else {
+                    return encode_error(id, "workspace_not_found", "target workspace not found");
+                };
+                ws.tabs.push(super::project_change::ProjectTab {
+                    root: source_pane_id,
+                    panes: vec![source_pane_id],
+                });
+            }
+            ResolvedPaneMoveDestination::NewWorkspace { .. } => {
+                projected.push(super::project_change::ProjectWorkspace {
+                    id: String::new(),
+                    tabs: vec![super::project_change::ProjectTab {
+                        root: source_pane_id,
+                        panes: vec![source_pane_id],
+                    }],
+                    checkout_path: None,
+                    tokens: std::collections::HashMap::new(),
+                });
+            }
+        }
+        let project_changes = match self.precheck_project_change(
+            &projected,
+            allow_project_change,
+            "pane.move_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
         };
 
         let previous_focus = self.state.current_pane_focus_target();
@@ -1356,6 +1414,7 @@ impl App {
         }
         self.emit_layout_updated_snapshot((*move_result.target_layout).clone());
 
+        Self::log_project_changes(&project_changes);
         encode_success(id, ResponseResult::PaneMove { move_result })
     }
 
@@ -3485,6 +3544,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public.clone(),
@@ -3542,6 +3602,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: previous_pane_id.clone(),
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_id.clone(),
@@ -3602,6 +3663,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: "t_2_1".into(),
@@ -3644,6 +3706,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::NewTab {
                     workspace_id: None,
@@ -3718,6 +3781,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::NewTab {
                     workspace_id: None,
@@ -3757,6 +3821,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public.clone(),
                 destination: PaneMoveDestination::NewWorkspace {
                     label: Some("promoted".into()),
@@ -3854,6 +3919,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: source_tab,
@@ -3890,6 +3956,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public,
@@ -3927,6 +3994,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public,
@@ -4003,6 +4071,7 @@ mod tests {
         let response = app.handle_pane_move(
             "req".into(),
             PaneMoveParams {
+                allow_project_change: false,
                 pane_id: source_public,
                 destination: PaneMoveDestination::Tab {
                     tab_id: target_tab_public.clone(),

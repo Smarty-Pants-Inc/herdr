@@ -2936,6 +2936,11 @@
         },
         "PaneMoveParams": {
           "properties": {
+            "allow_project_change": {
+              "default": false,
+              "description": "Explicit permission to change ownership of a surviving agent session.",
+              "type": "boolean"
+            },
             "destination": {
               "$ref": "#/schemas/request/$defs/PaneMoveDestination"
             },
@@ -4525,6 +4530,28 @@
           ],
           "type": "object"
         },
+        "TabMoveProjectCheckedParams": {
+          "description": "Additive checked method; the published tab.move shape remains immutable.",
+          "properties": {
+            "allow_project_change": {
+              "default": false,
+              "type": "boolean"
+            },
+            "insert_index": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "insert_index"
+          ],
+          "type": "object"
+        },
         "TabRenameParams": {
           "properties": {
             "label": {
@@ -5472,6 +5499,22 @@
         {
           "properties": {
             "method": {
+              "const": "tab.move_project_checked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabMoveProjectCheckedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "tab.close",
               "type": "string"
             },
@@ -5730,6 +5773,23 @@
           "properties": {
             "method": {
               "const": "pane.move",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneMoveParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Project-checked move; its distinct name prevents unsafe old-server fallback.",
+          "properties": {
+            "method": {
+              "const": "pane.move_project_checked",
               "type": "string"
             },
             "params": {

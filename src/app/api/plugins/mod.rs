@@ -3601,6 +3601,7 @@ command = ["sh", "-c", "echo ok"]
         let response = app.handle_api_request(Request {
             id: "move".into(),
             method: Method::PaneMove(crate::api::schema::PaneMoveParams {
+                allow_project_change: false,
                 pane_id: public_pane_id,
                 destination: crate::api::schema::PaneMoveDestination::NewTab {
                     workspace_id: None,

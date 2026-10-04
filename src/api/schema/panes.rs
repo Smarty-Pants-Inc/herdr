@@ -103,6 +103,9 @@ pub struct PaneMoveParams {
     pub destination: PaneMoveDestination,
     #[serde(default)]
     pub focus: bool,
+    /// Explicit permission to change ownership of a surviving agent session.
+    #[serde(default)]
+    pub allow_project_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

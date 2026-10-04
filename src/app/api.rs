@@ -12,6 +12,7 @@ mod layouts;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
+mod project_change;
 pub(super) mod responses;
 mod session;
 mod tabs;
@@ -1110,6 +1111,9 @@ impl App {
             Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
+            Method::TabMoveProjectChecked(params) => {
+                return self.handle_tab_move_project_checked(request.id, params)
+            }
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
@@ -1150,7 +1154,16 @@ impl App {
             }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
-            Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
+            Method::PaneMove(params) => {
+                if params.allow_project_change {
+                    return responses::encode_error(request.id, "project_change_capability_required",
+                        "allow_project_change requires pane.move_project_checked; do not fall back to pane.move");
+                }
+                return self.handle_pane_move(request.id, params);
+            }
+            Method::PaneMoveProjectChecked(params) => {
+                return self.handle_pane_move(request.id, params)
+            }
             Method::PaneZoom(params) => return self.handle_pane_zoom(request.id, params),
             Method::PaneLayout(params) => return self.handle_pane_layout(request.id, params),
             Method::PaneProcessInfo(params) => {

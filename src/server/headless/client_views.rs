@@ -231,6 +231,7 @@ impl HeadlessServer {
                 | Method::PaneClose(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneMove(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneSplit(_)
                 | Method::TabClose(_)
                 | Method::TabCreate(_)
@@ -260,6 +261,7 @@ impl HeadlessServer {
                 | Method::PaneInputSet(_)
                 | Method::PaneLinkActivate(_)
                 | Method::PaneLinkResolve(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneRename(_)
                 | Method::PaneResize(_)
                 | Method::PaneScroll(_)
@@ -271,6 +273,7 @@ impl HeadlessServer {
                 | Method::TabCreate(_)
                 | Method::TabFocus(_)
                 | Method::TabMove(_)
+                | Method::TabMoveProjectChecked(_)
                 | Method::TabRename(_)
                 | Method::WorkspaceClose(_)
                 | Method::WorkspaceCreate(_)
@@ -298,6 +301,8 @@ impl HeadlessServer {
                 | Method::PaneFocus(_)
                 | Method::PaneFocusDirection(_)
                 | Method::PaneResize(_)
+                | Method::PaneMove(_)
+                | Method::PaneMoveProjectChecked(_)
                 | Method::PaneSplit(_)
                 | Method::PaneSwap(_)
                 | Method::PaneZoom(_)
@@ -860,7 +865,8 @@ impl HeadlessServer {
         };
         let inspect_pane_move = matches!(
             &msg.request.method,
-            api::schema::Method::PaneMove(params) if params.focus
+            api::schema::Method::PaneMove(params)
+                | api::schema::Method::PaneMoveProjectChecked(params) if params.focus
         );
         let response_proxy = (agent_focus_target.is_some() || inspect_pane_move).then(|| {
             let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();

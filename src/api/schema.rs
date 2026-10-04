@@ -138,6 +138,8 @@ pub enum Method {
     TabRename(TabRenameParams),
     #[serde(rename = "tab.move")]
     TabMove(TabMoveParams),
+    #[serde(rename = "tab.move_project_checked")]
+    TabMoveProjectChecked(TabMoveProjectCheckedParams),
     #[serde(rename = "tab.close")]
     TabClose(TabTarget),
     #[serde(rename = "agent.list")]
@@ -173,6 +175,9 @@ pub enum Method {
     PaneSwap(PaneSwapParams),
     #[serde(rename = "pane.move")]
     PaneMove(PaneMoveParams),
+    /// Project-checked move; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "pane.move_project_checked")]
+    PaneMoveProjectChecked(PaneMoveParams),
     #[serde(rename = "pane.zoom")]
     PaneZoom(PaneZoomParams),
     #[serde(rename = "pane.layout")]

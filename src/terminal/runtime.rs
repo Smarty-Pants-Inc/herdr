@@ -607,6 +607,10 @@ impl TerminalRuntime {
         self.0.test_set_child_pid(pid);
     }
 
+    pub(crate) fn test_set_foreground_cwd(&self, cwd: Option<std::path::PathBuf>) {
+        self.0.test_set_foreground_cwd(cwd);
+    }
+
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)
