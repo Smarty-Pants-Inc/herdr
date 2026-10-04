@@ -83,9 +83,15 @@ fn shell_and_registry() -> TestFixture {
 }
 
 fn shell_and_registry_with_source_failure(source_fail_after_write: bool) -> TestFixture {
-    let mut shell = crate::client::ClientShellState::new(
-        crate::client::ClientShellConfig::from_config(&crate::config::Config::default()),
-    );
+    shell_and_registry_with_config(&crate::config::Config::default(), source_fail_after_write)
+}
+
+fn shell_and_registry_with_config(
+    config: &crate::config::Config,
+    source_fail_after_write: bool,
+) -> TestFixture {
+    let mut shell =
+        crate::client::ClientShellState::new(crate::client::ClientShellConfig::from_config(config));
     let profile = super::super::SavedSshEndpoint {
         id: super::super::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
         label: "Remote".into(),
@@ -403,6 +409,461 @@ fn source_release_is_sent_and_acknowledged_before_target_activation() {
         Some(&crate::protocol::ClientMessage::ClientShellFocus { focused: true })
     );
     assert_eq!(remote.get(1).and_then(surface_set_active), Some(true));
+}
+
+#[test]
+fn grouped_pending_endpoint_switch_fences_typing_until_safe_completion_with_colliding_ids() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w2x");
+}
+
+#[test]
+fn grouped_preview_enter_batch_fences_typing_until_safe_completion_with_colliding_ids() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w\x1b[B\rx");
+}
+
+#[test]
+fn grouped_activation_intent_batch_cancels_post_choice_endpoint_action() {
+    grouped_activation_intent_batch_fences_typing(b"\x02w2x\x02c");
+}
+
+fn grouped_activation_intent_batch_fences_typing(selection_batch: &[u8]) {
+    use crate::client::{
+        endpoint_commands::EndpointCommands,
+        shell_runtime::{
+            begin_endpoint_activation, complete_endpoint_activation, finish_client_shell_input,
+        },
+        ClientLoopEvent, ClientState,
+    };
+    use crate::protocol::{ClientMessage, ClientShellPane, ClientShellTab, ClientShellWorkspace};
+
+    let mut config = crate::config::Config::default();
+    config.ui.sidebar.grouping.enabled = true;
+    config.ui.prompt_new_tab_name = false;
+    let (mut shell, mut endpoints, local_sent, remote_sent) =
+        shell_and_registry_with_config(&config, false);
+    let target = endpoint();
+    // Identical resource IDs, labels, and portable group keys must not merge routing identity.
+    let snapshot = |boot: &str, revision| {
+        let mut snapshot = test_snapshot(boot, revision);
+        snapshot.focused_workspace_id = Some("ws_1".into());
+        snapshot.focused_tab_id = Some("tab_1".into());
+        snapshot.focused_pane_id = Some("pane_1".into());
+        snapshot.workspaces.push(ClientShellWorkspace {
+            workspace_id: "ws_1".into(),
+            active_tab_id: "tab_1".into(),
+            new_workspace_cwd: "/repo".into(),
+            number: 1,
+            label: "collision".into(),
+            custom_label: false,
+            branch: None,
+            git_ahead_behind: None,
+            tokens: vec![
+                (
+                    config.ui.sidebar.grouping.org_id.clone(),
+                    "example-org".into(),
+                ),
+                (
+                    config.ui.sidebar.grouping.org_label.clone(),
+                    "Example org".into(),
+                ),
+                (
+                    config.ui.sidebar.grouping.project_id.clone(),
+                    "example-project".into(),
+                ),
+                (
+                    config.ui.sidebar.grouping.project_label.clone(),
+                    "Example project".into(),
+                ),
+            ],
+            worktree: None,
+            focused: true,
+            agent_status: crate::api::schema::AgentStatus::Idle,
+        });
+        snapshot.tabs.push(ClientShellTab {
+            tab_id: "tab_1".into(),
+            workspace_id: "ws_1".into(),
+            number: 1,
+            label: "1".into(),
+            custom_label: false,
+            zoomed: false,
+            focused: true,
+            agent_status: crate::api::schema::AgentStatus::Idle,
+        });
+        snapshot.panes.push(ClientShellPane {
+            pane_id: "pane_1".into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            label: None,
+            cwd: Some("/repo".into()),
+            foreground_cwd: Some("/repo".into()),
+            focused: true,
+            right_click_passthrough: false,
+        });
+        snapshot
+    };
+    shell.set_endpoint_snapshot_for_generation(
+        &ClientEndpointId::Local,
+        1,
+        Box::new(snapshot("local-boot", 1)),
+    );
+    shell.set_endpoint_snapshot_for_generation(&target, 7, Box::new(snapshot("remote-boot", 1)));
+    shell.set_pane_surface(surface("local-boot", 1, "pane_1"));
+    shell.compose(100, 30).unwrap();
+    let mut state = ClientState::test_new();
+    state.shell = Some(shell);
+    let mut commands = EndpointCommands::default();
+    let mut pending = None;
+    let mut scheduled = None;
+    let mut input_source = crate::platform::RealPrefixInputSource::default();
+
+    // Allowed counterexample: ordinary typing on a coherent source still travels to Local.
+    let ordinary = state.shell.as_mut().unwrap().handle_input_bytes(b"a");
+    assert!(ordinary.actions.is_empty());
+    let ordinary_requests = ordinary.requests.clone();
+    assert!(matches!(ordinary_requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"));
+    finish_client_shell_input(
+        &mut state,
+        ordinary,
+        None,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+        &mut input_source,
+        &mut scheduled,
+    )
+    .unwrap();
+    assert_eq!(*local_sent.lock().unwrap(), ordinary_requests);
+    assert!(remote_sent.lock().unwrap().is_empty());
+    assert!(scheduled.is_none());
+    local_sent.lock().unwrap().clear();
+
+    // A command already queued on the source must not be drained by choice-batch dispatch.
+    commands.enqueue(
+        ClientEndpointId::Local,
+        1,
+        "local-boot".into(),
+        Box::new(crate::api::schema::Request {
+            id: "queued-source-before-choice".into(),
+            method: crate::api::schema::Method::WorkspaceList(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        }),
+    );
+
+    // Follow the complete parsed grouped keyboard batch. In particular, do NOT begin the
+    // transaction between the choice and its trailing typing: that was the missing fence.
+    let selection = state
+        .shell
+        .as_mut()
+        .unwrap()
+        .handle_input_bytes(selection_batch);
+    assert!(matches!(selection.actions.first(),
+        Some(crate::client::shell::ClientShellAction::ActivateEndpoint { endpoint_id, .. })
+        if endpoint_id == &target));
+    let post_choice_requests = selection.actions[1..]
+        .iter()
+        .map(|action| {
+            let crate::client::shell::ClientShellAction::Endpoint {
+                endpoint_id,
+                boot_id,
+                request,
+            } = action
+            else {
+                panic!("expected old-source API action after choice");
+            };
+            assert_eq!(endpoint_id, &ClientEndpointId::Local);
+            assert_eq!(boot_id, "local-boot");
+            assert!(matches!(
+                request.method,
+                crate::api::schema::Method::TabCreate(_)
+            ));
+            request.id.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        post_choice_requests.len(),
+        usize::from(selection_batch.ends_with(b"\x02c"))
+    );
+    assert!(matches!(selection.requests.as_slice(),
+        [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"));
+    finish_client_shell_input(
+        &mut state,
+        selection,
+        None,
+        &mut endpoints,
+        &mut pending,
+        &mut commands,
+        &mut input_source,
+        &mut scheduled,
+    )
+    .unwrap();
+    for request_id in post_choice_requests {
+        assert!(
+            !state
+                .shell
+                .as_mut()
+                .unwrap()
+                .cancel_endpoint_request(&request_id),
+            "dispatch already cancelled the old-source action instead of queueing it"
+        );
+        assert!(!commands.accepts_response(&ClientEndpointId::Local, 1, "local-boot", &request_id));
+    }
+    assert!(pending.is_none(), "bootstrap has not run yet");
+    assert!(
+        endpoints.active_surface_available(),
+        "intent does not alter registry leases"
+    );
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert!(
+        local_sent.lock().unwrap().is_empty(),
+        "choice-batch typing cannot reach Local"
+    );
+    assert!(
+        remote_sent.lock().unwrap().is_empty(),
+        "choice-batch typing cannot reach the target"
+    );
+    let ClientLoopEvent::ActivateEndpoint {
+        endpoint_id,
+        target: focus,
+        force,
+    } = scheduled
+        .take()
+        .expect("grouped leaf selection schedules activation")
+    else {
+        panic!("expected endpoint activation");
+    };
+    assert_eq!(endpoint_id, target);
+    assert_eq!(
+        focus,
+        Some(crate::client::shell::ClientEndpointFocusTarget::Workspace(
+            "ws_1".into()
+        ))
+    );
+    let mut serial = 60;
+    begin_endpoint_activation(
+        &mut state,
+        &mut endpoints,
+        &mut commands,
+        &mut pending,
+        &mut serial,
+        endpoint_id,
+        focus,
+        force,
+        Instant::now(),
+        &mut scheduled,
+    )
+    .unwrap();
+    assert!(state.presentation_frozen);
+    assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
+    assert_eq!(
+        local_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(surface_set_active)
+            .collect::<Vec<_>>(),
+        vec![false],
+        "source-off is sent before anything reaches the target"
+    );
+    assert_eq!(
+        local_sent.lock().unwrap().first(),
+        Some(&ClientMessage::ClientShellFocus { focused: false }),
+        "host focus is revoked before source-off"
+    );
+    assert!(remote_sent.lock().unwrap().is_empty());
+    assert!(commands
+        .send_next(&ClientEndpointId::Local, &mut endpoints)
+        .is_empty());
+    assert_eq!(
+        local_sent.lock().unwrap().len(),
+        2,
+        "bootstrap retired the queued source command, leaving only focus-revoke and source-off"
+    );
+
+    let mut type_key = |state: &mut ClientState,
+                        endpoints: &mut EndpointRegistry,
+                        pending: &mut Option<PendingEndpointActivation>,
+                        commands: &mut EndpointCommands| {
+        let outcome = state.shell.as_mut().unwrap().handle_input_bytes(b"x");
+        assert!(matches!(outcome.requests.as_slice(),
+            [ClientMessage::ClientShellPaneInput { pane_id, .. }] if pane_id == "pane_1"));
+        let input = outcome.requests[0].clone();
+        let before = (
+            local_sent.lock().unwrap().len(),
+            remote_sent.lock().unwrap().len(),
+        );
+        finish_client_shell_input(
+            state,
+            outcome,
+            None,
+            endpoints,
+            pending,
+            commands,
+            &mut input_source,
+            &mut None,
+        )
+        .unwrap();
+        if pending.is_some() {
+            assert!(!endpoints.active_surface_available());
+            assert_eq!(
+                (
+                    local_sent.lock().unwrap().len(),
+                    remote_sent.lock().unwrap().len()
+                ),
+                before,
+                "parsed typing must reach neither transport during a pending switch"
+            );
+        }
+        input
+    };
+    type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+    assert_eq!(
+        pending.as_mut().unwrap().receive_response(
+            &ClientEndpointId::Local,
+            1,
+            "client-shell-surface:60:off",
+            &surface_success("client-shell-surface:60:off", false, 1),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    assert_eq!(
+        remote_sent
+            .lock()
+            .unwrap()
+            .get(1)
+            .and_then(surface_set_active),
+        Some(true)
+    );
+    let focus_request = remote_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|message| {
+            let ClientMessage::ClientShellEndpointRequest { boot_id, request } = message else {
+                return None;
+            };
+            let request: crate::api::schema::Request = serde_json::from_str(request).unwrap();
+            matches!(request.method, crate::api::schema::Method::WorkspaceFocus(ref focus)
+            if focus.workspace_id == "ws_1")
+            .then(|| (boot_id.clone(), request.id))
+        })
+        .expect("workspace focus travels only on the selected endpoint transport");
+    assert_eq!(focus_request.0, "remote-boot");
+    assert_eq!(
+        pending.as_mut().unwrap().receive_response(
+            &target,
+            7,
+            &focus_request.1,
+            &workspace_focus_success(&focus_request.1, "ws_1"),
+            &mut endpoints,
+        ),
+        SurfaceActivationProgress::Pending
+    );
+    type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+
+    // Both the initial projection and the host-effects replay need fresh coherent evidence.
+    for (revision, request_id) in [
+        (2, "client-shell-surface:60:on"),
+        (3, "client-shell-surface:60:presentation-sync"),
+    ] {
+        let activation = pending.as_mut().unwrap();
+        assert_eq!(
+            activation.receive_response(
+                &target,
+                7,
+                request_id,
+                &surface_success(request_id, true, revision),
+                &mut endpoints,
+            ),
+            SurfaceActivationProgress::Pending
+        );
+        let projected = snapshot("remote-boot", revision);
+        state
+            .shell
+            .as_mut()
+            .unwrap()
+            .set_endpoint_snapshot_for_generation(&target, 7, Box::new(projected.clone()));
+        assert_eq!(
+            activation.receive_snapshot(&target, 7, &projected),
+            SurfaceActivationProgress::Pending
+        );
+        let geometry = state.shell.as_ref().unwrap().surface_size(100, 30);
+        let mut stale = surface("remote-boot", revision - 1, "pane_1");
+        stale.frame.width = geometry.cols;
+        stale.frame.height = geometry.rows;
+        assert_eq!(
+            activation.receive_surface(&target, 7, stale),
+            SurfaceActivationProgress::Pending,
+            "mismatched revisions cannot unlock input"
+        );
+        type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+        let mut coherent = surface("remote-boot", revision, "pane_1");
+        coherent.frame.width = geometry.cols;
+        coherent.frame.height = geometry.rows;
+        assert_eq!(
+            pending
+                .as_mut()
+                .unwrap()
+                .receive_surface(&target, 7, coherent),
+            SurfaceActivationProgress::Ready
+        );
+        assert!(complete_endpoint_activation(
+            &mut state,
+            &mut endpoints,
+            &mut pending,
+            &mut commands
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            pending.is_some(),
+            "projection completion is not effects completion"
+        );
+        assert_eq!(endpoints.active_id(), &target);
+        type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+    }
+    assert_eq!(
+        pending
+            .as_mut()
+            .unwrap()
+            .receive_presentation_effects_ready(&ClientEndpointId::Local, 1, "60:7:remote-boot",),
+        SurfaceActivationProgress::Stale,
+        "another endpoint cannot open the target fence"
+    );
+    type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+    assert_eq!(
+        pending
+            .as_mut()
+            .unwrap()
+            .receive_presentation_effects_ready(&target, 7, "60:7:remote-boot",),
+        SurfaceActivationProgress::Ready
+    );
+    assert!(
+        complete_endpoint_activation(&mut state, &mut endpoints, &mut pending, &mut commands)
+            .unwrap()
+            .is_none()
+    );
+    assert!(pending.is_none());
+    assert!(endpoints.active_surface_available());
+    assert!(!state.presentation_frozen);
+    let input = type_key(&mut state, &mut endpoints, &mut pending, &mut commands);
+    assert!(!local_sent
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|message| matches!(message, ClientMessage::ClientShellPaneInput { .. })));
+    assert_eq!(
+        remote_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| matches!(message, ClientMessage::ClientShellPaneInput { .. }))
+            .collect::<Vec<_>>(),
+        vec![&input],
+        "only typing after safe completion reaches the colliding target pane ID"
+    );
 }
 
 #[test]

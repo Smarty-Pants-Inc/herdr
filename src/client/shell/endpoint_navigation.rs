@@ -12,7 +12,8 @@ impl ClientShellState {
     }
 
     pub(super) fn endpoint_workspace_is_draggable(&self, press: &ClientWorkspacePress) -> bool {
-        press.endpoint_id == self.active_endpoint_id
+        !self.config.grouping.enabled
+            && press.endpoint_id == self.active_endpoint_id
             && self
                 .snapshot
                 .as_deref()
@@ -106,6 +107,46 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) -> bool {
         use crate::input::KeybindAction;
+        if self.config.grouping.enabled
+            && matches!(
+                action,
+                KeybindAction::PreviousWorkspace
+                    | KeybindAction::NextWorkspace
+                    | KeybindAction::SwitchWorkspace(_)
+            )
+        {
+            let targets = self.grouped_navigation_targets();
+            if targets.is_empty() {
+                return true;
+            }
+            let focused = self.focused_navigation_target();
+            let current = targets
+                .iter()
+                .position(|target| Some(target) == focused.as_ref());
+            let next = match (action, current) {
+                (KeybindAction::SwitchWorkspace(index), _) if index < targets.len() => index,
+                (KeybindAction::SwitchWorkspace(_), _) => return true,
+                (KeybindAction::PreviousWorkspace, Some(index)) => {
+                    (index + targets.len() - 1) % targets.len()
+                }
+                (KeybindAction::NextWorkspace, Some(index)) => (index + 1) % targets.len(),
+                (KeybindAction::PreviousWorkspace, None) => targets.len() - 1,
+                _ => 0,
+            };
+            let target = targets[next].clone();
+            self.reveal_grouped_workspace(&target.endpoint_id, &target.workspace_id);
+            self.reveal_navigation_workspace = true;
+            if self.focus_or_activate(
+                target.endpoint_id.clone(),
+                ClientEndpointFocusTarget::Workspace(target.workspace_id.clone()),
+                outcome,
+            ) {
+                // A display-only reveal target; activation and input leases remain runtime-owned.
+                self.grouped_reveal_target = Some(target);
+                outcome.repaint = true;
+            }
+            return true;
+        }
         if !self.multi_endpoint_active() {
             return false;
         }

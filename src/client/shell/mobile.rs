@@ -367,6 +367,10 @@ pub(super) fn render_mobile_switcher(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    grouped: (
+        &[super::grouped_projection::GroupedRow],
+        &HashSet<super::grouped_projection::GroupKey>,
+    ),
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
     scroll: &mut usize,
     reveal_workspace: &mut bool,
@@ -441,6 +445,8 @@ pub(super) fn render_mobile_switcher(
         endpoints,
         active_endpoint_id,
         config,
+        grouped.0,
+        grouped.1,
         selected_workspace_id,
         viewport.width.saturating_sub(1),
     );
@@ -577,12 +583,14 @@ fn mobile_items(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    grouped_rows: &[super::grouped_projection::GroupedRow],
+    grouped_collapsed: &HashSet<super::grouped_projection::GroupKey>,
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
     content_width: u16,
 ) -> Vec<MobileItem> {
     let palette = &config.palette;
     let mut items = Vec::new();
-    if endpoints.len() > 1 {
+    if endpoints.len() > 1 || config.grouping.enabled {
         items.push(MobileItem::section("machines", palette));
         for endpoint in endpoints {
             let background = palette.panel_bg;
@@ -753,7 +761,21 @@ fn mobile_items(
         ClientMobileTarget::NewWorkspace,
         palette,
     ));
+    if config.grouping.enabled {
+        items.extend(grouped_mobile_items(
+            grouped_rows,
+            grouped_collapsed,
+            endpoints,
+            active_endpoint_id,
+            config,
+            selected_workspace_id,
+            content_width,
+        ));
+    }
     for endpoint in super::aggregate_navigation::cached_endpoint_snapshots(endpoints) {
+        if config.grouping.enabled {
+            break;
+        }
         for entry in super::render::workspace_entries(endpoint.snapshot, &HashSet::new()) {
             let Some(workspace) = endpoint.snapshot.workspaces.get(entry.index) else {
                 continue;
@@ -1003,6 +1025,10 @@ impl ClientShellState {
             .find(|(rect, _)| super::contains(*rect, point))
             .map(|(_, target)| target.clone());
         match target {
+            Some(ClientMobileTarget::Group(key)) => {
+                self.toggle_grouped_heading(key);
+                self.persist_chrome_preferences(outcome);
+            }
             Some(ClientMobileTarget::Machine(endpoint_id)) => {
                 if endpoint_id == self.active_endpoint_id {
                     self.mode = ClientShellMode::Terminal;
@@ -1087,6 +1113,103 @@ impl ClientShellState {
         outcome.repaint = true;
         true
     }
+}
+
+fn grouped_mobile_items(
+    rows: &[super::grouped_projection::GroupedRow],
+    collapsed: &HashSet<super::grouped_projection::GroupKey>,
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint: &ClientEndpointId,
+    config: &ClientShellConfig,
+    selected: Option<&WorkspaceNavigationTarget>,
+    width: u16,
+) -> Vec<MobileItem> {
+    use super::grouped_projection::GroupedRow;
+    let palette = &config.palette;
+    rows.iter()
+        .filter_map(|row| match row {
+            GroupedRow::Heading { key, label, depth } => {
+                let marker = if collapsed.contains(key) {
+                    "▸"
+                } else {
+                    "▾"
+                };
+                Some(MobileItem {
+                    lines: vec![Line::from(Span::styled(
+                        format!("{} {marker} {label}", "  ".repeat(usize::from(*depth))),
+                        Style::default()
+                            .fg(palette.overlay1)
+                            .add_modifier(Modifier::BOLD),
+                    ))],
+                    background: palette.panel_bg,
+                    target: Some(ClientMobileTarget::Group(key.clone())),
+                })
+            }
+            GroupedRow::Workspace {
+                endpoint,
+                index,
+                depth,
+                label,
+                host,
+            } => {
+                let endpoint = endpoints.get(*endpoint)?;
+                let snapshot = endpoint.snapshot.as_deref()?;
+                let workspace = snapshot.workspaces.get(*index)?;
+                let stale = endpoint.status != ClientEndpointStatus::Online;
+                let highlighted = selected.is_some_and(|target| {
+                    target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
+                });
+                let background = if highlighted
+                    || (&endpoint.endpoint_id == active_endpoint && workspace.focused)
+                {
+                    palette.active_row_bg
+                } else {
+                    palette.panel_bg
+                };
+                let style = Style::default()
+                    .fg(if stale {
+                        palette.overlay0
+                    } else {
+                        palette.text
+                    })
+                    .bg(background)
+                    .add_modifier(if stale {
+                        Modifier::DIM
+                    } else {
+                        Modifier::empty()
+                    });
+                let detail = if stale {
+                    format!("[{host}] · {}", mobile_endpoint_state(endpoint.status))
+                } else {
+                    format!("[{host}] · {}", compact_tab_status(snapshot, workspace))
+                };
+                Some(MobileItem {
+                    lines: vec![
+                        Line::from(Span::styled(
+                            crate::ui::truncate_end(
+                                &format!(
+                                    "{} {} {label}",
+                                    "  ".repeat(usize::from(*depth)),
+                                    status_icon(workspace.agent_status, config.status_indicators)
+                                ),
+                                usize::from(width),
+                            ),
+                            style,
+                        )),
+                        Line::from(Span::styled(
+                            crate::ui::truncate_end(&format!("  {detail}"), usize::from(width)),
+                            style.fg(palette.overlay0),
+                        )),
+                    ],
+                    background,
+                    target: (!stale).then(|| ClientMobileTarget::Workspace {
+                        endpoint_id: endpoint.endpoint_id.clone(),
+                        workspace_id: workspace.workspace_id.clone(),
+                    }),
+                })
+            }
+        })
+        .collect()
 }
 
 fn render_left_scrollbar(
