@@ -653,6 +653,71 @@ mod tests {
     }
 
     #[test]
+    fn sec_r2_multi_pane_search_uses_one_message_budget() {
+        let width = 16u16;
+        let height = 1000u16;
+        let mut last = surface();
+        last.frame =
+            FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, width, height)), None);
+        let left = SurfaceRect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height,
+        };
+        let right = SurfaceRect {
+            x: 8,
+            y: 0,
+            width: 8,
+            height,
+        };
+        let mut first = pane();
+        first.inner_rect = left;
+        first.rect = left;
+        let mut second = first.clone();
+        second.pane_id = "w1:p2".into();
+        second.inner_rect = right;
+        second.rect = right;
+        last.panes = vec![first.clone(), second.clone()];
+        let mut rows = Vec::new();
+        for y in 0..height {
+            for x in 8..width {
+                last.frame.cells[usize::from(y) * usize::from(width) + usize::from(x)].symbol =
+                    format!("row-{y}");
+            }
+            let mut left_cells = last.frame.cells
+                [usize::from(y) * usize::from(width)..usize::from(y) * usize::from(width) + 8]
+                .to_vec();
+            for cell in &mut left_cells {
+                cell.symbol = "changed".into();
+            }
+            rows.push(PaneSurfacePatchRow {
+                x: 0,
+                y,
+                cells: left_cells,
+            });
+            let mut right_cells = last.frame.cells
+                [usize::from(y) * usize::from(width) + 8..usize::from(y + 1) * usize::from(width)]
+                .to_vec();
+            for cell in &mut right_cells {
+                cell.symbol = format!("row-{}", y + 1);
+            }
+            rows.push(PaneSurfacePatchRow {
+                x: 8,
+                y,
+                cells: right_cells,
+            });
+        }
+        let mut patch = row_patch(&surface(), &surface().frame);
+        patch.rows = rows;
+        patch.panes = vec![first, second];
+        assert!(
+            message(&last, &patch).is_none(),
+            "failed first pane must not replenish work for the next pane"
+        );
+    }
+
+    #[test]
     fn tall_no_match_detection_hits_budget_and_falls_back() {
         let width = 16u16;
         let height = 4096u16;

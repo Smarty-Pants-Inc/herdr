@@ -1903,6 +1903,16 @@ help = "prefix+ctrl+b"
     }
 
     #[test]
+    fn sec_r2_oversized_prefix_list_rejects_binding_replacement() {
+        let entries = (0..257).map(|_| "\"ctrl+a\"").collect::<Vec<_>>().join(",");
+        let config: Config = toml::from_str(&format!("[keys]\nprefix = [{entries}]\n")).unwrap();
+        assert!(config.live_keybinds_with_diagnostics().is_err());
+        let allowed: Config =
+            toml::from_str("[keys]\nprefix = [\"ctrl+a\",\"ctrl+a\",\"ctrl+b\"]\n").unwrap();
+        assert_eq!(allowed.prefix_keys().len(), 2);
+    }
+
+    #[test]
     fn multiple_prefix_keys_parse_reserve_and_share_prefix_bindings() {
         let config: Config = toml::from_str(
             r#"

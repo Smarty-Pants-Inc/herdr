@@ -378,6 +378,75 @@ fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
 }
 
 #[test]
+fn sec_r2_fresh_upload_failure_preserves_obligation_at_every_write_boundary() {
+    struct Broken {
+        remaining: usize,
+    }
+    impl std::io::Write for Broken {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let count = bytes.len().min(self.remaining);
+            self.remaining -= count;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    for remaining in 0..100 {
+        let id = 490_001;
+        let upload = format!("\x1b_Ga=t,i={id};AAAA\x1b\\");
+        assert!(super::frame_output::write_encoded_frame_with_graphics(
+            Broken { remaining },
+            b"frame",
+            upload.as_bytes(),
+        )
+        .is_err());
+        let mut cleanup = Vec::new();
+        clear_received_kitty_graphics(&mut cleanup).unwrap();
+        assert!(
+            String::from_utf8(cleanup)
+                .unwrap()
+                .contains(&format!("i={id}")),
+            "write boundary {remaining}"
+        );
+    }
+    let upload = crate::kitty_graphics::GraphicsOutput::from_bytes(
+        b"\x1b_Ga=t,i=490002;AAAA\x1b\\".to_vec(),
+    );
+    assert!(super::frame_output::write_composed_frame(
+        Broken {
+            remaining: usize::MAX
+        },
+        b"frame",
+        &upload,
+        &mut super::image_files::FileTransport::default(),
+    )
+    .is_err());
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup).unwrap().contains("i=490002"));
+}
+
+#[test]
+fn sec_r2_transmit_and_display_upload_gets_targeted_cleanup() {
+    let mut output = Vec::new();
+    super::frame_output::write_encoded_frame_with_graphics(
+        &mut output,
+        b"frame",
+        b"\x1b_Ga=T,i=490003;AAAA\x1b\\",
+    )
+    .unwrap();
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup)
+        .unwrap()
+        .contains("a=d,d=I,i=490003"));
+}
+
+#[test]
 fn composed_graphics_flush_failure_keeps_cleanup_obligation() {
     struct FlushBroken;
     impl std::io::Write for FlushBroken {
