@@ -104,40 +104,17 @@ fn git_watch_repair_symlink_refs_target_edits_and_retarget() {
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((2, 0)));
 }
 
-struct GitWatchEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl GitWatchEnv {
-    fn set(values: &[(&'static str, &std::path::Path)]) -> Self {
-        let previous = values
-            .iter()
-            .map(|(name, path)| {
-                let previous = std::env::var_os(name);
-                std::env::set_var(name, path);
-                (*name, previous)
-            })
-            .collect();
-        Self(previous)
-    }
-}
-
-impl Drop for GitWatchEnv {
-    fn drop(&mut self) {
-        for (name, previous) in self.0.drain(..) {
-            if let Some(previous) = previous {
-                std::env::set_var(name, previous);
-            } else {
-                std::env::remove_var(name);
-            }
-        }
-    }
-}
-
 #[test]
 fn git_watch_repair_user_config_fetch_refspec_and_missing_parent_creation() {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
+    let process_home = std::env::var_os("HOME");
+    let process_xdg = std::env::var_os("XDG_CONFIG_HOME");
     let home = GitWatchRepo::new("user-home");
     let xdg = home.0.join("xdg");
-    let _env = GitWatchEnv::set(&[("HOME", &home.0), ("XDG_CONFIG_HOME", &xdg)]);
+    let env = crate::environment::test_env();
+    env.set("HOME", &home.0);
+    env.set("XDG_CONFIG_HOME", &xdg);
+    assert_eq!(std::env::var_os("HOME"), process_home);
+    assert_eq!(std::env::var_os("XDG_CONFIG_HOME"), process_xdg);
     let repo = GitWatchRepo::new("user-config-fetch");
     repo.init();
     let initial = repo.git(&["rev-parse", "HEAD"]);
@@ -359,7 +336,6 @@ fn git_watch_repair_directory_symlink_retarget_and_missing_parent_migration() {
 
 #[test]
 fn git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo() {
-    let _guard = crate::config::test_config_env_lock().lock().unwrap();
     for in_flight in [false, true] {
         let repo = GitWatchRepo::new("demand-growth");
         repo.init();
@@ -389,14 +365,14 @@ fn git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo() {
             "[ui.sidebar.spaces]\nrows = [[\"branch\", \"git_status\"]]\n",
         )
         .unwrap();
-        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, config_path);
+        let process_config_path = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        let env = crate::environment::test_env();
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &config_path);
         let report = app.reload_config();
-        if let Some(previous) = previous {
-            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, previous);
-        } else {
-            std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
-        }
+        assert_eq!(
+            std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
+            process_config_path
+        );
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         // No repository mutation or native hint: actual reload must request the read.
         drive_git_watch_refresh(&mut app);

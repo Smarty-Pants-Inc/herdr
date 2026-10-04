@@ -342,7 +342,16 @@ fn git_ahead_behind_between(
     upstream_oid: &str,
 ) -> Option<(usize, usize)> {
     let range = format!("{head_oid}...{upstream_oid}");
-    let output = crate::noninteractive_process::command("git")
+    let mut command = crate::noninteractive_process::command("git");
+    #[cfg(test)]
+    for key in ["HOME", "XDG_CONFIG_HOME"] {
+        if let Some(value) = crate::environment::var_os(key) {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let output = command
         .arg("-C")
         .arg(cwd)
         .args(["rev-list", "--left-right", "--count", &range])

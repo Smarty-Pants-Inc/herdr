@@ -160,7 +160,24 @@ impl App {
             demand.branch = true;
         }
         self.git_identity_refresh_requested = false;
+        #[cfg(test)]
+        let git_test_homes =
+            ["HOME", "XDG_CONFIG_HOME"].map(|key| (key, crate::environment::var_os(key)));
         std::thread::spawn(move || {
+            // Test scopes do not implicitly cross threads. Pass only this
+            // worker's Git fixture homes explicitly; production is unchanged.
+            #[cfg(test)]
+            let _git_env = {
+                let env = crate::environment::test_env();
+                for (key, value) in git_test_homes {
+                    if let Some(value) = value {
+                        env.set(key, value);
+                    } else {
+                        env.remove(key);
+                    }
+                }
+                env
+            };
             let output =
                 refresh_workspace_git_statuses_with_cache_and_demand(workspaces, &cache, demand);
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
