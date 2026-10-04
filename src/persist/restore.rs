@@ -1078,12 +1078,24 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
 mod tests {
     use super::*;
 
+    // A valid path for recipe validation, not an executable to launch.
+    fn test_absolute_program() -> &'static str {
+        #[cfg(windows)]
+        {
+            r"C:\absolute\program"
+        }
+        #[cfg(not(windows))]
+        {
+            "/absolute/program"
+        }
+    }
+
     #[test]
     fn cold_restore_argv_selection_requires_mark_and_valid_recipe() {
         let (mut snapshot, _) = snapshot_with_saved_pane_history();
         let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
         pane.launch_argv = Some(vec![
-            "/absolute/program".into(),
+            test_absolute_program().into(),
             "a b".into(),
             "$(not shell)".into(),
         ]);
@@ -1095,7 +1107,7 @@ mod tests {
             Some(vec![]),
             Some(vec![String::new()]),
             Some(vec!["relative".into()]),
-            Some(vec!["/program".into(), "bad\0arg".into()]),
+            Some(vec![test_absolute_program().into(), "bad\0arg".into()]),
         ] {
             pane.launch_argv = invalid;
             assert!(cold_restore_argv(Some(pane)).is_none());
@@ -1111,7 +1123,8 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "session".into(),
         };
-        let argv = vec!["/program".to_string()];
+        let argv = vec![test_absolute_program().to_string()];
+        assert!(TerminalState::validate_cold_restore_argv(&argv).is_ok());
         let mut resumed = HashSet::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
@@ -1128,6 +1141,7 @@ mod tests {
         assert!(argv_after_native_restore_selection(Some(&argv), &disabled).is_some());
     }
 
+    // ponytail: Unix-only because this exercises real /bin/cat and shell executables.
     #[cfg(unix)]
     #[tokio::test]
     async fn cold_restore_argv_runtime_and_failed_launch_preserve_intent() {
@@ -1192,6 +1206,7 @@ mod tests {
         }
     }
 
+    // ponytail: Unix-only because this launches real /usr/bin/printf for literal argv output.
     #[cfg(unix)]
     #[tokio::test]
     async fn cold_restore_argv_direct_launch_keeps_argument_boundaries_and_literal_text() {
@@ -1241,10 +1256,20 @@ mod tests {
 
     #[tokio::test]
     async fn cold_restore_argv_missing_cwd_keeps_pane_and_recipe() {
+        let missing_cwd = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "herdr-missing-cold-argv-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(missing_cwd.is_absolute());
+        assert!(!missing_cwd.exists());
         let (mut snapshot, _) = snapshot_with_saved_pane_history();
         let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
-        pane.cwd = PathBuf::from("/herdr-definitely-missing-directory");
-        pane.launch_argv = Some(vec!["/absolute/program".into()]);
+        pane.cwd = missing_cwd;
+        pane.launch_argv = Some(vec![test_absolute_program().into()]);
         pane.cold_restore_argv = true;
         let saved_argv = pane.launch_argv.clone();
         let saved_cwd = pane.cwd.clone();
@@ -1927,7 +1952,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
         let cwd = std::env::current_dir().unwrap();
         let mut snapshot = SessionSnapshot {
@@ -1977,7 +2001,11 @@ mod tests {
         // Even a marked generic recipe must not override pending native resume
         // during either cold startup or a state-only live handoff.
         let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
-        pane.launch_argv = Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        pane.launch_argv = Some(vec![
+            test_absolute_program().into(),
+            "-c".into(),
+            "exit 0".into(),
+        ]);
         pane.cold_restore_argv = true;
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -2011,32 +2039,37 @@ mod tests {
             runtimes.is_empty(),
             "native agent restore should not spawn a fallback-size runtime during snapshot restore"
         );
-        let mut imports = HashMap::new();
-        let (_handoff_workspaces, handoff_terminals, handoff_runtimes) = restore_handoff(
-            &snapshot,
-            0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
-            &mut imports,
-            mpsc::channel(4).0,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-        )
-        .expect("handoff restore should preserve pending native agent resume");
-        let handoff_terminal = handoff_terminals
-            .values()
-            .next()
-            .expect("handoff restore should create terminal state");
-        assert!(
-            handoff_terminal.pending_agent_resume_plan.is_some(),
-            "handoff restore should preserve pending native agent resume intent"
-        );
-        assert!(
-            handoff_runtimes.is_empty(),
-            "handoff restore should not replace pending native agent resume with a shell runtime"
-        );
+        // ponytail: Only the handoff API is Unix-only; cold native selection above is portable.
+        #[cfg(unix)]
+        {
+            let mut imports = HashMap::new();
+            let (_handoff_workspaces, handoff_terminals, handoff_runtimes) = restore_handoff(
+                &snapshot,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .expect("handoff restore should preserve pending native agent resume");
+            let handoff_terminal = handoff_terminals
+                .values()
+                .next()
+                .expect("handoff restore should create terminal state");
+            assert!(
+                handoff_terminal.pending_agent_resume_plan.is_some(),
+                "handoff restore should preserve pending native agent resume intent"
+            );
+            assert!(
+                handoff_runtimes.is_empty(),
+                "handoff restore should not replace pending native agent resume with a shell runtime"
+            );
+        }
     }
 
+    // ponytail: Unix-only because restore_handoff uses runtime FDs; the recipe is not executed.
     #[tokio::test]
     #[cfg(unix)]
     async fn live_handoff_without_runtime_preserves_marked_recipe() {
@@ -2048,7 +2081,7 @@ mod tests {
             .unwrap();
         let cwd = pane.cwd.clone();
         let argv = vec![
-            "/bin/sh".to_string(),
+            test_absolute_program().to_string(),
             "-c".to_string(),
             "exit 0".to_string(),
         ];
@@ -2301,7 +2334,8 @@ mod tests {
     }
 
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let cwd = std::env::current_dir().unwrap();
+        assert!(cwd.is_absolute());
         let mut panes = HashMap::new();
         panes.insert(
             0,

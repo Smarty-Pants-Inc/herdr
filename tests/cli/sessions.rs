@@ -660,6 +660,8 @@ fn server_stop_then_restart_restores_pane_history() {
     cleanup_spawned_herdr(restarted, base);
 }
 
+// ponytail: these disk-replay tests need Linux snapshot trust and real Unix
+// scripts; macOS and Windows disk marks fail closed in persist::io tests.
 #[cfg(target_os = "linux")]
 #[test]
 fn cold_restore_replays_only_explicitly_authorized_argv_panes() {

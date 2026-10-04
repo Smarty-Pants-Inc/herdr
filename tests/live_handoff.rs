@@ -1066,6 +1066,7 @@ fn live_handoff_preserves_installed_plugins() {
 
 /// Argv startup is distinct from running a foreground command in a shell:
 /// live import must take the existing PTY, never the cold replay branch.
+// ponytail: real Unix scripts and PTY handoff require the Unix backend, not Windows.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn live_handoff_preserves_argv_process_without_relaunch() {
@@ -1309,6 +1310,8 @@ done
 
 /// A genuine failed cold restore has state but no exported runtime FD. Neither
 /// successful preparation nor a rejected preparation may retry that recipe.
+// ponytail: these cold-replay setup tests need Linux disk trust and /proc PTY
+// probes; macOS and Windows refuse disk argv marks in persist::io tests.
 #[cfg(all(debug_assertions, target_os = "linux"))]
 #[test]
 fn live_handoff_preserves_unavailable_argv_without_replay() {
