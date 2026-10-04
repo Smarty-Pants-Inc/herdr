@@ -1003,6 +1003,142 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn portable_darwin_chronology_sequences_feed_actual_attribution_and_guard() {
+        for sequence in 0..=15 {
+            let observation = crate::platform::test_server_chronology_sequence(sequence);
+            let expected = match sequence {
+                0 | 2 => Some(true),
+                1 => Some(false),
+                _ => None,
+            };
+            assert_eq!(observation, expected, "chronology sequence {sequence}");
+            exercise_server_ancestry_sequence(observation);
+        }
+    }
+
+    #[tokio::test]
+    async fn marker_free_outside_proof_precedes_missing_roots_but_failed_evidence_refuses_delivery()
+    {
+        let mut fixture = attributed_agent_fixture();
+        let context = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..attributed_context()
+        };
+        let peer = context.local_peer_identity.expect("live caller");
+        // An older-than-server witness proves outside ancestry without requiring
+        // visibility of any pane root. Reached-server is not that exemption.
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, pane)
+                .expect("runtime")
+                .test_set_child_pid(0);
+        }
+        let request = Request {
+            id: "outside-missing-roots".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "ordinary outside".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        for sequence in [0, 1, 3] {
+            let observation = crate::platform::test_server_chronology_sequence(sequence);
+            crate::platform::with_server_ancestry_for_test(peer, observation, || {
+                let response = fixture
+                    .app
+                    .handle_api_request_with_context(request.clone(), context);
+                if observation == Some(true) {
+                    assert_ok(&response);
+                    assert_eq!(
+                        fixture
+                            .target_rx
+                            .try_recv()
+                            .expect("default ordinary delivery"),
+                        Bytes::from_static(b"ordinary outside")
+                    );
+                } else {
+                    assert_unknown(&response);
+                }
+                assert!(fixture.source_rx.try_recv().is_err());
+                assert!(fixture.target_rx.try_recv().is_err());
+            });
+        }
+        // Captured markers are checked before outside/age evidence. Neither a
+        // marked orphan nor unreadable markers may take the ordinary exemption.
+        crate::platform::with_server_ancestry_for_test(
+            peer,
+            crate::platform::test_server_chronology_sequence(0),
+            || {
+                for marker in [
+                    crate::platform::PeerPaneOrigin::HasPane,
+                    crate::platform::PeerPaneOrigin::Unknown,
+                ] {
+                    let marked = ApiRequestContext {
+                        local_peer_pane_origin: marker,
+                        ..context
+                    };
+                    assert_unknown(
+                        &fixture
+                            .app
+                            .handle_api_request_with_context(request.clone(), marked),
+                    );
+                    assert!(fixture.source_rx.try_recv().is_err());
+                    assert!(fixture.target_rx.try_recv().is_err());
+                    let mut explicit = request.clone();
+                    if let Method::PaneSendText(params) = &mut explicit.method {
+                        params.allow_cross_pane = true;
+                    }
+                    assert_ok(
+                        &fixture
+                            .app
+                            .handle_api_request_with_context(explicit, marked),
+                    );
+                    assert_eq!(
+                        fixture
+                            .target_rx
+                            .try_recv()
+                            .expect("explicit marked opt-in"),
+                        Bytes::from_static(b"ordinary outside")
+                    );
+                }
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_peer_cannot_use_outside_age_exemption_in_actual_guard() {
+        let mut fixture = attributed_agent_fixture();
+        let live = crate::platform::process_identity(std::process::id()).expect("live caller");
+        let stale = crate::platform::ProcessIdentity {
+            start_time: live.start_time.wrapping_add(1),
+            ..live
+        };
+        let context = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..ApiRequestContext::capture(Some(stale))
+        };
+        crate::platform::with_server_ancestry_for_test(stale, Some(true), || {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "stale-outside-proof".into(),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: fixture.target_pane_id.clone(),
+                        text: "blocked".into(),
+                        allow_cross_pane: false,
+                    }),
+                },
+                context,
+            );
+            assert_unknown(&response);
+            assert!(fixture.source_rx.try_recv().is_err());
+            assert!(fixture.target_rx.try_recv().is_err());
+        });
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_snapshot_sequences_feed_actual_attribution_and_guard() {
@@ -1017,6 +1153,150 @@ mod tests {
             assert_eq!(observation, expected, "sequence {sequence}");
             exercise_server_ancestry_sequence(observation);
         }
+    }
+
+    // This in-process App fixture makes the caller a child of the server itself.
+    // Darwin's outside-server path is covered by the separate-server api_ping
+    // integrations, not by treating this different topology as outside.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_accepted_ordinary_child_requires_default_guard_delivery() {
+        use std::io::BufRead;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixListener;
+        use std::process::{Command, Stdio};
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut fixture = attributed_agent_fixture();
+        let mut roots = Vec::new();
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
+            let root = OwnedChild(detached_sleep_child());
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, pane)
+                .expect("runtime")
+                .test_set_child_pid(root.0.id());
+            roots.push(root);
+        }
+        struct OwnedDirectory(std::path::PathBuf);
+        impl Drop for OwnedDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        use std::os::unix::fs::DirBuilderExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let directory =
+            std::path::PathBuf::from(format!("/tmp/hdg-{}-{nonce}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .expect("exclusive short native socket directory");
+        let directory = OwnedDirectory(directory);
+        let socket = directory.0.join("s");
+        let listener = UnixListener::bind(&socket).expect("native listener");
+        listener.set_nonblocking(true).expect("bounded accept");
+        let request = Request {
+            id: "darwin-real-accepted-caller".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "native ordinary".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall((sys.argv[2]+'\\n').encode()); sys.stdin.readline()",
+        ])
+            .arg(&socket)
+            .arg(serde_json::to_string(&request).expect("child request"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        for key in [
+            "HERDR_ENV",
+            "HERDR_PANE_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_TAB_ID",
+        ] {
+            command.env_remove(key);
+        }
+        let mut caller = OwnedChild(command.spawn().expect("native socket caller"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(caller.0.try_wait().expect("caller liveness").is_none());
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "native accept deadline"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("native accept: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("blocking request stream");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("request deadline");
+        // Match the production accept path: capture generation-bound transport
+        // identity first, then initial marker provenance. Never fall back to PID.
+        let context = ApiRequestContext::capture(crate::platform::local_socket_peer_identity(
+            stream.as_raw_fd(),
+        ));
+        let peer = context
+            .local_peer_identity
+            .expect("native accepted transport identity");
+        assert_eq!(peer.pid, caller.0.id());
+        assert_eq!(crate::platform::process_identity(peer.pid), Some(peer));
+        assert_eq!(
+            context.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::Absent
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::ServerAncestry::ReachedServer
+        );
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .expect("native request bytes");
+        let request: Request = serde_json::from_str(&line).expect("native child request JSON");
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Ordinary
+        );
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(request, context),
+        );
+        assert_eq!(
+            fixture
+                .target_rx
+                .try_recv()
+                .expect("default native ordinary delivery"),
+            Bytes::from_static(b"native ordinary")
+        );
+        assert!(fixture.source_rx.try_recv().is_err());
+        assert_eq!(crate::platform::process_identity(peer.pid), Some(peer));
+        assert_eq!(roots.len(), 2, "both pane roots retained through dispatch");
     }
 
     #[cfg(windows)]
@@ -1709,6 +1989,14 @@ finally:
         assert_eq!(
             fixture.app.input_origin_for_context(context),
             InputOrigin::Ordinary
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            crate::platform::process_identity_server_ancestry(
+                context.local_peer_identity.expect("native Darwin caller")
+            ),
+            crate::platform::ServerAncestry::ReachedServer,
+            "a real ordinary child reaches the server; it is not an outside-proof seam"
         );
         let request = Request {
             id: "outside".into(),

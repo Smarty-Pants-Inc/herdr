@@ -1025,6 +1025,17 @@ pub(crate) fn parent_process_identity(
     )
 }
 
+/// Prove that a live peer is not descended from this server using the shared,
+/// chronology-checked walker. Darwin supplies only the pinned process identity
+/// and parent edge observations; the policy and bounded traversal live in
+/// `platform::mod` so Linux tests exercise the same algorithm.
+pub(crate) fn process_identity_outside_server_ancestry(
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let server = process_identity(std::process::id())?;
+    super::observe_outside_server_ancestry(peer, server, process_identity, parent_process_identity)
+}
+
 fn process_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -1305,6 +1316,50 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_socket_captures_original_identity_and_readable_initial_environment() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Darwin's sun_path is short; the native runner's TMPDIR can already
+        // consume most of it. Keep this owned socket fixture bounded.
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let path = std::path::Path::new("/tmp")
+            .join(format!("herdr-peer-{}-{suffix}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).expect("bind test listener");
+        let _client = UnixStream::connect(&path).expect("connect real test socket");
+        let (accepted, _) = listener.accept().expect("accept real test socket");
+        std::fs::remove_file(&path).expect("remove test socket pathname");
+
+        let original = process_identity(std::process::id()).expect("original process pin");
+        let peer = local_socket_peer_identity_platform(accepted.as_raw_fd())
+            .expect("accepted socket audit-token capture");
+        assert_eq!(peer, original);
+        // Exercise the actual KERN_PROCARGS2 read/framing/parser, not a numeric
+        // caller-context seam. Do not log environment values or assume this
+        // runner has no inherited pane markers.
+        assert!(process_initial_environment(peer).is_some());
+        assert_eq!(process_identity(peer.pid), Some(original));
+    }
+
+    #[test]
+    fn live_ordinary_child_reaches_this_server() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn ordinary child");
+        let identity = process_identity(child.id()).expect("child identity");
+        assert_eq!(
+            process_identity_outside_server_ancestry(identity),
+            Some(false)
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn initial_environment_parser_distinguishes_absence_and_malformed_data() {

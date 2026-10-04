@@ -206,8 +206,8 @@ fn valid_pane_marker(pane: &[u8]) -> bool {
         && pane.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-/// Windows can prove a process is outside this server's descendants before pane
-/// roots are inspected. Other platforms keep their existing attribution path.
+/// Windows and Darwin can prove a process is outside this server's descendants
+/// before pane roots are inspected. Other platforms keep their attribution path.
 // Individual variants are constructed only by their applicable platform (or tests).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,20 +231,76 @@ pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerA
     }
     #[cfg(windows)]
     return server_ancestry_observation(windows::process_identity_outside_server_ancestry(peer));
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return server_ancestry_observation(macos::process_identity_outside_server_ancestry(peer));
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = peer;
         ServerAncestry::NotApplicable
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
     match observation {
         Some(true) => ServerAncestry::Outside,
         Some(false) => ServerAncestry::ReachedServer,
         None => ServerAncestry::Unknown,
     }
+}
+
+/// Darwin's bounded chronology proof, shared with deterministic host-independent
+/// tests. A strictly older live ancestor cannot descend from the pinned server;
+/// equal timestamps are not a negative proof. Every observation remains tied to
+/// its original process generation, including successful terminal observations.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn observe_outside_server_ancestry(
+    peer: ProcessIdentity,
+    server: ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+    parent_of: impl Fn(ProcessIdentity) -> Option<ProcessIdentity>,
+) -> Option<bool> {
+    const MAX_DEPTH: usize = 32;
+    let mut current = peer;
+    let mut seen = Vec::with_capacity(MAX_DEPTH + 1);
+    let endpoints_live = || {
+        peer.pid != 0
+            && server.pid != 0
+            && identity_of(peer.pid) == Some(peer)
+            && identity_of(server.pid) == Some(server)
+    };
+    for _ in 0..=MAX_DEPTH {
+        if !endpoints_live()
+            || current.pid == 0
+            || identity_of(current.pid) != Some(current)
+            || seen.contains(&current)
+        {
+            return None;
+        }
+        seen.push(current);
+        let terminal = if current == server {
+            Some(false)
+        } else if current.start_time < server.start_time {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(outside) = terminal {
+            return (endpoints_live() && identity_of(current.pid) == Some(current))
+                .then_some(outside);
+        }
+        let parent = parent_of(current)?;
+        if !endpoints_live()
+            || identity_of(current.pid) != Some(current)
+            || parent.pid == 0
+            || parent.start_time > current.start_time
+            || identity_of(parent.pid) != Some(parent)
+        {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 /// Identity-aware boundary around the numeric OS session observation.
@@ -438,6 +494,46 @@ mod pane_origin_tests {
     }
 
     #[test]
+    fn server_ancestry_observations_keep_failed_evidence_unknown() {
+        assert_eq!(
+            server_ancestry_observation(Some(true)),
+            ServerAncestry::Outside
+        );
+        assert_eq!(
+            server_ancestry_observation(Some(false)),
+            ServerAncestry::ReachedServer
+        );
+        assert_eq!(server_ancestry_observation(None), ServerAncestry::Unknown);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn platforms_without_server_ancestry_keep_not_applicable() {
+        assert_eq!(
+            process_identity_server_ancestry(ProcessIdentity {
+                pid: 0,
+                start_time: 0
+            }),
+            ServerAncestry::NotApplicable
+        );
+    }
+
+    #[test]
+    fn scoped_server_observation_rejects_stale_peer_even_with_positive_outside_proof() {
+        let live = process_identity(std::process::id()).expect("live peer");
+        let stale = ProcessIdentity {
+            start_time: live.start_time.wrapping_add(1),
+            ..live
+        };
+        with_server_ancestry_for_test(stale, Some(true), || {
+            assert_eq!(
+                process_identity_server_ancestry(stale),
+                ServerAncestry::Unknown
+            );
+        });
+    }
+
+    #[test]
     fn scoped_server_observation_is_peer_keyed_and_restores_after_panic() {
         let peer = process_identity(std::process::id()).expect("test process");
         let other = ProcessIdentity {
@@ -460,6 +556,165 @@ mod pane_origin_tests {
         });
         assert!(panic.is_err());
         assert_eq!(process_identity_server_ancestry(peer), before);
+    }
+}
+
+#[cfg(test)]
+pub(crate) use server_chronology_tests::test_server_chronology_sequence;
+
+#[cfg(test)]
+mod server_chronology_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    fn identity(pid: u32, start_time: u64) -> ProcessIdentity {
+        ProcessIdentity { pid, start_time }
+    }
+
+    // Feed the production Darwin walker, not a parallel test-only algorithm.
+    // The guard tests consume these same observations on Linux and Darwin.
+    pub(crate) fn test_server_chronology_sequence(sequence: u8) -> Option<bool> {
+        let server = identity(100, 20);
+        let peer = identity(200, 40);
+        let mut identities = HashMap::from([
+            (100, server),
+            (200, peer),
+            (201, identity(201, 30)),
+            (202, identity(202, 10)),
+        ]);
+        let mut parents = HashMap::from([(200, 201), (201, 202)]);
+        let invalid = Cell::new(None);
+        let older_reads = Cell::new(0);
+        match sequence {
+            0 | 7..=11 | 14..=15 => {}
+            1 => {
+                parents.insert(200, 100);
+            }
+            2 => {
+                identities.insert(201, identity(201, 20));
+            }
+            3 => {
+                parents.remove(&201);
+            }
+            4 => {
+                identities.insert(201, identity(201, 50));
+            }
+            5 => {
+                parents.insert(200, 200);
+            }
+            6 => {
+                identities.insert(201, identity(201, 40));
+                parents.insert(201, 200);
+            }
+            12 => {
+                for pid in 200..=234 {
+                    identities.insert(pid, identity(pid, 40));
+                    parents.insert(pid, pid + 1);
+                }
+            }
+            13 => {
+                identities.insert(201, identity(201, 20));
+                parents.remove(&201);
+            }
+            _ => panic!("unknown chronology fixture"),
+        }
+        observe_outside_server_ancestry(
+            peer,
+            server,
+            |pid| {
+                if invalid.get() == Some(pid) {
+                    return None;
+                }
+                if pid == 202 {
+                    older_reads.set(older_reads.get() + 1);
+                    // Invalidate a terminal witness or endpoint after its live
+                    // lookup, before the successful proof's final validation.
+                    match (sequence, older_reads.get()) {
+                        (11, 2) => invalid.set(Some(202)),
+                        (14, 2) => invalid.set(Some(200)),
+                        (15, 2) => invalid.set(Some(100)),
+                        _ => {}
+                    }
+                }
+                identities.get(&pid).copied()
+            },
+            |child| {
+                if child.pid == 201 {
+                    match sequence {
+                        7 => invalid.set(Some(200)),
+                        8 => invalid.set(Some(100)),
+                        9 => invalid.set(Some(201)),
+                        10 => invalid.set(Some(202)),
+                        _ => {}
+                    }
+                }
+                parents
+                    .get(&child.pid)
+                    .and_then(|pid| identities.get(pid))
+                    .copied()
+            },
+        )
+    }
+
+    #[test]
+    fn darwin_chronology_older_witness_reached_server_and_equal_time_have_distinct_proofs() {
+        assert_eq!(test_server_chronology_sequence(0), Some(true));
+        assert_eq!(test_server_chronology_sequence(1), Some(false));
+        assert_eq!(test_server_chronology_sequence(2), Some(true));
+        assert_eq!(
+            test_server_chronology_sequence(13),
+            None,
+            "equal age is not outside proof"
+        );
+    }
+
+    #[test]
+    fn darwin_chronology_incomplete_newer_cyclic_and_overdepth_walks_are_unknown() {
+        for sequence in [3, 4, 5, 6, 12] {
+            assert_eq!(
+                test_server_chronology_sequence(sequence),
+                None,
+                "sequence {sequence}"
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_chronology_revalidates_peer_server_current_parent_and_success_witness() {
+        for sequence in [7, 8, 9, 10, 11, 14, 15] {
+            assert_eq!(
+                test_server_chronology_sequence(sequence),
+                None,
+                "sequence {sequence}"
+            );
+        }
+    }
+
+    #[test]
+    fn darwin_chronology_zero_and_stale_endpoints_are_unknown() {
+        let server = identity(100, 20);
+        let peer = identity(200, 10);
+        for (peer, server) in [
+            (identity(0, 10), server),
+            (peer, identity(0, 20)),
+            (identity(200, 11), server),
+            (peer, identity(100, 21)),
+        ] {
+            assert_eq!(
+                observe_outside_server_ancestry(
+                    peer,
+                    server,
+                    |pid| match pid {
+                        100 => Some(identity(100, 20)),
+                        200 => Some(identity(200, 10)),
+                        _ => None,
+                    },
+                    |_| panic!("invalid endpoint must not walk")
+                ),
+                None
+            );
+        }
     }
 }
 
