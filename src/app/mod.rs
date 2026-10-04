@@ -1140,10 +1140,12 @@ mod tests {
         app.terminal_runtimes.insert(terminal.clone(), runtime);
         assert!(!app.api_input_log.exists());
 
+        // This synthetic channel fixture deliberately opts in per request to isolate
+        // terminal identity, log isolation and redaction, not caller attribution.
         let rejected = serde_json::from_value(serde_json::json!({
             "id": "reject", "method": "pane.send_input_guarded",
             "params": {"pane_id": public_pane, "expected_terminal": "term_unknown",
-                "text": "secret prompt", "keys": ["Enter"]},
+                "text": "secret prompt", "keys": ["Enter"], "allow_cross_pane": true},
         }))
         .unwrap();
         let error: ErrorResponse = serde_json::from_str(&app.handle_api_request(rejected)).unwrap();
@@ -1155,7 +1157,7 @@ mod tests {
         let matched = serde_json::from_value(serde_json::json!({
             "id": "match", "method": "pane.send_input_guarded",
             "params": {"pane_id": public_pane, "expected_terminal": terminal.to_string(),
-                "text": "secret prompt", "keys": ["Enter"]},
+                "text": "secret prompt", "keys": ["Enter"], "allow_cross_pane": true},
         }))
         .unwrap();
         let success: SuccessResponse =
@@ -2943,7 +2945,8 @@ mod tests {
                 expected_terminal: None,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
-                allow_cross_pane: false,
+                // Synthetic API caller deliberately opts in to reach availability checks.
+                allow_cross_pane: true,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2987,7 +2990,8 @@ mod tests {
                 expected_terminal: None,
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
-                allow_cross_pane: false,
+                // Explicit API opt-in isolates enqueue rollback/retry from origin policy.
+                allow_cross_pane: true,
             }),
         };
         let response = app.handle_api_request(request());

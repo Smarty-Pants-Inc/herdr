@@ -235,7 +235,14 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
 }
 
 /// Unsupported platform stub.
-pub fn parent_process_id(_pid: u32) -> Option<u32> {
+pub(crate) fn process_identity(_pid: u32) -> Option<crate::platform::ProcessIdentity> {
+    None
+}
+
+/// Unsupported platform stub.
+pub(crate) fn parent_process_identity(
+    _identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
     None
 }
 
