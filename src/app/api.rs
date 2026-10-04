@@ -1154,6 +1154,9 @@ impl App {
             }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
+            Method::PaneSwapProjectChecked(params) => {
+                return self.handle_pane_swap_project_checked(request.id, params)
+            }
             Method::PaneMove(params) => {
                 if params.allow_project_change {
                     return responses::encode_error(request.id, "project_change_capability_required",
@@ -1171,6 +1174,9 @@ impl App {
             }
             Method::LayoutExport(params) => return self.handle_layout_export(request.id, params),
             Method::LayoutApply(params) => return self.handle_layout_apply(request.id, params),
+            Method::LayoutApplyProjectChecked(params) => {
+                return self.handle_layout_apply_project_checked(request.id, params)
+            }
             Method::LayoutSetSplitRatio(params) => {
                 return self.handle_layout_set_split_ratio(request.id, params);
             }

@@ -17,6 +17,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "command.invoke",
     "integration.install",
     "integration.list",
+    "layout.apply_project_checked",
     "layout.set_split_ratio",
     "pane.clear",
     "pane.close",
@@ -36,6 +37,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.selection.read",
     "pane.split",
     "pane.swap",
+    "pane.swap_project_checked",
     "pane.zoom",
     "product_announcement.dismiss",
     "release_notes.dismiss",
@@ -307,6 +309,8 @@ mod tests {
         // Additive, safety-guaranteed topology method, not a generation-1 change.
         assert!(actual.remove("pane.move_project_checked").is_some());
         assert!(actual.remove("tab.move_project_checked").is_some());
+        assert!(actual.remove("pane.swap_project_checked").is_some());
+        assert!(actual.remove("layout.apply_project_checked").is_some());
 
         assert_eq!(
             actual, expected,

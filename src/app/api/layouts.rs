@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use ratatui::layout::Direction;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutDescription, LayoutExportParams,
-    LayoutNode, LayoutPane, LayoutSetSplitRatioParams, ResponseResult, SplitDirection,
+    EventData, EventEnvelope, EventKind, LayoutApplyParams, LayoutApplyProjectCheckedParams,
+    LayoutDescription, LayoutExportParams, LayoutNode, LayoutPane, LayoutSetSplitRatioParams,
+    ResponseResult, SplitDirection,
 };
 use crate::app::{App, Mode};
 use crate::layout::{Node, PaneId};
@@ -32,6 +33,23 @@ impl App {
     }
 
     pub(super) fn handle_layout_apply(&mut self, id: String, params: LayoutApplyParams) -> String {
+        self.handle_layout_apply_checked(id, params, false)
+    }
+
+    pub(super) fn handle_layout_apply_project_checked(
+        &mut self,
+        id: String,
+        params: LayoutApplyProjectCheckedParams,
+    ) -> String {
+        self.handle_layout_apply_checked(id, params.params, params.allow_project_change)
+    }
+
+    fn handle_layout_apply_checked(
+        &mut self,
+        id: String,
+        params: LayoutApplyParams,
+        allow_project_change: bool,
+    ) -> String {
         let replace_target = match params.tab_id.as_deref() {
             Some(tab_id) => match self.parse_tab_id(tab_id) {
                 Some(target) => Some(target),
@@ -101,6 +119,22 @@ impl App {
         let command = match layout_command(root_leaf) {
             Ok(command) => command,
             Err(message) => return encode_error(id, "invalid_layout", message),
+        };
+
+        // New shells are appended and have no existing Pi session. Excluding
+        // the replaced tab therefore predicts the surviving first Pi exactly,
+        // without spawning any PTYs or destroying the old tab first.
+        let mut projected = self.project_topology();
+        if let Some((target_ws_idx, target_tab_idx)) = replace_target {
+            projected[target_ws_idx].tabs.remove(target_tab_idx);
+        }
+        let project_changes = match self.precheck_project_change(
+            &projected,
+            allow_project_change,
+            "layout.apply_project_checked",
+        ) {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
         };
 
         let created = {
@@ -215,6 +249,7 @@ impl App {
         let Some(layout) = self.layout_description(ws_idx, new_tab_idx) else {
             return encode_error(id, "layout_apply_failed", "new layout unavailable");
         };
+        Self::log_project_changes(&project_changes);
         encode_success(id, ResponseResult::LayoutApply { layout })
     }
 

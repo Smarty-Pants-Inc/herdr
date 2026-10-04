@@ -291,8 +291,12 @@ impl App {
     }
 
     pub(super) fn log_project_changes(changes: &[ProjectChange]) {
+        Self::log_project_changes_with_context(changes, "topology command");
+    }
+
+    pub(super) fn log_project_changes_with_context(changes: &[ProjectChange], context: &str) {
         if !changes.is_empty() {
-            tracing::info!(changes = %changes.iter().map(ProjectChange::description)
+            tracing::info!(context, changes = %changes.iter().map(ProjectChange::description)
                 .collect::<Vec<_>>().join("; "), "intentional project change allowed");
         }
     }

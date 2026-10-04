@@ -12,9 +12,9 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapProjectCheckedParams,
+    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode,
+    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -765,6 +765,23 @@ impl App {
     }
 
     pub(super) fn handle_pane_swap(&mut self, id: String, params: PaneSwapParams) -> String {
+        self.handle_pane_swap_checked(id, params, false)
+    }
+
+    pub(super) fn handle_pane_swap_project_checked(
+        &mut self,
+        id: String,
+        params: PaneSwapProjectCheckedParams,
+    ) -> String {
+        self.handle_pane_swap_checked(id, params.params, params.allow_project_change)
+    }
+
+    fn handle_pane_swap_checked(
+        &mut self,
+        id: String,
+        params: PaneSwapParams,
+        allow_project_change: bool,
+    ) -> String {
         let directional = params.direction.is_some();
         let explicit = params.source_pane_id.is_some() || params.target_pane_id.is_some();
         if directional == explicit {
@@ -866,6 +883,24 @@ impl App {
         let mut changed = false;
         if reason.is_none() {
             if let Some(target_pane_id) = target_pane_id {
+                // Swapping leaves changes collect_agent_infos order even within
+                // one tab, and can change every survivor's first-Pi project.
+                let mut projected = self.project_topology();
+                for pane in &mut projected[ws_idx].tabs[tab_idx].panes {
+                    if *pane == source_pane_id {
+                        *pane = target_pane_id;
+                    } else if *pane == target_pane_id {
+                        *pane = source_pane_id;
+                    }
+                }
+                let project_changes = match self.precheck_project_change(
+                    &projected,
+                    allow_project_change,
+                    "pane.swap_project_checked",
+                ) {
+                    Ok(changes) => changes,
+                    Err(message) => return encode_error(id, "project_change_refused", message),
+                };
                 let previous_focus = self.state.current_pane_focus_target();
                 if let Some(tab) = self
                     .state
@@ -876,6 +911,7 @@ impl App {
                     changed = tab.layout.swap_panes(source_pane_id, target_pane_id);
                     tab.layout.focus_pane(source_pane_id);
                     if changed {
+                        Self::log_project_changes(&project_changes);
                         self.state.switch_workspace_tab(ws_idx, tab_idx);
                         self.state
                             .record_pane_focus_change(previous_focus, ws_idx, source_pane_id);
@@ -1989,6 +2025,16 @@ impl App {
                 "closing this pane would close a worktree group",
             ));
         }
+        let mut projected = self.project_topology();
+        projected[ws_idx].remove_pane(pane_id);
+        if projected[ws_idx].tabs.is_empty() {
+            projected.remove(ws_idx);
+        }
+        // Explicit close intentionally permits re-rooting only the sessions
+        // that survive. Plugin pane.close also uses this shared helper.
+        let project_changes = self
+            .precheck_project_change(&projected, true, "pane.close")
+            .map_err(|message| encode_error(id.clone(), "project_change_refused", message))?;
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {
@@ -2032,6 +2078,7 @@ impl App {
             }
         }
 
+        Self::log_project_changes_with_context(&project_changes, "pane.close (intentional close)");
         Ok(())
     }
 

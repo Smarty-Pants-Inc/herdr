@@ -63,6 +63,74 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn project_checked_swap_and_layout_requests_use_flattened_params() {
+    for (method, legacy_params) in [
+        (
+            "pane.swap_project_checked",
+            serde_json::json!({ "source_pane_id": "p1", "target_pane_id": "p2" }),
+        ),
+        (
+            "layout.apply_project_checked",
+            serde_json::json!({ "tab_id": "t1", "root": { "type": "pane", "pane_id": "p1" } }),
+        ),
+    ] {
+        for allow in [None, Some(false), Some(true)] {
+            let mut params = legacy_params.clone();
+            if let Some(allow) = allow {
+                params["allow_project_change"] = serde_json::json!(allow);
+            }
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "id": "checked", "method": method, "params": params,
+            }))
+            .unwrap();
+            let permission = match &request.method {
+                Method::PaneSwapProjectChecked(params) => params.allow_project_change,
+                Method::LayoutApplyProjectChecked(params) => params.allow_project_change,
+                _ => panic!("unexpected checked method"),
+            };
+            assert_eq!(permission, allow.unwrap_or(false));
+            assert_eq!(crate::api::api_method_name(&request.method), method);
+            assert!(crate::api::request_changes_ui(&request));
+            assert!(crate::server::client_commands::supports_client_shell_method_name(method));
+            let serialized = serde_json::to_value(&request).unwrap();
+            assert_eq!(serialized["method"], method);
+            assert!(serialized["params"].get("params").is_none());
+            for (key, value) in legacy_params.as_object().unwrap() {
+                assert_eq!(&serialized["params"][key], value);
+            }
+            assert_eq!(serialized["params"]["allow_project_change"], permission);
+            assert_eq!(
+                serde_json::from_value::<Request>(serialized).unwrap(),
+                request
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_swap_and_layout_params_do_not_advertise_project_permission() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(PaneSwapParams)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(LayoutApplyParams)).unwrap(),
+    ] {
+        assert!(schema["properties"].get("allow_project_change").is_none());
+    }
+    let swap = serde_json::to_value(PaneSwapParams::default()).unwrap();
+    assert_eq!(swap, serde_json::json!({}));
+    let layout: LayoutApplyParams = serde_json::from_value(serde_json::json!({
+        "root": { "type": "pane", "pane_id": "p1" }
+    }))
+    .unwrap();
+    let layout = serde_json::to_value(layout).unwrap();
+    assert_eq!(
+        layout,
+        serde_json::json!({
+            "focus": false, "root": { "type": "pane", "pane_id": "p1" }
+        })
+    );
+}
+
+#[test]
 fn workspace_close_group_intent_defaults_false_and_round_trips() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "id": "close",

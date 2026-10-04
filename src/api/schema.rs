@@ -173,6 +173,9 @@ pub enum Method {
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
     PaneSwap(PaneSwapParams),
+    /// Project-checked swap; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "pane.swap_project_checked")]
+    PaneSwapProjectChecked(PaneSwapProjectCheckedParams),
     #[serde(rename = "pane.move")]
     PaneMove(PaneMoveParams),
     /// Project-checked move; its distinct name prevents unsafe old-server fallback.
@@ -188,6 +191,9 @@ pub enum Method {
     LayoutExport(LayoutExportParams),
     #[serde(rename = "layout.apply")]
     LayoutApply(LayoutApplyParams),
+    /// Project-checked apply; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "layout.apply_project_checked")]
+    LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams),
     #[serde(rename = "layout.set_split_ratio")]
     LayoutSetSplitRatio(LayoutSetSplitRatioParams),
     #[serde(rename = "pane.neighbor")]

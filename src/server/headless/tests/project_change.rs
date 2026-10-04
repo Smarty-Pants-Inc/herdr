@@ -976,3 +976,730 @@ fn project_change_checked_schemas_default_to_deny_without_changing_legacy_tab_sh
         assert!(crate::server::client_commands::supports_client_shell_method_name(method));
     }
 }
+
+// The reported fallback is first Pi in tab/layout-leaf order, NOT root_pane
+// or TerminalState.cwd. Real processes are exercised by .local/r1-proof.sh;
+// these tests supply the same detected Pi/session and foreground-cwd evidence.
+fn two_pi_fallback_server(
+    split: Option<ratatui::layout::Direction>,
+    same_project: bool,
+) -> (
+    HeadlessServer,
+    crate::layout::PaneId,
+    crate::layout::PaneId,
+    String,
+    String,
+) {
+    let mut server = project_server();
+    server.app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+    let first = root(&server, 0, 0);
+    let next = match split {
+        Some(direction) => server.app.state.workspaces[0].test_split(direction),
+        None => root(&server, 0, 1),
+    };
+    server.app.state.ensure_test_terminals();
+    let a = std::env::temp_dir().join("r1-first-pi-project-a");
+    let b = if same_project {
+        a.clone()
+    } else {
+        std::env::temp_dir().join("r1-next-pi-project-b")
+    };
+    cwd(&mut server, first, &a);
+    cwd(&mut server, next, &b);
+    let first_session = session(&mut server, first, "r1-first-pi");
+    let next_session = session(&mut server, next, "r1-next-pi");
+    // Deliberately stale/equal cached cwd: policy must read foreground cwd.
+    for pane in [first, next] {
+        let id = server.app.state.workspaces[0]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        server.app.state.terminals.get_mut(&id).unwrap().cwd =
+            std::env::temp_dir().join("r1-unrelated-cached-shell-cwd");
+    }
+    assert!(server.app.state.workspaces[0].worktree_space().is_none());
+    (server, first, next, first_session, next_session)
+}
+
+fn capture_project_logs(action: impl FnOnce()) -> String {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || LogWriter(writer.clone()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, action);
+    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    output
+}
+
+fn assert_project_audit(logs: &str, count: usize, sessions: &[&str]) {
+    let lines: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("intentional project change allowed"))
+        .collect();
+    assert_eq!(lines.len(), count, "{logs}");
+    assert_eq!(
+        logs.matches("intentional project change allowed").count(),
+        count,
+        "{logs}"
+    );
+    if count > 0 {
+        for expected in sessions.iter().copied().chain([
+            "Path",
+            "r1-first-pi-project-a",
+            "r1-next-pi-project-b",
+        ]) {
+            assert!(lines[0].contains(expected), "missing {expected}: {logs}");
+        }
+    }
+}
+
+fn assert_attached_session(server: &HeadlessServer, pane: crate::layout::PaneId, path: &str) {
+    let terminal = server.app.state.workspaces[0].terminal_id(pane).unwrap();
+    assert_eq!(
+        server.app.state.terminals[terminal]
+            .agent_session_reference()
+            .unwrap()
+            .value,
+        path
+    );
+    assert!(server.app.terminal_runtimes.get(terminal).is_some());
+}
+
+#[tokio::test]
+async fn project_change_swap_directional_and_explicit_refuse_atomically_then_allow_once() {
+    use api::schema::{PaneDirection, PaneSwapParams, PaneSwapProjectCheckedParams};
+    // All four directional routes plus the explicit source/target API form.
+    for (direction, reverse) in [
+        (Some(PaneDirection::Right), false),
+        (Some(PaneDirection::Left), true),
+        (Some(PaneDirection::Down), false),
+        (Some(PaneDirection::Up), true),
+        (None, false),
+    ] {
+        let axis = if matches!(direction, Some(PaneDirection::Down | PaneDirection::Up)) {
+            ratatui::layout::Direction::Vertical
+        } else {
+            ratatui::layout::Direction::Horizontal
+        };
+        let (mut server, first, next, first_session, next_session) =
+            two_pi_fallback_server(Some(axis), false);
+        let source = server
+            .app
+            .public_pane_id(0, if reverse { next } else { first })
+            .unwrap();
+        let target = server
+            .app
+            .public_pane_id(0, if reverse { first } else { next })
+            .unwrap();
+        let params = if let Some(direction) = direction {
+            PaneSwapParams {
+                pane_id: Some(source),
+                direction: Some(direction),
+                ..PaneSwapParams::default()
+            }
+        } else {
+            PaneSwapParams {
+                source_pane_id: Some(source),
+                target_pane_id: Some(target),
+                ..PaneSwapParams::default()
+            }
+        };
+        let (control_rx, _render_rx) = connect_test_shell(&mut server, 144, 80, 23);
+        let _initial = client_shell_snapshot(&control_rx);
+        let location = server.clients[&144].shell_location.clone();
+        let revision = server.clients[&144].shell_projection_revision;
+        let before = fingerprint(&server);
+        for method in [
+            Method::PaneSwap(params.clone()),
+            Method::PaneSwapProjectChecked(PaneSwapProjectCheckedParams {
+                params: params.clone(),
+                allow_project_change: false,
+            }),
+        ] {
+            let logs = capture_project_logs(|| {
+                let error = public_method(&mut server, method).unwrap_err();
+                assert_eq!(error.error.code, "project_change_refused");
+                for text in [&first_session, &next_session] {
+                    assert!(
+                        error.error.message.contains(text),
+                        "{}",
+                        error.error.message
+                    );
+                }
+                assert!(error.error.message.contains("r1-first-pi-project-a"));
+                assert!(error.error.message.contains("r1-next-pi-project-b"));
+                assert_eq!(fingerprint(&server), before, "swap refusal is atomic");
+                assert_eq!(server.clients[&144].shell_location, location);
+                assert_eq!(server.clients[&144].shell_projection_revision, revision);
+            });
+            assert_project_audit(&logs, 0, &[]);
+        }
+        let logs = capture_project_logs(|| {
+            let ResponseResult::PaneSwap { swap } = public_method(
+                &mut server,
+                Method::PaneSwapProjectChecked(PaneSwapProjectCheckedParams {
+                    params,
+                    allow_project_change: true,
+                }),
+            )
+            .unwrap() else {
+                panic!("pane swap response")
+            };
+            assert!(swap.changed);
+            assert_eq!(
+                server.app.state.workspaces[0].tabs[0].layout.pane_ids(),
+                vec![next, first]
+            );
+            // Swapping leaves does not alter root identity or terminal/session attachment.
+            assert_eq!(root(&server, 0, 0), first);
+            assert_attached_session(&server, first, &first_session);
+            assert_attached_session(&server, next, &next_session);
+        });
+        assert_project_audit(&logs, 1, &[&first_session, &next_session]);
+        server.app.state.assert_invariants_for_test();
+        shutdown_test_runtimes(&mut server);
+    }
+}
+
+#[tokio::test]
+async fn project_change_swap_same_foreground_project_succeeds_without_audit() {
+    use api::schema::{PaneSwapParams, PaneSwapProjectCheckedParams};
+    let (mut server, first, next, first_session, next_session) =
+        two_pi_fallback_server(Some(ratatui::layout::Direction::Horizontal), true);
+    let params = PaneSwapParams {
+        source_pane_id: server.app.public_pane_id(0, first),
+        target_pane_id: server.app.public_pane_id(0, next),
+        ..PaneSwapParams::default()
+    };
+    for method in [
+        Method::PaneSwap(params.clone()),
+        Method::PaneSwapProjectChecked(PaneSwapProjectCheckedParams {
+            params,
+            allow_project_change: true,
+        }),
+    ] {
+        let logs = capture_project_logs(|| {
+            assert!(matches!(public_method(&mut server, method).unwrap(),
+                ResponseResult::PaneSwap { swap } if swap.changed));
+        });
+        assert_project_audit(&logs, 0, &[]);
+        assert_attached_session(&server, first, &first_session);
+        assert_attached_session(&server, next, &next_session);
+    }
+    server.app.state.assert_invariants_for_test();
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn project_change_explicit_pane_and_tab_close_allow_once_only_for_changed_survivors() {
+    // pane.close of a split root, pane.close of a whole tab, and tab.close.
+    // Explicit close is an intentional opt-in: there is NO public refusal path.
+    for close_kind in 0..3 {
+        for same_project in [false, true] {
+            for close_first in [true, false] {
+                let split = (close_kind == 0).then_some(ratatui::layout::Direction::Horizontal);
+                let (mut server, first, next, first_session, next_session) =
+                    two_pi_fallback_server(split, same_project);
+                let (removed, survivor, removed_session, survivor_session) = if close_first {
+                    (first, next, &first_session, &next_session)
+                } else {
+                    (next, first, &next_session, &first_session)
+                };
+                let removed_terminal = server.app.state.workspaces[0]
+                    .terminal_id(removed)
+                    .unwrap()
+                    .clone();
+                let method = if close_kind == 2 {
+                    Method::TabClose(api::schema::TabTarget {
+                        tab_id: server
+                            .app
+                            .public_tab_id(0, if close_first { 0 } else { 1 })
+                            .unwrap(),
+                    })
+                } else {
+                    Method::PaneClose(api::schema::PaneTarget {
+                        pane_id: server.app.public_pane_id(0, removed).unwrap(),
+                    })
+                };
+                let logs = capture_project_logs(|| {
+                    assert!(public_method(&mut server, method).is_ok());
+                    assert_attached_session(&server, survivor, survivor_session);
+                    assert!(server.app.state.workspaces[0]
+                        .find_tab_index_for_pane(removed)
+                        .is_none());
+                    assert!(!server.app.state.terminals.contains_key(&removed_terminal));
+                    assert!(server
+                        .app
+                        .terminal_runtimes
+                        .get(&removed_terminal)
+                        .is_none());
+                });
+                let changed = close_first && !same_project;
+                assert_project_audit(&logs, usize::from(changed), &[survivor_session]);
+                if changed {
+                    let audit = logs
+                        .lines()
+                        .find(|line| line.contains("intentional project change allowed"))
+                        .unwrap();
+                    assert!(
+                        !audit.contains(removed_session),
+                        "closed session is not a survivor: {audit}"
+                    );
+                    assert!(audit.contains("intentional close"), "{audit}");
+                    assert!(
+                        audit.contains(if close_kind == 2 {
+                            "tab.close"
+                        } else {
+                            "pane.close"
+                        }),
+                        "{audit}"
+                    );
+                }
+                server.app.state.assert_invariants_for_test();
+                shutdown_test_runtimes(&mut server);
+            }
+        }
+    }
+}
+
+fn replacement_params(server: &HeadlessServer, tab: usize) -> api::schema::LayoutApplyParams {
+    // Deserialization keeps this fixture aligned with the published JSON shape.
+    serde_json::from_value(serde_json::json!({
+        "tab_id": server.app.public_tab_id(0, tab).unwrap(),
+        "focus": false,
+        "root": { "type": "pane", "command": ["/bin/bash"] }
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn project_change_layout_replacement_refuses_before_spawn_then_allows_one_survivor_audit() {
+    use api::schema::LayoutApplyProjectCheckedParams;
+    let (mut server, first, next, first_session, next_session) =
+        two_pi_fallback_server(None, false);
+    let params = replacement_params(&server, 0);
+    let terminals_before = server.app.state.terminals.len();
+    let runtimes_before = server.app.terminal_runtimes.len();
+    let (control_rx, _render_rx) = connect_test_shell(&mut server, 145, 80, 23);
+    let _initial = client_shell_snapshot(&control_rx);
+    let before = fingerprint(&server);
+    let location = server.clients[&145].shell_location.clone();
+    let revision = server.clients[&145].shell_projection_revision;
+    for method in [
+        Method::LayoutApply(params.clone()),
+        Method::LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams {
+            params: params.clone(),
+            allow_project_change: false,
+        }),
+    ] {
+        let logs = capture_project_logs(|| {
+            let error = public_method(&mut server, method).unwrap_err();
+            assert_eq!(error.error.code, "project_change_refused");
+            assert!(error.error.message.contains(&next_session));
+            assert!(!error.error.message.contains(&first_session));
+            assert!(error.error.message.contains("r1-first-pi-project-a"));
+            assert!(error.error.message.contains("r1-next-pi-project-b"));
+            assert_eq!(fingerprint(&server), before, "layout refusal is atomic");
+            assert_eq!(server.app.state.terminals.len(), terminals_before);
+            assert_eq!(server.app.terminal_runtimes.len(), runtimes_before);
+            assert_eq!(server.clients[&145].shell_location, location);
+            assert_eq!(server.clients[&145].shell_projection_revision, revision);
+        });
+        assert_project_audit(&logs, 0, &[]);
+    }
+    let logs = capture_project_logs(|| {
+        assert!(matches!(
+            public_method(
+                &mut server,
+                Method::LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams {
+                    params,
+                    allow_project_change: true,
+                })
+            )
+            .unwrap(),
+            ResponseResult::LayoutApply { .. }
+        ));
+        assert!(server.app.state.workspaces[0]
+            .find_tab_index_for_pane(first)
+            .is_none());
+        assert_attached_session(&server, next, &next_session);
+        assert_eq!(
+            root(&server, 0, 0),
+            next,
+            "plain-shell replacement is appended"
+        );
+    });
+    assert_project_audit(&logs, 1, &[&next_session]);
+    let audit = logs
+        .lines()
+        .find(|line| line.contains("intentional project change allowed"))
+        .unwrap();
+    assert!(!audit.contains(&first_session));
+    server.app.state.assert_invariants_for_test();
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn project_change_layout_unchanged_first_pi_or_same_foreground_project_never_audits() {
+    use api::schema::LayoutApplyProjectCheckedParams;
+    for same_project in [false, true] {
+        for checked in [false, true] {
+            let (mut server, first, next, first_session, next_session) =
+                two_pi_fallback_server(None, same_project);
+            // Distinct cwd counterexample: replacing the SECOND Pi leaves first
+            // Pi unchanged. Same-cwd counterexample: replace the FIRST Pi.
+            let tab = if same_project { 0 } else { 1 };
+            let (survivor, survivor_session) = if same_project {
+                (next, &next_session)
+            } else {
+                (first, &first_session)
+            };
+            let params = replacement_params(&server, tab);
+            let method = if checked {
+                Method::LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams {
+                    params,
+                    allow_project_change: true,
+                })
+            } else {
+                Method::LayoutApply(params)
+            };
+            let logs = capture_project_logs(|| {
+                assert!(matches!(
+                    public_method(&mut server, method).unwrap(),
+                    ResponseResult::LayoutApply { .. }
+                ));
+                assert_attached_session(&server, survivor, survivor_session);
+            });
+            assert_project_audit(&logs, 0, &[]);
+            server.app.state.assert_invariants_for_test();
+            shutdown_test_runtimes(&mut server);
+        }
+    }
+}
+
+// Exercise the receiver, not App::handle_api_request: shell requests attribute
+// geometry to their client, while public requests reapply existing controllers.
+fn project_receiver_method(
+    server: &mut HeadlessServer,
+    client_id: Option<u64>,
+    method: Method,
+) -> Result<ResponseResult, ErrorResponse> {
+    let Some(client_id) = client_id else {
+        return public_method(server, method);
+    };
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_client_shell_api_request(
+        client_id,
+        api::ApiRequestMessage {
+            context: api::ApiRequestContext::default(),
+            request: api::schema::Request {
+                id: "project-receiver".into(),
+                method,
+            },
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        },
+    );
+    decode_response(
+        &response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded shell receiver response"),
+    )
+}
+
+fn project_pane_size(server: &HeadlessServer, pane: crate::layout::PaneId) -> (u16, u16) {
+    let terminal = server.app.state.workspaces[0].terminal_id(pane).unwrap();
+    let runtime = server.app.terminal_runtimes.get(terminal).unwrap();
+    let size = runtime.current_size();
+    assert_eq!(runtime.terminal_dimensions(), Some((size.1, size.0)));
+    size
+}
+
+#[tokio::test]
+async fn project_change_checked_swap_receivers_reapply_unequal_controlled_leaf_geometry() {
+    use api::schema::{LayoutSetSplitRatioParams, PaneSwapParams, PaneSwapProjectCheckedParams};
+    for shell_route in [false, true] {
+        for same_project in [false, true] {
+            let (mut server, first, next, first_session, next_session) =
+                two_pi_fallback_server(Some(ratatui::layout::Direction::Horizontal), same_project);
+            let (control, _render) = connect_test_shell(&mut server, 144, 137, 41);
+            let _initial = client_shell_snapshot(&control);
+            let tab_id = server.app.public_tab_id(0, 0).unwrap();
+            assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&144));
+            // A 50/50 split can conceal a skipped resize after swapping leaves.
+            public_method(
+                &mut server,
+                Method::LayoutSetSplitRatio(LayoutSetSplitRatioParams {
+                    tab_id: Some(tab_id.clone()),
+                    pane_id: None,
+                    path: Vec::new(),
+                    ratio: 0.3,
+                }),
+            )
+            .unwrap();
+            let before_sizes = [
+                project_pane_size(&server, first),
+                project_pane_size(&server, next),
+            ];
+            assert_ne!(before_sizes[0], before_sizes[1]);
+            let location = server.clients[&144].shell_location.clone();
+            let before = fingerprint(&server);
+            let route = shell_route.then_some(144);
+            let params = PaneSwapParams {
+                source_pane_id: server.app.public_pane_id(0, first),
+                target_pane_id: server.app.public_pane_id(0, next),
+                ..PaneSwapParams::default()
+            };
+            if !same_project {
+                let logs = capture_project_logs(|| {
+                    let error = project_receiver_method(
+                        &mut server,
+                        route,
+                        Method::PaneSwapProjectChecked(PaneSwapProjectCheckedParams {
+                            params: params.clone(),
+                            allow_project_change: false,
+                        }),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.error.code, "project_change_refused");
+                    assert_eq!(fingerprint(&server), before);
+                    assert_eq!(server.clients[&144].shell_location, location);
+                    assert_eq!(
+                        [
+                            project_pane_size(&server, first),
+                            project_pane_size(&server, next)
+                        ],
+                        before_sizes
+                    );
+                });
+                assert_project_audit(&logs, 0, &[]);
+            }
+            let logs = capture_project_logs(|| {
+                assert!(matches!(
+                    project_receiver_method(
+                        &mut server,
+                        route,
+                        Method::PaneSwapProjectChecked(PaneSwapProjectCheckedParams {
+                            params,
+                            allow_project_change: !same_project,
+                        }),
+                    ).unwrap(),
+                    ResponseResult::PaneSwap { swap } if swap.changed
+                ));
+                assert_eq!(
+                    server.app.state.workspaces[0].tabs[0].layout.pane_ids(),
+                    vec![next, first]
+                );
+                assert_eq!(server.clients[&144].shell_location, location);
+                assert_eq!(server.tab_geometry_controllers.get(&tab_id), Some(&144));
+                // Exact cross-over proves a receiver resize occurred. The frozen
+                // checked-method lists leave each terminal at its old leaf size.
+                assert_eq!(project_pane_size(&server, first), before_sizes[1]);
+                assert_eq!(project_pane_size(&server, next), before_sizes[0]);
+                assert_attached_session(&server, first, &first_session);
+                assert_attached_session(&server, next, &next_session);
+            });
+            assert_project_audit(
+                &logs,
+                usize::from(!same_project),
+                &[&first_session, &next_session],
+            );
+            server.app.state.assert_invariants_for_test();
+            shutdown_test_runtimes(&mut server);
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_change_checked_layout_receivers_reconcile_viewers_and_reapply_dimensions() {
+    use api::schema::LayoutApplyProjectCheckedParams;
+    for shell_route in [false, true] {
+        // Replacing the first Pi changes project; replacing the second leaves
+        // the first Pi/project unchanged and must not audit or disturb its tab.
+        for replace_first in [true, false] {
+            let (mut server, first, next, first_session, next_session) =
+                two_pi_fallback_server(None, false);
+            let tab = usize::from(!replace_first);
+            let removed = if replace_first { first } else { next };
+            let survivor = if replace_first { next } else { first };
+            let survivor_session = if replace_first {
+                &next_session
+            } else {
+                &first_session
+            };
+            let removed_terminal = server.app.state.workspaces[0]
+                .terminal_id(removed)
+                .unwrap()
+                .clone();
+            let removed_tab_id = server.app.public_tab_id(0, tab).unwrap();
+            let survivor_tab_id = server
+                .app
+                .public_tab_id(0, usize::from(replace_first))
+                .unwrap();
+            let (control, _render) = connect_test_shell(&mut server, 144, 137, 41);
+            let _initial = client_shell_snapshot(&control);
+            // Singleton bootstrap resizes all existing tabs, not just active.
+            let full_size = project_pane_size(&server, survivor);
+            assert_eq!(project_pane_size(&server, removed), full_size);
+            let (observer_control, _observer_render) = connect_test_shell(&mut server, 145, 71, 19);
+            let _observer_initial = client_shell_snapshot(&observer_control);
+            assert!(server.focus_shell_client_on_tab(145, &removed_tab_id));
+            if shell_route && !replace_first {
+                assert!(server.focus_shell_client_on_tab(144, &removed_tab_id));
+                assert!(server.claim_shell_tab_geometry(144, false));
+            }
+            // The second viewer is necessary: the shell receiver directly
+            // focuses its requesting client even without reconciliation.
+            let locations = [
+                server.clients[&144].shell_location.clone(),
+                server.clients[&145].shell_location.clone(),
+            ];
+            let before = fingerprint(&server);
+            let sizes = [
+                project_pane_size(&server, first),
+                project_pane_size(&server, next),
+            ];
+            let counts = (
+                server.app.state.terminals.len(),
+                server.app.terminal_runtimes.len(),
+            );
+            let params = replacement_params(&server, tab);
+            let route = shell_route.then_some(144);
+            if replace_first {
+                let logs = capture_project_logs(|| {
+                    let error = project_receiver_method(
+                        &mut server,
+                        route,
+                        Method::LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams {
+                            params: params.clone(),
+                            allow_project_change: false,
+                        }),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.error.code, "project_change_refused");
+                    assert_eq!(fingerprint(&server), before);
+                    assert_eq!(
+                        [
+                            server.clients[&144].shell_location.clone(),
+                            server.clients[&145].shell_location.clone()
+                        ],
+                        locations
+                    );
+                    assert_eq!(
+                        [
+                            project_pane_size(&server, first),
+                            project_pane_size(&server, next)
+                        ],
+                        sizes
+                    );
+                    assert_eq!(
+                        (
+                            server.app.state.terminals.len(),
+                            server.app.terminal_runtimes.len()
+                        ),
+                        counts
+                    );
+                });
+                assert_project_audit(&logs, 0, &[]);
+            }
+            let logs = capture_project_logs(|| {
+                let ResponseResult::LayoutApply { layout } = project_receiver_method(
+                    &mut server,
+                    route,
+                    Method::LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams {
+                        params,
+                        allow_project_change: replace_first,
+                    }),
+                )
+                .unwrap() else {
+                    panic!("checked layout receiver response")
+                };
+                assert!(server.app.parse_tab_id(&removed_tab_id).is_none());
+                assert!(!server.app.state.terminals.contains_key(&removed_terminal));
+                assert!(server
+                    .app
+                    .terminal_runtimes
+                    .get(&removed_terminal)
+                    .is_none());
+                assert_attached_session(&server, survivor, survivor_session);
+                assert_eq!(project_pane_size(&server, survivor), full_size);
+                assert!(server.app.parse_tab_id(&survivor_tab_id).is_some());
+                for client_id in [144, 145] {
+                    let location = server.clients[&client_id].shell_location.as_ref().unwrap();
+                    let viewed = location.focused_tab_id().unwrap();
+                    assert_ne!(viewed, removed_tab_id);
+                    let (ws, tab) = server
+                        .app
+                        .parse_tab_id(viewed)
+                        .expect("reconciled live tab");
+                    let focused = server.app.state.workspaces[ws].tabs[tab].layout.focused();
+                    assert!(server.app.state.workspaces[ws].tabs[tab]
+                        .terminal_id(focused)
+                        .is_some());
+                    assert_eq!(project_pane_size(&server, focused), full_size);
+                    assert_eq!(server.tab_geometry_controllers.get(viewed), Some(&144));
+                }
+                assert!(!server
+                    .tab_geometry_controllers
+                    .contains_key(&removed_tab_id));
+                // Public replacement of an inactive tab preserves the primary
+                // client's location. Shell/active replacement selects the new tab.
+                if !shell_route && !replace_first {
+                    assert_eq!(server.clients[&144].shell_location, locations[0]);
+                    assert_eq!(
+                        server.shell_tab_id_for_client(145).as_deref(),
+                        Some(survivor_tab_id.as_str())
+                    );
+                } else {
+                    assert_eq!(
+                        server.shell_tab_id_for_client(144).as_deref(),
+                        Some(layout.tab_id.as_str())
+                    );
+                    let (_, new_tab) = server.app.parse_tab_id(&layout.tab_id).unwrap();
+                    assert_eq!(
+                        project_pane_size(&server, root(&server, 0, new_tab)),
+                        full_size
+                    );
+                }
+            });
+            assert_project_audit(&logs, usize::from(replace_first), &[survivor_session]);
+            server.app.state.assert_invariants_for_test();
+            shutdown_test_runtimes(&mut server);
+        }
+    }
+}
+
+#[test]
+fn project_change_swap_and_layout_checked_schemas_default_deny_and_preserve_legacy_shapes() {
+    let swap_json = serde_json::json!({ "source_pane_id": "w1:p1", "target_pane_id": "w1:p2" });
+    let swap: api::schema::PaneSwapProjectCheckedParams =
+        serde_json::from_value(swap_json.clone()).unwrap();
+    assert!(!swap.allow_project_change);
+    assert_eq!(serde_json::to_value(swap.params).unwrap(), swap_json);
+    let layout_json =
+        serde_json::json!({ "tab_id": "w1:t1", "focus": false, "root": { "type": "pane" } });
+    let layout: api::schema::LayoutApplyProjectCheckedParams =
+        serde_json::from_value(layout_json.clone()).unwrap();
+    assert!(!layout.allow_project_change);
+    assert_eq!(serde_json::to_value(layout.params).unwrap(), layout_json);
+    for (method, params) in [
+        ("pane.swap_project_checked", swap_json),
+        ("layout.apply_project_checked", layout_json),
+    ] {
+        assert!(crate::server::client_commands::supports_client_shell_method_name(method));
+        let request: api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "r1-schema", "method": method, "params": params
+        }))
+        .unwrap();
+        match request.method {
+            Method::PaneSwapProjectChecked(params) => assert!(!params.allow_project_change),
+            Method::LayoutApplyProjectChecked(params) => assert!(!params.allow_project_change),
+            other => panic!("wrong checked method: {other:?}"),
+        }
+    }
+}

@@ -268,6 +268,18 @@ impl App {
             return tab_not_found(id, &target.tab_id);
         };
         let closes_workspace = ws.tabs.len() <= 1;
+        let mut projected = self.project_topology();
+        if closes_workspace {
+            projected.remove(ws_idx);
+        } else {
+            projected[ws_idx].tabs.remove(tab_idx);
+        }
+        // Closing explicitly permits a project change for surviving sessions;
+        // the destroyed tab's sessions are absent from the projected topology.
+        let project_changes = match self.precheck_project_change(&projected, true, "tab.close") {
+            Ok(changes) => changes,
+            Err(message) => return encode_error(id, "project_change_refused", message),
+        };
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
         let pane_ids = ws
             .tabs
@@ -302,6 +314,10 @@ impl App {
                     workspace: Some(workspace),
                 },
             });
+            Self::log_project_changes_with_context(
+                &project_changes,
+                "tab.close (intentional close)",
+            );
             return encode_success(id, ResponseResult::Ok {});
         }
 
@@ -315,6 +331,7 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
+        Self::log_project_changes_with_context(&project_changes, "tab.close (intentional close)");
         self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();
