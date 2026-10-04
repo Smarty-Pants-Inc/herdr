@@ -1,0 +1,1784 @@
+{
+  "kind": "implementation real-path behavioral probe, NOT final audit",
+  "head": "dee2ba2a5e5051258b83f027433392eaf6a35a8a",
+  "binary": "/tmp/herdr-4346.Kly4v4/target/debug/herdr",
+  "binary_sha256": "5d5ebeeea8d96817ead77be924f2c8243e21eab07fea83e2467352cf17198150",
+  "scratch": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp",
+  "started_unix": 1791070046.8596423,
+  "checks": {
+    "branch-switch-1": {
+      "passed": true,
+      "git_completion_mono": 383992.364340169,
+      "visible_observed_mono": 383992.487343628,
+      "latency_seconds_upper_bound": 0.1230034590116702,
+      "screen_file": "branch-switch-1.txt",
+      "capture_bytes": 25965
+    },
+    "branch-return-1": {
+      "passed": true,
+      "git_completion_mono": 383992.492040136,
+      "visible_observed_mono": 383992.61667406,
+      "latency_seconds_upper_bound": 0.124633923987858,
+      "screen_file": "branch-return-1.txt",
+      "capture_bytes": 26098
+    },
+    "branch-switch-2": {
+      "passed": true,
+      "git_completion_mono": 383992.62039459,
+      "visible_observed_mono": 383992.741516374,
+      "latency_seconds_upper_bound": 0.12112178397364914,
+      "screen_file": "branch-switch-2.txt",
+      "capture_bytes": 26210
+    },
+    "branch-return-2": {
+      "passed": true,
+      "git_completion_mono": 383992.745118422,
+      "visible_observed_mono": 383992.868211098,
+      "latency_seconds_upper_bound": 0.12309267598902807,
+      "screen_file": "branch-return-2.txt",
+      "capture_bytes": 26343
+    },
+    "branch-switch-3": {
+      "passed": true,
+      "git_completion_mono": 383992.871885161,
+      "visible_observed_mono": 383992.997202816,
+      "latency_seconds_upper_bound": 0.12531765503808856,
+      "screen_file": "branch-switch-3.txt",
+      "capture_bytes": 26455
+    },
+    "branch-return-3": {
+      "passed": true,
+      "git_completion_mono": 383993.001017342,
+      "visible_observed_mono": 383993.139645733,
+      "latency_seconds_upper_bound": 0.13862839102512226,
+      "screen_file": "branch-return-3.txt",
+      "capture_bytes": 26588
+    },
+    "commit-ahead-1": {
+      "passed": true,
+      "git_completion_mono": 383993.153093146,
+      "visible_observed_mono": 383993.274153725,
+      "latency_seconds_upper_bound": 0.12106057902565226,
+      "screen_file": "commit-ahead-1.txt",
+      "capture_bytes": 26735,
+      "git_ahead_behind_verification": "0\t1"
+    },
+    "commit-ahead-2": {
+      "passed": true,
+      "git_completion_mono": 383993.284692849,
+      "visible_observed_mono": 383993.401893276,
+      "latency_seconds_upper_bound": 0.11720042704837397,
+      "screen_file": "commit-ahead-2.txt",
+      "capture_bytes": 26837,
+      "git_ahead_behind_verification": "0\t2"
+    },
+    "commit-ahead-3": {
+      "passed": true,
+      "git_completion_mono": 383993.417604861,
+      "visible_observed_mono": 383993.534043471,
+      "latency_seconds_upper_bound": 0.1164386099553667,
+      "screen_file": "commit-ahead-3.txt",
+      "capture_bytes": 26939,
+      "git_ahead_behind_verification": "0\t3"
+    },
+    "remote-behind-1": {
+      "passed": true,
+      "git_completion_mono": 383993.54262632,
+      "visible_observed_mono": 383993.667155437,
+      "latency_seconds_upper_bound": 0.12452911701984704,
+      "screen_file": "remote-behind-1.txt",
+      "capture_bytes": 27051,
+      "git_ahead_behind_verification": "1\t3"
+    },
+    "100-workspace-cycles": {
+      "passed": true,
+      "cycles_completed": 100,
+      "fd_before": 23,
+      "fd_after": 23,
+      "inotify_before": 6,
+      "inotify_after": 6,
+      "lingering_removed_path_inodes": [],
+      "removed_paths_still_exist_at_observation": true,
+      "retained_anchor_id": "w1"
+    },
+    "anchor-retained": {
+      "passed": true
+    },
+    "final-anchor-screen": {
+      "passed": true
+    },
+    "ansi-replay-supported": {
+      "passed": true,
+      "unknown_csi": []
+    }
+  },
+  "git_commands": [
+    {
+      "argv": [
+        "init",
+        "-b",
+        "main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.723612507,
+      "completion_mono": 383991.725856471,
+      "returncode": 0,
+      "stdout": "Initialized empty Git repository in /run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo/.git/\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "add",
+        "tracked"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.725969252,
+      "completion_mono": 383991.727760779,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "commit",
+        "-m",
+        "fixture"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.727765668,
+      "completion_mono": 383991.731661015,
+      "returncode": 0,
+      "stdout": "[main (root-commit) d4ec487] fixture\n 1 file changed, 1 insertion(+)\n create mode 100644 tracked\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "update-ref",
+        "refs/remotes/origin/main",
+        "HEAD"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.731669541,
+      "completion_mono": 383991.733358906,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "remote.origin.url",
+        "."
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.733366982,
+      "completion_mono": 383991.734581848,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.734586306,
+      "completion_mono": 383991.736028728,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "branch.main.remote",
+        "origin"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.736031163,
+      "completion_mono": 383991.737416939,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "branch.main.merge",
+        "refs/heads/main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.737419203,
+      "completion_mono": 383991.738697117,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "branch",
+        "probe-branch"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.738699993,
+      "completion_mono": 383991.740109433,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "branch.probe-branch.remote",
+        "origin"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.740112108,
+      "completion_mono": 383991.741322035,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "config",
+        "branch.probe-branch.merge",
+        "refs/heads/main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.741324399,
+      "completion_mono": 383991.743076352,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "rev-list",
+        "--left-right",
+        "--count",
+        "@{upstream}...HEAD"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383991.743079097,
+      "completion_mono": 383991.745090946,
+      "returncode": 0,
+      "stdout": "0\t0\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "switch",
+        "probe-branch"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.355099848,
+      "completion_mono": 383992.364340169,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'probe-branch'\n"
+    },
+    {
+      "argv": [
+        "switch",
+        "main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.487938873,
+      "completion_mono": 383992.492040136,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'main'\n"
+    },
+    {
+      "argv": [
+        "switch",
+        "probe-branch"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.617258675,
+      "completion_mono": 383992.62039459,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'probe-branch'\n"
+    },
+    {
+      "argv": [
+        "switch",
+        "main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.741955376,
+      "completion_mono": 383992.745118422,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'main'\n"
+    },
+    {
+      "argv": [
+        "switch",
+        "probe-branch"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.868711786,
+      "completion_mono": 383992.871885161,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'probe-branch'\n"
+    },
+    {
+      "argv": [
+        "switch",
+        "main"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383992.997621901,
+      "completion_mono": 383993.001017342,
+      "returncode": 0,
+      "stdout": "Your branch is up to date with 'origin/main'.\n",
+      "stderr": "Switched to branch 'main'\n"
+    },
+    {
+      "argv": [
+        "add",
+        "tracked"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.140446463,
+      "completion_mono": 383993.142839486,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "commit",
+        "-m",
+        "real ahead change 1"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.142848293,
+      "completion_mono": 383993.153093146,
+      "returncode": 0,
+      "stdout": "[main 572a5f7] real ahead change 1\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "add",
+        "tracked"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.277332169,
+      "completion_mono": 383993.279588055,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "commit",
+        "-m",
+        "real ahead change 2"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.279593355,
+      "completion_mono": 383993.284692849,
+      "returncode": 0,
+      "stdout": "[main ff6aa56] real ahead change 2\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "add",
+        "tracked"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.405227282,
+      "completion_mono": 383993.411173232,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "commit",
+        "-m",
+        "real ahead change 3"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.411180004,
+      "completion_mono": 383993.417604861,
+      "returncode": 0,
+      "stdout": "[main 91092bf] real ahead change 3\n 1 file changed, 1 insertion(+), 1 deletion(-)\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        "refs/remotes/origin/main",
+        "-m",
+        "real remote divergence"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.536705528,
+      "completion_mono": 383993.539348339,
+      "returncode": 0,
+      "stdout": "f2e578c19c2c9416427712f41732b61457fc0933\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "update-ref",
+        "refs/remotes/origin/main",
+        "f2e578c19c2c9416427712f41732b61457fc0933"
+      ],
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "start_mono": 383993.539356965,
+      "completion_mono": 383993.54262632,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "cycles": [
+    {
+      "index": 1,
+      "workspace_id": "w2",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-000",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 2,
+      "workspace_id": "w3",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-001",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 3,
+      "workspace_id": "w4",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-002",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 4,
+      "workspace_id": "w5",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-003",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 5,
+      "workspace_id": "w6",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-004",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 6,
+      "workspace_id": "w7",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-005",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 7,
+      "workspace_id": "w8",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-006",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 8,
+      "workspace_id": "w9",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-007",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 9,
+      "workspace_id": "wA",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-008",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 10,
+      "workspace_id": "wB",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-009",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 11,
+      "workspace_id": "wC",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-010",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 12,
+      "workspace_id": "wD",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-011",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 13,
+      "workspace_id": "wE",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-012",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 14,
+      "workspace_id": "wF",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-013",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 15,
+      "workspace_id": "wG",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-014",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 16,
+      "workspace_id": "wH",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-015",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 17,
+      "workspace_id": "wJ",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-016",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 18,
+      "workspace_id": "wK",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-017",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 19,
+      "workspace_id": "wM",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-018",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 20,
+      "workspace_id": "wN",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-019",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 21,
+      "workspace_id": "wP",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-020",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 22,
+      "workspace_id": "wQ",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-021",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 23,
+      "workspace_id": "wR",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-022",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 24,
+      "workspace_id": "wS",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-023",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 25,
+      "workspace_id": "wT",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-024",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 26,
+      "workspace_id": "wV",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-025",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 27,
+      "workspace_id": "wW",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-026",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 28,
+      "workspace_id": "wX",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-027",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 29,
+      "workspace_id": "wY",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-028",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 30,
+      "workspace_id": "wZ",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-029",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 31,
+      "workspace_id": "w0",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-030",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 32,
+      "workspace_id": "w11",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-031",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 33,
+      "workspace_id": "w12",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-032",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 34,
+      "workspace_id": "w13",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-033",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 35,
+      "workspace_id": "w14",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-034",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 36,
+      "workspace_id": "w15",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-035",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 37,
+      "workspace_id": "w16",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-036",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 38,
+      "workspace_id": "w17",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-037",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 39,
+      "workspace_id": "w18",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-038",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 40,
+      "workspace_id": "w19",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-039",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 41,
+      "workspace_id": "w1A",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-040",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 42,
+      "workspace_id": "w1B",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-041",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 43,
+      "workspace_id": "w1C",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-042",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 44,
+      "workspace_id": "w1D",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-043",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 45,
+      "workspace_id": "w1E",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-044",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 46,
+      "workspace_id": "w1F",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-045",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 47,
+      "workspace_id": "w1G",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-046",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 48,
+      "workspace_id": "w1H",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-047",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 49,
+      "workspace_id": "w1J",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-048",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 50,
+      "workspace_id": "w1K",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-049",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 51,
+      "workspace_id": "w1M",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-050",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 52,
+      "workspace_id": "w1N",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-051",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 53,
+      "workspace_id": "w1P",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-052",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 54,
+      "workspace_id": "w1Q",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-053",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 55,
+      "workspace_id": "w1R",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-054",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 56,
+      "workspace_id": "w1S",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-055",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 57,
+      "workspace_id": "w1T",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-056",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 58,
+      "workspace_id": "w1V",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-057",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 59,
+      "workspace_id": "w1W",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-058",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 60,
+      "workspace_id": "w1X",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-059",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 61,
+      "workspace_id": "w1Y",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-060",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 62,
+      "workspace_id": "w1Z",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-061",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 63,
+      "workspace_id": "w10",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-062",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 64,
+      "workspace_id": "w21",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-063",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 65,
+      "workspace_id": "w22",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-064",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 66,
+      "workspace_id": "w23",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-065",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 67,
+      "workspace_id": "w24",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-066",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 68,
+      "workspace_id": "w25",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-067",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 69,
+      "workspace_id": "w26",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-068",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 70,
+      "workspace_id": "w27",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-069",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 71,
+      "workspace_id": "w28",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-070",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 72,
+      "workspace_id": "w29",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-071",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 73,
+      "workspace_id": "w2A",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-072",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 74,
+      "workspace_id": "w2B",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-073",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 75,
+      "workspace_id": "w2C",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-074",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 76,
+      "workspace_id": "w2D",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-075",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 77,
+      "workspace_id": "w2E",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-076",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 78,
+      "workspace_id": "w2F",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-077",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 79,
+      "workspace_id": "w2G",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-078",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 80,
+      "workspace_id": "w2H",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-079",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 81,
+      "workspace_id": "w2J",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-080",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 82,
+      "workspace_id": "w2K",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-081",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 83,
+      "workspace_id": "w2M",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-082",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 84,
+      "workspace_id": "w2N",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-083",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 85,
+      "workspace_id": "w2P",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-084",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 86,
+      "workspace_id": "w2Q",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-085",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 87,
+      "workspace_id": "w2R",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-086",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 88,
+      "workspace_id": "w2S",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-087",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 89,
+      "workspace_id": "w2T",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-088",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 90,
+      "workspace_id": "w2V",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-089",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 91,
+      "workspace_id": "w2W",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-090",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 92,
+      "workspace_id": "w2X",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-091",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 93,
+      "workspace_id": "w2Y",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-092",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 94,
+      "workspace_id": "w2Z",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-093",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 95,
+      "workspace_id": "w20",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-094",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 96,
+      "workspace_id": "w31",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-095",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 97,
+      "workspace_id": "w32",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-096",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 98,
+      "workspace_id": "w33",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-097",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 99,
+      "workspace_id": "w34",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-098",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    },
+    {
+      "index": 100,
+      "workspace_id": "w35",
+      "path": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/cycle-099",
+      "during_fd_count": 26,
+      "during_watch_count": 12,
+      "registered_then_removed": true,
+      "close_result": {
+        "type": "ok"
+      }
+    }
+  ],
+  "isolation": {
+    "HOME": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/home",
+    "XDG_CONFIG_HOME": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/config",
+    "XDG_RUNTIME_DIR": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/runtime",
+    "XDG_STATE_HOME": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/state",
+    "HERDR_SESSION": "live4346",
+    "HERDR_SOCKET_PATH": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/api.sock",
+    "client_socket": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/api-client.sock",
+    "inherited_herdr_variables_removed": [
+      "HERDR_BIN_PATH",
+      "HERDR_CONFIG_PATH",
+      "HERDR_ENV",
+      "HERDR_PANE_ID",
+      "HERDR_SESSION",
+      "HERDR_SOCKET_PATH",
+      "HERDR_TAB_ID",
+      "HERDR_WORKSPACE_ID"
+    ]
+  },
+  "server_pid": 1383217,
+  "anchor_create": {
+    "type": "workspace_created",
+    "workspace": {
+      "workspace_id": "w1",
+      "number": 1,
+      "label": "retained-anchor",
+      "focused": true,
+      "pane_count": 1,
+      "tab_count": 1,
+      "active_tab_id": "w1:t1",
+      "agent_status": "unknown"
+    },
+    "tab": {
+      "tab_id": "w1:t1",
+      "workspace_id": "w1",
+      "number": 1,
+      "label": "1",
+      "focused": true,
+      "pane_count": 1,
+      "agent_status": "unknown"
+    },
+    "root_pane": {
+      "pane_id": "w1:p1",
+      "terminal_id": "term_65cf7fdee165c1",
+      "workspace_id": "w1",
+      "tab_id": "w1:t1",
+      "focused": true,
+      "cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "foreground_cwd": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/anchor-repo",
+      "agent_status": "unknown",
+      "scroll": {
+        "offset_from_bottom": 0,
+        "max_offset_from_bottom": 0,
+        "viewport_rows": 40
+      },
+      "revision": 0
+    }
+  },
+  "client_pid": 1383414,
+  "index_display_contract": "No dirty/index flag exists in the UI; no such assertion invented. Index-trigger refresh is covered by the source-owner unit tests.",
+  "resources_before": {
+    "fd_count": 23,
+    "fds": {
+      "0": "/dev/null",
+      "1": "/home/paul/herdr-lanes/herdr-4346/.local/4346/live-proof/run-3/server.log",
+      "2": "/home/paul/herdr-lanes/herdr-4346/.local/4346/live-proof/run-3/server.log",
+      "3": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/config/herdr-dev/sessions/live4346/herdr-server.log",
+      "4": "socket:[678978036]",
+      "5": "anon_inode:[eventpoll]",
+      "6": "anon_inode:[eventfd]",
+      "7": "anon_inode:[eventpoll]",
+      "8": "socket:[678978039]",
+      "9": "socket:[678978040]",
+      "10": "socket:[678978039]",
+      "11": "socket:[678945702]",
+      "12": "socket:[678945702]",
+      "13": "socket:[678976012]",
+      "14": "socket:[678945706]",
+      "15": "/run/systemd/inhibit/750.ref",
+      "16": "pipe:[678982822]",
+      "17": "pipe:[678982822]",
+      "18": "/dev/ptmx",
+      "19": "socket:[678945706]",
+      "20": "anon_inode:inotify",
+      "21": "anon_inode:[eventpoll]",
+      "22": "anon_inode:[eventfd]"
+    },
+    "inotify_watch_count": 6,
+    "watches": [
+      {
+        "fd": "20",
+        "wd": 6,
+        "inode": 17122423,
+        "sdev": "2e",
+        "raw": "inotify wd:6 ino:1054477 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:9a521f347744050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 5,
+        "inode": 17122424,
+        "sdev": "2e",
+        "raw": "inotify wd:5 ino:1054478 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:194111b77844050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 4,
+        "inode": 17122489,
+        "sdev": "2e",
+        "raw": "inotify wd:4 ino:10544b9 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:7f9e0fc6b944050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 3,
+        "inode": 17122488,
+        "sdev": "2e",
+        "raw": "inotify wd:3 ino:10544b8 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:fdedc150b844050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 2,
+        "inode": 17122422,
+        "sdev": "2e",
+        "raw": "inotify wd:2 ino:1054476 sdev:2e mask:fee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:333e873c7644050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 1,
+        "inode": 17122402,
+        "sdev": "2e",
+        "raw": "inotify wd:1 ino:1054462 sdev:2e mask:fee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:f5ddabd66244050100000000"
+      }
+    ]
+  },
+  "resources_after": {
+    "fd_count": 23,
+    "fds": {
+      "0": "/dev/null",
+      "1": "/home/paul/herdr-lanes/herdr-4346/.local/4346/live-proof/run-3/server.log",
+      "2": "/home/paul/herdr-lanes/herdr-4346/.local/4346/live-proof/run-3/server.log",
+      "3": "/run/user/1000/smarty-pi-tmp/pi-9ff67e0f2be2/p.Ebiehf/live4346-506caxhp/config/herdr-dev/sessions/live4346/herdr-server.log",
+      "4": "socket:[678978036]",
+      "5": "anon_inode:[eventpoll]",
+      "6": "anon_inode:[eventfd]",
+      "7": "anon_inode:[eventpoll]",
+      "8": "socket:[678978039]",
+      "9": "socket:[678978040]",
+      "10": "socket:[678978039]",
+      "11": "socket:[678945702]",
+      "12": "socket:[678945702]",
+      "13": "socket:[678976012]",
+      "14": "socket:[678945706]",
+      "15": "/run/systemd/inhibit/750.ref",
+      "16": "pipe:[678982822]",
+      "17": "pipe:[678982822]",
+      "18": "/dev/ptmx",
+      "19": "socket:[678945706]",
+      "20": "anon_inode:inotify",
+      "21": "anon_inode:[eventpoll]",
+      "22": "anon_inode:[eventfd]"
+    },
+    "inotify_watch_count": 6,
+    "watches": [
+      {
+        "fd": "20",
+        "wd": 6,
+        "inode": 17122423,
+        "sdev": "2e",
+        "raw": "inotify wd:6 ino:1054477 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:9a521f347744050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 5,
+        "inode": 17122424,
+        "sdev": "2e",
+        "raw": "inotify wd:5 ino:1054478 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:194111b77844050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 4,
+        "inode": 17122489,
+        "sdev": "2e",
+        "raw": "inotify wd:4 ino:10544b9 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:7f9e0fc6b944050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 3,
+        "inode": 17122488,
+        "sdev": "2e",
+        "raw": "inotify wd:3 ino:10544b8 sdev:2e mask:3ee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:fdedc150b844050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 2,
+        "inode": 17122422,
+        "sdev": "2e",
+        "raw": "inotify wd:2 ino:1054476 sdev:2e mask:fee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:333e873c7644050100000000"
+      },
+      {
+        "fd": "20",
+        "wd": 1,
+        "inode": 17122402,
+        "sdev": "2e",
+        "raw": "inotify wd:1 ino:1054462 sdev:2e mask:fee ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:f5ddabd66244050100000000"
+      }
+    ]
+  },
+  "final_workspaces": [
+    {
+      "workspace_id": "w1",
+      "number": 1,
+      "label": "retained-anchor",
+      "focused": true,
+      "pane_count": 1,
+      "tab_count": 1,
+      "active_tab_id": "w1:t1",
+      "agent_status": "unknown"
+    }
+  ],
+  "passed": true,
+  "process_cleanup": [
+    {
+      "pid": 1383414,
+      "returncode": 1,
+      "reaped": true
+    },
+    {
+      "pid": 1383217,
+      "returncode": 0,
+      "reaped": true
+    }
+  ],
+  "capture_bytes": 53495,
+  "finished_unix": 1791070063.131106,
+  "private_scratch_removed": true
+}
