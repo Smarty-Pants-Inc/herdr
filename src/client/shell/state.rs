@@ -22,6 +22,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) tab_bar_position: TabBarPositionConfig,
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
+    pub(super) grouping: crate::config::SidebarGroupingConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
@@ -64,6 +65,7 @@ pub(super) struct ClientShellLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClientMobileTarget {
     Machine(ClientEndpointId),
+    Group(grouped_projection::GroupKey),
     NewWorkspace,
     Workspace {
         endpoint_id: ClientEndpointId,
@@ -84,6 +86,7 @@ pub(super) enum ClientMobileTarget {
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
+    pub(super) grouped_headings: Vec<(Rect, grouped_projection::GroupKey)>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -879,6 +882,13 @@ pub(crate) struct ClientShellState {
     pub(super) workspace_press: Option<ClientWorkspacePress>,
     pub(super) tab_press: Option<ClientTabPress>,
     pub(super) collapsed_groups: HashSet<String>,
+    pub(super) grouped_rows: Vec<grouped_projection::GroupedRow>,
+    pub(super) grouped_visible_rows: Vec<grouped_projection::GroupedRow>,
+    pub(super) grouped_projection_dirty: bool,
+    #[cfg(test)]
+    pub(super) grouped_projection_rebuilds: usize,
+    pub(super) grouped_reveal_target: Option<WorkspaceNavigationTarget>,
+    pub(super) grouped_collapsed: HashSet<grouped_projection::GroupKey>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
@@ -1044,6 +1054,17 @@ impl ClientShellState {
             workspace_press: None,
             tab_press: None,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
+            grouped_rows: Vec::new(),
+            grouped_visible_rows: Vec::new(),
+            grouped_projection_dirty: true,
+            #[cfg(test)]
+            grouped_projection_rebuilds: 0,
+            grouped_reveal_target: None,
+            grouped_collapsed: preferences
+                .grouped_collapsed
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             remote_collapsed_groups,
             workspace_scroll: 0,
             agent_scroll: 0,
@@ -1186,6 +1207,12 @@ impl ClientShellState {
     }
 
     pub(super) fn reveal_workspace(&mut self, workspace_id: &str) {
+        if self.config.grouping.enabled {
+            let endpoint_id = self.active_endpoint_id.clone();
+            self.reveal_grouped_workspace(&endpoint_id, workspace_id);
+            self.reveal_focused_workspace = true;
+            return;
+        }
         if self
             .hits
             .workspaces

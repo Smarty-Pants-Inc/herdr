@@ -475,11 +475,59 @@ impl Default for SpacesSidebarConfig {
     }
 }
 
+/// Client-side grouping roles mapped to existing workspace metadata token names.
+/// The client does not interpret launcher configuration or use these tokens for routing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SidebarGroupingConfig {
+    /// Opt in to grouped view. False keeps the existing Machines view.
+    pub enabled: bool,
+    /// Workspace token containing the stable organization ID.
+    pub org_id: String,
+    /// Workspace token containing the organization display label.
+    pub org_label: String,
+    /// Workspace token containing the stable project ID within an organization.
+    pub project_id: String,
+    /// Workspace token containing the project display label.
+    pub project_label: String,
+    /// Workspace token containing the stable lane ID.
+    pub lane_id: String,
+    /// Workspace token containing the lane's short task purpose.
+    pub lane_purpose: String,
+    /// Workspace token containing the tracking issue display hint.
+    pub issue: String,
+    /// Workspace token containing the execution host display hint, not routing authority.
+    pub host: String,
+    /// Workspace token containing the workspace's display role.
+    pub role: String,
+    /// Workspace token containing the owning lead display hint.
+    pub lead: String,
+}
+
+impl Default for SidebarGroupingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            org_id: "smarty_org_id".into(),
+            org_label: "smarty_org_label".into(),
+            project_id: "smarty_project_id".into(),
+            project_label: "smarty_project_label".into(),
+            lane_id: "smarty_lane_id".into(),
+            lane_purpose: "smarty_lane_purpose".into(),
+            issue: "smarty_issue".into(),
+            host: "smarty_host".into(),
+            role: "smarty_role".into(),
+            lead: "smarty_lead".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SidebarConfig {
     pub agents: AgentsSidebarConfig,
     pub spaces: SpacesSidebarConfig,
+    pub grouping: SidebarGroupingConfig,
 }
 
 #[cfg(test)]
@@ -511,6 +559,137 @@ mod tests {
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+    }
+
+    #[test]
+    fn grouping_defaults_to_machines_and_exact_launcher_token_names() {
+        let expected = SidebarGroupingConfig {
+            enabled: false,
+            org_id: "smarty_org_id".into(),
+            org_label: "smarty_org_label".into(),
+            project_id: "smarty_project_id".into(),
+            project_label: "smarty_project_label".into(),
+            lane_id: "smarty_lane_id".into(),
+            lane_purpose: "smarty_lane_purpose".into(),
+            issue: "smarty_issue".into(),
+            host: "smarty_host".into(),
+            role: "smarty_role".into(),
+            lead: "smarty_lead".into(),
+        };
+        assert_eq!(SidebarGroupingConfig::default(), expected);
+        assert_eq!(
+            crate::config::Config::default().ui.sidebar.grouping,
+            expected
+        );
+        for input in [
+            "",
+            "[ui.sidebar]\n",
+            "[ui.sidebar.grouping]\n",
+            "[ui.sidebar.agents]\nrows = [['agent']]\n",
+        ] {
+            let config: crate::config::Config = toml::from_str(input).expect("default grouping");
+            assert_eq!(config.ui.sidebar.grouping, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn grouping_parses_opt_in_partial_mapping_and_false_rollback() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.grouping]
+enabled = true
+org_id = "team_id"
+project_id = "product_id"
+"#,
+        )
+        .expect("opt-in grouping");
+        assert_eq!(
+            config.ui.sidebar.grouping,
+            SidebarGroupingConfig {
+                enabled: true,
+                org_id: "team_id".into(),
+                project_id: "product_id".into(),
+                ..SidebarGroupingConfig::default()
+            }
+        );
+        assert_eq!(config.ui.sidebar.agents, AgentsSidebarConfig::default());
+        assert_eq!(config.ui.sidebar.spaces, SpacesSidebarConfig::default());
+
+        let rollback: crate::config::Config =
+            toml::from_str("[ui.sidebar.grouping]\nenabled = false\n").expect("Machines rollback");
+        assert_eq!(
+            rollback.ui.sidebar.grouping,
+            SidebarGroupingConfig::default()
+        );
+    }
+
+    #[test]
+    fn grouping_custom_token_mapping_round_trips_with_sidebar_layouts() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.grouping]
+enabled = true
+org_id = "team_id"
+org_label = "team_name"
+project_id = "product_id"
+project_label = "product_name"
+lane_id = "assignment_id"
+lane_purpose = "task_summary"
+issue = "ticket"
+host = "execution_host"
+role = "kind"
+lead = "owner"
+
+[ui.sidebar.agents]
+rows = [["agent", "$summary"]]
+row_gap = 2
+
+[ui.sidebar.spaces]
+rows = [["workspace"]]
+"#,
+        )
+        .expect("custom grouping mapping and layouts");
+        let expected = SidebarGroupingConfig {
+            enabled: true,
+            org_id: "team_id".into(),
+            org_label: "team_name".into(),
+            project_id: "product_id".into(),
+            project_label: "product_name".into(),
+            lane_id: "assignment_id".into(),
+            lane_purpose: "task_summary".into(),
+            issue: "ticket".into(),
+            host: "execution_host".into(),
+            role: "kind".into(),
+            lead: "owner".into(),
+        };
+        assert_eq!(config.ui.sidebar.grouping, expected);
+        let encoded = toml::to_string(&config.ui.sidebar).expect("serialize sidebar");
+        let decoded: SidebarConfig = toml::from_str(&encoded).expect("deserialize sidebar");
+        assert_eq!(decoded, config.ui.sidebar);
+
+        let encoded = toml::to_string(&expected).expect("serialize grouping");
+        assert_eq!(
+            toml::from_str::<SidebarGroupingConfig>(&encoded).expect("deserialize grouping"),
+            expected
+        );
+        let defaults = SidebarGroupingConfig::default();
+        let encoded = toml::to_string(&defaults).expect("serialize grouping defaults");
+        assert_eq!(
+            toml::from_str::<SidebarGroupingConfig>(&encoded)
+                .expect("deserialize grouping defaults"),
+            defaults
+        );
+    }
+
+    #[test]
+    fn grouping_rejects_non_boolean_enabled_and_non_string_token_names() {
+        for input in [
+            "[ui.sidebar.grouping]\nenabled = 'true'\n",
+            "[ui.sidebar.grouping]\norg_id = 42\n",
+            "[ui.sidebar.grouping]\nhost = ['hostname']\n",
+        ] {
+            assert!(toml::from_str::<crate::config::Config>(input).is_err());
+        }
     }
 
     #[test]

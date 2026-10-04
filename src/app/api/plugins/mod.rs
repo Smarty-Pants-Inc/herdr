@@ -1741,6 +1741,8 @@ command = ["cmd.exe", "/d", "/c", "slot.cmd", "default"]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn plugin_launch_survives_executable_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
         const CHILD_ROOT: &str = "HERDR_TEST_PLUGIN_REPLACEMENT_ROOT";
         if let Some(root) = std::env::var_os(CHILD_ROOT) {
             let root = std::path::PathBuf::from(root);
@@ -1815,7 +1817,10 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
             return;
         }
 
-        let root = std::path::PathBuf::from("/var/tmp").join(format!(
+        let original_executable = std::env::current_exe().unwrap();
+        let original_metadata = std::fs::metadata(&original_executable).unwrap();
+        // Keep the fixture on the executable's filesystem so it can be hard-linked.
+        let root = original_executable.parent().unwrap().join(format!(
             "herdr-plugin-update-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -1825,7 +1830,10 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
         ));
         std::fs::create_dir_all(&root).unwrap();
         let executable = root.join("herdr test");
-        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        // A copy opens a writable destination that concurrent forks can inherit,
+        // transiently causing ETXTBSY on exec. Link the finished executable instead;
+        // the child's copy-and-rename replaces only this private alias.
+        std::fs::hard_link(&original_executable, &executable).unwrap();
         let result = std::process::Command::new(&executable)
             .args([
                 "--exact",
@@ -1835,6 +1843,12 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
             .env(CHILD_ROOT, &root)
             .output();
         std::fs::remove_dir_all(&root).unwrap();
+        let remaining_metadata = std::fs::metadata(&original_executable).unwrap();
+        assert_eq!(
+            (remaining_metadata.dev(), remaining_metadata.ino()),
+            (original_metadata.dev(), original_metadata.ino()),
+            "replacing the private hard-link alias must preserve the original executable"
+        );
         let output = result.unwrap();
         assert!(
             output.status.success(),
@@ -2563,10 +2577,8 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
 
     #[test]
     fn non_cli_plugin_consumers_refresh_global_enabled_state() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
-        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
         let base = unique_temp_path("plugin-global-refresh");
-        std::env::set_var("XDG_CONFIG_HOME", &base);
+        let _dirs = crate::config::test_config_dirs(&base, &base.join("state"));
         let root = base.join("plugin");
         write_manifest(&root);
         let plugin = load_plugin_manifest(&root.display().to_string(), false).unwrap();
@@ -2649,10 +2661,6 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         assert_eq!(app.state.plugin_command_logs.len(), logs_before);
 
         let _ = std::fs::remove_dir_all(&base);
-        match previous_config_home {
-            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
     }
 
     #[cfg(unix)]

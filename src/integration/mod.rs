@@ -14,7 +14,7 @@ mod version;
 pub(crate) use actions::{
     install_experimental_letta, install_target, uninstall_experimental_letta, uninstall_target,
 };
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
     apply_pane_base_env, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,

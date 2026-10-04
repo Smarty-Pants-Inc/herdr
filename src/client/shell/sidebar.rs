@@ -638,6 +638,16 @@ pub(in crate::client::shell) fn workspace_rows(
     } else {
         &workspace.label
     };
+    workspace_rows_with_label(workspace, status, label, indented, config)
+}
+
+pub(in crate::client::shell) fn workspace_rows_with_label(
+    workspace: &ClientShellWorkspace,
+    status: crate::api::schema::AgentStatus,
+    label: &str,
+    suppress_git_details: bool,
+    config: &SpacesSidebarConfig,
+) -> Vec<Vec<crate::ui::ResolvedToken>> {
     let token_values = workspace.tokens.iter().cloned().collect::<HashMap<_, _>>();
     crate::ui::sidebar_space_rows(
         config,
@@ -647,7 +657,7 @@ pub(in crate::client::shell) fn workspace_rows(
             state_text: status_text(status),
             ahead_behind: workspace.git_ahead_behind,
             tokens: &token_values,
-            suppress_git_details: indented,
+            suppress_git_details,
         },
     )
 }

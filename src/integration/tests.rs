@@ -128,23 +128,123 @@ fn enforce_agent_version_accepts_current_version() {
     assert!(result.is_none(), "matching version must not warn");
 }
 
-fn clear_integration_path_env() {
-    std::env::remove_var(PI_CODING_AGENT_DIR_ENV_VAR);
-    std::env::remove_var(OMP_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(CLAUDE_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(CODEX_HOME_ENV_VAR);
-    std::env::remove_var(COPILOT_HOME_ENV_VAR);
-    std::env::remove_var(KIMI_CODE_HOME_ENV_VAR);
-    std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::remove_var("XDG_STATE_HOME");
+#[test]
+fn integration_fixture_sequence_preserves_parent_home_and_path() {
+    let parent_home = std::env::var_os("HOME");
+    let parent_path = std::env::var_os("PATH");
+
+    // HOME removal or clearing this override caused a failed Cursor install,
+    // followed by PoisonError failures in the remaining integration tests.
+    install_pi_writes_embedded_asset_to_pi_extensions_dir();
+    install_cursor_is_idempotent_for_hook_entries();
+    assert_eq!(std::env::var_os("HOME"), parent_home);
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+    {
+        let env = integration_test_env();
+        let home = unique_base().join("home");
+        env.set("HOME", &home);
+        assert_eq!(
+            opencode_state_dir().unwrap(),
+            home.join(".local/state/opencode")
+        );
+        assert_eq!(devin_dir().unwrap(), home.join(".config/devin"));
+    }
+    assert_eq!(std::env::var_os("HOME"), parent_home);
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn integration_fake_path_sequence_preserves_parent_version_probes() {
+    let parent_home = std::env::var_os("HOME");
+    let parent_path = std::env::var_os("PATH");
+    command_available_requires_executable_file_on_path();
+    assert_eq!(std::env::var_os("HOME"), parent_home);
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+
+    // An intentionally absent test-local PATH may warn about a missing command;
+    // it must not run the parent's echo or leak into the subsequent real probe.
+    {
+        let _env = integration_test_env();
+        let requirement = AgentVersionRequirement {
+            label: "kimi code",
+            binary: "echo",
+            args: &["0.12.1"],
+            min_version: "0.14.0",
+        };
+        assert!(!command_available("echo"));
+        let warning = enforce_agent_version(&requirement).unwrap().unwrap();
+        assert!(warning.contains("could not run"));
+    }
+    enforce_agent_version_rejects_old_version();
+    enforce_agent_version_accepts_current_version();
+    assert_eq!(std::env::var_os("HOME"), parent_home);
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn enforce_agent_version_uses_injected_lookup_and_child_environment() {
+    let parent_home = std::env::var_os("HOME");
+    let parent_path = std::env::var_os("PATH");
+    let env = integration_test_env();
+    let base = unique_base();
+    let bin = base.join("bin");
+    let home = base.join("home");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let binary = bin.join("herdr-test-version");
+    fs::write(
+        &binary,
+        "#!/bin/sh\n[ -d \"$HOME\" ] || exit 1\n[ \"$HOME\" = \"$HERDR_TEST_VERSION_HOME\" ] || exit 2\n[ \"$PATH\" = \"$HERDR_TEST_VERSION_PATH\" ] || exit 3\n[ -z \"${XDG_CONFIG_HOME+x}\" ] || exit 4\nprintf '%s\\n' \"$1\"\n",
+    )
+    .unwrap();
+    make_executable(&binary).unwrap();
+    env.set("HOME", &home);
+    env.set("PATH", &bin);
+    env.set("HERDR_TEST_VERSION_HOME", &home);
+    env.set("HERDR_TEST_VERSION_PATH", &bin);
+    assert!(command_available("herdr-test-version"));
+    let mut requirement = AgentVersionRequirement {
+        label: "test agent",
+        binary: "herdr-test-version",
+        args: &["0.14.0"],
+        min_version: "0.14.0",
+    };
+    assert!(enforce_agent_version(&requirement).unwrap().is_none());
+    requirement.args = &["0.12.1"];
+    assert!(enforce_agent_version(&requirement)
+        .unwrap_err()
+        .to_string()
+        .contains("too old"));
+    env.remove("PATH");
+    assert!(!command_available("herdr-test-version"));
+    assert!(enforce_agent_version(&requirement)
+        .unwrap()
+        .unwrap()
+        .contains("could not run"));
+    assert_eq!(std::env::var_os("HOME"), parent_home);
+    assert_eq!(std::env::var_os("PATH"), parent_path);
+    fs::remove_dir_all(base).unwrap();
+}
+
+fn clear_integration_path_env(env: &IntegrationTestEnv) {
+    env.remove(PI_CODING_AGENT_DIR_ENV_VAR);
+    env.remove(OMP_CONFIG_DIR_ENV_VAR);
+    env.remove(CLAUDE_CONFIG_DIR_ENV_VAR);
+    env.remove(CODEX_HOME_ENV_VAR);
+    env.remove(COPILOT_HOME_ENV_VAR);
+    env.remove(KIMI_CODE_HOME_ENV_VAR);
+    env.remove("XDG_CONFIG_HOME");
+    env.remove("XDG_STATE_HOME");
     #[cfg(windows)]
-    std::env::remove_var("APPDATA");
-    std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(QWEN_HOME_ENV_VAR);
-    std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
-    std::env::remove_var(GROK_HOME_ENV_VAR);
+    env.remove("APPDATA");
+    env.remove(QODERCLI_CONFIG_DIR_ENV_VAR);
+    env.remove(QWEN_HOME_ENV_VAR);
+    env.remove(CURSOR_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_HOME_ENV_VAR);
 }
 
 fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -181,67 +281,61 @@ fn assert_kimi_hook(
 }
 
 fn unique_base() -> PathBuf {
-    clear_integration_path_env();
+    // Fixtures now overlap; clock granularity alone is not a uniqueness guarantee.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "herdr-integration-install-test-{}-{}",
+        "herdr-integration-install-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 
 #[cfg(windows)]
 #[test]
 fn home_dir_uses_userprofile_when_home_is_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let previous_home = std::env::var_os("HOME");
-    let previous_userprofile = std::env::var_os("USERPROFILE");
-    std::env::remove_var("HOME");
-    std::env::set_var("USERPROFILE", &base);
+    let previous_home = var_os("HOME");
+    let previous_userprofile = var_os("USERPROFILE");
+    env.remove("HOME");
+    env.set("USERPROFILE", &base);
 
     assert_eq!(home_dir().unwrap(), base);
 
     if let Some(home) = previous_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     }
     if let Some(userprofile) = previous_userprofile {
-        std::env::set_var("USERPROFILE", userprofile);
+        env.set("USERPROFILE", userprofile);
     } else {
-        std::env::remove_var("USERPROFILE");
+        env.remove("USERPROFILE");
     }
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_devin_dir_uses_appdata_without_xdg_override() {
-    let previous_appdata;
+    let parent_appdata = std::env::var_os("APPDATA");
+    let env = integration_test_env();
+    let base = unique_base();
+    let outer_appdata = base.join("outer-appdata");
+    env.set("APPDATA", &outer_appdata);
     {
-        let _lock = integration_env_lock();
-        previous_appdata = std::env::var_os("APPDATA");
-        let previous_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let base = unique_base();
+        let inner = integration_test_env();
         let appdata = base.join("appdata");
         let xdg = base.join("xdg");
-        std::env::set_var("APPDATA", &appdata);
-
+        inner.set("APPDATA", &appdata);
         assert_eq!(devin_dir().unwrap(), appdata.join("devin"));
-
-        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        inner.set("XDG_CONFIG_HOME", &xdg);
         assert_eq!(devin_dir().unwrap(), xdg.join("devin"));
-
-        if let Some(value) = previous_xdg {
-            std::env::set_var("XDG_CONFIG_HOME", value);
-        } else {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
     }
-    {
-        let _lock = integration_env_lock();
-        assert_eq!(std::env::var_os("APPDATA"), previous_appdata);
-    }
+    assert_eq!(devin_dir().unwrap(), outer_appdata.join("devin"));
+    assert_eq!(var_os("XDG_CONFIG_HOME"), None);
+    assert_eq!(std::env::var_os("APPDATA"), parent_appdata);
 }
 
 #[cfg(windows)]
@@ -273,12 +367,12 @@ fn windows_supports_portable_integrations() {
 fn windows_availability_includes_native_integrations() {
     use crate::api::schema::IntegrationTarget;
 
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let original_path = var_os("PATH");
+    env.set("PATH", &bin);
 
     fs::write(bin.join("pi.cmd"), "@echo off\r\n").unwrap();
     fs::write(bin.join("omp.cmd"), "@echo off\r\n").unwrap();
@@ -301,9 +395,9 @@ fn windows_availability_includes_native_integrations() {
     assert!(integration_target_available(IntegrationTarget::Grok));
 
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -313,12 +407,12 @@ fn windows_availability_includes_native_integrations() {
 fn command_available_requires_executable_file_on_path() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let original_path = var_os("PATH");
+    env.set("PATH", &bin);
 
     let command = bin.join("claude");
     fs::write(&command, "#!/bin/sh\n").unwrap();
@@ -329,9 +423,9 @@ fn command_available_requires_executable_file_on_path() {
     assert!(command_available("claude"));
 
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -339,12 +433,12 @@ fn command_available_requires_executable_file_on_path() {
 #[test]
 #[cfg(windows)]
 fn command_available_finds_windows_command_shims_on_path() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let original_path = var_os("PATH");
+    env.set("PATH", &bin);
 
     fs::write(bin.join("claude.cmd"), "@echo off\r\n").unwrap();
     assert!(command_available("claude"));
@@ -355,9 +449,9 @@ fn command_available_finds_windows_command_shims_on_path() {
     assert!(!command_available("missing-agent"));
 
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -365,12 +459,12 @@ fn command_available_finds_windows_command_shims_on_path() {
 #[test]
 #[cfg(windows)]
 fn qodercli_availability_checks_windows_aliases() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let bin = base.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("PATH", &bin);
+    let original_path = var_os("PATH");
+    env.set("PATH", &bin);
 
     fs::write(bin.join("qoder.cmd"), "@echo off\r\n").unwrap();
 
@@ -379,9 +473,9 @@ fn qodercli_availability_checks_windows_aliases() {
     ));
 
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -389,20 +483,20 @@ fn qodercli_availability_checks_windows_aliases() {
 #[test]
 #[cfg(windows)]
 fn hermes_layout_makes_target_available() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let local_app_data = base.join("local-app-data");
     let hermes_bin = local_app_data.join("hermes").join("bin");
     fs::create_dir_all(&hermes_bin).unwrap();
     fs::write(hermes_bin.join("hermes.exe"), "").unwrap();
-    let original_hermes_home = std::env::var_os(HERMES_HOME_ENV_VAR);
-    let original_home = std::env::var_os("HOME");
-    let original_local_app_data = std::env::var_os("LOCALAPPDATA");
-    let original_path = std::env::var_os("PATH");
-    std::env::remove_var(HERMES_HOME_ENV_VAR);
-    std::env::remove_var("HOME");
-    std::env::set_var("LOCALAPPDATA", &local_app_data);
-    std::env::set_var("PATH", "");
+    let original_hermes_home = var_os(HERMES_HOME_ENV_VAR);
+    let original_home = var_os("HOME");
+    let original_local_app_data = var_os("LOCALAPPDATA");
+    let original_path = var_os("PATH");
+    env.remove(HERMES_HOME_ENV_VAR);
+    env.remove("HOME");
+    env.set("LOCALAPPDATA", &local_app_data);
+    env.set("PATH", "");
 
     assert!(hermes_install_layout_available());
     assert!(integration_target_available(
@@ -410,31 +504,31 @@ fn hermes_layout_makes_target_available() {
     ));
 
     if let Some(hermes_home) = original_hermes_home {
-        std::env::set_var(HERMES_HOME_ENV_VAR, hermes_home);
+        env.set(HERMES_HOME_ENV_VAR, hermes_home);
     } else {
-        std::env::remove_var(HERMES_HOME_ENV_VAR);
+        env.remove(HERMES_HOME_ENV_VAR);
     }
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     if let Some(local_app_data) = original_local_app_data {
-        std::env::set_var("LOCALAPPDATA", local_app_data);
+        env.set("LOCALAPPDATA", local_app_data);
     } else {
-        std::env::remove_var("LOCALAPPDATA");
+        env.remove("LOCALAPPDATA");
     }
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn codex_availability_finds_standalone_binary_under_codex_home() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let bin = home
@@ -444,31 +538,31 @@ fn codex_availability_finds_standalone_binary_under_codex_home() {
     let binary = bin.join(codex_executable_name());
     fs::write(&binary, "").unwrap();
     make_executable(&binary).unwrap();
-    let original_home = std::env::var_os("HOME");
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("HOME", &home);
-    std::env::set_var("PATH", "");
+    let original_home = var_os("HOME");
+    let original_path = var_os("PATH");
+    env.set("HOME", &home);
+    env.set("PATH", "");
 
     assert!(integration_target_available(
         crate::api::schema::IntegrationTarget::Codex
     ));
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn integration_recommendations_mark_standalone_codex_available() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let bin = home
@@ -478,10 +572,10 @@ fn integration_recommendations_mark_standalone_codex_available() {
     let binary = bin.join(codex_executable_name());
     fs::write(&binary, "").unwrap();
     make_executable(&binary).unwrap();
-    let original_home = std::env::var_os("HOME");
-    let original_path = std::env::var_os("PATH");
-    std::env::set_var("HOME", &home);
-    std::env::set_var("PATH", "");
+    let original_home = var_os("HOME");
+    let original_path = var_os("PATH");
+    env.set("HOME", &home);
+    env.set("PATH", "");
 
     let codex = integration_recommendations()
         .into_iter()
@@ -495,14 +589,14 @@ fn integration_recommendations_mark_standalone_codex_available() {
     assert!(codex.needs_install());
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     if let Some(path) = original_path {
-        std::env::set_var("PATH", path);
+        env.set("PATH", path);
     } else {
-        std::env::remove_var("PATH");
+        env.remove("PATH");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -533,12 +627,12 @@ fn integration_recommendation_installs_available_or_outdated_targets() {
 
 #[test]
 fn install_pi_writes_embedded_asset_to_pi_extensions_dir() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".pi/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let path = install_pi().unwrap();
     let content = fs::read_to_string(&path).unwrap();
@@ -546,18 +640,18 @@ fn install_pi_writes_embedded_asset_to_pi_extensions_dir() {
     assert_eq!(path, ext_dir.join(PI_EXTENSION_INSTALL_NAME));
     assert_eq!(content, PI_EXTENSION_ASSET);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_pi_creates_extensions_dir_when_agent_dir_exists() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let agent_dir = home.join(".pi/agent");
     fs::create_dir_all(&agent_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let path = install_pi().unwrap();
 
@@ -567,54 +661,54 @@ fn install_pi_creates_extensions_dir_when_agent_dir_exists() {
     );
     assert!(path.is_file());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_pi_uses_pi_coding_agent_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agent_dir = base.join("custom-pi-agent");
     let ext_dir = agent_dir.join("extensions");
     fs::create_dir_all(&ext_dir).unwrap();
-    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &agent_dir);
+    env.set(PI_CODING_AGENT_DIR_ENV_VAR, &agent_dir);
 
     let path = install_pi().unwrap();
 
     assert_eq!(path, ext_dir.join(PI_EXTENSION_INSTALL_NAME));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_pi_expands_tilde_in_pi_coding_agent_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join("custom-pi-agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, "~/custom-pi-agent");
+    env.set("HOME", &home);
+    env.set(PI_CODING_AGENT_DIR_ENV_VAR, "~/custom-pi-agent");
 
     let path = install_pi().unwrap();
 
     assert_eq!(path, ext_dir.join(PI_EXTENSION_INSTALL_NAME));
 
-    std::env::remove_var("HOME");
-    clear_integration_path_env();
+    env.remove("HOME");
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_writes_embedded_asset_to_omp_extensions_dir() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".omp/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_omp().unwrap();
     let content = fs::read_to_string(&installed.extension_path).unwrap();
@@ -626,20 +720,20 @@ fn install_omp_writes_embedded_asset_to_omp_extensions_dir() {
     assert!(!installed.removed_legacy_pi_extension);
     assert_eq!(content, OMP_EXTENSION_ASSET);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_removes_legacy_pi_integration_from_omp_extensions_dir() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".omp/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
     let legacy_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
     fs::write(&legacy_path, PI_EXTENSION_ASSET).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_omp().unwrap();
 
@@ -650,20 +744,20 @@ fn install_omp_removes_legacy_pi_integration_from_omp_extensions_dir() {
     assert!(installed.removed_legacy_pi_extension);
     assert!(!legacy_path.exists());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_preserves_non_herdr_file_with_pi_install_name() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".omp/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
     let user_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
     fs::write(&user_path, "// user extension\n").unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_omp().unwrap();
 
@@ -677,19 +771,19 @@ fn install_omp_preserves_non_herdr_file_with_pi_install_name() {
         "// user extension\n"
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_uses_pi_config_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join("custom-omp/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
-    std::env::set_var("HOME", &home);
-    std::env::set_var(OMP_CONFIG_DIR_ENV_VAR, "custom-omp");
+    env.set("HOME", &home);
+    env.set(OMP_CONFIG_DIR_ENV_VAR, "custom-omp");
 
     let installed = install_omp().unwrap();
 
@@ -699,22 +793,22 @@ fn install_omp_uses_pi_config_dir_env() {
     );
     assert!(!installed.removed_legacy_pi_extension);
 
-    std::env::remove_var("HOME");
-    clear_integration_path_env();
+    env.remove("HOME");
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_refuses_shared_pi_extension_directory() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agent_dir = base.join("shared-agent");
     let ext_dir = agent_dir.join("extensions");
     let pi_extension = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
     fs::create_dir_all(&ext_dir).unwrap();
     fs::write(&pi_extension, PI_EXTENSION_ASSET).unwrap();
-    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &agent_dir);
-    std::env::set_var(OMP_CONFIG_DIR_ENV_VAR, "ignored-omp-config");
+    env.set(PI_CODING_AGENT_DIR_ENV_VAR, &agent_dir);
+    env.set(OMP_CONFIG_DIR_ENV_VAR, "ignored-omp-config");
 
     let err = install_omp().unwrap_err().to_string();
 
@@ -723,19 +817,19 @@ fn install_omp_refuses_shared_pi_extension_directory() {
     assert!(pi_extension.is_file());
     assert!(!ext_dir.join(OMP_EXTENSION_INSTALL_NAME).exists());
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_creates_extensions_dir_when_agent_dir_exists() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let agent_dir = home.join(".omp/agent");
     let ext_dir = agent_dir.join("extensions");
     fs::create_dir_all(&agent_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_omp().unwrap();
 
@@ -746,13 +840,13 @@ fn install_omp_creates_extensions_dir_when_agent_dir_exists() {
     assert!(ext_dir.is_dir());
     assert!(!installed.removed_legacy_pi_extension);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_omp_removes_embedded_extension_when_present() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".omp/agent/extensions");
@@ -762,7 +856,7 @@ fn uninstall_omp_removes_embedded_extension_when_present() {
         OMP_EXTENSION_ASSET,
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_omp().unwrap();
 
@@ -773,35 +867,35 @@ fn uninstall_omp_removes_embedded_extension_when_present() {
     assert!(result.removed_extension);
     assert!(!result.extension_path.exists());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_omp_errors_when_extension_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_omp().unwrap_err().to_string();
 
     assert!(err.contains("omp extension directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_pi_removes_embedded_extension_when_present() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".pi/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
     fs::write(ext_dir.join(PI_EXTENSION_INSTALL_NAME), PI_EXTENSION_ASSET).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_pi().unwrap();
 
@@ -812,20 +906,20 @@ fn uninstall_pi_removes_embedded_extension_when_present() {
     assert!(result.removed_extension);
     assert!(!result.extension_path.exists());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn outdated_integrations_treat_missing_version_marker_as_legacy() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".pi/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
     let extension_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
     fs::write(&extension_path, "// installed by herdr\n").unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let outdated = outdated_installed_integrations();
 
@@ -838,13 +932,13 @@ fn outdated_integrations_treat_missing_version_marker_as_legacy() {
     assert_eq!(outdated[0].installed_version, None);
     assert_eq!(outdated[0].expected_version, PI_INTEGRATION_VERSION);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn outdated_integrations_detect_previous_pi_version() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".pi/agent/extensions");
@@ -855,7 +949,7 @@ fn outdated_integrations_detect_previous_pi_version() {
         "// HERDR_INTEGRATION_ID=pi\n// HERDR_INTEGRATION_VERSION=4\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let outdated = outdated_installed_integrations();
 
@@ -868,13 +962,13 @@ fn outdated_integrations_detect_previous_pi_version() {
     assert_eq!(outdated[0].installed_version, Some(4));
     assert_eq!(outdated[0].expected_version, PI_INTEGRATION_VERSION);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn outdated_integrations_detect_previous_omp_version() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".omp/agent/extensions");
@@ -885,7 +979,7 @@ fn outdated_integrations_detect_previous_omp_version() {
         "// HERDR_INTEGRATION_ID=omp\n// HERDR_INTEGRATION_VERSION=4\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let outdated = outdated_installed_integrations();
 
@@ -898,45 +992,45 @@ fn outdated_integrations_detect_previous_omp_version() {
     assert_eq!(outdated[0].installed_version, Some(4));
     assert_eq!(outdated[0].expected_version, OMP_INTEGRATION_VERSION);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn outdated_integrations_accept_current_version_marker() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let ext_dir = home.join(".pi/agent/extensions");
     fs::create_dir_all(&ext_dir).unwrap();
     fs::write(ext_dir.join(PI_EXTENSION_INSTALL_NAME), PI_EXTENSION_ASSET).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     assert!(outdated_installed_integrations().is_empty());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_pi_errors_when_extension_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_pi().unwrap_err().to_string();
 
     assert!(err.contains("pi extension directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_claude_writes_hook_and_updates_settings() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_dir = home.join(".claude");
@@ -946,7 +1040,7 @@ fn install_claude_writes_hook_and_updates_settings() {
         r#"{"permissions":{"allow":["Read"]},"hooks":{}}"#,
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_claude().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -976,17 +1070,17 @@ fn install_claude_writes_hook_and_updates_settings() {
     assert!(settings["hooks"].get("Stop").is_none());
     assert!(settings["hooks"].get("SessionEnd").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_claude_uses_claude_config_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let claude_dir = base.join("custom-claude");
     fs::create_dir_all(&claude_dir).unwrap();
-    std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+    env.set(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
     let installed = install_claude().unwrap();
 
@@ -996,18 +1090,18 @@ fn install_claude_uses_claude_config_dir_env() {
         claude_dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME)
     );
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_claude_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_dir = home.join(".claude");
     fs::create_dir_all(&claude_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_claude().unwrap();
     install_claude().unwrap();
@@ -1028,13 +1122,13 @@ fn install_claude_is_idempotent_for_hook_entries() {
     assert!(settings["hooks"].get("Stop").is_none());
     assert!(settings["hooks"].get("SessionEnd").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_claude_removes_deprecated_completion_hooks_and_preserves_user_hooks() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_dir = home.join(".claude");
@@ -1078,7 +1172,7 @@ fn install_claude_removes_deprecated_completion_hooks_and_preserves_user_hooks()
         serde_json::to_string(&settings).unwrap(),
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_claude().unwrap();
 
@@ -1105,13 +1199,13 @@ fn install_claude_removes_deprecated_completion_hooks_and_preserves_user_hooks()
     assert!(settings["hooks"].get("PreToolUse").is_none());
     assert!(settings["hooks"].get("Stop").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn claude_v9_integration_status_is_outdated_until_reinstalled() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_hooks_dir = home.join(".claude").join("hooks");
@@ -1122,7 +1216,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=9\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let statuses = installed_integration_statuses();
     let claude = statuses
@@ -1144,13 +1238,13 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
     assert_eq!(status.installed_version, Some(10));
     assert_eq!(status.state, IntegrationStatusKind::Current);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn claude_v2_integration_status_is_outdated() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_hooks_dir = home.join(".claude").join("hooks");
@@ -1161,7 +1255,7 @@ fn claude_v2_integration_status_is_outdated() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=2\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let statuses = installed_integration_statuses();
     let claude = statuses
@@ -1174,13 +1268,13 @@ fn claude_v2_integration_status_is_outdated() {
     assert_eq!(claude.expected_version, 10);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_claude_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let claude_dir = home.join(".claude");
@@ -1232,7 +1326,7 @@ fn uninstall_claude_removes_herdr_hooks_and_preserves_others() {
         serde_json::to_string(&settings).unwrap(),
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_claude().unwrap();
     let settings: Value =
@@ -1261,29 +1355,29 @@ fn uninstall_claude_removes_herdr_hooks_and_preserves_others() {
     assert!(settings["hooks"].get("Stop").is_none());
     assert!(settings["hooks"].get("SessionEnd").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_claude_errors_when_claude_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_claude().unwrap_err().to_string();
 
     assert!(err.contains("claude directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn codex_v2_integration_status_is_outdated() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let codex_dir = home.join(".codex");
@@ -1294,7 +1388,7 @@ fn codex_v2_integration_status_is_outdated() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=codex\n# HERDR_INTEGRATION_VERSION=2\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let statuses = installed_integration_statuses();
     let codex = statuses
@@ -1307,19 +1401,19 @@ fn codex_v2_integration_status_is_outdated() {
     assert_eq!(codex.expected_version, 8);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_codex_writes_hook_and_updates_hooks_and_config() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let codex_dir = home.join(".codex");
     fs::create_dir_all(&codex_dir).unwrap();
     fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_codex().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -1344,18 +1438,18 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
     assert!(config.contains("hooks = true"));
     assert!(!config.contains("codex_hooks"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_codex_uses_codex_home_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let codex_dir = base.join("custom-codex");
     fs::create_dir_all(&codex_dir).unwrap();
     fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
-    std::env::set_var(CODEX_HOME_ENV_VAR, &codex_dir);
+    env.set(CODEX_HOME_ENV_VAR, &codex_dir);
 
     let installed = install_codex().unwrap();
 
@@ -1363,13 +1457,13 @@ fn install_codex_uses_codex_home_env() {
     assert_eq!(installed.hooks_path, codex_dir.join("hooks.json"));
     assert_eq!(installed.config_path, codex_dir.join("config.toml"));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let codex_dir = home.join(".codex");
@@ -1379,7 +1473,7 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
         "[features]\ncodex_hooks = false\nother = true\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_codex().unwrap();
     install_codex().unwrap();
@@ -1397,13 +1491,13 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     assert!(!config.contains("codex_hooks"));
     assert!(config.contains("other = true"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_codex_only_migrates_top_level_feature_flags() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let codex_dir = home.join(".codex");
@@ -1413,7 +1507,7 @@ fn install_codex_only_migrates_top_level_feature_flags() {
             "profile = \"work\"\n\n[profiles.work.features]\nhooks = false\ncodex_hooks = false\n\n[features]\ncodex_hooks = true\nother = true\n",
         )
         .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_codex().unwrap();
 
@@ -1422,13 +1516,13 @@ fn install_codex_only_migrates_top_level_feature_flags() {
     assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
     assert!(config.contains("[features]\nhooks = true\nother = true"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let codex_dir = home.join(".codex");
@@ -1457,7 +1551,7 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
         "[features]\nhooks = true\nother = true\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_codex().unwrap();
     let hooks: Value =
@@ -1485,29 +1579,29 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
     assert!(config.contains("hooks = true"));
     assert!(config.contains("other = true"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_codex_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_codex().unwrap_err().to_string();
 
     assert!(err.contains("codex config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_kimi_writes_hook_and_updates_config() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let kimi_dir = home.join(".kimi-code");
@@ -1517,7 +1611,7 @@ fn install_kimi_writes_hook_and_updates_config() {
             "default_model = \"moonshot\"\n\n[[hooks]]\nevent = \"Notification\"\nmatcher = \"task.completed\"\ncommand = \"echo keep\"\ntimeout = 3\n",
         )
         .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_kimi().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -1539,7 +1633,7 @@ fn install_kimi_writes_hook_and_updates_config() {
         assert_kimi_hook(&config, &installed.hook_path, event, matcher, action);
     }
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
@@ -1565,11 +1659,11 @@ fn kimi_question_hooks_report_blocked_until_the_question_finishes() {
 
 #[test]
 fn install_kimi_uses_kimi_code_home_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let kimi_dir = base.join("custom-kimi");
     fs::create_dir_all(&kimi_dir).unwrap();
-    std::env::set_var(KIMI_CODE_HOME_ENV_VAR, &kimi_dir);
+    env.set(KIMI_CODE_HOME_ENV_VAR, &kimi_dir);
 
     let installed = install_kimi().unwrap();
 
@@ -1579,18 +1673,18 @@ fn install_kimi_uses_kimi_code_home_env() {
     );
     assert_eq!(installed.config_path, kimi_dir.join("config.toml"));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_kimi_is_idempotent_for_config_block() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let kimi_dir = home.join(".kimi-code");
     fs::create_dir_all(&kimi_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_kimi().unwrap();
     install_kimi().unwrap();
@@ -1602,18 +1696,18 @@ fn install_kimi_is_idempotent_for_config_block() {
     assert_eq!(config.matches(KIMI_CONFIG_BLOCK_END).count(), 1);
     assert_eq!(hooks.len(), KIMI_HOOK_EVENTS.len());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_kimi_removes_hook_and_config_block_preserves_other_hooks() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let kimi_dir = home.join(".kimi-code");
     fs::create_dir_all(&kimi_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_kimi().unwrap();
     fs::write(
@@ -1642,29 +1736,29 @@ fn uninstall_kimi_removes_hook_and_config_block_preserves_other_hooks() {
         Some("Notification")
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_kimi_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_kimi().unwrap_err().to_string();
 
     assert!(err.contains("kimi code config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_copilot_writes_hook_and_updates_settings() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let copilot_dir = home.join(".copilot");
@@ -1682,7 +1776,7 @@ fn install_copilot_writes_hook_and_updates_settings() {
             ),
         )
         .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_copilot().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -1712,13 +1806,13 @@ fn install_copilot_writes_hook_and_updates_settings() {
     }
     assert!(settings["hooks"].get("sessionStart").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn copilot_v1_integration_status_is_outdated() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let copilot_hooks_dir = home.join(".copilot").join("hooks");
@@ -1729,7 +1823,7 @@ fn copilot_v1_integration_status_is_outdated() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=copilot\n# HERDR_INTEGRATION_VERSION=1\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let statuses = installed_integration_statuses();
     let copilot = statuses
@@ -1742,17 +1836,17 @@ fn copilot_v1_integration_status_is_outdated() {
     assert_eq!(copilot.expected_version, COPILOT_INTEGRATION_VERSION);
     assert_eq!(copilot.state, IntegrationStatusKind::Outdated);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_copilot_uses_copilot_home_env_and_is_idempotent() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let copilot_dir = base.join("custom-copilot");
     fs::create_dir_all(&copilot_dir).unwrap();
-    std::env::set_var(COPILOT_HOME_ENV_VAR, &copilot_dir);
+    env.set(COPILOT_HOME_ENV_VAR, &copilot_dir);
 
     let installed = install_copilot().unwrap();
     install_copilot().unwrap();
@@ -1777,13 +1871,13 @@ fn install_copilot_uses_copilot_home_env_and_is_idempotent() {
     }
     assert!(settings["hooks"].get("sessionStart").is_none());
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_copilot_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let copilot_dir = home.join(".copilot");
@@ -1815,7 +1909,7 @@ fn uninstall_copilot_removes_herdr_hooks_and_preserves_others() {
         serde_json::to_string(&settings).unwrap(),
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_copilot().unwrap();
     let settings: Value =
@@ -1830,29 +1924,29 @@ fn uninstall_copilot_removes_herdr_hooks_and_preserves_others() {
     assert!(settings["hooks"].get("PostToolUse").is_none());
     assert!(settings["hooks"].get("notification").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_copilot_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_copilot().unwrap_err().to_string();
 
     assert!(err.contains("copilot config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_devin_writes_hook_and_updates_settings() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let xdg_config = base.join("xdg");
     let devin_dir = xdg_config.join("devin");
@@ -1862,8 +1956,8 @@ fn install_devin_writes_hook_and_updates_settings() {
         r#"{"theme_mode":"dark","hooks":{}}"#,
     )
     .unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
-    std::env::set_var("HOME", base.join("home"));
+    env.set("XDG_CONFIG_HOME", &xdg_config);
+    env.set("HOME", base.join("home"));
 
     let installed = install_devin().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -1884,20 +1978,20 @@ fn install_devin_writes_hook_and_updates_settings() {
         );
     }
 
-    clear_integration_path_env();
-    std::env::remove_var("HOME");
+    clear_integration_path_env(&env);
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_devin_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let xdg_config = base.join("xdg");
     let devin_dir = xdg_config.join("devin");
     fs::create_dir_all(&devin_dir).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
-    std::env::set_var("HOME", base.join("home"));
+    env.set("XDG_CONFIG_HOME", &xdg_config);
+    env.set("HOME", base.join("home"));
 
     install_devin().unwrap();
     install_devin().unwrap();
@@ -1912,20 +2006,20 @@ fn install_devin_is_idempotent_for_hook_entries() {
         );
     }
 
-    clear_integration_path_env();
-    std::env::remove_var("HOME");
+    clear_integration_path_env(&env);
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_devin_removes_legacy_lifecycle_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let xdg_config = base.join("xdg");
     let devin_dir = xdg_config.join("devin");
     fs::create_dir_all(&devin_dir).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
-    std::env::set_var("HOME", base.join("home"));
+    env.set("XDG_CONFIG_HOME", &xdg_config);
+    env.set("HOME", base.join("home"));
 
     let hook_path = devin_dir.join(DEVIN_HOOK_INSTALL_NAME);
     let mut hooks = Map::new();
@@ -1998,20 +2092,20 @@ fn install_devin_removes_legacy_lifecycle_hook_entries() {
         );
     }
 
-    clear_integration_path_env();
-    std::env::remove_var("HOME");
+    clear_integration_path_env(&env);
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_devin_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let xdg_config = base.join("xdg");
     let devin_dir = xdg_config.join("devin");
     fs::create_dir_all(&devin_dir).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
-    std::env::set_var("HOME", base.join("home"));
+    env.set("XDG_CONFIG_HOME", &xdg_config);
+    env.set("HOME", base.join("home"));
 
     install_devin().unwrap();
 
@@ -2059,31 +2153,31 @@ fn uninstall_devin_removes_herdr_hooks_and_preserves_others() {
     assert!(settings["hooks"].get("Stop").is_none());
     assert!(settings["hooks"].get("SessionEnd").is_none());
 
-    clear_integration_path_env();
-    std::env::remove_var("HOME");
+    clear_integration_path_env(&env);
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_devin_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let xdg_config = base.join("xdg");
     fs::create_dir_all(&xdg_config).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
-    std::env::set_var("HOME", base.join("home"));
+    env.set("XDG_CONFIG_HOME", &xdg_config);
+    env.set("HOME", base.join("home"));
 
     let err = install_devin().unwrap_err().to_string();
     assert!(err.contains("devin config directory not found"));
 
-    clear_integration_path_env();
-    std::env::remove_var("HOME");
+    clear_integration_path_env(&env);
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_droid_writes_hook_to_settings_and_cleans_legacy_hooks_json() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let droid_dir = home.join(".factory");
@@ -2107,7 +2201,7 @@ fn install_droid_writes_hook_to_settings_and_cleans_legacy_hooks_json() {
         r#"{"theme":"factory-dark"}"#,
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_droid().unwrap();
     let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
@@ -2144,18 +2238,18 @@ fn install_droid_writes_hook_to_settings_and_cleans_legacy_hooks_json() {
     assert_eq!(legacy_hooks["hooks"]["PreToolUse"][0]["matcher"], "Read");
     assert!(legacy_hooks["hooks"].get("SessionStart").is_none());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_droid_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let droid_dir = home.join(".factory");
     fs::create_dir_all(&droid_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_droid().unwrap();
     install_droid().unwrap();
@@ -2171,13 +2265,13 @@ fn install_droid_is_idempotent_for_hook_entries() {
         );
     }
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn droid_v1_integration_status_is_outdated() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let droid_hooks_dir = home.join(".factory").join("hooks");
@@ -2188,7 +2282,7 @@ fn droid_v1_integration_status_is_outdated() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=droid\n# HERDR_INTEGRATION_VERSION=1\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let statuses = installed_integration_statuses();
     let droid = statuses
@@ -2201,13 +2295,13 @@ fn droid_v1_integration_status_is_outdated() {
     assert_eq!(droid.expected_version, DROID_INTEGRATION_VERSION);
     assert_eq!(droid.state, IntegrationStatusKind::Outdated);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_droid_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let droid_dir = home.join(".factory");
@@ -2235,7 +2329,7 @@ fn uninstall_droid_removes_herdr_hooks_and_preserves_others() {
             ),
         )
         .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_droid().unwrap();
     let hooks: Value =
@@ -2263,34 +2357,34 @@ fn uninstall_droid_removes_herdr_hooks_and_preserves_others() {
     assert!(settings["hooks"].get("SessionStart").is_none());
     assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Edit");
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_droid_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_droid().unwrap_err().to_string();
 
     assert!(err.contains("droid config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_opencode_writes_server_and_tui_plugins() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
     fs::create_dir_all(&opencode_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_opencode().unwrap();
 
@@ -2324,14 +2418,14 @@ fn install_opencode_writes_server_and_tui_plugins() {
         serde_json::from_str(&fs::read_to_string(&cli_config_path).unwrap()).unwrap();
     assert_eq!(cli_config["plugins"], json!([OPENCODE_V2_TUI_PLUGIN_SPEC]));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[cfg(unix)]
 #[test]
 fn opencode_reuses_json_registration_in_symlinked_config_directory() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dotfiles = base.join("dotfiles");
@@ -2339,7 +2433,7 @@ fn opencode_reuses_json_registration_in_symlinked_config_directory() {
     fs::create_dir_all(home.join(".config")).unwrap();
     fs::create_dir_all(&dotfiles).unwrap();
     std::os::unix::fs::symlink(&dotfiles, &dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let json_path = dir.join("tui.json");
     let original = "{\n  // User preferences\n  \"theme\":\"system\",\n  \"plugin\":[\"other\",[\"./herdr-tui-session.js\",{\"enabled\":true}]]\n}\n";
     fs::write(&json_path, original).unwrap();
@@ -2387,19 +2481,19 @@ fn opencode_reuses_json_registration_in_symlinked_config_directory() {
     assert_eq!(fs::read_link(&dir).unwrap(), dotfiles);
     assert!(!result.plugin_path.exists());
     assert!(!result.tui_plugin_path.exists());
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
 fn opencode_install_defers_v2_registration_while_migration_pending() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
     fs::create_dir_all(&opencode_dir).unwrap();
     fs::write(opencode_dir.join("tui.json"), "{}").unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_opencode().unwrap();
 
@@ -2410,18 +2504,18 @@ fn opencode_install_defers_v2_registration_while_migration_pending() {
         .join("tui.js")
         .is_file());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn opencode_v2_install_status_and_uninstall_preserve_cli_preferences() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dir = home.join(".config/opencode");
     fs::create_dir_all(&dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let cli = dir.join("cli.json");
     fs::write(
         &cli,
@@ -2456,18 +2550,18 @@ fn opencode_v2_install_status_and_uninstall_preserve_cli_preferences() {
         serde_json::from_str::<Value>(&fs::read_to_string(cli).unwrap()).unwrap(),
         json!({"theme":{"name":"catppuccin"},"plugins":["other"]})
     );
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn opencode_hard_link_rejection_precedes_install_and_uninstall_asset_changes() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dir = home.join(".config/opencode");
     fs::create_dir_all(dir.join("plugins")).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
     fs::write(&plugin, "previous integration").unwrap();
     let config = dir.join("cli.json");
@@ -2488,18 +2582,18 @@ fn opencode_hard_link_rejection_precedes_install_and_uninstall_asset_changes() {
     assert_eq!(crate::platform::config_file_link_count(&config).unwrap(), 2);
     assert!(!dir.join("tui.jsonc").exists());
     assert!(!dir.join(OPENCODE_V2_TUI_PLUGIN_DIR).exists());
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
 fn opencode_json_config_validation_precedes_asset_changes() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dir = home.join(".config/opencode");
     fs::create_dir_all(dir.join("plugins")).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
     fs::write(&plugin, "previous integration").unwrap();
     let config = dir.join("tui.json");
@@ -2524,19 +2618,19 @@ fn opencode_json_config_validation_precedes_asset_changes() {
     assert_eq!(fs::read_to_string(&alias).unwrap(), original);
     assert!(!dir.join("tui.jsonc").exists());
     assert!(!dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME).exists());
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     fs::remove_dir_all(base).unwrap();
 }
 
 #[cfg(windows)]
 #[test]
 fn opencode_recovery_copy_blocks_retry_before_parsing_or_asset_changes() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dir = home.join(".config/opencode");
     fs::create_dir_all(dir.join("plugins")).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
     fs::write(&plugin, "previous integration").unwrap();
     let config = dir.join("cli.json");
@@ -2576,36 +2670,36 @@ fn opencode_recovery_copy_blocks_retry_before_parsing_or_asset_changes() {
     assert_eq!(fs::read_to_string(&plugin).unwrap(), "previous integration");
     assert!(!dir.join("tui.jsonc").exists());
     assert!(!dir.join(OPENCODE_V2_TUI_PLUGIN_DIR).exists());
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     fs::remove_dir_all(base).unwrap();
 }
 
 #[test]
 fn opencode_invalid_cli_config_does_not_overwrite_existing_plugins() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let dir = home.join(".config/opencode");
     fs::create_dir_all(dir.join("plugins")).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let plugin = dir.join("plugins").join(OPENCODE_PLUGIN_INSTALL_NAME);
     fs::write(&plugin, "previous integration").unwrap();
     fs::write(dir.join("cli.json"), r#"{"plugins":{}}"#).unwrap();
     assert!(install_opencode().is_err());
     assert_eq!(fs::read_to_string(plugin).unwrap(), "previous integration");
     assert!(!dir.join("tui.jsonc").exists());
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn opencode_status_requires_the_tui_plugin_and_config_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
     fs::create_dir_all(&opencode_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let installed = install_opencode().unwrap();
     let status = || {
         integration_status_at(
@@ -2623,18 +2717,18 @@ fn opencode_status_requires_the_tui_plugin_and_config_entry() {
     super::opencode_config::remove_tui_plugin(&opencode_dir, OPENCODE_TUI_PLUGIN_SPEC).unwrap();
     assert_eq!(status(), IntegrationStatusKind::Outdated);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_opencode_removes_plugins_and_managed_tui_config_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
     fs::create_dir_all(&opencode_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
     let installed = install_opencode().unwrap();
 
     let result = uninstall_opencode().unwrap();
@@ -2653,19 +2747,19 @@ fn uninstall_opencode_removes_plugins_and_managed_tui_config_entry() {
     assert_eq!(tui_config, json!({}));
     assert_eq!(installed.plugin_path, result.plugin_path);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_opencode_invalid_tui_config_does_not_write_plugins() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
     fs::create_dir_all(&opencode_dir).unwrap();
     fs::write(opencode_dir.join("tui.jsonc"), r#"{"plugin":{}}"#).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_opencode().unwrap_err().to_string();
 
@@ -2676,13 +2770,13 @@ fn install_opencode_invalid_tui_config_does_not_write_plugins() {
         .exists());
     assert!(!opencode_dir.join(OPENCODE_TUI_PLUGIN_INSTALL_NAME).exists());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_opencode_removes_plugins_when_tui_config_is_invalid() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let opencode_dir = home.join(".config/opencode");
@@ -2699,7 +2793,7 @@ fn uninstall_opencode_removes_plugins_when_tui_config_is_invalid() {
         r#"{"plugin":["./herdr-tui-session.js","other"]}"#,
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = uninstall_opencode().unwrap_err().to_string();
 
@@ -2711,34 +2805,34 @@ fn uninstall_opencode_removes_plugins_when_tui_config_is_invalid() {
         json!({"plugin":["other"]})
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_opencode_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_opencode().unwrap_err().to_string();
 
     assert!(err.contains("opencode config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_kilo_writes_plugin_to_plugin_dir() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let kilo_dir = home.join(".config/kilo");
     fs::create_dir_all(&kilo_dir).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_kilo().unwrap();
     let plugin_content = fs::read_to_string(&installed.plugin_path).unwrap();
@@ -2749,13 +2843,13 @@ fn install_kilo_writes_plugin_to_plugin_dir() {
     );
     assert_eq!(plugin_content, KILO_PLUGIN_ASSET);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_kilo_removes_plugin_when_present() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let kilo_plugin_dir = home.join(".config/kilo/plugin");
@@ -2765,42 +2859,42 @@ fn uninstall_kilo_removes_plugin_when_present() {
         KILO_PLUGIN_ASSET,
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_kilo().unwrap();
 
     assert!(result.removed_plugin);
     assert!(!result.plugin_path.exists());
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_kilo_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_kilo().unwrap_err().to_string();
 
     assert!(err.contains("kilo config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_hermes_writes_plugin_and_enables_it() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
     fs::create_dir_all(&hermes_dir).unwrap();
     fs::write(hermes_dir.join("config.yaml"), "model:\n  provider: auto\n").unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let installed = install_hermes().unwrap();
     let manifest = fs::read_to_string(
@@ -2821,13 +2915,13 @@ fn install_hermes_writes_plugin_and_enables_it() {
     assert_eq!(init, HERMES_PLUGIN_INIT_ASSET);
     assert!(config.contains("plugins:\n  enabled:\n    - herdr-agent-state"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_hermes_is_idempotent_for_enabled_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -2837,7 +2931,7 @@ fn install_hermes_is_idempotent_for_enabled_entry() {
         "plugins:\n  enabled:\n    - herdr-agent-state\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_hermes().unwrap();
     install_hermes().unwrap();
@@ -2845,13 +2939,13 @@ fn install_hermes_is_idempotent_for_enabled_entry() {
     let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
     assert_eq!(config.matches("herdr-agent-state").count(), 1);
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_hermes_preserves_flat_plugin_list() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -2861,7 +2955,7 @@ fn install_hermes_preserves_flat_plugin_list() {
         "plugins:\n  - platforms/discord\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_hermes().unwrap();
 
@@ -2871,13 +2965,13 @@ fn install_hermes_preserves_flat_plugin_list() {
         "plugins:\n  - herdr-agent-state\n  - platforms/discord\n"
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_hermes_converts_flow_plugin_list_to_block_list() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -2887,7 +2981,7 @@ fn install_hermes_converts_flow_plugin_list_to_block_list() {
         "plugins: [platforms/discord]\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_hermes().unwrap();
 
@@ -2897,7 +2991,7 @@ fn install_hermes_converts_flow_plugin_list_to_block_list() {
         "plugins:\n  - herdr-agent-state\n  - platforms/discord\n"
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
@@ -2956,7 +3050,7 @@ fn install_hermes_is_idempotent_for_inline_enabled_list_entry() {
 
 #[test]
 fn install_hermes_is_idempotent_for_quoted_flat_plugin_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -2966,7 +3060,7 @@ fn install_hermes_is_idempotent_for_quoted_flat_plugin_entry() {
         "plugins:\n  - \"herdr-agent-state\" # installed by herdr\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     install_hermes().unwrap();
 
@@ -2976,13 +3070,13 @@ fn install_hermes_is_idempotent_for_quoted_flat_plugin_entry() {
         "plugins:\n  - \"herdr-agent-state\" # installed by herdr\n"
     );
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_hermes_removes_plugin_and_enabled_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -2998,7 +3092,7 @@ fn uninstall_hermes_removes_plugin_and_enabled_entry() {
         "plugins:\n  enabled:\n    - other-plugin\n    - herdr-agent-state\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_hermes().unwrap();
     let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
@@ -3009,13 +3103,13 @@ fn uninstall_hermes_removes_plugin_and_enabled_entry() {
     assert!(config.contains("    - other-plugin"));
     assert!(!config.contains("herdr-agent-state"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_hermes_preserves_flat_plugin_list() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -3031,7 +3125,7 @@ fn uninstall_hermes_preserves_flat_plugin_list() {
         "plugins:\n  - other-plugin\n  - herdr-agent-state\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_hermes().unwrap();
     let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
@@ -3040,13 +3134,13 @@ fn uninstall_hermes_preserves_flat_plugin_list() {
     assert!(result.updated_config);
     assert_eq!(config, "plugins:\n  - other-plugin\n");
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_hermes_removes_flow_plugin_list_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -3062,7 +3156,7 @@ fn uninstall_hermes_removes_flow_plugin_list_entry() {
         "plugins: [other-plugin, herdr-agent-state]\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_hermes().unwrap();
     let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
@@ -3071,7 +3165,7 @@ fn uninstall_hermes_removes_flow_plugin_list_entry() {
     assert!(result.updated_config);
     assert_eq!(config, "plugins:\n  - other-plugin\n");
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
@@ -3101,7 +3195,7 @@ fn uninstall_hermes_converts_single_inline_enabled_entry_to_empty_list() {
 
 #[test]
 fn uninstall_hermes_removes_commented_flat_plugin_entry() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let hermes_dir = home.join(".hermes");
@@ -3117,7 +3211,7 @@ fn uninstall_hermes_removes_commented_flat_plugin_entry() {
         "plugins:\n  - other-plugin\n  - herdr-agent-state # installed by herdr\n",
     )
     .unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let result = uninstall_hermes().unwrap();
     let config = fs::read_to_string(hermes_dir.join("config.yaml")).unwrap();
@@ -3126,23 +3220,23 @@ fn uninstall_hermes_removes_commented_flat_plugin_entry() {
     assert!(result.updated_config);
     assert_eq!(config, "plugins:\n  - other-plugin\n");
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_hermes_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    std::env::set_var("HOME", &home);
+    env.set("HOME", &home);
 
     let err = install_hermes().unwrap_err().to_string();
 
     assert!(err.contains("hermes config directory not found"));
 
-    std::env::remove_var("HOME");
+    env.remove("HOME");
     let _ = fs::remove_dir_all(base);
 }
 
@@ -3383,7 +3477,7 @@ fn omp_ask_and_approval_events_report_blocked_state() {
 
 #[test]
 fn install_qodercli_writes_hook_and_updates_settings() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let qoder_dir = base.join(".qoder");
     fs::create_dir_all(&qoder_dir).unwrap();
@@ -3392,7 +3486,7 @@ fn install_qodercli_writes_hook_and_updates_settings() {
         r#"{"permissions":{"allow":["Read"]},"hooks":{}}"#,
     )
     .unwrap();
-    std::env::set_var(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
+    env.set(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
 
     let installed = install_qodercli().unwrap();
 
@@ -3423,17 +3517,17 @@ fn install_qodercli_writes_hook_and_updates_settings() {
     // Pre-existing settings keys must be preserved.
     assert!(settings.get("permissions").is_some());
 
-    std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    env.remove(QODERCLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_qodercli_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let qoder_dir = base.join(".qoder");
     fs::create_dir_all(&qoder_dir).unwrap();
-    std::env::set_var(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
+    env.set(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
 
     install_qodercli().unwrap();
     install_qodercli().unwrap();
@@ -3451,17 +3545,17 @@ fn install_qodercli_is_idempotent_for_hook_entries() {
         );
     }
 
-    std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    env.remove(QODERCLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_qodercli_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let qoder_dir = base.join(".qoder");
     fs::create_dir_all(&qoder_dir).unwrap();
-    std::env::set_var(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
+    env.set(QODERCLI_CONFIG_DIR_ENV_VAR, &qoder_dir);
 
     install_qodercli().unwrap();
     // Inject a foreign hook entry the user might have configured by hand.
@@ -3494,16 +3588,16 @@ fn uninstall_qodercli_removes_herdr_hooks_and_preserves_others() {
     let cmd = remaining[0]["hooks"][0]["command"].as_str().unwrap();
     assert_eq!(cmd, "echo user-defined");
 
-    std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    env.remove(QODERCLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_qodercli_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let missing = base.join(".qoder");
-    std::env::set_var(QODERCLI_CONFIG_DIR_ENV_VAR, &missing);
+    env.set(QODERCLI_CONFIG_DIR_ENV_VAR, &missing);
 
     let err = install_qodercli().unwrap_err().to_string();
     assert!(
@@ -3511,13 +3605,13 @@ fn install_qodercli_errors_when_config_dir_missing() {
         "unexpected error: {err}"
     );
 
-    std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
+    env.remove(QODERCLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_qwen_writes_session_hook_and_preserves_settings() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let qwen_dir = base.join(".qwen");
     fs::create_dir_all(&qwen_dir).unwrap();
@@ -3526,7 +3620,7 @@ fn install_qwen_writes_session_hook_and_preserves_settings() {
         r#"{"permissions":{"allow":["Read"]},"hooks":{}}"#,
     )
     .unwrap();
-    std::env::set_var(QWEN_HOME_ENV_VAR, &qwen_dir);
+    env.set(QWEN_HOME_ENV_VAR, &qwen_dir);
 
     let installed = install_qwen().unwrap();
 
@@ -3560,17 +3654,17 @@ fn install_qwen_writes_session_hook_and_preserves_settings() {
         1
     );
 
-    std::env::remove_var(QWEN_HOME_ENV_VAR);
+    env.remove(QWEN_HOME_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_qwen_removes_only_herdr_hook() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let qwen_dir = base.join(".qwen");
     fs::create_dir_all(&qwen_dir).unwrap();
-    std::env::set_var(QWEN_HOME_ENV_VAR, &qwen_dir);
+    env.set(QWEN_HOME_ENV_VAR, &qwen_dir);
 
     install_qwen().unwrap();
     let settings_path = qwen_dir.join("settings.json");
@@ -3599,27 +3693,27 @@ fn uninstall_qwen_removes_only_herdr_hook() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0]["hooks"][0]["command"], "echo user-defined");
 
-    std::env::remove_var(QWEN_HOME_ENV_VAR);
+    env.remove(QWEN_HOME_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_qwen_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let missing = base.join(".qwen");
-    std::env::set_var(QWEN_HOME_ENV_VAR, &missing);
+    env.set(QWEN_HOME_ENV_VAR, &missing);
 
     let err = install_qwen().unwrap_err().to_string();
     assert!(err.contains("qwen code config directory not found"));
 
-    std::env::remove_var(QWEN_HOME_ENV_VAR);
+    env.remove(QWEN_HOME_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_and_uninstall_letta_preserve_unrelated_settings_and_hooks() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let letta_dir = home.join(".letta");
@@ -3630,8 +3724,8 @@ fn install_and_uninstall_letta_preserve_unrelated_settings_and_hooks() {
         r#"{"theme":"dark","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo user"}]}]}}"#,
     )
     .unwrap();
-    let previous_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &home);
+    let previous_home = var_os("HOME");
+    env.set("HOME", &home);
 
     let installed = install_letta().unwrap();
     assert_eq!(
@@ -3667,9 +3761,9 @@ fn install_and_uninstall_letta_preserve_unrelated_settings_and_hooks() {
     assert_eq!(remaining[0]["hooks"][0]["command"], "echo user");
 
     if let Some(home) = previous_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -3679,14 +3773,14 @@ fn install_and_uninstall_letta_preserve_unrelated_settings_and_hooks() {
 fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(home.join(".letta")).unwrap();
-    let previous_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &home);
+    let previous_home = var_os("HOME");
+    env.set("HOME", &home);
     let installed = install_letta().unwrap();
 
     let capture = base.join("args.txt");
@@ -3703,7 +3797,10 @@ fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     permissions.set_mode(0o755);
     fs::set_permissions(&fake_herdr, permissions).unwrap();
 
-    let mut child = Command::new("sh")
+    // The real hook needs shell utilities, but its HOME remains the fixture's.
+    env.set("PATH", std::env::var_os("PATH").expect("test runner PATH"));
+    let mut child = super::test_support::command("sh")
+        .unwrap()
         .arg(&installed.hook_path)
         .arg("session")
         .env("HERDR_ENV", "1")
@@ -3734,43 +3831,43 @@ fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     assert!(args.contains("--session-start-source resume"));
 
     if let Some(home) = previous_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_letta_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     fs::create_dir_all(&home).unwrap();
-    let previous_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &home);
+    let previous_home = var_os("HOME");
+    env.set("HOME", &home);
 
     let err = install_letta().unwrap_err().to_string();
     assert!(err.contains("letta code config directory not found"));
 
     if let Some(home) = previous_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_letta_does_not_publish_hook_when_settings_are_invalid() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home = base.join("home");
     let letta_dir = home.join(".letta");
     fs::create_dir_all(&letta_dir).unwrap();
     fs::write(letta_dir.join("settings.json"), "not json").unwrap();
-    let previous_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &home);
+    let previous_home = var_os("HOME");
+    env.set("HOME", &home);
 
     assert!(install_letta().is_err());
     assert!(!letta_dir
@@ -3779,9 +3876,9 @@ fn install_letta_does_not_publish_hook_when_settings_are_invalid() {
         .exists());
 
     if let Some(home) = previous_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -3807,7 +3904,7 @@ fn letta_staged_install_can_restore_the_prior_file() {
 
 #[test]
 fn install_cursor_writes_hook_and_updates_hooks_json() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
     fs::create_dir_all(&cursor_dir).unwrap();
@@ -3816,7 +3913,7 @@ fn install_cursor_writes_hook_and_updates_hooks_json() {
         r#"{"version":1,"hooks":{"stop":[{"command":"echo keep-me"}]}}"#,
     )
     .unwrap();
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
 
     let installed = install_cursor().unwrap();
 
@@ -3848,17 +3945,17 @@ fn install_cursor_writes_hook_and_updates_hooks_json() {
         Some("echo keep-me")
     );
 
-    std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
+    env.remove(CURSOR_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_cursor_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
     fs::create_dir_all(&cursor_dir).unwrap();
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
 
     install_cursor().unwrap();
     install_cursor().unwrap();
@@ -3869,17 +3966,17 @@ fn install_cursor_is_idempotent_for_hook_entries() {
     let session_start = hooks.get("sessionStart").and_then(Value::as_array).unwrap();
     assert_eq!(session_start.len(), 1);
 
-    std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
+    env.remove(CURSOR_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_cursor_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
     fs::create_dir_all(&cursor_dir).unwrap();
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
 
     install_cursor().unwrap();
     let mut hooks_file: Value =
@@ -3902,17 +3999,17 @@ fn uninstall_cursor_removes_herdr_hooks_and_preserves_others() {
     assert!(!hooks.contains_key("sessionStart"));
     assert!(hooks.contains_key("beforeSubmitPrompt"));
 
-    std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
+    env.remove(CURSOR_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_cursor_uses_cursor_config_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join("custom-cursor");
     fs::create_dir_all(&cursor_dir).unwrap();
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
 
     let installed = install_cursor().unwrap();
 
@@ -3922,13 +4019,13 @@ fn install_cursor_uses_cursor_config_dir_env() {
     );
     assert_eq!(installed.hooks_path, cursor_dir.join("hooks.json"));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn cursor_v1_integration_status_is_current() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
     fs::create_dir_all(&cursor_dir).unwrap();
@@ -3938,7 +4035,7 @@ fn cursor_v1_integration_status_is_current() {
         "#!/bin/sh\n# HERDR_INTEGRATION_ID=cursor\n# HERDR_INTEGRATION_VERSION=1\n",
     )
     .unwrap();
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &cursor_dir);
 
     let statuses = installed_integration_statuses();
     let cursor = statuses
@@ -3948,16 +4045,16 @@ fn cursor_v1_integration_status_is_current() {
     assert_eq!(cursor.state, IntegrationStatusKind::Current);
     assert_eq!(cursor.installed_version, Some(CURSOR_INTEGRATION_VERSION));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_cursor_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let missing = base.join(".cursor");
-    std::env::set_var(CURSOR_CONFIG_DIR_ENV_VAR, &missing);
+    env.set(CURSOR_CONFIG_DIR_ENV_VAR, &missing);
 
     let err = install_cursor().unwrap_err().to_string();
     assert!(
@@ -3965,15 +4062,15 @@ fn install_cursor_errors_when_config_dir_missing() {
         "unexpected error: {err}"
     );
 
-    std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
+    env.remove(CURSOR_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_mastracode_writes_hook_and_updates_hooks_json() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
+    let original_home = var_os("HOME");
     let mastracode_dir = base.join(".mastracode");
     fs::create_dir_all(&mastracode_dir).unwrap();
     fs::write(
@@ -3981,7 +4078,7 @@ fn install_mastracode_writes_hook_and_updates_hooks_json() {
         r#"{"PostToolUse":[{"type":"command","command":"echo keep-me"}]}"#,
     )
     .unwrap();
-    std::env::set_var("HOME", &base);
+    env.set("HOME", &base);
 
     let installed = install_mastracode().unwrap();
 
@@ -4026,9 +4123,9 @@ fn install_mastracode_writes_hook_and_updates_hooks_json() {
     );
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
@@ -4042,11 +4139,11 @@ fn grok_session_command(config: &Value) -> String {
 
 #[test]
 fn install_grok_writes_hook_and_config() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
 
     let installed = install_grok().unwrap();
 
@@ -4076,15 +4173,15 @@ fn install_grok_writes_hook_and_config() {
         assert!(command.ends_with(" session"));
     }
 
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_mastracode_removes_v1_lifecycle_hooks() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
+    let original_home = var_os("HOME");
     let mastracode_dir = base.join(".mastracode");
     let hook_path = mastracode_dir
         .join("hooks")
@@ -4107,7 +4204,7 @@ fn install_mastracode_removes_v1_lifecycle_hooks() {
         .unwrap(),
     )
     .unwrap();
-    std::env::set_var("HOME", &base);
+    env.set("HOME", &base);
 
     install_mastracode().unwrap();
 
@@ -4124,19 +4221,19 @@ fn install_mastracode_removes_v1_lifecycle_hooks() {
     );
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_mastracode_is_idempotent_for_hook_entries() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &base);
+    let original_home = var_os("HOME");
+    env.set("HOME", &base);
 
     install_mastracode().unwrap();
     install_mastracode().unwrap();
@@ -4151,20 +4248,20 @@ fn install_mastracode_is_idempotent_for_hook_entries() {
     }
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_grok_is_idempotent() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
 
     install_grok().unwrap();
     let first =
@@ -4174,16 +4271,16 @@ fn install_grok_is_idempotent() {
         fs::read_to_string(grok_dir.join("hooks").join(GROK_HOOK_CONFIG_INSTALL_NAME)).unwrap();
     assert_eq!(first, second);
 
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_mastracode_removes_herdr_hooks_and_preserves_others() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", &base);
+    let original_home = var_os("HOME");
+    env.set("HOME", &base);
 
     install_mastracode().unwrap();
     let hooks_path = base.join(".mastracode").join("hooks.json");
@@ -4228,22 +4325,22 @@ fn uninstall_mastracode_removes_herdr_hooks_and_preserves_others() {
     );
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_grok_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     // Deliberately do not create the ~/.grok directory ahead of time: the
     // installer must refuse instead of conjuring a config dir for an agent
     // that is not installed.
     let missing = base.join(".grok");
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &missing);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &missing);
 
     let err = install_grok().unwrap_err().to_string();
     assert!(
@@ -4251,17 +4348,17 @@ fn install_grok_errors_when_config_dir_missing() {
         "unexpected error: {err}"
     );
 
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_grok_removes_files() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
 
     install_grok().unwrap();
     let result = uninstall_grok().unwrap();
@@ -4275,17 +4372,17 @@ fn uninstall_grok_removes_files() {
     assert!(!again.removed_hook_file);
     assert!(!again.removed_config_file);
 
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_grok_uses_grok_config_dir_env() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join("custom-grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
 
     let installed = install_grok().unwrap();
 
@@ -4296,19 +4393,19 @@ fn install_grok_uses_grok_config_dir_env() {
         hooks_dir.join(GROK_HOOK_CONFIG_INSTALL_NAME)
     );
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_mastracode_errors_when_event_value_not_array() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
+    let original_home = var_os("HOME");
     let mastracode_dir = base.join(".mastracode");
     fs::create_dir_all(&mastracode_dir).unwrap();
     fs::write(mastracode_dir.join("hooks.json"), r#"{"SessionStart":{}}"#).unwrap();
-    std::env::set_var("HOME", &base);
+    env.set("HOME", &base);
 
     let err = install_mastracode().unwrap_err().to_string();
     assert!(
@@ -4317,22 +4414,22 @@ fn install_mastracode_errors_when_event_value_not_array() {
     );
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_mastracode_errors_when_event_value_not_array() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
-    let original_home = std::env::var_os("HOME");
+    let original_home = var_os("HOME");
     let mastracode_dir = base.join(".mastracode");
     fs::create_dir_all(&mastracode_dir).unwrap();
     fs::write(mastracode_dir.join("hooks.json"), r#"{"SessionStart":{}}"#).unwrap();
-    std::env::set_var("HOME", &base);
+    env.set("HOME", &base);
 
     let err = uninstall_mastracode().unwrap_err().to_string();
     assert!(
@@ -4341,16 +4438,16 @@ fn uninstall_mastracode_errors_when_event_value_not_array() {
     );
 
     if let Some(home) = original_home {
-        std::env::set_var("HOME", home);
+        env.set("HOME", home);
     } else {
-        std::env::remove_var("HOME");
+        env.remove("HOME");
     }
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
     fs::create_dir_all(&agy_dir).unwrap();
@@ -4359,7 +4456,7 @@ fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
         r#"{"lint-checker":{"PreInvocation":[{"type":"command","command":"echo keep-me"}]}}"#,
     )
     .unwrap();
-    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
 
     let installed = install_antigravity_cli().unwrap();
 
@@ -4433,13 +4530,13 @@ fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
         Some("echo keep-me")
     );
 
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
     let hook_dir = agy_dir.join("hooks");
@@ -4450,7 +4547,7 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
             .replace("HERDR_INTEGRATION_VERSION=3", "HERDR_INTEGRATION_VERSION=2"),
     )
     .unwrap();
-    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
 
     let status = || {
         installed_integration_statuses()
@@ -4466,13 +4563,13 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
     install_antigravity_cli().unwrap();
     assert_eq!(status().state, IntegrationStatusKind::Current);
 
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_antigravity_cli_rewrites_stale_herdr_block() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
     fs::create_dir_all(&agy_dir).unwrap();
@@ -4483,7 +4580,7 @@ fn install_antigravity_cli_rewrites_stale_herdr_block() {
         r#"{"herdr":{"Stop":[{"matcher":"*","hooks":[{"type":"command","command":"stale"}]}],"PostInvocation":[{"type":"command","command":"stale idle"}],"Legacy":[]}}"#,
     )
     .unwrap();
-    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
 
     install_antigravity_cli().unwrap();
 
@@ -4512,33 +4609,33 @@ fn install_antigravity_cli_rewrites_stale_herdr_block() {
         .and_then(Value::as_str)
         .is_some_and(|command| command != "stale" && command != "stale idle"));
 
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn install_antigravity_cli_errors_when_config_dir_missing() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
-    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
 
     let err = install_antigravity_cli().unwrap_err();
     assert!(err.to_string().contains("install antigravity cli first"));
     assert!(!agy_dir.exists(), "install must not create the config dir");
 
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn grok_v1_integration_status_is_outdated() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     let hooks_dir = grok_dir.join("hooks");
     fs::create_dir_all(&hooks_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
     let hook_path = hooks_dir.join(GROK_HOOK_INSTALL_NAME);
     fs::write(
         &hook_path,
@@ -4559,17 +4656,17 @@ fn grok_v1_integration_status_is_outdated() {
     assert_eq!(grok.expected_version, GROK_INTEGRATION_VERSION);
     assert_eq!(grok.state, IntegrationStatusKind::Outdated);
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn grok_v2_integration_status_is_current() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
     // A real install writes both the hook script and hooks/herdr.json.
     install_grok().unwrap();
 
@@ -4581,17 +4678,17 @@ fn grok_v2_integration_status_is_current() {
     assert_eq!(grok.state, IntegrationStatusKind::Current);
     assert_eq!(grok.installed_version, Some(GROK_INTEGRATION_VERSION));
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn grok_status_reports_outdated_when_hook_config_missing_or_broken() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let grok_dir = base.join(".grok");
     fs::create_dir_all(&grok_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &grok_dir);
     install_grok().unwrap();
     let config_path = grok_dir.join("hooks").join(GROK_HOOK_CONFIG_INSTALL_NAME);
 
@@ -4670,13 +4767,13 @@ fn grok_status_reports_outdated_when_hook_config_missing_or_broken() {
     install_grok().unwrap();
     assert_eq!(grok_state(), IntegrationStatusKind::Current);
 
-    clear_integration_path_env();
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn uninstall_antigravity_cli_removes_hooks_json_entries_and_hook_file() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
     fs::create_dir_all(&agy_dir).unwrap();
@@ -4685,7 +4782,7 @@ fn uninstall_antigravity_cli_removes_hooks_json_entries_and_hook_file() {
         r#"{"lint-checker":{"PreInvocation":[{"type":"command","command":"echo keep-me"}]}}"#,
     )
     .unwrap();
-    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    env.set(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
 
     // Install first
     let installed = install_antigravity_cli().unwrap();
@@ -4705,18 +4802,18 @@ fn uninstall_antigravity_cli_removes_hooks_json_entries_and_hook_file() {
     assert!(hooks.get(ANTIGRAVITY_CLI_HOOK_BLOCK_NAME).is_none());
     assert!(hooks.contains_key("lint-checker"));
 
-    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    env.remove(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_dir_all(base);
 }
 
 #[test]
 fn grok_dir_honors_grok_home_after_config_dir_seam() {
-    let _lock = integration_env_lock();
+    let env = integration_test_env();
     let base = unique_base();
     let home_dir = base.join("grok-home");
     fs::create_dir_all(&home_dir).unwrap();
-    std::env::remove_var(GROK_CONFIG_DIR_ENV_VAR);
-    std::env::set_var(GROK_HOME_ENV_VAR, &home_dir);
+    env.remove(GROK_CONFIG_DIR_ENV_VAR);
+    env.set(GROK_HOME_ENV_VAR, &home_dir);
 
     // The grok CLI reads its config (and hooks/) from $GROK_HOME, so the
     // integration must install there too.
@@ -4729,14 +4826,14 @@ fn grok_dir_honors_grok_home_after_config_dir_seam() {
     // The herdr-level test seam still wins over GROK_HOME when set.
     let seam_dir = base.join("seam");
     fs::create_dir_all(&seam_dir).unwrap();
-    std::env::set_var(GROK_CONFIG_DIR_ENV_VAR, &seam_dir);
+    env.set(GROK_CONFIG_DIR_ENV_VAR, &seam_dir);
     let installed = install_grok().unwrap();
     assert_eq!(
         installed.hook_path,
         seam_dir.join("hooks").join(GROK_HOOK_INSTALL_NAME)
     );
 
-    std::env::remove_var(GROK_HOME_ENV_VAR);
-    clear_integration_path_env();
+    env.remove(GROK_HOME_ENV_VAR);
+    clear_integration_path_env(&env);
     let _ = fs::remove_dir_all(base);
 }

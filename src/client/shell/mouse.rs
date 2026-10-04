@@ -568,6 +568,9 @@ impl ClientShellState {
         source_workspace_id: &str,
         before_workspace_id: Option<&str>,
     ) -> Option<crate::api::schema::Method> {
+        if self.config.grouping.enabled {
+            return None;
+        }
         let snapshot = self.snapshot.as_deref()?;
         let source = snapshot
             .workspaces
@@ -2004,6 +2007,9 @@ impl ClientShellState {
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
                     outcome.repaint = true;
+                    return;
+                }
+                if self.handle_grouped_heading_click(point, outcome) {
                     return;
                 }
                 if self.handle_endpoint_machine_click(point, outcome) {

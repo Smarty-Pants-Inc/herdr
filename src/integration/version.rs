@@ -47,10 +47,14 @@ pub(crate) fn enforce_agent_version(
     requirement: &AgentVersionRequirement,
 ) -> io::Result<Option<String>> {
     let probe = format!("{} {}", requirement.binary, requirement.args.join(" "));
-    let output = match crate::noninteractive_process::command(requirement.binary)
+    #[cfg(test)]
+    let output = super::test_support::command(requirement.binary)
+        .and_then(|mut command| command.args(requirement.args).output());
+    #[cfg(not(test))]
+    let output = crate::noninteractive_process::command(requirement.binary)
         .args(requirement.args)
-        .output()
-    {
+        .output();
+    let output = match output {
         Ok(output) if output.status.success() => output,
         _ => {
             return Ok(Some(format!(

@@ -390,11 +390,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn update_preserves_symlink_and_existing_plugin_settings() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let base = temp_registry_path("update");
         let base = base.parent().unwrap();
-        let previous_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", base);
+        let _dirs = crate::config::test_config_dirs(base, &base.join("state"));
         let path = registry_path();
         let target = base.join("dotfiles/plugins.json");
         let mut existing = sample_plugin("example.existing");
@@ -406,10 +404,6 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
 
         let result = update(|plugins| plugins.push(sample_plugin("example.added")));
-        match previous_config_home {
-            Some(previous) => std::env::set_var("XDG_CONFIG_HOME", previous),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
 
         let (_, entries) = result.unwrap();
         assert_eq!(std::fs::read_link(&path).unwrap(), target);

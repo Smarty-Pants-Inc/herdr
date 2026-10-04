@@ -126,7 +126,7 @@ pub(crate) fn integration_target_install_layout_available(
 }
 
 pub(crate) fn command_available(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
+    let Some(paths) = var_os("PATH") else {
         return false;
     };
     std::env::split_paths(&paths).any(|dir| {

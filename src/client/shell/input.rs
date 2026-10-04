@@ -649,7 +649,12 @@ impl ClientShellState {
         use crate::input::{KeybindAction, KeybindDispatch, KeybindMatch};
 
         self.pending_workspace_highlight = None;
-        if key.code == KeyCode::Esc || self.config.keybinds.matches_prefix(key) {
+        if self.handle_grouped_navigation_key(key, outcome) {
+            return;
+        }
+        if key.code == KeyCode::Esc
+            || crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix)
+        {
             self.mode = self.copy_or_terminal_mode();
             self.navigate_workspace_id = None;
             outcome.repaint = true;

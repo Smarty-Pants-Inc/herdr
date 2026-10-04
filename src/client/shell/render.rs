@@ -232,6 +232,9 @@ pub(super) fn render_mode_bar(
 pub(super) struct ShellRenderState<'a> {
     pub(super) machine_diagnostics: &'a super::machine_diagnostics::MachineDiagnostics,
     pub(super) endpoints: &'a [ClientShellEndpoint],
+    pub(super) grouped_rows: &'a [super::grouped_projection::GroupedRow],
+    pub(super) grouped_collapsed: &'a HashSet<super::grouped_projection::GroupKey>,
+    pub(super) grouped_reveal_target: Option<&'a WorkspaceNavigationTarget>,
     pub(super) active_endpoint_id: &'a ClientEndpointId,
     pub(super) collapsed_endpoints: &'a HashSet<ClientEndpointId>,
     pub(super) collapsed_groups: &'a HashSet<String>,
@@ -268,7 +271,16 @@ pub(super) fn render_shell(
         );
     }
     if layout.sidebar.width > 0 {
-        if state.endpoints.len() > 1 {
+        if config.grouping.enabled {
+            super::grouped_sidebar::render(
+                buffer,
+                layout.sidebar,
+                Some(snapshot),
+                config,
+                &mut state,
+                &mut hits,
+            );
+        } else if state.endpoints.len() > 1 {
             if state.sidebar_collapsed {
                 super::endpoint_sidebar::render_collapsed(
                     buffer,
@@ -329,6 +341,7 @@ pub(super) fn render_shell(
         hits.agent_sort_toggle = Rect::default();
         hits.new_workspace = Rect::default();
         hits.machines.clear();
+        hits.grouped_headings.clear();
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();

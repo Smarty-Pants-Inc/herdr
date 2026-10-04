@@ -57,6 +57,9 @@ impl ClientShellState {
         let mut render_state = render::ShellRenderState {
             machine_diagnostics: &self.machine_diagnostics,
             endpoints: &self.endpoints,
+            grouped_rows: &self.grouped_visible_rows,
+            grouped_collapsed: &self.grouped_collapsed,
+            grouped_reveal_target: self.grouped_reveal_target.as_ref(),
             active_endpoint_id: &self.active_endpoint_id,
             collapsed_endpoints: &self.collapsed_endpoints,
             collapsed_groups: &self.collapsed_groups,
@@ -78,7 +81,16 @@ impl ClientShellState {
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
         };
-        if let Some(snapshot) = local_snapshot {
+        if self.config.grouping.enabled {
+            super::grouped_sidebar::render(
+                &mut buffer,
+                sidebar,
+                self.snapshot.as_deref(),
+                &self.config,
+                &mut render_state,
+                &mut self.hits,
+            );
+        } else if let Some(snapshot) = local_snapshot {
             render::render_sidebar(
                 &mut buffer,
                 sidebar,
@@ -158,6 +170,9 @@ impl ClientShellState {
             self.reveal_navigation_workspace = true;
             self.reveal_mobile_workspace = true;
         }
+        // Prepare after resize reveal requests so mobile consumes them in this frame,
+        // rather than reopening a manually collapsed heading on the next frame.
+        self.prepare_grouped_view(cols, rows);
         self.last_composed_size = Some((cols, rows));
         let valid_navigation_target = self.mode == ClientShellMode::Navigate
             && self
@@ -213,6 +228,9 @@ impl ClientShellState {
             render::ShellRenderState {
                 machine_diagnostics: &self.machine_diagnostics,
                 endpoints: &self.endpoints,
+                grouped_rows: &self.grouped_visible_rows,
+                grouped_collapsed: &self.grouped_collapsed,
+                grouped_reveal_target: self.grouped_reveal_target.as_ref(),
                 active_endpoint_id: &self.active_endpoint_id,
                 collapsed_endpoints: &self.collapsed_endpoints,
                 collapsed_groups: &self.collapsed_groups,
@@ -607,6 +625,7 @@ impl ClientShellState {
                 &self.endpoints,
                 &self.active_endpoint_id,
                 &self.config,
+                (&self.grouped_visible_rows, &self.grouped_collapsed),
                 self.navigate_workspace_id
                     .as_ref()
                     .filter(|_| valid_navigation_target),

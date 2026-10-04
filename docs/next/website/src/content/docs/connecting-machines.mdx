@@ -67,6 +67,49 @@ Local opens immediately on startup without waiting for SSH connections. Selectin
 
 When a connection is lost, the last workspace and agent state remains visible but dimmed. That is cached information, not live state. Input and navigation into those cached panes stay disabled until a fresh connection and matching screen arrive. Reconnecting never takes selection away from the machine you are using.
 
+## Grouped view
+
+Machines is the default view. You can opt in to a client-side organization → project → lane
+sidebar across Local and saved endpoints by adding this to your local `config.toml`:
+
+```toml
+[ui.sidebar.grouping]
+enabled = true
+```
+
+Apply it with the UI's `reload config` action. Set `enabled = false` and reload again for
+an immediate return to Machines, without changing saved profiles or custom row layouts.
+
+Grouping uses explicit workspace metadata, not repository paths, machine labels, or workspace
+names. Optional token-name mappings default to the launcher's `smarty_*` contract; see
+[Grouped sidebar configuration](/docs/config-reference/#grouped-sidebar) for all ten keys
+and their defaults. Launchers report those values through the existing
+`workspace.report_metadata` API and must re-report them after server restore. Herdr does
+not interpret launcher or organization files.
+
+Workspaces without usable grouping metadata remain visible under **Ungrouped**, including
+ordinary Local work and workspaces on compatible servers without metadata reporting support.
+A missing reporting method does not reject the connection or require a server update.
+
+Click a group heading to expand or collapse it; headings never focus a server resource.
+Keyboard workspace navigation follows the displayed leaf order. In `prefix+w` mode,
+press `+` or `=` to expand all groups, or `-` to collapse the highlighted workspace's
+section. Pane arrow bindings stay unchanged. Compact and mobile views use the same
+workspace order; the mobile switcher also lets you select a heading to toggle it.
+Dragging workspaces is disabled in grouped view. Connection rows remain accessible
+below the grouped tree, including for endpoints that have not supplied a snapshot.
+
+Groups combine display headings only. Each selectable workspace keeps its originating
+endpoint and server-local workspace/pane IDs. Selecting it uses that endpoint's existing
+activation and input fencing; group IDs, host tags, issue text, and lead names never choose
+a transport. Equal IDs or labels on different servers remain separate resources. Existing
+connection failure isolation and disabled stale input still apply. This view reuses existing
+workspace tokens and connections, with **no server or endpoint codec change**.
+
+Selecting a grouped workspace does not retarget CLI commands already running inside another
+pane. Continue using `herdr --machine <label-or-id>` for explicit remote CLI routing, as
+explained under [Settings and automation](#settings-and-automation).
+
 ## Rename, disable, or remove
 
 Read profile IDs from the list rather than deriving them from labels or hostnames:

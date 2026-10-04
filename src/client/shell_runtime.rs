@@ -18,7 +18,9 @@ pub(super) fn dispatch_client_shell_actions(
                 request,
             } => {
                 if let Some(connection) = endpoints.connection(&endpoint_id).filter(|_| {
-                    endpoints.active_id() == &endpoint_id && endpoints.active_surface_available()
+                    scheduled_activation.is_none()
+                        && endpoints.active_id() == &endpoint_id
+                        && endpoints.active_surface_available()
                 }) {
                     endpoint_commands.enqueue(endpoint_id, connection.generation, boot_id, request);
                 } else if let Some(shell) = shell.as_deref_mut() {
@@ -56,10 +58,12 @@ pub(super) fn dispatch_client_shell_actions(
             }
         }
     }
-    // A source-off-first handoff leaves the registry's committed identity pointing at a
-    // deliberately surface-inactive source. Do not drain its retained queue into a server that
-    // must reject it; completion below resumes the committed owner's lane.
-    if endpoints.active_surface_available() {
+    // Selection intent already fences this batch, before the next loop installs the handoff.
+    // Do not drain old-source commands here; bootstrap retires that lane at source-off. Keep
+    // registry leases unchanged so prepare/start can still send the ordered control traffic.
+    // A pending handoff likewise retains a deliberately surface-inactive committed source;
+    // completion below resumes the committed owner's lane.
+    if scheduled_activation.is_none() && endpoints.active_surface_available() {
         let active_endpoint = endpoints.active_id().clone();
         let cancelled = endpoint_commands.send_next(&active_endpoint, endpoints);
         if let Some(shell) = shell {
@@ -848,8 +852,11 @@ pub(super) fn finish_client_shell_input(
         if !active_endpoint_online {
             continue;
         }
-        if pending_activation.is_some() {
-            // Pane input and non-focus host effects do not cross the frozen handoff boundary.
+        if pending_activation.is_some() || scheduled_activation.is_some() {
+            // Actions and requests are accumulated separately for a whole parsed stdin batch.
+            // A choice in its actions fences pane input immediately, not just after the next
+            // loop installs PendingEndpointActivation. Never replay this old-source input on
+            // either endpoint; retained host theme/focus baselines still reach the target.
             continue;
         }
         if let ClientMessage::ClientShellPaneInput { pane_id, .. } = &request {

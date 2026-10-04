@@ -587,7 +587,7 @@ fn active_endpoint_label<'a>(state: &'a ShellRenderState<'_>) -> &'a str {
         .map_or("Local", |endpoint| endpoint.label.as_str())
 }
 
-fn render_endpoint_row(
+pub(super) fn render_endpoint_row(
     buffer: &mut Buffer,
     rect: Rect,
     marker: &str,
