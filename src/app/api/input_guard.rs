@@ -64,6 +64,12 @@ impl App {
             Method::PaneSendInput(params) | Method::PaneSendInputGuarded(params) => {
                 self.pane_target(&params.pane_id)
             }
+            Method::PaneReportAgent(params) if params.resume_argv.is_some() => {
+                self.pane_target(&params.pane_id)
+            }
+            Method::PaneReportAgentSession(params) if params.resume_argv.is_some() => {
+                self.pane_target(&params.pane_id)
+            }
             _ => None,
         }
     }
@@ -79,8 +85,8 @@ mod tests {
     use super::*;
     use crate::api::schema::{
         AgentPromptParams, AgentSendKeysParams, AgentStartParams, ErrorResponse,
-        PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, ResponseResult,
-        SuccessResponse,
+        PaneReportAgentParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams,
+        ResponseResult, SuccessResponse,
     };
     use crate::app::Mode;
     use crate::config::Config;
@@ -288,6 +294,56 @@ mod tests {
             Bytes::from_static(b"deliberate")
         );
         assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_reports_are_cross_pane_content_writes_but_own_pane_reports_work() {
+        let mut fixture = attributed_agent_fixture();
+        let target_response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "foreign-resume".into(),
+                method: Method::PaneReportAgent(PaneReportAgentParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    source: "custom:pi".into(),
+                    agent: "pi".into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: Some(1),
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: Some(vec!["attacker".into()]),
+                }),
+            },
+            attributed_context(),
+        );
+        assert_denied(&target_response);
+        let (_, target_pane) = fixture.app.parse_pane_id(&fixture.target_pane_id).unwrap();
+        let target_terminal_id = fixture.app.state.workspaces[0]
+            .terminal_id(target_pane)
+            .unwrap()
+            .clone();
+        assert!(fixture.app.state.terminals[&target_terminal_id]
+            .reported_resume()
+            .is_none());
+
+        let own_response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "own-resume".into(),
+                method: Method::PaneReportAgent(PaneReportAgentParams {
+                    pane_id: fixture.source_pane_id.clone(),
+                    source: "custom:pi".into(),
+                    agent: "pi".into(),
+                    state: crate::api::schema::PaneAgentState::Working,
+                    message: None,
+                    seq: Some(1),
+                    agent_session_id: None,
+                    agent_session_path: None,
+                    resume_argv: Some(vec!["pi".into()]),
+                }),
+            },
+            attributed_context(),
+        );
+        assert_ok(&own_response);
     }
 
     #[tokio::test]
