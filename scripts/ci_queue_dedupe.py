@@ -55,7 +55,7 @@ SUBJECT = re.compile(
     r"(?:\([^)\r\n]+\))?!?:\s+\S.* \(#([1-9][0-9]*)\)$"
 )
 SHA = re.compile(r"[0-9a-f]{40}")
-PAGE_SIZE, MAX_PAGES, MAX_HISTORY, MAX_CANDIDATES = 100, 5, 100, 50
+PAGE_SIZE, MAX_PAGES, MAX_HISTORY = 100, 5, 100
 API_BUDGET_SECONDS = 120
 MAX_LOG_BYTES = 8 * 1024 * 1024
 MAX_LOG_STDERR_BYTES = 4096
@@ -317,8 +317,7 @@ class Inspector:
                       and pr["head"]["repo"] is not None
                       and pr["head"]["repo"]["full_name"] == self.repo
                       and pr["head"]["ref"].startswith("mergify/merge-queue/")]
-        require(len(candidates) <= MAX_CANDIDATES, "queue candidate cap reached")
-        proofs = []
+        # Closed-PR pagination and the shared GET deadline already bound discovery.
         for pr in candidates:
             entry = {"queue_pr": pr["number"], "head_sha": pr["head"]["sha"],
                      "head_ref": pr["head"]["ref"], "author_id": pr["user"]["id"],
@@ -339,12 +338,12 @@ class Inspector:
             except EvidenceError as error:
                 entry["reason"] = str(error)
                 continue  # An abandoned distinct queue head does not invalidate a tested tree.
-            proofs.append(proof)
-        if not proofs:
-            reasons = [entry["reason"] for entry in inspected
-                       if entry.get("head_tree") == commit["commit"]["tree"]["sha"] and "reason" in entry]
-            raise EvidenceError(reasons[0] if reasons else "no matching closed queue draft with successful CI")
-        return max(proofs, key=lambda proof: proof["run_id"])
+            # A complete proof is sufficient. Do not spend the shared API budget
+            # traversing unrelated speculative or later queue candidates.
+            return proof
+        reasons = [entry["reason"] for entry in inspected
+                   if entry.get("head_tree") == commit["commit"]["tree"]["sha"] and "reason" in entry]
+        raise EvidenceError(reasons[0] if reasons else "no matching closed queue draft with successful CI")
 
     def run_proof(self, pr, merged, entry):
         head = pr["head"]
