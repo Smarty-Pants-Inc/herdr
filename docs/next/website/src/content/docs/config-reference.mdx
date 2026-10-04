@@ -18,4 +18,50 @@ Custom command bindings (`[[keys.command]]`) are user-defined tables and are not
 listed per key here; see
 [Custom command keybindings](/docs/configuration/#custom-command-keybindings).
 
+## Grouped sidebar
+
+Machines remains the default sidebar view. To opt in to an organization → project → lane
+view across connected endpoints, add this to the **client's local** `config.toml`:
+
+```toml
+[ui.sidebar.grouping]
+enabled = true
+```
+
+Use the UI's `reload config` action to apply the change. For an immediate rollback to
+Machines, set `enabled = false` in the same table and reload config again. Saved machine
+profiles and custom sidebar row layouts are unchanged.
+
+All token-name settings below are optional strings. They map generic grouping roles to
+existing **workspace metadata token keys**, without a `$` prefix. The defaults match the
+launcher contract; other launchers can report different keys and configure these mappings.
+Herdr does not read organization files or infer project identity from paths, machine labels,
+or workspace names.
+
+| Setting under `ui.sidebar.grouping` | Default | Workspace token meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opt in to the grouped client view (boolean). |
+| `org_id` | `"smarty_org_id"` | Stable organization ID. |
+| `org_label` | `"smarty_org_label"` | Readable organization label. |
+| `project_id` | `"smarty_project_id"` | Stable project ID within the organization. |
+| `project_label` | `"smarty_project_label"` | Readable project label. |
+| `lane_id` | `"smarty_lane_id"` | Stable lane or assignment ID. |
+| `lane_purpose` | `"smarty_lane_purpose"` | Short task purpose. |
+| `issue` | `"smarty_issue"` | Tracking issue display hint. |
+| `host` | `"smarty_host"` | Execution host display hint, not a routing target. |
+| `role` | `"smarty_role"` | Workspace display role. |
+| `lead` | `"smarty_lead"` | Owning lead display hint. |
+
+Unmapped workspaces remain visible under **Ungrouped**, including ordinary Local work and
+workspaces from compatible servers that do not support `workspace.report_metadata`.
+Missing, incomplete, or conflicting grouping identity does not hide a workspace or require
+a server update. Launchers must re-report metadata after server restore; until then, missing
+metadata falls back to Ungrouped.
+
+Grouping changes only client presentation. Workspace and pane actions still route by the
+originating endpoint and its local IDs; group IDs, issue text, host hints, and lead names
+confer no routing authority. It reuses existing workspace tokens and endpoint connections,
+with **no server or endpoint codec change**. See
+[Connecting machines](/docs/connecting-machines/#grouped-view) for switching and CLI routing.
+
 <ConfigReference />

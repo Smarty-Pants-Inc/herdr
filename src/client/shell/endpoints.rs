@@ -12,6 +12,7 @@ pub(crate) struct ClientEndpointAgentViewProjection {
 pub(crate) struct ClientShellEndpoint {
     pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) label: String,
+    pub(crate) connection_target: Option<String>,
     pub(crate) status: ClientEndpointStatus,
     pub(crate) snapshot: Option<Box<ClientShellSnapshot>>,
     /// Connection generation that produced `snapshot`. `None` is reserved for local tests.
@@ -55,11 +56,14 @@ impl ClientShellState {
                 .iter()
                 .find(|endpoint| endpoint.endpoint_id == endpoint_id)
                 .filter(|endpoint| {
-                    profile.enabled && endpoint.status != ClientEndpointStatus::Disabled
+                    profile.enabled
+                        && endpoint.status != ClientEndpointStatus::Disabled
+                        && endpoint.connection_target.as_deref() == Some(profile.target.as_str())
                 });
             next.push(ClientShellEndpoint {
                 endpoint_id,
                 label: profile.label.clone(),
+                connection_target: Some(profile.target.clone()),
                 status: previous.map_or(
                     if profile.enabled {
                         ClientEndpointStatus::Connecting
@@ -97,6 +101,7 @@ impl ClientShellState {
                 .any(|endpoint| &endpoint.endpoint_id == endpoint_id)
         });
         self.endpoints = next;
+        self.invalidate_grouped_projection();
     }
 
     pub(crate) fn select_unavailable_local(&mut self) {
@@ -109,6 +114,7 @@ impl ClientShellState {
     }
 
     pub(crate) fn retire_endpoint(&mut self, endpoint_id: &ClientEndpointId) {
+        self.invalidate_grouped_projection();
         self.clear_machine_diagnostic(endpoint_id);
         if endpoint_id == &self.active_endpoint_id {
             self.pending_workspace_highlight = None;
@@ -136,6 +142,7 @@ impl ClientShellState {
         endpoint_id: &ClientEndpointId,
         status: ClientEndpointStatus,
     ) {
+        self.invalidate_grouped_projection();
         if matches!(
             status,
             ClientEndpointStatus::Online | ClientEndpointStatus::Disabled
@@ -562,6 +569,7 @@ impl ClientShellState {
         {
             return;
         }
+        self.invalidate_grouped_projection();
         let boot_changed = self.endpoints[index]
             .snapshot
             .as_deref()
@@ -728,6 +736,7 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
     ClientShellEndpoint {
         endpoint_id: ClientEndpointId::Local,
         label: "Local".into(),
+        connection_target: None,
         status: ClientEndpointStatus::Online,
         snapshot: None,
         snapshot_generation: None,

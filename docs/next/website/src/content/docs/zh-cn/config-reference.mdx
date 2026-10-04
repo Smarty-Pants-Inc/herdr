@@ -17,6 +17,47 @@ herdr --default-config
 自定义命令绑定（`[[keys.command]]`）是用户自定义的表，因此不在此处逐键列出，
 见[自定义命令按键绑定](/zh-cn/docs/configuration/#自定义命令按键绑定)。
 
+## 分组侧边栏
+
+默认侧边栏仍为 Machines 视图。要按组织 → 项目 → 工作通道汇总已连接端点的工作区，
+在**客户端本地**的 `config.toml` 中添加：
+
+```toml
+[ui.sidebar.grouping]
+enabled = true
+```
+
+使用 UI 中的 `reload config` 应用更改。要立即回退到 Machines，在同一表中设置
+`enabled = false`，然后再次重载配置。已保存的机器配置和自定义侧边栏行布局不会改变。
+
+以下 token 名称设置都是可选字符串，将通用的分组字段映射到已有的**工作区元数据 token 键**，
+无需 `$` 前缀。默认值遵循启动器约定；其他启动器可以报告不同的键并修改映射。
+Herdr 不读取组织配置文件，也不根据路径、机器标签或工作区名称推断项目身份。
+
+| `ui.sidebar.grouping` 中的设置 | 默认值 | 工作区 token 的含义 |
+| --- | --- | --- |
+| `enabled` | `false` | 启用客户端分组视图（布尔值）。 |
+| `org_id` | `"smarty_org_id"` | 稳定的组织 ID。 |
+| `org_label` | `"smarty_org_label"` | 易读的组织标签。 |
+| `project_id` | `"smarty_project_id"` | 组织内稳定的项目 ID。 |
+| `project_label` | `"smarty_project_label"` | 易读的项目标签。 |
+| `lane_id` | `"smarty_lane_id"` | 稳定的工作通道或任务分配 ID。 |
+| `lane_purpose` | `"smarty_lane_purpose"` | 简短的任务目的。 |
+| `issue` | `"smarty_issue"` | 跟踪 issue 的显示提示。 |
+| `host` | `"smarty_host"` | 执行主机的显示提示，不是路由目标。 |
+| `role` | `"smarty_role"` | 工作区的显示角色。 |
+| `lead` | `"smarty_lead"` | 负责人的显示提示。 |
+
+无法映射的工作区仍显示在 **Ungrouped** 下，包括普通的 Local 工作，以及不支持
+`workspace.report_metadata` 的兼容服务器上的工作区。分组身份缺失、不完整或冲突，
+不会隐藏工作区，也不要求更新服务器。服务器恢复后，启动器需要重新报告元数据；
+在此之前，缺少元数据的工作区回退到 Ungrouped。
+
+分组只改变客户端呈现方式。工作区和窗格操作仍通过原始端点及其本地 ID 路由；
+分组 ID、issue 文本、主机提示和负责人名称都没有决定路由的权限。
+此功能复用已有的工作区 token 和端点连接，**不改变服务器或端点编解码器**。
+切换与 CLI 路由说明见[连接机器](/zh-cn/docs/connecting-machines/#分组视图)。
+
 各键的描述目前为英文。
 
 <ConfigReference
