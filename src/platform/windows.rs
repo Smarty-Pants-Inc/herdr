@@ -2378,9 +2378,24 @@ fn nul_terminated_utf16_to_string(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..len])
 }
 
-/// Not needed on Windows: pane attribution there already covers every descendant of the pane
-/// child (`session_processes`), so the ancestor walk finds nothing more.
-pub fn parent_process_id(_pid: u32) -> Option<u32> {
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    Some(crate::platform::ProcessIdentity {
+        pid,
+        start_time: process_creation_time(handle.as_raw_handle().cast())?,
+    })
+}
+
+pub(crate) fn parent_process_identity(
+    _identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
     None
 }
 

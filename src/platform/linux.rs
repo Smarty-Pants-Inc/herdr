@@ -53,6 +53,46 @@ pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
+/// Capture the socket's original peer instance, not a later numeric PID owner.
+/// SO_PEERPIDFD is socket-bound; pidfd_open(SO_PEERCRED.pid) is not equivalent.
+pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::ProcessIdentity> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut raw: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes one descriptor into the sized integer buffer.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut raw as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    if status != 0 || raw < 0 {
+        return None;
+    }
+    // SAFETY: successful SO_PEERPIDFD returns a new owned descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    if len != std::mem::size_of::<libc::c_int>() as libc::socklen_t {
+        return None;
+    }
+    let alive = || {
+        let mut event = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows this initialized descriptor for a zero-time query.
+        unsafe { libc::poll(&mut event, 1, 0) == 0 }
+    };
+    // A live original pidfd prevents numeric reuse across the start-time read.
+    // Old kernels without SO_PEERPIDFD intentionally provide no attribution.
+    super::capture_bound_peer_identity(alive, || {
+        process_identity(local_socket_peer_pid_platform(fd)?)
+    })
+}
+
 /// A pidfd on the process connected to a Unix-domain socket. Signalling it
 /// can never reach a later process that reuses the numeric PID.
 pub(crate) struct LocalSocketPeerProcess {
@@ -1270,12 +1310,36 @@ fn detach_clipboard_owner(child: std::process::Child) -> bool {
     true
 }
 
-/// The parent of `pid`, from `/proc/<pid>/stat`. A process gone or unreadable has none.
-pub fn parent_process_id(pid: u32) -> Option<u32> {
+pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdentity> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;
-    // After (comm): state(0) ppid(1)
-    rest.split_whitespace().nth(1)?.parse().ok()
+    // After (comm): state(0), ppid(1), ..., starttime(19).
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if matches!(fields.first().copied(), Some("Z" | "X" | "x")) {
+        return None;
+    }
+    Some(crate::platform::ProcessIdentity {
+        pid,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+pub(crate) fn parent_process_identity(
+    identity: crate::platform::ProcessIdentity,
+) -> Option<crate::platform::ProcessIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", identity.pid)).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let mut fields = rest.split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let start_time = fields.nth(17)?.parse().ok()?;
+    crate::platform::checked_parent_process_identity(
+        identity,
+        crate::platform::ProcessIdentity {
+            pid: identity.pid,
+            start_time,
+        },
+        ppid,
+    )
 }
 
 fn process_session_id(pid: u32) -> Option<i32> {
@@ -1458,6 +1522,87 @@ mod tests {
         assert!(!peer.kill().unwrap());
         assert!(local_socket_peer_process_platform(stream.as_raw_fd()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn socket_peer_identity_captures_live_original_and_rejects_exited_peer() {
+        use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-peer-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+            *dst = *src as libc::c_char;
+        }
+        // Only async-signal-safe calls run in the forked socket peer.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if libc::connect(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) != 0
+                {
+                    libc::_exit(1);
+                }
+                let mut byte = 0u8;
+                libc::read(fd, (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let (mut stream, _) = listener.accept().unwrap();
+        // Probe feature support independently: older kernels safely return None.
+        let mut raw: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERPIDFD,
+                (&mut raw as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        if status == 0 {
+            unsafe {
+                libc::close(raw);
+            }
+            let original = process_identity(child as u32).expect("live original peer");
+            assert_eq!(
+                local_socket_peer_identity_platform(stream.as_raw_fd()),
+                Some(original)
+            );
+        } else {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOPROTOOPT)
+            );
+            assert_eq!(
+                local_socket_peer_identity_platform(stream.as_raw_fd()),
+                None
+            );
+        }
+        stream.write_all(b"x").expect("release owned socket peer");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(
+            local_socket_peer_identity_platform(stream.as_raw_fd()),
+            None
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

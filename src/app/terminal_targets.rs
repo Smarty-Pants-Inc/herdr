@@ -198,34 +198,12 @@ impl App {
     /// Maps a locally attributed process to the managed agent terminal that owns
     /// its session. Missing runtime state or process inspection intentionally
     /// yields no match so callers retain normal compatibility behavior.
-    pub(crate) fn agent_terminal_target_for_peer_pid(
+    pub(crate) fn agent_terminal_target_for_peer_identity(
         &self,
-        peer_pid: u32,
+        peer_identity: crate::platform::ProcessIdentity,
     ) -> Option<TerminalTarget> {
-        let mut matches = self.terminal_targets().into_iter().filter(|target| {
-            if !self.target_is_agent(target) {
-                return false;
-            }
-
-            let Some(child_pid) = self
-                .state
-                .runtime_for_pane_in_workspace(
-                    &self.terminal_runtimes,
-                    target.ws_idx,
-                    target.pane_id,
-                )
-                .and_then(crate::terminal::TerminalRuntime::child_pid)
-            else {
-                return false;
-            };
-
-            child_pid == peer_pid
-                || crate::platform::session_processes(child_pid)
-                    .into_iter()
-                    .any(|session_pid| session_pid == peer_pid)
-        });
-        let target = matches.next()?;
-        matches.next().is_none().then_some(target)
+        let target = self.pane_target_for_peer_identity(peer_identity)?;
+        self.target_is_agent(&target).then_some(target)
     }
 
     /// Maps a locally attributed process to the one pane whose session it runs in,
@@ -235,29 +213,53 @@ impl App {
     /// A process that left its pane's session (a tool runner that calls `setsid`, as Pi's shell
     /// tool does) still descends from the pane's shell, so the lookup walks the peer's
     /// ancestors until one runs in a pane session (smarty-dev#931).
-    pub(crate) fn pane_target_for_peer_pid(&self, peer_pid: u32) -> Option<TerminalTarget> {
-        let panes: Vec<(TerminalTarget, u32)> = self
+    pub(crate) fn pane_target_for_peer_identity(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+    ) -> Option<TerminalTarget> {
+        let panes: Vec<(TerminalTarget, crate::platform::ProcessIdentity)> = self
             .terminal_targets()
             .into_iter()
             .filter_map(|target| {
-                let child_pid = self
+                let child_identity = self
                     .state
                     .runtime_for_pane_in_workspace(
                         &self.terminal_runtimes,
                         target.ws_idx,
                         target.pane_id,
                     )
-                    .and_then(crate::terminal::TerminalRuntime::child_pid)?;
-                Some((target, child_pid))
+                    .and_then(crate::terminal::TerminalRuntime::child_process_identity)?;
+                Some((target, child_identity))
             })
             .collect();
-        find_in_ancestors(peer_pid, crate::platform::parent_process_id, |pid| {
-            let mut matches = panes
-                .iter()
-                .filter(|(_, child_pid)| crate::platform::process_in_pane_session(*child_pid, pid));
-            let (target, _) = matches.next()?;
-            matches.next().is_none().then(|| target.clone())
-        })
+        find_in_ancestors(
+            peer_identity,
+            crate::platform::process_identity,
+            crate::platform::parent_process_identity,
+            |identity| {
+                let mut matched = None;
+                for (target, root) in &panes {
+                    let belongs =
+                        crate::platform::process_identity_in_pane_session(*root, identity)
+                            .ok_or(())?;
+                    if belongs {
+                        if matched.is_some() {
+                            return Ok(None);
+                        }
+                        matched = Some((target.clone(), *root));
+                    }
+                }
+                match matched {
+                    Some((target, root)) => {
+                        if crate::platform::process_identity(root.pid) != Some(root) {
+                            return Err(());
+                        }
+                        Ok(Some(target))
+                    }
+                    None => Ok(None),
+                }
+            },
+        )
     }
 
     fn terminal_target_candidate(
@@ -285,23 +287,39 @@ impl App {
 /// The deepest ancestor walk: a pane's shell sits a few levels above any tool it runs.
 const MAX_ANCESTOR_DEPTH: usize = 32;
 
-/// Returns the first hit of `found` for `pid` or one of its ancestors, nearest first. The walk
-/// stops at pid 1 (init adopts orphans, so it and above belong to no pane), at an unknown parent,
-/// and after `MAX_ANCESTOR_DEPTH` steps, which also ends a parent cycle.
+/// Nearest-first, bounded ancestry with pinned origin/current validation across
+/// successful hits and parent transitions. Unknown or replaced instances stop
+/// attribution, rather than restarting from a replacement PID.
 fn find_in_ancestors<T>(
-    pid: u32,
-    parent_of: impl Fn(u32) -> Option<u32>,
-    mut found: impl FnMut(u32) -> Option<T>,
+    peer: crate::platform::ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+    parent_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::ProcessIdentity>,
+    mut found: impl FnMut(crate::platform::ProcessIdentity) -> Result<Option<T>, ()>,
 ) -> Option<T> {
-    let mut current = pid;
+    let mut current = peer;
     for _ in 0..=MAX_ANCESTOR_DEPTH {
-        if current <= 1 {
+        if current.pid <= 1
+            || identity_of(peer.pid) != Some(peer)
+            || identity_of(current.pid) != Some(current)
+        {
             return None;
         }
-        if let Some(hit) = found(current) {
+        let hit = found(current).ok()?;
+        if identity_of(peer.pid) != Some(peer) || identity_of(current.pid) != Some(current) {
+            return None;
+        }
+        if let Some(hit) = hit {
             return Some(hit);
         }
-        current = parent_of(current)?;
+        let parent = parent_of(current)?;
+        if identity_of(peer.pid) != Some(peer)
+            || identity_of(current.pid) != Some(current)
+            || identity_of(parent.pid) != Some(parent)
+            || parent.start_time > current.start_time
+        {
+            return None;
+        }
+        current = parent;
     }
     None
 }
@@ -314,12 +332,20 @@ mod tests {
     /// Fake process table: pid -> parent. Pane shells are pid 100 (pane "a") and 200 (pane "b").
     fn walk(table: &HashMap<u32, u32>, pid: u32) -> Option<&'static str> {
         find_in_ancestors(
-            pid,
-            |pid| table.get(&pid).copied(),
-            |pid| match pid {
-                100 => Some("a"),
-                200 => Some("b"),
-                _ => None,
+            crate::platform::ProcessIdentity { pid, start_time: 1 },
+            |pid| Some(crate::platform::ProcessIdentity { pid, start_time: 1 }),
+            |identity| {
+                table
+                    .get(&identity.pid)
+                    .copied()
+                    .map(|pid| crate::platform::ProcessIdentity { pid, start_time: 1 })
+            },
+            |identity| {
+                Ok(match identity.pid {
+                    100 => Some("a"),
+                    200 => Some("b"),
+                    _ => None,
+                })
             },
         )
     }
@@ -340,6 +366,140 @@ mod tests {
         assert_eq!(walk(&table, 400), None);
         assert_eq!(walk(&table, 1), None);
         assert_eq!(walk(&table, 0), None);
+    }
+
+    #[test]
+    fn ancestor_walk_does_not_follow_reused_pid_identity() {
+        let parent = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 2,
+        };
+        let caller = crate::platform::ProcessIdentity {
+            pid: 103,
+            start_time: 1,
+        };
+        assert_eq!(
+            find_in_ancestors(
+                caller,
+                |pid| Some(crate::platform::ProcessIdentity { pid, start_time: 1 }),
+                |identity| (identity == caller).then_some(parent),
+                |identity| Ok((identity.pid == 100).then_some("reused")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_revalidates_origin_and_ancestor_after_found_hit() {
+        use std::cell::Cell;
+        let peer = crate::platform::ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let ancestor = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for changed in [peer, ancestor] {
+            for replacement in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: 30,
+                    ..changed
+                }),
+            ] {
+                let current = Cell::new(Some(changed));
+                assert_eq!(
+                    find_in_ancestors(
+                        peer,
+                        |pid| if pid == changed.pid {
+                            current.get()
+                        } else if pid == peer.pid {
+                            Some(peer)
+                        } else {
+                            Some(ancestor)
+                        },
+                        |identity| (identity == peer).then_some(ancestor),
+                        |identity| {
+                            if identity == ancestor {
+                                current.set(replacement);
+                                Ok(Some("wrong hit"))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_walk_revalidates_parent_transition() {
+        use std::cell::Cell;
+        let peer = crate::platform::ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let parent = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for changed in [peer, parent] {
+            for replacement in [
+                None,
+                Some(crate::platform::ProcessIdentity {
+                    start_time: 30,
+                    ..changed
+                }),
+            ] {
+                let current = Cell::new(Some(changed));
+                assert_eq!(
+                    find_in_ancestors(
+                        peer,
+                        |pid| if pid == changed.pid {
+                            current.get()
+                        } else if pid == peer.pid {
+                            Some(peer)
+                        } else {
+                            Some(parent)
+                        },
+                        |_| {
+                            current.set(replacement);
+                            Some(parent)
+                        },
+                        |identity| Ok((identity == parent).then_some("replacement"))
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_membership_observation_stops_before_parent_attribution() {
+        let peer = crate::platform::ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let parent = crate::platform::ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            find_in_ancestors(
+                peer,
+                |pid| if pid == peer.pid {
+                    Some(peer)
+                } else {
+                    Some(parent)
+                },
+                |_| panic!("invalid membership must not resume at parent"),
+                |_| Err::<Option<&str>, ()>(())
+            ),
+            None
+        );
     }
 
     #[test]

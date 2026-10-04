@@ -2182,16 +2182,16 @@ impl App {
         if self.parse_pane_id(pane_id).is_some() {
             return;
         }
-        let Some(peer_pid) = context.local_peer_pid else {
+        let Some(peer_identity) = context.local_peer_identity else {
             return;
         };
         let Some(current) = self
-            .pane_target_for_peer_pid(peer_pid)
+            .pane_target_for_peer_identity(peer_identity)
             .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id))
         else {
             return;
         };
-        tracing::info!(stale = %pane_id, %current, peer_pid, "rebinding agent report to its pane");
+        tracing::info!(stale = %pane_id, %current, peer_pid = peer_identity.pid, "rebinding agent report to its pane");
         *pane_id = current;
     }
 

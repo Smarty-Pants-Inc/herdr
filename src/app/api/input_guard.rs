@@ -12,7 +12,7 @@ impl App {
         context: ApiRequestContext,
     ) -> Option<String> {
         // Missing attribution retains the normal compatibility path.
-        let peer_pid = context.local_peer_pid?;
+        let peer_identity = context.local_peer_identity?;
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
         // Only a content write that does not allow cross-pane input needs it.
@@ -20,7 +20,7 @@ impl App {
             return None;
         }
         let target = self.content_write_target(&request.method)?;
-        let Some(source) = self.agent_terminal_target_for_peer_pid(peer_pid) else {
+        let Some(source) = self.agent_terminal_target_for_peer_identity(peer_identity) else {
             // PID attribution, managed runtime state, and session membership are all
             // best-effort. Unknown, non-agent, and out-of-pane callers fail open.
             return None;
@@ -156,9 +156,7 @@ mod tests {
     }
 
     fn attributed_context() -> ApiRequestContext {
-        ApiRequestContext {
-            local_peer_pid: Some(std::process::id()),
-        }
+        ApiRequestContext::for_local_peer_pid(Some(std::process::id()))
     }
 
     fn assert_denied(response: &str) {
@@ -169,6 +167,321 @@ mod tests {
     fn assert_ok(response: &str) {
         let response: SuccessResponse = serde_json::from_str(response).expect("success response");
         assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn imported_legacy_pty_pin_enforces_guard_and_preserves_own_override_paths() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut fixture = attributed_agent_fixture();
+        let (_, source_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source");
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("real transferred PTY");
+        let mut command = portable_pty::CommandBuilder::new("sh");
+        command.args(["-c", "read line"]);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("live original leader");
+        let pid = child.process_id().expect("root PID");
+        let original = crate::platform::process_identity(pid).expect("original root");
+        let context = ApiRequestContext::for_local_peer_pid(Some(pid));
+        let mut writer = pair.master.take_writer().expect("root input");
+        // Legacy match, actual unrelated live PID, supplied stale pin (must NOT
+        // fall back to legacy), new-to-new original pin, then legacy exited root.
+        for (index, (candidate_pid, start_time, expected)) in [
+            (pid, None, Some(original)),
+            (std::process::id(), None, None),
+            (pid, Some(original.start_time.wrapping_add(1)), None),
+            (pid, Some(original.start_time), Some(original)),
+            (pid, None, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 4 {
+                writer.write_all(b"\n").expect("release owned root");
+                child.wait().expect("reap root");
+            }
+            let mut json = serde_json::json!({
+                "pane_id": source_pane.raw(), "child_pid": candidate_pid,
+                "rows": 24, "cols": 80, "cell_width_px": 0, "cell_height_px": 0
+            });
+            if let Some(start_time) = start_time {
+                json["child_start_time"] = start_time.into();
+            }
+            let master_fd = unsafe { libc::dup(pair.master.as_raw_fd().expect("master")) };
+            assert!(master_fd >= 0);
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer({
+                    let logs = logs.clone();
+                    move || LogWriter(logs.clone())
+                })
+                .finish();
+            let (events, _events_rx) = tokio::sync::mpsc::channel(8);
+            let (runtime, repeat_runtime) = tracing::subscriber::with_default(subscriber, || {
+                let runtime = crate::terminal::TerminalRuntime::from_handoff_fd(
+                    crate::handoff_runtime::ImportedHandoffRuntime {
+                        master_fd,
+                        state: serde_json::from_value(json).expect("manifest"),
+                    },
+                    4096,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    events,
+                    Arc::new(tokio::sync::Notify::new()),
+                    Arc::new(crate::render_signal::RenderSignal::new()),
+                )
+                .expect("import runtime");
+                assert_eq!(runtime.child_process_identity(), expected);
+                assert_eq!(runtime.child_process_identity(), expected);
+                if index == 2 {
+                    // Exercise the production import -> export -> reimport path.  Before
+                    // the repair, the rejected pin is omitted and this second import
+                    // incorrectly adopts the live PTY owner through legacy bootstrap.
+                    let exported = runtime.handoff_runtime_state(source_pane.raw());
+                    let second_master_fd =
+                        unsafe { libc::dup(pair.master.as_raw_fd().expect("master")) };
+                    assert!(second_master_fd >= 0);
+                    let second = crate::terminal::TerminalRuntime::from_handoff_fd(
+                        crate::handoff_runtime::ImportedHandoffRuntime {
+                            master_fd: second_master_fd,
+                            state: exported.clone(),
+                        },
+                        4096,
+                        crate::terminal_theme::TerminalTheme::default(),
+                        None,
+                        tokio::sync::mpsc::channel(8).0,
+                        Arc::new(tokio::sync::Notify::new()),
+                        Arc::new(crate::render_signal::RenderSignal::new()),
+                    )
+                    .expect("reimport runtime");
+                    assert_eq!(second.child_pid(), Some(pid));
+                    assert_eq!(second.child_process_identity(), None);
+                    let original_start_time = Some(start_time.expect("stale timestamp"));
+                    assert_eq!(exported.child_start_time, original_start_time);
+                    assert_eq!(
+                        second
+                            .handoff_runtime_state(source_pane.raw())
+                            .child_start_time,
+                        original_start_time
+                    );
+                    (runtime, Some(second))
+                } else if expected.is_some() {
+                    assert_eq!(
+                        runtime
+                            .handoff_runtime_state(source_pane.raw())
+                            .child_start_time,
+                        Some(original.start_time)
+                    );
+                    (runtime, None)
+                } else {
+                    (runtime, None)
+                }
+            });
+            let logs = String::from_utf8(logs.lock().expect("logs").clone()).expect("UTF8 log");
+            assert_eq!(
+                logs.matches("handoff root identity unavailable").count(),
+                usize::from(expected.is_none()) + usize::from(index == 2),
+                "case {index}: {logs}"
+            );
+            fixture.app.state.insert_test_runtime(source_pane, runtime);
+            let mut request = Request {
+                id: format!("import-{index}"),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "foreign".into(),
+                    allow_cross_pane: false,
+                }),
+            };
+            let denial = fixture.app.cross_pane_input_denial(&request, context);
+            if expected.is_some() {
+                assert_denied(&denial.expect("imported guard applies"));
+            } else {
+                assert!(denial.is_none(), "unprovable import remains unattributed");
+            }
+            if let Some(repeated_runtime) = repeat_runtime {
+                fixture
+                    .app
+                    .state
+                    .insert_test_runtime(source_pane, repeated_runtime);
+                let repeated_request = Request {
+                    id: format!("reimport-{index}"),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: fixture.target_pane_id.clone(),
+                        text: "foreign-again".into(),
+                        allow_cross_pane: false,
+                    }),
+                };
+                assert!(fixture
+                    .app
+                    .cross_pane_input_denial(&repeated_request, context)
+                    .is_none());
+            }
+            if let Method::PaneSendText(params) = &mut request.method {
+                params.pane_id = fixture.source_pane_id.clone();
+            }
+            assert!(fixture
+                .app
+                .cross_pane_input_denial(&request, context)
+                .is_none());
+            request.method = Method::AgentPrompt(AgentPromptParams {
+                target: "target-agent".into(),
+                text: "explicit".into(),
+                wait: None,
+                allow_cross_pane: true,
+            });
+            assert!(fixture
+                .app
+                .cross_pane_input_denial(&request, context)
+                .is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn detached_sleep_child() -> std::process::Child {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+        crate::platform::detach_server_daemon_command(&mut command);
+        command.spawn().expect("spawn detached sleep child")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn setsid_child_of_agent_is_denied_cross_pane_input() {
+        let mut fixture = attributed_agent_fixture();
+        let mut child = detached_sleep_child();
+        let peer_pid = child.id();
+        assert!(!crate::platform::process_in_pane_session(
+            std::process::id(),
+            peer_pid,
+        ));
+        let source = fixture
+            .app
+            .pane_target(&fixture.source_pane_id)
+            .expect("source target");
+        let attributed = fixture
+            .app
+            .agent_terminal_target_for_peer_identity(
+                crate::platform::process_identity(peer_pid).expect("live detached identity"),
+            )
+            .expect("detached child attributed to source agent");
+        assert_eq!(attributed.terminal_id, source.terminal_id);
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "setsid-cross-pane".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "setsid child".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            ApiRequestContext::for_local_peer_pid(Some(peer_pid)),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_denied(&response);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn setsid_agent_can_explicitly_allow_cross_pane_agent_prompt() {
+        let mut fixture = attributed_agent_fixture();
+        let mut child = detached_sleep_child();
+        let context = ApiRequestContext::for_local_peer_pid(Some(child.id()));
+        let mut request = Request {
+            id: "setsid-allow-cross-pane-check".into(),
+            method: Method::AgentPrompt(AgentPromptParams {
+                target: "target-agent".into(),
+                text: "explicitly allowed".into(),
+                wait: None,
+                allow_cross_pane: false,
+            }),
+        };
+        assert_denied(
+            &fixture
+                .app
+                .cross_pane_input_denial(&request, context)
+                .expect("attributed detached child must be denied without opt-in"),
+        );
+        if let Method::AgentPrompt(params) = &mut request.method {
+            params.allow_cross_pane = true;
+        }
+        assert!(fixture
+            .app
+            .cross_pane_input_denial(&request, context)
+            .is_none());
+
+        // The prompt fixture lacks detector runtime; prove actual opt-in delivery
+        // through the text receiver using the very same attributed child PID.
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "setsid-allow-cross-pane-text".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "explicitly allowed".into(),
+                    allow_cross_pane: true,
+                }),
+            },
+            context,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ok(&response);
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("opt-in target bytes"),
+            Bytes::from_static(b"explicitly allowed")
+        );
+        assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn setsid_agent_can_send_to_its_own_pane() {
+        let mut fixture = attributed_agent_fixture();
+        let mut child = detached_sleep_child();
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "setsid-same-pane".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.source_pane_id.clone(),
+                    text: "setsid own pane".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            ApiRequestContext::for_local_peer_pid(Some(child.id())),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ok(&response);
+        assert_eq!(
+            fixture.source_rx.try_recv().expect("same-pane bytes"),
+            Bytes::from_static(b"setsid own pane")
+        );
     }
 
     #[tokio::test]
@@ -314,15 +627,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_pinned_peer_is_not_replaced_by_current_pid_owner() {
+        let mut fixture = attributed_agent_fixture();
+        let live =
+            crate::platform::process_identity(std::process::id()).expect("live test peer identity");
+        let stale = crate::platform::ProcessIdentity {
+            start_time: live.start_time.wrapping_add(1),
+            ..live
+        };
+        assert!(fixture
+            .app
+            .agent_terminal_target_for_peer_identity(stale)
+            .is_none());
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "stale-peer".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "unattributed".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            ApiRequestContext {
+                local_peer_identity: Some(stale),
+            },
+        );
+        assert_ok(&response);
+        assert_eq!(
+            fixture
+                .target_rx
+                .try_recv()
+                .expect("compatibility delivery"),
+            Bytes::from_static(b"unattributed")
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_non_agent_and_out_of_pane_origins_remain_compatible() {
         let mut fixture = attributed_agent_fixture();
         for (id, context) in [
             ("unknown", ApiRequestContext::default()),
             (
                 "out-of-pane",
-                ApiRequestContext {
-                    local_peer_pid: Some(u32::MAX),
-                },
+                ApiRequestContext::for_local_peer_pid(Some(u32::MAX)),
             ),
         ] {
             let response = fixture.app.handle_api_request_with_context(
@@ -435,9 +782,7 @@ mod tests {
             ("unattributed", ApiRequestContext::default()),
             (
                 "outside-every-pane",
-                ApiRequestContext {
-                    local_peer_pid: Some(u32::MAX),
-                },
+                ApiRequestContext::for_local_peer_pid(Some(u32::MAX)),
             ),
         ] {
             let response = fixture.app.handle_api_request_with_context(

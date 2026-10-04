@@ -51,6 +51,14 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// Stable identity for a process instance. PIDs can be reused after a process exits;
+/// the start time makes ancestry transitions reject a reused PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -82,9 +90,318 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, process_in_pane_session, read_fd,
-    shared_ssh_control_path,
+    classify_child_exit, poll_fd_readable, process_identity_for_pty, process_in_pane_session,
+    read_fd, shared_ssh_control_path,
 };
+
+/// Capture numeric process metadata only while the socket-bound original
+/// process generation is still live. The liveness primitive must refer to the
+/// original pidfd/audit token, never to a newly opened numeric PID.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn capture_bound_peer_identity(
+    original_alive: impl Fn() -> bool,
+    identity_now: impl FnOnce() -> Option<ProcessIdentity>,
+) -> Option<ProcessIdentity> {
+    if !original_alive() {
+        return None;
+    }
+    let identity = identity_now()?;
+    original_alive().then_some(identity)
+}
+
+/// Identity-aware boundary around the numeric OS session observation.
+pub(crate) fn process_identity_in_pane_session(
+    root: ProcessIdentity,
+    peer: ProcessIdentity,
+) -> Option<bool> {
+    observe_pane_session(root, peer, process_identity, process_in_pane_session)
+}
+
+fn observe_pane_session(
+    root: ProcessIdentity,
+    peer: ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+    membership: impl FnOnce(u32, u32) -> bool,
+) -> Option<bool> {
+    if identity_of(peer.pid) != Some(peer) || identity_of(root.pid) != Some(root) {
+        return None;
+    }
+    let belongs = membership(root.pid, peer.pid);
+    // The OS observation reopens numeric PIDs. Never accept its answer for a
+    // replacement instance, including a successful hit that ends the ancestor walk.
+    (identity_of(peer.pid) == Some(peer) && identity_of(root.pid) == Some(root)).then_some(belongs)
+}
+
+/// Validate a parent link read together with the child's instance identity.
+/// Shared by the Unix implementations; an exited/reused endpoint ends the walk.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn checked_parent_process_identity(
+    child: ProcessIdentity,
+    observed_child: ProcessIdentity,
+    parent_pid: u32,
+) -> Option<ProcessIdentity> {
+    observe_parent_identity(child, observed_child, parent_pid, process_identity)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn observe_parent_identity(
+    child: ProcessIdentity,
+    observed_child: ProcessIdentity,
+    parent_pid: u32,
+    identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
+) -> Option<ProcessIdentity> {
+    if child != observed_child {
+        return None;
+    }
+    let parent = identity_of(parent_pid)?;
+    (parent.start_time <= child.start_time
+        && identity_of(child.pid) == Some(child)
+        && identity_of(parent.pid) == Some(parent))
+    .then_some(parent)
+}
+
+#[cfg(test)]
+mod membership_identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn original_generation_liveness_rejects_numeric_peer_replacement() {
+        let alive = Cell::new(true);
+        let replacement = ProcessIdentity {
+            pid: 100,
+            start_time: 30,
+        };
+        assert_eq!(
+            capture_bound_peer_identity(
+                || alive.get(),
+                || {
+                    alive.set(false);
+                    Some(replacement)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            capture_bound_peer_identity(
+                || false,
+                || panic!("dead original must not inspect a numeric replacement")
+            ),
+            None
+        );
+        assert_eq!(
+            capture_bound_peer_identity(|| true, || Some(replacement)),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn session_observation_rejects_root_swap_and_exited_endpoints() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        for changed in [root, peer] {
+            for replacement in [
+                None,
+                Some(ProcessIdentity {
+                    start_time: 30,
+                    ..changed
+                }),
+            ] {
+                let current = Cell::new(Some(changed));
+                assert_eq!(
+                    observe_pane_session(
+                        root,
+                        peer,
+                        |pid| if pid == changed.pid {
+                            current.get()
+                        } else if pid == root.pid {
+                            Some(root)
+                        } else {
+                            Some(peer)
+                        },
+                        |_, _| {
+                            current.set(replacement);
+                            true
+                        },
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_observation_accepts_only_stable_pinned_instances() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        for belongs in [false, true] {
+            assert_eq!(
+                observe_pane_session(
+                    root,
+                    peer,
+                    |pid| if pid == root.pid {
+                        Some(root)
+                    } else {
+                        Some(peer)
+                    },
+                    |_, _| belongs
+                ),
+                Some(belongs)
+            );
+        }
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| if pid == root.pid {
+                    Some(root)
+                } else {
+                    Some(ProcessIdentity {
+                        start_time: 30,
+                        ..peer
+                    })
+                },
+                |_, _| panic!("reused peer must not reach OS observation")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parent_link_rejects_reused_exited_and_younger_instances() {
+        let child = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let parent = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        for replacement in [
+            None,
+            Some(ProcessIdentity {
+                start_time: 30,
+                ..parent
+            }),
+        ] {
+            let reads = Cell::new(0);
+            assert_eq!(
+                observe_parent_identity(child, child, parent.pid, |pid| {
+                    if pid == child.pid {
+                        return Some(child);
+                    }
+                    let count = reads.get();
+                    reads.set(count + 1);
+                    if count == 0 {
+                        Some(parent)
+                    } else {
+                        replacement
+                    }
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                None
+            } else {
+                Some(parent)
+            }),
+            None
+        );
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                Some(child)
+            } else {
+                Some(ProcessIdentity {
+                    start_time: 30,
+                    ..parent
+                })
+            }),
+            None
+        );
+        assert_eq!(
+            observe_parent_identity(child, child, parent.pid, |pid| if pid == child.pid {
+                Some(child)
+            } else {
+                Some(parent)
+            }),
+            Some(parent)
+        );
+        assert_eq!(
+            observe_parent_identity(
+                child,
+                ProcessIdentity {
+                    start_time: 30,
+                    ..child
+                },
+                parent.pid,
+                |_| panic!("replacement child snapshot must stop the transition")
+            ),
+            None
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_parent_link_preserves_instance_and_rejects_stale_child() {
+        let child = process_identity(std::process::id()).expect("live child");
+        // SAFETY: getppid only reads the calling process's parent PID.
+        let parent_pid = unsafe { libc::getppid() } as u32;
+        let parent = parent_process_identity(child).expect("live parent link");
+        assert_eq!(parent.pid, parent_pid);
+        assert_eq!(process_identity(parent_pid), Some(parent));
+        assert!(parent_process_identity(ProcessIdentity {
+            start_time: child.start_time.wrapping_add(1),
+            ..child
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn session_observation_rejects_peer_swap_after_precheck() {
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let current = Cell::new(Some(peer));
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| if pid == root.pid {
+                    Some(root)
+                } else {
+                    current.get()
+                },
+                |_, _| {
+                    current.set(Some(ProcessIdentity {
+                        start_time: 30,
+                        ..peer
+                    }));
+                    true
+                },
+            ),
+            None
+        );
+    }
+}
 
 /// Whether `pid` belongs to the process tree of the pane child `child_pid`.
 #[cfg(not(unix))]
@@ -190,9 +507,26 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+/// Capture the original process instance bound to a connected local transport.
+/// A platform lacking a provable instance binding deliberately returns None.
+#[cfg(unix)]
+pub(crate) fn local_socket_peer_identity(fd: std::os::fd::RawFd) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    return linux::local_socket_peer_identity_platform(fd);
+
+    #[cfg(target_os = "macos")]
+    return macos::local_socket_peer_identity_platform(fd);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 /// Returns the PID connected to a Unix-domain socket when the platform exposes
 /// it. Unsupported or unavailable attribution deliberately returns `None`.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn local_socket_peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
     #[cfg(target_os = "linux")]
     return linux::local_socket_peer_pid_platform(fd);
