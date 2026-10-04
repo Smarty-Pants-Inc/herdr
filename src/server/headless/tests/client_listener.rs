@@ -3,6 +3,20 @@ use std::future::Future as _;
 use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll, Wake, Waker};
 
+struct IdleClientAcceptTestBlockGuard(bool);
+
+impl IdleClientAcceptTestBlockGuard {
+    fn block() -> Self {
+        Self(BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.replace(true)))
+    }
+}
+
+impl Drop for IdleClientAcceptTestBlockGuard {
+    fn drop(&mut self) {
+        set_idle_client_accept_test_blocked(self.0);
+    }
+}
+
 #[derive(Default)]
 struct ReadinessWakes(AtomicUsize);
 
@@ -179,6 +193,87 @@ async fn client_listener_stale_readiness_clears_only_after_would_block() {
 }
 
 #[tokio::test]
+async fn client_listener_blocked_idle_leaves_ready_backlog_for_render_without_error() {
+    let mut server = test_headless_server();
+    let readiness = crate::platform::local_listener_readiness(&server.client_listener).unwrap();
+    let mut client = crate::ipc::connect_local_stream(&server.client_socket_path).unwrap();
+    protocol::write_message(
+        &mut client,
+        &protocol::ClientMessage::TerminalHello {
+            version: protocol::PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+        },
+    )
+    .unwrap();
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), readiness.readable())
+            .await
+            .expect("the actual client backlog must be ready")
+            .unwrap(),
+    );
+
+    let blocked_idle = IdleClientAcceptTestBlockGuard::block();
+    let wakes = Arc::new(ReadinessWakes::default());
+    let waker = Waker::from(wakes.clone());
+    {
+        let mut waiting = std::pin::pin!(accept_ready_client_connections(
+            &server.client_listener,
+            &readiness,
+            &mut server.next_client_id,
+            &server.should_quit,
+            &server.server_event_tx,
+            false,
+        ));
+        assert!(matches!(
+            waiting.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+    }
+    assert_eq!(server.next_client_id, 1);
+    assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    let accepts_before_render = RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed);
+    try_accept_ready_client_connections(
+        &server.client_listener,
+        &readiness,
+        &mut server.next_client_id,
+        &server.should_quit,
+        &server.server_event_tx,
+        false,
+    )
+    .expect("the idle gate must not inject an error or request shared retry backoff");
+    assert_eq!(server.next_client_id, 2);
+    assert!(RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed) > accepts_before_render);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), readiness.readable())
+            .await
+            .is_err(),
+        "the render drain must clear readiness after WouldBlock"
+    );
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), server.server_event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let ServerEvent::ClientConnected { client_id, .. } = event {
+            assert_eq!(client_id, 1);
+            break;
+        }
+    }
+    let welcome: ServerMessage = protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+    assert!(matches!(
+        welcome,
+        ServerMessage::Welcome { error: None, .. }
+    ));
+    drop(blocked_idle);
+    protocol::write_message(&mut client, &protocol::ClientMessage::Detach).unwrap();
+    server.should_quit.store(true, Ordering::Release);
+}
+
+#[tokio::test]
 async fn client_listener_running_server_accepts_fresh_attach() {
     run_client_listener_attach(0).await;
 }
@@ -246,9 +341,9 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let accepts_before_second = RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed);
-        // Hold the idle select's accept path in its existing error backoff so
-        // only the render-iteration drain can accept the fresh client.
-        set_idle_client_accept_test_blocked(true);
+        // Leave only the idle select's accept future pending, without injecting
+        // errors or activating the shared backoff that also gates render accepts.
+        let blocked_idle = IdleClientAcceptTestBlockGuard::block();
         let second_path = path.clone();
         let welcome = tokio::task::spawn_blocking(move || {
             let mut client = crate::ipc::connect_local_stream(&second_path).unwrap();
@@ -272,7 +367,7 @@ async fn client_listener_rendering_server_accepts_fresh_attach() {
             .await
             .expect("fresh attach must not wait behind rendering")
             .unwrap());
-        set_idle_client_accept_test_blocked(false);
+        drop(blocked_idle);
         assert!(
             RENDER_ACCEPT_TEST_COUNT.load(Ordering::Relaxed) > accepts_before_second,
             "the fresh attach must be accepted on a render iteration"

@@ -3820,7 +3820,17 @@ async fn accept_ready_client_connections(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     handoff_in_progress: bool,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
+        std::future::pending::<()>().await;
+    }
     let mut ready = readiness.readable().await?;
+    // The test can install its gate while this future is already awaiting
+    // readiness. Recheck after the await without clearing the ready backlog.
+    #[cfg(test)]
+    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
+        std::future::pending::<()>().await;
+    }
     accept_pending_client_connections_with(
         || {
             // try_io clears only the readiness observed by this guard, and only
@@ -3828,10 +3838,6 @@ async fn accept_ready_client_connections(
             // be lost between draining the backlog and rearming the reactor.
             ready
                 .try_io(|_| {
-                    #[cfg(test)]
-                    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
-                        return Err(io::Error::from_raw_os_error(libc::EMFILE));
-                    }
                     #[cfg(test)]
                     if let Some(err) = injected_client_accept_error() {
                         return Err(err);
