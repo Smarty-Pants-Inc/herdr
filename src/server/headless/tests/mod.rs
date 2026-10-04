@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "client_listener.rs"]
+mod client_listener_tests;
 #[path = "last_input_alt_read.rs"]
 mod last_input_alt_read_tests;
 #[path = "last_input_scroll.rs"]

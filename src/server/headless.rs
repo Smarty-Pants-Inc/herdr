@@ -49,7 +49,8 @@ use crate::protocol::{
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
-    accept_pending_client_connections, reject_pending_client_connections,
+    accept_pending_client_connections, accept_pending_client_connections_with,
+    reject_pending_client_connections,
 };
 use crate::server::client_shell::{
     render_pane_surface as render_client_shell_pane_surface,
@@ -132,6 +133,7 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
+    ClientConnectionsAccepted(io::Result<()>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -167,14 +169,9 @@ fn record_render_impact(source: &'static str, impact: RenderImpact) {
 #[allow(dead_code)]
 const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the idle headless loop wakes to poll the local listener for new
-/// client connections.
-///
-/// The listener is non-blocking and not integrated into `tokio::select!`, so
-/// a low-frequency wake is required to notice new thin-client attaches while
-/// otherwise idle. Keep this much slower than the old resize-poll cadence to
-/// avoid reintroducing the idle CPU spin.
-const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Retry only after an accept error (for example transient descriptor exhaustion).
+/// A quiet listener has no timer and waits solely for native readiness.
+const CLIENT_ACCEPT_ERROR_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Headless server
@@ -329,7 +326,7 @@ impl HeadlessServer {
         let client_socket_identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
 
-        // Set non-blocking on Unix so we can poll it from the event loop.
+        // AsyncFd readiness requires non-blocking accepts on Unix.
         #[cfg(unix)]
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
@@ -417,6 +414,20 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        let mut client_accept_retry_after = None;
+
+        // Preserve the synchronous initial backlog drain; subsequent accepts are
+        // readiness-driven, never checked on unrelated loop iterations.
+        self.accept_client_connections()?;
+
+        // Register only inside the runtime, keeping construction usable by sync tests.
+        // The registration owns a duplicate fd so a handoff recovery may replace the
+        // listener without leaving Tokio watching a closed/reused descriptor.
+        #[cfg(unix)]
+        let mut client_readiness =
+            crate::platform::local_listener_readiness(&self.client_listener)?;
+        #[cfg(unix)]
+        let mut registered_client_identity = self.client_socket_identity.clone();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -495,8 +506,8 @@ impl HeadlessServer {
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
 
-            // 4. Accept new client connections.
-            self.accept_client_connections()?;
+            // 4. Client accepts are driven by listener readiness in the wait below.
+            // Windows keeps its dedicated blocking named-pipe accept thread.
 
             // 5. Drain server events from client threads.
             if self.pane_graphics_runtime_active() {
@@ -521,6 +532,14 @@ impl HeadlessServer {
             }
             if self.should_quit.load(Ordering::Acquire) {
                 continue;
+            }
+
+            // Reconcile git watch topology outside render/view computation, and
+            // retain the no-client suppression of background git work.
+            if self.has_app_client() {
+                self.app.sync_git_watches();
+            } else {
+                self.app.clear_git_watches();
             }
 
             // 6. Handle scheduled tasks.
@@ -574,6 +593,24 @@ impl HeadlessServer {
                         )))
             {
                 crate::render_prof::event("render.attempt");
+                #[cfg(unix)]
+                if client_accept_retry_after.is_none_or(|deadline| now >= deadline) {
+                    match try_accept_ready_client_connections(
+                        &self.client_listener,
+                        &client_readiness,
+                        &mut self.next_client_id,
+                        &self.should_quit,
+                        &self.server_event_tx,
+                        self.handoff_in_progress,
+                    ) {
+                        Ok(()) => client_accept_retry_after = None,
+                        Err(err) => {
+                            warn!(err = %err, "client listener accept failed during render; will retry");
+                            client_accept_retry_after =
+                                Some(Instant::now() + CLIENT_ACCEPT_ERROR_RETRY_INTERVAL);
+                        }
+                    }
+                }
                 let render_request = self.app.render_dirty.take();
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
@@ -626,15 +663,11 @@ impl HeadlessServer {
             }
 
             // 8. Wait for next event.
-            let next_deadline = self
-                .app
-                .next_headless_loop_deadline_with_git_refresh(
-                    now,
-                    needs_render,
-                    self.has_app_client(),
-                )
-                .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
-                .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+            let next_deadline = self.app.next_headless_loop_deadline_with_git_refresh(
+                now,
+                needs_render,
+                self.has_app_client(),
+            );
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
@@ -642,6 +675,33 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
+            #[cfg(unix)]
+            if registered_client_identity != self.client_socket_identity {
+                client_readiness =
+                    crate::platform::local_listener_readiness(&self.client_listener)?;
+                registered_client_identity = self.client_socket_identity.clone();
+            }
+            let client_connections = async {
+                if let Some(deadline) = client_accept_retry_after {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                }
+                #[cfg(unix)]
+                {
+                    accept_ready_client_connections(
+                        &self.client_listener,
+                        &client_readiness,
+                        &mut self.next_client_id,
+                        &self.should_quit,
+                        &self.server_event_tx,
+                        self.handoff_in_progress,
+                    )
+                    .await
+                }
+                #[cfg(windows)]
+                {
+                    std::future::pending::<io::Result<()>>().await
+                }
+            };
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -658,6 +718,7 @@ impl HeadlessServer {
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
+                    accepted = client_connections => LoopEvent::ClientConnectionsAccepted(accepted),
                 }
             };
 
@@ -687,6 +748,14 @@ impl HeadlessServer {
 
             match event {
                 LoopEvent::Timer => {}
+                LoopEvent::ClientConnectionsAccepted(Ok(())) => {
+                    client_accept_retry_after = None;
+                }
+                LoopEvent::ClientConnectionsAccepted(Err(err)) => {
+                    warn!(err = %err, "client listener accept failed; will retry");
+                    client_accept_retry_after =
+                        Some(Instant::now() + CLIENT_ACCEPT_ERROR_RETRY_INTERVAL);
+                }
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
                         needs_render = true;
@@ -1117,7 +1186,7 @@ impl HeadlessServer {
         }
     }
 
-    /// Accepts pending client connections from the non-blocking listener.
+    /// Synchronous initial backlog drain, also usable without Tokio in tests.
     #[cfg(unix)]
     fn accept_client_connections(&mut self) -> io::Result<()> {
         if self.handoff_in_progress {
@@ -1131,8 +1200,7 @@ impl HeadlessServer {
         )
     }
 
-    /// Windows named-pipe clients can block in connect unless the server has a
-    /// pending blocking accept. The dedicated accept thread handles that path.
+    /// Windows keeps a pending blocking accept on its dedicated thread.
     #[cfg(windows)]
     fn accept_client_connections(&mut self) -> io::Result<()> {
         Ok(())
@@ -3669,6 +3737,121 @@ impl Drop for HeadlessServer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+#[cfg(all(unix, test))]
+struct ClientAcceptTestHook {
+    remaining_errors: usize,
+    attempts: Arc<std::sync::Mutex<Vec<Instant>>>,
+}
+
+#[cfg(all(unix, test))]
+std::thread_local! {
+    static CLIENT_ACCEPT_TEST_HOOK: std::cell::RefCell<Option<ClientAcceptTestHook>> =
+        const { std::cell::RefCell::new(None) };
+    static BLOCK_IDLE_CLIENT_ACCEPT_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(unix, test))]
+fn set_idle_client_accept_test_blocked(blocked: bool) {
+    BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.set(blocked));
+}
+
+#[cfg(all(unix, test))]
+static RENDER_ACCEPT_TEST_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(unix, test))]
+fn injected_client_accept_error() -> Option<io::Error> {
+    CLIENT_ACCEPT_TEST_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        let hook = hook.as_mut()?;
+        hook.attempts.lock().unwrap().push(Instant::now());
+        if hook.remaining_errors == 0 {
+            return None;
+        }
+        hook.remaining_errors -= 1;
+        Some(io::Error::from_raw_os_error(libc::EMFILE))
+    })
+}
+
+/// Drains accepts only when the listener is already ready; render iterations
+/// must not wait for idle readiness.
+#[cfg(unix)]
+fn try_accept_ready_client_connections(
+    listener: &LocalListener,
+    readiness: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    handoff_in_progress: bool,
+) -> io::Result<()> {
+    accept_pending_client_connections_with(
+        || {
+            // Keep each accept inside try_io so a drained listener clears the
+            // reactor readiness. Wrapping the whole drain would leave stale
+            // readiness after its inner WouldBlock is consumed.
+            readiness.try_io(tokio::io::Interest::READABLE, |_| {
+                #[cfg(test)]
+                if let Some(err) = injected_client_accept_error() {
+                    return Err(err);
+                }
+                let result = listener.accept();
+                #[cfg(test)]
+                if result.is_ok() {
+                    RENDER_ACCEPT_TEST_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                result
+            })
+        },
+        next_client_id,
+        should_quit,
+        server_event_tx,
+        handoff_in_progress,
+    )
+}
+
+/// Waits without a timer, then drains accepts until WouldBlock clears readiness.
+#[cfg(unix)]
+async fn accept_ready_client_connections(
+    listener: &LocalListener,
+    readiness: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    handoff_in_progress: bool,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
+        std::future::pending::<()>().await;
+    }
+    let mut ready = readiness.readable().await?;
+    // The test can install its gate while this future is already awaiting
+    // readiness. Recheck after the await without clearing the ready backlog.
+    #[cfg(test)]
+    if BLOCK_IDLE_CLIENT_ACCEPT_TEST.with(|value| value.get()) {
+        std::future::pending::<()>().await;
+    }
+    accept_pending_client_connections_with(
+        || {
+            // try_io clears only the readiness observed by this guard, and only
+            // after accept actually returns WouldBlock. A fresh arrival cannot
+            // be lost between draining the backlog and rearming the reactor.
+            ready
+                .try_io(|_| {
+                    #[cfg(test)]
+                    if let Some(err) = injected_client_accept_error() {
+                        return Err(err);
+                    }
+                    listener.accept()
+                })
+                .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
+        },
+        next_client_id,
+        should_quit,
+        server_event_tx,
+        handoff_in_progress,
+    )
+}
 
 /// Installs a Ctrl+C handler that sets the should_quit flag and wakes up
 /// the event loop by sending a QuitSignal on the server event channel.

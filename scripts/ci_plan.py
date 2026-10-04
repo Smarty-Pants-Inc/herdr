@@ -67,7 +67,11 @@ def check_matrix(event_name: str, event: dict) -> dict:
         and head_repo == base_repo
     )
     include = [{"os": "ubuntu-latest", "kind": "unix", "nextest_filter": "all()"}]
-    if queue or (event_name == "push" and event.get("ref") == "refs/heads/master"):
+    if (
+        queue
+        or (event_name == "push" and event.get("ref") == "refs/heads/master")
+        or event_name == "workflow_dispatch"
+    ):
         include.append({"os": "macos-latest", "kind": "unix", "nextest_filter": MACOS_FILTER})
     include.append({"os": "windows-latest", "kind": "windows"})
     return {"include": include}

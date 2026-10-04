@@ -606,11 +606,24 @@ fn handle_request_with_context(
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
             server_stop.store(true, Ordering::Release);
-            return serde_json::to_string(&SuccessResponse {
-                id: request.id,
+            let response = serde_json::to_string(&SuccessResponse {
+                id: request.id.clone(),
                 result: ResponseResult::Ok {},
             })
             .unwrap_or_else(|_| "{}".to_string());
+            // Changing the flag alone cannot wake an idle, deadline-free App
+            // loop. Enqueue the actual stop request, but never wait for its
+            // response: stop control must remain responsive even with a busy
+            // App or a receiver that has already shut down.
+            let (respond_to, _response_rx) = std::sync::mpsc::channel();
+            let _ = api_tx.send(ApiRequestMessage {
+                request,
+                context,
+                respond_to,
+                response_write_complete: None,
+                stream_active: None,
+            });
+            return response;
         }
     } else if server_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
         return error_response_json(
@@ -1857,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn server_stop_control_bypasses_app_channel() {
+    fn server_stop_control_wakes_app_without_waiting_for_app_response() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
         let response = handle_request(
@@ -1875,6 +1888,12 @@ mod tests {
         assert_eq!(response["id"], "priority_stop");
         assert_eq!(response["result"]["type"], "ok");
         assert!(stop.load(Ordering::Acquire));
+        // No App consumed or answered the request before the immediate reply.
+        // The queued request also wakes a receiver parked in the headless select.
+        let wake = rx.try_recv().expect("stop must wake the App receiver");
+        assert_eq!(wake.request.id, "priority_stop");
+        assert!(matches!(wake.request.method, Method::ServerStop(_)));
+        assert!(wake.respond_to.send("unused".into()).is_err());
 
         let rejected = handle_request(
             Request {
@@ -1889,6 +1908,27 @@ mod tests {
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn server_stop_control_replies_even_after_app_receiver_closes() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let response = handle_request(
+            Request {
+                id: "closed_app_stop".into(),
+                method: Method::ServerStop(crate::api::schema::EmptyParams::default()),
+            },
+            &tx,
+            None,
+            Some(&stop),
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "closed_app_stop");
+        assert_eq!(response["result"]["type"], "ok");
+        assert!(stop.load(Ordering::Acquire));
     }
 
     #[test]

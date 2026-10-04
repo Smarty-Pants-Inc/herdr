@@ -126,6 +126,10 @@ class CIPlanTests(unittest.TestCase):
         self.assertEqual(matrix, FULL_MATRIX)
         self.assertFalse(conpty)
 
+    def test_manual_dispatch_selects_full_matrix_and_conservative_conpty(self) -> None:
+        self.write("docs/page.md")
+        self.assertEqual(self.plan({"ref": "refs/heads/ci/candidate", "inputs": {}}, "workflow_dispatch"), (FULL_MATRIX, True))
+
     def test_windows_push_does_not_select_macos(self) -> None:
         event = self.event()
         event["ref"] = "refs/heads/windows"

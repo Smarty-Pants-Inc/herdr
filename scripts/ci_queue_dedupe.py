@@ -13,13 +13,18 @@ The caller must also authenticate the current push sender as Mergify (GitHub id
 Inspection (no output-file writes):
   python3 scripts/ci_queue_dedupe.py --repo OWNER/REPO --dry-run --last 10
 Walks master first parents via REST, not the date-ordered commits listing, and
-reports the last ten two-parent merges. --sha may pin the starting master tip.
+reports the last one or ten two-parent merges. --sha may pin the starting master tip.
 
-All API requests are cached `gh api --method GET`; use the caller's read-only
-credentials. Missing/malformed evidence, errors, and exhausted pagination/history
-bounds mean dedupe=false, not success. Push GETs share a 120-second walltime
-budget (--last shares 600 seconds). All three matrix job checkout logs must
-identify the same immutable commit whose tree equals AFTER; run.head_sha alone
+JSON API requests are cached `gh api --method GET`; job logs use `curl -fsSL`
+with the caller's read-only GH_TOKEN. Authorization is not forwarded across hosts.
+Missing/malformed evidence, errors, and exhausted pagination/history bounds mean
+dedupe=false, not success. Push GETs and --last 1 share a 120-second walltime
+budget; --last 10 shares 600 seconds.
+--compare-log-fetch requires --dry-run and adds bounded gh/curl diagnostics;
+legacy probe results never change curl eligibility or extend the shared budget.
+The gh probe uses output-only --include for HTTP status; headers are never emitted.
+All three matrix job checkout logs must identify the same immutable commit
+whose tree equals AFTER; run.head_sha alone
 is not checkout proof. Log reads are capped at 8 MiB and never printed.
 JSON goes to stdout. Unless --dry-run or
 --last, --github-output PATH (or GITHUB_OUTPUT) receives dedupe=true/false and
@@ -53,6 +58,8 @@ SHA = re.compile(r"[0-9a-f]{40}")
 PAGE_SIZE, MAX_PAGES, MAX_HISTORY, MAX_CANDIDATES = 100, 5, 100, 50
 API_BUDGET_SECONDS = 120
 MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_LOG_STDERR_BYTES = 4096
+LOG_HTTP_MARKER = "HERDR_JOB_LOG_HTTP_STATUS:"
 CHECKOUT_PIN = "df4cb1c069e1874edd31b4311f1884172cec0e10"
 
 
@@ -75,12 +82,42 @@ def date(value):
     return parsed.astimezone(timezone.utc)
 
 
-class GhApi:
-    """GET only; never surface gh stderr (it can contain credential diagnostics)."""
+def log_diagnostics(stderr, token):
+    """Expose a bounded first stderr line, never credentials or redirect URLs."""
+    match = re.search(r"\n" + LOG_HTTP_MARKER + r"([0-9]{3})\n$",
+                      stderr["tail"].decode("utf-8", errors="replace"))
+    prefix = stderr["prefix"].decode("utf-8", errors="replace")
+    legacy_status = re.search(r"\bHTTP[ :]+([0-9]{3})\b", prefix)
+    http_status = match[1] if match else legacy_status[1] if legacy_status else "unknown"
+    truncated = len(stderr["prefix"]) == MAX_LOG_STDERR_BYTES and not prefix.endswith("\n")
+    # Redact before selecting/truncating a line. Discard an incomplete captured
+    # line altogether so a token cut at the byte boundary cannot leak a prefix.
+    if token:
+        prefix = prefix.replace(token, "[redacted token]")
+    prefix = re.sub(r"https?://[^\s<>\"']+", "[redacted URL]", prefix, flags=re.IGNORECASE)
+    prefix = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b",
+                    "[redacted token]", prefix)
+    lines = prefix.splitlines()
+    line = next((line for line in (lines[:-1] if truncated else lines)
+                 if line.strip() and not line.startswith(LOG_HTTP_MARKER)),
+                "stderr first line exceeds capture limit" if truncated else "no stderr")
+    line = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line)
+    return {"http_status": http_status, "first_stderr": line[:500]}
 
-    def __init__(self, budget_seconds=API_BUDGET_SECONDS):
+
+def log_failure(diagnostic):
+    return (f"{diagnostic['reason']} ({diagnostic['method']} exit {diagnostic['status']}; "
+            f"HTTP {diagnostic['http_status']}): {diagnostic['first_stderr']}")
+
+
+class GhApi:
+    """GET only; gh JSON errors stay private, curl log errors are sanitized."""
+
+    def __init__(self, budget_seconds=API_BUDGET_SECONDS, compare_log_fetch=False):
         self.cache = {}
         self.deadline = time.monotonic() + budget_seconds
+        self.compare_log_fetch = compare_log_fetch
+        self.log_fetch_comparison = []
 
     def get(self, endpoint):
         if endpoint not in self.cache:
@@ -97,28 +134,93 @@ class GhApi:
                 raise EvidenceError("GitHub GET failed: " + endpoint.split("?")[0]) from error
         return self.cache[endpoint]
 
+    def fetch_log(self, endpoint, method):
+        """One bounded subprocess path for curl and the optional legacy probe."""
+        remaining = self.deadline - time.monotonic()
+        stderr = {"prefix": b"", "tail": b""}
+        token = os.environ.get("GH_TOKEN", "")
+        diagnostic = {"method": method, "success": False, "status": "unavailable"}
+        data, raw = None, b""
+        if method == "gh":
+            diagnostic["include"] = "output-only"
+        try:
+            require(remaining > 0, "GitHub GET cumulative deadline exhausted")
+            request_deadline = min(self.deadline, time.monotonic() + 30)
+            require(token and not any(c in token for c in "\r\n\x00"),
+                    "valid GH_TOKEN is required for job-log GET")
+            if method == "curl":
+                # --disable ignores curlrc (which could enable location-trusted). Feed
+                # the header on stdin, not argv; curl strips it on cross-host
+                # redirects by default. Only HTTPS is allowed in production.
+                command = ["curl", "--disable", "-fsSL", "--proto", "=https",
+                           "--proto-redir", "=https", "--max-time", str(min(remaining, 30)),
+                           "--header", "@-", "--write-out",
+                           "%{stderr}\n" + LOG_HTTP_MARKER + "%{http_code}\n",
+                           "https://api.github.com/" + endpoint]
+            else:
+                command = ["gh", "api", "--method", "GET", endpoint, "--include"]
+            timed_out = threading.Event()
+            stdin = subprocess.PIPE if method == "curl" else subprocess.DEVNULL
+            with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as process:
+                def expire():
+                    timed_out.set()
+                    process.kill()
+
+                def drain_stderr():
+                    # Drain concurrently so noisy failures cannot block stdout.
+                    # Only the prefix and final HTTP marker are retained.
+                    while chunk := process.stderr.read(4096):
+                        stderr["prefix"] = (stderr["prefix"] + chunk)[:MAX_LOG_STDERR_BYTES]
+                        stderr["tail"] = (stderr["tail"] + chunk)[-128:]
+
+                timer = threading.Timer(max(0, request_deadline - time.monotonic()), expire)
+                reader = threading.Thread(target=drain_stderr)
+                timer.start()
+                reader.start()
+                try:
+                    if method == "curl":
+                        process.stdin.write(("Authorization: Bearer " + token + "\n").encode("utf-8"))
+                        process.stdin.close()
+                    raw = process.stdout.read(MAX_LOG_BYTES + 1)
+                    if len(raw) > MAX_LOG_BYTES:
+                        process.kill()
+                    diagnostic["status"] = process.wait()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                    timer.cancel()
+                    timer.join()
+                    reader.join()
+            require(len(raw) <= MAX_LOG_BYTES, "checkout log byte cap exceeded")
+            require(not timed_out.is_set() and not (method == "curl" and diagnostic["status"] == 28),
+                    "GitHub job-log GET deadline exhausted")
+            require(diagnostic["status"] == 0, "GitHub job-log GET failed")
+            data = raw.decode("utf-8")
+            diagnostic["success"] = True
+        except EvidenceError as error:
+            diagnostic["reason"] = str(error)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            diagnostic["reason"] = "GitHub job-log GET failed"
+        diagnostic.update(log_diagnostics(stderr, token))
+        # --include only changes gh's output, not its GET/redirect behavior. Read
+        # just the initial status line; never publish response headers/Location.
+        if method == "gh" and diagnostic["http_status"] == "unknown":
+            status_line = re.match(rb"HTTP/\S+\s+([0-9]{3})(?:\s|$)", raw[:MAX_LOG_STDERR_BYTES])
+            if status_line:
+                diagnostic["http_status"] = status_line[1].decode("ascii")
+        return data, diagnostic
+
     def text(self, endpoint):
         if endpoint not in self.cache:
-            remaining = self.deadline - time.monotonic()
-            require(remaining > 0, "GitHub GET cumulative deadline exhausted")
-            try:
-                with subprocess.Popen(["gh", "api", "--method", "GET", endpoint],
-                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
-                    timer = threading.Timer(min(remaining, 30), process.kill)
-                    timer.start()
-                    try:
-                        data = process.stdout.read(MAX_LOG_BYTES + 1)
-                        if len(data) > MAX_LOG_BYTES:
-                            process.kill()
-                        status = process.wait(timeout=min(remaining, 30))
-                    finally:
-                        timer.cancel()
-                        timer.join()
-                require(len(data) <= MAX_LOG_BYTES, "checkout log byte cap exceeded")
-                require(status == 0, "GitHub job-log GET failed")
-                self.cache[endpoint] = data.decode("utf-8")
-            except (OSError, subprocess.SubprocessError, ValueError) as error:
-                raise EvidenceError("GitHub job-log GET failed") from error
+            if self.compare_log_fetch:
+                _, legacy = self.fetch_log(endpoint, "gh")
+            data, diagnostic = self.fetch_log(endpoint, "curl")
+            if self.compare_log_fetch:
+                self.log_fetch_comparison.append({"endpoint": endpoint, "methods": [legacy, diagnostic]})
+            require(diagnostic["success"], log_failure(diagnostic) if not diagnostic["success"] else "")
+            self.cache[endpoint] = data
         return self.cache[endpoint]
 
 
@@ -314,6 +416,22 @@ class Inspector:
                 "queue PR snapshot head/base mismatch")
 
     def log_proof(self, pr, jobs, entry):
+        if getattr(self.api, "compare_log_fetch", False):
+            # Inspection collects both methods for all matrix logs even when an
+            # early curl read fails. Fail closed after collecting the probes.
+            failures = []
+            for job in jobs:
+                if job["name"] not in REQUIRED_JOBS or not job["name"].startswith("check ("):
+                    continue
+                require(type(job["id"]) is int and job["id"] > 0, "invalid workflow job ID")
+                endpoint = self.root + f"/actions/jobs/{job['id']}/logs"
+                if endpoint not in self.cache:
+                    try:
+                        self.cache[endpoint] = self.api.text(endpoint)
+                    except EvidenceError as error:
+                        failures.append(error)
+            if failures:
+                raise Unavailable(str(failures[0])) from failures[0]
         entry["checkouts"] = []
         for job in jobs:
             if job["name"] not in REQUIRED_JOBS or not job["name"].startswith("check ("):
@@ -360,7 +478,7 @@ class Inspector:
                 result["range"].append(evidence)
                 self.merge(current, evidence)
                 if before is None:
-                    break  # last-ten inspection checks one merge independently
+                    break  # --last inspection checks one merge independently
                 require(current["parents"], "before not on first-parent history")
                 current = self.commit(current["parents"][0]["sha"])
             else:
@@ -397,7 +515,9 @@ def main(argv=None, api=None):
     parser.add_argument("--sha")
     parser.add_argument("--before")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--last", type=int, choices=[10])
+    parser.add_argument("--last", type=int, choices=[1, 10])
+    parser.add_argument("--compare-log-fetch", action="store_true",
+                        help="compare bounded gh/curl job-log diagnostics (requires --dry-run)")
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
@@ -406,9 +526,15 @@ def main(argv=None, api=None):
         parser.error("push mode requires --sha and --before")
     if args.last and args.before:
         parser.error("--before is only used in push mode")
-    inspector = Inspector(api or GhApi(budget_seconds=600 if args.last else API_BUDGET_SECONDS), args.repo)
+    if args.compare_log_fetch and not args.dry_run:
+        parser.error("--compare-log-fetch requires --dry-run")
+    api = api or GhApi(budget_seconds=600 if args.last == 10 else API_BUDGET_SECONDS,
+                       compare_log_fetch=args.compare_log_fetch)
+    inspector = Inspector(api, args.repo)
     result = (inspector.last(args.sha or "master", args.last) if args.last
               else inspector.inspect(args.sha, args.before))
+    if args.compare_log_fetch:
+        result["log_fetch_comparison"] = api.log_fetch_comparison
     print(json.dumps(result, sort_keys=True))
     if args.github_output and not args.dry_run and not args.last:
         with Path(args.github_output).open("a", encoding="utf-8") as output:

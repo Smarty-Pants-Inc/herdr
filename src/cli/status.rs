@@ -4,7 +4,7 @@ use crate::api;
 use crate::api::client::ApiClientError;
 
 pub(super) fn run_status_command(args: &[String]) -> std::io::Result<i32> {
-    let Some((scope, json)) = parse_status_args(args) else {
+    let Some((scope, json, client_id)) = parse_status_args(args) else {
         return Ok(2);
     };
 
@@ -12,7 +12,7 @@ pub(super) fn run_status_command(args: &[String]) -> std::io::Result<i32> {
         StatusScope::Full => print_full_status(json),
         StatusScope::Server => print_server_status(json),
         StatusScope::Client => {
-            print_client_status(json)?;
+            print_client_status(json, client_id)?;
             Ok(0)
         }
         StatusScope::Help => {
@@ -30,22 +30,20 @@ enum StatusScope {
     Help,
 }
 
-fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
+fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool, Option<&str>)> {
     match args.first().map(|arg| arg.as_str()) {
-        None => Some((StatusScope::Full, false)),
-        Some("--json") if args.len() == 1 => Some((StatusScope::Full, true)),
+        None => Some((StatusScope::Full, false, None)),
+        Some("--json") if args.len() == 1 => Some((StatusScope::Full, true, None)),
         Some("server") => {
             parse_status_scope_args(args, StatusScope::Server, "herdr status server [--json]")
         }
-        Some("client") => {
-            parse_status_scope_args(args, StatusScope::Client, "herdr status client [--json]")
-        }
+        Some("client") => parse_client_status_args(&args[1..]),
         Some("help" | "--help" | "-h") => {
             if args.len() > 1 {
                 print_status_help();
                 return None;
             }
-            Some((StatusScope::Help, false))
+            Some((StatusScope::Help, false, None))
         }
         Some(_) => {
             print_status_help();
@@ -54,19 +52,48 @@ fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
     }
 }
 
-fn parse_status_scope_args(
-    args: &[String],
+fn parse_status_scope_args<'a>(
+    args: &'a [String],
     scope: StatusScope,
     usage: &str,
-) -> Option<(StatusScope, bool)> {
+) -> Option<(StatusScope, bool, Option<&'a str>)> {
     match args.get(1).map(|arg| arg.as_str()) {
-        None => Some((scope, false)),
-        Some("--json") if args.len() == 2 => Some((scope, true)),
+        None => Some((scope, false, None)),
+        Some("--json") if args.len() == 2 => Some((scope, true, None)),
         _ => {
             eprintln!("usage: {usage}");
             None
         }
     }
+}
+
+fn parse_client_status_args(args: &[String]) -> Option<(StatusScope, bool, Option<&str>)> {
+    let mut json = false;
+    let mut client_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !json => json = true,
+            "--client-id" if client_id.is_none() => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("missing value for --client-id");
+                    return None;
+                };
+                if crate::client::endpoint::ProfileId::parse(value).is_err() {
+                    eprintln!("--client-id must be a client readout's 32-character hexadecimal ID");
+                    return None;
+                }
+                client_id = Some(value.as_str());
+            }
+            _ => {
+                eprintln!("usage: herdr status client [--json] [--client-id <id>]");
+                return None;
+            }
+        }
+        index += 1;
+    }
+    Some((StatusScope::Client, json, client_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +111,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
 
     if json {
         print_json(&FullStatusJson {
-            client: client_status_json(),
+            client: client_status_json(None),
             server: server_status_json(&server),
             update: update_status_json(&server),
         })?;
@@ -126,9 +153,10 @@ fn print_server_status(json: bool) -> std::io::Result<i32> {
     Ok(0)
 }
 
-fn print_client_status(json: bool) -> std::io::Result<()> {
+fn print_client_status(json: bool, client_id: Option<&str>) -> std::io::Result<()> {
+    let status = client_status_json(client_id);
     if json {
-        print_json(&client_status_json())?;
+        print_json(&status)?;
         return Ok(());
     }
 
@@ -143,6 +171,20 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION
     );
     println!("binary: {}", current_exe_label());
+    println!("running: {}", status.running);
+    println!("readout: {}", status.readout.status);
+    for endpoint in &status.endpoints {
+        println!(
+            "{}\t{}\tenabled={} connected={} listed={} ready={} workspaces={}",
+            endpoint.id,
+            endpoint.label,
+            endpoint.enabled,
+            endpoint.connected,
+            endpoint.listed,
+            endpoint.ready,
+            endpoint.workspace_count,
+        );
+    }
     Ok(())
 }
 
@@ -256,6 +298,9 @@ struct ClientStatusJson {
     remote_bridge_idle_timeout: bool,
     binary: String,
     session: Option<String>,
+    running: bool,
+    endpoints: Vec<crate::client::machine_status::MachineStatus>,
+    readout: crate::client::machine_status::Readout,
 }
 
 #[derive(Serialize)]
@@ -290,7 +335,8 @@ struct UpdateStatusJson {
     server_binary_stale: Option<bool>,
 }
 
-fn client_status_json() -> ClientStatusJson {
+fn client_status_json(client_id: Option<&str>) -> ClientStatusJson {
+    let runtime = crate::client::machine_status::read_runtime_status(client_id);
     ClientStatusJson {
         version: crate::build_info::version(),
         channel: crate::config::Config::load().config.update.channel.as_str(),
@@ -305,6 +351,9 @@ fn client_status_json() -> ClientStatusJson {
         remote_bridge_idle_timeout: crate::platform::REMOTE_BRIDGE_IDLE_TIMEOUT_SUPPORTED,
         binary: current_exe_label(),
         session: crate::session::active_name(),
+        running: runtime.running,
+        endpoints: runtime.endpoints,
+        readout: runtime.readout,
     }
 }
 
@@ -406,7 +455,9 @@ fn print_status_help() {
     eprintln!("herdr status commands:");
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
-    eprintln!("  herdr status client [--json]  show local client binary status");
+    eprintln!("  herdr status client [--json] [--client-id <id>]  show binary and running client machine status");
+    eprintln!("Client readouts are local, session/socket-scoped, and expire after five seconds.");
+    eprintln!("Multiple live clients require --client-id; unavailable/old clients have no usable readout.");
 }
 
 #[cfg(test)]
@@ -430,6 +481,30 @@ mod tests {
                 guarded_live_handoff: true,
                 expected_terminal_guard: true,
             }),
+        }
+    }
+
+    #[test]
+    fn client_status_selection_is_explicit_and_order_independent() {
+        let id = "0123456789abcdef0123456789abcdef";
+        for args in [
+            vec!["client", "--json", "--client-id", id],
+            vec!["client", "--client-id", id, "--json"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(
+                parse_status_args(&args),
+                Some((StatusScope::Client, true, Some(id)))
+            );
+        }
+        for args in [
+            vec!["client", "--client-id"],
+            vec!["client", "--client-id", "bad"],
+            vec!["client", "--json", "--json"],
+            vec!["server", "--client-id", id],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(parse_status_args(&args).is_none());
         }
     }
 
