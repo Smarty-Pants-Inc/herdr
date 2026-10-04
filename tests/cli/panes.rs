@@ -634,6 +634,31 @@ fn pane_agent_reports_accept_options_before_pane() {
     assert!(session_report.stdout.is_empty());
     assert!(session_report.stderr.is_empty());
 
+    let resume_report = run_cli(
+        &socket_path,
+        &[
+            "pane",
+            "report-agent",
+            "--source=custom:cli-test",
+            "--agent=cli-test",
+            "--state=idle",
+            "--seq=2",
+            "--agent-session-id=session=1",
+            &pane_id,
+            "--",
+            "cli-test",
+            "--resume",
+            "session=1",
+        ],
+    );
+    assert!(
+        resume_report.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&resume_report.stderr)
+    );
+    assert!(resume_report.stdout.is_empty());
+    assert!(resume_report.stderr.is_empty());
+
     cleanup_spawned_herdr(herdr, base);
 }
 
