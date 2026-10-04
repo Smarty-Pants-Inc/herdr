@@ -658,6 +658,9 @@ class CliTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("curl"), "curl is needed for local HTTP probes")
+# ponytail: the job-log fetch only ever runs in the ubuntu `plan` job, with the runner's
+# curl; Windows curl reports its write-out differently, so these real-curl tests are Unix-only.
+@unittest.skipIf(os.name == "nt", "the queue-dedupe log fetch runs only on the ubuntu CI runner")
 class LogFetchTests(unittest.TestCase):
     def test_real_http_failure_retains_status_and_first_stderr_not_body(self):
         for status in [401, 403, 404, 500]:
