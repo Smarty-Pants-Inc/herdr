@@ -2357,6 +2357,157 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
 }
 
 #[tokio::test]
+async fn client_shell_focused_restorable_layout_claims_full_pane_runtime_geometry() {
+    use api::schema::{Method, ResponseResult, SuccessResponse};
+    use serde_json::json;
+
+    // Exercise the advertised checked and restorable endpoint routes. Ordinary
+    // layout.apply remains covered by existing direct receiver tests; it is
+    // intentionally not advertised on the client-shell endpoint lane.
+    for method_name in ["layout.apply_project_checked", "layout.apply_restorable"] {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("restorable-geometry");
+        let first_pane = workspace.tabs[0].root_pane;
+        let second_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        for pane_id in [first_pane, second_pane] {
+            workspace.insert_test_runtime(
+                pane_id,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+            );
+        }
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let split_tab_id = server.app.public_tab_id(0, 0).expect("split tab id");
+
+        // Keep another attached viewer on the split tab: the new tab must belong to
+        // the requesting client, not the other viewer or an arbitrary lowest client ID.
+        let (other_control, _other_render) = connect_test_shell(&mut server, 67, 70, 20);
+        let (source_control, _source_render) = connect_test_shell(&mut server, 68, 100, 30);
+        let _ = client_shell_snapshot(&other_control);
+        let initial = client_shell_snapshot(&source_control);
+        assert_eq!(
+            initial.focused_tab_id.as_deref(),
+            Some(split_tab_id.as_str())
+        );
+        server.render_and_stream();
+
+        let method: Method = serde_json::from_value(json!({
+            "method": method_name,
+            "params": {
+                "focus": true,
+                "root": {"type": "pane", "command": [crate::app::exiting_test_command()]}
+            }
+        }))
+        .expect("portable single absolute argv pane");
+        assert!(
+            server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+                client_id: 68,
+                boot_id: server.client_shell_boot_id.clone(),
+                request: Box::new(api::schema::Request {
+                    id: "focused-layout-geometry".into(),
+                    method,
+                }),
+            })
+        );
+        let response_ready =
+            tokio::time::timeout(Duration::from_secs(5), server.server_event_rx.recv())
+                .await
+                .expect("endpoint response deadline")
+                .expect("endpoint response ready");
+        assert!(!server.handle_server_event(response_ready));
+        let ServerMessage::ClientShellEndpointResponseChunk {
+            request_id,
+            final_chunk,
+            data,
+            ..
+        } = read_server_message(source_control.recv().expect("layout endpoint response"))
+        else {
+            panic!("expected layout endpoint response");
+        };
+        assert_eq!(request_id, "focused-layout-geometry");
+        assert!(final_chunk);
+        let response: SuccessResponse =
+            serde_json::from_slice(&data).expect("layout apply must succeed");
+        let ResponseResult::LayoutApply { layout } = response.result else {
+            panic!("expected applied layout");
+        };
+        let new_tab_id = layout.tab_id;
+        assert_ne!(new_tab_id, split_tab_id);
+        assert_eq!(server.shell_tab_id_for_client(68), Some(new_tab_id.clone()));
+        assert_eq!(server.shell_tab_id_for_client(67), Some(split_tab_id));
+
+        // The request's foreground-view synchronization captured the old split before
+        // creation. Its estimated rectangle must be narrower than the new single pane.
+        let old_split_size = server.app.state.estimate_pane_size();
+        let target = server
+            .shell_target_for_client(68)
+            .expect("new tab surface target");
+        let new_tab = &server.app.state.workspaces[target.workspace_index].tabs[target.tab_index];
+        let terminal_id = new_tab
+            .terminal_id(new_tab.root_pane)
+            .expect("new terminal")
+            .clone();
+        assert!(
+            new_tab.runtimes.is_empty(),
+            "new PTY must not be a tab test runtime"
+        );
+        assert!(!server.app.state.workspaces[0]
+            .test_runtimes
+            .contains_key(&new_tab.root_pane));
+        // The existing portable command exits quickly. The real runtime is retained
+        // until AppEvent processing, which this test does not perform during render.
+        let runtime = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("real argv PTY runtime");
+        assert!(
+            runtime.child_pid().is_some(),
+            "layout apply must use the real PTY constructor"
+        );
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].launch_argv,
+            Some(vec![crate::app::exiting_test_command().into()])
+        );
+
+        // Only ordinary rendering follows creation: no keypress, resize, explicit
+        // claim, or manual geometry reapply may repair the restorable endpoint here.
+        server.render_and_stream();
+        let full_layout = crate::ui::compute_tab_surface_for(
+            &server.app.state,
+            &server.app.terminal_runtimes,
+            Some(target),
+            Rect::new(0, 0, 100, 30),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        assert_eq!(full_layout.pane_infos.len(), 1);
+        let full_rect = full_layout.pane_infos[0].inner_rect;
+        let full_size = (full_rect.height, full_rect.width);
+        assert!(
+            old_split_size.1 < full_size.1,
+            "fixture must start from a split width"
+        );
+        let runtime_size = server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("real runtime retained after normal render")
+            .current_size();
+        let controller = server.tab_geometry_controllers.get(&new_tab_id).copied();
+        shutdown_test_runtimes(&mut server);
+        assert_eq!(
+            (controller, runtime_size),
+            (Some(68), full_size),
+            "{method_name}: normal render must retain the source client's controller and full-pane PTY size, not the old split {old_split_size:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn public_close_reapplies_controller_geometry() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("public-close-geometry");
