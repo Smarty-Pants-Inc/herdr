@@ -1169,12 +1169,34 @@ fn exercise_cold_restore_argv(untrusted_snapshot: bool, unavailable_executable: 
             })
             .collect()
     }
-    fn acknowledge(base: &Path, pane_id: &str, cwd: &Path, marker: &str) {
+    fn send_input(base: &Path, pane_id: &str, text: &str) {
+        // Raw requests originate in the test process, whose initial environment
+        // may carry an enclosing agent pane's launch markers. Input here models
+        // an ordinary external caller: exec the shipped CLI with command()'s
+        // cleared environment, without any cross-pane opt-in. Keep default
+        // delivery mandatory even when a different restored pane has no runtime.
+        let cli_text = format!("{text}\n");
+        let output = command(base)
+            .args(["pane", "send-text", pane_id, &cli_text])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ordinary CLI input failed for {pane_id} ({text:?}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Preserve the original raw-socket default-delivery path as well. Run
+        // these tests with the test process's inherited pane markers unset;
+        // unlike the CLI above, this caller is the test process itself. Repeating
+        // these fixture lines is harmless (append-only markers or file writes).
         request(
             base,
             "pane.send_input",
-            serde_json::json!({"pane_id": pane_id, "text": marker, "keys": ["Enter"]}),
+            serde_json::json!({"pane_id": pane_id, "text": text, "keys": ["Enter"]}),
         );
+    }
+    fn acknowledge(base: &Path, pane_id: &str, cwd: &Path, marker: &str) {
+        send_input(base, pane_id, marker);
         assert!(
             wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
                 fs::read_to_string(cwd.join("received"))
@@ -1366,10 +1388,10 @@ fn exercise_cold_restore_argv(untrusted_snapshot: bool, unavailable_executable: 
             let ordinary = restored_pane(base, &workspace, "ordinary");
             assert_eq!(ordinary, initial_panes[0].0);
             let ready = format!("ordinary-shell-ready-{cycle}");
-            request(
+            send_input(
                 base,
-                "pane.send_input",
-                serde_json::json!({"pane_id": ordinary, "text": format!("printf 'shell-ready\\n' > {ready}"), "keys": ["Enter"]}),
+                &ordinary,
+                &format!("printf 'shell-ready\\n' > {ready}"),
             );
             assert!(
                 wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
@@ -1468,10 +1490,10 @@ fn exercise_cold_restore_argv(untrusted_snapshot: bool, unavailable_executable: 
         "ARGV1_SENTINEL WORKSPACE_ENV_SENTINEL_VALUE\n"
     );
     // A fresh file proves the ordinary pane restored as a functioning shell.
-    request(
+    send_input(
         base,
-        "pane.send_input",
-        serde_json::json!({"pane_id": ordinary, "text": "printf 'shell-ready\\n' > ordinary-shell-ready", "keys": ["Enter"]}),
+        &ordinary,
+        "printf 'shell-ready\\n' > ordinary-shell-ready",
     );
     assert!(
         wait_until(Duration::from_secs(5), Duration::from_millis(25), || {

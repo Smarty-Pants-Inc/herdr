@@ -1140,10 +1140,12 @@ mod tests {
         app.terminal_runtimes.insert(terminal.clone(), runtime);
         assert!(!app.api_input_log.exists());
 
+        // This synthetic channel fixture deliberately opts in per request to isolate
+        // terminal identity, log isolation and redaction, not caller attribution.
         let rejected = serde_json::from_value(serde_json::json!({
             "id": "reject", "method": "pane.send_input_guarded",
             "params": {"pane_id": public_pane, "expected_terminal": "term_unknown",
-                "text": "secret prompt", "keys": ["Enter"]},
+                "text": "secret prompt", "keys": ["Enter"], "allow_cross_pane": true},
         }))
         .unwrap();
         let error: ErrorResponse = serde_json::from_str(&app.handle_api_request(rejected)).unwrap();
@@ -1155,7 +1157,7 @@ mod tests {
         let matched = serde_json::from_value(serde_json::json!({
             "id": "match", "method": "pane.send_input_guarded",
             "params": {"pane_id": public_pane, "expected_terminal": terminal.to_string(),
-                "text": "secret prompt", "keys": ["Enter"]},
+                "text": "secret prompt", "keys": ["Enter"], "allow_cross_pane": true},
         }))
         .unwrap();
         let success: SuccessResponse =

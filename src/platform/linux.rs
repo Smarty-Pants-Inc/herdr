@@ -1417,6 +1417,22 @@ pub(crate) fn parent_process_identity(
     )
 }
 
+/// Linux uses the shared generation-checked chronology walker: a live peer is
+/// outside this server only when its ancestry reaches a strictly older process
+/// before reaching the current server. Missing, reused, exited, or newer
+/// evidence remains unknown; pane markers are enforced by the caller.
+pub(crate) fn process_identity_outside_server_ancestry(
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let server = process_identity(std::process::id())?;
+    crate::platform::observe_outside_server_ancestry(
+        peer,
+        server,
+        process_identity,
+        parent_process_identity,
+    )
+}
+
 fn process_session_id(pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;

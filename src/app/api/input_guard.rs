@@ -1233,6 +1233,165 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_outside_proof_ignores_one_failed_pane_root_but_marked_agent_stays_linked() {
+        let mut fixture = attributed_agent_fixture();
+        let (_, source_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source pane");
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target pane");
+        // A third restored pane has no runtime. Both managed panes stay healthy.
+        fixture.app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        fixture.app.state.ensure_test_terminals();
+        let target_root = detached_sleep_child();
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(target_root.id());
+        let marked_child = GuardTestChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", &fixture.source_pane_id)
+                .spawn()
+                .expect("actual marked agent child"),
+        );
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, source_pane)
+            .expect("healthy agent runtime")
+            .test_set_child_pid(marked_child.id());
+        let marked_context = ApiRequestContext::for_local_peer_pid(Some(marked_child.id()));
+        assert_eq!(
+            marked_context.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::HasPane
+        );
+        let peer = marked_context
+            .local_peer_identity
+            .expect("live marked caller");
+        let ordinary_peer = crate::platform::parent_process_identity(
+            crate::platform::process_identity(std::process::id()).expect("server"),
+        )
+        .expect("real older parent");
+        assert!(
+            ordinary_peer.start_time
+                < crate::platform::process_identity(std::process::id())
+                    .expect("server")
+                    .start_time
+        );
+        let request = |id: &str, pane_id: String, text: &str| Request {
+            id: id.into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id,
+                text: text.into(),
+                allow_cross_pane: false,
+            }),
+        };
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            // A marked live agent remains attributable to its actual healthy
+            // source pane; outside proof never grants cross-pane delivery.
+            {
+                let marked = marked_context;
+                let own = fixture.app.handle_api_request_with_context(
+                    request("marked-own", fixture.source_pane_id.clone(), "own"),
+                    marked,
+                );
+                assert_ok(&own);
+                assert_eq!(
+                    fixture.source_rx.try_recv().expect("own delivery"),
+                    Bytes::from_static(b"own")
+                );
+                let denied = fixture.app.handle_api_request_with_context(
+                    request("marked-cross", fixture.target_pane_id.clone(), "cross"),
+                    marked,
+                );
+                assert_denied(&denied);
+                assert!(fixture.target_rx.try_recv().is_err());
+            }
+
+            // Check the native adapter against a real strictly older parent.
+            assert_eq!(
+                crate::platform::process_identity_server_ancestry(ordinary_peer),
+                crate::platform::ServerAncestry::Outside
+            );
+            // Capture readable absence from an actual sanitized exec. Model its
+            // older-server ancestry separately so this test remains valid when
+            // nextest itself inherited pane markers from the enclosing harness.
+            let ordinary_child = GuardTestChild(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .env_remove("HERDR_ENV")
+                    .env_remove("HERDR_PANE_ID")
+                    .spawn()
+                    .expect("marker-free ordinary child"),
+            );
+            let ordinary = ApiRequestContext::for_local_peer_pid(Some(ordinary_child.id()));
+            assert_eq!(
+                ordinary.local_peer_pane_origin,
+                crate::platform::PeerPaneOrigin::Absent
+            );
+            let response = crate::platform::with_server_ancestry_for_test(
+                ordinary.local_peer_identity.expect("ordinary pin"),
+                Some(true),
+                || {
+                    fixture.app.handle_api_request_with_context(
+                        request(
+                            "ordinary-failed-root",
+                            fixture.target_pane_id.clone(),
+                            "ordinary",
+                        ),
+                        ordinary,
+                    )
+                },
+            );
+            assert_ok(&response);
+            assert_eq!(
+                fixture.target_rx.try_recv().expect("ordinary delivery"),
+                Bytes::from_static(b"ordinary")
+            );
+
+            // Unknown marker evidence cannot use the same outside proof.
+            let unknown = ApiRequestContext {
+                local_peer_pane_origin: crate::platform::PeerPaneOrigin::Unknown,
+                local_peer_identity: Some(peer),
+            };
+            let response = fixture.app.handle_api_request_with_context(
+                request(
+                    "unknown-failed-root",
+                    fixture.target_pane_id.clone(),
+                    "blocked",
+                ),
+                unknown,
+            );
+            assert_unknown(&response);
+            assert!(fixture.target_rx.try_recv().is_err());
+
+            // Losing the real pane link cannot promote the marked caller even
+            // with Outside observation available for that exact live peer.
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, source_pane)
+                .expect("source runtime")
+                .test_set_child_pid(0);
+            let response = fixture.app.handle_api_request_with_context(
+                request("marked-orphan", fixture.target_pane_id.clone(), "blocked"),
+                marked_context,
+            );
+            assert_unknown(&response);
+            assert!(fixture.source_rx.try_recv().is_err());
+            assert!(fixture.target_rx.try_recv().is_err());
+        });
+    }
+
     #[tokio::test]
     async fn stale_peer_cannot_use_outside_age_exemption_in_actual_guard() {
         let mut fixture = attributed_agent_fixture();

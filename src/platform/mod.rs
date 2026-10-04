@@ -223,8 +223,9 @@ fn valid_pane_marker(pane: &[u8]) -> bool {
         && pane.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
-/// Windows and Darwin can prove a process is outside this server's descendants
-/// before pane roots are inspected. Other platforms keep their attribution path.
+/// Windows, Darwin, and Linux can prove a process is outside this server's
+/// descendants before pane roots are inspected. Other platforms keep their
+/// attribution path.
 // Individual variants are constructed only by their applicable platform (or tests).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,14 +251,16 @@ pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerA
     return server_ancestry_observation(windows::process_identity_outside_server_ancestry(peer));
     #[cfg(target_os = "macos")]
     return server_ancestry_observation(macos::process_identity_outside_server_ancestry(peer));
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    return server_ancestry_observation(linux::process_identity_outside_server_ancestry(peer));
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = peer;
         ServerAncestry::NotApplicable
     }
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
     match observation {
         Some(true) => ServerAncestry::Outside,
@@ -266,11 +269,12 @@ fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
     }
 }
 
-/// Darwin's bounded chronology proof, shared with deterministic host-independent
-/// tests. A strictly older live ancestor cannot descend from the pinned server;
-/// equal timestamps are not a negative proof. Every observation remains tied to
-/// its original process generation, including successful terminal observations.
-#[cfg(any(target_os = "macos", test))]
+/// Unix bounded chronology proof, shared with Darwin/Linux adapters and
+/// deterministic host-independent tests. A strictly older live ancestor cannot
+/// descend from the pinned server; equal timestamps are not a negative proof.
+/// Every observation remains tied to its original process generation, including
+/// successful terminal observations.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 pub(crate) fn observe_outside_server_ancestry(
     peer: ProcessIdentity,
     server: ProcessIdentity,
@@ -523,7 +527,7 @@ mod pane_origin_tests {
         assert_eq!(server_ancestry_observation(None), ServerAncestry::Unknown);
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     #[test]
     fn platforms_without_server_ancestry_keep_not_applicable() {
         assert_eq!(
