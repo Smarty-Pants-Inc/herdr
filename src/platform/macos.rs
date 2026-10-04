@@ -1184,9 +1184,26 @@ fn procargs2_env(buf: &[u8]) -> Option<&[u8]> {
     }
 
     let rest = &buf[4..];
+    // A missing executable is malformed, not readable environment absence.
+    if rest.first() == Some(&0) {
+        return None;
+    }
     let argv_start = procargs2_argv_start(rest)?;
     let env_start = skip_nul_strings(rest, argv_start, argc as usize)?;
-    rest.get(env_start..)
+    let environment = rest.get(env_start..)?;
+    let mut end = 0;
+    while end < environment.len() {
+        let record_len = environment[end..].iter().position(|&byte| byte == 0)?;
+        if record_len == 0 {
+            // Darwin follows the empty environment terminator with an Apple
+            // vector. Its strings (even KEY=value strings) are not environment.
+            return Some(&environment[..end]);
+        }
+        end += record_len + 1;
+    }
+    // Also accept a readable empty environment or a final NUL-ended record
+    // when the kernel buffer ends without an Apple vector.
+    Some(environment)
 }
 
 /// Get the current working directory of a process.
@@ -1460,6 +1477,83 @@ mod tests {
 
         let env = procargs2_env(&buf).expect("expected env block");
         assert_eq!(crate::platform::parse_agent_env_hint(env), None);
+    }
+
+    #[test]
+    fn procargs2_env_stops_before_apple_vector() {
+        for (entries, expected) in [
+            (vec!["PATH=/bin"], super::super::PeerPaneOrigin::Absent),
+            (vec![], super::super::PeerPaneOrigin::Absent),
+            (
+                vec!["HERDR_ENV=1", "HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::HasPane,
+            ),
+            (vec!["HERDR_ENV=1"], super::super::PeerPaneOrigin::Unknown),
+            (
+                vec!["HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::Unknown,
+            ),
+            (
+                vec!["HERDR_ENV=1", "HERDR_ENV=1", "HERDR_PANE_ID=w9V:p1"],
+                super::super::PeerPaneOrigin::Unknown,
+            ),
+        ] {
+            let mut buf = build_procargs2("/bin/tool", &["tool", "arg"], &entries);
+            let expected_env = procargs2_env(&buf)
+                .expect("legacy NUL-ended environment")
+                .to_vec();
+            buf.extend_from_slice(
+                b"\0executable_path=/bin/tool\0HERDR_ENV=1\0HERDR_PANE_ID=w9V:p2\0HERDR_AGENT=claude\0apple-string\0\0\0",
+            );
+            let env = procargs2_env(&buf).expect("environment before Apple vector");
+            assert_eq!(env, expected_env);
+            let pairs = parse_initial_environment(env).expect("readable environment prefix");
+            assert_eq!(super::super::pane_origin_from_environment(&pairs), expected);
+            assert_eq!(super::super::parse_agent_env_hint(env), None);
+        }
+        let mut buf = build_procargs2("/bin/tool", &["tool"], &["HERDR_AGENT=codex"]);
+        buf.extend_from_slice(b"\0HERDR_AGENT=claude\0\0");
+        assert_eq!(
+            super::super::parse_agent_env_hint(procargs2_env(&buf).expect("env prefix")),
+            Some(crate::detect::Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn procargs2_env_rejects_malformed_prefix_before_apple_vector() {
+        for entries in [vec!["BAD"], vec!["=bad"], vec!["PATH=/bin", "BAD"]] {
+            let mut buf = build_procargs2("/bin/tool", &["tool"], &entries);
+            buf.extend_from_slice(b"\0HERDR_ENV=1\0HERDR_PANE_ID=w9V:p1\0\0");
+            assert_eq!(
+                parse_initial_environment(procargs2_env(&buf).expect("framed prefix")),
+                None
+            );
+        }
+        let mut invalid_utf8 = build_procargs2("/bin/tool", &["tool"], &[]);
+        invalid_utf8.extend_from_slice(b"KEY=\xff\0\0apple\0");
+        assert_eq!(
+            parse_initial_environment(procargs2_env(&invalid_utf8).expect("framed prefix")),
+            None
+        );
+
+        for buf in [
+            vec![],
+            vec![1, 0, 0],
+            build_procargs2("/bin/tool", &[], &[]),
+            build_procargs2("", &["tool"], &[]),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool"].concat(),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0"].concat(),
+            [1i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0tool"].concat(),
+            [2i32.to_ne_bytes().as_slice(), b"/bin/tool\0\0tool\0arg"].concat(),
+            [
+                1i32.to_ne_bytes().as_slice(),
+                b"/bin/tool\0\0tool\0PATH=/bin",
+            ]
+            .concat(),
+            [(-1i32).to_ne_bytes().as_slice(), b"/bin/tool\0\0tool\0"].concat(),
+        ] {
+            assert_eq!(procargs2_env(&buf), None, "malformed framing: {buf:?}");
+        }
     }
 
     #[test]
