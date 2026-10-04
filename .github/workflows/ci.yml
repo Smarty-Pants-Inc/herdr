@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [master, windows]
+  # A maintainer dispatches the full matrix, macOS included, on a pushed exact merge candidate,
+  # because queue entry needs review/astra and Astra can require macOS first (smarty-dev#4345).
+  workflow_dispatch:
 
 permissions:
   contents: read
