@@ -279,7 +279,10 @@ pub(crate) fn reload_manifests() -> Vec<AgentManifestSummary> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache = build_manifest_cache();
     let summaries = manifest_summaries_from_cache(&cache);
+    #[cfg(not(test))]
     let lock = MANIFEST_CACHE.get_or_init(|| RwLock::new(cache.clone()));
+    #[cfg(test)]
+    let lock = test_manifest_cache_access(|| cache.clone());
     match lock.write() {
         Ok(mut guard) => *guard = cache,
         Err(poisoned) => *poisoned.into_inner() = cache,
@@ -317,8 +320,111 @@ pub(crate) fn reload_manifests_for_agents(agents: &[Agent]) {
     }
 }
 
+#[cfg(not(test))]
 fn manifest_cache() -> &'static RwLock<ManifestCache> {
     MANIFEST_CACHE.get_or_init(|| RwLock::new(build_manifest_cache()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MANIFEST_CACHE: std::cell::RefCell<Option<Arc<RwLock<ManifestCache>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+enum TestManifestCacheAccess {
+    Global(&'static RwLock<ManifestCache>),
+    Scoped(Arc<RwLock<ManifestCache>>),
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestManifestCacheAccess {
+    type Target = RwLock<ManifestCache>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Global(cache) => cache,
+            Self::Scoped(cache) => cache,
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_manifest_cache_access(build: impl FnOnce() -> ManifestCache) -> TestManifestCacheAccess {
+    match TEST_MANIFEST_CACHE.with(|cache| cache.borrow().clone()) {
+        Some(cache) => TestManifestCacheAccess::Scoped(cache),
+        None => {
+            TestManifestCacheAccess::Global(MANIFEST_CACHE.get_or_init(|| RwLock::new(build())))
+        }
+    }
+}
+
+#[cfg(test)]
+fn manifest_cache() -> TestManifestCacheAccess {
+    test_manifest_cache_access(build_manifest_cache)
+}
+
+#[cfg(test)]
+struct TestManifestCache {
+    previous: Option<Arc<RwLock<ManifestCache>>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl TestManifestCache {
+    // Tests that intentionally exercise cross-thread cache sharing install the
+    // same Arc on their worker threads; unrelated tests never see this cache.
+    fn install(cache: Arc<RwLock<ManifestCache>>) -> Self {
+        Self {
+            previous: TEST_MANIFEST_CACHE.with(|current| current.replace(Some(cache))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestManifestCache {
+    fn drop(&mut self) {
+        let _ = TEST_MANIFEST_CACHE.with(|current| current.replace(self.previous.take()));
+    }
+}
+
+/// Isolate disk inputs and the cache together, without publishing test fixtures
+/// into MANIFEST_CACHE. Reloads still use the normal serialization mutex.
+#[cfg(test)]
+#[must_use]
+pub(super) struct TestManifestDirs {
+    // Fields drop in declaration order: restore the cache before directory inputs.
+    _cache: TestManifestCache,
+    _dirs: crate::config::TestConfigDirs,
+    base: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TestManifestDirs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_manifest_dirs(name: &str) -> TestManifestDirs {
+    static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base =
+        std::env::temp_dir().join(format!("herdr-manifest-{name}-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dirs = crate::config::test_config_dirs(&base.join("config"), &base.join("state"));
+    let cache = TestManifestCache::install(Arc::new(RwLock::new(ManifestCache {
+        manifests: Vec::new(),
+    })));
+    let guard = TestManifestDirs {
+        _cache: cache,
+        _dirs: dirs,
+        base,
+    };
+    reload_manifests();
+    guard
 }
 
 fn build_manifest_cache() -> ManifestCache {
