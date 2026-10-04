@@ -191,6 +191,8 @@ pub enum Method {
     LayoutExport(LayoutExportParams),
     #[serde(rename = "layout.apply")]
     LayoutApply(LayoutApplyParams),
+    #[serde(rename = "layout.apply_restorable")]
+    LayoutApplyRestorable(LayoutApplyParams),
     /// Project-checked apply; its distinct name prevents unsafe old-server fallback.
     #[serde(rename = "layout.apply_project_checked")]
     LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams),

@@ -1,0 +1,18 @@
+{
+  "version": 3,
+  "layout_fingerprint": "0887c13fc8bee2daf7729444b633812305ce117d40934af9964b16b02b83d99b",
+  "workspaces": [
+    {
+      "tabs": [
+        {
+          "panes": {
+            "1": {
+              "ansi": "$ printf \"\\nHERDR_PRE_PR_HISTORY_4508\\n\"; i=1; while [ \"$i\" -le 60 ]; do printf \"historical filler %02d\\n\" \"$i\"; i=$((i+1)); done; printf \"HERDR_PRE_PR_READY_4508\\n\"\r\n\r\nHERDR_PRE_PR_HISTORY_4508\r\nhistorical filler 01\r\nhistorical filler 02\r\nhistorical filler 03\r\nhistorical filler 04\r\nhistorical filler 05\r\nhistorical filler 06\r\nhistorical filler 07\r\nhistorical filler 08\r\nhistorical filler 09\r\nhistorical filler 10\r\nhistorical filler 11\r\nhistorical filler 12\r\nhistorical filler 13\r\nhistorical filler 14\r\nhistorical filler 15\r\nhistorical filler 16\r\nhistorical filler 17\r\nhistorical filler 18\r\nhistorical filler 19\r\nhistorical filler 20\r\nhistorical filler 21\r\nhistorical filler 22\r\nhistorical filler 23\r\nhistorical filler 24\r\nhistorical filler 25\r\nhistorical filler 26\r\nhistorical filler 27\r\nhistorical filler 28\r\nhistorical filler 29\r\nhistorical filler 30\r\nhistorical filler 31\r\nhistorical filler 32\r\nhistorical filler 33\r\nhistorical filler 34\r\nhistorical filler 35\r\nhistorical filler 36\r\nhistorical filler 37\r\nhistorical filler 38\r\nhistorical filler 39\r\nhistorical filler 40\r\nhistorical filler 41\r\nhistorical filler 42\r\nhistorical filler 43\r\nhistorical filler 44\r\nhistorical filler 45\r\nhistorical filler 46\r\nhistorical filler 47\r\nhistorical filler 48\r\nhistorical filler 49\r\nhistorical filler 50\r\nhistorical filler 51\r\nhistorical filler 52\r\nhistorical filler 53\r\nhistorical filler 54\r\nhistorical filler 55\r\nhistorical filler 56\r\nhistorical filler 57\r\nhistorical filler 58\r\nhistorical filler 59\r\nhistorical filler 60\r\nHERDR_PRE_PR_READY_4508\r\n$ ",
+              "lines": 65
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
