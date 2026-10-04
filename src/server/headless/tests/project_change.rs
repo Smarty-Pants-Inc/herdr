@@ -1268,10 +1268,11 @@ async fn project_change_explicit_pane_and_tab_close_allow_once_only_for_changed_
 
 fn replacement_params(server: &HeadlessServer, tab: usize) -> api::schema::LayoutApplyParams {
     // Deserialization keeps this fixture aligned with the published JSON shape.
+    // Omit command to use test_headless_server's portable exiting default shell.
     serde_json::from_value(serde_json::json!({
         "tab_id": server.app.public_tab_id(0, tab).unwrap(),
         "focus": false,
-        "root": { "type": "pane", "command": ["/bin/bash"] }
+        "root": { "type": "pane" }
     }))
     .unwrap()
 }
