@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 
 mod diagnostics;
-pub(crate) use diagnostics::{
-    diagnostic_process_exists, DiagnosticDirectoryScan, PrivateDiagnosticDirectory,
-};
+pub(crate) use diagnostics::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
 
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {

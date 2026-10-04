@@ -27,10 +27,6 @@ use windows_sys::Win32::{
     },
 };
 
-pub(crate) fn diagnostic_process_exists(pid: u32) -> bool {
-    pid != 0 && super::process_exists(pid)
-}
-
 pub(crate) struct PrivateDiagnosticDirectory {
     path: PathBuf,
     _ancestors: Vec<File>,

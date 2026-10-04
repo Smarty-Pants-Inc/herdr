@@ -1,14 +1,18 @@
 //! Bounded, client-owned diagnostics for `status client`. This is not a server protocol.
 //!
 //! The foreground loop publishes at most once per second, from its Timer branch (never
-//! from render). Readers require both a live owner PID and a recent atomic snapshot.
+//! from render). Readers require kernel owner birth identity and a recent atomic snapshot.
 //! Multiple live owners require explicit selection; missing/old clients fail closed.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 
-use crate::platform::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
+use crate::platform::{
+    diagnostic_directory, diagnostic_snapshot_name, diagnostic_temporary_name as temporary_name,
+    parse_diagnostic_name, DiagnosticDirectoryScan, DiagnosticName, PrivateDiagnosticDirectory,
+    DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION,
+};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +52,8 @@ struct Snapshot {
     schema_version: u32,
     client_id: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_identity: Option<String>,
     updated_at_ms: u64,
     version: String,
     endpoints: Vec<MachineStatus>,
@@ -113,20 +119,17 @@ pub(crate) fn read_runtime_status(client_id: Option<&str>) -> RuntimeStatus {
             &diagnostic_directory(&crate::server::socket_paths::client_socket_path()),
             client_id,
             now,
-            crate::platform::diagnostic_process_exists,
+            crate::platform::diagnostic_owner_identity,
         ),
         Err(error) => RuntimeStatus::unavailable("invalid", Some(error.to_string())),
     }
-}
-
-fn diagnostic_directory(socket: &Path) -> PathBuf {
-    socket.with_extension("machine-status")
 }
 
 /// Owns exactly one foreground client's file; dropping it does not affect other clients.
 pub(super) struct MachineStatusPublisher {
     path: PathBuf,
     client_id: String,
+    owner_identity: io::Result<Option<String>>,
     last_attempt: Option<Instant>,
     reclamation_scan: RefCell<Option<DiagnosticDirectoryScan>>,
 }
@@ -135,8 +138,9 @@ impl MachineStatusPublisher {
     pub(super) fn new(socket: &Path) -> Self {
         let client_id = ProfileId::generate().to_string();
         Self {
-            path: diagnostic_directory(socket).join(format!("{client_id}.json")),
+            path: diagnostic_directory(socket).join(diagnostic_snapshot_name(&client_id)),
             client_id,
+            owner_identity: crate::platform::diagnostic_owner_identity(std::process::id()),
             last_attempt: None,
             reclamation_scan: RefCell::new(None),
         }
@@ -160,10 +164,17 @@ impl MachineStatusPublisher {
         // Also rate-limit failed writes, so an unavailable directory cannot create a hot loop.
         self.last_attempt = Some(now);
         let result = unix_ms().and_then(|updated_at_ms| {
+            let owner_identity = self
+                .owner_identity
+                .as_ref()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string()))?
+                .clone()
+                .ok_or_else(|| io::Error::other("publisher process is absent"))?;
             self.write(&Snapshot {
-                schema_version: SCHEMA_VERSION,
+                schema_version: DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION,
                 client_id: self.client_id.clone(),
                 pid: std::process::id(),
+                owner_identity: Some(owner_identity),
                 updated_at_ms,
                 version: crate::build_info::version(),
                 endpoints: collect_machines(profiles, shell.endpoint_views(), registry),
@@ -191,16 +202,22 @@ impl MachineStatusPublisher {
             .path
             .file_name()
             .ok_or_else(|| io::Error::other("invalid diagnostic filename"))?;
-        // The PID is in the temporary filename so even a partial write has an
-        // identifiable owner. Reclamation never guesses that an old timestamp is dead.
-        let temporary = format!("{}.{}.tmp", self.client_id, std::process::id());
+        // Both PID and captured birth identity survive a partial write in the filename.
+        // Reclamation never guesses that an old timestamp or reused numeric PID is dead.
+        let owner = self
+            .owner_identity
+            .as_ref()
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?
+            .as_deref()
+            .ok_or_else(|| io::Error::other("publisher process is absent"))?;
+        let temporary = temporary_name(&self.client_id, std::process::id(), owner)?;
         let reclamation = {
             let mut scan = self.reclamation_scan.borrow_mut();
             reclaim_abandoned(
                 &directory,
                 name,
                 &mut scan,
-                crate::platform::diagnostic_process_exists,
+                crate::platform::diagnostic_owner_identity,
             )
         };
         let retained = match reclamation {
@@ -247,8 +264,13 @@ impl Drop for MachineStatusPublisher {
                     if let Some(name) = self.path.file_name() {
                         let _ = directory.remove(name);
                     }
-                    let temporary = format!("{}.{}.tmp", self.client_id, std::process::id());
-                    let _ = directory.remove(OsStr::new(&temporary));
+                    if let Ok(Some(owner)) = &self.owner_identity {
+                        if let Ok(temporary) =
+                            temporary_name(&self.client_id, std::process::id(), owner)
+                        {
+                            let _ = directory.remove(OsStr::new(&temporary));
+                        }
+                    }
                 }
             }
         }
@@ -312,6 +334,12 @@ fn load_snapshot(path: &Path) -> io::Result<Snapshot> {
 }
 
 fn load_snapshot_at(directory: &PrivateDiagnosticDirectory, name: &OsStr) -> io::Result<Snapshot> {
+    let Some(DiagnosticName::Snapshot { client_id }) = parse_diagnostic_name(name) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unrecognized diagnostic filename",
+        ));
+    };
     let file = directory.open_file(name)?;
     if file.metadata()?.len() > MAX_BYTES {
         return Err(io::Error::other("diagnostic exceeds storage limit"));
@@ -323,11 +351,14 @@ fn load_snapshot_at(directory: &PrivateDiagnosticDirectory, name: &OsStr) -> io:
     }
     let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
     let mut ids = HashSet::new();
-    if snapshot.schema_version != SCHEMA_VERSION
+    if snapshot.schema_version != DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION
+        || snapshot
+            .owner_identity
+            .as_ref()
+            .is_none_or(|owner| owner.is_empty() || owner.len() > 96)
         || snapshot.pid == 0
         || ProfileId::parse(&snapshot.client_id).is_err()
-        || Path::new(name).file_stem().and_then(|stem| stem.to_str())
-            != Some(snapshot.client_id.as_str())
+        || client_id != snapshot.client_id
         || snapshot.endpoints.len() > MAX_MACHINES
         || snapshot
             .endpoints
@@ -341,14 +372,44 @@ fn load_snapshot_at(directory: &PrivateDiagnosticDirectory, name: &OsStr) -> io:
     Ok(snapshot)
 }
 
-/// Reclaim only authenticated regular files with a demonstrably dead owner. Invalid
-/// legacy temporaries with no attributable PID are retained, never guessed dead.
-/// The admission limit bounds such unreclaimable storage instead of accumulating more.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotOwner {
+    Live,
+    Abandoned,
+    Unverified,
+}
+
+/// One owner decision for both selection and pruning. An occupied numeric PID alone
+/// cannot authenticate a legacy snapshot, nor prove its owner has died.
+fn snapshot_owner(
+    snapshot: &Snapshot,
+    lookup: &impl Fn(u32) -> io::Result<Option<String>>,
+) -> io::Result<SnapshotOwner> {
+    owner_state(snapshot.pid, snapshot.owner_identity.as_deref(), lookup)
+}
+
+fn owner_state(
+    pid: u32,
+    recorded: Option<&str>,
+    lookup: &impl Fn(u32) -> io::Result<Option<String>>,
+) -> io::Result<SnapshotOwner> {
+    Ok(match lookup(pid)? {
+        None => SnapshotOwner::Abandoned,
+        Some(current) => match recorded {
+            Some(recorded) if recorded == current => SnapshotOwner::Live,
+            Some(_) => SnapshotOwner::Abandoned,
+            None => SnapshotOwner::Unverified,
+        },
+    })
+}
+
+/// Only the qualified, never-released private format belongs to us. Foreign and
+/// earlier experiment files are ignored, not authenticated, counted or deleted.
 fn reclaim_abandoned(
     directory: &PrivateDiagnosticDirectory,
     own_name: &OsStr,
     scan: &mut Option<DiagnosticDirectoryScan>,
-    process_exists: impl Fn(u32) -> bool,
+    owner_identity: impl Fn(u32) -> io::Result<Option<String>>,
 ) -> io::Result<usize> {
     if !scan
         .as_ref()
@@ -363,63 +424,33 @@ fn reclaim_abandoned(
         .ok_or_else(|| io::Error::other("missing diagnostic scan"))?
         .next_batch(MAX_SCAN_FILES)?;
     for name in &names {
-        let path = Path::new(name);
-        if path.extension() != Some(OsStr::new("json")) {
+        let Some(parsed) = parse_diagnostic_name(name) else {
             continue;
-        }
-        // Reject insecure files even if their content is corrupt or not ours.
-        match directory.open_file(name) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        }
-        if name == own_name {
-            continue; // Our current file may be repaired without trusting its payload.
-        }
-        if let Ok(snapshot) = load_snapshot_at(directory, name) {
-            if !process_exists(snapshot.pid) {
-                directory.remove(name)?;
-                // A paired legacy partial temporary need not be in this scan batch.
-                // Its client ID was unique to the demonstrably dead snapshot owner.
-                let legacy_tmp = format!("{}.tmp", snapshot.client_id);
-                match directory.open_file(OsStr::new(&legacy_tmp)) {
-                    Ok(_) => {
-                        if !load_snapshot_at(directory, OsStr::new(&legacy_tmp))
-                            .is_ok_and(|tmp| process_exists(tmp.pid))
-                        {
-                            directory.remove(OsStr::new(&legacy_tmp))?;
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-    for name in &names {
-        let path = Path::new(name);
-        if path.extension() != Some(OsStr::new("tmp")) {
-            continue;
-        }
-        match directory.open_file(name) {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or_default();
-        let dead = if let Some((id, pid)) = stem.rsplit_once('.') {
-            ProfileId::parse(id).is_ok()
-                && pid
-                    .parse::<u32>()
-                    .ok()
-                    .is_some_and(|pid| pid != 0 && !process_exists(pid))
-        } else {
-            load_snapshot_at(directory, name).is_ok_and(|snapshot| !process_exists(snapshot.pid))
         };
-        if dead {
+        match directory.open_file(name) {
+            Ok(file) => drop(file), // Close before any Windows deletion.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        let abandoned = match parsed {
+            DiagnosticName::Snapshot { .. } if name == own_name => false,
+            DiagnosticName::Snapshot { .. } => match load_snapshot_at(directory, name) {
+                Ok(snapshot) => {
+                    snapshot_owner(&snapshot, &owner_identity)? == SnapshotOwner::Abandoned
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                Err(_) => false,
+            },
+            DiagnosticName::Temporary {
+                client_id,
+                pid,
+                owner_identity: recorded,
+            } => {
+                debug_assert!(ProfileId::parse(client_id).is_ok());
+                owner_state(pid, Some(&recorded), &owner_identity)? == SnapshotOwner::Abandoned
+            }
+        };
+        if abandoned {
             directory.remove(name)?;
         }
     }
@@ -434,14 +465,25 @@ fn reclaim_abandoned(
     *scan = None;
     // A fresh count under the publisher lock catches files admitted by other
     // publishers between batches; never rely on an old cursor's cumulative count.
-    Ok(directory.names(MAX_FILES)?.len())
+    let mut count_scan = directory.scan()?;
+    let (names, complete) = count_scan.next_batch(MAX_SCAN_FILES)?;
+    if !complete {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "diagnostic admission scan exceeds bounded work",
+        ));
+    }
+    Ok(names
+        .iter()
+        .filter(|name| parse_diagnostic_name(name).is_some())
+        .count())
 }
 
 fn read_from_directory(
     directory: &Path,
     client_id: Option<&str>,
     now: u64,
-    process_exists: impl Fn(u32) -> bool,
+    owner_identity: impl Fn(u32) -> io::Result<Option<String>>,
 ) -> RuntimeStatus {
     let mut snapshots = Vec::new();
     let result = (|| -> io::Result<()> {
@@ -456,12 +498,15 @@ fn read_from_directory(
             if ProfileId::parse(id).is_err() {
                 return Ok(());
             }
-            vec![format!("{id}.json").into()]
+            vec![diagnostic_snapshot_name(id).into()]
         } else {
             directory.names(MAX_SCAN_FILES)?
         };
         for name in names {
-            if Path::new(&name).extension() != Some(OsStr::new("json")) {
+            if !matches!(
+                parse_diagnostic_name(&name),
+                Some(DiagnosticName::Snapshot { .. })
+            ) {
                 continue;
             }
             let snapshot = match load_snapshot_at(&directory, &name) {
@@ -470,7 +515,9 @@ fn read_from_directory(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            if process_exists(snapshot.pid) {
+            let owner = snapshot_owner(&snapshot, &owner_identity)
+                .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
+            if owner == SnapshotOwner::Live {
                 if snapshots.len() == MAX_FILES {
                     return Err(io::Error::other("too many live client machine diagnostics"));
                 }
@@ -480,7 +527,14 @@ fn read_from_directory(
         Ok(())
     })();
     if let Err(error) = result {
-        return RuntimeStatus::unavailable("invalid", Some(error.to_string()));
+        return RuntimeStatus::unavailable(
+            if error.kind() == io::ErrorKind::WouldBlock {
+                "unavailable"
+            } else {
+                "invalid"
+            },
+            Some(error.to_string()),
+        );
     }
     snapshots.sort_by(|left, right| left.client_id.cmp(&right.client_id));
     let candidates = snapshots
@@ -623,9 +677,14 @@ mod tests {
 
     fn storage_sample(client_id: &str, pid: u32) -> Snapshot {
         Snapshot {
-            schema_version: SCHEMA_VERSION,
+            schema_version: DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION,
             client_id: client_id.into(),
             pid,
+            owner_identity: Some(
+                crate::platform::diagnostic_owner_identity(pid)
+                    .unwrap()
+                    .unwrap_or_else(|| "old-process".into()),
+            ),
             updated_at_ms: 20_000,
             version: "storage-test".into(),
             endpoints: Vec::new(),
@@ -643,9 +702,14 @@ mod tests {
         let directory = publisher.path.parent().unwrap();
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            read_from_directory(directory, None, 20_000, |_| true)
-                .readout
-                .status,
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
             "invalid"
         );
         assert!(
@@ -656,9 +720,14 @@ mod tests {
         let alias = root.join("alias.machine-status");
         symlink(directory, &alias).unwrap();
         assert_eq!(
-            read_from_directory(&alias, None, 20_000, |_| true)
-                .readout
-                .status,
+            read_from_directory(
+                &alias,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
             "invalid"
         );
         let mut redirected = MachineStatusPublisher::new(&root.join("alias.sock"));
@@ -682,9 +751,14 @@ mod tests {
         publisher.write(&sample).unwrap();
         std::fs::set_permissions(&publisher.path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            read_from_directory(publisher.path.parent().unwrap(), None, 20_000, |_| true)
-                .readout
-                .status,
+            read_from_directory(
+                publisher.path.parent().unwrap(),
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
             "invalid"
         );
         assert!(
@@ -718,6 +792,343 @@ mod tests {
     }
 
     #[test]
+    fn reused_pid_orphan_does_not_hide_or_block_a_genuine_publisher() {
+        let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
+        let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
+        let directory = healthy.path.parent().unwrap();
+        let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
+        let id = ProfileId::generate().to_string();
+        let name = diagnostic_snapshot_name(&id);
+        let mut orphan = serde_json::to_value(storage_sample(&id, std::process::id())).unwrap();
+        orphan["owner_identity"] = "old-process-before-pid-reuse".into();
+        orphan["updated_at_ms"] = 1.into();
+        storage
+            .create_file(OsStr::new(&name))
+            .unwrap()
+            .write_all(&serde_json::to_vec(&orphan).unwrap())
+            .unwrap();
+        // Populate a genuine publisher without allowing reclamation to hide a read bug.
+        storage
+            .create_file(healthy.path.file_name().unwrap())
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&storage_sample(&healthy.client_id, std::process::id()))
+                    .unwrap(),
+            )
+            .unwrap();
+        for selector in [None, Some(healthy.client_id.as_str())] {
+            assert!(
+                read_from_directory(
+                    directory,
+                    selector,
+                    20_000,
+                    crate::platform::diagnostic_owner_identity
+                )
+                .readout
+                .fresh
+            );
+        }
+        assert_eq!(
+            read_from_directory(
+                directory,
+                Some(&id),
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
+            "unavailable"
+        );
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        assert!(
+            !directory.join(name).exists(),
+            "PID reuse orphan must be reclaimed"
+        );
+        // A genuinely live but expired publisher remains a protected ambiguous candidate.
+        let other = MachineStatusPublisher::new(&root.join("client.sock"));
+        let mut stale = storage_sample(&other.client_id, std::process::id());
+        stale.updated_at_ms = 1;
+        other.write(&stale).unwrap();
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        assert!(other.path.exists());
+        assert_eq!(
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
+            "ambiguous"
+        );
+        drop(other);
+        drop(healthy);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_bound_partial_temporaries_recover_reused_pid_and_protect_live_owner() {
+        let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
+        let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
+        let directory = healthy.path.parent().unwrap();
+        let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
+        let pid = std::process::id();
+        let owner = crate::platform::diagnostic_owner_identity(pid)
+            .unwrap()
+            .unwrap();
+        let live = temporary_name(&ProfileId::generate().to_string(), pid, &owner).unwrap();
+        storage
+            .create_file(OsStr::new(&live))
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+        // No JSON ever existed: filename identity is the only crash attribution.
+        for _ in 0..MAX_FILES {
+            let name =
+                temporary_name(&ProfileId::generate().to_string(), pid, "old-process").unwrap();
+            storage
+                .create_file(OsStr::new(&name))
+                .unwrap()
+                .write_all(b"{")
+                .unwrap();
+        }
+        healthy
+            .write(&storage_sample(&healthy.client_id, pid))
+            .unwrap();
+        assert!(directory.join(&live).exists());
+        assert_eq!(storage.names(MAX_FILES).unwrap().len(), 2);
+        assert!(
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .fresh
+        );
+        assert!(
+            matches!(parse_diagnostic_name(OsStr::new(&live)), Some(DiagnosticName::Temporary { owner_identity, .. }) if owner_identity == owner)
+        );
+        assert!(parse_diagnostic_name(OsStr::new(&format!(
+            "owner-v2.{}.1.z0.tmp",
+            healthy.client_id
+        )))
+        .is_none());
+        assert!(temporary_name(&healthy.client_id, pid, &"a".repeat(97)).is_err());
+        drop(healthy);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unrecognized_experiment_files_are_ignored_not_adopted_deleted_or_quota_counted() {
+        let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
+        let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
+        let directory = healthy.path.parent().unwrap();
+        let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
+        let mut legacy_names = Vec::new();
+        for _ in 0..MAX_FILES {
+            let id = ProfileId::generate().to_string();
+            let mut legacy = storage_sample(&id, std::process::id());
+            legacy.schema_version = 1; // Exact unsupported pre-R2 experiment payload.
+            legacy.owner_identity = None;
+            legacy.updated_at_ms = 1;
+            let name = format!("{id}.json");
+            storage
+                .create_file(OsStr::new(&name))
+                .unwrap()
+                .write_all(&serde_json::to_vec(&legacy).unwrap())
+                .unwrap();
+            legacy_names.push(name);
+        }
+        // Unsupported old partial files are foreign, even with an occupied PID.
+        let old_tmp = format!("{}.{}.tmp", ProfileId::generate(), std::process::id());
+        storage
+            .create_file(OsStr::new(&old_tmp))
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        for selector in [None, Some(healthy.client_id.as_str())] {
+            assert!(
+                read_from_directory(
+                    directory,
+                    selector,
+                    20_000,
+                    crate::platform::diagnostic_owner_identity
+                )
+                .readout
+                .fresh
+            );
+        }
+        assert!(legacy_names
+            .iter()
+            .all(|name| directory.join(name).exists()));
+        assert!(directory.join(&old_tmp).exists());
+        // Ignoring foreign files must not widen the current 128-client quota.
+        for _ in 1..MAX_FILES {
+            let id = ProfileId::generate().to_string();
+            storage
+                .create_file(OsStr::new(&diagnostic_snapshot_name(&id)))
+                .unwrap()
+                .write_all(&serde_json::to_vec(&storage_sample(&id, std::process::id())).unwrap())
+                .unwrap();
+        }
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        let excess = MachineStatusPublisher::new(&root.join("client.sock"));
+        assert!(excess
+            .write(&storage_sample(&excess.client_id, std::process::id()))
+            .is_err());
+        assert!(!excess.path.exists());
+        // Unknown partial files remain untouched and never consume current quota.
+        let overflow = format!("{}.tmp", ProfileId::generate());
+        storage
+            .create_file(OsStr::new(&overflow))
+            .unwrap()
+            .write_all(b"{")
+            .unwrap();
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        assert!(legacy_names
+            .iter()
+            .all(|name| directory.join(name).exists()));
+        assert_eq!(std::fs::read(directory.join(&overflow)).unwrap(), b"{");
+        drop(excess);
+        drop(healthy);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn occupied_legacy_owner_is_unverified_and_query_failure_never_reclaims() {
+        let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
+        let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
+        let directory = healthy.path.parent().unwrap();
+        let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
+        let id = ProfileId::generate().to_string();
+        let pid = std::process::id();
+        let mut legacy = storage_sample(&id, pid);
+        legacy.schema_version = 1;
+        legacy.owner_identity = None;
+        legacy.updated_at_ms = 1;
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let names = [
+            format!("{id}.json"),
+            format!("{id}.tmp"),
+            format!("{id}.{pid}.tmp"),
+        ];
+        for name in &names {
+            storage
+                .create_file(OsStr::new(name))
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+        healthy
+            .write(&storage_sample(&healthy.client_id, pid))
+            .unwrap();
+        assert!(
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .fresh
+        );
+        assert_eq!(
+            read_from_directory(
+                directory,
+                Some(&id),
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
+            "unavailable"
+        );
+        for name in &names {
+            assert!(directory.join(name).exists());
+        }
+        // Even a known identity must not be called dead when the kernel query fails.
+        let fail = |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected query failure",
+            ))
+        };
+        assert_eq!(
+            snapshot_owner(&legacy, &fail).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let read = read_from_directory(directory, Some(&healthy.client_id), 20_000, fail);
+        assert_eq!(read.readout.status, "unavailable");
+        assert!(!read.running);
+        assert!(reclaim_abandoned(&storage, OsStr::new("own.json"), &mut None, fail).is_err());
+        assert!(healthy.path.exists());
+        for name in &names {
+            assert!(directory.join(name).exists());
+        }
+        drop(healthy);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_partial_current_temporary_is_closed_reclaimed_and_republished() {
+        let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
+        let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
+        let directory = healthy.path.parent().unwrap();
+        let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
+        for _ in 0..MAX_FILES {
+            let id = ProfileId::generate().to_string();
+            storage
+                .create_file(OsStr::new(&diagnostic_snapshot_name(&id)))
+                .unwrap()
+                .write_all(&serde_json::to_vec(&storage_sample(&id, i32::MAX as u32)).unwrap())
+                .unwrap();
+            storage
+                .create_file(OsStr::new(
+                    &temporary_name(&id, i32::MAX as u32, "old-process").unwrap(),
+                ))
+                .unwrap()
+                .write_all(b"{")
+                .unwrap();
+        }
+        healthy
+            .write(&storage_sample(&healthy.client_id, std::process::id()))
+            .unwrap();
+        assert_eq!(storage.names(MAX_FILES).unwrap().len(), 1);
+        assert!(
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .fresh
+        );
+        drop(healthy);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn abandoned_snapshots_and_temporaries_do_not_hide_a_live_client() {
         let root = std::env::temp_dir().join(format!("herdr-diagnostic-{}", ProfileId::generate()));
         let healthy = MachineStatusPublisher::new(&root.join("client.sock"));
@@ -726,20 +1137,22 @@ mod tests {
         // failing-first reproduction before the reader has seen it.
         let storage = PrivateDiagnosticDirectory::open(directory, true).unwrap();
         let dead_pid = i32::MAX as u32;
-        assert!(!crate::platform::diagnostic_process_exists(dead_pid));
+        assert_eq!(
+            crate::platform::diagnostic_owner_identity(dead_pid).unwrap(),
+            None
+        );
         for _ in 0..MAX_FILES {
             let id = ProfileId::generate().to_string();
             let content = serde_json::to_vec(&storage_sample(&id, dead_pid)).unwrap();
-            for extension in ["json", "tmp"] {
-                let mut file = crate::platform::create_private_state_file(
-                    &directory.join(format!("{id}.{extension}")),
-                )
-                .unwrap();
-                file.write_all(&content).unwrap();
-            }
+            let mut file = crate::platform::create_private_state_file(
+                &directory.join(diagnostic_snapshot_name(&id)),
+            )
+            .unwrap();
+            file.write_all(&content).unwrap();
+            drop(file);
             // New-format interrupted writes can be reclaimed even if JSON is partial.
             let mut file = crate::platform::create_private_state_file(
-                &directory.join(format!("{id}.{dead_pid}.tmp")),
+                &directory.join(temporary_name(&id, dead_pid, "old-process").unwrap()),
             )
             .unwrap();
             file.write_all(b"{").unwrap();
@@ -751,8 +1164,12 @@ mod tests {
             .write_all(&content)
             .unwrap();
         for selector in [None, Some(healthy.client_id.as_str())] {
-            let readout =
-                read_from_directory(directory, selector, 20_000, |pid| pid == std::process::id());
+            let readout = read_from_directory(
+                directory,
+                selector,
+                20_000,
+                crate::platform::diagnostic_owner_identity,
+            );
             assert!(
                 readout.readout.fresh,
                 "abandoned files blocked healthy selection: {:?}",
@@ -772,15 +1189,25 @@ mod tests {
         );
         assert_eq!(storage.names(MAX_FILES).unwrap().len(), 2);
         assert_eq!(
-            read_from_directory(directory, None, 20_000, |_| true)
-                .readout
-                .status,
+            read_from_directory(
+                directory,
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
             "ambiguous"
         );
         assert!(
-            read_from_directory(directory, Some(&healthy.client_id), 20_000, |_| true)
-                .readout
-                .fresh
+            read_from_directory(
+                directory,
+                Some(&healthy.client_id),
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .fresh
         );
         drop(other);
         drop(healthy);
@@ -809,7 +1236,14 @@ mod tests {
                     .unwrap(),
             );
         }
-        let live_tmp = format!("{}.{}.tmp", ProfileId::generate(), std::process::id());
+        let live_tmp = temporary_name(
+            &ProfileId::generate().to_string(),
+            std::process::id(),
+            &crate::platform::diagnostic_owner_identity(std::process::id())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         write_fixture(OsStr::new(&live_tmp), b"{");
         let legacy_id = ProfileId::generate().to_string();
         let legacy_live_tmp = format!("{legacy_id}.tmp");
@@ -820,11 +1254,14 @@ mod tests {
         let unowned_tmp = format!("{}.tmp", ProfileId::generate());
         write_fixture(OsStr::new(&unowned_tmp), b"{");
         let dead_pid = i32::MAX as u32;
-        assert!(!crate::platform::diagnostic_process_exists(dead_pid));
+        assert_eq!(
+            crate::platform::diagnostic_owner_identity(dead_pid).unwrap(),
+            None
+        );
         for _ in 0..(2 * MAX_SCAN_FILES + 17) {
             let id = ProfileId::generate().to_string();
             write_fixture(
-                OsStr::new(&format!("{id}.json")),
+                OsStr::new(&diagnostic_snapshot_name(&id)),
                 &serde_json::to_vec(&storage_sample(&id, dead_pid)).unwrap(),
             );
         }
@@ -832,7 +1269,7 @@ mod tests {
             directory,
             Some(&healthy.client_id),
             20_000,
-            crate::platform::diagnostic_process_exists,
+            crate::platform::diagnostic_owner_identity,
         );
         assert!(
             selected.readout.fresh,
@@ -843,7 +1280,7 @@ mod tests {
                 directory,
                 None,
                 20_000,
-                crate::platform::diagnostic_process_exists
+                crate::platform::diagnostic_owner_identity
             )
             .readout
             .status,
@@ -874,7 +1311,7 @@ mod tests {
                 directory,
                 None,
                 20_000,
-                crate::platform::diagnostic_process_exists
+                crate::platform::diagnostic_owner_identity
             )
             .readout
             .status,
@@ -885,7 +1322,7 @@ mod tests {
                 directory,
                 Some(&healthy.client_id),
                 20_000,
-                crate::platform::diagnostic_process_exists
+                crate::platform::diagnostic_owner_identity
             )
             .readout
             .fresh
@@ -907,7 +1344,7 @@ mod tests {
             let id = ProfileId::generate().to_string();
             let bytes = serde_json::to_vec(&storage_sample(&id, std::process::id())).unwrap();
             storage
-                .create_file(OsStr::new(&format!("{id}.json")))
+                .create_file(OsStr::new(&diagnostic_snapshot_name(&id)))
                 .unwrap()
                 .write_all(&bytes)
                 .unwrap();
@@ -921,7 +1358,7 @@ mod tests {
         // At the same quota an existing live client can still refresh atomically.
         let mut existing = MachineStatusPublisher::new(&root.join("client.sock"));
         existing.client_id = existing_id.clone();
-        existing.path = directory.join(format!("{existing_id}.json"));
+        existing.path = directory.join(diagnostic_snapshot_name(&existing_id));
         existing
             .write(&storage_sample(&existing_id, std::process::id()))
             .unwrap();
@@ -1033,12 +1470,21 @@ mod tests {
         let first = MachineStatusPublisher::new(&dir.join("herdr-client.sock"));
         let second = MachineStatusPublisher::new(&dir.join("herdr-client.sock"));
         let directory = first.path.parent().unwrap();
-        let read = |now, alive| read_from_directory(directory, None, now, |_| alive);
+        let read = |now, alive| {
+            read_from_directory(directory, None, now, |pid| {
+                if alive {
+                    crate::platform::diagnostic_owner_identity(pid)
+                } else {
+                    Ok(None)
+                }
+            })
+        };
         assert_eq!(read(20_000, true).readout.status, "unavailable");
         let sample = |client_id: String, updated_at_ms| Snapshot {
-            schema_version: 1,
+            schema_version: DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION,
             client_id,
             pid: std::process::id(),
+            owner_identity: crate::platform::diagnostic_owner_identity(std::process::id()).unwrap(),
             updated_at_ms,
             version: "test".into(),
             endpoints: vec![MachineStatus {
@@ -1070,16 +1516,26 @@ mod tests {
         let ambiguous = read(20_000, true);
         assert!(ambiguous.running && !ambiguous.readout.fresh && ambiguous.endpoints.is_empty());
         assert_eq!(ambiguous.readout.status, "ambiguous");
-        let selected = read_from_directory(directory, Some(&first.client_id), 20_000, |_| true);
+        let selected = read_from_directory(
+            directory,
+            Some(&first.client_id),
+            20_000,
+            crate::platform::diagnostic_owner_identity,
+        );
         assert!(selected.readout.fresh);
         assert_eq!(
             selected.readout.client_id.as_deref(),
             Some(first.client_id.as_str())
         );
         assert_eq!(
-            read_from_directory(directory, Some("absent"), 20_000, |_| true)
-                .readout
-                .status,
+            read_from_directory(
+                directory,
+                Some("absent"),
+                20_000,
+                crate::platform::diagnostic_owner_identity
+            )
+            .readout
+            .status,
             "unavailable"
         );
         drop(first);
@@ -1095,14 +1551,19 @@ mod tests {
             schema_version: 99,
             client_id: publisher.client_id.clone(),
             pid: 12,
+            owner_identity: None,
             updated_at_ms: 20_000,
             version: "future".into(),
             endpoints: Vec::new(),
         };
         publisher.write(&sample).unwrap();
         let assert_invalid = || {
-            let readout =
-                read_from_directory(publisher.path.parent().unwrap(), None, 20_000, |_| true);
+            let readout = read_from_directory(
+                publisher.path.parent().unwrap(),
+                None,
+                20_000,
+                crate::platform::diagnostic_owner_identity,
+            );
             assert_eq!(readout.readout.status, "invalid");
             assert!(!readout.readout.fresh && readout.endpoints.is_empty());
         };
@@ -1111,7 +1572,7 @@ mod tests {
         assert_invalid();
         std::fs::write(&publisher.path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
         assert_invalid();
-        sample.schema_version = 1;
+        sample.schema_version = DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION;
         sample.endpoints = vec![
             MachineStatus {
                 id: ProfileId::generate().to_string(),

@@ -5,15 +5,13 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
 
-pub(crate) struct PrivateDiagnosticDirectory(File);
+#[path = "../diagnostic_storage_creation.rs"]
+mod diagnostic_storage_creation;
 
-pub(crate) fn diagnostic_process_exists(pid: u32) -> bool {
-    // Diagnostic payloads must never turn a PID into kill(0, 0) or kill(-1, 0).
-    libc::pid_t::try_from(pid).is_ok_and(|pid| pid > 0) && crate::platform::process_exists(pid)
-}
+pub(crate) struct PrivateDiagnosticDirectory(File);
 
 fn denied() -> io::Error {
     io::Error::new(
@@ -46,8 +44,16 @@ fn validate_owner(metadata: &std::fs::Metadata) -> io::Result<()> {
 fn validate_file(file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     validate_owner(&metadata)?;
-    if !metadata.is_file() || metadata.mode() & 0o7777 != 0o600 || metadata.nlink() != 1 {
+    if !metadata.is_file() || metadata.mode() & 0o7777 != 0o600 || metadata.nlink() > 1 {
         return Err(denied());
+    }
+    if metadata.nlink() == 0 {
+        // The opened, authenticated inode may have been atomically replaced.
+        // Never confuse unsafe objects with this retryable publication race.
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "diagnostic snapshot was replaced during open",
+        ));
     }
     Ok(())
 }
@@ -58,7 +64,7 @@ impl PrivateDiagnosticDirectory {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            match diagnostic_storage_creation::create_private_directory(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
@@ -86,39 +92,47 @@ impl PrivateDiagnosticDirectory {
     }
 
     pub(crate) fn open_file(&self, name: &OsStr) -> io::Result<File> {
+        self.open_file_with(name, |_, _| Ok(()))
+    }
+
+    // A per-call seam permits exact open -> replace -> validate tests, with no
+    // global hook or timing dependency. Production passes a no-op closure.
+    fn open_file_with(
+        &self,
+        name: &OsStr,
+        mut before_validate: impl FnMut(&File, usize) -> io::Result<()>,
+    ) -> io::Result<File> {
         let name = name_cstring(name)?;
-        // O_NONBLOCK prevents a substituted FIFO from hanging before fstat validation.
-        let fd = unsafe {
-            libc::openat(
-                self.0.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        if fd == -1 {
-            return Err(io::Error::last_os_error());
+        for attempt in 0..3 {
+            // O_NONBLOCK prevents a substituted FIFO from hanging before fstat validation.
+            let fd = unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: openat returned an owned descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            before_validate(&file, attempt)?;
+            match validate_file(&file) {
+                Ok(()) => return Ok(file),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
         }
-        // SAFETY: openat returned an owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        validate_file(&file)?;
-        Ok(file)
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "diagnostic snapshot replacement retry limit reached",
+        ))
     }
 
     pub(crate) fn create_file(&self, name: &OsStr) -> io::Result<File> {
         let name = name_cstring(name)?;
-        let fd = unsafe {
-            libc::openat(
-                self.0.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: openat returned an owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
+        let file = diagnostic_storage_creation::create_private_file_at(&self.0, &name)?;
         validate_file(&file)?;
         Ok(file)
     }
@@ -318,10 +332,95 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_pid_probe_does_not_accept_process_group_or_all_process_ids() {
-        assert!(!diagnostic_process_exists(0));
-        assert!(!diagnostic_process_exists(u32::MAX));
-        assert!(diagnostic_process_exists(std::process::id()));
+    fn diagnostic_atomic_replace_reopens_authenticated_unlinked_snapshot() {
+        use std::io::{Read, Write};
+        let root = std::env::temp_dir().join(format!(
+            "herdr-diagnostic-replace-{}",
+            crate::client::endpoint::ProfileId::generate()
+        ));
+        let directory = PrivateDiagnosticDirectory::open(&root, true).unwrap();
+        directory
+            .create_file(OsStr::new("snapshot"))
+            .unwrap()
+            .write_all(b"old")
+            .unwrap();
+        let mut opens = 0;
+        let mut file = directory
+            .open_file_with(OsStr::new("snapshot"), |old, attempt| {
+                opens += 1;
+                if attempt == 0 {
+                    directory
+                        .create_file(OsStr::new("next"))?
+                        .write_all(b"new")?;
+                    directory.replace(OsStr::new("next"), OsStr::new("snapshot"))?;
+                    assert_eq!(old.metadata()?.nlink(), 0);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "new");
+        assert_eq!(opens, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_atomic_replace_retry_exhaustion_is_bounded_and_unavailable() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-diagnostic-exhaustion-{}",
+            crate::client::endpoint::ProfileId::generate()
+        ));
+        let directory = PrivateDiagnosticDirectory::open(&root, true).unwrap();
+        directory.create_file(OsStr::new("snapshot")).unwrap();
+        let mut opens = 0;
+        let error = directory
+            .open_file_with(OsStr::new("snapshot"), |old, _| {
+                opens += 1;
+                directory.create_file(OsStr::new("next"))?;
+                directory.replace(OsStr::new("next"), OsStr::new("snapshot"))?;
+                assert_eq!(old.metadata()?.nlink(), 0);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(opens, 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_atomic_replace_does_not_retry_unsafe_mode_or_multiple_links() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-diagnostic-unsafe-replace-{}",
+            crate::client::endpoint::ProfileId::generate()
+        ));
+        let directory = PrivateDiagnosticDirectory::open(&root, true).unwrap();
+        directory.create_file(OsStr::new("snapshot")).unwrap();
+        let mut opens = 0;
+        let error = directory
+            .open_file_with(OsStr::new("snapshot"), |old, _| {
+                opens += 1;
+                directory.create_file(OsStr::new("next"))?;
+                directory.replace(OsStr::new("next"), OsStr::new("snapshot"))?;
+                assert_eq!(old.metadata()?.nlink(), 0);
+                old.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(opens, 1, "unsafe unlinked inode must not consume retries");
+
+        std::fs::hard_link(root.join("snapshot"), root.join("hardlink")).unwrap();
+        opens = 0;
+        let error = directory
+            .open_file_with(OsStr::new("snapshot"), |_, _| {
+                opens += 1;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(opens, 1, "multiple links are not a replacement transient");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -11,9 +11,6 @@ fn unsupported<T>() -> io::Result<T> {
     ))
 }
 
-pub(crate) fn diagnostic_process_exists(_pid: u32) -> bool {
-    false
-}
 pub(crate) struct PrivateDiagnosticDirectory;
 pub(crate) struct DiagnosticDirectoryScan;
 impl PrivateDiagnosticDirectory {
