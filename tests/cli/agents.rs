@@ -207,6 +207,134 @@ fn agent_start_stops_retrying_when_the_pane_shell_stays_busy() {
     cleanup_spawned_herdr(herdr, base);
 }
 
+// Re-run the real CLI fixture in a child so the lock seam never changes the
+// test runner's environment or touches the user's API input log.
+#[cfg(target_os = "linux")]
+#[test]
+fn agent_start_short_timeout_before_prompt_dispatch() {
+    let base = unique_test_dir();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cases::agents::agent_start_command_works",
+            "--nocapture",
+        ])
+        .env("XDG_STATE_HOME", base.join("state"))
+        .env("HERDR_TEST_STALL_INITIAL_AGENT_GET", "1")
+        .output()
+        .unwrap();
+    cleanup_test_base(&base);
+    assert!(
+        output.status.success(),
+        "slow initial agent.get fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[cfg(target_os = "linux")]
+fn prompt_with_stalled_initial_get(
+    socket_path: &Path,
+    server_pid: u32,
+    received_prompts: &Path,
+    prompt: impl FnOnce() -> std::process::Output,
+) -> std::process::Output {
+    use std::os::unix::fs::MetadataExt;
+
+    let unrelated = run_cli_json(socket_path, &["workspace", "create", "--no-focus"]);
+    let pane_id = unrelated["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap();
+    let log_path = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap())
+        .join(app_dir_name())
+        .join("api-input.jsonl");
+    let receipts_before = fs::read(received_prompts).unwrap();
+    let prompt_records = || {
+        fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["method"] == "agent.prompt"
+            })
+            .count()
+    };
+    let records_before = prompt_records();
+    let output = thread::scope(|scope| {
+        // Open inside the scope: on panic this drops BEFORE scope joins the
+        // blocked writer. Otherwise an assertion failure would deadlock cleanup.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log_path)
+            .unwrap();
+        lock.lock().unwrap();
+        let metadata = lock.metadata().unwrap();
+        let identity = format!(
+            "{:02x}:{:02x}:{}",
+            libc::major(metadata.dev()),
+            libc::minor(metadata.dev()),
+            metadata.ino()
+        );
+        let pid = server_pid.to_string();
+        let writer = scope.spawn(|| {
+            let mut stream = UnixStream::connect(socket_path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "id": "stall-app",
+                    "method": "pane.send_input",
+                    "params": {"pane_id": pane_id, "text": "", "keys": ["Ctrl+U"]}
+                })
+            )
+            .unwrap();
+            let mut response = String::new();
+            BufReader::new(stream).read_line(&mut response).unwrap();
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+        });
+        // Prove the App is actually blocked on this inode, not merely that an
+        // input request was sent. API listener/connection threads remain live.
+        assert!(
+            wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
+                fs::read_to_string("/proc/locks")
+                    .unwrap()
+                    .lines()
+                    .any(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        fields.contains(&"->")
+                            && fields.contains(&"FLOCK")
+                            && fields.contains(&"WRITE")
+                            && fields.contains(&pid.as_str())
+                            && fields.contains(&identity.as_str())
+                    })
+            }),
+            "App PID {pid} did not block on input log inode {identity}"
+        );
+        let output = prompt();
+        assert_eq!(output.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "timeout");
+        assert_eq!(fs::read(received_prompts).unwrap(), receipts_before);
+        drop(lock);
+        writer.join().unwrap();
+        output
+    });
+    // This request drains behind the timed-out internal get. There must not be
+    // a deferred prompt dispatch after the lock is released either.
+    run_cli_json(socket_path, &["agent", "get", "main"]);
+    assert_eq!(prompt_records(), records_before);
+    assert_eq!(fs::read(received_prompts).unwrap(), receipts_before);
+    eprintln!(
+        "counterexample: App PID {server_pid} blocked -> short timeout -> no dispatch/receipt -> unlocked and drained; prompt records unchanged at {records_before}"
+    );
+    output
+}
+
 #[test]
 fn agent_start_command_works() {
     use std::os::unix::fs::PermissionsExt;
@@ -224,7 +352,7 @@ fn agent_start_command_works() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}'\nexport HERDR_AGENT=pi\n'{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do\n  printf '%s\\n' \"$prompt\" >> '{3}'\n  case \"$prompt\" in\n    \"do not transition\") continue ;;\n    \"done churn\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state done >/dev/null\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n      continue\n      ;;\n    \"session churn\")\n      '{1}' pane report-agent-session \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --agent-session-id replacement >/dev/null\n      continue\n      ;;\n    \"block after submit\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state blocked >/dev/null\n      continue\n      ;;\n  esac\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state working >/dev/null\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n  printf '%s\\n' \"$prompt\" >> '{2}'\ndone\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}'\nexport HERDR_AGENT=pi\n'{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r prompt; do\n  printf '%s\\n' \"$prompt\" >> '{3}'\n  case \"$prompt\" in\n    \"do not transition\"|\"unlimited no transition\") continue ;;\n    \"done churn\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state done >/dev/null\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n      continue\n      ;;\n    \"session churn\")\n      '{1}' pane report-agent-session \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --agent-session-id replacement >/dev/null\n      continue\n      ;;\n    \"block after submit\")\n      '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state blocked >/dev/null\n      continue\n      ;;\n  esac\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state working >/dev/null\n  '{1}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\n  printf '%s\\n' \"$prompt\" >> '{2}'\ndone\n",
             captured_args.display(),
             env!("CARGO_BIN_EXE_herdr"),
             captured_prompts.display(),
@@ -428,13 +556,13 @@ fn agent_start_command_works() {
         )
     };
 
-    let wait_for_received_prompts = |expected: &[&str]| {
-        let expected = format!("{}\n", expected.join("\n"));
+    let wait_for_received_prompt = |expected: &str| {
         assert!(
             wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
-                fs::read_to_string(&received_prompts).is_ok_and(|received| received == expected)
+                fs::read_to_string(&received_prompts)
+                    .is_ok_and(|received| received.lines().filter(|line| *line == expected).count() == 1)
             }),
-            "fake Pi did not receive the submitted prompts: expected {expected:?}, got {:?}",
+            "fake Pi did not receive the submitted prompt exactly once: expected {expected:?}, got {:?}",
             fs::read_to_string(&received_prompts)
         );
     };
@@ -443,23 +571,46 @@ fn agent_start_command_works() {
     let idle_before = run_cli_json(&socket_path, &["agent", "get", "main"]);
     assert_eq!(idle_before["result"]["agent"]["interactive_ready"], true);
     assert_eq!(idle_before["result"]["agent"]["agent_status"], "idle");
-    let idle_sequence = idle_before["result"]["agent"]["state_change_seq"]
-        .as_u64()
-        .unwrap();
 
-    // A caller budget shorter than the activity gate must still win.
+    // A caller budget shorter than the activity gate must still win. Its
+    // initial agent.get may exhaust the budget before any prompt is dispatched.
+    #[cfg(target_os = "linux")]
+    let stale_idle = if std::env::var_os("HERDR_TEST_STALL_INITIAL_AGENT_GET").is_some() {
+        prompt_with_stalled_initial_get(
+            &socket_path,
+            herdr.child.process_id().unwrap(),
+            &received_prompts,
+            || prompt_wait("do not transition", "500"),
+        )
+    } else {
+        prompt_wait("do not transition", "500")
+    };
+    #[cfg(not(target_os = "linux"))]
     let stale_idle = prompt_wait("do not transition", "500");
     assert_eq!(stale_idle.status.code(), Some(1));
     let stale_idle: serde_json::Value = serde_json::from_slice(&stale_idle.stderr).unwrap();
     assert_eq!(stale_idle["error"]["code"], "timeout");
-    wait_for_received_prompts(&["--wait", "do not transition"]);
+
+    // Baseline this independent call, not the optionally dispatched short one.
+    let idle_before = run_cli_json(&socket_path, &["agent", "get", "main"]);
+    assert_eq!(idle_before["result"]["agent"]["agent_status"], "idle");
+    assert_eq!(idle_before["result"]["agent"]["interactive_ready"], true);
+    let idle_sequence = idle_before["result"]["agent"]["state_change_seq"]
+        .as_u64()
+        .unwrap();
 
     // No caller deadline: only the 5000ms activity gate decides this error.
     // A 6000ms total budget incorrectly assumes get + dispatch + submission
     // always take less than 1000ms, which is not guaranteed under load.
     let stalled = run_cli(
         &socket_path,
-        &["agent", "prompt", "main", "do not transition", "--wait"],
+        &[
+            "agent",
+            "prompt",
+            "main",
+            "unlimited no transition",
+            "--wait",
+        ],
     );
     assert_eq!(stalled.status.code(), Some(1));
     let stalled: serde_json::Value = serde_json::from_slice(&stalled.stderr).unwrap();
@@ -467,7 +618,11 @@ fn agent_start_command_works() {
     assert!(stalled["error"]["message"]
         .as_str()
         .is_some_and(|message| message.contains("no observed working or blocked state")));
-    wait_for_received_prompts(&["--wait", "do not transition", "do not transition"]);
+    wait_for_received_prompt("unlimited no transition");
+    eprintln!(
+        "stalled prompt receipts: {:?}",
+        fs::read_to_string(&received_prompts).unwrap()
+    );
     let idle_after = run_cli_json(&socket_path, &["agent", "get", "main"]);
     assert_eq!(idle_after["result"]["agent"]["agent_status"], "idle");
     assert_eq!(
