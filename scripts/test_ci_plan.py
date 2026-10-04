@@ -328,7 +328,10 @@ class CIPlanTests(unittest.TestCase):
         self.write("docs/page.md")
         after = self.commit()
         tree = self.git("rev-parse", f"{after}^{{tree}}")
-        (self.repo / ".git/objects" / tree[:2] / tree[2:]).unlink()
+        obj = self.repo / ".git/objects" / tree[:2] / tree[2:]
+        # ponytail: git writes loose objects read-only; Windows refuses to unlink those.
+        obj.chmod(0o644)
+        obj.unlink()
         self.assertTrue(self.plan(self.event(after), "push")[1])
 
     def test_not_a_repository_enables_conpty(self) -> None:
