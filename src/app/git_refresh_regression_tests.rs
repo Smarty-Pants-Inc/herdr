@@ -342,7 +342,7 @@ fn git_watch_repair_directory_symlink_retarget_and_missing_parent_migration() {
     let missing = link.join("nested/config");
     std::fs::write(
         second.join("config"),
-        format!("[include]\npath = {}\n", missing.display()),
+        format!("[include]\npath = {}\n", git_config_path(&missing)),
     )
     .unwrap();
     drive_git_watch_refresh(&mut app);
