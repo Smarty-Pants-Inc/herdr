@@ -226,6 +226,29 @@ impl App {
         }
     }
 
+    /// Captured launch markers only remove the ordinary ancestry exemption. They
+    /// never select a pane, whose public ID may have been reused or renumbered.
+    /// A marked caller must still have a live, validated relationship to a pane.
+    pub(crate) fn input_origin_for_context(
+        &self,
+        context: crate::api::ApiRequestContext,
+    ) -> InputOrigin {
+        let Some(peer) = context.local_peer_identity else {
+            return InputOrigin::Unknown;
+        };
+        match context.local_peer_pane_origin {
+            crate::platform::PeerPaneOrigin::Unknown => InputOrigin::Unknown,
+            crate::platform::PeerPaneOrigin::Absent => self.input_origin_for_peer_identity(peer),
+            crate::platform::PeerPaneOrigin::HasPane => {
+                match self.checked_pane_target_for_peer_identity_with_outside_proof(peer, false) {
+                    Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+                    Ok(Some(_)) => InputOrigin::Ordinary,
+                    Ok(None) | Err(()) => InputOrigin::Unknown,
+                }
+            }
+        }
+    }
+
     /// Maps a locally attributed process to the one pane whose session it runs in,
     /// agent or not. Used when a process reports under a pane ID it inherited
     /// before its pane was renumbered or moved (smarty-dev#509).
@@ -246,6 +269,22 @@ impl App {
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> Result<Option<TerminalTarget>, ()> {
+        self.checked_pane_target_for_peer_identity_with_outside_proof(peer_identity, true)
+    }
+
+    fn checked_pane_target_for_peer_identity_with_outside_proof(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+        allow_outside_proof: bool,
+    ) -> Result<Option<TerminalTarget>, ()> {
+        if allow_outside_proof {
+            match crate::platform::process_identity_server_ancestry(peer_identity) {
+                crate::platform::ServerAncestry::Outside => return Ok(None),
+                crate::platform::ServerAncestry::Unknown => return Err(()),
+                crate::platform::ServerAncestry::NotApplicable
+                | crate::platform::ServerAncestry::ReachedServer => {}
+            }
+        }
         let mut missing_root = false;
         let panes: Vec<(TerminalTarget, crate::platform::ProcessIdentity)> = self
             .terminal_targets()

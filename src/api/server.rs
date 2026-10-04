@@ -215,9 +215,7 @@ fn start_server_inner(
                     retrying = false;
                     // Pin once while accepting; queued/handler dispatch must not recapture
                     // a later numeric owner, including the older-kernel credential fallback.
-                    let context = ApiRequestContext {
-                        local_peer_identity: local_stream_peer_identity(&stream),
-                    };
+                    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
@@ -297,9 +295,7 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    let context = ApiRequestContext {
-        local_peer_identity: local_stream_peer_identity(&stream),
-    };
+    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
     handle_connection_with_stop(
         stream,
         context,
@@ -1651,9 +1647,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker_registry = registry.clone();
         let worker = std::thread::spawn(move || {
-            let context = ApiRequestContext {
-                local_peer_identity: local_stream_peer_identity(&server),
-            };
+            let context = ApiRequestContext::capture(local_stream_peer_identity(&server));
             handle_connection_with_stop(
                 server,
                 context,

@@ -123,6 +123,123 @@ pub(crate) fn checked_membership_covers_ancestry() -> bool {
     cfg!(windows)
 }
 
+/// Accept-time pane provenance is a restriction, not an identity or authorization
+/// token. A marker never binds a public pane ID to its current terminal owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PeerPaneOrigin {
+    Absent,
+    HasPane,
+    #[default]
+    Unknown,
+}
+
+pub(crate) fn process_initial_pane_origin(peer: ProcessIdentity) -> PeerPaneOrigin {
+    if process_identity(peer.pid) != Some(peer) {
+        return PeerPaneOrigin::Unknown;
+    }
+    let environment = process_initial_environment(peer);
+    if process_identity(peer.pid) != Some(peer) {
+        return PeerPaneOrigin::Unknown;
+    }
+    environment
+        .as_deref()
+        .map_or(PeerPaneOrigin::Unknown, pane_origin_from_environment)
+}
+
+fn process_initial_environment(peer: ProcessIdentity) -> Option<Vec<(String, String)>> {
+    #[cfg(target_os = "linux")]
+    return linux::process_initial_environment(peer);
+    #[cfg(target_os = "macos")]
+    return macos::process_initial_environment(peer);
+    #[cfg(windows)]
+    return windows::process_initial_environment(peer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = peer;
+        None
+    }
+}
+
+/// Missing both markers is readable absence. Partial, duplicated, or malformed
+/// markers cannot be used as proof of ordinary origin. Platform readers must
+/// return None for an unreadable or incomplete environment, not an empty list.
+fn pane_origin_from_environment(environment: &[(String, String)]) -> PeerPaneOrigin {
+    let mut herdr_env = None;
+    let mut pane_id = None;
+    for (key, value) in environment {
+        let slot = match key.as_str() {
+            "HERDR_ENV" => &mut herdr_env,
+            "HERDR_PANE_ID" => &mut pane_id,
+            _ => continue,
+        };
+        if slot.replace(value.as_str()).is_some() {
+            return PeerPaneOrigin::Unknown;
+        }
+    }
+    match (herdr_env, pane_id) {
+        (None, None) => PeerPaneOrigin::Absent,
+        (Some("1"), Some(pane)) if valid_pane_marker(pane.as_bytes()) => PeerPaneOrigin::HasPane,
+        _ => PeerPaneOrigin::Unknown,
+    }
+}
+
+fn valid_pane_marker(pane: &[u8]) -> bool {
+    let Ok(pane) = std::str::from_utf8(pane) else {
+        return false;
+    };
+    let Some((workspace, pane)) = pane.split_once(":p") else {
+        return false;
+    };
+    let Some(workspace) = workspace.strip_prefix('w') else {
+        return false;
+    };
+    !workspace.is_empty()
+        && !pane.is_empty()
+        && workspace.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && pane.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Windows can prove a process is outside this server's descendants before pane
+/// roots are inspected. Other platforms keep their existing attribution path.
+// Individual variants are constructed only by their applicable platform (or tests).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerAncestry {
+    NotApplicable,
+    ReachedServer,
+    Outside,
+    Unknown,
+}
+
+pub(crate) fn process_identity_server_ancestry(peer: ProcessIdentity) -> ServerAncestry {
+    #[cfg(test)]
+    if let Some((expected, observation)) = TEST_SERVER_ANCESTRY.with(|value| value.get()) {
+        if peer == expected {
+            return if process_identity(peer.pid) == Some(peer) {
+                observation
+            } else {
+                ServerAncestry::Unknown
+            };
+        }
+    }
+    #[cfg(windows)]
+    return server_ancestry_observation(windows::process_identity_outside_server_ancestry(peer));
+    #[cfg(not(windows))]
+    {
+        let _ = peer;
+        ServerAncestry::NotApplicable
+    }
+}
+
+#[cfg(any(windows, test))]
+fn server_ancestry_observation(observation: Option<bool>) -> ServerAncestry {
+    match observation {
+        Some(true) => ServerAncestry::Outside,
+        Some(false) => ServerAncestry::ReachedServer,
+        None => ServerAncestry::Unknown,
+    }
+}
+
 /// Identity-aware boundary around the numeric OS session observation.
 pub(crate) fn process_identity_in_pane_session(
     root: ProcessIdentity,
@@ -154,7 +271,32 @@ pub(crate) fn process_identity_in_pane_session(
 thread_local! {
     static TEST_MEMBERSHIP: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
     static TEST_MEMBERSHIP_ANCESTRY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SERVER_ANCESTRY: std::cell::Cell<Option<(ProcessIdentity, ServerAncestry)>> = const { std::cell::Cell::new(None) };
 }
+
+/// Peer-keyed, thread-local OS-observation seam; never changes other callers or
+/// bypasses live endpoint checks. Drop restores the prior observation on panic.
+#[cfg(test)]
+pub(crate) fn with_server_ancestry_for_test<T>(
+    peer: ProcessIdentity,
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<(ProcessIdentity, ServerAncestry)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SERVER_ANCESTRY.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(
+        TEST_SERVER_ANCESTRY
+            .with(|value| value.replace(Some((peer, server_ancestry_observation(observation))))),
+    );
+    run()
+}
+
+#[cfg(all(windows, test))]
+pub(crate) use windows::test_outside_server_ancestry_sequence;
 
 /// Scoped OS-observation seam: still runs endpoint checks and the actual app guard.
 #[cfg(test)]
@@ -231,6 +373,87 @@ fn observe_parent_identity(
         && identity_of(child.pid) == Some(child)
         && identity_of(parent.pid) == Some(parent))
     .then_some(parent)
+}
+
+#[cfg(test)]
+mod pane_origin_tests {
+    use super::*;
+
+    #[test]
+    fn marker_presence_distinguishes_readable_absence_from_malformed_markers() {
+        let pairs = |values: &[(&str, &str)]| {
+            values
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>()
+        };
+        for values in [vec![], vec![("PATH", "/bin")]] {
+            assert_eq!(
+                pane_origin_from_environment(&pairs(&values)),
+                PeerPaneOrigin::Absent
+            );
+        }
+        assert_eq!(
+            pane_origin_from_environment(&pairs(&[
+                ("HERDR_ENV", "1"),
+                ("HERDR_PANE_ID", "w9V:p1")
+            ])),
+            PeerPaneOrigin::HasPane
+        );
+        for values in [
+            vec![("HERDR_ENV", "1")],
+            vec![("HERDR_PANE_ID", "w9V:p1")],
+            vec![("HERDR_ENV", "0"), ("HERDR_PANE_ID", "w9V:p1")],
+            vec![("HERDR_ENV", "1"), ("HERDR_PANE_ID", "")],
+            vec![("HERDR_ENV", "1"), ("HERDR_PANE_ID", "not-a-pane")],
+            vec![
+                ("HERDR_ENV", "1"),
+                ("HERDR_ENV", "1"),
+                ("HERDR_PANE_ID", "w9V:p1"),
+            ],
+        ] {
+            assert_eq!(
+                pane_origin_from_environment(&pairs(&values)),
+                PeerPaneOrigin::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_process_marker_capture_is_unknown_not_readable_absence() {
+        assert_eq!(
+            process_initial_pane_origin(ProcessIdentity {
+                pid: 0,
+                start_time: 0
+            }),
+            PeerPaneOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn scoped_server_observation_is_peer_keyed_and_restores_after_panic() {
+        let peer = process_identity(std::process::id()).expect("test process");
+        let other = ProcessIdentity {
+            start_time: peer.start_time.saturating_add(1),
+            ..peer
+        };
+        let before = process_identity_server_ancestry(peer);
+        let panic = std::panic::catch_unwind(|| {
+            with_server_ancestry_for_test(peer, Some(true), || {
+                assert_eq!(
+                    process_identity_server_ancestry(peer),
+                    ServerAncestry::Outside
+                );
+                assert_ne!(
+                    process_identity_server_ancestry(other),
+                    ServerAncestry::Outside
+                );
+                panic!("exercise restoration");
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(process_identity_server_ancestry(peer), before);
+    }
 }
 
 #[cfg(test)]

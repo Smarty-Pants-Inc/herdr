@@ -1061,6 +1061,47 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     procargs2_argv(&buf)
 }
 
+/// Capture the peer's initial environment while its process instance remains pinned.
+/// A failed or malformed environment is unknown; an empty readable environment is absence.
+pub(crate) fn process_initial_environment(
+    peer: super::ProcessIdentity,
+) -> Option<Vec<(String, String)>> {
+    if peer.pid == 0 || super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    let buffer = kern_procargs2(peer.pid)?;
+    let environment = procargs2_env(&buffer)?;
+    if super::process_identity(peer.pid) != Some(peer) {
+        return None;
+    }
+    parse_initial_environment(environment)
+}
+
+fn parse_initial_environment(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    let mut trailing_empty = false;
+    for record in bytes.split(|&byte| byte == 0) {
+        if record.is_empty() {
+            trailing_empty = true;
+            continue;
+        }
+        if trailing_empty {
+            return None;
+        }
+        let separator = record.iter().position(|&byte| byte == b'=')?;
+        if separator == 0 {
+            return None;
+        }
+        let key = std::str::from_utf8(&record[..separator]).ok()?;
+        let value = std::str::from_utf8(&record[separator + 1..]).ok()?;
+        pairs.push((key.to_string(), value.to_string()));
+    }
+    Some(pairs)
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {
@@ -1264,6 +1305,25 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_environment_parser_distinguishes_absence_and_malformed_data() {
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0TERM=xterm\0\0"),
+            Some(vec![
+                ("PATH".to_string(), "/bin".to_string()),
+                ("TERM".to_string(), "xterm".to_string()),
+            ])
+        );
+        assert_eq!(parse_initial_environment(b""), Some(Vec::new()));
+        assert_eq!(parse_initial_environment(b"PATH=/bin"), None);
+        assert_eq!(
+            parse_initial_environment(b"PATH=/bin\0\0TERM=xterm\0"),
+            None
+        );
+        assert_eq!(parse_initial_environment(b"BAD\0"), None);
+        assert_eq!(parse_initial_environment(b"\xff=bad\0"), None);
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

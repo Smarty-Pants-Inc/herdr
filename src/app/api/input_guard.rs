@@ -18,11 +18,7 @@ impl App {
             return None;
         }
         let target = self.content_write_target(&request.method)?;
-        let origin = context
-            .local_peer_identity
-            .map_or(InputOrigin::Unknown, |peer| {
-                self.input_origin_for_peer_identity(peer)
-            });
+        let origin = self.input_origin_for_context(context);
         let (code, message) = match origin {
             InputOrigin::Ordinary => return None,
             InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
@@ -667,9 +663,7 @@ mod tests {
                     allow_cross_pane: false,
                 }),
             },
-            ApiRequestContext {
-                local_peer_identity: Some(stale),
-            },
+            ApiRequestContext::capture(Some(stale)),
         );
         assert_unknown(&response);
         assert!(fixture.target_rx.try_recv().is_err());
@@ -779,7 +773,12 @@ mod tests {
                 allow_cross_pane: false,
             }),
         };
-        let context = attributed_context();
+        // Deliberate scoped observation fixture, not a claim about this test
+        // process's inherited launch environment.
+        let context = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..attributed_context()
+        };
         // Simulate the checked Windows observer's complete negative answer, not
         // native Windows process behavior. Both real endpoint pins still validate.
         let response = crate::platform::with_ancestry_membership_for_test(Some(false), || {
@@ -824,6 +823,202 @@ mod tests {
         assert!(fixture.source_rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn captured_markers_require_live_pane_link_and_never_select_a_public_pane() {
+        let mut fixture = attributed_agent_fixture();
+        let mut context = attributed_context();
+        context.local_peer_pane_origin = crate::platform::PeerPaneOrigin::Unknown;
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Unknown
+        );
+        context.local_peer_pane_origin = crate::platform::PeerPaneOrigin::HasPane;
+        assert!(matches!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Agent(_)
+        ));
+        let (_, source) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source");
+        let terminal = fixture.app.state.workspaces[0]
+            .terminal_id(source)
+            .cloned()
+            .expect("source terminal");
+        let source = fixture
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal)
+            .expect("source state");
+        source.clear_agent_name();
+        source.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Ordinary
+        );
+        let (_, target) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target)
+            .expect("target runtime")
+            .test_set_child_pid(std::process::id());
+        let peer = context.local_peer_identity.expect("live captured peer");
+        // Both runtime roots and peer stay live, but no pane relationship can be
+        // established. An otherwise positive Windows outside proof cannot turn
+        // this captured marked caller into ordinary origin.
+        crate::platform::with_server_ancestry_for_test(peer, Some(true), || {
+            crate::platform::with_ancestry_membership_for_test(Some(false), || {
+                assert_eq!(
+                    fixture.app.input_origin_for_context(context),
+                    InputOrigin::Unknown
+                );
+                let request = Request {
+                    id: "unlinked-marker".into(),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: fixture.target_pane_id.clone(),
+                        text: "blocked".into(),
+                        allow_cross_pane: false,
+                    }),
+                };
+                assert_unknown(
+                    &fixture
+                        .app
+                        .handle_api_request_with_context(request, context),
+                );
+                let (respond_to, response) = std::sync::mpsc::channel();
+                assert!(fixture.app.handle_deferred_agent_api_request(
+                    Request {
+                        id: "deferred-unlinked-marker".into(),
+                        method: Method::AgentPrompt(AgentPromptParams {
+                            target: "target-agent".into(),
+                            text: "blocked".into(),
+                            wait: None,
+                            allow_cross_pane: false,
+                        })
+                    },
+                    context,
+                    respond_to,
+                ));
+                assert_unknown(&response.recv().expect("deferred unknown"));
+                assert!(fixture.source_rx.try_recv().is_err());
+                assert!(fixture.target_rx.try_recv().is_err());
+            });
+        });
+    }
+
+    fn exercise_server_ancestry_sequence(observation: Option<bool>) {
+        let mut fixture = attributed_agent_fixture();
+        // The ancestry sequence seam explicitly models a marker-free caller.
+        let context = ApiRequestContext {
+            local_peer_pane_origin: crate::platform::PeerPaneOrigin::Absent,
+            ..attributed_context()
+        };
+        let peer = context.local_peer_identity.expect("live pinned peer");
+        crate::platform::with_server_ancestry_for_test(peer, observation, || {
+            let expected = match observation {
+                Some(true) => InputOrigin::Ordinary,
+                Some(false) => InputOrigin::Agent(
+                    fixture
+                        .app
+                        .resolve_terminal_target(&fixture.source_pane_id)
+                        .expect("source"),
+                ),
+                None => InputOrigin::Unknown,
+            };
+            assert_eq!(fixture.app.input_origin_for_peer_identity(peer), expected);
+            for (own, opt_in) in [(false, false), (true, false), (false, true)] {
+                let pane_id = if own {
+                    fixture.source_pane_id.clone()
+                } else {
+                    fixture.target_pane_id.clone()
+                };
+                let response = fixture.app.handle_api_request_with_context(
+                    Request {
+                        id: "server-ancestry-sequence".into(),
+                        method: Method::PaneSendText(PaneSendTextParams {
+                            pane_id,
+                            text: "sequence".into(),
+                            allow_cross_pane: opt_in,
+                        }),
+                    },
+                    context,
+                );
+                let allowed =
+                    opt_in || observation == Some(true) || (own && observation == Some(false));
+                if allowed {
+                    assert_ok(&response);
+                    let rx = if own {
+                        &mut fixture.source_rx
+                    } else {
+                        &mut fixture.target_rx
+                    };
+                    assert_eq!(
+                        rx.try_recv().expect("approved delivery"),
+                        Bytes::from_static(b"sequence")
+                    );
+                } else if observation.is_none() {
+                    assert_unknown(&response);
+                } else {
+                    assert_denied(&response);
+                }
+                assert!(fixture.source_rx.try_recv().is_err());
+                assert!(fixture.target_rx.try_recv().is_err());
+            }
+
+            let (respond_to, response_rx) = std::sync::mpsc::channel();
+            assert!(fixture.app.handle_deferred_agent_api_request(
+                Request {
+                    id: "deferred-server-ancestry-sequence".into(),
+                    method: Method::AgentPrompt(AgentPromptParams {
+                        target: fixture.target_pane_id.clone(),
+                        text: "deferred".into(),
+                        wait: None,
+                        allow_cross_pane: false,
+                    }),
+                },
+                context,
+                respond_to,
+            ));
+            if observation != Some(true) {
+                let response = response_rx.recv().expect("deferred refusal");
+                if observation.is_none() {
+                    assert_unknown(&response);
+                } else {
+                    assert_denied(&response);
+                }
+                assert!(fixture.target_rx.try_recv().is_err());
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn server_ancestry_policy_preserves_ordinary_agent_and_unknown_guard_outcomes() {
+        for observation in [Some(true), Some(false), None] {
+            exercise_server_ancestry_sequence(observation);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_snapshot_sequences_feed_actual_attribution_and_guard() {
+        for (sequence, expected) in [
+            (0, Some(true)),
+            (1, None),
+            (2, None),
+            (3, Some(false)),
+            (4, None),
+        ] {
+            let observation = crate::platform::test_outside_server_ancestry_sequence(sequence);
+            assert_eq!(observation, expected, "sequence {sequence}");
+            exercise_server_ancestry_sequence(observation);
+        }
+    }
+
     #[cfg(windows)]
     struct WindowsRealChild {
         child: std::process::Child,
@@ -834,11 +1029,15 @@ mod tests {
     #[cfg(windows)]
     impl WindowsRealChild {
         fn spawn(request: &str) -> Self {
+            Self::spawn_with_pane(request, None)
+        }
+
+        fn spawn_with_pane(request: &str, pane: Option<&str>) -> Self {
             use std::io::BufRead;
             use std::process::{Command, Stdio};
 
-            let child = Command::new("powershell.exe")
-                .args([
+            let mut command = Command::new("powershell.exe");
+            command.args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
@@ -847,9 +1046,19 @@ mod tests {
                 .env("HERDR_GUARD_TEST_REQUEST", request)
                 // Retain the owned stdin pipe alongside the live child handle.
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("spawn real Windows helper child");
+                .stdout(Stdio::piped());
+            for key in [
+                "HERDR_ENV",
+                "HERDR_PANE_ID",
+                "HERDR_WORKSPACE_ID",
+                "HERDR_TAB_ID",
+            ] {
+                command.env_remove(key);
+            }
+            if let Some(pane) = pane {
+                command.env("HERDR_ENV", "1").env("HERDR_PANE_ID", pane);
+            }
+            let child = command.spawn().expect("spawn real Windows helper child");
             // Install cleanup before reading/asserting anything about the child.
             let mut owned = Self {
                 pid: child.id(),
@@ -892,8 +1101,20 @@ mod tests {
     #[tokio::test]
     async fn real_non_pane_windows_child_uses_os_identity_in_actual_guard() {
         let mut fixture = attributed_agent_fixture();
+        let server =
+            crate::platform::process_identity(std::process::id()).expect("live actual server");
         let source_root = WindowsRealChild::spawn("{}");
         let target_root = WindowsRealChild::spawn("{}");
+        // The actual server is a live strictly older ancestor than either pane
+        // root, so sibling-root exclusion has a controlled chronology witness.
+        for pid in [source_root.pid, target_root.pid] {
+            assert!(
+                crate::platform::process_identity(pid)
+                    .expect("live pane root")
+                    .start_time
+                    > server.start_time
+            );
+        }
         let (_, source_pane) = fixture
             .app
             .parse_pane_id(&fixture.source_pane_id)
@@ -934,6 +1155,14 @@ mod tests {
             .expect("live OS caller identity");
         assert_ne!(peer.pid, source_root.pid);
         assert_ne!(peer.pid, target_root.pid);
+        assert_eq!(
+            context.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::Absent
+        );
+        assert_eq!(
+            crate::platform::process_identity_server_ancestry(peer),
+            crate::platform::ServerAncestry::ReachedServer
+        );
         assert!(caller
             .child
             .try_wait()
@@ -945,21 +1174,16 @@ mod tests {
         let origin = fixture
             .app
             .input_origin_for_peer_identity(context.local_peer_identity.expect("caller identity"));
-        assert!(
-            !matches!(origin, InputOrigin::Agent(_)),
-            "real sibling caller was wrongly attributed to a managed pane: {origin:?}"
+        assert_eq!(
+            origin,
+            InputOrigin::Ordinary,
+            "live older-server sibling exclusion must be positive"
         );
-        if matches!(origin, InputOrigin::Unknown) {
-            assert_unknown(&response);
-            assert!(response.contains("--allow-cross-pane"));
-            assert!(fixture.target_rx.try_recv().is_err());
-        } else {
-            assert_ok(&response);
-            assert_eq!(
-                fixture.target_rx.try_recv().expect("ordinary child bytes"),
-                Bytes::from_static(b"windows real child")
-            );
-        }
+        assert_ok(&response);
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("ordinary child bytes"),
+            Bytes::from_static(b"windows real child")
+        );
         assert!(fixture.source_rx.try_recv().is_err());
 
         let explicit = match request.method {
@@ -994,6 +1218,96 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn marked_windows_source_with_live_sibling_root_keeps_same_cross_and_opt_in_policy() {
+        let mut fixture = attributed_agent_fixture();
+        let source = WindowsRealChild::spawn_with_pane("{}", Some(&fixture.source_pane_id));
+        let target = WindowsRealChild::spawn_with_pane("{}", Some(&fixture.target_pane_id));
+        let server =
+            crate::platform::process_identity(std::process::id()).expect("live actual server");
+        for (pane, pid) in [
+            (&fixture.source_pane_id, source.pid),
+            (&fixture.target_pane_id, target.pid),
+        ] {
+            assert!(
+                crate::platform::process_identity(pid)
+                    .expect("live pane root")
+                    .start_time
+                    > server.start_time
+            );
+            let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, pane)
+                .expect("runtime")
+                .test_set_child_pid(pid);
+        }
+        let context = ApiRequestContext::for_local_peer_pid(Some(source.pid));
+        assert_eq!(
+            context.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::HasPane
+        );
+        assert!(matches!(
+            fixture.app.input_origin_for_context(context),
+            InputOrigin::Agent(_)
+        ));
+        for (own, opt_in, allowed) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "windows-two-live-roots".into(),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: if own {
+                            fixture.source_pane_id.clone()
+                        } else {
+                            fixture.target_pane_id.clone()
+                        },
+                        text: "live roots".into(),
+                        allow_cross_pane: opt_in,
+                    }),
+                },
+                context,
+            );
+            if allowed {
+                assert_ok(&response);
+                let rx = if own {
+                    &mut fixture.source_rx
+                } else {
+                    &mut fixture.target_rx
+                };
+                assert_eq!(
+                    rx.try_recv().expect("approved input"),
+                    Bytes::from_static(b"live roots")
+                );
+            } else {
+                assert_denied(&response);
+            }
+            assert!(fixture.source_rx.try_recv().is_err());
+            assert!(fixture.target_rx.try_recv().is_err());
+        }
+        let (respond_to, response) = std::sync::mpsc::channel();
+        assert!(fixture.app.handle_deferred_agent_api_request(
+            Request {
+                id: "windows-two-live-roots-deferred".into(),
+                method: Method::AgentPrompt(AgentPromptParams {
+                    target: "target-agent".into(),
+                    text: "blocked".into(),
+                    wait: None,
+                    allow_cross_pane: false,
+                })
+            },
+            context,
+            respond_to,
+        ));
+        assert_denied(&response.recv().expect("deferred cross-pane refusal"));
+        assert!(fixture.target_rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn reused_windows_intermediate_parent_is_unknown_in_actual_guard() {
         let mut fixture = attributed_agent_fixture();
         let observation = crate::platform::test_reused_intermediate_parent_membership();
@@ -1022,11 +1336,9 @@ mod tests {
         use std::os::fd::AsRawFd;
         let mut fixture = attributed_agent_fixture();
         let (server, client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        let context = ApiRequestContext {
-            local_peer_identity: crate::platform::local_socket_peer_identity_without_pidfd(
-                server.as_raw_fd(),
-            ),
-        };
+        let context = ApiRequestContext::capture(
+            crate::platform::local_socket_peer_identity_without_pidfd(server.as_raw_fd()),
+        );
         assert_eq!(
             context.local_peer_identity,
             attributed_context().local_peer_identity
@@ -1065,11 +1377,9 @@ mod tests {
             }
         }
         drop(client);
-        let missing = ApiRequestContext {
-            local_peer_identity: crate::platform::local_socket_peer_identity_without_pidfd(
-                server.as_raw_fd(),
-            ),
-        };
+        let missing = ApiRequestContext::capture(
+            crate::platform::local_socket_peer_identity_without_pidfd(server.as_raw_fd()),
+        );
         assert_eq!(missing.local_peer_identity, None);
         let response = fixture.app.handle_api_request_with_context(
             Request {
@@ -1135,6 +1445,233 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct OrphanTree {
+        root: std::process::Child,
+        output: std::io::BufReader<std::process::ChildStdout>,
+        peer: crate::platform::ProcessIdentity,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl OrphanTree {
+        fn spawn(pane: &str) -> Self {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+            let script = r#"
+import os, signal, subprocess, sys
+assert os.getsid(os.getpid()) == os.getpid(), 'pane root must lead its own session'
+middle = subprocess.Popen([sys.executable, '-c', "import subprocess,sys; p=subprocess.Popen(['sleep','60'],start_new_session=True); print(p.pid,flush=True); sys.stdin.readline(); p.terminate(); p.wait()"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+peer = int(middle.stdout.readline())
+try:
+    print(peer, os.getsid(os.getpid()), os.getsid(peer), flush=True)
+    if sys.stdin.readline().strip() == 'orphan':
+        middle.terminate()
+        middle.wait()
+        print('gone', flush=True)
+        sys.stdin.readline()
+finally:
+    try: os.kill(peer, signal.SIGTERM)
+    except ProcessLookupError: pass
+    if middle.poll() is None: middle.terminate()
+    middle.wait()
+"#;
+            let mut command = Command::new("python3");
+            command
+                .args(["-c", script])
+                .env("HERDR_ENV", "1")
+                .env("HERDR_PANE_ID", pane)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            crate::platform::detach_server_daemon_command(&mut command);
+            let mut root = command
+                .spawn()
+                .expect("owned pane root and detached child tree");
+            let output = std::io::BufReader::new(root.stdout.take().expect("root stdout"));
+            // Cleanup is installed before reading, parsing, or asserting stdout.
+            let mut owned = Self {
+                root,
+                output,
+                peer: crate::platform::ProcessIdentity {
+                    pid: 0,
+                    start_time: 0,
+                },
+            };
+            let mut line = String::new();
+            owned
+                .output
+                .read_line(&mut line)
+                .expect("peer PID and real session identities");
+            let ids = line
+                .split_whitespace()
+                .map(|value| value.parse::<u32>().expect("numeric identity"))
+                .collect::<Vec<_>>();
+            assert_eq!(ids.len(), 3, "peer/root SID/peer SID");
+            assert_eq!(ids[1], owned.root.id(), "root is an actual session leader");
+            assert_eq!(
+                ids[2], ids[0],
+                "detached peer leads its own different session"
+            );
+            assert_ne!(ids[1], ids[2]);
+            owned.peer = crate::platform::process_identity(ids[0]).expect("live peer");
+            owned
+        }
+
+        fn orphan(&mut self) {
+            use std::io::{BufRead, Write};
+            writeln!(self.root.stdin.as_mut().expect("root control"), "orphan")
+                .expect("exit intermediate");
+            let mut line = String::new();
+            self.output
+                .read_line(&mut line)
+                .expect("intermediate exit receipt");
+            assert_eq!(line.trim(), "gone");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for OrphanTree {
+        fn drop(&mut self) {
+            use std::io::Write;
+            if let Some(input) = self.root.stdin.as_mut() {
+                let _ = writeln!(input, "cleanup");
+            }
+            let _ = self.root.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn marked_detached_orphan_never_becomes_ordinary_in_normal_or_deferred_dispatch() {
+        let mut fixture = attributed_agent_fixture();
+        let mut tree = OrphanTree::spawn(&fixture.source_pane_id);
+        let (_, source_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, source_pane)
+            .expect("source runtime")
+            .test_set_child_pid(tree.root.id());
+        let mut target_root = detached_sleep_child();
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(target_root.id());
+        let root = crate::platform::process_identity(tree.root.id()).expect("live root");
+        let intermediate =
+            crate::platform::parent_process_identity(tree.peer).expect("live intermediate");
+        let accepted = ApiRequestContext::for_local_peer_pid(Some(tree.peer.pid));
+        assert_eq!(
+            accepted.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::HasPane
+        );
+        assert!(matches!(
+            fixture.app.input_origin_for_context(accepted),
+            InputOrigin::Agent(_)
+        ));
+        let own = Request {
+            id: "marked-own-before-orphan".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.source_pane_id.clone(),
+                text: "own".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        assert_ok(&fixture.app.handle_api_request_with_context(own, accepted));
+        assert_eq!(
+            fixture.source_rx.try_recv().expect("own bytes"),
+            Bytes::from_static(b"own")
+        );
+        let request = Request {
+            id: "queued-marked-orphan".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "orphan".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (respond_to, _) = std::sync::mpsc::channel();
+        tx.send(crate::api::ApiRequestMessage {
+            request,
+            context: accepted,
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        })
+        .expect("queued before intermediate exit");
+        tree.orphan();
+        assert_eq!(crate::platform::process_identity(root.pid), Some(root));
+        assert_eq!(
+            crate::platform::process_identity(tree.peer.pid),
+            Some(tree.peer)
+        );
+        assert_ne!(
+            crate::platform::parent_process_identity(tree.peer),
+            Some(intermediate)
+        );
+        let queued = rx.try_recv().expect("dispatch after reparenting");
+        let after_orphan = ApiRequestContext::for_local_peer_pid(Some(tree.peer.pid));
+        assert_eq!(
+            after_orphan.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::HasPane
+        );
+        for context in [queued.context, after_orphan] {
+            assert_eq!(
+                fixture.app.input_origin_for_context(context),
+                InputOrigin::Unknown
+            );
+            assert_unknown(
+                &fixture
+                    .app
+                    .handle_api_request_with_context(queued.request.clone(), context),
+            );
+            let (respond_to, response) = std::sync::mpsc::channel();
+            assert!(fixture.app.handle_deferred_agent_api_request(
+                Request {
+                    id: "deferred-marked-orphan".into(),
+                    method: Method::AgentPrompt(AgentPromptParams {
+                        target: "target-agent".into(),
+                        text: "orphan".into(),
+                        wait: None,
+                        allow_cross_pane: false,
+                    })
+                },
+                context,
+                respond_to,
+            ));
+            assert_unknown(&response.recv().expect("deferred refusal"));
+            assert!(fixture.target_rx.try_recv().is_err());
+            assert!(fixture.source_rx.try_recv().is_err());
+        }
+        let mut explicit = queued.request;
+        if let Method::PaneSendText(params) = &mut explicit.method {
+            params.allow_cross_pane = true;
+        }
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(explicit, accepted),
+        );
+        assert_eq!(
+            fixture
+                .target_rx
+                .try_recv()
+                .expect("explicit orphan opt-in"),
+            Bytes::from_static(b"orphan")
+        );
+        let _ = target_root.kill();
+        let _ = target_root.wait();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn validated_outside_shell_is_ordinary_but_missing_roots_are_unknown() {
         let mut fixture = attributed_agent_fixture();
@@ -1150,11 +1687,27 @@ mod tests {
                 .test_set_child_pid(child.id());
             roots.push(child);
         }
-        let context = attributed_context();
+        // A genuine ordinary caller has no inherited pane launch markers. Do
+        // not rely on this test process's environment under a Herdr harness.
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+        for key in [
+            "HERDR_ENV",
+            "HERDR_PANE_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_TAB_ID",
+        ] {
+            command.env_remove(key);
+        }
+        crate::platform::detach_server_daemon_command(&mut command);
+        let mut ordinary_peer = command.spawn().expect("marker-free ordinary caller");
+        let context = ApiRequestContext::for_local_peer_pid(Some(ordinary_peer.id()));
         assert_eq!(
-            fixture
-                .app
-                .input_origin_for_peer_identity(context.local_peer_identity.expect("peer")),
+            context.local_peer_pane_origin,
+            crate::platform::PeerPaneOrigin::Absent
+        );
+        assert_eq!(
+            fixture.app.input_origin_for_context(context),
             InputOrigin::Ordinary
         );
         let request = Request {
@@ -1184,6 +1737,8 @@ mod tests {
                 .handle_api_request_with_context(request, context),
         );
         assert!(fixture.target_rx.try_recv().is_err());
+        let _ = ordinary_peer.kill();
+        let _ = ordinary_peer.wait();
     }
 
     fn report_working(pane_id: &str) -> Method {
