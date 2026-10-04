@@ -1676,17 +1676,8 @@ async fn run_client_loop(
                                     &control,
                                     &path,
                                 );
-                                frame_output::record_pending_kitty_uploads(&command);
                                 let mut stdout = io::stdout();
-                                let written = state
-                                    .flush_native_cleanup(&mut stdout)
-                                    .and_then(|()| stdout.write_all(&command))
-                                    .and_then(|()| stdout.flush())
-                                    .is_ok();
-                                if written {
-                                    record_received_kitty_graphics(&command);
-                                }
-                                written
+                                state.write_direct_graphics(&mut stdout, &command).is_ok()
                             } else {
                                 false
                             };

@@ -314,6 +314,22 @@ impl ClientState {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub(super) fn write_direct_graphics(
+        &mut self,
+        writer: &mut impl std::io::Write,
+        command: &[u8],
+    ) -> io::Result<()> {
+        self.flush_native_cleanup(writer)?;
+        // Cleanup may retire the same ID, so record the replacement only after cleanup
+        // succeeds and before any upload bytes can reach the terminal.
+        frame_output::record_pending_kitty_uploads(command);
+        writer.write_all(command)?;
+        writer.flush()?;
+        record_received_kitty_graphics(command);
+        Ok(())
+    }
+
     pub(super) fn present_graphics(&mut self, graphics: &[u8]) {
         if self.presentation_frozen || graphics.is_empty() || !self.kitty_graphics_enabled {
             return;
@@ -584,6 +600,68 @@ impl ClientState {
 #[cfg(all(test, unix))]
 mod native_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn direct_graphics_same_id_replacement_flush_failure_retains_cleanup() {
+        struct FailAfterCleanup {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+        impl io::Write for FailAfterCleanup {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == 1 {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("replacement flush failure"))
+                }
+            }
+        }
+
+        let image_id = 4_294_901_732;
+        let mut command = Vec::new();
+        crate::kitty_graphics::encode_kitty_regular_file(
+            &mut command,
+            &[],
+            &format!("a=t,f=32,s=1,v=1,i={image_id},q=0"),
+            "/tmp/herdr-ordering-test.rgba",
+        );
+        record_received_kitty_graphics(&command);
+        let mut state = ClientState::test_new();
+        state.queue_native_image_cleanup(image_id);
+        let deletion = state.pending_native_cleanup.clone();
+        let mut output = FailAfterCleanup {
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+
+        assert!(state.write_direct_graphics(&mut output, &command).is_err());
+        assert_eq!(output.flushes, 2);
+        assert_eq!(output.bytes, [deletion, command.clone()].concat());
+        assert!(state.pending_native_cleanup.is_empty());
+
+        // Fail teardown's flush so this observes obligations without consuming the ledger.
+        let mut teardown = FailAfterCleanup {
+            bytes: Vec::new(),
+            flushes: 1,
+        };
+        let _ = clear_received_kitty_graphics(&mut teardown);
+        assert!(
+            kitty_graphics_image_ids(&teardown.bytes).contains(&image_id),
+            "replacement exposed before failed flush must remain a teardown obligation"
+        );
+
+        let mut retry = Vec::new();
+        state.write_direct_graphics(&mut retry, &command).unwrap();
+        assert_eq!(retry, command);
+        state.queue_native_image_cleanup(image_id);
+        state.flush_native_cleanup(&mut Vec::new()).unwrap();
+    }
 
     #[test]
     fn native_cleanup_retires_ledger_only_after_successful_write_and_flush() {
