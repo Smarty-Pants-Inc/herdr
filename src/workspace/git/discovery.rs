@@ -393,6 +393,46 @@ mod tests {
         path
     }
 
+    // ponytail: APFS cannot create a non-UTF-8 path, so keep this native-path
+    // fixture on Linux instead of weakening it into a lossy Unicode approximation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_worktree_info_preserves_non_utf8_ancestor_with_relative_markers() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (base, _, _) = crate::workspace::git::test_support::create_repo_with_linked_worktree(
+            "native-relative-markers",
+        );
+        let mut name = base.file_name().unwrap().to_os_string().into_vec();
+        name.push(0x80);
+        let native_base = base.with_file_name(std::ffi::OsString::from_vec(name));
+        std::fs::rename(&base, &native_base).unwrap();
+        let checkout = native_base.join("testr56");
+        let common = native_base.join("herdr/.git");
+        let git_dir = common.join("worktrees/testr56");
+        std::fs::write(
+            checkout.join(".git"),
+            "gitdir: ../herdr/.git/worktrees/testr56\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let info: crate::workspace::GitWorktreeInfo =
+            crate::workspace::git_worktree_info(&checkout).expect("native linked worktree");
+        assert_eq!(info.repo_root, checkout);
+        assert_eq!(info.git_dir, std::fs::canonicalize(&git_dir).unwrap());
+        assert_eq!(info.git_common_dir, std::fs::canonicalize(&common).unwrap());
+        assert!(info.is_linked_worktree);
+        assert_ne!(
+            info.git_common_dir,
+            PathBuf::from(git_space_metadata(&checkout).unwrap().key),
+            "the display key is not a native filesystem path"
+        );
+        run_git(&checkout, &["rev-parse", "--git-common-dir"]);
+
+        std::fs::remove_dir_all(native_base).unwrap();
+    }
+
     #[test]
     fn git_branch_reads_head_from_standard_repo() {
         let root = temp_test_dir("standard-repo");

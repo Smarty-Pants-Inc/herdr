@@ -1600,6 +1600,8 @@ impl AppState {
                 }
                 Vec::new()
             }
+            // Native watcher scheduling is runtime-only, handled by App.
+            AppEvent::GitFilesChanged => Vec::new(),
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
