@@ -1359,11 +1359,19 @@ fn single_key_char(s: &str) -> Option<char> {
 fn parse_prefix_keys(config: &BindingConfig) -> (Vec<KeyCombo>, Option<String>, Vec<String>) {
     let mut combos: Vec<KeyCombo> = Vec::new();
     let mut diagnostics = Vec::new();
+    if config.values().len() > 256 {
+        return (
+            vec![DEFAULT_PREFIX],
+            Some("too many prefix keys; retaining previous keybindings".into()),
+            diagnostics,
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
 
     for raw in config.values() {
         let raw = raw.trim();
         match parse_key_combo(raw) {
-            Some(combo) if !combos.contains(&combo) => combos.push(combo),
+            Some(combo) if seen.insert(combo) => combos.push(combo),
             Some(_) => {}
             None => diagnostics.push(format!(
                 "invalid keybinding: keys.prefix = {raw:?}; ignoring prefix"

@@ -1550,6 +1550,11 @@ async fn run_client_loop(
                         crate::render_prof::flush_if_due();
                     }
                     ServerMessage::Terminal(frame) => {
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            frame_output::record_pending_kitty_uploads(&frame.bytes);
+                        }
                         let mut stdout = io::stdout();
                         let written = stdout
                             .write_all(&frame.bytes)
@@ -1564,6 +1569,7 @@ async fn run_client_loop(
                     }
                     ServerMessage::Graphics { bytes } => {
                         if state.kitty_graphics_enabled {
+                            frame_output::record_pending_kitty_uploads(&bytes);
                             let mut stdout = io::stdout();
                             let written = stdout
                                 .write_all(&bytes)
@@ -1670,6 +1676,7 @@ async fn run_client_loop(
                                     &control,
                                     &path,
                                 );
+                                frame_output::record_pending_kitty_uploads(&command);
                                 let mut stdout = io::stdout();
                                 let written = state
                                     .flush_native_cleanup(&mut stdout)

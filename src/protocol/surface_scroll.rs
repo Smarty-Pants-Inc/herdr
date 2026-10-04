@@ -185,6 +185,7 @@ fn pane_scroll(
     frame: &FrameData,
     rect: SurfaceRect,
     rows: &[PaneSurfacePatchRow],
+    budget: &mut DetectionBudget,
 ) -> Option<(i16, Vec<PaneSurfacePatchRow>)> {
     let (width, height) = (usize::from(rect.width), usize::from(rect.height));
     let stride = usize::from(frame.width);
@@ -193,7 +194,6 @@ fn pane_scroll(
         &frame.cells[start..start + width]
     };
 
-    let mut budget = DetectionBudget::new();
     let mut next = (0..height)
         .map(|y| RowView {
             base: previous(y),
@@ -230,7 +230,7 @@ fn pane_scroll(
             if row.spans.is_empty() {
                 Some(old)
             } else {
-                row.hash(&mut budget)
+                row.hash(budget)
             }
         })
         .collect::<Option<Vec<_>>>()?;
@@ -275,7 +275,7 @@ fn pane_scroll(
         let (base, target) = (previous(source), &next[y]);
         let mut x = 0;
         while x < width {
-            let target_cell = target.cell(x, &mut budget)?;
+            let target_cell = target.cell(x, budget)?;
             if base[x] == *target_cell {
                 x += 1;
                 continue;
@@ -283,7 +283,7 @@ fn pane_scroll(
             let start = x;
             x += 1;
             while x < width {
-                let target_cell = target.cell(x, &mut budget)?;
+                let target_cell = target.cell(x, budget)?;
                 if base[x] == *target_cell {
                     break;
                 }
@@ -297,7 +297,7 @@ fn pane_scroll(
                 x: rect.x + start as u16,
                 y: rect.y + y as u16,
                 cells: (start..x)
-                    .map(|x| target.cell(x, &mut budget).cloned())
+                    .map(|x| target.cell(x, budget).cloned())
                     .collect::<Option<Vec<_>>>()?,
             });
         }
@@ -321,6 +321,7 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
     }
     let mut scrolls = Vec::new();
     let mut residual = Vec::new();
+    let mut budget = DetectionBudget::new();
     for pane in &patch.panes {
         let rect = pane.inner_rect;
         // Both peers hold the committed geometry; never scroll a region that moved.
@@ -332,7 +333,7 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
         if !committed || !scroll_fits(&scroll, frame.width, frame.height) {
             continue;
         }
-        if let Some((shift, rows)) = pane_scroll(frame, rect, &patch.rows) {
+        if let Some((shift, rows)) = pane_scroll(frame, rect, &patch.rows, &mut budget) {
             scrolls.push(SurfaceScroll { rect, shift });
             residual.extend(rows);
             if scrolls.len() == MAX_SCROLLS {
@@ -679,7 +680,8 @@ mod tests {
                     .collect(),
             })
             .collect::<Vec<_>>();
-        assert!(pane_scroll(&frame, rect, &rows).is_none());
+        let mut budget = DetectionBudget::new();
+        assert!(pane_scroll(&frame, rect, &rows, &mut budget).is_none());
     }
 
     #[test]

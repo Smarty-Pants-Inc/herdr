@@ -134,6 +134,10 @@ pub(super) fn record_received_kitty_graphics(bytes: &[u8]) {
     apply_graphics_ledger_changes(commands);
 }
 
+pub(super) fn record_pending_kitty_uploads(bytes: &[u8]) {
+    apply_upload_ledger_obligations(&kitty_graphics_image_commands(bytes));
+}
+
 fn apply_upload_ledger_obligations(commands: &[KittyGraphicsImageCommand]) {
     let uploads = commands
         .iter()
@@ -211,7 +215,7 @@ fn kitty_graphics_image_commands(bytes: &[u8]) -> Vec<KittyGraphicsImageCommand>
             }
             if delete_whole && action == Some(b"d") {
                 commands.push(KittyGraphicsImageCommand::Delete(id));
-            } else if action == Some(b"t") {
+            } else if matches!(action, Some(b"t" | b"T")) {
                 commands.push(KittyGraphicsImageCommand::Upload(id));
             }
         }
