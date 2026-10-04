@@ -46,8 +46,8 @@ pub(super) fn write_composed_frame(
     for operation in &graphics.operations {
         match operation {
             GraphicsOperation::Bytes(bytes) => {
-                record_received_kitty_graphics(bytes);
                 writer.write_all(bytes)?;
+                record_received_kitty_graphics(bytes);
             }
             GraphicsOperation::Upload { control, data } => {
                 let file_eligible = control
@@ -65,7 +65,6 @@ pub(super) fn write_composed_frame(
                 }
                 let path = file_eligible.then(|| files.prepare(data)).flatten();
                 let header = format!("\x1b_G{control};\x1b\\");
-                record_received_kitty_graphics(header.as_bytes());
                 if let Some(path) = path.as_ref().and_then(|path| path.to_str()) {
                     let control = control.replace(",t=d,", ",t=t,");
                     let path = base64::engine::general_purpose::STANDARD.encode(path.as_bytes());
@@ -73,6 +72,7 @@ pub(super) fn write_composed_frame(
                 } else {
                     crate::kitty_graphics::write_kitty_data(&mut writer, control, data)?;
                 }
+                record_received_kitty_graphics(header.as_bytes());
             }
         }
     }
@@ -93,10 +93,10 @@ pub(super) fn write_encoded_frame_with_graphics(
     let insertion = render_ansi::final_sync_output_end(encoded).unwrap_or(encoded.len());
 
     writer.write_all(&encoded[..insertion])?;
-    record_received_kitty_graphics(graphics);
     writer.write_all(b"\x1b7")?;
     writer.write_all(graphics)?;
     writer.write_all(b"\x1b8")?;
+    record_received_kitty_graphics(graphics);
     writer.write_all(&encoded[insertion..])
 }
 
@@ -105,13 +105,22 @@ pub(super) fn contains_kitty_graphics_bytes(bytes: &[u8]) -> bool {
 }
 
 pub(super) fn record_received_kitty_graphics(bytes: &[u8]) {
-    let ids = kitty_graphics_image_ids(bytes);
-    if ids.is_empty() {
+    let commands = kitty_graphics_image_commands(bytes);
+    if commands.is_empty() {
         return;
     }
     let set = RECEIVED_KITTY_GRAPHICS_IDS.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut set) = set.lock() {
-        set.extend(ids);
+        for command in commands {
+            match command {
+                KittyGraphicsImageCommand::Upload(id) => {
+                    set.insert(id);
+                }
+                KittyGraphicsImageCommand::Delete(id) => {
+                    set.remove(&id);
+                }
+            }
+        }
     }
 }
 
@@ -122,10 +131,56 @@ pub(super) fn clear_received_kitty_graphics(mut writer: impl io::Write) -> io::R
     let Ok(mut set) = set.lock() else {
         return Ok(());
     };
-    for id in set.drain() {
+    let mut ids = set.iter().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    for id in &ids {
         write!(writer, "\x1b_Ga=d,d=I,i={id},q=2;\x1b\\")?;
     }
-    writer.flush()
+    writer.flush()?;
+    for id in ids {
+        set.remove(&id);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum KittyGraphicsImageCommand {
+    Upload(u32),
+    Delete(u32),
+}
+
+fn kitty_graphics_image_commands(bytes: &[u8]) -> Vec<KittyGraphicsImageCommand> {
+    let mut commands = Vec::new();
+    let mut index = 0usize;
+    while let Some(start) = find_subslice(&bytes[index..], b"\x1b_G") {
+        let command_start = index + start + 3;
+        let Some(end) = find_subslice(&bytes[command_start..], b"\x1b\\") else {
+            break;
+        };
+        let command = &bytes[command_start..command_start + end];
+        if let Some(id) = kitty_graphics_command_image_id(command) {
+            let header_end = command
+                .iter()
+                .position(|byte| *byte == b';')
+                .unwrap_or(command.len());
+            let mut action = None;
+            let mut delete_whole = false;
+            for part in command[..header_end].split(|byte| *byte == b',') {
+                if let Some(value) = part.strip_prefix(b"a=") {
+                    action = Some(value);
+                } else if part == b"d=I" {
+                    delete_whole = true;
+                }
+            }
+            if delete_whole && action == Some(b"d") {
+                commands.push(KittyGraphicsImageCommand::Delete(id));
+            } else if action == Some(b"t") {
+                commands.push(KittyGraphicsImageCommand::Upload(id));
+            }
+        }
+        index = command_start + end + 2;
+    }
+    commands
 }
 
 pub(super) fn kitty_graphics_image_ids(bytes: &[u8]) -> Vec<u32> {

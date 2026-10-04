@@ -1550,21 +1550,28 @@ async fn run_client_loop(
                         crate::render_prof::flush_if_due();
                     }
                     ServerMessage::Terminal(frame) => {
-                        if state.kitty_graphics_enabled
+                        let mut stdout = io::stdout();
+                        let written = stdout
+                            .write_all(&frame.bytes)
+                            .and_then(|()| stdout.flush())
+                            .is_ok();
+                        if written
+                            && state.kitty_graphics_enabled
                             && contains_kitty_graphics_bytes(&frame.bytes)
                         {
                             record_received_kitty_graphics(&frame.bytes);
                         }
-                        let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&frame.bytes);
-                        let _ = stdout.flush();
                     }
                     ServerMessage::Graphics { bytes } => {
                         if state.kitty_graphics_enabled {
-                            record_received_kitty_graphics(&bytes);
                             let mut stdout = io::stdout();
-                            let _ = stdout.write_all(&bytes);
-                            let _ = stdout.flush();
+                            let written = stdout
+                                .write_all(&bytes)
+                                .and_then(|()| stdout.flush())
+                                .is_ok();
+                            if written {
+                                record_received_kitty_graphics(&bytes);
+                            }
                         }
                     }
                     ServerMessage::TerminalBell { count } => {

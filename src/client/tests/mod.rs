@@ -379,12 +379,31 @@ fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
 
 #[test]
 fn kitty_graphics_cleanup_deletes_tracked_images_not_all_images() {
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
     record_received_kitty_graphics(b"\x1b_Ga=t,i=123,q=2;AAAA\x1b\\");
     let mut output = Vec::new();
     clear_received_kitty_graphics(&mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
     assert!(text.contains("a=d,d=I,i=123"));
     assert!(!text.contains("d=A"));
+}
+
+#[test]
+fn kitty_graphics_ledger_tracks_outstanding_uploads_through_deletes() {
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
+    let old = 1u32 << 28;
+    let current = old + 1;
+    record_received_kitty_graphics(
+        format!("\x1b_Ga=t,i={old};AAAA\x1b\\\x1b_Ga=d,d=I,i={old};\x1b\\").as_bytes(),
+    );
+    record_received_kitty_graphics(format!("\x1b_Ga=t,i={current};AAAA\x1b\\").as_bytes());
+    let mut output = Vec::new();
+    clear_received_kitty_graphics(&mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(!text.contains(&format!("i={old}")));
+    assert!(text.contains(&format!("i={current}")));
 }
 
 #[test]
