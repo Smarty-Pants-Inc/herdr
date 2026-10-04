@@ -805,6 +805,9 @@ impl TerminalState {
             session_ref,
         });
         let current_session = self.current_session_identity_for_persistence();
+        if previous_session != current_session {
+            self.set_reported_resume(None);
+        }
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
