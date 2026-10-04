@@ -20,6 +20,9 @@ pub(crate) const MESSAGE_KIND: &str = "endpoint.surface-scroll.v1";
 // `ServerMessage::PaneSurfacePatch` decoded by the shared bounded reader.
 const MAX_SCROLLS: usize = 64;
 const SCROLL_BYTES: usize = 10;
+// Scroll detection is optional. Keep its synchronous search bounded so a
+// hostile or merely tall surface falls back to the ordinary patch.
+const MAX_DETECTION_WORK: usize = 1_000_000;
 
 /// Reorders the rows of one pane region before the patch rows apply.
 ///
@@ -107,20 +110,44 @@ struct RowView<'a> {
     spans: Vec<&'a PaneSurfacePatchRow>,
 }
 
+struct DetectionBudget {
+    remaining: usize,
+}
+
+impl DetectionBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_DETECTION_WORK,
+        }
+    }
+
+    fn take(&mut self, work: usize) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(work) else {
+            self.remaining = 0;
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+}
+
 impl RowView<'_> {
-    fn cell(&self, x: usize) -> &CellData {
+    fn cell(&self, x: usize, budget: &mut DetectionBudget) -> Option<&CellData> {
+        if !budget.take(self.spans.len() + 1) {
+            return None;
+        }
         let column = self.left + x;
         for span in self.spans.iter().rev() {
             let start = usize::from(span.x);
             if column >= start && column < start + span.cells.len() {
-                return &span.cells[column - start];
+                return Some(&span.cells[column - start]);
             }
         }
-        &self.base[x]
+        Some(&self.base[x])
     }
 
-    fn hash(&self) -> u64 {
-        (0..self.base.len()).fold(0, |hash, x| cell_hash(hash, self.cell(x)))
+    fn hash(&self, budget: &mut DetectionBudget) -> Option<u64> {
+        (0..self.base.len()).try_fold(0, |hash, x| Some(cell_hash(hash, self.cell(x, budget)?)))
     }
 }
 
@@ -166,6 +193,7 @@ fn pane_scroll(
         &frame.cells[start..start + width]
     };
 
+    let mut budget = DetectionBudget::new();
     let mut next = (0..height)
         .map(|y| RowView {
             base: previous(y),
@@ -200,30 +228,35 @@ fn pane_scroll(
         .zip(&old_hashes)
         .map(|(row, &old)| {
             if row.spans.is_empty() {
-                old
+                Some(old)
             } else {
-                row.hash()
+                row.hash(&mut budget)
             }
         })
-        .collect::<Vec<_>>();
-    let matches = |shift: isize| {
-        (0..height)
-            .filter(|&y| {
-                let source = y as isize + shift;
-                source >= 0
-                    && (source as usize) < height
-                    && new_hashes[y] == old_hashes[source as usize]
-            })
-            .count()
+        .collect::<Option<Vec<_>>>()?;
+    let mut matches = |shift: isize| {
+        if !budget.take(height) {
+            return None;
+        }
+        Some(
+            (0..height)
+                .filter(|&y| {
+                    let source = y as isize + shift;
+                    source >= 0
+                        && (source as usize) < height
+                        && new_hashes[y] == old_hashes[source as usize]
+                })
+                .count(),
+        )
     };
-    let unshifted = matches(0);
+    let unshifted = matches(0)?;
     let (mut best_shift, mut best) = (0isize, unshifted);
     for distance in 1..height {
         if height - distance <= best {
             break;
         }
         for shift in [distance as isize, -(distance as isize)] {
-            let count = matches(shift);
+            let count = matches(shift)?;
             if count > best {
                 (best_shift, best) = (shift, count);
             }
@@ -242,12 +275,22 @@ fn pane_scroll(
         let (base, target) = (previous(source), &next[y]);
         let mut x = 0;
         while x < width {
-            if base[x] == *target.cell(x) {
+            let Some(target_cell) = target.cell(x, &mut budget) else {
+                return None;
+            };
+            if base[x] == *target_cell {
                 x += 1;
                 continue;
             }
             let start = x;
-            while x < width && base[x] != *target.cell(x) {
+            x += 1;
+            while x < width {
+                let Some(target_cell) = target.cell(x, &mut budget) else {
+                    return None;
+                };
+                if base[x] == *target_cell {
+                    break;
+                }
                 x += 1;
             }
             residual_cells += x - start;
@@ -257,7 +300,9 @@ fn pane_scroll(
             residual.push(PaneSurfacePatchRow {
                 x: rect.x + start as u16,
                 y: rect.y + y as u16,
-                cells: (start..x).map(|x| target.cell(x).clone()).collect(),
+                cells: (start..x)
+                    .map(|x| target.cell(x, &mut budget).cloned())
+                    .collect::<Option<Vec<_>>>()?,
             });
         }
     }
@@ -608,6 +653,37 @@ mod tests {
                 assert!(!overlap, "expanded rows overlap: {a:?} / {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn tall_no_match_detection_hits_budget_and_falls_back() {
+        let width = 16u16;
+        let height = 4096u16;
+        let frame =
+            FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, width, height)), None);
+        let rect = SurfaceRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let rows = (0..height)
+            .map(|y| PaneSurfacePatchRow {
+                x: 0,
+                y,
+                cells: (0..width)
+                    .map(|x| {
+                        let mut cell = frame.cells[usize::from(x)].clone();
+                        cell.symbol = format!(
+                            "{}",
+                            (usize::from(y) * usize::from(width) + usize::from(x)) % 10
+                        );
+                        cell
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        assert!(pane_scroll(&frame, rect, &rows).is_none());
     }
 
     #[test]
