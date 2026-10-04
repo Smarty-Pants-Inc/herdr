@@ -22,7 +22,7 @@ use crate::api::{
 };
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    local_stream_peer_pid, poll_local_stream_read, remove_socket_file_if_owned,
+    local_stream_peer_identity, poll_local_stream_read, remove_socket_file_if_owned,
     set_local_stream_polling, socket_file_identity, LocalStream, LocalStreamRead,
     SocketFileIdentity,
 };
@@ -213,6 +213,9 @@ fn start_server_inner(
                     }
                     retry_delay = ACCEPT_RETRY_INITIAL_DELAY;
                     retrying = false;
+                    // Pin once while accepting; queued/handler dispatch must not recapture
+                    // a later numeric owner, including the older-kernel credential fallback.
+                    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
@@ -223,6 +226,7 @@ fn start_server_inner(
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
                             stream,
+                            context,
                             &api_tx,
                             &event_hub,
                             &connection_running,
@@ -291,8 +295,10 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
+    let context = ApiRequestContext::capture(local_stream_peer_identity(&stream));
     handle_connection_with_stop(
         stream,
+        context,
         api_tx,
         event_hub,
         running,
@@ -305,6 +311,7 @@ fn handle_connection(
 
 fn handle_connection_with_stop(
     mut stream: LocalStream,
+    context: ApiRequestContext,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -315,10 +322,6 @@ fn handle_connection_with_stop(
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
-
-    let context = ApiRequestContext {
-        local_peer_pid: local_stream_peer_pid(&stream),
-    };
 
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
@@ -989,7 +992,11 @@ mod windows_tests {
         });
 
         let msg = api_rx.blocking_recv().expect("API request dispatch");
-        assert_eq!(msg.context.local_peer_pid, Some(std::process::id()));
+        assert_eq!(msg.context.local_peer_pid(), Some(std::process::id()));
+        assert_eq!(
+            msg.context.local_peer_identity,
+            crate::platform::process_identity(std::process::id())
+        );
         msg.respond_to
             .send(
                 serde_json::to_string(&SuccessResponse {
@@ -1653,8 +1660,10 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker_registry = registry.clone();
         let worker = std::thread::spawn(move || {
+            let context = ApiRequestContext::capture(local_stream_peer_identity(&server));
             handle_connection_with_stop(
                 server,
+                context,
                 &tx,
                 &EventHub::default(),
                 &Arc::new(AtomicBool::new(true)),
@@ -2378,9 +2387,14 @@ mod tests {
 
         let prompt = api_rx.blocking_recv().expect("agent.prompt dispatch");
         assert_eq!(
-            prompt.context.local_peer_pid,
+            prompt.context.local_peer_pid(),
             Some(std::process::id()),
             "wait-mode prompt must retain the socket origin"
+        );
+        assert_eq!(
+            prompt.context.local_peer_identity,
+            crate::platform::process_identity(std::process::id()),
+            "wait-mode prompt must retain the captured socket process instance"
         );
         assert!(matches!(prompt.request.method, Method::AgentPrompt(_)));
         let prompt_id = prompt.request.id.clone();

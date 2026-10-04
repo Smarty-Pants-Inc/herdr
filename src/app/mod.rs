@@ -2824,7 +2824,8 @@ mod tests {
                 expected_terminal: None,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
-                allow_cross_pane: false,
+                // Synthetic API caller deliberately opts in to reach availability checks.
+                allow_cross_pane: true,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2868,7 +2869,8 @@ mod tests {
                 expected_terminal: None,
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
-                allow_cross_pane: false,
+                // Explicit API opt-in isolates enqueue rollback/retry from origin policy.
+                allow_cross_pane: true,
             }),
         };
         let response = app.handle_api_request(request());
