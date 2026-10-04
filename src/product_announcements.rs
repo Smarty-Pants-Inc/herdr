@@ -134,21 +134,21 @@ fn announcement_from_manifest(
 }
 
 fn load_fake_for_current_version() -> Option<ProductAnnouncement> {
-    let body = std::env::var(FAKE_ANNOUNCEMENT_BODY_FILE_ENV)
+    let body = crate::environment::var(FAKE_ANNOUNCEMENT_BODY_FILE_ENV)
         .ok()
         .and_then(|path| fs::read_to_string(path).ok())
-        .or_else(|| std::env::var(FAKE_ANNOUNCEMENT_BODY_ENV).ok())?;
+        .or_else(|| crate::environment::var(FAKE_ANNOUNCEMENT_BODY_ENV).ok())?;
     let body = normalize_body(&body);
     if body.is_empty() {
         return None;
     }
 
-    let id = std::env::var(FAKE_ANNOUNCEMENT_ID_ENV)
+    let id = crate::environment::var(FAKE_ANNOUNCEMENT_ID_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "local-preview".to_string());
-    let title = std::env::var(FAKE_ANNOUNCEMENT_TITLE_ENV)
+    let title = crate::environment::var(FAKE_ANNOUNCEMENT_TITLE_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -230,11 +230,6 @@ fn normalize_body(body: &str) -> String {
 mod tests {
     use super::*;
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "herdr-product-announcements-{name}-{}-{}.json",
@@ -308,24 +303,17 @@ mod tests {
 
     #[test]
     fn fake_announcement_body_env_creates_preview() {
-        let _guard = env_lock().lock().unwrap();
-        unsafe {
-            std::env::set_var(FAKE_ANNOUNCEMENT_BODY_ENV, "### Preview\n- Local body");
-            std::env::set_var(FAKE_ANNOUNCEMENT_TITLE_ENV, "Local title");
-            std::env::set_var(FAKE_ANNOUNCEMENT_ID_ENV, "local-id");
-        }
+        let env = crate::environment::test_env();
+        env.remove(FAKE_ANNOUNCEMENT_BODY_FILE_ENV);
+        env.set(FAKE_ANNOUNCEMENT_BODY_ENV, "### Preview\n- Local body");
+        env.set(FAKE_ANNOUNCEMENT_TITLE_ENV, "Local title");
+        env.set(FAKE_ANNOUNCEMENT_ID_ENV, "local-id");
 
         let announcement = load_fake_for_current_version().expect("fake announcement");
         assert_eq!(announcement.id, "local-id");
         assert_eq!(announcement.title, "Local title");
         assert_eq!(announcement.body, "### Preview\n- Local body");
         assert!(announcement.preview);
-
-        unsafe {
-            std::env::remove_var(FAKE_ANNOUNCEMENT_BODY_ENV);
-            std::env::remove_var(FAKE_ANNOUNCEMENT_TITLE_ENV);
-            std::env::remove_var(FAKE_ANNOUNCEMENT_ID_ENV);
-        }
     }
 
     #[test]

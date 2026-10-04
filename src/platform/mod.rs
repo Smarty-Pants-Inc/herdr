@@ -3,6 +3,13 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+mod diagnostic_owner;
+pub(crate) use diagnostic_owner::{
+    diagnostic_directory, diagnostic_owner_identity, diagnostic_snapshot_name,
+    diagnostic_temporary_name, parse_diagnostic_name, DiagnosticName,
+    DIAGNOSTIC_SNAPSHOT_SCHEMA_VERSION,
+};
+
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
@@ -412,8 +419,14 @@ mod remote_bridge_tests;
 mod unix_common;
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, RemoteBridgeWake,
+    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, DiagnosticDirectoryScan,
+    PrivateDiagnosticDirectory, RemoteBridgeWake,
 };
+
+#[cfg(not(any(unix, windows)))]
+mod unsupported_diagnostics;
+#[cfg(not(any(unix, windows)))]
+pub(crate) use unsupported_diagnostics::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
 
 mod client_state;
 pub(crate) use client_state::{

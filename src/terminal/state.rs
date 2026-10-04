@@ -1392,6 +1392,19 @@ impl TerminalState {
             })
     }
 
+    /// Session ownership survives transient detection state and detached views.
+    /// Topology checks must protect the identity that a session list can expose.
+    pub(crate) fn agent_session_reference(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        self.hook_authority
+            .as_ref()
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .map(|session| &session.session_ref)
+            })
+    }
+
     fn current_session_identity_for_persistence(
         &self,
     ) -> Option<(

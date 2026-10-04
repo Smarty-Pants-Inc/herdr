@@ -178,7 +178,7 @@ fn start_server_inner(
     #[cfg(unix)]
     let ssh_agents = match crate::platform::ssh_agent::SshAgentRegistry::new(
         crate::platform::ssh_agent::socket_path(),
-        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+        crate::environment::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
     ) {
         Ok(registry) => Some(registry),
         Err(error) => {
@@ -667,6 +667,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::TabFocus(_) => "tab.focus",
         Method::TabRename(_) => "tab.rename",
         Method::TabMove(_) => "tab.move",
+        Method::TabMoveProjectChecked(_) => "tab.move_project_checked",
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
@@ -683,13 +684,16 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
+        Method::PaneSwapProjectChecked(_) => "pane.swap_project_checked",
         Method::PaneMove(_) => "pane.move",
+        Method::PaneMoveProjectChecked(_) => "pane.move_project_checked",
         Method::PaneZoom(_) => "pane.zoom",
         Method::PaneLayout(_) => "pane.layout",
         Method::PaneProcessInfo(_) => "pane.process_info",
         Method::LayoutExport(_) => "layout.export",
         Method::LayoutApply(_) => "layout.apply",
         Method::LayoutApplyRestorable(_) => "layout.apply_restorable",
+        Method::LayoutApplyProjectChecked(_) => "layout.apply_project_checked",
         Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
         Method::PaneNeighbor(_) => "pane.neighbor",
         Method::PaneEdges(_) => "pane.edges",
@@ -1300,13 +1304,8 @@ mod tests {
     use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use tokio::sync::mpsc;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -1740,43 +1739,43 @@ mod tests {
 
     #[test]
     fn socket_path_prefers_explicit_env_override() {
-        let _guard = env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let unique = format!("/tmp/herdr-test-{}.sock", std::process::id());
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.remove(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
-        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &unique);
+        env.set(crate::api::SOCKET_PATH_ENV_VAR, &unique);
         assert_eq!(socket_path(), PathBuf::from(&unique));
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
     }
 
     #[test]
     fn socket_path_defaults_to_config_dir_even_when_xdg_runtime_dir_is_set() {
-        let _guard = env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_test_path("socket-default-config-home");
         let runtime_dir = unique_test_path("socket-default-runtime");
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.set("XDG_RUNTIME_DIR", &runtime_dir);
 
         let expected = config_home
             .join(crate::config::app_dir_name())
             .join("herdr.sock");
         assert_eq!(socket_path(), expected);
 
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        env.remove("XDG_CONFIG_HOME");
+        env.remove("XDG_RUNTIME_DIR");
     }
 
     #[test]
     fn socket_path_uses_named_session_dir() {
-        let _guard = env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_test_path("socket-named-config-home");
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
-        std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        env.set(crate::session::SESSION_ENV_VAR, "work");
+        env.set("XDG_CONFIG_HOME", &config_home);
 
         let expected = config_home
             .join(crate::config::app_dir_name())
@@ -1785,8 +1784,8 @@ mod tests {
             .join("herdr.sock");
         assert_eq!(socket_path(), expected);
 
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
-        std::env::remove_var("XDG_CONFIG_HOME");
+        env.remove(crate::session::SESSION_ENV_VAR);
+        env.remove("XDG_CONFIG_HOME");
     }
 
     #[test]

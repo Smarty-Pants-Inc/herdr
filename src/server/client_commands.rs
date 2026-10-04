@@ -17,6 +17,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "command.invoke",
     "integration.install",
     "integration.list",
+    "layout.apply_project_checked",
     "layout.apply_restorable",
     "layout.set_split_ratio",
     "pane.clear",
@@ -30,12 +31,14 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.last_input",
     "pane.link.activate",
     "pane.link.resolve",
+    "pane.move_project_checked",
     "pane.rename",
     "pane.resize",
     "pane.scroll",
     "pane.selection.read",
     "pane.split",
     "pane.swap",
+    "pane.swap_project_checked",
     "pane.zoom",
     "product_announcement.dismiss",
     "release_notes.dismiss",
@@ -44,6 +47,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "tab.create",
     "tab.focus",
     "tab.move",
+    "tab.move_project_checked",
     "tab.rename",
     "workspace.close",
     "workspace.create",
@@ -304,6 +308,11 @@ mod tests {
         // Its canonical params and response are covered by schema::tests.
         assert!(actual.remove("pane.last_input").is_some());
         assert!(actual.remove("layout.apply_restorable").is_some());
+        // Additive, safety-guaranteed topology method, not a generation-1 change.
+        assert!(actual.remove("pane.move_project_checked").is_some());
+        assert!(actual.remove("tab.move_project_checked").is_some());
+        assert!(actual.remove("pane.swap_project_checked").is_some());
+        assert!(actual.remove("layout.apply_project_checked").is_some());
 
         assert_eq!(
             actual, expected,

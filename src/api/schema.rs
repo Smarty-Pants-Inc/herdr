@@ -138,6 +138,8 @@ pub enum Method {
     TabRename(TabRenameParams),
     #[serde(rename = "tab.move")]
     TabMove(TabMoveParams),
+    #[serde(rename = "tab.move_project_checked")]
+    TabMoveProjectChecked(TabMoveProjectCheckedParams),
     #[serde(rename = "tab.close")]
     TabClose(TabTarget),
     #[serde(rename = "agent.list")]
@@ -171,8 +173,14 @@ pub enum Method {
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
     PaneSwap(PaneSwapParams),
+    /// Project-checked swap; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "pane.swap_project_checked")]
+    PaneSwapProjectChecked(PaneSwapProjectCheckedParams),
     #[serde(rename = "pane.move")]
     PaneMove(PaneMoveParams),
+    /// Project-checked move; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "pane.move_project_checked")]
+    PaneMoveProjectChecked(PaneMoveParams),
     #[serde(rename = "pane.zoom")]
     PaneZoom(PaneZoomParams),
     #[serde(rename = "pane.layout")]
@@ -185,6 +193,9 @@ pub enum Method {
     LayoutApply(LayoutApplyParams),
     #[serde(rename = "layout.apply_restorable")]
     LayoutApplyRestorable(LayoutApplyParams),
+    /// Project-checked apply; its distinct name prevents unsafe old-server fallback.
+    #[serde(rename = "layout.apply_project_checked")]
+    LayoutApplyProjectChecked(LayoutApplyProjectCheckedParams),
     #[serde(rename = "layout.set_split_ratio")]
     LayoutSetSplitRatio(LayoutSetSplitRatioParams),
     #[serde(rename = "pane.neighbor")]

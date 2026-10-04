@@ -1342,6 +1342,7 @@ enum PaneRuntimeIo {
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        foreground_cwd: Mutex<Option<std::path::PathBuf>>,
     },
 }
 
@@ -1639,7 +1640,7 @@ fn truncate_handoff_history(history: String, max_bytes: usize) -> String {
 }
 
 fn pane_shell(configured_shell: &str) -> String {
-    pane_shell_from(configured_shell, std::env::var("SHELL").ok())
+    pane_shell_from(configured_shell, crate::environment::var("SHELL").ok())
 }
 
 fn pane_shell_from(configured_shell: &str, env_shell: Option<String>) -> String {
@@ -3648,6 +3649,17 @@ impl PaneRuntime {
 
     /// Get the current working directory of the process group controlling the pane PTY.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        let test_cwd = match &self.io {
+            PaneRuntimeIo::TestChannel { foreground_cwd, .. } => {
+                foreground_cwd.lock().ok().and_then(|cwd| cwd.clone())
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some(cwd) = test_cwd {
+            return Some(cwd);
+        }
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
@@ -3677,6 +3689,12 @@ impl PaneRuntime {
 impl PaneRuntime {
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.child_pid.store(pid, Ordering::Release);
+    }
+
+    pub(crate) fn test_set_foreground_cwd(&self, cwd: Option<std::path::PathBuf>) {
+        if let PaneRuntimeIo::TestChannel { foreground_cwd, .. } = &self.io {
+            *foreground_cwd.lock().expect("test foreground cwd") = cwd;
+        }
     }
 
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
@@ -3795,6 +3813,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    foreground_cwd: Mutex::new(None),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -5102,6 +5121,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                foreground_cwd: Mutex::new(None),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5141,6 +5161,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                foreground_cwd: Mutex::new(None),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),

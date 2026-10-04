@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [master, windows]
+  # A maintainer dispatches the full matrix, macOS included, on a pushed exact merge candidate,
+  # because queue entry needs review/astra and Astra can require macOS first (smarty-dev#4345).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +26,57 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.pull_request.user.id != 37929162 || startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/') == false }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      conpty: ${{ steps.plan.outputs.conpty }}
+      dedupe: ${{ steps.plan.outputs.dedupe }}
+      target_url: ${{ steps.plan.outputs.target_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Read-only proof with this job's workflow token; never changes the plan.
+      - name: Probe queue log fetch with the workflow token
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh --version
+          curl --version
+          evidence=$(python3 scripts/ci_queue_dedupe.py --repo "$GITHUB_REPOSITORY" \
+            --dry-run --last 1 --compare-log-fetch)
+          echo "$evidence"
+          printf '%s\n' "$evidence" | python3 -c 'import json,sys; r=json.load(sys.stdin); results=r.get("results", []); latest=results[0] if results else {}; print(json.dumps({"eligible": latest.get("dedupe", False), "checkouts": max((len(c.get("checkouts", [])) for c in latest.get("candidates", [])), default=0)}))'
+
+      - name: Select CI lanes and verify queue evidence
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SENDER_ID: ${{ github.event.sender.id }}
+        run: |
+          python3 scripts/ci_plan.py --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"
+          echo 'dedupe=false' >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/master ] \
+            && [ "$PUSH_SENDER_ID" = 37929162 ]; then
+            python3 scripts/ci_queue_dedupe.py --repo "$GITHUB_REPOSITORY" \
+              --sha "$GITHUB_SHA" --before "$BEFORE_SHA" \
+              --github-output "$GITHUB_OUTPUT" || echo 'dedupe=false' >> "$GITHUB_OUTPUT"
+          fi
+
   conventional-commits:
     if: github.event_name != 'push' || github.ref_name == 'master'
     runs-on: ubuntu-latest
@@ -46,19 +100,11 @@ jobs:
 
   check:
     name: check (${{ matrix.os }})
+    needs: plan
+    if: needs.plan.outputs.dedupe != 'true'
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            kind: unix
-            nextest_filter: all()
-          - os: macos-latest
-            kind: unix
-            # Keep the macOS owner-watchdog regression; the rest of live_handoff stays Linux-only.
-            nextest_filter: not binary(live_handoff) or test(=live_handoff_import_exits_when_its_test_owner_dies)
-          - os: windows-latest
-            kind: windows
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     # The native-media feature adds a second herdr build with WebRTC and libopus.
     timeout-minutes: 30
@@ -187,6 +233,8 @@ jobs:
 
   windows-conpty-package:
     name: Windows ConPTY package
+    needs: plan
+    if: needs.plan.outputs.dedupe != 'true' && needs.plan.outputs.conpty == 'true'
     runs-on: windows-2022
     timeout-minutes: 25
     steps:
@@ -305,14 +353,61 @@ jobs:
           }
 
   smarty-ci:
-    name: smarty-ci
+    # Do not create a competing smarty-ci check when reusing the queue run's status.
+    name: ${{ needs.plan.outputs.dedupe == 'true' && 'queue-tested CI' || 'smarty-ci' }}
     if: ${{ always() }}
-    needs: [conventional-commits, check, windows-conpty-package]
+    needs: [plan, conventional-commits, check, windows-conpty-package]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      statuses: write
     steps:
-      - name: Require every CI lane to succeed
+      - name: Require every selected CI lane to succeed
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          CONVENTIONAL_RESULT: ${{ needs.conventional-commits.result }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          CONPTY_RESULT: ${{ needs.windows-conpty-package.result }}
+          CONPTY_SELECTED: ${{ needs.plan.outputs.conpty }}
+          DEDUPE: ${{ needs.plan.outputs.dedupe }}
+          PUSH_SENDER_ID: ${{ github.event.sender.id }}
         run: |
-          test '${{ needs.conventional-commits.result }}' = success
-          test '${{ needs.check.result }}' = success
-          test '${{ needs.windows-conpty-package.result }}' = success
+          test "$PLAN_RESULT" = success
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/windows ]; then
+            test "$CONVENTIONAL_RESULT" = skipped
+          else
+            test "$CONVENTIONAL_RESULT" = success
+          fi
+          if [ "$DEDUPE" != true ]; then
+            test "$CHECK_RESULT" = success
+            if [ "$CONPTY_SELECTED" = true ]; then
+              test "$CONPTY_RESULT" = success
+            else
+              test "$CONPTY_SELECTED" = false
+              test "$CONPTY_RESULT" = skipped
+            fi
+          else
+            test "$GITHUB_EVENT_NAME" = push
+            test "$GITHUB_REF" = refs/heads/master
+            test "$PUSH_SENDER_ID" = 37929162
+            test "$CHECK_RESULT" = skipped
+            test "$CONPTY_RESULT" = skipped
+          fi
+
+      - name: Publish queue-tested install checks
+        if: needs.plan.outputs.dedupe == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/master' && github.event.sender.id == 37929162
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_RUN_URL: ${{ needs.plan.outputs.target_url }}
+          DEDUPE: ${{ needs.plan.outputs.dedupe }}
+          PUSH_SENDER_ID: ${{ github.event.sender.id }}
+        run: |
+          test "$DEDUPE" = true
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/master
+          test "$PUSH_SENDER_ID" = 37929162
+          for context in smarty-ci 'check (ubuntu-latest)'; do
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              -f state=success -f context="$context" -f target_url="$QUEUE_RUN_URL" \
+              -f description='Queue tested the identical master tree'
+          done

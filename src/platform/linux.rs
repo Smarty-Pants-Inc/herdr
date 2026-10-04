@@ -26,6 +26,9 @@ pub(crate) use super::unix_common::{
 };
 
 #[cfg(test)]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
+
+#[cfg(test)]
 mod config_file_tests;
 
 mod shutdown;

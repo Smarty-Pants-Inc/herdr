@@ -22,6 +22,9 @@ pub(crate) fn read_session_snapshot_with_trust(
     ))
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 

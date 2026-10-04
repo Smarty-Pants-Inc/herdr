@@ -36,6 +36,15 @@ pub struct TabMoveParams {
     pub insert_index: usize,
 }
 
+/// Additive checked method; the published tab.move shape remains immutable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TabMoveProjectCheckedParams {
+    pub tab_id: String,
+    pub insert_index: usize,
+    #[serde(default)]
+    pub allow_project_change: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TabInfo {
     pub tab_id: String,

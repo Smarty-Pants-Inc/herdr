@@ -37,6 +37,8 @@ pub(crate) fn read_session_snapshot_with_trust(
 
 mod clipboard_image;
 mod config_backup;
+mod diagnostics;
+pub(crate) use diagnostics::{DiagnosticDirectoryScan, PrivateDiagnosticDirectory};
 
 pub(crate) fn windows_virtual_terminal_input_active() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -199,43 +201,7 @@ pub(crate) fn create_config_temporary(
             .create_new(true)
             .open(path);
     }
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt as _, SecurityDescriptor,
-    };
-    use widestring::U16CString;
-    use windows_sys::Win32::{
-        Foundation::GENERIC_WRITE,
-        Storage::FileSystem::{
-            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
-        },
-    };
-    let sddl =
-        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
-    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
-    let mut attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 0,
-    };
-    descriptor.write_to_security_attributes(&mut attributes);
-    let path = extended_length_path(path)?;
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &attributes,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    // CreateFileW returned an owned handle; File closes it exactly once.
-    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    diagnostic_storage_creation::create_private_file(path)
 }
 
 /// Opens or creates `path` as a private log and returns the handle that was validated.
@@ -514,7 +480,6 @@ use windows_sys::{
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
         Security::SECURITY_ATTRIBUTES,
-        Storage::FileSystem::CreateDirectoryW,
         System::{
             Console::GetConsoleWindow,
             DataExchange::{
@@ -770,48 +735,15 @@ pub(crate) fn create_remote_ssh_config_file(
         .open(path)
 }
 
-pub(crate) fn create_remote_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt as _, SecurityDescriptor,
-    };
-    use widestring::U16CString;
+#[path = "diagnostic_storage_creation.rs"]
+mod diagnostic_storage_creation;
 
-    let sddl = U16CString::from_str("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;OW)")
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
-    let mut security_attributes = SECURITY_ATTRIBUTES {
-        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
-        lpSecurityDescriptor: null_mut(),
-        bInheritHandle: 0,
-    };
-    security_descriptor.write_to_security_attributes(&mut security_attributes);
-    let path = extended_length_path(path)?;
-    if unsafe { CreateDirectoryW(path.as_ptr(), &security_attributes) } != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+pub(crate) fn create_remote_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    diagnostic_storage_creation::create_private_directory(path)
 }
 
 fn extended_length_path(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    let path = std::path::absolute(path)?;
-    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    let mut extended = if wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
-        || wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
-    {
-        wide
-    } else if wide.starts_with(&[b'\\' as u16, b'\\' as u16]) {
-        "\\\\?\\UNC\\"
-            .encode_utf16()
-            .chain(wide.into_iter().skip(2))
-            .collect()
-    } else {
-        "\\\\?\\".encode_utf16().chain(wide).collect()
-    };
-    extended.push(0);
-    Ok(extended)
+    diagnostic_storage_creation::extended_length_path(path)
 }
 
 pub(crate) fn remote_private_temp_base() -> PathBuf {
