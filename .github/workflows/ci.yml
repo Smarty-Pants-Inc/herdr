@@ -42,6 +42,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Read-only proof with this job's workflow token; never changes the plan.
+      - name: Probe queue log fetch with the workflow token
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh --version
+          curl --version
+          evidence=$(python3 scripts/ci_queue_dedupe.py --repo "$GITHUB_REPOSITORY" \
+            --dry-run --last 1 --compare-log-fetch)
+          echo "$evidence"
+          printf '%s\n' "$evidence" | python3 -c 'import json,sys; r=json.load(sys.stdin); results=r.get("results", []); latest=results[0] if results else {}; print(json.dumps({"eligible": latest.get("dedupe", False), "checkouts": max((len(c.get("checkouts", [])) for c in latest.get("candidates", [])), default=0)}))'
+
       - name: Select CI lanes and verify queue evidence
         id: plan
         env:
