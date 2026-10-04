@@ -7932,9 +7932,7 @@ impl CrossPaneGuardFixture {
                     id: id.into(),
                     method,
                 },
-                context: api::ApiRequestContext {
-                    local_peer_pid: Some(std::process::id()),
-                },
+                context: api::ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
                 respond_to,
                 response_write_complete: None,
                 stream_active: None,

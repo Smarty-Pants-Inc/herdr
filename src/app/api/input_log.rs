@@ -49,8 +49,8 @@ impl App {
         bytes: usize,
     ) -> String {
         let caller = context
-            .local_peer_pid
-            .and_then(|pid| self.pane_target_for_peer_pid(pid));
+            .local_peer_identity
+            .and_then(|identity| self.pane_target_for_peer_identity(identity));
         let caller_pane = caller
             .as_ref()
             .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id));
@@ -72,7 +72,7 @@ impl App {
                 .map(|terminal| terminal.to_string()),
             "bytes": bytes,
             "caller": {
-                "pid": context.local_peer_pid,
+                "pid": context.local_peer_pid(),
                 "pane": caller_pane,
                 "agent": caller_agent.as_ref().and_then(|agent| agent.name.clone()),
                 "session": caller_agent
@@ -225,9 +225,7 @@ mod tests {
                     allow_cross_pane: true,
                 }),
             },
-            ApiRequestContext {
-                local_peer_pid: Some(std::process::id()),
-            },
+            ApiRequestContext::for_local_peer_pid(Some(std::process::id())),
         )
     }
 
