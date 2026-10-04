@@ -142,9 +142,8 @@ fn update_file_at_checked(
     }
     // herdr#127 r3: the file a save really changes (its symlinks followed, its directory canonical), so a save through
     // a symlink and one through HERDR_CONFIG_PATH to the target take the same lock, read and publish the same file.
-    let path = &crate::integration::config_file::resolve_target(path).map_err(|error| {
-        format!("failed to resolve config before saving {description}: {error}")
-    })?;
+    let path = &crate::integration::config_file::resolve_target(path)
+        .map_err(|error| format!("failed to read config before saving {description}: {error}"))?;
     let path = &match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => parent
             .canonicalize()
