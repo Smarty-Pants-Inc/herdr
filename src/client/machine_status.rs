@@ -781,7 +781,10 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         // A real foreign-owned regular file, rather than a JSON parse error masquerading
         // as an ownership test. No root/chown privilege is needed for this probe.
-        let foreign = Path::new("/etc/passwd");
+        // ponytail: canonical path, because macOS /etc is a symlink to /private/etc and the
+        // no-follow parent walk would report NotADirectory before the owner check.
+        let foreign = std::fs::canonicalize("/etc/passwd").unwrap();
+        let foreign = foreign.as_path();
         if std::fs::metadata(foreign).unwrap().uid() == unsafe { libc::geteuid() } {
             return; // Root runners cannot use this foreign-owner fixture.
         }
