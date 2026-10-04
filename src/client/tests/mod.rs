@@ -378,6 +378,41 @@ fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
 }
 
 #[test]
+fn composed_graphics_flush_failure_keeps_cleanup_obligation() {
+    struct FlushBroken;
+    impl std::io::Write for FlushBroken {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    let mut reset = Vec::new();
+    clear_received_kitty_graphics(&mut reset).unwrap();
+    let id = 424_242;
+    record_received_kitty_graphics(format!("\x1b_Ga=t,i={id};AAAA\x1b\\").as_bytes());
+    let deletion = crate::kitty_graphics::GraphicsOutput::from_bytes(
+        format!("\x1b_Ga=d,d=I,i={id};\x1b\\").into_bytes(),
+    );
+    let result = super::frame_output::write_composed_frame(
+        FlushBroken,
+        b"frame",
+        &deletion,
+        &mut super::image_files::FileTransport::default(),
+    );
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+
+    let mut cleanup = Vec::new();
+    clear_received_kitty_graphics(&mut cleanup).unwrap();
+    assert!(String::from_utf8(cleanup)
+        .unwrap()
+        .contains(&format!("i={id}")));
+}
+
+#[test]
 fn kitty_graphics_cleanup_deletes_tracked_images_not_all_images() {
     let mut reset = Vec::new();
     clear_received_kitty_graphics(&mut reset).unwrap();

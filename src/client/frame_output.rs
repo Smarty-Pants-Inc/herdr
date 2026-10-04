@@ -36,6 +36,7 @@ pub(super) fn write_composed_frame(
     graphics: &GraphicsOutput,
     files: &mut super::image_files::FileTransport,
 ) -> io::Result<()> {
+    let mut pending_ledger = Vec::new();
     if graphics.is_empty() {
         return writer.write_all(encoded);
     }
@@ -47,7 +48,7 @@ pub(super) fn write_composed_frame(
         match operation {
             GraphicsOperation::Bytes(bytes) => {
                 writer.write_all(bytes)?;
-                record_received_kitty_graphics(bytes);
+                pending_ledger.extend(kitty_graphics_image_commands(bytes));
             }
             GraphicsOperation::Upload { control, data } => {
                 let file_eligible = control
@@ -72,13 +73,15 @@ pub(super) fn write_composed_frame(
                 } else {
                     crate::kitty_graphics::write_kitty_data(&mut writer, control, data)?;
                 }
-                record_received_kitty_graphics(header.as_bytes());
+                pending_ledger.extend(kitty_graphics_image_commands(header.as_bytes()));
             }
         }
     }
     writer.write_all(b"\x1b8")?;
     writer.write_all(&encoded[insertion..])?;
-    io::Write::flush(&mut writer)
+    io::Write::flush(&mut writer)?;
+    apply_graphics_ledger_changes(pending_ledger);
+    Ok(())
 }
 
 pub(super) fn write_encoded_frame_with_graphics(
@@ -96,8 +99,10 @@ pub(super) fn write_encoded_frame_with_graphics(
     writer.write_all(b"\x1b7")?;
     writer.write_all(graphics)?;
     writer.write_all(b"\x1b8")?;
+    writer.write_all(&encoded[insertion..])?;
+    writer.flush()?;
     record_received_kitty_graphics(graphics);
-    writer.write_all(&encoded[insertion..])
+    Ok(())
 }
 
 pub(super) fn contains_kitty_graphics_bytes(bytes: &[u8]) -> bool {
@@ -109,6 +114,10 @@ pub(super) fn record_received_kitty_graphics(bytes: &[u8]) {
     if commands.is_empty() {
         return;
     }
+    apply_graphics_ledger_changes(commands);
+}
+
+fn apply_graphics_ledger_changes(commands: Vec<KittyGraphicsImageCommand>) {
     let set = RECEIVED_KITTY_GRAPHICS_IDS.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut set) = set.lock() {
         for command in commands {
