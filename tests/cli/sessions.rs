@@ -661,6 +661,524 @@ fn server_stop_then_restart_restores_pane_history() {
 }
 
 #[test]
+fn cold_restore_replays_only_explicitly_authorized_argv_panes() {
+    exercise_cold_restore_argv(false, false);
+}
+
+#[test]
+fn cold_restore_untrusted_snapshot_cannot_authorize_or_launder_ordinary_argv() {
+    exercise_cold_restore_argv(true, false);
+}
+
+#[test]
+fn cold_restore_failed_argv_redacts_restart_log_and_preserves_successful_control() {
+    exercise_cold_restore_argv(false, true);
+}
+
+fn exercise_cold_restore_argv(untrusted_snapshot: bool, unavailable_executable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Keep every child and all persistence inside this test's private root.
+    struct PrivateRoot(PathBuf);
+    impl Drop for PrivateRoot {
+        fn drop(&mut self) {
+            cleanup_test_base(&self.0);
+        }
+    }
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            unregister_spawned_herdr_pid(Some(self.0.id()));
+        }
+    }
+    fn command(base: &Path) -> Command {
+        let mut command = crate::test_command::herdr_command();
+        command
+            .env_clear()
+            .env("HOME", base.join("home"))
+            .env("XDG_CONFIG_HOME", base.join("config"))
+            .env("XDG_STATE_HOME", base.join("state"))
+            .env("XDG_DATA_HOME", base.join("data"))
+            .env("XDG_CACHE_HOME", base.join("cache"))
+            .env("XDG_RUNTIME_DIR", base.join("runtime"))
+            .env("HERDR_SESSION", "default")
+            .env("HERDR_SOCKET_PATH", base.join("runtime/herdr.sock"))
+            .env(
+                "HERDR_CLIENT_SOCKET_PATH",
+                base.join("runtime/herdr-client.sock"),
+            )
+            .env("SHELL", "/bin/sh")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .current_dir(base);
+        command
+    }
+    fn start(base: &Path) -> Server {
+        let child = command(base)
+            .arg("server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        register_spawned_herdr_pid(Some(child.id()));
+        let server = Server(child);
+        wait_for_socket(&base.join("runtime/herdr.sock"), Duration::from_secs(10));
+        wait_for_socket(
+            &base.join("runtime/herdr-client.sock"),
+            Duration::from_secs(10),
+        );
+        // Socket binding precedes restore; an App read is the restore barrier.
+        request(base, "workspace.list", serde_json::json!({}));
+        server
+    }
+    fn stop(base: &Path, server: &mut Server) {
+        let output = command(base).args(["server", "stop"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "stop failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                server.0.try_wait().unwrap().is_some()
+            }),
+            "cold stop must terminate the original server"
+        );
+        assert!(server.0.wait().unwrap().success());
+        unregister_spawned_herdr_pid(Some(server.0.id()));
+    }
+    fn request(base: &Path, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let mut stream = UnixStream::connect(base.join("runtime/herdr.sock")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let id = format!("cold-restore:{method}");
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id": id, "method": method, "params": params})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id, "response: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "{method} failed: {response}"
+        );
+        response["result"].clone()
+    }
+    fn launches(cwd: &Path) -> Vec<(usize, u32)> {
+        fs::read_to_string(cwd.join("launches"))
+            .unwrap_or_default()
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                assert_eq!(fields.len(), 2, "invalid complete launch record: {line:?}");
+                (fields[0].parse().unwrap(), fields[1].parse().unwrap())
+            })
+            .collect()
+    }
+    fn acknowledge(base: &Path, pane_id: &str, cwd: &Path, marker: &str) {
+        request(
+            base,
+            "pane.send_input",
+            serde_json::json!({"pane_id": pane_id, "text": marker, "keys": ["Enter"]}),
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                fs::read_to_string(cwd.join("received"))
+                    .is_ok_and(|text| text.lines().any(|line| line == marker))
+            }),
+            "pane must acknowledge fresh input {marker:?} in a file, not restored screen history"
+        );
+    }
+    fn restored_pane(base: &Path, workspace: &str, label: &str) -> String {
+        let tabs = request(
+            base,
+            "tab.list",
+            serde_json::json!({"workspace_id": workspace}),
+        );
+        let tab_id = tabs["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tab| tab["label"] == label)
+            .and_then(|tab| tab["tab_id"].as_str())
+            .unwrap_or_else(|| panic!("missing restored tab {label}: {tabs}"));
+        let layout = request(base, "layout.export", serde_json::json!({"tab_id": tab_id}));
+        layout["layout"]["root"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn snapshot_pane<'a>(snapshot: &'a serde_json::Value, label: &str) -> &'a serde_json::Value {
+        let tab = snapshot["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|ws| ws["tabs"].as_array().unwrap())
+            .find(|tab| tab["custom_name"] == label)
+            .unwrap_or_else(|| panic!("snapshot missing tab {label}: {snapshot}"));
+        let panes = tab["panes"].as_object().unwrap();
+        assert_eq!(panes.len(), 1);
+        panes.values().next().unwrap()
+    }
+
+    let root = PrivateRoot(unique_test_dir());
+    let base = &root.0;
+    for dir in [
+        "home",
+        "config",
+        "state",
+        "data",
+        "cache",
+        "runtime",
+        "eligible",
+        "ordinary",
+        "unavailable",
+    ] {
+        fs::create_dir_all(base.join(dir)).unwrap();
+    }
+    fs::set_permissions(base, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(base.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
+    register_runtime_dir(&base.join("runtime"));
+    let app_dir = base.join("config").join(app_dir_name());
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("config.toml"),
+        "onboarding = false\n[experimental]\npane_history = false\n",
+    )
+    .unwrap();
+    let script = base.join("ARGV0_CONTROL_SENTINEL.sh");
+    assert!(script.is_absolute());
+    fs::write(&script, "#!/bin/sh\nset -eu\nprintf '%s %s\\n' \"$1\" \"$RECIPE_ENV_SENTINEL_KEY\" > recipe_arguments\nn=0\nif [ -f count ]; then read -r n < count; fi\nn=$((n + 1))\nprintf '%s\\n' \"$n\" > count\nprintf '%s %s\\n' \"$n\" \"$$\" >> launches\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> received\n  printf 'got:%s\\n' \"$line\"\ndone\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let argv = serde_json::json!([script, "ARGV1_SENTINEL"]);
+    let unavailable_script = base.join("ARGV0_FAILURE_SENTINEL.sh");
+    fs::copy(&script, &unavailable_script).unwrap();
+    let unavailable_argv = serde_json::json!([unavailable_script, "ARGV1_SENTINEL"]);
+    let eligible_cwd = base.join("eligible");
+    let ordinary_cwd = base.join("ordinary");
+    let unavailable_cwd = base.join("unavailable");
+    let mut server = start(base);
+    let created = request(
+        base,
+        "workspace.create",
+        serde_json::json!({
+            "cwd": base, "label": "cold-argv", "focus": false,
+            "env": {"RECIPE_ENV_SENTINEL_KEY": "WORKSPACE_ENV_SENTINEL_VALUE"}
+        }),
+    );
+    let workspace = created["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut initial_panes = Vec::new();
+    let mut layouts = vec![("ordinary", &ordinary_cwd, "layout.apply")];
+    if !untrusted_snapshot {
+        layouts.insert(0, ("eligible", &eligible_cwd, "layout.apply_restorable"));
+    }
+    if unavailable_executable {
+        layouts.push(("unavailable", &unavailable_cwd, "layout.apply_restorable"));
+    }
+    for (label, cwd, method) in layouts {
+        let command = if label == "unavailable" {
+            &unavailable_argv
+        } else {
+            &argv
+        };
+        // Same arguments (except the failed executable), no leaf env or replacement target.
+        let applied = request(
+            base,
+            method,
+            serde_json::json!({
+                "workspace_id": workspace, "tab_label": label, "focus": false,
+                "root": {"type": "pane", "cwd": cwd, "command": command}
+            }),
+        );
+        let pane_id = applied["layout"]["root"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            wait_until(
+                Duration::from_secs(5),
+                Duration::from_millis(25),
+                || launches(cwd).len() == 1
+            ),
+            "{label} must start once"
+        );
+        let records = launches(cwd);
+        assert_eq!(records[0].0, 1);
+        assert!(process_exists(records[0].1));
+        acknowledge(base, &pane_id, cwd, &format!("before-cold-{label}"));
+        assert_eq!(
+            fs::read_to_string(cwd.join("recipe_arguments")).unwrap(),
+            "ARGV1_SENTINEL WORKSPACE_ENV_SENTINEL_VALUE\n",
+            "sentinels must reach the real argv process, not just exist in test inputs"
+        );
+        initial_panes.push((pane_id, records[0].1));
+    }
+    stop(base, &mut server);
+    drop(server);
+    for (_, pid) in &initial_panes {
+        assert!(
+            wait_for_pid_exit(*pid, Duration::from_secs(5)),
+            "old pane process {pid} must exit before restart"
+        );
+    }
+    let snapshot_path = app_dir.join("session.json");
+    let mut first_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    assert_eq!(
+        snapshot_pane(&first_snapshot, "ordinary")["launch_argv"],
+        argv
+    );
+    assert!(
+        !snapshot_pane(&first_snapshot, "ordinary")["cold_restore_argv"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+
+    if untrusted_snapshot {
+        // Ordinary layout.apply never grants replay. Add a forged grant while
+        // stopped, then make the same-owner snapshot writable by other users.
+        let tab = first_snapshot["workspaces"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|ws| ws["tabs"].as_array_mut().unwrap())
+            .find(|tab| tab["custom_name"] == "ordinary")
+            .unwrap();
+        let pane = tab["panes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        pane["cold_restore_argv"] = serde_json::json!(true);
+        fs::write(&snapshot_path, serde_json::to_vec(&first_snapshot).unwrap()).unwrap();
+        fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            fs::metadata(&snapshot_path).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        assert_eq!(
+            snapshot_pane(&first_snapshot, "ordinary")["cold_restore_argv"],
+            true
+        );
+
+        // A second cold cycle checks anti-laundering: a private autosave must
+        // not turn the rejected grant into trusted replay authorization.
+        for cycle in 1..=2 {
+            let mut restarted = start(base);
+            let ordinary = restored_pane(base, &workspace, "ordinary");
+            assert_eq!(ordinary, initial_panes[0].0);
+            let ready = format!("ordinary-shell-ready-{cycle}");
+            request(
+                base,
+                "pane.send_input",
+                serde_json::json!({"pane_id": ordinary, "text": format!("printf 'shell-ready\\n' > {ready}"), "keys": ["Enter"]}),
+            );
+            assert!(
+                wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                    fs::read_to_string(ordinary_cwd.join(&ready))
+                        .is_ok_and(|text| text == "shell-ready\n")
+                }),
+                "cold cycle {cycle}: rejected argv must restore as a functioning plain shell"
+            );
+            assert_eq!(
+                launches(&ordinary_cwd).len(),
+                1,
+                "cold cycle {cycle} must not replay argv"
+            );
+            if cycle == 1 {
+                let log = fs::read_to_string(app_dir.join("herdr-server.log")).unwrap();
+                assert!(
+                    log.lines().any(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.contains("argv")
+                            && (line.contains("untrusted") || line.contains("not trusted"))
+                    }),
+                    "untrusted snapshot must log argv trust refusal: {log}"
+                );
+            }
+            stop(base, &mut restarted);
+            drop(restarted);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+            assert!(
+                !snapshot_pane(&saved, "ordinary")["cold_restore_argv"]
+                    .as_bool()
+                    .unwrap_or(false),
+                "cold cycle {cycle}: autosave must strip the rejected authorization"
+            );
+            assert_eq!(
+                fs::metadata(&snapshot_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(launches(&ordinary_cwd).len(), 1);
+        }
+        return;
+    }
+
+    assert_eq!(
+        snapshot_pane(&first_snapshot, "eligible")["launch_argv"],
+        argv
+    );
+    assert_eq!(
+        snapshot_pane(&first_snapshot, "eligible")["cold_restore_argv"],
+        true
+    );
+    if unavailable_executable {
+        assert_eq!(
+            snapshot_pane(&first_snapshot, "unavailable")["launch_argv"],
+            unavailable_argv
+        );
+        assert_eq!(
+            snapshot_pane(&first_snapshot, "unavailable")["cold_restore_argv"],
+            true
+        );
+        assert_eq!(
+            fs::metadata(&snapshot_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the failed replay must come from a genuinely eligible trusted snapshot"
+        );
+        fs::remove_file(&unavailable_script).unwrap();
+    }
+    fs::remove_file(eligible_cwd.join("recipe_arguments")).unwrap();
+    let log_path = app_dir.join("herdr-server.log");
+    let log_offset = fs::metadata(&log_path).unwrap().len() as usize;
+    let mut restarted = start(base);
+    let workspaces = request(base, "workspace.list", serde_json::json!({}));
+    let workspace = workspaces["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ws| ws["label"] == "cold-argv")
+        .and_then(|ws| ws["workspace_id"].as_str())
+        .unwrap();
+    let eligible = restored_pane(base, workspace, "eligible");
+    let ordinary = restored_pane(base, workspace, "ordinary");
+    assert_eq!(eligible, initial_panes[0].0);
+    assert_eq!(ordinary, initial_panes[1].0);
+    assert!(wait_until(Duration::from_secs(8), Duration::from_millis(25), || launches(&eligible_cwd).len() == 2),
+        "eligible argv must execute a SECOND startup after a real cold stop/restart; launches={:?}, ordinary={:?}", launches(&eligible_cwd), launches(&ordinary_cwd));
+    let records = launches(&eligible_cwd);
+    assert_eq!(
+        records.iter().map(|record| record.0).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_ne!(records[1].1, initial_panes[0].1);
+    assert!(process_exists(records[1].1));
+    acknowledge(base, &eligible, &eligible_cwd, "after-cold-eligible");
+    assert_eq!(
+        fs::read_to_string(eligible_cwd.join("recipe_arguments")).unwrap(),
+        "ARGV1_SENTINEL WORKSPACE_ENV_SENTINEL_VALUE\n"
+    );
+    // A fresh file proves the ordinary pane restored as a functioning shell.
+    request(
+        base,
+        "pane.send_input",
+        serde_json::json!({"pane_id": ordinary, "text": "printf 'shell-ready\\n' > ordinary-shell-ready", "keys": ["Enter"]}),
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            fs::read_to_string(ordinary_cwd.join("ordinary-shell-ready"))
+                .is_ok_and(|text| text == "shell-ready\n")
+        }),
+        "ordinary argv must become a shell, not restart the script"
+    );
+    assert_eq!(launches(&ordinary_cwd).len(), 1);
+    assert_eq!(launches(&eligible_cwd).len(), 2);
+    if unavailable_executable {
+        let unavailable = restored_pane(base, workspace, "unavailable");
+        assert_eq!(unavailable, initial_panes[2].0);
+        let pane = request(
+            base,
+            "pane.get",
+            serde_json::json!({"pane_id": unavailable}),
+        );
+        let restore_error = pane["pane"]["restore_error"].as_str().unwrap();
+        assert_eq!(restore_error, "Could not start the saved argv command. Check its executable and saved directory, then restart this session.");
+        assert_eq!(launches(&unavailable_cwd).len(), 1);
+    }
+    stop(base, &mut restarted);
+    drop(restarted);
+    assert!(wait_for_pid_exit(records[1].1, Duration::from_secs(5)));
+    let second_snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(app_dir.join("session.json")).unwrap()).unwrap();
+    // Restore must retain the mark on terminal state so a later capture keeps it.
+    assert_eq!(
+        snapshot_pane(&second_snapshot, "eligible")["cold_restore_argv"],
+        true
+    );
+    assert_eq!(
+        snapshot_pane(&second_snapshot, "eligible")["launch_argv"],
+        argv
+    );
+    assert!(
+        !snapshot_pane(&second_snapshot, "ordinary")["cold_restore_argv"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    assert_eq!(launches(&eligible_cwd).len(), 2);
+    assert_eq!(launches(&ordinary_cwd).len(), 1);
+    // Inspect only bytes appended by this restart, never earlier creation logs.
+    let log = fs::read(&log_path).unwrap();
+    assert!(
+        log.len() >= log_offset,
+        "restart log must remain append-only"
+    );
+    let restart_log = std::str::from_utf8(&log[log_offset..]).unwrap();
+    let replay_lines: Vec<_> = restart_log
+        .lines()
+        .filter(|line| line.contains("replayed cold restore argv"))
+        .collect();
+    assert_eq!(replay_lines.len(), 1, "{restart_log}");
+    for sentinel in [
+        "ARGV0_CONTROL_SENTINEL",
+        "ARGV0_FAILURE_SENTINEL",
+        "ARGV1_SENTINEL",
+        "RECIPE_ENV_SENTINEL_KEY",
+        "WORKSPACE_ENV_SENTINEL_VALUE",
+    ] {
+        assert!(
+            !restart_log.contains(sentinel),
+            "recipe leaked into restart log: {sentinel}: {restart_log}"
+        );
+    }
+    if unavailable_executable {
+        assert!(
+            restart_log.contains("failed to spawn argv command pane"),
+            "{restart_log}"
+        );
+        assert!(
+            restart_log.contains("failed to replay cold restore argv"),
+            "{restart_log}"
+        );
+        assert_eq!(launches(&unavailable_cwd).len(), 1);
+        assert_eq!(
+            snapshot_pane(&second_snapshot, "unavailable")["cold_restore_argv"],
+            true
+        );
+        assert_eq!(
+            snapshot_pane(&second_snapshot, "unavailable")["launch_argv"],
+            unavailable_argv
+        );
+    }
+}
+
+#[test]
 fn unloaded_session_survives_autosave_and_shutdown_when_recovery_is_blocked() {
     let base = unique_test_dir();
     let config_home = base.join("config");

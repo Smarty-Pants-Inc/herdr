@@ -156,6 +156,8 @@ pub struct TerminalState {
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    /// Explicit creation consent, retained only from trusted disk snapshots.
+    pub cold_restore_argv: bool,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
@@ -195,6 +197,7 @@ impl TerminalState {
             last_agent_completion_seq: None,
             revision: 0,
             launch_argv: None,
+            cold_restore_argv: false,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
@@ -281,6 +284,20 @@ impl TerminalState {
             raw_changed: true,
             stripped_changed,
         }
+    }
+
+    /// Shared creation/restore validation; never interpret argv as shell text.
+    pub(crate) fn validate_cold_restore_argv(argv: &[String]) -> Result<(), &'static str> {
+        let Some(program) = argv.first().filter(|program| !program.is_empty()) else {
+            return Err("restorable command requires nonempty argv");
+        };
+        if !std::path::Path::new(program).is_absolute() {
+            return Err("restorable command requires an absolute program path");
+        }
+        if argv.iter().any(|arg| arg.contains('\0')) {
+            return Err("restorable command arguments must not contain NUL");
+        }
+        Ok(())
     }
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {
@@ -2289,6 +2306,7 @@ impl TerminalState {
         self.last_agent_state_change_seq = None;
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
+        self.cold_restore_argv = false;
         self.respawn_shell_on_exit = false;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
@@ -6205,6 +6223,19 @@ mod tests {
 
         assert!(terminal.agent_name.is_none());
         assert_eq!(terminal.effective_known_agent(), Some(Agent::Pi));
+    }
+
+    #[test]
+    fn cold_restore_argv_mark_clears_on_shell_respawn() {
+        let mut terminal = test_terminal()
+            .with_launch_argv(vec!["/program".into()])
+            .with_respawn_shell_on_exit();
+        assert!(!terminal.cold_restore_argv);
+        terminal.cold_restore_argv = true;
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(!terminal.cold_restore_argv);
+        assert!(terminal.launch_argv.is_none());
+        assert!(!terminal.respawn_shell_on_exit);
     }
 
     #[test]

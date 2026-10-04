@@ -13,6 +13,28 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Fail closed until a non-mutating, same-handle owner/DACL validator exists.
+pub(crate) fn read_session_snapshot_with_trust(
+    path: &std::path::Path,
+) -> std::io::Result<(String, super::SnapshotFileTrust)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok((
+        content,
+        super::SnapshotFileTrust::Untrusted(
+            "snapshot owner/DACL verification unavailable on Windows",
+        ),
+    ))
+}
+
 mod clipboard_image;
 mod config_backup;
 

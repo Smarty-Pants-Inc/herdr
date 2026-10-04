@@ -2544,8 +2544,11 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
-            .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
+        // Backend diagnostics can contain executable paths or other launch recipe values.
+        // Keep those details in the returned error for the caller, not in server logs.
+        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).inspect_err(
+            |err| error!(pane = pane_id.raw(), kind = ?err.kind(), "{spawn_error_message}"),
+        )?;
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
@@ -5909,6 +5912,42 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_argv_spawn_preserves_backend_error_for_caller() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-missing-argv-{}-{}",
+            std::process::id(),
+            PaneId::from_raw(42).raw()
+        ));
+        // A nonexistent parent makes the failure deterministic without touching global env.
+        assert!(!root.exists());
+        let program = root
+            .join("ARGV0_CALLER_SENTINEL")
+            .to_string_lossy()
+            .into_owned();
+        let (events, _event_rx) = mpsc::channel(8);
+        let result = PaneRuntime::spawn_argv_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            std::env::temp_dir(),
+            &[program.clone(), "ARGV1_CALLER_SENTINEL".into()],
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let error = result.err().expect("missing executable must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains(&program), "{error}");
+        assert!(error.to_string().contains("Unable to spawn"), "{error}");
     }
 
     #[cfg(unix)]

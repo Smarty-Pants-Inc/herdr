@@ -5825,6 +5825,22 @@
         {
           "properties": {
             "method": {
+              "const": "layout.apply_restorable",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/LayoutApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "layout.set_split_ratio",
               "type": "string"
             },

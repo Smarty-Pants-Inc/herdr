@@ -116,6 +116,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub cold_restore_argv: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +382,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                cold_restore_argv: terminal.is_some_and(|terminal| terminal.cold_restore_argv),
             },
         );
     }
@@ -724,6 +727,18 @@ mod tests {
     }
 
     #[test]
+    fn cold_restore_argv_defaults_false_and_round_trips() {
+        let mut pane: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","launch_argv":["/program","a b"]}"#).unwrap();
+        assert!(!pane.cold_restore_argv);
+        pane.cold_restore_argv = true;
+        let restored: PaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert!(restored.cold_restore_argv);
+        assert_eq!(restored.launch_argv, pane.launch_argv);
+    }
+
+    #[test]
     fn round_trip_full_workspace_snapshot() {
         let mut panes = HashMap::new();
         panes.insert(
@@ -735,6 +750,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
         panes.insert(
@@ -746,6 +762,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
 
@@ -1398,6 +1415,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
         panes.insert(
@@ -1411,6 +1429,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
 

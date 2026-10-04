@@ -92,9 +92,12 @@ pub fn clear_history() {
 }
 
 pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
+    load_from_path(&session_path())
+}
+
+fn load_from_path(path: &Path) -> Option<SessionSnapshot> {
+    let (content, trust) = match crate::platform::read_session_snapshot_with_trust(path) {
+        Ok(result) => result,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
                 event = "persist.restore", subsystem = "persist", outcome = "missing",
@@ -111,7 +114,27 @@ pub fn load() -> Option<SessionSnapshot> {
         }
     };
     match parse_snapshot(&content) {
-        Ok(snapshot) => Some(snapshot),
+        Ok(mut snapshot) => {
+            if let crate::platform::SnapshotFileTrust::Untrusted(reason) = trust {
+                let mut refused = 0;
+                for workspace in &mut snapshot.workspaces {
+                    for tab in &mut workspace.tabs {
+                        for pane in tab.panes.values_mut() {
+                            refused += usize::from(pane.cold_restore_argv);
+                            pane.cold_restore_argv = false;
+                        }
+                    }
+                }
+                if refused > 0 {
+                    warn!(
+                        event = "persist.restore", subsystem = "persist", outcome = "argv_trust_refused",
+                        path = %path.display(), reason, panes = refused,
+                        "refusing cold restore argv from untrusted snapshot"
+                    );
+                }
+            }
+            Some(snapshot)
+        }
         Err(err) => {
             if let Some(version) = snapshot_file_version(&content) {
                 if version > SNAPSHOT_VERSION {
@@ -217,6 +240,64 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn marked_snapshot() -> SessionSnapshot {
+        parse_snapshot(r#"{
+            "version":3, "workspaces":[{"identity_cwd":"/tmp","tabs":[{
+                "layout":{"Pane":0},"zoomed":false,"panes":{
+                    "0":{"cwd":"/tmp","label":"retained","launch_argv":["/program","secret argument"],"cold_restore_argv":true},
+                    "1":{"cwd":"/tmp","launch_argv":["/other"],"cold_restore_argv":true}
+                }
+            }]}], "active":0,"selected":0
+        }"#).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cold_restore_file_trust_strips_marks_before_private_autosave() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for mode in [0o600, 0o644, 0o620, 0o602, 0o666] {
+            let path = temp_session_path("argv-trust");
+            save_to_path(&path, &marked_snapshot()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let loaded = load_from_path(&path).unwrap();
+            let panes = &loaded.workspaces[0].tabs[0].panes;
+            let trusted = mode & 0o022 == 0;
+            assert!(panes.values().all(|pane| pane.cold_restore_argv == trusted));
+            assert_eq!(panes[&0].label.as_deref(), Some("retained"));
+            assert_eq!(
+                panes[&0].launch_argv.as_ref().unwrap()[1],
+                "secret argument"
+            );
+            // Authorization must not repair the original mode before deciding.
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            save_to_path(&path, &loaded).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(load_from_path(&path).unwrap().workspaces[0].tabs[0]
+                .panes
+                .values()
+                .all(|pane| pane.cold_restore_argv == trusted));
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cold_restore_windows_disk_marks_fail_closed() {
+        let path = temp_session_path("argv-trust-windows");
+        save_to_path(&path, &marked_snapshot()).unwrap();
+        assert!(load_from_path(&path).unwrap().workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| !pane.cold_restore_argv));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

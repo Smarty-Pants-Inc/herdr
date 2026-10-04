@@ -36,6 +36,12 @@ fn monitor_host_shutdown(
     None
 }
 
+/// Provenance of the opened snapshot object, not a serialized assertion.
+pub(crate) enum SnapshotFileTrust {
+    Trusted,
+    Untrusted(&'static str),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,

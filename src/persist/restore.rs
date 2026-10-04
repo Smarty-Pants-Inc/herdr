@@ -34,8 +34,15 @@ struct PaneRestoreStartup<'a> {
     reserved_agent_session: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreKind {
+    ColdStart,
+    LiveHandoff,
+}
+
 struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
+    kind: RestoreKind,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
     events: mpsc::Sender<AppEvent>,
@@ -207,6 +214,7 @@ fn restore_with_imports_strict(
         shell_config,
         resume_agents_on_restore,
         imported_panes,
+        RestoreKind::LiveHandoff,
         events,
         render_notify,
         render_dirty,
@@ -247,6 +255,7 @@ fn restore_with_imports(
         shell_config,
         resume_agents_on_restore,
         imported_panes,
+        RestoreKind::ColdStart,
         events,
         render_notify,
         render_dirty,
@@ -254,6 +263,8 @@ fn restore_with_imports(
     .0
 }
 
+// Keep startup kind explicit alongside native-resume policy; mirrors the restore entrypoints.
+#[allow(clippy::too_many_arguments)]
 fn restore_with_imports_and_failures(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
@@ -263,6 +274,7 @@ fn restore_with_imports_and_failures(
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    kind: RestoreKind,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -283,6 +295,7 @@ fn restore_with_imports_and_failures(
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
+            kind,
             shell_config,
             resume_agents_on_restore,
             events: events.clone(),
@@ -455,6 +468,7 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        terminal.cold_restore_argv = pane.cold_restore_argv;
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -470,6 +484,53 @@ fn unavailable_restored_terminal(
         }
     }
     terminal
+}
+
+/// Disk load removes untrusted marks before this selection (including before autosave).
+fn cold_restore_argv(pane: Option<&super::snapshot::PaneSnapshot>) -> Option<&[String]> {
+    let pane = pane.filter(|pane| pane.cold_restore_argv)?;
+    let argv = pane.launch_argv.as_deref()?;
+    TerminalState::validate_cold_restore_argv(argv).ok()?;
+    Some(argv)
+}
+
+fn argv_after_native_restore_selection<'a>(
+    argv: Option<&'a [String]>,
+    startup: &PaneRestoreStartup<'_>,
+) -> Option<&'a [String]> {
+    if startup.restore_plan.is_some() || startup.duplicate_agent_session {
+        None
+    } else {
+        argv
+    }
+}
+
+// Mirrors the existing argv runtime constructor without injecting saved shell history.
+#[allow(clippy::too_many_arguments)]
+fn spawn_restored_argv(
+    pane_id: PaneId,
+    rows: u16,
+    cols: u16,
+    cwd: &std::path::Path,
+    argv: &[String],
+    launch_env: &PaneLaunchEnv,
+    context: &RestoreRuntimeContext<'_>,
+) -> std::io::Result<TerminalRuntime> {
+    TerminalRuntime::spawn_argv_command(
+        pane_id,
+        rows,
+        cols,
+        cwd.to_path_buf(),
+        argv,
+        launch_env,
+        crate::pane::AgentDetection::Enabled,
+        context.scrollback_limit_bytes,
+        crate::terminal_theme::TerminalTheme::default(),
+        None,
+        context.events.clone(),
+        context.render_notify.clone(),
+        context.render_dirty.clone(),
+    )
 }
 
 fn restored_worktree_space_membership(
@@ -533,6 +594,18 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        let saved_cold_restore_argv = saved_pane.is_some_and(|pane| pane.cold_restore_argv);
+        let replay_argv = cold_restore_argv(saved_pane);
+        if runtime_context.kind == RestoreKind::ColdStart
+            && saved_cold_restore_argv
+            && replay_argv.is_none()
+            && !has_import
+        {
+            warn!(
+                pane_id = id.raw(),
+                "refusing invalid cold restore argv; restoring plain shell"
+            );
+        }
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -543,6 +616,27 @@ fn restore_tab(
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
         };
+        // Native resume (including dedupe suppression) takes precedence over raw argv.
+        let replay_argv = argv_after_native_restore_selection(replay_argv, &startup);
+        // Capture includes state-only panes, but handoff exports only real runtime FDs.
+        // Missing imports are not permission to execute cold recipes before commit.
+        // Keep this after native selection so pending resume and dedupe stay unchanged.
+        let preserve_marked_pane_for_handoff = runtime_context.kind == RestoreKind::LiveHandoff
+            && !has_import
+            && saved_cold_restore_argv
+            && startup.restore_plan.is_none()
+            && !startup.duplicate_agent_session;
+        if preserve_marked_pane_for_handoff {
+            let terminal = unavailable_restored_terminal(
+                saved_pane,
+                cwd,
+                "Saved command is unavailable during live handoff preparation; the existing pane runtime was not imported."
+                    .into(),
+            );
+            panes.insert(*id, PaneState::new(terminal.id.clone()));
+            terminals.push(terminal);
+            continue;
+        }
         let restored_agent_session =
             restored_terminal_agent_session(saved_agent_session, startup.duplicate_agent_session);
         let initial_restore_agent = startup
@@ -578,6 +672,8 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.launch_argv = saved_launch_argv;
+            terminal.cold_restore_argv = saved_cold_restore_argv;
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -628,6 +724,8 @@ fn restore_tab(
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
                 )
+            } else if let Some(argv) = replay_argv {
+                spawn_restored_argv(*id, rows, cols, &cwd, argv, &launch_env, runtime_context)
             } else {
                 TerminalRuntime::spawn_with_initial_history(
                     *id,
@@ -647,7 +745,9 @@ fn restore_tab(
             }
 
             #[cfg(not(unix))]
-            {
+            if let Some(argv) = replay_argv {
+                spawn_restored_argv(*id, rows, cols, &cwd, argv, &launch_env, runtime_context)
+            } else {
                 TerminalRuntime::spawn_with_initial_history(
                     *id,
                     rows,
@@ -670,9 +770,13 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
-                if was_imported {
+                if was_imported || replay_argv.is_some() {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
+                        terminal.cold_restore_argv = saved_cold_restore_argv;
+                    }
+                    if !was_imported {
+                        tracing::info!(pane_id = id.raw(), "replayed cold restore argv");
                     }
                 }
                 if let Some(label) = saved_label {
@@ -722,17 +826,21 @@ fn restore_tab(
                         "failed to restore imported pane"
                     );
                 }
-                error!(
-                    tab = ?snap.custom_name,
-                    pane_id = id.raw(),
-                    err = %e,
-                    "failed to restore pane"
-                );
-                if !was_imported {
-                    let terminal = unavailable_restored_terminal(
-                        saved_pane, cwd,
-                        format!("Could not start the saved shell: {e}. Fix the shell configuration and restart this session."),
+                let reason = if replay_argv.is_some() {
+                    // Spawn errors can include executable paths: do not log recipe secrets.
+                    error!(pane_id = id.raw(), "failed to replay cold restore argv");
+                    "Could not start the saved argv command. Check its executable and saved directory, then restart this session.".to_string()
+                } else {
+                    error!(
+                        tab = ?snap.custom_name,
+                        pane_id = id.raw(),
+                        err = %e,
+                        "failed to restore pane"
                     );
+                    format!("Could not start the saved shell: {e}. Fix the shell configuration and restart this session.")
+                };
+                if !was_imported {
+                    let terminal = unavailable_restored_terminal(saved_pane, cwd, reason);
                     panes.insert(*id, PaneState::new(terminal.id.clone()));
                     terminals.push(terminal);
                 }
@@ -969,6 +1077,199 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_restore_argv_selection_requires_mark_and_valid_recipe() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.launch_argv = Some(vec![
+            "/absolute/program".into(),
+            "a b".into(),
+            "$(not shell)".into(),
+        ]);
+        assert!(cold_restore_argv(Some(pane)).is_none());
+        pane.cold_restore_argv = true;
+        assert_eq!(cold_restore_argv(Some(pane)).unwrap()[1], "a b");
+        for invalid in [
+            None,
+            Some(vec![]),
+            Some(vec![String::new()]),
+            Some(vec!["relative".into()]),
+            Some(vec!["/program".into(), "bad\0arg".into()]),
+        ] {
+            pane.launch_argv = invalid;
+            assert!(cold_restore_argv(Some(pane)).is_none());
+        }
+        assert!(cold_restore_argv(None).is_none());
+    }
+
+    #[test]
+    fn cold_restore_argv_native_resume_and_duplicate_take_precedence() {
+        let session = PaneAgentSessionSnapshot {
+            source: "herdr:opencode".into(),
+            agent: "opencode".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "session".into(),
+        };
+        let argv = vec!["/program".to_string()];
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let first = pane_restore_startup(Some(&session), None, &mut agent_restore);
+        assert!(first.restore_plan.is_some());
+        assert!(argv_after_native_restore_selection(Some(&argv), &first).is_none());
+        let duplicate = pane_restore_startup(Some(&session), None, &mut agent_restore);
+        assert!(duplicate.duplicate_agent_session);
+        assert!(argv_after_native_restore_selection(Some(&argv), &duplicate).is_none());
+        agent_restore.enabled = false;
+        let disabled = pane_restore_startup(Some(&session), None, &mut agent_restore);
+        assert!(argv_after_native_restore_selection(Some(&argv), &disabled).is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cold_restore_argv_runtime_and_failed_launch_preserve_intent() {
+        for (marked, argv, expected_replay, expected_error) in [
+            (true, vec!["/bin/cat".to_string()], true, false),
+            (false, vec!["/bin/cat".to_string()], false, false),
+            (true, vec!["relative".to_string()], false, false),
+            (
+                true,
+                vec!["/herdr-definitely-missing-executable".to_string()],
+                false,
+                true,
+            ),
+        ] {
+            let (mut snapshot, history) = snapshot_with_saved_pane_history();
+            let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+            pane.cold_restore_argv = marked;
+            pane.launch_argv = Some(argv.clone());
+            let (events, _rx) = mpsc::channel(128);
+            let (workspaces, terminals, runtimes) = restore(
+                &snapshot,
+                Some(&history),
+                24,
+                80,
+                1024 * 1024,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values().next().unwrap();
+            assert_eq!(terminal.restore_error.is_some(), expected_error);
+            if expected_replay || expected_error {
+                assert_eq!(terminal.launch_argv.as_ref(), Some(&argv));
+                assert!(terminal.cold_restore_argv);
+            } else {
+                assert!(terminal.launch_argv.is_none());
+                assert!(!terminal.cold_restore_argv);
+            }
+            if expected_error {
+                assert!(runtimes.is_empty());
+                assert_eq!(workspaces[0].tabs[0].panes.len(), 1);
+            }
+            if expected_replay {
+                assert!(!runtimes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .recent_unwrapped_text(20)
+                    .contains("RESTORED_HISTORY"));
+            }
+            let mut state = crate::app::AppState::test_new();
+            state.workspaces = workspaces;
+            state.terminals = terminals;
+            state.active = Some(0);
+            state.assert_invariants_for_test();
+            for runtime in runtimes.into_values() {
+                runtime.shutdown();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cold_restore_argv_direct_launch_keeps_argument_boundaries_and_literal_text() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.cold_restore_argv = true;
+        pane.launch_argv = Some(vec![
+            "/usr/bin/printf".into(),
+            "%s|%s|%s".into(),
+            "a b".into(),
+            "'quoted'".into(),
+            "$(echo NOT_EVALUATED)".into(),
+        ]);
+        let (events, _rx) = mpsc::channel(128);
+        let (_, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            100,
+            1024 * 1024,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        assert!(terminals.values().next().unwrap().cold_restore_argv);
+        let runtime = runtimes.values().next().unwrap();
+        let expected = "a b|'quoted'|$(echo NOT_EVALUATED)";
+        let mut observed = String::new();
+        for _ in 0..100 {
+            observed = runtime.recent_unwrapped_text(5);
+            if observed.contains(expected) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed.contains(expected),
+            "direct argv output: {observed:?}"
+        );
+        for runtime in runtimes.into_values() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_restore_argv_missing_cwd_keeps_pane_and_recipe() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.cwd = PathBuf::from("/herdr-definitely-missing-directory");
+        pane.launch_argv = Some(vec!["/absolute/program".into()]);
+        pane.cold_restore_argv = true;
+        let saved_argv = pane.launch_argv.clone();
+        let saved_cwd = pane.cwd.clone();
+        let (events, _rx) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        assert_eq!(workspaces[0].tabs[0].panes.len(), 1);
+        assert!(runtimes.is_empty());
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.cold_restore_argv);
+        assert_eq!(terminal.launch_argv, saved_argv);
+        assert_eq!(terminal.cwd, saved_cwd);
+        assert!(terminal.restore_error.is_some());
+    }
 
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
@@ -1338,6 +1639,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            cold_restore_argv: false,
                         },
                     )]),
                     zoomed: false,
@@ -1420,6 +1722,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                cold_restore_argv: false,
                             },
                         ),
                         (
@@ -1431,6 +1734,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                cold_restore_argv: false,
                             },
                         ),
                     ]),
@@ -1484,6 +1788,7 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    cold_restore_argv: false,
                 },
             )
         };
@@ -1499,6 +1804,7 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            cold_restore_argv: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1624,7 +1930,7 @@ mod tests {
     #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
         let cwd = std::env::current_dir().unwrap();
-        let snapshot = SessionSnapshot {
+        let mut snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
@@ -1653,6 +1959,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            cold_restore_argv: false,
                         },
                     )]),
                     zoomed: false,
@@ -1667,6 +1974,11 @@ mod tests {
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
         };
+        // Even a marked generic recipe must not override pending native resume
+        // during either cold startup or a state-only live handoff.
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.launch_argv = Some(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]);
+        pane.cold_restore_argv = true;
         let (events, _event_rx) = mpsc::channel(4);
 
         let (_workspaces, terminals, runtimes) = restore(
@@ -1723,6 +2035,48 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_without_runtime_preserves_marked_recipe() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap();
+        let cwd = pane.cwd.clone();
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ];
+        pane.launch_argv = Some(argv.clone());
+        pane.cold_restore_argv = true;
+        pane.label = Some("unavailable recipe".into());
+        let (_, terminals, runtimes) = restore_handoff(
+            &snapshot,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut HashMap::new(),
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .expect("state-only marked pane must not reject handoff");
+        assert!(
+            runtimes.is_empty(),
+            "handoff preparation must not execute saved argv or start a shell"
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert_eq!(terminal.cwd, cwd);
+        assert_eq!(terminal.launch_argv, Some(argv));
+        assert!(terminal.cold_restore_argv);
+        assert_eq!(terminal.manual_label.as_deref(), Some("unavailable recipe"));
+        assert!(terminal.restore_error.is_some());
+        assert!(terminal.pending_agent_resume_plan.is_none());
     }
 
     #[tokio::test]
@@ -1958,6 +2312,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                cold_restore_argv: false,
             },
         );
         let mut history = SessionHistorySnapshot {
