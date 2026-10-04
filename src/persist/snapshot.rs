@@ -1387,6 +1387,49 @@ mod tests {
     }
 
     #[test]
+    fn capture_contract_drops_resume_after_session_replacement() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("session-a"),
+                Some(1),
+                Some("new".into()),
+            )
+            .unwrap();
+        terminal.restore_reported_resume(crate::agent_resume::ReportedAgentResume {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            argv: vec!["pi".into(), "--resume".into(), "session-a".into()],
+        });
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("session-b"),
+                Some(2),
+                Some("new".into()),
+            )
+            .unwrap();
+
+        let snapshot = capture_from_state(&state);
+        let pane = &snapshot.workspaces[0].tabs[0].panes[&root.raw()];
+        assert!(pane.agent_resume.is_none());
+        assert_eq!(pane.agent_session.as_ref().unwrap().value, "session-b");
+    }
+
+    #[test]
     fn capture_contract_preserves_restored_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;

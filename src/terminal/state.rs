@@ -1673,6 +1673,9 @@ impl TerminalState {
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
                 let current_session = self.current_session_identity_for_persistence();
+                if previous_session != current_session {
+                    self.set_reported_resume(None);
+                }
                 return Some(TerminalStateMutation {
                     effective_state_change: self.recompute_effective_state(
                         previous_agent_label,
@@ -1790,6 +1793,9 @@ impl TerminalState {
         }
         self.persisted_agent_session = Some(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
+        if previous_session != current_session {
+            self.set_reported_resume(None);
+        }
         if previous_session.is_some() && previous_session != current_session {
             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
             self.agent_process_acquisition_pending = true;
@@ -3986,6 +3992,39 @@ mod tests {
 
         assert!(child_update.is_some());
         assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    #[test]
+    fn accepted_session_replacement_clears_the_previous_reported_resume() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::agent_resume::AgentSessionRef::id("session-a"),
+                Some(1),
+                Some("new".into()),
+            )
+            .expect("initial session");
+        terminal.restore_reported_resume(crate::agent_resume::ReportedAgentResume {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            argv: vec!["pi".into(), "--resume".into(), "session-a".into()],
+        });
+        let revision = terminal.reported_resume_revision();
+
+        let replacement = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            crate::agent_resume::AgentSessionRef::id("session-b"),
+            Some(2),
+            Some("new".into()),
+        );
+
+        assert!(replacement.is_some_and(|mutation| mutation.session_ref_changed));
+        assert!(terminal.reported_resume().is_none());
+        assert!(terminal.reported_resume_revision() > revision);
     }
 
     #[test]
