@@ -275,9 +275,7 @@ fn pane_scroll(
         let (base, target) = (previous(source), &next[y]);
         let mut x = 0;
         while x < width {
-            let Some(target_cell) = target.cell(x, &mut budget) else {
-                return None;
-            };
+            let target_cell = target.cell(x, &mut budget)?;
             if base[x] == *target_cell {
                 x += 1;
                 continue;
@@ -285,9 +283,7 @@ fn pane_scroll(
             let start = x;
             x += 1;
             while x < width {
-                let Some(target_cell) = target.cell(x, &mut budget) else {
-                    return None;
-                };
+                let target_cell = target.cell(x, &mut budget)?;
                 if base[x] == *target_cell {
                     break;
                 }

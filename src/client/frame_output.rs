@@ -183,6 +183,7 @@ fn kitty_graphics_image_commands(bytes: &[u8]) -> Vec<KittyGraphicsImageCommand>
     commands
 }
 
+#[cfg(test)]
 pub(super) fn kitty_graphics_image_ids(bytes: &[u8]) -> Vec<u32> {
     let mut ids = Vec::new();
     let mut index = 0usize;
