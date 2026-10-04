@@ -102,13 +102,31 @@ impl AppPolicy {
 }
 
 /// A separate API input log per test app, so tests do not share or pollute a real one.
+#[cfg(test)]
 fn test_api_input_log_path() -> std::path::PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "herdr-test-api-input-{}-{next}.jsonl",
-        std::process::id()
-    ))
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test log allocation clock")
+        .as_nanos();
+    reserve_test_api_input_log_path(&std::env::temp_dir(), std::process::id(), next, stamp)
+        .expect("reserve a fresh test API input log directory")
+}
+
+#[cfg(test)]
+fn reserve_test_api_input_log_path(
+    root: &std::path::Path,
+    pid: u32,
+    next: u64,
+    stamp: u128,
+) -> std::io::Result<std::path::PathBuf> {
+    // PIDs can be reused between nextest processes, each with a reset counter.
+    // Reserve an empty directory atomically; never reuse or delete a peer's path,
+    // even if the clock and PID repeat. The log itself must remain absent.
+    let dir = root.join(format!("herdr-test-api-input-{pid}-{stamp}-{next}"));
+    std::fs::create_dir(&dir)?;
+    Ok(dir.join("api-input.jsonl"))
 }
 
 pub struct App {
@@ -588,10 +606,15 @@ impl App {
 
         let mut app = Self {
             accepted_api_inputs: Vec::new(),
-            api_input_log: if cfg!(test) {
-                test_api_input_log_path()
-            } else {
-                api::input_log::default_api_input_log_path()
+            api_input_log: {
+                #[cfg(test)]
+                {
+                    test_api_input_log_path()
+                }
+                #[cfg(not(test))]
+                {
+                    api::input_log::default_api_input_log_path()
+                }
             },
             config_diagnostic_deadline: None,
             toast_deadline: None,
@@ -1047,6 +1070,102 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()))
+    }
+
+    #[test]
+    fn test_api_input_logs_isolate_reused_pids_and_reset_counters() {
+        let root = unique_temp_path("api-log-pid-reuse");
+        std::fs::create_dir(&root).unwrap();
+        let (pid, next) = (1234, 0);
+        // The old allocator returned this same file in every process with this PID.
+        let legacy_path =
+            |pid: u32, next: u64| root.join(format!("herdr-test-api-input-{pid}-{next}.jsonl"));
+        let stale = legacy_path(pid, next);
+        std::fs::write(&stale, b"prior process input\n").unwrap();
+        let reused = legacy_path(pid, 0);
+        assert_eq!(reused, stale);
+        assert!(reused.exists());
+
+        let first = reserve_test_api_input_log_path(&root, pid, next, 100).unwrap();
+        assert!(!first.exists());
+        std::fs::write(&first, b"first process input\n").unwrap();
+        let second = reserve_test_api_input_log_path(&root, pid, next, 101).unwrap();
+        assert_ne!(first, second);
+        assert!(!second.exists());
+        assert_eq!(std::fs::read(&first).unwrap(), b"first process input\n");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"prior process input\n");
+
+        // An exact collision is an allocation error, not permission to erase a peer.
+        let error = reserve_test_api_input_log_path(&root, pid, next, 100).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first process input\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_test_api_log_stays_absent_on_rejection_and_records_matched_input() {
+        use crate::api::schema::{ErrorResponse, ResponseResult, SuccessResponse};
+
+        let mut app = test_app();
+        assert!(!app.api_input_log.exists());
+        assert_ne!(
+            app.api_input_log,
+            api::input_log::default_api_input_log_path()
+        );
+        let root = app.api_input_log.parent().unwrap().to_path_buf();
+        let (pid, next) = (1234, 0);
+        let stale = root.join(format!("herdr-test-api-input-{pid}-{next}.jsonl"));
+        std::fs::write(&stale, b"old PID-counter log\n").unwrap();
+        let previous = reserve_test_api_input_log_path(&root, pid, next, 100).unwrap();
+        std::fs::write(&previous, b"previous allocation\n").unwrap();
+        app.api_input_log = reserve_test_api_input_log_path(&root, pid, next, 101).unwrap();
+        let workspace = Workspace::test_new("fresh-api-log");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminal_id_for_pane(0, pane).unwrap();
+        let public_pane = app.public_pane_id(0, pane).unwrap();
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        assert!(!app.api_input_log.exists());
+
+        let rejected = serde_json::from_value(serde_json::json!({
+            "id": "reject", "method": "pane.send_input_guarded",
+            "params": {"pane_id": public_pane, "expected_terminal": "term_unknown",
+                "text": "secret prompt", "keys": ["Enter"]},
+        }))
+        .unwrap();
+        let error: ErrorResponse = serde_json::from_str(&app.handle_api_request(rejected)).unwrap();
+        assert_eq!(error.error.code, "terminal_identity_mismatch");
+        assert!(rx.try_recv().is_err());
+        assert!(app.accepted_api_inputs.is_empty());
+        assert!(!app.api_input_log.exists());
+
+        let matched = serde_json::from_value(serde_json::json!({
+            "id": "match", "method": "pane.send_input_guarded",
+            "params": {"pane_id": public_pane, "expected_terminal": terminal.to_string(),
+                "text": "secret prompt", "keys": ["Enter"]},
+        }))
+        .unwrap();
+        let success: SuccessResponse =
+            serde_json::from_str(&app.handle_api_request(matched)).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"secret prompt\r")
+        );
+        assert_eq!(app.accepted_api_inputs, vec![pane]);
+        let raw = std::fs::read_to_string(&app.api_input_log).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        let record: serde_json::Value = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(record["method"], "pane.send_input");
+        assert_eq!(record["bytes"], 14);
+        assert_eq!(record["target_terminal"], terminal.to_string());
+        assert!(record["caller"]["pid"].is_null());
+        assert!(!raw.contains("secret prompt"));
+        assert_eq!(std::fs::read(&stale).unwrap(), b"old PID-counter log\n");
+        assert_eq!(std::fs::read(&previous).unwrap(), b"previous allocation\n");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
