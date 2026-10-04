@@ -1027,7 +1027,6 @@ mod tests {
     use crate::detect::{Agent, AgentState};
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::sync::Mutex;
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1050,10 +1049,6 @@ mod tests {
         std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()))
     }
 
-    fn config_env_lock() -> &'static Mutex<()> {
-        crate::config::test_config_env_lock()
-    }
-
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         let unique = format!(
             "herdr-{name}-{}-{}",
@@ -1064,14 +1059,6 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("config.toml")
-    }
-
-    fn restore_xdg_state_home(original: Option<std::ffi::OsString>) {
-        if let Some(value) = original {
-            std::env::set_var("XDG_STATE_HOME", value);
-        } else {
-            std::env::remove_var("XDG_STATE_HOME");
-        }
     }
 
     #[test]
@@ -1530,9 +1517,9 @@ mod tests {
 
     #[test]
     fn startup_restores_preview_update_available_from_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("startup-preview-update-available");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         // Use a bogus far-future version so preview=true regardless of current binary version.
         crate::release_notes::save_pending("99.99.99", "### Changed\n- One").unwrap();
@@ -1549,15 +1536,14 @@ mod tests {
             Some("99.99.99")
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn update_ready_refreshes_cached_release_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("update-ready-refreshes-release-notes");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
         let mut app = test_app();
         assert!(app.state.latest_release_notes.is_none());
 
@@ -1576,15 +1562,14 @@ mod tests {
             Some(("99.99.99", "### Changed\n- One", true))
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn release_notes_dismiss_api_marks_current_seen_but_keeps_preview_unseen() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("release-notes-dismiss-persistence");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let dismiss = |app: &mut App, version: &str| {
             let response = app.handle_api_request(crate::api::schema::Request {
@@ -1617,15 +1602,14 @@ mod tests {
         dismiss(&mut app, "99.99.99");
         assert_eq!(show_on_startup(), Some(true));
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn startup_does_not_restore_update_available_from_older_saved_notes() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("startup-stale-update-notes");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         crate::release_notes::save_pending("0.4.9", "### Changed\n- One").unwrap();
 
@@ -1634,15 +1618,14 @@ mod tests {
         assert_eq!(app.state.update_available, None);
         assert!(app.state.latest_release_notes_available);
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn startup_keeps_pending_release_notes_available_without_auto_opening() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
@@ -1663,18 +1646,16 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Navigate);
         assert!(app.state.latest_release_notes_available);
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn startup_loads_unseen_product_announcement_for_clients() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("startup-product-announcement-auto-open");
         let state_home = path.parent().unwrap().join("state");
-        let original_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
-        std::env::set_var("XDG_STATE_HOME", &state_home);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set("XDG_STATE_HOME", &state_home);
 
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
@@ -1711,14 +1692,12 @@ mod tests {
             Some("startup-announcement")
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
-        restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_updates_live_state() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-success");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -1726,7 +1705,7 @@ mod tests {
             "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[server]\nheadless_cols = 160\nheadless_rows = 50\n[ui]\nagent_panel_sort = \"priority\"\n[ui.toast]\ndelivery = \"herdr\"\n",
         )
         .unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         app.next_auto_update_check = Some(Instant::now());
@@ -1769,17 +1748,16 @@ mod tests {
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_keeps_kitty_graphics_until_restart() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-kitty-graphics");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[terminal]\nkitty_graphics = false\n").unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         assert!(app.state.kitty_graphics_enabled);
@@ -1796,7 +1774,6 @@ mod tests {
             ]
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -1822,11 +1799,11 @@ mod tests {
 
     #[test]
     fn reload_config_requests_client_reload_for_key_only_change() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-key-only");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[keys]\nprefix = \"ctrl+a\"\n").unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         app.state.request_client_config_reload = false;
@@ -1836,17 +1813,16 @@ mod tests {
         assert_eq!(app.state.prefix_code, KeyCode::Char('a'));
         assert!(app.state.request_client_config_reload);
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_requests_client_reload_for_host_cursor_only_change() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-host-cursor");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[ui]\nhost_cursor = \"native\"\n").unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         app.state.request_client_config_reload = false;
@@ -1860,16 +1836,15 @@ mod tests {
         );
         assert!(app.state.request_client_config_reload);
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_updates_sidebar_token_rows() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-sidebar-tokens");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
         let mut app = test_app();
 
         std::fs::write(
@@ -1934,16 +1909,15 @@ mod tests {
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(app.state.sidebar_agents, previous_agents);
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_invalid_sidebar_bounds_keeps_previous_ui_and_returns_partial() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-invalid-sidebar-bounds");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let original_pane_borders = app.state.pane_borders;
@@ -1971,13 +1945,12 @@ mod tests {
             Some("config.toml; herdr config check")
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_disables_invalid_binding_but_applies_valid_keymap_and_other_sections() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-invalid-keybind");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -1985,7 +1958,7 @@ mod tests {
             "[keys]\nnew_workspace = \"wat\"\n[ui.toast]\ndelivery = \"terminal\"\n",
         )
         .unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
@@ -2004,16 +1977,15 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Terminal
         );
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_applies_known_sibling_and_summarizes_unknown_key() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-unknown-key");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let target_pane_borders = crate::config::PaneBordersConfig::Always;
@@ -2036,13 +2008,12 @@ mod tests {
             Some("config.toml has unknown keys; herdr config check")
         );
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_user_binding_displaces_default_without_rejecting_prefix() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-user-binding-displaces-default");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2050,7 +2021,7 @@ mod tests {
             "[keys]\nprefix = \"ctrl+space\"\nprevious_workspace = \"prefix+shift+l\"\n",
         )
         .unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let report = app.reload_config();
@@ -2066,13 +2037,12 @@ mod tests {
         assert!(app.state.keybinds.swap_pane_right.bindings.is_empty());
         assert!(app.state.config_diagnostic.is_none());
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_preserves_invalid_ui_section_but_applies_valid_keys() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-invalid-ui-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2080,7 +2050,7 @@ mod tests {
             "[keys]\nnew_workspace = \"prefix+m\"\n[ui.toast]\ndelivery = \"desktop\"\n",
         )
         .unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
@@ -2100,13 +2070,12 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Herdr
         );
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn reload_config_preserves_invalid_terminal_section_but_applies_valid_ui() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-invalid-terminal-section");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -2114,7 +2083,7 @@ mod tests {
             "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"sideways\"\nnew_cwd = \"home\"\n[ui.toast]\ndelivery = \"terminal\"\n",
         )
         .unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let original_default_shell = app.state.default_shell.clone();
@@ -2134,16 +2103,15 @@ mod tests {
             app.state.toast_config.delivery,
             crate::config::ToastDelivery::Terminal
         );
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
     #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
-        let _guard = config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let path = temp_config_path("reload-config-invalid-toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[keys\nnew_workspace = \"g\"\n").unwrap();
-        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        env.set(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
         let original_prefix = (app.state.prefix_code, app.state.prefix_mods);
@@ -2167,7 +2135,6 @@ mod tests {
             }));
         assert!(app.state.toast.is_none());
 
-        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
     #[test]
@@ -2690,9 +2657,8 @@ mod tests {
 
     #[tokio::test]
     async fn pane_split_request_focuses_new_pane_when_requested() {
-        let _guard = config_env_lock().lock().unwrap();
-        let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", exiting_test_command());
+        let env = crate::environment::test_env();
+        env.set("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let mut workspace = Workspace::test_new("api-pane-split-focus-background-tab");
@@ -2732,17 +2698,12 @@ mod tests {
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
         }
-        match original_shell {
-            Some(value) => std::env::set_var("SHELL", value),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[tokio::test]
     async fn pane_split_request_applies_ratio() {
-        let _guard = config_env_lock().lock().unwrap();
-        let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", exiting_test_command());
+        let env = crate::environment::test_env();
+        env.set("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let workspace = Workspace::test_new("api-pane-split-ratio");
@@ -2788,17 +2749,12 @@ mod tests {
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
         }
-        match original_shell {
-            Some(value) => std::env::set_var("SHELL", value),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[tokio::test]
     async fn pane_split_request_uses_active_focused_pane_when_target_is_omitted() {
-        let _guard = config_env_lock().lock().unwrap();
-        let original_shell = std::env::var_os("SHELL");
-        std::env::set_var("SHELL", exiting_test_command());
+        let env = crate::environment::test_env();
+        env.set("SHELL", exiting_test_command());
 
         let mut app = test_app();
         let workspace = Workspace::test_new("api-pane-split-current");
@@ -2834,10 +2790,6 @@ mod tests {
         let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
-        }
-        match original_shell {
-            Some(value) => std::env::set_var("SHELL", value),
-            None => std::env::remove_var("SHELL"),
         }
     }
 
@@ -3091,11 +3043,60 @@ mod tests {
     }
 
     #[test]
+    fn session_writer_keeps_captured_path_while_plugin_config_scope_is_active() {
+        let env = crate::environment::test_env();
+        let config_home = unique_temp_path("session-plugin-path-overlap");
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.remove(crate::session::SESSION_ENV_VAR);
+        let session_path = crate::session::data_dir().join("session.json");
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces = vec![Workspace::test_new("captured-session")];
+        app.state.ensure_test_terminals();
+
+        let plugin_home = unique_temp_path("plugin-session-path-overlap");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let plugin_thread = std::thread::spawn({
+            let plugin_home = plugin_home.clone();
+            move || {
+                let _dirs =
+                    crate::config::test_config_dirs(&plugin_home, &plugin_home.join("state"));
+                crate::persist::plugin_registry::update(|_| ()).unwrap();
+                ready_tx.send(crate::config::config_dir()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        });
+        let plugin_dir = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(session_path.parent().unwrap(), plugin_dir.as_path());
+
+        // The plugin scope remains live throughout the asynchronous save.
+        // Its thread-local dirs cannot redirect the App's captured writer path,
+        // and the writer thread does not need to inherit the App's env scope.
+        app.start_background_session_save();
+        assert!(app.session_save_thread.is_some());
+        app.save_session_now();
+        release_tx.send(()).unwrap();
+        plugin_thread.join().unwrap();
+
+        let snapshot = crate::persist::load().expect("session should remain in its captured home");
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert!(session_path.exists());
+        assert!(plugin_dir.join("plugins.json").exists());
+        assert!(!plugin_dir.join("session.json").exists());
+        assert!(!session_path.parent().unwrap().join("plugins.json").exists());
+
+        app.policy.persist_session = false;
+        let _ = std::fs::remove_dir_all(config_home);
+        let _ = std::fs::remove_dir_all(plugin_home);
+    }
+
+    #[test]
     fn due_session_save_starts_background_writer() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_temp_path("background-session-save");
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.remove(crate::session::SESSION_ENV_VAR);
 
         let mut app = test_app();
         app.policy.persist_session = true;
@@ -3110,7 +3111,6 @@ mod tests {
         app.save_session_now();
         assert!(crate::session::data_dir().join("session.json").exists());
 
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(config_home);
     }
 
@@ -3157,10 +3157,10 @@ mod tests {
 
     #[tokio::test]
     async fn pane_exit_checkpoint_survives_automatic_workspace_creation_on_shutdown() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_temp_path("signaled-pane-session-checkpoint");
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.remove(crate::session::SESSION_ENV_VAR);
 
         let mut app = test_app();
         app.policy.persist_session = true;
@@ -3188,16 +3188,15 @@ mod tests {
         assert_eq!(snapshot.workspaces.len(), 1);
         assert_eq!(snapshot.workspaces[0].tabs[0].panes.len(), 2);
 
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]
     fn normal_autosave_replaces_a_signaled_exit_checkpoint() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_temp_path("signaled-pane-autosave");
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.remove(crate::session::SESSION_ENV_VAR);
 
         let mut app = test_app();
         app.policy.persist_session = true;
@@ -3221,16 +3220,15 @@ mod tests {
 
         assert!(crate::persist::load().is_none());
 
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]
     fn durable_mutation_after_pane_exit_checkpoint_wins_on_shutdown() {
-        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let config_home = unique_temp_path("pane-exit-newer-session-state");
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.set("XDG_CONFIG_HOME", &config_home);
+        env.remove(crate::session::SESSION_ENV_VAR);
 
         for another_interrupted_exit in [false, true] {
             let mut app = test_app();
@@ -3262,7 +3260,6 @@ mod tests {
             assert_eq!(snapshot.workspaces[0].custom_name.as_deref(), Some("newer"));
         }
 
-        std::env::remove_var("XDG_CONFIG_HOME");
         let _ = std::fs::remove_dir_all(config_home);
     }
 

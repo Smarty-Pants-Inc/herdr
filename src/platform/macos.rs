@@ -27,6 +27,9 @@ mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
 #[cfg(test)]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
+
+#[cfg(test)]
 mod config_file_tests;
 
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {

@@ -339,12 +339,28 @@ pub(crate) fn remote_private_temp_base() -> PathBuf {
 }
 
 pub(crate) fn remote_bridge_endpoint_path(readable_name: &str, short_name: &str) -> PathBuf {
-    let tmp = std::env::temp_dir();
-    let readable = tmp.join(readable_name);
+    remote_bridge_endpoint_path_for_temp_dir(readable_name, short_name, &std::env::temp_dir())
+}
+
+#[cfg(test)]
+pub(crate) fn remote_bridge_endpoint_path_in(
+    readable_name: &str,
+    short_name: &str,
+    temp_dir: &Path,
+) -> PathBuf {
+    remote_bridge_endpoint_path_for_temp_dir(readable_name, short_name, temp_dir)
+}
+
+fn remote_bridge_endpoint_path_for_temp_dir(
+    readable_name: &str,
+    short_name: &str,
+    temp_dir: &Path,
+) -> PathBuf {
+    let readable = temp_dir.join(readable_name);
     if fits_unix_socket_path(&readable) {
         return readable;
     }
-    let short = tmp.join(short_name);
+    let short = temp_dir.join(short_name);
     if fits_unix_socket_path(&short) {
         return short;
     }

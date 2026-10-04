@@ -3,6 +3,9 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+#[cfg(all(test, unix))]
+pub(crate) use super::unix_common::remote_bridge_endpoint_path_in;
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 
