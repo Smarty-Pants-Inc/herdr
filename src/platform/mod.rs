@@ -90,13 +90,16 @@ impl ChildExitReason {
 
 #[cfg(unix)]
 pub(crate) use unix_common::{
-    classify_child_exit, poll_fd_readable, process_identity_for_pty, process_in_pane_session,
-    read_fd, shared_ssh_control_path,
+    classify_child_exit, poll_fd_readable, process_identity_for_pty, read_fd,
+    shared_ssh_control_path,
 };
 
-/// Capture numeric process metadata only while the socket-bound original
-/// process generation is still live. The liveness primitive must refer to the
-/// original pidfd/audit token, never to a newly opened numeric PID.
+#[cfg(all(unix, test))]
+pub(crate) use unix_common::process_in_pane_session;
+
+/// Capture process metadata across two checks of the transport's liveness
+/// primitive (native pidfd/audit token, or connected socket for the older Linux
+/// credential fallback), never a newly opened numeric PID handle.
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn capture_bound_peer_identity(
     original_alive: impl Fn() -> bool,
@@ -109,24 +112,94 @@ fn capture_bound_peer_identity(
     original_alive().then_some(identity)
 }
 
+/// Whether checked pane membership validates ancestry itself, including the full
+/// chain to a process-tree root for a negative result. POSIX session membership
+/// does not cover detached descendants and needs a separate ancestor walk.
+pub(crate) fn checked_membership_covers_ancestry() -> bool {
+    #[cfg(test)]
+    if let Some(covers) = TEST_MEMBERSHIP_ANCESTRY.with(|value| value.get()) {
+        return covers;
+    }
+    cfg!(windows)
+}
+
 /// Identity-aware boundary around the numeric OS session observation.
 pub(crate) fn process_identity_in_pane_session(
     root: ProcessIdentity,
     peer: ProcessIdentity,
 ) -> Option<bool> {
-    observe_pane_session(root, peer, process_identity, process_in_pane_session)
+    #[cfg(test)]
+    if let Some(observation) = TEST_MEMBERSHIP.with(|value| value.get()) {
+        return observe_pane_session(root, peer, process_identity, |_, _| observation);
+    }
+    #[cfg(unix)]
+    return observe_pane_session(
+        root,
+        peer,
+        process_identity,
+        unix_common::process_in_pane_session_checked,
+    );
+    #[cfg(windows)]
+    return observe_pane_session(root, peer, process_identity, |_, _| {
+        windows::process_identity_in_pane_session_checked(root, peer)
+    });
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, peer);
+        None
+    }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MEMBERSHIP: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
+    static TEST_MEMBERSHIP_ANCESTRY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped OS-observation seam: still runs endpoint checks and the actual app guard.
+#[cfg(test)]
+pub(crate) fn with_checked_membership_for_test<T>(
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<Option<bool>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MEMBERSHIP.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_MEMBERSHIP.with(|value| value.replace(Some(observation))));
+    run()
+}
+
+/// Exercise the Windows complete-ancestry policy on any host, without bypassing
+/// endpoint validation or the real app guard. Observations remain explicitly scoped.
+#[cfg(test)]
+pub(crate) fn with_ancestry_membership_for_test<T>(
+    observation: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MEMBERSHIP_ANCESTRY.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_MEMBERSHIP_ANCESTRY.with(|value| value.replace(Some(true))));
+    with_checked_membership_for_test(observation, run)
+}
+
+#[cfg(any(unix, windows, test))]
 fn observe_pane_session(
     root: ProcessIdentity,
     peer: ProcessIdentity,
     identity_of: impl Fn(u32) -> Option<ProcessIdentity>,
-    membership: impl FnOnce(u32, u32) -> bool,
+    membership: impl FnOnce(u32, u32) -> Option<bool>,
 ) -> Option<bool> {
     if identity_of(peer.pid) != Some(peer) || identity_of(root.pid) != Some(root) {
         return None;
     }
-    let belongs = membership(root.pid, peer.pid);
+    let belongs = membership(root.pid, peer.pid)?;
     // The OS observation reopens numeric PIDs. Never accept its answer for a
     // replacement instance, including a successful hit that ends the ancestor walk.
     (identity_of(peer.pid) == Some(peer) && identity_of(root.pid) == Some(root)).then_some(belongs)
@@ -227,13 +300,34 @@ mod membership_identity_tests {
                         },
                         |_, _| {
                             current.set(replacement);
-                            true
+                            Some(true)
                         },
                     ),
                     None
                 );
             }
         }
+    }
+
+    #[test]
+    fn failed_session_observation_is_not_a_negative_match() {
+        let peer = ProcessIdentity {
+            pid: 200,
+            start_time: 20,
+        };
+        let root = ProcessIdentity {
+            pid: 100,
+            start_time: 10,
+        };
+        assert_eq!(
+            observe_pane_session(
+                root,
+                peer,
+                |pid| Some(if pid == root.pid { root } else { peer }),
+                |_, _| None
+            ),
+            None
+        );
     }
 
     #[test]
@@ -256,7 +350,7 @@ mod membership_identity_tests {
                     } else {
                         Some(peer)
                     },
-                    |_, _| belongs
+                    |_, _| Some(belongs)
                 ),
                 Some(belongs)
             );
@@ -395,18 +489,12 @@ mod membership_identity_tests {
                         start_time: 30,
                         ..peer
                     }));
-                    true
+                    Some(true)
                 },
             ),
             None
         );
     }
-}
-
-/// Whether `pid` belongs to the process tree of the pane child `child_pid`.
-#[cfg(not(unix))]
-pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
-    child_pid == pid || session_processes(child_pid).contains(&pid)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -507,8 +595,9 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
-/// Capture the original process instance bound to a connected local transport.
-/// A platform lacking a provable instance binding deliberately returns None.
+/// Capture a process instance once at local-transport acceptance. Linux prefers
+/// a native socket-bound pidfd and falls back to connected-socket SO_PEERCRED plus
+/// a start-time pin. Missing/invalid evidence remains None and policy refuses it.
 #[cfg(unix)]
 pub(crate) fn local_socket_peer_identity(fd: std::os::fd::RawFd) -> Option<ProcessIdentity> {
     #[cfg(target_os = "linux")]

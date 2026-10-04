@@ -2393,6 +2393,73 @@ pub(crate) fn process_identity(pid: u32) -> Option<crate::platform::ProcessIdent
     })
 }
 
+/// Checked Windows ancestry membership for the identity-aware attribution path.
+///
+/// `Toolhelp32` reports numeric parent PIDs, so every edge is checked against the
+/// process creation times captured from the same snapshot and against live process
+/// identities before the walk advances. An exited, reused, younger, or otherwise
+/// unobservable intermediate process is `None` (unknown), never a negative match.
+pub(crate) fn process_identity_in_pane_session_checked(
+    root: crate::platform::ProcessIdentity,
+    peer: crate::platform::ProcessIdentity,
+) -> Option<bool> {
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    checked_membership_from_snapshot(&snapshot, root, peer, process_identity)
+}
+
+#[cfg(test)]
+pub(crate) fn test_reused_intermediate_parent_membership() -> Option<bool> {
+    tests::reused_intermediate_parent_membership()
+}
+
+fn checked_membership_from_snapshot(
+    snapshot: &ProcessSnapshot,
+    root: crate::platform::ProcessIdentity,
+    peer: crate::platform::ProcessIdentity,
+    identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
+) -> Option<bool> {
+    if identity_of(root.pid) != Some(root) || identity_of(peer.pid) != Some(peer) {
+        return None;
+    }
+    let root_entry = snapshot.entry(root.pid)?;
+    if root_entry.command().creation_time? != root.start_time {
+        return None;
+    }
+
+    let mut current = peer;
+    let mut visited = HashSet::new();
+    while visited.insert(current.pid) {
+        let entry = snapshot.entry(current.pid)?;
+        let current_start = entry.command().creation_time?;
+        if current.start_time != current_start || identity_of(current.pid) != Some(current) {
+            return None;
+        }
+        if current.pid == root.pid {
+            return Some(true);
+        }
+
+        let parent_pid = entry.parent_pid;
+        if parent_pid == 0 {
+            return Some(false);
+        }
+        let parent_entry = snapshot.entry(parent_pid)?;
+        let parent_start = parent_entry.command().creation_time?;
+        if parent_start > current_start {
+            return None;
+        }
+        let parent = identity_of(parent_pid)?;
+        if parent.start_time != parent_start
+            || identity_of(current.pid) != Some(current)
+            || identity_of(parent.pid) != Some(parent)
+        {
+            return None;
+        }
+        current = parent;
+    }
+
+    None
+}
+
 pub(crate) fn parent_process_identity(
     _identity: crate::platform::ProcessIdentity,
 ) -> Option<crate::platform::ProcessIdentity> {
@@ -3118,6 +3185,7 @@ impl Drop for InputSourceRestore {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs,
         process::{Command, Stdio},
         sync::Arc,
@@ -3128,6 +3196,142 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    pub(super) fn reused_intermediate_parent_membership() -> Option<bool> {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(20, 10, "helper.exe", &["helper.exe"], Some(20)),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 10,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let parent_reads = Cell::new(0);
+        super::checked_membership_from_snapshot(&snapshot, root, peer, |pid| match pid {
+            10 => Some(root),
+            30 => Some(peer),
+            20 => {
+                let reads = parent_reads.get();
+                parent_reads.set(reads + 1);
+                Some(crate::platform::ProcessIdentity {
+                    pid,
+                    start_time: if reads == 0 { 20 } else { 40 },
+                })
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn checked_windows_membership_rejects_reused_intermediate_parent() {
+        assert_eq!(
+            reused_intermediate_parent_membership(),
+            None,
+            "a reused intermediate PID is unknown"
+        );
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(20, 10, "helper.exe", &["helper.exe"], Some(20)),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 10,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let valid = super::checked_membership_from_snapshot(&snapshot, root, peer, |pid| {
+            Some(crate::platform::ProcessIdentity {
+                pid,
+                start_time: u64::from(pid),
+            })
+        });
+        assert_eq!(valid, Some(true));
+        let younger_parent = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 0, "shell.exe", &["shell.exe"], Some(10)),
+            test_entry_with_creation_time(
+                20,
+                10,
+                "replacement.exe",
+                &["replacement.exe"],
+                Some(40),
+            ),
+            test_entry_with_creation_time(30, 20, "agent.exe", &["agent.exe"], Some(30)),
+        ]);
+        assert_eq!(
+            super::checked_membership_from_snapshot(&younger_parent, root, peer, |pid| {
+                Some(crate::platform::ProcessIdentity {
+                    pid,
+                    start_time: if pid == 20 { 40 } else { u64::from(pid) },
+                })
+            }),
+            None,
+            "a parent created after its child is unknown"
+        );
+    }
+
+    #[test]
+    fn checked_windows_negative_membership_requires_complete_chain_to_parent_zero() {
+        let root = crate::platform::ProcessIdentity {
+            pid: 10,
+            start_time: 10,
+        };
+        let peer = crate::platform::ProcessIdentity {
+            pid: 30,
+            start_time: 30,
+        };
+        let entries = |parent_start| {
+            vec![
+                test_entry_with_creation_time(10, 0, "pane.exe", &["pane.exe"], Some(10)),
+                test_entry_with_creation_time(20, 0, "outside.exe", &["outside.exe"], parent_start),
+                test_entry_with_creation_time(30, 20, "shell.exe", &["shell.exe"], Some(30)),
+            ]
+        };
+        let identity = |pid| {
+            Some(crate::platform::ProcessIdentity {
+                pid,
+                start_time: u64::from(pid),
+            })
+        };
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &super::ProcessSnapshot::new(entries(Some(20))),
+                root,
+                peer,
+                identity
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &super::ProcessSnapshot::new(entries(None)),
+                root,
+                peer,
+                identity
+            ),
+            None,
+            "an inaccessible tree root cannot prove negative membership"
+        );
+        let mut missing_parent = entries(Some(20));
+        missing_parent.retain(|entry| entry.pid != 20);
+        assert_eq!(
+            super::checked_membership_from_snapshot(
+                &super::ProcessSnapshot::new(missing_parent),
+                root,
+                peer,
+                identity
+            ),
+            None,
+            "an exited intermediate ancestor cannot prove negative membership"
+        );
+    }
 
     #[test]
     fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {

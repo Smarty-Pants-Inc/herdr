@@ -29,6 +29,14 @@ pub(crate) enum TerminalTargetError {
     },
 }
 
+/// Failed evidence is not proof that a caller is ordinary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InputOrigin {
+    Ordinary,
+    Agent(TerminalTarget),
+    Unknown,
+}
+
 impl App {
     /// Compare only opaque identities, never pane positions or agent names. The caller
     /// holds server ownership through the effect and uses the checked terminal directly.
@@ -195,15 +203,27 @@ impl App {
         })
     }
 
-    /// Maps a locally attributed process to the managed agent terminal that owns
-    /// its session. Missing runtime state or process inspection intentionally
-    /// yields no match so callers retain normal compatibility behavior.
+    /// Test convenience lookup for a positively identified agent.
+    #[cfg(test)]
     pub(crate) fn agent_terminal_target_for_peer_identity(
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> Option<TerminalTarget> {
-        let target = self.pane_target_for_peer_identity(peer_identity)?;
-        self.target_is_agent(&target).then_some(target)
+        match self.input_origin_for_peer_identity(peer_identity) {
+            InputOrigin::Agent(target) => Some(target),
+            InputOrigin::Ordinary | InputOrigin::Unknown => None,
+        }
+    }
+
+    pub(crate) fn input_origin_for_peer_identity(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+    ) -> InputOrigin {
+        match self.checked_pane_target_for_peer_identity(peer_identity) {
+            Ok(Some(target)) if self.target_is_agent(&target) => InputOrigin::Agent(target),
+            Ok(_) => InputOrigin::Ordinary,
+            Err(()) => InputOrigin::Unknown,
+        }
     }
 
     /// Maps a locally attributed process to the one pane whose session it runs in,
@@ -217,6 +237,16 @@ impl App {
         &self,
         peer_identity: crate::platform::ProcessIdentity,
     ) -> Option<TerminalTarget> {
+        self.checked_pane_target_for_peer_identity(peer_identity)
+            .ok()
+            .flatten()
+    }
+
+    fn checked_pane_target_for_peer_identity(
+        &self,
+        peer_identity: crate::platform::ProcessIdentity,
+    ) -> Result<Option<TerminalTarget>, ()> {
+        let mut missing_root = false;
         let panes: Vec<(TerminalTarget, crate::platform::ProcessIdentity)> = self
             .terminal_targets()
             .into_iter()
@@ -228,38 +258,62 @@ impl App {
                         target.ws_idx,
                         target.pane_id,
                     )
-                    .and_then(crate::terminal::TerminalRuntime::child_process_identity)?;
+                    .and_then(crate::terminal::TerminalRuntime::child_process_identity);
+                let Some(child_identity) = child_identity else {
+                    missing_root = true;
+                    return None;
+                };
                 Some((target, child_identity))
             })
             .collect();
-        find_in_ancestors(
-            peer_identity,
-            crate::platform::process_identity,
-            crate::platform::parent_process_identity,
-            |identity| {
-                let mut matched = None;
-                for (target, root) in &panes {
-                    let belongs =
-                        crate::platform::process_identity_in_pane_session(*root, identity)
-                            .ok_or(())?;
-                    if belongs {
-                        if matched.is_some() {
-                            return Ok(None);
-                        }
-                        matched = Some((target.clone(), *root));
+        let find = |identity| {
+            let mut matched = None;
+            for (target, root) in &panes {
+                let belongs =
+                    crate::platform::process_identity_in_pane_session(*root, identity).ok_or(())?;
+                if belongs {
+                    if matched.is_some() {
+                        return Err(());
                     }
+                    matched = Some((target.clone(), *root));
                 }
-                match matched {
-                    Some((target, root)) => {
-                        if crate::platform::process_identity(root.pid) != Some(root) {
-                            return Err(());
-                        }
-                        Ok(Some(target))
+            }
+            match matched {
+                Some((target, root)) => {
+                    if crate::platform::process_identity(root.pid) != Some(root) {
+                        return Err(());
                     }
-                    None => Ok(None),
+                    Ok(Some(target))
                 }
-            },
-        )
+                None => Ok(None),
+            }
+        };
+        let target = if crate::platform::checked_membership_covers_ancestry() {
+            // A checked ancestry membership result already covers detached descendants
+            // and a negative result proves a complete walk to the platform's root.
+            // Keep endpoint validation even when there are no observable pane roots.
+            if peer_identity.pid == 0
+                || crate::platform::process_identity(peer_identity.pid) != Some(peer_identity)
+            {
+                return Err(());
+            }
+            let target = find(peer_identity)?;
+            if crate::platform::process_identity(peer_identity.pid) != Some(peer_identity) {
+                return Err(());
+            }
+            target
+        } else {
+            find_in_ancestors(
+                peer_identity,
+                crate::platform::process_identity,
+                crate::platform::parent_process_identity,
+                find,
+            )?
+        };
+        if target.is_none() && missing_root {
+            return Err(());
+        }
+        Ok(target)
     }
 
     fn terminal_target_candidate(
@@ -295,33 +349,37 @@ fn find_in_ancestors<T>(
     identity_of: impl Fn(u32) -> Option<crate::platform::ProcessIdentity>,
     parent_of: impl Fn(crate::platform::ProcessIdentity) -> Option<crate::platform::ProcessIdentity>,
     mut found: impl FnMut(crate::platform::ProcessIdentity) -> Result<Option<T>, ()>,
-) -> Option<T> {
+) -> Result<Option<T>, ()> {
     let mut current = peer;
     for _ in 0..=MAX_ANCESTOR_DEPTH {
-        if current.pid <= 1
+        if current.pid == 0
             || identity_of(peer.pid) != Some(peer)
             || identity_of(current.pid) != Some(current)
         {
-            return None;
+            return Err(());
         }
-        let hit = found(current).ok()?;
+        let hit = found(current)?;
         if identity_of(peer.pid) != Some(peer) || identity_of(current.pid) != Some(current) {
-            return None;
+            return Err(());
         }
         if let Some(hit) = hit {
-            return Some(hit);
+            return Ok(Some(hit));
         }
-        let parent = parent_of(current)?;
+        // Only a validated walk to the process-tree root proves an out-of-pane caller.
+        if current.pid == 1 {
+            return Ok(None);
+        }
+        let parent = parent_of(current).ok_or(())?;
         if identity_of(peer.pid) != Some(peer)
             || identity_of(current.pid) != Some(current)
             || identity_of(parent.pid) != Some(parent)
             || parent.start_time > current.start_time
         {
-            return None;
+            return Err(());
         }
         current = parent;
     }
-    None
+    Err(())
 }
 
 #[cfg(test)]
@@ -348,6 +406,8 @@ mod tests {
                 })
             },
         )
+        .ok()
+        .flatten()
     }
 
     #[test]
@@ -385,7 +445,7 @@ mod tests {
                 |identity| (identity == caller).then_some(parent),
                 |identity| Ok((identity.pid == 100).then_some("reused")),
             ),
-            None
+            Err(())
         );
     }
 
@@ -429,7 +489,7 @@ mod tests {
                             }
                         }
                     ),
-                    None
+                    Err(())
                 );
             }
         }
@@ -471,7 +531,7 @@ mod tests {
                         },
                         |identity| Ok((identity == parent).then_some("replacement"))
                     ),
-                    None
+                    Err(())
                 );
             }
         }
@@ -498,7 +558,7 @@ mod tests {
                 |_| panic!("invalid membership must not resume at parent"),
                 |_| Err::<Option<&str>, ()>(())
             ),
-            None
+            Err(())
         );
     }
 

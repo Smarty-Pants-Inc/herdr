@@ -2543,7 +2543,8 @@ mod tests {
                     "ctrl+k".into(),
                     "ctrl+l".into(),
                 ],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2566,7 +2567,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+tab".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2930,7 +2932,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["C-c".into(), "c-c".into(), "ctrl+c".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2959,7 +2962,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["cmd+c".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -2982,7 +2986,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["+".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3012,7 +3017,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["shift+?".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3029,6 +3035,7 @@ mod tests {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
         let internal = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.terminal_id_for_pane(0, internal).unwrap();
+        // Each synthetic request opts in explicitly to isolate expected-terminal policy.
         for expected in ["", "not-a-terminal", "term_unknown", pane_id.as_str()] {
             for method in [
                 "pane.send_input",
@@ -3038,7 +3045,7 @@ mod tests {
             ] {
                 let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
                     "id": "guard-reject", "method": method,
-                    "params": {"pane_id": pane_id, "expected_terminal": expected,
+                    "params": {"pane_id": pane_id, "expected_terminal": expected, "allow_cross_pane": true,
                         "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
                 })).unwrap();
                 let response = app.handle_api_request(request);
@@ -3056,7 +3063,7 @@ mod tests {
         for method in ["pane.send_input", "agent.start"] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-missing-pane", "method": method,
-                "params": {"pane_id": "w999:p999", "expected_terminal": terminal_id.to_string(),
+                "params": {"pane_id": "w999:p999", "allow_cross_pane": true, "expected_terminal": terminal_id.to_string(),
                     "name": "worker", "kind": "pi", "text": "must not send"},
             }))
             .unwrap();
@@ -3067,7 +3074,7 @@ mod tests {
         for method in ["pane.send_input_guarded", "agent.start_guarded"] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-required", "method": method,
-                "params": {"pane_id": pane_id, "name": "worker", "kind": "pi", "text": "must not send"},
+                "params": {"pane_id": pane_id, "allow_cross_pane": true, "name": "worker", "kind": "pi", "text": "must not send"},
             })).unwrap();
             let error: ErrorResponse =
                 serde_json::from_str(&app.handle_api_request(request)).unwrap();
@@ -3081,6 +3088,7 @@ mod tests {
         let (mut app, pane_id, mut original_rx) = app_with_send_key_runtime(2);
         let root = app.state.workspaces[0].tabs[0].root_pane;
         let original_id = app.state.terminal_id_for_pane(0, root).unwrap();
+        // Explicit request opt-ins isolate attachment identity, not process attribution.
         let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.state.ensure_test_terminals();
         let replacement_id = app.state.terminal_id_for_pane(0, other).unwrap();
@@ -3108,7 +3116,7 @@ mod tests {
         ] {
             let request = serde_json::from_value(serde_json::json!({
                 "id": "guard-stale", "method": method,
-                "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+                "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": original_id.to_string(),
                     "name": "worker", "kind": "pi", "text": "must not send", "keys": ["Enter"]},
             }))
             .unwrap();
@@ -3123,7 +3131,7 @@ mod tests {
         }
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-match", "method": "pane.send_input_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": replacement_id.to_string(),
                 "text": "matched", "keys": ["Enter"]},
         }))
         .unwrap();
@@ -3137,7 +3145,7 @@ mod tests {
         assert!(original_rx.try_recv().is_err());
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-start-match", "method": "agent.start_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": replacement_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": replacement_id.to_string(),
                 "name": "worker", "kind": "pi"},
         }))
         .unwrap();
@@ -3157,7 +3165,7 @@ mod tests {
         // A pending launch and its reserved name must not mask a stale identity.
         let request = serde_json::from_value(serde_json::json!({
             "id": "guard-pending-stale", "method": "agent.start_guarded",
-            "params": {"pane_id": pane_id, "expected_terminal": original_id.to_string(),
+            "params": {"pane_id": pane_id, "allow_cross_pane": true, "expected_terminal": original_id.to_string(),
                 "name": "worker", "kind": "pi"},
         }))
         .unwrap();
@@ -3188,7 +3196,8 @@ mod tests {
                 text: "A != B".into(),
                 expected_terminal: None,
                 keys: vec!["Enter".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3212,7 +3221,8 @@ mod tests {
                 text: String::new(),
                 expected_terminal: None,
                 keys: vec!["ctrl+j".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3232,7 +3242,8 @@ mod tests {
             method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
                 pane_id,
                 keys: vec!["ctrl+h".into(), "not-a-key".into()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 
@@ -3254,7 +3265,8 @@ mod tests {
                 text: "hello".into(),
                 expected_terminal: None,
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
-                allow_cross_pane: false,
+                // Synthetic payload fixture explicitly opts out of origin policy.
+                allow_cross_pane: true,
             }),
         });
 

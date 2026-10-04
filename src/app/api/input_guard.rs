@@ -2,7 +2,7 @@ use super::responses::encode_error;
 use super::App;
 use crate::api::schema::{Method, Request};
 use crate::api::ApiRequestContext;
-use crate::app::terminal_targets::TerminalTarget;
+use crate::app::terminal_targets::{InputOrigin, TerminalTarget};
 
 impl App {
     // This is a policy guard, not caller authentication.
@@ -11,8 +11,6 @@ impl App {
         request: &Request,
         context: ApiRequestContext,
     ) -> Option<String> {
-        // Missing attribution retains the normal compatibility path.
-        let peer_identity = context.local_peer_identity?;
         // Decide from the method first: attribution walks every agent pane's session in
         // /proc, so doing it for each API request kept the server busy (smarty-dev#931).
         // Only a content write that does not allow cross-pane input needs it.
@@ -20,20 +18,24 @@ impl App {
             return None;
         }
         let target = self.content_write_target(&request.method)?;
-        let Some(source) = self.agent_terminal_target_for_peer_identity(peer_identity) else {
-            // PID attribution, managed runtime state, and session membership are all
-            // best-effort. Unknown, non-agent, and out-of-pane callers fail open.
-            return None;
+        let origin = context
+            .local_peer_identity
+            .map_or(InputOrigin::Unknown, |peer| {
+                self.input_origin_for_peer_identity(peer)
+            });
+        let (code, message) = match origin {
+            InputOrigin::Ordinary => return None,
+            InputOrigin::Agent(source) if source.terminal_id == target.terminal_id => return None,
+            InputOrigin::Agent(_) => (
+                "cross_pane_input_denied",
+                "agent-originated input cannot target a different pane",
+            ),
+            InputOrigin::Unknown => (
+                "input_origin_unknown",
+                "cannot validate input origin; retry from a live attributable caller or explicitly opt in with CLI --allow-cross-pane (API allow_cross_pane: true)",
+            ),
         };
-        if source.terminal_id == target.terminal_id {
-            return None;
-        }
-
-        Some(encode_error(
-            request.id.clone(),
-            "cross_pane_input_denied",
-            "agent-originated input cannot target a different pane",
-        ))
+        Some(encode_error(request.id.clone(), code, message))
     }
 
     fn allows_cross_pane(method: &Method) -> bool {
@@ -162,6 +164,11 @@ mod tests {
     fn assert_denied(response: &str) {
         let response: ErrorResponse = serde_json::from_str(response).expect("denial response");
         assert_eq!(response.error.code, "cross_pane_input_denied");
+    }
+
+    fn assert_unknown(response: &str) {
+        let response: ErrorResponse = serde_json::from_str(response).expect("unknown response");
+        assert_eq!(response.error.code, "input_origin_unknown");
     }
 
     fn assert_ok(response: &str) {
@@ -322,7 +329,7 @@ mod tests {
             if expected.is_some() {
                 assert_denied(&denial.expect("imported guard applies"));
             } else {
-                assert!(denial.is_none(), "unprovable import remains unattributed");
+                assert_unknown(&denial.expect("unprovable import refuses input"));
             }
             if let Some(repeated_runtime) = repeat_runtime {
                 fixture
@@ -337,18 +344,22 @@ mod tests {
                         allow_cross_pane: false,
                     }),
                 };
-                assert!(fixture
-                    .app
-                    .cross_pane_input_denial(&repeated_request, context)
-                    .is_none());
+                assert_unknown(
+                    &fixture
+                        .app
+                        .cross_pane_input_denial(&repeated_request, context)
+                        .expect("rejected reimport refuses input"),
+                );
             }
             if let Method::PaneSendText(params) = &mut request.method {
                 params.pane_id = fixture.source_pane_id.clone();
             }
-            assert!(fixture
-                .app
-                .cross_pane_input_denial(&request, context)
-                .is_none());
+            let own_denial = fixture.app.cross_pane_input_denial(&request, context);
+            if expected.is_some() {
+                assert!(own_denial.is_none());
+            } else {
+                assert_unknown(&own_denial.expect("unproven own pane is also protected"));
+            }
             request.method = Method::AgentPrompt(AgentPromptParams {
                 target: "target-agent".into(),
                 text: "explicit".into(),
@@ -544,6 +555,14 @@ mod tests {
             })
             .collect();
         for (index, method) in methods.into_iter().chain(guarded_methods).enumerate() {
+            let unknown_response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: format!("unknown-origin-{index}"),
+                    method: method.clone(),
+                },
+                ApiRequestContext::default(),
+            );
+            assert_unknown(&unknown_response);
             let response = fixture.app.handle_api_request_with_context(
                 Request {
                     id: format!("cross-pane-{index}"),
@@ -652,18 +671,13 @@ mod tests {
                 local_peer_identity: Some(stale),
             },
         );
-        assert_ok(&response);
-        assert_eq!(
-            fixture
-                .target_rx
-                .try_recv()
-                .expect("compatibility delivery"),
-            Bytes::from_static(b"unattributed")
-        );
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert!(fixture.source_rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn unknown_non_agent_and_out_of_pane_origins_remain_compatible() {
+    async fn unknown_origins_are_refused_but_known_ordinary_shell_is_allowed() {
         let mut fixture = attributed_agent_fixture();
         for (id, context) in [
             ("unknown", ApiRequestContext::default()),
@@ -683,14 +697,9 @@ mod tests {
                 },
                 context,
             );
-            assert_ok(&response);
-            assert_eq!(
-                fixture
-                    .target_rx
-                    .try_recv()
-                    .expect("compatible input bytes"),
-                Bytes::from(id)
-            );
+            assert_unknown(&response);
+            assert!(fixture.target_rx.try_recv().is_err());
+            assert!(fixture.source_rx.try_recv().is_err());
         }
 
         let (_, source_pane) = fixture
@@ -726,6 +735,455 @@ mod tests {
             fixture.target_rx.try_recv().expect("non-agent input bytes"),
             Bytes::from_static(b"non-agent")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_checked_membership_is_unknown_in_actual_guard() {
+        let mut fixture = attributed_agent_fixture();
+        let request = Request {
+            id: "invalid-membership".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "refused".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let response = crate::platform::with_checked_membership_for_test(None, || {
+            fixture
+                .app
+                .handle_api_request_with_context(request, attributed_context())
+        });
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_ancestry_negative_membership_allows_ordinary_shell_in_actual_guard() {
+        let mut fixture = attributed_agent_fixture();
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target pane");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(std::process::id());
+        let request = Request {
+            id: "complete-ancestry-outside".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "ordinary".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let context = attributed_context();
+        // Simulate the checked Windows observer's complete negative answer, not
+        // native Windows process behavior. Both real endpoint pins still validate.
+        let response = crate::platform::with_ancestry_membership_for_test(Some(false), || {
+            assert_eq!(
+                fixture
+                    .app
+                    .input_origin_for_peer_identity(context.local_peer_identity.expect("peer")),
+                InputOrigin::Ordinary
+            );
+            fixture
+                .app
+                .handle_api_request_with_context(request.clone(), context)
+        });
+        assert_ok(&response);
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("ordinary shell bytes"),
+            Bytes::from_static(b"ordinary")
+        );
+        assert!(fixture.source_rx.try_recv().is_err());
+
+        // Incomplete/reused-edge observation is not a negative membership answer.
+        let response = crate::platform::with_ancestry_membership_for_test(None, || {
+            fixture
+                .app
+                .handle_api_request_with_context(request.clone(), context)
+        });
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(0);
+        let response = crate::platform::with_ancestry_membership_for_test(Some(false), || {
+            fixture
+                .app
+                .handle_api_request_with_context(request, context)
+        });
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    struct WindowsRealChild {
+        child: std::process::Child,
+        pid: u32,
+        request_line: String,
+    }
+
+    #[cfg(windows)]
+    impl WindowsRealChild {
+        fn spawn(request: &str) -> Self {
+            use std::io::BufRead;
+            use std::process::{Command, Stdio};
+
+            let child = Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$p=$PID; [Console]::Out.WriteLine('{\"pid\":'+$p+'}'); [Console]::Out.WriteLine($env:HERDR_GUARD_TEST_REQUEST); [Console]::Out.Flush(); Start-Sleep -Seconds 60",
+                ])
+                .env("HERDR_GUARD_TEST_REQUEST", request)
+                // Retain the owned stdin pipe alongside the live child handle.
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn real Windows helper child");
+            // Install cleanup before reading/asserting anything about the child.
+            let mut owned = Self {
+                pid: child.id(),
+                child,
+                request_line: String::new(),
+            };
+            let pid = {
+                let stdout = owned.child.stdout.as_mut().expect("helper stdout");
+                let mut reader = std::io::BufReader::new(stdout);
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read helper identity");
+                reader
+                    .read_line(&mut owned.request_line)
+                    .expect("read child JSON request");
+                serde_json::from_str::<serde_json::Value>(&line)
+                    .expect("helper identity JSON")
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .expect("helper PID")
+            };
+            assert_eq!(owned.pid, pid, "stdout PID must be the spawned child");
+            assert_eq!(
+                crate::platform::process_identity(pid).map(|identity| identity.pid),
+                Some(pid)
+            );
+            owned
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsRealChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_non_pane_windows_child_uses_os_identity_in_actual_guard() {
+        let mut fixture = attributed_agent_fixture();
+        let source_root = WindowsRealChild::spawn("{}");
+        let target_root = WindowsRealChild::spawn("{}");
+        let (_, source_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.source_pane_id)
+            .expect("source pane");
+        let (_, target_pane) = fixture
+            .app
+            .parse_pane_id(&fixture.target_pane_id)
+            .expect("target pane");
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, source_pane)
+            .expect("source runtime")
+            .test_set_child_pid(source_root.pid);
+        fixture
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, target_pane)
+            .expect("target runtime")
+            .test_set_child_pid(target_root.pid);
+
+        let request = Request {
+            id: "windows-real-non-pane-child".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "windows real child".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let mut caller = WindowsRealChild::spawn(
+            &serde_json::to_string(&request).expect("serialize child request"),
+        );
+        let request: Request =
+            serde_json::from_str(&caller.request_line).expect("parse child's JSON request");
+        let context = ApiRequestContext::for_local_peer_pid(Some(caller.pid));
+        let peer = context
+            .local_peer_identity
+            .expect("live OS caller identity");
+        assert_ne!(peer.pid, source_root.pid);
+        assert_ne!(peer.pid, target_root.pid);
+        assert!(caller
+            .child
+            .try_wait()
+            .expect("check caller liveness")
+            .is_none());
+        let response = fixture
+            .app
+            .handle_api_request_with_context(request.clone(), context);
+        let origin = fixture
+            .app
+            .input_origin_for_peer_identity(context.local_peer_identity.expect("caller identity"));
+        assert!(
+            !matches!(origin, InputOrigin::Agent(_)),
+            "real sibling caller was wrongly attributed to a managed pane: {origin:?}"
+        );
+        if matches!(origin, InputOrigin::Unknown) {
+            assert_unknown(&response);
+            assert!(response.contains("--allow-cross-pane"));
+            assert!(fixture.target_rx.try_recv().is_err());
+        } else {
+            assert_ok(&response);
+            assert_eq!(
+                fixture.target_rx.try_recv().expect("ordinary child bytes"),
+                Bytes::from_static(b"windows real child")
+            );
+        }
+        assert!(fixture.source_rx.try_recv().is_err());
+
+        let explicit = match request.method {
+            Method::PaneSendText(mut params) => {
+                params.allow_cross_pane = true;
+                Request {
+                    id: "windows-real-non-pane-child-opt-in".into(),
+                    method: Method::PaneSendText(params),
+                }
+            }
+            _ => unreachable!("fixed test request method"),
+        };
+        let response = fixture
+            .app
+            .handle_api_request_with_context(explicit, context);
+        assert_ok(&response);
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("explicit opt-in bytes"),
+            Bytes::from_static(b"windows real child")
+        );
+        assert!(fixture.source_rx.try_recv().is_err());
+
+        // Keep all three owned helpers alive until both normal dispatches have
+        // completed; their identities were captured from their live OS processes.
+        assert_eq!(crate::platform::process_identity(peer.pid), Some(peer));
+        assert!(caller
+            .child
+            .try_wait()
+            .expect("caller still alive")
+            .is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reused_windows_intermediate_parent_is_unknown_in_actual_guard() {
+        let mut fixture = attributed_agent_fixture();
+        let observation = crate::platform::test_reused_intermediate_parent_membership();
+        assert_eq!(observation, None);
+        let request = Request {
+            id: "reused-windows-parent".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "refused".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        let response = crate::platform::with_checked_membership_for_test(observation, || {
+            fixture
+                .app
+                .handle_api_request_with_context(request, attributed_context())
+        });
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        assert!(fixture.source_rx.try_recv().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unsupported_pidfd_uses_accept_time_pin_through_actual_guard() {
+        use std::os::fd::AsRawFd;
+        let mut fixture = attributed_agent_fixture();
+        let (server, client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let context = ApiRequestContext {
+            local_peer_identity: crate::platform::local_socket_peer_identity_without_pidfd(
+                server.as_raw_fd(),
+            ),
+        };
+        assert_eq!(
+            context.local_peer_identity,
+            attributed_context().local_peer_identity
+        );
+        assert!(context.local_peer_identity.is_some());
+        for (pane, opt_in, permitted) in [
+            (fixture.target_pane_id.clone(), false, false),
+            (fixture.source_pane_id.clone(), false, true),
+            (fixture.target_pane_id.clone(), true, true),
+        ] {
+            let response = fixture.app.handle_api_request_with_context(
+                Request {
+                    id: "fallback".into(),
+                    method: Method::PaneSendText(PaneSendTextParams {
+                        pane_id: pane.clone(),
+                        text: "fallback".into(),
+                        allow_cross_pane: opt_in,
+                    }),
+                },
+                context,
+            );
+            if permitted {
+                assert_ok(&response);
+                let rx = if pane == fixture.source_pane_id {
+                    &mut fixture.source_rx
+                } else {
+                    &mut fixture.target_rx
+                };
+                assert_eq!(
+                    rx.try_recv().expect("approved delivery"),
+                    Bytes::from_static(b"fallback")
+                );
+            } else {
+                assert_denied(&response);
+                assert!(fixture.target_rx.try_recv().is_err());
+            }
+        }
+        drop(client);
+        let missing = ApiRequestContext {
+            local_peer_identity: crate::platform::local_socket_peer_identity_without_pidfd(
+                server.as_raw_fd(),
+            ),
+        };
+        assert_eq!(missing.local_peer_identity, None);
+        let response = fixture.app.handle_api_request_with_context(
+            Request {
+                id: "unsupported-and-disconnected".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "refused".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            missing,
+        );
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn captured_peer_exit_before_queued_dispatch_refuses_input() {
+        let mut fixture = attributed_agent_fixture();
+        let mut child = detached_sleep_child();
+        let context = ApiRequestContext::for_local_peer_pid(Some(child.id()));
+        assert!(context.local_peer_identity.is_some());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (respond_to, _response) = std::sync::mpsc::channel();
+        tx.send(crate::api::ApiRequestMessage {
+            request: Request {
+                id: "queued-peer-exit".into(),
+                method: Method::PaneSendText(PaneSendTextParams {
+                    pane_id: fixture.target_pane_id.clone(),
+                    text: "refused".into(),
+                    allow_cross_pane: false,
+                }),
+            },
+            context,
+            respond_to,
+            response_write_complete: None,
+            stream_active: None,
+        })
+        .expect("queued request");
+        child.kill().expect("stop peer");
+        child.wait().expect("reap peer");
+        let queued = rx.try_recv().expect("receive after exit");
+        assert_eq!(queued.context, context);
+        let response = fixture
+            .app
+            .handle_api_request_with_context(queued.request.clone(), queued.context);
+        assert_unknown(&response);
+        assert!(fixture.target_rx.try_recv().is_err());
+        let mut explicit = queued.request;
+        if let Method::PaneSendText(params) = &mut explicit.method {
+            params.allow_cross_pane = true;
+        }
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(explicit, context),
+        );
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("explicit opt-in"),
+            Bytes::from_static(b"refused")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn validated_outside_shell_is_ordinary_but_missing_roots_are_unknown() {
+        let mut fixture = attributed_agent_fixture();
+        let mut roots = Vec::new();
+        for pane in [&fixture.source_pane_id, &fixture.target_pane_id] {
+            let (_, pane) = fixture.app.parse_pane_id(pane).expect("pane");
+            let child = detached_sleep_child();
+            fixture
+                .app
+                .state
+                .runtime_for_pane_in_workspace(&fixture.app.terminal_runtimes, 0, pane)
+                .expect("runtime")
+                .test_set_child_pid(child.id());
+            roots.push(child);
+        }
+        let context = attributed_context();
+        assert_eq!(
+            fixture
+                .app
+                .input_origin_for_peer_identity(context.local_peer_identity.expect("peer")),
+            InputOrigin::Ordinary
+        );
+        let request = Request {
+            id: "outside".into(),
+            method: Method::PaneSendText(PaneSendTextParams {
+                pane_id: fixture.target_pane_id.clone(),
+                text: "ordinary".into(),
+                allow_cross_pane: false,
+            }),
+        };
+        assert_ok(
+            &fixture
+                .app
+                .handle_api_request_with_context(request.clone(), context),
+        );
+        assert_eq!(
+            fixture.target_rx.try_recv().expect("ordinary shell"),
+            Bytes::from_static(b"ordinary")
+        );
+        for child in &mut roots {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_unknown(
+            &fixture
+                .app
+                .handle_api_request_with_context(request, context),
+        );
+        assert!(fixture.target_rx.try_recv().is_err());
     }
 
     fn report_working(pane_id: &str) -> Method {

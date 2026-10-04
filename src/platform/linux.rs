@@ -53,8 +53,9 @@ pub(super) fn local_socket_peer_pid_platform(fd: RawFd) -> Option<u32> {
     u32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
-/// Capture the socket's original peer instance, not a later numeric PID owner.
-/// SO_PEERPIDFD is socket-bound; pidfd_open(SO_PEERCRED.pid) is not equivalent.
+/// Prefer the socket-bound pidfd. Older kernels use SO_PEERCRED plus an
+/// accept-time start pin, guarded by connection liveness and repeated reads.
+/// pidfd_open(SO_PEERCRED.pid) is not a socket-bound identity primitive.
 pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::ProcessIdentity> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut raw: libc::c_int = -1;
@@ -69,7 +70,16 @@ pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::Pr
             &mut len,
         )
     };
-    if status != 0 || raw < 0 {
+    if status != 0 {
+        let error = std::io::Error::last_os_error().raw_os_error();
+        return match error {
+            Some(libc::ENOPROTOOPT | libc::EINVAL | libc::ENOSYS) => {
+                local_socket_peer_identity_without_pidfd(fd)
+            }
+            _ => None,
+        };
+    }
+    if raw < 0 {
         return None;
     }
     // SAFETY: successful SO_PEERPIDFD returns a new owned descriptor.
@@ -87,9 +97,32 @@ pub(super) fn local_socket_peer_identity_platform(fd: RawFd) -> Option<super::Pr
         unsafe { libc::poll(&mut event, 1, 0) == 0 }
     };
     // A live original pidfd prevents numeric reuse across the start-time read.
-    // Old kernels without SO_PEERPIDFD intentionally provide no attribution.
     super::capture_bound_peer_identity(alive, || {
         process_identity(local_socket_peer_pid_platform(fd)?)
+    })
+}
+
+/// Older-kernel fallback. Capture once at accept, never repin a queued request.
+/// A hung-up/invalid transport or changing process observation is unknown.
+pub(crate) fn local_socket_peer_identity_without_pidfd(
+    fd: RawFd,
+) -> Option<super::ProcessIdentity> {
+    let connected = || {
+        let mut event = libc::pollfd {
+            fd,
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: zero-time poll only borrows the caller's socket.
+        (unsafe { libc::poll(&mut event, 1, 0) >= 0 })
+            && event.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                == 0
+    };
+    super::capture_bound_peer_identity(connected, || {
+        let pid = local_socket_peer_pid_platform(fd)?;
+        let identity = process_identity(pid)?;
+        (local_socket_peer_pid_platform(fd) == Some(pid) && process_identity(pid) == Some(identity))
+            .then_some(identity)
     })
 }
 

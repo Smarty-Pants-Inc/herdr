@@ -496,7 +496,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                allow_cross_pane: false,
+                allow_cross_pane: true,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -597,7 +597,8 @@ mod tests {
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // Synthetic channel fixture isolates submission, not caller attribution.
+                allow_cross_pane: true,
             },
         );
         assert!(response_rx.try_recv().is_err());
@@ -627,7 +628,7 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                allow_cross_pane: false,
+                allow_cross_pane: true,
             },
         );
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
@@ -643,7 +644,7 @@ mod tests {
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
-                allow_cross_pane: false,
+                allow_cross_pane: true,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -671,7 +672,8 @@ mod tests {
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // Isolate the blocked-agent check with an explicit synthetic opt-in.
+                allow_cross_pane: true,
             },
         );
 
@@ -712,7 +714,8 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // Synthetic channel fixture isolates focus/paste/submit ordering.
+                allow_cross_pane: true,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -796,7 +799,8 @@ mod tests {
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
-                allow_cross_pane: false,
+                // Isolate managed startup readiness from caller attribution.
+                allow_cross_pane: true,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();

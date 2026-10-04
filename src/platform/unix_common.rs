@@ -785,11 +785,17 @@ mod pty_identity_tests {
 
 /// Whether `pid` runs in the POSIX session that the pane child `child_pid` leads.
 /// A process gone or unreadable is not in the session.
+#[cfg(test)]
 pub(crate) fn process_in_pane_session(child_pid: u32, pid: u32) -> bool {
+    process_in_pane_session_checked(child_pid, pid).unwrap_or(false)
+}
+
+/// Unlike the discovery predicate, policy must retain failed OS observations.
+pub(crate) fn process_in_pane_session_checked(child_pid: u32, pid: u32) -> Option<bool> {
     let session_id = |pid: u32| {
         let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
         let sid = unsafe { libc::getsid(pid) };
         (sid > 0).then_some(sid)
     };
-    session_id(child_pid).is_some_and(|pane| session_id(pid) == Some(pane))
+    Some(session_id(child_pid)? == session_id(pid)?)
 }
