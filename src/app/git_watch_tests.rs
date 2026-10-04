@@ -30,7 +30,8 @@ fn git_watch_registry_releases_native_watches_over_100_add_remove_cycles() {
     for _ in 0..100 {
         watches.sync(HashSet::from([root.clone()]));
         assert_eq!(watches.roots.len(), 1);
-        assert_eq!(watches.watched.len(), 3); // .git direct + refs recursive + exact .git parent sentinel
+        let expected_watches = if cfg!(windows) { 2 } else { 3 };
+        assert_eq!(watches.watched.len(), expected_watches); // Windows folds refs into the recursive .git watch.
         assert!(!watches.watched.keys().any(|path| path.ends_with("objects")));
         watches.sync(HashSet::new());
         assert!(watches.roots.is_empty());
@@ -74,7 +75,8 @@ fn git_watch_directory_aliases_share_registration_after_partial_removal() {
         alias.clone(),
         canonical.clone(),
     ]));
-    assert_eq!(watches.watched.len(), 3);
+    let expected_watches = if cfg!(windows) { 2 } else { 3 };
+    assert_eq!(watches.watched.len(), expected_watches);
     let registrations = watches.watched.clone();
     watches.sync(HashSet::from([canonical.clone()]));
     assert_eq!(watches.watched, registrations);
@@ -91,6 +93,19 @@ fn git_watch_directory_aliases_share_registration_after_partial_removal() {
     drop(watches);
     std::fs::remove_file(alias).unwrap();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_watch_structural_filter_accepts_directory_recreation_events() {
+    use notify::event::{CreateKind, EventKind, RemoveKind};
+    let dir = PathBuf::from("repo/.git");
+    let targets = vec![WatchTarget::Metadata(dir.clone())];
+    let create_any = Event::new(EventKind::Create(CreateKind::Any)).add_path(dir.clone());
+    let create_folder = Event::new(EventKind::Create(CreateKind::Folder)).add_path(dir.clone());
+    let remove_folder = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(dir);
+    assert!(structural_event(&create_any, &targets));
+    assert!(structural_event(&create_folder, &targets));
+    assert!(structural_event(&remove_folder, &targets));
 }
 
 #[test]

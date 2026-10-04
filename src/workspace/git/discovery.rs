@@ -393,7 +393,9 @@ mod tests {
         path
     }
 
-    #[cfg(unix)]
+    // ponytail: APFS cannot create a non-UTF-8 path, so keep this native-path
+    // fixture on Linux instead of weakening it into a lossy Unicode approximation.
+    #[cfg(target_os = "linux")]
     #[test]
     fn git_worktree_info_preserves_non_utf8_ancestor_with_relative_markers() {
         use std::os::unix::ffi::OsStringExt;

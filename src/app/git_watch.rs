@@ -34,6 +34,8 @@ impl WatchTarget {
     fn recursive_mode(&self) -> RecursiveMode {
         match self {
             Self::Refs(_) => RecursiveMode::Recursive,
+            #[cfg(windows)]
+            Self::Metadata(_) => RecursiveMode::Recursive,
             _ => RecursiveMode::NonRecursive,
         }
     }
@@ -97,7 +99,8 @@ fn structural_event(event: &Event, targets: &[WatchTarget]) -> bool {
     event.need_rescan()
         || (matches!(
             event.kind,
-            EventKind::Create(CreateKind::Folder)
+            EventKind::Create(CreateKind::Any)
+                | EventKind::Create(CreateKind::Folder)
                 | EventKind::Remove(RemoveKind::Folder)
                 | EventKind::Modify(ModifyKind::Name(_))
                 | EventKind::Remove(RemoveKind::Any)
@@ -297,6 +300,23 @@ impl GitWatches {
                     }
                 })
                 .or_insert(mode);
+        }
+        #[cfg(windows)]
+        {
+            // ReadDirectoryChangesW keeps a handle for every registration.
+            // Do not hold a descendant handle while Git replaces its parent
+            // `.git` directory: the recursive parent watch covers the same
+            // notifications and avoids blocking a user rename/delete.
+            let recursive_ancestors: Vec<_> = desired
+                .iter()
+                .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
+                .map(|(path, _)| path.clone())
+                .collect();
+            desired.retain(|path, _| {
+                !recursive_ancestors
+                    .iter()
+                    .any(|ancestor| path != ancestor && path.starts_with(ancestor))
+            });
         }
         self.watched.retain(|path, mode| {
             // The safety reconciliation also re-arms watches after missed

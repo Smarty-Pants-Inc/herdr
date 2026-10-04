@@ -13,6 +13,31 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_tree_writable(path: &std::path::Path) {
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    if metadata.file_type().is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            make_tree_writable(&entry.unwrap().path());
+        }
+    }
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+#[cfg(not(windows))]
+fn make_tree_writable(_path: &std::path::Path) {}
+
+fn git_config_path(path: &std::path::Path) -> String {
+    // Git config treats backslashes as escapes. Forward slashes are accepted on
+    // every platform and keep this fixture valid on Windows.
+    path.to_string_lossy().replace('\\', "/")
+}
+
 #[test]
 fn git_watch_repair_same_path_directory_replacement_then_real_change() {
     for directory in [".git/refs", ".git"] {
@@ -191,6 +216,9 @@ fn git_watch_repair_git_directory_recreated_after_removal_was_applied() {
     repo.init();
     let mut app = repo.app();
     let retired = repo.0.join("retired-metadata");
+    // Git for Windows can mark object files read-only. That is fixture state,
+    // not a watcher handle: notify opens directory watches with FILE_SHARE_DELETE.
+    make_tree_writable(&repo.0.join(".git"));
     std::fs::rename(repo.0.join(".git"), &retired).unwrap();
     drive_git_watch_refresh(&mut app);
     assert_eq!(app.state.workspaces[0].cached_git_branch, None);
@@ -217,7 +245,8 @@ fn git_watch_repair_external_include_atomic_replacement_and_graph_change() {
     repo.git(&["commit", "--allow-empty", "-m", "ahead"]);
     let include = external.0.join("included-config");
     std::fs::write(&include, upstream_config("upstream")).unwrap();
-    repo.git(&["config", "include.path", include.to_str().unwrap()]);
+    let include_config_path = git_config_path(&include);
+    repo.git(&["config", "include.path", &include_config_path]);
     let mut app = repo.app();
     assert_eq!(app.state.workspaces[0].git_ahead_behind(), Some((1, 0)));
     let metadata_before = std::fs::read(repo.0.join(".git/config")).unwrap();
@@ -230,7 +259,7 @@ fn git_watch_repair_external_include_atomic_replacement_and_graph_change() {
     let nested = external.0.join("new-config");
     std::fs::write(
         &include,
-        format!("[include]\npath = {}\n", nested.display()),
+        format!("[include]\npath = {}\n", git_config_path(&nested)),
     )
     .unwrap();
     drive_git_watch_refresh(&mut app);
@@ -381,7 +410,9 @@ fn git_watch_repair_config_reload_expands_branch_only_demand_on_quiet_repo() {
     }
 }
 
-#[cfg(unix)]
+// ponytail: APFS cannot create a non-UTF-8 path, so keep this native-path
+// fixture on Linux instead of weakening it into a lossy Unicode approximation.
+#[cfg(target_os = "linux")]
 #[test]
 fn git_watch_repair_non_utf8_ancestor_relative_markers_common_ref_update() {
     use std::os::unix::ffi::OsStringExt;
