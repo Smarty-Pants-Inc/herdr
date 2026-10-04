@@ -186,6 +186,10 @@ async fn client_listener_running_server_accepts_fresh_attach() {
 #[tokio::test]
 async fn client_listener_rendering_server_accepts_fresh_attach() {
     let mut server = test_headless_server();
+    // Keep the API receiver open so render notifications, not a closed channel,
+    // drive the loop between render iterations.
+    let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    server.app.api_rx = api_rx;
     let path = server.client_socket_path.clone();
     let first = tokio::task::spawn_blocking({
         let path = path.clone();
