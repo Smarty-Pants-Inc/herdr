@@ -184,6 +184,90 @@ async fn client_listener_running_server_accepts_fresh_attach() {
 }
 
 #[tokio::test]
+async fn client_listener_rendering_server_accepts_fresh_attach() {
+    let mut server = test_headless_server();
+    let path = server.client_socket_path.clone();
+    let first = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || {
+            let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+            protocol::write_message(
+                &mut client,
+                &protocol::ClientMessage::TerminalHello {
+                    version: protocol::PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    pixel_mouse: false,
+                },
+            )
+            .unwrap();
+            let welcome: ServerMessage =
+                protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+            assert!(matches!(
+                welcome,
+                ServerMessage::Welcome { error: None, .. }
+            ));
+            client
+        }
+    });
+    let render_dirty = server.app.render_dirty.clone();
+    let render_notify = server.app.render_notify.clone();
+    let should_quit = server.should_quit.clone();
+    let event_tx = server.server_event_tx.clone();
+    let second_should_quit = should_quit.clone();
+    let second_render_notify = render_notify.clone();
+    let second = async move {
+        let _first_client = first.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let second_path = path.clone();
+        let welcome = tokio::task::spawn_blocking(move || {
+            let mut client = crate::ipc::connect_local_stream(&second_path).unwrap();
+            protocol::write_message(
+                &mut client,
+                &protocol::ClientMessage::TerminalHello {
+                    version: protocol::PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    pixel_mouse: false,
+                },
+            )
+            .unwrap();
+            let welcome: ServerMessage =
+                protocol::read_message(&mut client, MAX_FRAME_SIZE).unwrap();
+            matches!(welcome, ServerMessage::Welcome { error: None, .. })
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(2), welcome)
+            .await
+            .expect("fresh attach must not wait behind rendering")
+            .unwrap());
+        second_should_quit.store(true, Ordering::Release);
+        event_tx.send(ServerEvent::QuitSignal).await.unwrap();
+        second_render_notify.notify_one();
+    };
+    let renderer = async move {
+        loop {
+            if should_quit.load(Ordering::Acquire) {
+                break;
+            }
+            render_dirty.request_generic();
+            render_notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = tokio::time::timeout(Duration::from_secs(4), server.run());
+    let (result, ()) = tokio::join!(run, async {
+        tokio::join!(second, renderer);
+    });
+    result
+        .expect("continuously rendering server must remain responsive")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn client_listener_transient_accept_errors_back_off_without_stopping_server() {
     let attempts = run_client_listener_attach(3).await;
     assert_eq!(

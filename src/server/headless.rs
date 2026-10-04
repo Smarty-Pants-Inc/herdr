@@ -593,6 +593,24 @@ impl HeadlessServer {
                         )))
             {
                 crate::render_prof::event("render.attempt");
+                #[cfg(unix)]
+                if client_accept_retry_after.is_none_or(|deadline| now >= deadline) {
+                    match try_accept_ready_client_connections(
+                        &self.client_listener,
+                        &client_readiness,
+                        &mut self.next_client_id,
+                        &self.should_quit,
+                        &self.server_event_tx,
+                        self.handoff_in_progress,
+                    ) {
+                        Ok(()) => client_accept_retry_after = None,
+                        Err(err) => {
+                            warn!(err = %err, "client listener accept failed during render; will retry");
+                            client_accept_retry_after =
+                                Some(Instant::now() + CLIENT_ACCEPT_ERROR_RETRY_INTERVAL);
+                        }
+                    }
+                }
                 let render_request = self.app.render_dirty.take();
                 let pty_dirty = !render_request.pty_sources.is_empty();
                 if pty_dirty {
@@ -3744,6 +3762,38 @@ fn injected_client_accept_error() -> Option<io::Error> {
         hook.remaining_errors -= 1;
         Some(io::Error::from_raw_os_error(libc::EMFILE))
     })
+}
+
+/// Drains accepts only when the listener is already ready; render iterations
+/// must not wait for idle readiness.
+#[cfg(unix)]
+fn try_accept_ready_client_connections(
+    listener: &LocalListener,
+    readiness: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+    handoff_in_progress: bool,
+) -> io::Result<()> {
+    match readiness.try_io(tokio::io::Interest::READABLE, |_| {
+        accept_pending_client_connections_with(
+            || {
+                #[cfg(test)]
+                if let Some(err) = injected_client_accept_error() {
+                    return Err(err);
+                }
+                listener.accept()
+            },
+            next_client_id,
+            should_quit,
+            server_event_tx,
+            handoff_in_progress,
+        )
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Waits without a timer, then drains accepts until WouldBlock clears readiness.
