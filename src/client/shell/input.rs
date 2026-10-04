@@ -649,6 +649,9 @@ impl ClientShellState {
         use crate::input::{KeybindAction, KeybindDispatch, KeybindMatch};
 
         self.pending_workspace_highlight = None;
+        if self.handle_grouped_navigation_key(key, outcome) {
+            return;
+        }
         if key.code == KeyCode::Esc
             || crate::config::terminal_key_matches_combo(key, self.config.keybinds.prefix)
         {
@@ -705,11 +708,15 @@ impl ClientShellState {
                 (KeyCode::Char(digit), KeyModifiers::empty()),
             )
         }) {
-            let valid = self.snapshot.as_deref().is_some_and(|snapshot| {
-                self.navigation_workspace_entries(snapshot)
-                    .get(index)
-                    .is_some()
-            });
+            let valid = if self.config.grouping.enabled {
+                self.grouped_navigation_targets().get(index).is_some()
+            } else {
+                self.snapshot.as_deref().is_some_and(|snapshot| {
+                    self.navigation_workspace_entries(snapshot)
+                        .get(index)
+                        .is_some()
+                })
+            };
             if valid {
                 self.mode = ClientShellMode::Terminal;
                 self.navigate_workspace_id = None;
@@ -852,18 +859,23 @@ impl ClientShellState {
     }
 
     pub(super) fn indexed_navigation_target_exists(
-        &self,
+        &mut self,
         binding: &crate::input::KeybindMatch,
     ) -> bool {
         use crate::input::{KeybindAction, KeybindMatch};
 
         match binding {
             KeybindMatch::Action(KeybindAction::SwitchWorkspace(index)) => {
-                self.snapshot.as_deref().is_some_and(|snapshot| {
-                    self.navigation_workspace_entries(snapshot)
-                        .get(*index)
-                        .is_some()
-                })
+                if self.config.grouping.enabled {
+                    // Validate the same visible online leaf order used by grouped dispatch.
+                    self.grouped_navigation_targets().get(*index).is_some()
+                } else {
+                    self.snapshot.as_deref().is_some_and(|snapshot| {
+                        self.navigation_workspace_entries(snapshot)
+                            .get(*index)
+                            .is_some()
+                    })
+                }
             }
             KeybindMatch::Action(KeybindAction::SwitchTab(index)) => self
                 .snapshot

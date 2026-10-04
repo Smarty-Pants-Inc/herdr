@@ -337,12 +337,6 @@ mod tests {
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -361,10 +355,10 @@ mod tests {
 
     #[test]
     fn server_daemon_command_clears_socket_overrides_for_explicit_session() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/inherited.sock");
-        std::env::set_var("HERDR_CLIENT_SOCKET_PATH", "/tmp/inherited-client.sock");
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let env = crate::environment::test_env();
+        env.set(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/inherited.sock");
+        env.set("HERDR_CLIENT_SOCKET_PATH", "/tmp/inherited-client.sock");
+        env.remove(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let args = vec![
             "herdr".to_string(),
@@ -382,9 +376,9 @@ mod tests {
         assert!(envs.iter().any(|(key, value)| {
             *key == OsStr::new("HERDR_CLIENT_SOCKET_PATH") && value.is_none()
         }));
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
-        std::env::remove_var("HERDR_CLIENT_SOCKET_PATH");
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove("HERDR_CLIENT_SOCKET_PATH");
+        env.remove(crate::session::SESSION_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
     }
 
@@ -540,11 +534,11 @@ test "$sid" = "$$"
 
     #[test]
     fn validate_running_server_compatibility_fails_when_status_api_missing() {
-        let _guard = env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let dir = unique_test_dir("missing-api");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
-        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+        env.set(crate::api::SOCKET_PATH_ENV_VAR, &path);
 
         let err = validate_running_server_compatibility(false).unwrap_err();
 
@@ -552,17 +546,17 @@ test "$sid" = "$$"
             err.to_string().contains("status API is unavailable"),
             "unexpected error: {err}"
         );
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn validate_running_server_compatibility_names_session_commands_for_protocol_mismatch() {
-        let _guard = env_lock().lock().unwrap();
+        let env = crate::environment::test_env();
         let dir = unique_test_dir("named-protocol");
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-        std::env::set_var(crate::session::SESSION_ENV_VAR, "work");
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        env.set("XDG_CONFIG_HOME", &dir);
+        env.set(crate::session::SESSION_ENV_VAR, "work");
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let path = crate::session::api_socket_path_for(Some("work"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -598,9 +592,9 @@ test "$sid" = "$$"
             message.contains("then run `herdr session attach work` again"),
             "unexpected error: {message}"
         );
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var(crate::session::SESSION_ENV_VAR);
-        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        env.remove("XDG_CONFIG_HOME");
+        env.remove(crate::session::SESSION_ENV_VAR);
+        env.remove(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -1,7 +1,10 @@
 use std::io;
 use std::path::PathBuf;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
+
+#[cfg(test)]
+pub(crate) use super::test_support::{integration_test_env, IntegrationTestEnv};
 
 use portable_pty::CommandBuilder;
 
@@ -25,6 +28,15 @@ pub(crate) const GROK_CONFIG_DIR_ENV_VAR: &str = "GROK_CONFIG_DIR";
 pub(crate) const GROK_HOME_ENV_VAR: &str = "GROK_HOME";
 pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 
+/// Integration path lookup; unscoped tests and production use the process environment.
+pub(crate) fn var_os(key: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(value) = super::test_support::env_override(key) {
+        return value;
+    }
+    std::env::var_os(key)
+}
+
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     if let Ok(executable) = crate::platform::launch_executable() {
@@ -40,13 +52,11 @@ pub(crate) fn pi_extension_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn omp_extension_dir() -> io::Result<PathBuf> {
-    if let Some(value) =
-        std::env::var_os(PI_CODING_AGENT_DIR_ENV_VAR).filter(|value| !value.is_empty())
-    {
+    if let Some(value) = var_os(PI_CODING_AGENT_DIR_ENV_VAR).filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("extensions"));
     }
 
-    let config_dir = std::env::var_os(OMP_CONFIG_DIR_ENV_VAR)
+    let config_dir = var_os(OMP_CONFIG_DIR_ENV_VAR)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".omp".into());
     Ok(home_dir()?
@@ -72,12 +82,12 @@ pub(crate) fn copilot_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn devin_dir() -> io::Result<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+    if let Some(value) = var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("devin"));
     }
 
     #[cfg(windows)]
-    if let Some(value) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+    if let Some(value) = var_os("APPDATA").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value).join("devin"));
     }
 
@@ -92,7 +102,7 @@ pub(crate) fn config_dir_from_env_or_home(
     env_var: &str,
     home_relative_segments: &[&str],
 ) -> io::Result<PathBuf> {
-    if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+    if let Some(value) = var_os(env_var).filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value));
     }
 
@@ -128,7 +138,7 @@ pub(crate) fn opencode_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn opencode_state_dir() -> io::Result<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+    if let Some(value) = var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("opencode"));
     }
 
@@ -140,20 +150,18 @@ pub(crate) fn kilo_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn hermes_dir() -> io::Result<PathBuf> {
-    if let Some(value) = std::env::var_os(HERMES_HOME_ENV_VAR).filter(|value| !value.is_empty()) {
+    if let Some(value) = var_os(HERMES_HOME_ENV_VAR).filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value));
     }
 
     #[cfg(windows)]
     {
-        let explicit_home = std::env::var_os("HOME").filter(|value| !value.is_empty());
-        let profile = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty());
+        let explicit_home = var_os("HOME").filter(|value| !value.is_empty());
+        let profile = var_os("USERPROFILE").filter(|value| !value.is_empty());
         if let Some(home) = explicit_home.filter(|home| profile.as_ref() != Some(home)) {
             return Ok(PathBuf::from(home).join(".hermes"));
         }
-        if let Some(local_app_data) =
-            std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
-        {
+        if let Some(local_app_data) = var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(local_app_data).join("hermes"));
         }
     }
@@ -197,8 +205,7 @@ pub(crate) fn antigravity_cli_dir() -> io::Result<PathBuf> {
 pub(crate) fn grok_dir() -> io::Result<PathBuf> {
     // GROK_CONFIG_DIR is a herdr-level override only (primarily a test
     // seam); the grok CLI does not honor it, so it stays first and explicit.
-    if let Some(value) = std::env::var_os(GROK_CONFIG_DIR_ENV_VAR).filter(|value| !value.is_empty())
-    {
+    if let Some(value) = var_os(GROK_CONFIG_DIR_ENV_VAR).filter(|value| !value.is_empty()) {
         return expand_tilde_path(PathBuf::from(value));
     }
     // The grok CLI honors GROK_HOME as its config home (config.toml,
@@ -207,18 +214,18 @@ pub(crate) fn grok_dir() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn home_dir() -> io::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+    if let Some(home) = var_os("HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(home));
     }
 
     #[cfg(windows)]
     {
-        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        if let Some(profile) = var_os("USERPROFILE").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(profile));
         }
         if let (Some(drive), Some(path)) = (
-            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
-            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
+            var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
+            var_os("HOMEPATH").filter(|value| !value.is_empty()),
         ) {
             let mut home = PathBuf::from(drive);
             home.push(path);
@@ -231,34 +238,14 @@ pub(crate) fn home_dir() -> io::Result<PathBuf> {
     ))
 }
 
-#[cfg(test)]
-pub(crate) struct IntegrationEnvLock {
-    _guard: MutexGuard<'static, ()>,
-    #[cfg(windows)]
-    appdata: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl Drop for IntegrationEnvLock {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        if let Some(appdata) = self.appdata.take() {
-            std::env::set_var("APPDATA", appdata);
-        } else {
-            std::env::remove_var("APPDATA");
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
+/// Legacy serialization for Windows sound/platform subprocess tests only.
+/// Integration tests use the lock-free `integration_test_env` scope instead.
+#[cfg(all(test, windows))]
+pub(crate) fn integration_env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    IntegrationEnvLock {
-        _guard: guard,
-        #[cfg(windows)]
-        appdata: std::env::var_os("APPDATA"),
-    }
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -266,28 +253,131 @@ mod tests {
     use super::*;
 
     #[test]
-    fn opencode_state_dir_defaults_to_local_state() {
-        let _lock = integration_env_lock();
-        let original = std::env::var_os("XDG_STATE_HOME");
-        std::env::remove_var("XDG_STATE_HOME");
-        let expected = home_dir().unwrap().join(".local/state/opencode");
-        assert_eq!(opencode_state_dir().unwrap(), expected);
-        match original {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
+    fn integration_test_env_masks_parent_path_and_config_defaults() {
+        let _env = integration_test_env();
+        for key in [
+            "HOME",
+            "PATH",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            PI_CODING_AGENT_DIR_ENV_VAR,
+            OMP_CONFIG_DIR_ENV_VAR,
+            CLAUDE_CONFIG_DIR_ENV_VAR,
+            CODEX_HOME_ENV_VAR,
+            HERMES_HOME_ENV_VAR,
+        ] {
+            assert_eq!(var_os(key), None, "{key} must not fall back to the parent");
         }
+        assert!(home_dir().is_err());
+    }
+
+    #[test]
+    fn integration_test_env_restores_nested_scope_after_unwind() {
+        let parent_home = std::env::var_os("HOME");
+        let parent_path = std::env::var_os("PATH");
+        {
+            let outer = integration_test_env();
+            let home = std::env::temp_dir().join("herdr-outer-home");
+            outer.set("HOME", &home);
+            outer.set("PATH", "outer-path");
+            outer.set("XDG_STATE_HOME", "outer-state");
+            let result = std::panic::catch_unwind(|| {
+                let inner = integration_test_env();
+                inner.set("HOME", "inner-home");
+                inner.set("PATH", "inner-path");
+                inner.set("XDG_STATE_HOME", "inner-state");
+                panic!("test fixture failed");
+            });
+            assert!(result.is_err());
+            assert_eq!(home_dir().unwrap(), home);
+            assert_eq!(var_os("PATH"), Some("outer-path".into()));
+            assert_eq!(
+                opencode_state_dir().unwrap(),
+                PathBuf::from("outer-state/opencode")
+            );
+        }
+        assert_eq!(std::env::var_os("HOME"), parent_home);
+        assert_eq!(std::env::var_os("PATH"), parent_path);
+        assert_eq!(var_os("HOME"), parent_home);
+        assert_eq!(var_os("PATH"), parent_path);
+        // A failed fixture cannot poison a later scope or leave its HOME behind.
+        let fresh = integration_test_env();
+        assert!(home_dir().is_err());
+        fresh.set("HOME", "fresh-home");
+        assert_eq!(home_dir().unwrap(), PathBuf::from("fresh-home"));
+    }
+
+    #[test]
+    fn integration_test_env_isolates_overlapping_threads() {
+        let parent_home = std::env::var_os("HOME");
+        let parent_path = std::env::var_os("PATH");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            let handles = ["a", "b"].map(|label| {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let env = integration_test_env();
+                    let home = std::env::temp_dir().join(format!("herdr-isolated-{label}"));
+                    let state = home.join("state");
+                    let config = home.join("config");
+                    env.set("HOME", &home);
+                    env.set("PATH", home.join("bin"));
+                    env.set("XDG_STATE_HOME", &state);
+                    env.set("XDG_CONFIG_HOME", &config);
+                    barrier.wait();
+                    assert_eq!(home_dir().unwrap(), home);
+                    assert_eq!(opencode_state_dir().unwrap(), state.join("opencode"));
+                    assert_eq!(devin_dir().unwrap(), config.join("devin"));
+                    assert_eq!(var_os("PATH"), Some(home.join("bin").into_os_string()));
+                })
+            });
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        assert_eq!(std::env::var_os("HOME"), parent_home);
+        assert_eq!(std::env::var_os("PATH"), parent_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn integration_test_env_covers_windows_home_fallbacks() {
+        let env = integration_test_env();
+        env.set("HOMEDRIVE", "C:");
+        env.set("HOMEPATH", r"\Users\integration");
+        assert_eq!(home_dir().unwrap(), PathBuf::from(r"C:\Users\integration"));
+        env.set("USERPROFILE", r"C:\Users\profile");
+        assert_eq!(home_dir().unwrap(), PathBuf::from(r"C:\Users\profile"));
+        env.set("HOME", r"C:\fixture-home");
+        assert_eq!(home_dir().unwrap(), PathBuf::from(r"C:\fixture-home"));
+        env.set("HOME", "");
+        assert_eq!(home_dir().unwrap(), PathBuf::from(r"C:\Users\profile"));
+        env.remove("USERPROFILE");
+        env.remove("HOMEPATH");
+        assert!(home_dir().is_err());
+    }
+
+    #[test]
+    fn opencode_state_dir_defaults_to_local_state() {
+        let env = integration_test_env();
+        let home = std::env::temp_dir().join("herdr-opencode-state-home");
+        env.set("HOME", &home);
+        assert_eq!(
+            opencode_state_dir().unwrap(),
+            home.join(".local/state/opencode")
+        );
     }
 
     #[test]
     fn opencode_state_dir_honors_xdg_state_home() {
-        let _lock = integration_env_lock();
-        let original = std::env::var_os("XDG_STATE_HOME");
+        let env = integration_test_env();
         let xdg = std::env::temp_dir().join("herdr-xdg-state");
-        std::env::set_var("XDG_STATE_HOME", &xdg);
+        env.set("XDG_STATE_HOME", &xdg);
         assert_eq!(opencode_state_dir().unwrap(), xdg.join("opencode"));
-        match original {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
     }
 }

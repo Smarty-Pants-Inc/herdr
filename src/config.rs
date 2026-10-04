@@ -29,8 +29,8 @@ pub use self::{
         ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
-        AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
-        SpaceSidebarToken, SpacesSidebarConfig,
+        AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarGroupingConfig,
+        SidebarTokenStyle, SpaceSidebarToken, SpacesSidebarConfig,
     },
     sound::SoundConfig,
     tab_bar::TabBarRightEntryConfig,
@@ -80,14 +80,11 @@ pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
 
 #[cfg(test)]
-pub(crate) fn app_dir_name() -> &'static str {
-    io::app_dir_name()
-}
+pub(crate) use self::io::{test_config_dirs, TestConfigDirs};
 
 #[cfg(test)]
-pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) fn app_dir_name() -> &'static str {
+    io::app_dir_name()
 }
 
 impl Config {

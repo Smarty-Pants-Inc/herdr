@@ -1639,7 +1639,7 @@ fn truncate_handoff_history(history: String, max_bytes: usize) -> String {
 }
 
 fn pane_shell(configured_shell: &str) -> String {
-    pane_shell_from(configured_shell, std::env::var("SHELL").ok())
+    pane_shell_from(configured_shell, crate::environment::var("SHELL").ok())
 }
 
 fn pane_shell_from(configured_shell: &str, env_shell: Option<String>) -> String {
@@ -1864,7 +1864,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
+fn resolve_shell_for_login_mode(shell: &str, path: Option<&std::ffi::OsStr>) -> io::Result<String> {
     if shell.contains(std::path::MAIN_SEPARATOR) {
         let path = Path::new(shell);
         return is_executable_file(path)
@@ -1877,19 +1877,18 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
             });
     }
 
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(shell))
-                .find(|candidate| is_executable_file(candidate))
-        })
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("login shell {shell:?} was not found on PATH"),
-            )
-        })
+    path.and_then(|path| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(shell))
+            .find(|candidate| is_executable_file(candidate))
+    })
+    .and_then(|path| path.into_os_string().into_string().ok())
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("login shell {shell:?} was not found on PATH"),
+        )
+    })
 }
 
 /// Sourced via `-NoExit -Command` when launching PowerShell on Windows. It
@@ -1939,6 +1938,17 @@ fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
+    let path = std::env::var_os("PATH");
+    pane_shell_command_builder_for_target_with_path(shell_config, target, path.as_deref())
+}
+
+/// The production builder supplies the process PATH; tests supply their own
+/// lookup input without changing the environment shared with other panes/tests.
+fn pane_shell_command_builder_for_target_with_path(
+    shell_config: PaneShellConfig<'_>,
+    target: ShellLaunchTarget,
+    path: Option<&std::ffi::OsStr>,
+) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
     // Unix login shells go through portable-pty's default-program builder so
     // they receive the login argv0 convention. Windows has no such convention
@@ -1948,7 +1958,7 @@ fn pane_shell_command_builder_for_target(
         && target != ShellLaunchTarget::Windows
     {
         let mut cmd = CommandBuilder::new_default_prog();
-        cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
+        cmd.env("SHELL", resolve_shell_for_login_mode(&shell, path)?);
         return Ok(cmd);
     }
 
@@ -4042,7 +4052,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create process cwd");
 
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
+            .args(["-c", "exec sleep 30"])
             .current_dir(&cwd)
             .spawn()
             .expect("spawn process in cwd");
@@ -4660,63 +4670,200 @@ mod tests {
 
     #[test]
     fn login_shell_builder_rejects_missing_shell_instead_of_falling_back() {
-        let err = pane_shell_command_builder_for_target(
+        let err = pane_shell_command_builder_for_target_with_path(
             PaneShellConfig::new(
                 "/__herdr_missing_shell__",
                 crate::config::ShellModeConfig::Login,
             ),
             ShellLaunchTarget::OtherUnix,
+            None,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // This synthetic Unix target still uses the host path separator.
+        #[cfg(unix)]
+        assert_eq!(
+            err.to_string(),
+            "login shell \"/__herdr_missing_shell__\" is not executable"
+        );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn login_shell_builder_resolves_bare_shell_names_from_path() {
-        let _lock = crate::integration::integration_env_lock();
+    fn login_shell_test_dir(label: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "herdr-login-shell-path-{}-{}",
+            "herdr-login-shell-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[cfg(unix)]
+    fn write_login_test_shell(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_builder_resolves_bare_shell_names_from_path() {
+        let base = login_shell_test_dir("path");
         let bin = base.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let shell = bin.join("fake-shell");
-        std::fs::write(&shell, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let original_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", &bin);
+        write_login_test_shell(&shell, 0o755);
 
-        let cmd = pane_shell_command_builder_for_target(
+        let cmd = pane_shell_command_builder_for_target_with_path(
             PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
             ShellLaunchTarget::OtherUnix,
+            Some(bin.as_os_str()),
         )
         .unwrap();
 
         assert!(cmd.is_default_prog());
-        assert_eq!(
-            cmd.get_env("SHELL").and_then(std::ffi::OsStr::to_str),
-            shell.to_str()
-        );
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
+        assert_eq!(cmd.get_env("SHELL"), Some(shell.as_os_str()));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_builder_rejects_missing_path_inputs_without_fallback() {
+        let base = login_shell_test_dir("missing-path");
+        // A real executable exists, but only the supplied lookup input may find it.
+        write_login_test_shell(&base.join("sh"), 0o755);
+        let missing_bin = base.join("missing-bin");
+        for path in [None, Some(missing_bin.as_os_str())] {
+            let err = pane_shell_command_builder_for_target_with_path(
+                PaneShellConfig::new("sh", crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::OtherUnix,
+                path,
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            assert_eq!(err.to_string(), "login shell \"sh\" was not found on PATH");
         }
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
     #[test]
+    fn login_shell_builder_requires_executable_file_and_respects_path_order() {
+        let base = login_shell_test_dir("executable-order");
+        let non_executable = base.join("non-executable");
+        let directory = base.join("directory");
+        let first = base.join("first");
+        let second = base.join("second");
+        for bin in [&non_executable, &directory, &first, &second] {
+            std::fs::create_dir_all(bin).unwrap();
+        }
+        write_login_test_shell(&non_executable.join("fake-shell"), 0o644);
+        std::fs::create_dir(directory.join("fake-shell")).unwrap();
+        write_login_test_shell(&first.join("fake-shell"), 0o755);
+        write_login_test_shell(&second.join("fake-shell"), 0o755);
+
+        let invalid_path = std::env::join_paths([&non_executable, &directory]).unwrap();
+        let err = pane_shell_command_builder_for_target_with_path(
+            PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::OtherUnix,
+            Some(&invalid_path),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            err.to_string(),
+            "login shell \"fake-shell\" was not found on PATH"
+        );
+
+        for (bins, expected) in [
+            ([&non_executable, &directory, &first, &second], &first),
+            ([&non_executable, &directory, &second, &first], &second),
+        ] {
+            let path = std::env::join_paths(bins).unwrap();
+            let cmd = pane_shell_command_builder_for_target_with_path(
+                PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
+                ShellLaunchTarget::OtherUnix,
+                Some(&path),
+            )
+            .unwrap();
+            assert!(cmd.is_default_prog());
+            assert_eq!(
+                cmd.get_env("SHELL"),
+                Some(expected.join("fake-shell").as_os_str())
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    // ponytail: APFS rejects non-UTF-8 names before the resolver can be exercised.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn login_shell_builder_preserves_non_utf8_path_resolution_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = login_shell_test_dir("non-utf8-path");
+        let bin = base.join(std::ffi::OsString::from_vec(b"bin-\xff".to_vec()));
+        std::fs::create_dir_all(&bin).unwrap();
+        write_login_test_shell(&bin.join("fake-shell"), 0o755);
+        // Preserve the existing error when the first executable's path cannot
+        // be represented by SHELL, even if a later candidate is valid UTF-8.
+        write_login_test_shell(&base.join("fake-shell"), 0o755);
+        let path = std::env::join_paths([&bin, &base]).unwrap();
+        let err = pane_shell_command_builder_for_target_with_path(
+            PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::OtherUnix,
+            Some(&path),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            err.to_string(),
+            "login shell \"fake-shell\" was not found on PATH"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn login_shell_resolution_preserves_shell_paths() {
-        assert_eq!(resolve_shell_for_login_mode("/bin/sh").unwrap(), "/bin/sh");
+        for shell in ["/bin/sh", "/bin/../bin/sh"] {
+            assert_eq!(resolve_shell_for_login_mode(shell, None).unwrap(), shell);
+        }
+        let base = login_shell_test_dir("explicit-path");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_login_test_shell(&bin.join("fake-shell"), 0o755);
+        let shell = bin.join("..").join("bin").join("fake-shell");
+        let cmd = pane_shell_command_builder_for_target_with_path(
+            PaneShellConfig::new(
+                shell.to_str().unwrap(),
+                crate::config::ShellModeConfig::Login,
+            ),
+            ShellLaunchTarget::OtherUnix,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cmd.get_env("SHELL"), Some(shell.as_os_str()));
+
+        // An explicit non-executable path must not fall back to a valid PATH candidate.
+        let invalid = base.join("fake-shell");
+        write_login_test_shell(&invalid, 0o644);
+        let err = resolve_shell_for_login_mode(invalid.to_str().unwrap(), Some(bin.as_os_str()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "login shell {:?} is not executable",
+                invalid.to_str().unwrap()
+            )
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

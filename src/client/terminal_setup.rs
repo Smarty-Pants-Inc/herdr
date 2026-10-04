@@ -493,12 +493,13 @@ fn enable_windows_virtual_terminal_input_inner() -> WindowsVirtualTerminalInputS
 }
 
 pub(super) fn is_ssh_session() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+    crate::environment::var_os("SSH_CONNECTION").is_some()
+        || crate::environment::var_os("SSH_TTY").is_some()
 }
 
 #[cfg(windows)]
 pub(super) fn windows_vti_input_backend_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_BACKEND")
+    crate::environment::var("HERDR_WINDOWS_INPUT_BACKEND")
         .map(|backend| !backend.eq_ignore_ascii_case("crossterm"))
         .unwrap_or(true)
 }
@@ -699,7 +700,7 @@ fn pop_keyboard_enhancement_flags() -> io::Result<()> {
 
 #[cfg(any(windows, test))]
 pub(super) fn windows_win32_input_mode_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_PROBE")
+    crate::environment::var("HERDR_WINDOWS_INPUT_PROBE")
         .map(|probe| probe.eq_ignore_ascii_case("win32"))
         .unwrap_or(true)
 }
