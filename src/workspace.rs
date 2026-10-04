@@ -20,7 +20,6 @@ mod git;
 mod tab;
 
 use self::git::git_status_cache_key_for_space;
-pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPane};
 pub use self::{
     git::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_checkout_space_metadata,
@@ -28,6 +27,10 @@ pub use self::{
         GitStatusRefreshDemand,
     },
     tab::{NewPane, Tab},
+};
+pub(crate) use self::{
+    git::{git_status_snapshot_for_cwd_with_demand, git_worktree_info, GitWorktreeInfo},
+    tab::MovedPane,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -143,6 +143,7 @@ pub struct App {
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     git_watches: Option<git_watch::GitWatches>,
+    git_watch_demand: crate::workspace::GitStatusRefreshDemand,
     git_watch_refresh_deadline: Option<Instant>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) worktree_read_slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -616,6 +617,7 @@ impl App {
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
             git_watches: None,
+            git_watch_demand: crate::workspace::GitStatusRefreshDemand::default(),
             git_watch_refresh_deadline: None,
             pending_api_worktree_creates: HashMap::new(),
             worktree_read_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
@@ -828,6 +830,7 @@ impl App {
         invalid_sections: &[String],
         notify_success: bool,
     ) -> crate::config::ConfigReloadReport {
+        let previous_git_demand = self.git_refresh_demand();
         let mut diagnostics = load_diagnostics.to_vec();
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
@@ -1020,6 +1023,7 @@ impl App {
             }
         }
 
+        self.request_git_demand_growth(previous_git_demand);
         self.state.request_client_config_reload = true;
         crate::config::ConfigReloadReport {
             status,

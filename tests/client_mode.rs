@@ -2006,6 +2006,56 @@ fn unavailable_restored_pane_keeps_saved_cwd_in_server() {
 }
 
 #[test]
+fn server_stop_wakes_idle_server_without_client_or_pty_events() {
+    let _lock = test_lock();
+    for wait_for_app in [false, true] {
+        assert_server_stop_exits_without_other_events(wait_for_app);
+    }
+}
+
+fn assert_server_stop_exits_without_other_events(wait_for_app: bool) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    if wait_for_app {
+        wait_for_socket(&client_socket, Duration::from_secs(10));
+        // Synchronize with App startup without creating a pane or a client that
+        // could accidentally wake the event loop after the stop flag is set.
+        let workspaces = send_json_request(
+            &api_socket,
+            r#"{"id":"ready","method":"workspace.list","params":{}}"#,
+        );
+        assert_eq!(workspaces["result"]["workspaces"], serde_json::json!([]));
+    }
+    // The other case stops as soon as the API binds, including startup before
+    // the App begins receiving requests or registers client readiness.
+    let stopped = send_json_request(
+        &api_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    assert!(stopped.get("error").is_none(), "{stopped}");
+
+    // The immediate API acknowledgement alone does not prove shutdown: the
+    // real server process must complete cleanup with no further socket traffic.
+    let mut exit_status = None;
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            exit_status = spawned.child.try_wait().unwrap();
+            exit_status.is_some()
+        }),
+        "idle server did not exit after acknowledging server.stop"
+    );
+    assert!(exit_status.unwrap().success());
+    assert!(!api_socket.exists(), "API socket must be cleaned up");
+    assert!(!client_socket.exists(), "client socket must be cleaned up");
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
 fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Issue 2 fix: SIGINT triggers initiate_shutdown → ServerShutdown
     // broadcast to all clients before the server exits.

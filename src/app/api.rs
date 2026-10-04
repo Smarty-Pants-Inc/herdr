@@ -84,6 +84,7 @@ impl App {
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        self.reconcile_git_config_watches();
         self.sync_git_watches();
         if changed {
             self.render_dirty.request_generic();

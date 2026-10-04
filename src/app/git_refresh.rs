@@ -39,26 +39,53 @@ impl App {
     /// Reconcile native watches outside rendering. Main's headless loop calls
     /// this after workspace/client changes; unchanged roots do no filesystem I/O.
     pub(crate) fn sync_git_watches(&mut self) {
-        let roots: HashSet<_> = if self.git_refresh_demand().is_empty() {
+        let demand = self.git_refresh_demand();
+        let roots: HashSet<_> = if demand.is_empty() {
             HashSet::new()
         } else {
             self.workspace_git_refresh_items(false)
                 .into_iter()
-                .map(|item| item.cache_key_hint.unwrap_or(item.resolved_identity_cwd))
+                // Consumer identity must not change when discovery supplies a
+                // canonical cache key for the same logical workspace CWD.
+                .map(|item| item.resolved_identity_cwd)
                 .collect()
         };
         if roots.is_empty() {
             self.clear_git_watches();
             return;
         }
+        self.git_watch_demand = self.request_git_demand_growth(self.git_watch_demand);
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(|watches| watches.roots_changed(&roots))
+        {
+            // Config dependencies belong to current consumers, not retired cache entries.
+            self.reconcile_git_config_watches();
+        }
         if self.git_watches.is_none() {
             match GitWatches::new(self.event_tx.clone()) {
-                Ok(watches) => self.git_watches = Some(watches),
+                Ok(mut watches) => {
+                    let cache_roots = self
+                        .workspace_git_refresh_items(false)
+                        .into_iter()
+                        .map(|item| item.cache_key_hint.unwrap_or(item.resolved_identity_cwd))
+                        .collect();
+                    watches.set_config_dependencies(self.git_config_dependency_paths(&cache_roots));
+                    self.git_watches = Some(watches);
+                }
                 Err(err) => {
                     tracing::warn!(%err, "native git watches unavailable; using safety refresh");
                     return;
                 }
             }
+        }
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(|watches| watches.has_new_roots(&roots))
+        {
+            self.mark_git_status_refresh_due(Instant::now());
         }
         if let Some(watches) = &mut self.git_watches {
             watches.sync(roots);
@@ -68,16 +95,23 @@ impl App {
     /// A clientless headless server can release all native watcher resources.
     pub(crate) fn clear_git_watches(&mut self) {
         self.git_watches = None;
+        self.git_watch_demand = GitStatusRefreshDemand::default();
         self.git_watch_refresh_deadline = None;
     }
 
     pub(super) fn handle_git_files_changed(&mut self, now: Instant) {
-        if let Some(watches) = &mut self.git_watches {
-            watches.topology_dirty = true;
-        }
         if self.git_refresh_demand().is_empty() {
             self.clear_git_watches();
             return;
+        }
+        if self
+            .git_watches
+            .as_ref()
+            .is_some_and(GitWatches::take_discovery_hint)
+        {
+            // Directory/marker changes can invalidate a negative cache or a
+            // cached checkout identity. Ordinary HEAD/index writes do neither.
+            self.request_git_identity_refresh(now);
         }
         // Bound bursts to one wakeup and one refresh per debounce window, even
         // if a writer never goes quiet. In-flight refreshes keep this deadline.
@@ -94,18 +128,21 @@ impl App {
             return;
         }
 
-        let refresh_repo_discovery = self.git_identity_refresh_requested
-            || now.saturating_duration_since(self.last_git_repo_discovery_refresh)
-                >= GIT_REPO_DISCOVERY_REFRESH_INTERVAL;
+        let safety_discovery_due = now
+            .saturating_duration_since(self.last_git_repo_discovery_refresh)
+            >= GIT_REPO_DISCOVERY_REFRESH_INTERVAL;
+        let refresh_repo_discovery = self.git_identity_refresh_requested || safety_discovery_due;
         let workspaces = self.workspace_git_refresh_items(refresh_repo_discovery);
         self.git_watch_refresh_deadline = None;
         if let Some(watches) = &mut self.git_watches {
             watches.acknowledge();
-            if refresh_repo_discovery {
+            if safety_discovery_due {
                 watches.rearm_requested = true;
             }
         }
-        if refresh_repo_discovery {
+        // Explicit/native identity hints must not move the independent safety
+        // net; continuous metadata replacement cannot postpone reconciliation.
+        if safety_discovery_due {
             self.last_git_repo_discovery_refresh = now;
         }
 
@@ -163,7 +200,40 @@ impl App {
         })
     }
 
-    fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
+    pub(super) fn request_git_demand_growth(
+        &mut self,
+        previous: GitStatusRefreshDemand,
+    ) -> GitStatusRefreshDemand {
+        let demand = self.git_refresh_demand();
+        if (demand.branch && !previous.branch) || (demand.ahead_behind && !previous.ahead_behind) {
+            self.mark_git_status_refresh_due(Instant::now());
+        }
+        demand
+    }
+
+    fn git_config_dependency_paths(&self, roots: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+        roots
+            .iter()
+            .filter_map(|root| self.git_status_cache.get(root))
+            .flat_map(GitStatusCacheEntry::config_dependency_paths)
+            .collect()
+    }
+
+    pub(super) fn reconcile_git_config_watches(&mut self) {
+        // Only worker completion reads cached config dependencies. The regular
+        // unchanged-root app-loop sync never discovers files or clones deps.
+        let roots = self
+            .workspace_git_refresh_items(false)
+            .into_iter()
+            .map(|item| item.cache_key_hint.unwrap_or(item.resolved_identity_cwd))
+            .collect();
+        let paths = self.git_config_dependency_paths(&roots);
+        if let Some(watches) = &mut self.git_watches {
+            watches.set_config_dependencies(paths);
+        }
+    }
+
+    pub(super) fn git_refresh_demand(&self) -> GitStatusRefreshDemand {
         let mut demand = GitStatusRefreshDemand::default();
         for token in self.state.sidebar_spaces.rows.iter().flatten() {
             match token.parts().0 {
@@ -661,6 +731,7 @@ mod tests {
 
     /// Exercise the same sync -> scheduler -> worker -> App event application
     /// path used by a headless server with an attached app consumer.
+    #[track_caller]
     fn drive_git_watch_refresh(app: &mut App) -> (std::time::Duration, bool) {
         let start = Instant::now();
         loop {
@@ -883,6 +954,8 @@ mod tests {
         app.sync_git_watches();
         assert!(app.git_watches.is_none());
     }
+
+    include!("git_refresh_regression_tests.rs");
 
     fn test_app(config: &crate::config::Config) -> super::super::App {
         super::super::App::new(

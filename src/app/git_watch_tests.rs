@@ -30,7 +30,7 @@ fn git_watch_registry_releases_native_watches_over_100_add_remove_cycles() {
     for _ in 0..100 {
         watches.sync(HashSet::from([root.clone()]));
         assert_eq!(watches.roots.len(), 1);
-        assert_eq!(watches.watched.len(), 2); // .git direct + refs recursive
+        assert_eq!(watches.watched.len(), 3); // .git direct + refs recursive + exact .git parent sentinel
         assert!(!watches.watched.keys().any(|path| path.ends_with("objects")));
         watches.sync(HashSet::new());
         assert!(watches.roots.is_empty());
@@ -57,6 +57,39 @@ fn git_watch_identical_checkout_directories_share_watches_and_remain_until_last_
     watches.sync(HashSet::new());
     assert!(watches.watched.is_empty());
     drop(watches);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn git_watch_directory_aliases_share_registration_after_partial_removal() {
+    let root = repository("directory-alias");
+    let canonical = root.canonicalize().unwrap();
+    let alias = root.with_extension("alias");
+    std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut watches = GitWatches::new(tx).unwrap();
+    watches.sync(HashSet::from([
+        root.clone(),
+        alias.clone(),
+        canonical.clone(),
+    ]));
+    assert_eq!(watches.watched.len(), 3);
+    let registrations = watches.watched.clone();
+    watches.sync(HashSet::from([canonical.clone()]));
+    assert_eq!(watches.watched, registrations);
+    std::fs::write(canonical.join(".git/HEAD.new"), "ref: refs/heads/other\n").unwrap();
+    std::fs::rename(canonical.join(".git/HEAD.new"), canonical.join(".git/HEAD")).unwrap();
+    let start = std::time::Instant::now();
+    while rx.is_empty() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(matches!(rx.try_recv().unwrap(), AppEvent::GitFilesChanged));
+    watches.sync(HashSet::new());
+    assert!(watches.watched.is_empty());
+    drop(watches);
+    std::fs::remove_file(alias).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
